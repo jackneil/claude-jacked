@@ -88,7 +88,14 @@ def _service_is_discoverable(home: str) -> bool:
             control=paths.control,
             legacy_pid=claude_dir / "jacked-service.pid",
         )
-        return discover_service(paths).source in {"manifest", "legacy"}
+        source = discover_service(paths).source
+        if source == "manifest":
+            from jacked.service.instance import manifest_is_proven_stale
+
+            # A crashed service leaves a valid manifest behind; only a live,
+            # identity-matched PID counts as the service being up.
+            return not manifest_is_proven_stale(paths.manifest)
+        return source == "legacy"
     except Exception:  # noqa: BLE001 - a broken probe must never claim a failure
         return True
 

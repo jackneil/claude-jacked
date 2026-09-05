@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -343,3 +344,164 @@ def test_active_identity_callers_do_not_reintroduce_file_precedence() -> None:
     )
     assert "_write_swap_credentials" not in usage_monitor
     assert "sync_credential_to_all_stores" not in usage_monitor
+
+
+def _activate_on_linux_home(home: Path):
+    """Run the real activation path, real identity publisher included."""
+    from jacked.credentials.repository import InMemoryCredentialSwitchRepository
+
+    with (
+        mock.patch(
+            "jacked.credentials.runtime.detect_claude_identity",
+            return_value=_identity(platform_system="linux", platform_machine="x86_64"),
+        ),
+        mock.patch("jacked.credentials.runtime.Path.home", return_value=home),
+        mock.patch(
+            "jacked.credentials.runtime.DatabaseCredentialSwitchRepository",
+            lambda _db: InMemoryCredentialSwitchRepository(),
+        ),
+    ):
+        return activate_account(object(), _account(), SwitchContext.MANUAL, "op-linux")
+
+
+def _assert_switch_reports_that_sessions_must_restart(result, home: Path) -> None:
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert result.existing_session_activation is SessionActivationState.RESTART_REQUIRED
+    assert "claude config identity not updated" in result.message
+    # The credentials themselves still landed; only the mirror that running
+    # sessions watch did not.
+    authority = (home / ".claude" / ".credentials.json").read_text(encoding="utf-8")
+    assert '"_jackedAccountId":7' in authority.replace(" ", "")
+
+
+def test_activation_reports_restart_required_when_the_config_is_a_symlink(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{}", encoding="utf-8")
+    try:
+        (home / ".claude.json").symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks require privileges on this platform")
+
+    result = _activate_on_linux_home(home)
+
+    _assert_switch_reports_that_sessions_must_restart(result, home)
+    # A symlinked config is never written through, not even to say so.
+    assert json.loads(target.read_text(encoding="utf-8")) == {}
+
+
+def test_activation_reports_restart_required_when_the_config_cannot_be_written(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    # A directory where the config file belongs: every write attempt fails.
+    (home / ".claude.json").mkdir()
+
+    result = _activate_on_linux_home(home)
+
+    _assert_switch_reports_that_sessions_must_restart(result, home)
+    assert (home / ".claude.json").is_dir()
+
+
+# ------------------------------------------------------------------
+# Cross-process switch lease
+# ------------------------------------------------------------------
+
+
+def test_two_leases_on_one_path_exclude_each_other(tmp_path: Path) -> None:
+    from jacked.credentials.lease import FileSwitchLease
+
+    first = FileSwitchLease(tmp_path / "locks" / "credential-switch.lock")
+    second = FileSwitchLease(tmp_path / "locks" / "credential-switch.lock")
+
+    with first.acquire() as held:
+        assert held is True
+        with second.acquire() as blocked:
+            assert blocked is False
+
+    with second.acquire() as free_now:
+        assert free_now is True
+
+
+def test_the_lease_file_and_its_directory_are_private(tmp_path: Path) -> None:
+    from jacked.credentials.lease import FileSwitchLease
+
+    path = tmp_path / "state" / "credential-switch.lock"
+    with FileSwitchLease(path).acquire() as held:
+        assert held is True
+
+    assert path.exists()
+    if posix_file_modes_enforced():
+        assert (path.stat().st_mode & 0o777) == 0o600
+        assert (path.parent.stat().st_mode & 0o777) == 0o700
+
+
+def test_an_unusable_lease_path_refuses_the_switch(tmp_path: Path) -> None:
+    """Fail closed: a lock that cannot be taken never grants the switch."""
+    from jacked.credentials.lease import FileSwitchLease
+
+    directory = tmp_path / "not-a-file"
+    directory.mkdir()
+
+    with FileSwitchLease(directory).acquire() as held:
+        assert held is False
+
+
+def test_a_lock_held_by_another_process_blocks_this_one(tmp_path: Path) -> None:
+    import subprocess
+    import sys
+
+    lock_path = tmp_path / "credential-switch.lock"
+    child_source = (
+        "import sys\n"
+        "from jacked.credentials.lease import FileSwitchLease\n"
+        "with FileSwitchLease(sys.argv[1]).acquire() as held:\n"
+        "    print('ACQUIRED' if held else 'REFUSED', flush=True)\n"
+        "    sys.stdin.readline()\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", child_source, str(lock_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        cwd=str(Path(__file__).resolve().parents[2]),
+    )
+    try:
+        assert child.stdout.readline().strip() == "ACQUIRED"
+        from jacked.credentials.lease import FileSwitchLease
+
+        with FileSwitchLease(lock_path).acquire() as held:
+            assert held is False
+        child.stdin.write("go\n")
+        child.stdin.flush()
+        assert child.wait(timeout=30) == 0
+        with FileSwitchLease(lock_path).acquire() as held:
+            assert held is True
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=30)
+
+
+def test_the_runtime_lease_covers_threads_and_processes(tmp_path: Path) -> None:
+    from jacked.credentials.lease import FileSwitchLease
+    from jacked.credentials.runtime import SWITCH_LEASE_RELATIVE_PATH, switch_lease_for
+
+    expected = tmp_path / ".claude" / Path(*SWITCH_LEASE_RELATIVE_PATH)
+    lease = switch_lease_for(tmp_path)
+
+    with lease.acquire() as held:
+        assert held is True
+        # The same file blocks another process...
+        with FileSwitchLease(expected).acquire() as other_process:
+            assert other_process is False
+        # ...and the in-process lock blocks another thread of this one, which
+        # a file lock shared by the process cannot see.
+        with switch_lease_for(tmp_path).acquire() as same_process:
+            assert same_process is False
+
+    assert expected.exists()

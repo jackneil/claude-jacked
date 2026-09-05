@@ -1309,6 +1309,7 @@ class ServiceRunner:
         try:
             from jacked.service.updater import RECOVERY_FILE
 
+            self._record_abandoned_update()
             if RECOVERY_FILE.exists():
                 icon.notify(
                     "Previous update failed. See "
@@ -1339,6 +1340,42 @@ class ServiceRunner:
         else:
             self._apply_icon("stopped")
             icon.notify("Jacked failed to start", "Jacked Service")
+
+    def _record_abandoned_update(self) -> None:
+        """Tell the user when an update was interrupted before it finished.
+
+        A machine that lost power (or the tray process) mid-update boots with
+        an `in_progress` status file nobody will ever close. The status reader
+        hides it so no zombie banner appears, which also hid it from the user.
+        Write the recovery file instead, and close the status as failed.
+        """
+        from jacked import __version__
+        from jacked.service import update_status as _us
+        from jacked.service.updater import RECOVERY_FILE
+
+        record = _us.abandoned_status(_us.UPDATE_STATUS_FILE)
+        if record is None:
+            return
+        phase = record.get("current_phase") or "an unknown phase"
+        error = (
+            f"An update was interrupted at phase {phase}. "
+            f"This tray is v{__version__}."
+        )
+        recovery = "jacked upgrade"
+        try:
+            RECOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            RECOVERY_FILE.write_text(
+                f"Jacked update interrupted: {error}\n\n"
+                "Recovery:\n"
+                f"  {recovery}\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.exception("Could not write the update recovery file")
+        try:
+            _us.mark_failed(_us.UPDATE_STATUS_FILE, error=error, recovery=recovery)
+        except Exception:
+            logger.exception("Could not mark the abandoned update failed")
 
     def _install_tray_file_logger(self) -> None:
         """Route `jacked` logger output to ~/.claude/jacked-tray.log.
@@ -1426,6 +1463,13 @@ class ServiceRunner:
     def run(self) -> None:
         """Start the service: tray icon on main thread, uvicorn in background."""
         self._install_tray_file_logger()
+        # An update that died after the old tray exited leaves an in_progress
+        # status nobody closes; turn it into a recovery file before anything
+        # else so the operator learns about it on this boot.
+        try:
+            self._record_abandoned_update()
+        except Exception:
+            logger.exception("Could not check for an interrupted update")
 
         from jacked.service.lifecycle import (
             claim_service_ownership,

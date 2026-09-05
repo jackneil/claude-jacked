@@ -37,22 +37,34 @@ def _no_real_service_processes(request, monkeypatch):
             return " ".join(str(part) for part in args)
         return str(args)
 
+    def _refuse(args) -> None:
+        """One predicate for every subprocess entry point.
+
+        A supervisor binary anywhere in argv[0], or a jacked service
+        lifecycle command (start/restart/preflight/recover/install) reached
+        through any launcher, is refused. subprocess.call/check_call/
+        check_output route through Popen, so guarding run and Popen covers
+        them too.
+        """
+        text = _text(args)
+        first = text.split(" ", 1)[0].rsplit("/", 1)[-1].lower()
+        if first in supervisors:
+            raise RuntimeError("test tried to drive a real supervisor: " + text)
+        padded = f" {text} "
+        after_service = " " + padded.split(" service ", 1)[1] if " service " in padded else ""
+        if "jacked" in text and any(
+            f" {verb} " in after_service
+            for verb in ("start", "restart", "preflight", "recover", "install")
+        ):
+            raise RuntimeError("test tried to spawn a real jacked service: " + text)
+
     class _GuardedPopen(real_popen):
         def __init__(self, args, *popen_args, **popen_kwargs):
-            text = _text(args)
-            if "jacked" in text and " service " in f" {text} " and (
-                " start" in text or " restart" in text
-            ):
-                raise RuntimeError(
-                    "test tried to spawn a real jacked service: " + text
-                )
+            _refuse(args)
             super().__init__(args, *popen_args, **popen_kwargs)
 
     def _guarded_run(args, *run_args, **run_kwargs):
-        text = _text(args)
-        first = text.split(" ", 1)[0].rsplit("/", 1)[-1]
-        if first in supervisors:
-            raise RuntimeError("test tried to drive a real supervisor: " + text)
+        _refuse(args)
         return real_run(args, *run_args, **run_kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", _GuardedPopen)

@@ -1,7 +1,26 @@
 """Tests for `jacked upgrade` one-shot upgrade command."""
 
 from unittest.mock import patch, MagicMock
+
+import pytest
 from click.testing import CliRunner
+
+
+@pytest.fixture(autouse=True)
+def _isolated_update_state(tmp_path_factory, monkeypatch):
+    """Keep every upgrade test off the developer's real ~/.claude.
+
+    `jacked upgrade` now claims the shared update-status file as its lock and
+    writes phases into it, so without this a test run would clobber the real
+    status file and could even refuse on a real in-flight update.
+    """
+    from jacked.service import update_status as us_mod
+    from jacked.service import updater as up_mod
+
+    state = tmp_path_factory.mktemp("update-state")
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", state / "status.json")
+    monkeypatch.setattr(up_mod, "RECOVERY_FILE", state / "jacked-update-failed.txt")
+    monkeypatch.setattr(up_mod, "UPDATE_LOG", state / "jacked-update.log")
 
 
 def _ok(stdout: str = "") -> MagicMock:
@@ -284,34 +303,42 @@ class TestUpgradeCommand:
     @patch("jacked.service.process.read_pid", return_value=None)
     @patch("subprocess.Popen")
     @patch("subprocess.run")
-    def test_upgrade_continues_if_jacked_install_fails(
+    def test_a_failed_settings_migration_rolls_the_upgrade_back(
         self, mock_run, mock_popen, mock_read_pid, mock_alive, mock_find, mock_method,
     ):
-        """jacked install failure is non-fatal — package is still upgraded."""
+        """A migration failure is a transaction failure, not a warning.
+
+        It used to print a warning, restart the NEW service and report
+        "Upgrade complete" while settings.json sat half-migrated.
+        """
         from jacked.cli import main
         mock_find.side_effect = lambda name: {
             "uv": "/fake/uv",
             "jacked": "/fake/jacked",
         }.get(name)
-        # uv install succeeds, preflight passes, jacked install fails.
+        # uv install, preflight ok, jacked install fails, then the rollback.
         mock_run.side_effect = [
             _ok(),
             _ok("[OK] Service contract OK"),
             _fail(1),
-            _ok(),
+            _ok(),   # rollback: uv install ==<previous>
+            _ok(),   # jacked install --force
+            _ok(),   # jacked service restart
         ]
 
         runner = CliRunner()
         result = runner.invoke(main, ["upgrade"])
 
-        assert result.exit_code == 0
-        # Migration remains non-fatal; the new CLI still owns the v2 restart.
-        # A failed migration is NOT a rollback trigger: the new build already
-        # proved it can provision its service contract.
-        assert mock_run.call_count == 4
-        assert mock_run.call_args_list[3][0][0] == [
-            "/fake/jacked", "service", "restart"
-        ]
+        assert result.exit_code == 1, result.output
+        argvs = [call[0][0] for call in mock_run.call_args_list]
+        # The NEW service is never restarted: the transaction failed first.
+        assert argvs[3][0] == "/fake/uv"
+        assert argvs[3][3].startswith("claude-jacked[tray]==")
+        assert argvs[4] == ["/fake/jacked", "install", "--force"]
+        assert argvs[5] == ["/fake/jacked", "service", "restart"]
+        assert "settings migration failed" in result.output.lower()
+        assert "settings.json.bak-" in result.output
+        assert "upgrade complete" not in result.output.lower()
         mock_popen.assert_not_called()
 
 
@@ -477,6 +504,125 @@ class TestUpgradeIsATransaction:
         body = recovery.read_text(encoding="utf-8")
         assert "rollback" in body.lower()
         assert "claude-jacked[tray]==0.95.0" in body
+
+
+class TestPartialRollback:
+    """A rollback that did not finish is never reported as a restoration."""
+
+    RB_ARGV = [
+        "/fake/uv", "tool", "install", "claude-jacked[tray]==0.95.0",
+        "--force", "--refresh",
+    ]
+
+    def _invoke(self, run_results, tmp_path, args=()):
+        return TestUpgradeIsATransaction._invoke(
+            TestUpgradeIsATransaction(), run_results, args=args, tmp_path=tmp_path
+        )
+
+    def test_a_failed_install_step_is_not_called_a_rollback(self, tmp_path):
+        recovery = tmp_path / "jacked-update-failed.txt"
+        result, run, _popen = self._invoke(
+            [
+                _ok(),                                   # uv install
+                _fail(1, stderr="[FAIL] ValueError: nope"),
+                _ok(),                                   # rollback package: ok
+                _fail(4),                                # jacked install --force
+            ],
+            tmp_path,
+        )
+
+        assert result.exit_code == 1, result.output
+        argvs = [call[0][0] for call in run.call_args_list]
+        # It stops at the failed step - it never restarts a half-restored build.
+        assert ["/fake/jacked", "service", "restart"] not in argvs
+        body = recovery.read_text(encoding="utf-8")
+        assert "settings migration" in body
+        assert "jacked install --force" in body
+        assert "rolled back to v0.95.0" not in body
+        assert "restored v0.95.0" not in result.output.lower()
+
+    def test_a_failed_restart_step_is_not_called_a_rollback(self, tmp_path):
+        recovery = tmp_path / "jacked-update-failed.txt"
+        result, _run, _popen = self._invoke(
+            [
+                _ok(),                                   # uv install
+                _fail(1, stderr="[FAIL] ValueError: nope"),
+                _ok(),                                   # rollback package
+                _ok(),                                   # jacked install --force
+                _fail(7),                                # jacked service restart
+            ],
+            tmp_path,
+        )
+
+        assert result.exit_code == 1, result.output
+        body = recovery.read_text(encoding="utf-8")
+        assert "service restart" in body
+        assert "rolled back to v0.95.0" not in body
+        assert "rollback incomplete" in result.output.lower()
+
+    def test_a_complete_rollback_is_still_reported_as_restored(self, tmp_path):
+        recovery = tmp_path / "jacked-update-failed.txt"
+        result, _run, _popen = self._invoke(
+            [
+                _ok(),
+                _fail(1, stderr="[FAIL] ValueError: nope"),
+                _ok(), _ok(), _ok(),
+            ],
+            tmp_path,
+        )
+
+        assert result.exit_code == 1
+        assert "rolled back to v0.95.0" in recovery.read_text(encoding="utf-8")
+        assert "restored v0.95.0" in result.output.lower()
+
+
+class TestUpgradeLockAndRecoveryFile:
+    def test_a_second_upgrade_refuses_while_one_is_in_flight(self, tmp_path):
+        """The update-status file is the lock the tray updater already uses."""
+        from jacked.cli import main
+        from jacked.service import update_status as us_mod
+
+        status = tmp_path / "status.json"
+        us_mod.init_status(status, "0.95.0", "0.100.0", "uv")
+        us_mod.begin_phase(status, "installing_package")
+
+        with (
+            patch("sys.platform", "darwin"),
+            patch("jacked.install_method.detect_install_method", return_value="uv"),
+            patch("jacked.findbin.find_bin", side_effect=lambda n: {
+                "uv": "/fake/uv", "jacked": "/fake/jacked"}.get(n)),
+            patch("jacked.service.update_status.UPDATE_STATUS_FILE", status),
+            patch("subprocess.run") as run,
+            patch("subprocess.Popen") as popen,
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
+
+        assert result.exit_code == 1, result.output
+        assert "already running" in result.output.lower()
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_a_successful_upgrade_clears_a_stale_recovery_file(self, tmp_path):
+        from jacked.cli import main
+
+        recovery = tmp_path / "jacked-update-failed.txt"
+        recovery.write_text("an older upgrade failed\n", encoding="utf-8")
+
+        with (
+            patch("sys.platform", "darwin"),
+            patch("jacked.install_method.detect_install_method", return_value="uv"),
+            patch("jacked.findbin.find_bin", side_effect=lambda n: {
+                "uv": "/fake/uv", "jacked": "/fake/jacked"}.get(n)),
+            patch("jacked.service.updater.RECOVERY_FILE", recovery),
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("subprocess.run", return_value=_ok("[OK] Service contract OK")),
+            patch("subprocess.Popen"),
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        assert "upgrade complete" in result.output.lower()
+        assert not recovery.exists()
 
 
 class TestUpgradeWindows:

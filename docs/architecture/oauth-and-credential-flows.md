@@ -176,6 +176,36 @@ It is not consulted by the canonical active-credential resolver.
 a per-account `.credentials.json` and selected shared resources. The directory
 is launch input, not a certified authority for the currently shipped build.
 
+### 5.5 Claude config identity mirror
+
+Claude Code holds its OAuth token in memory. It reads the credential store
+again only when the `oauthAccount` identity in `~/.claude.json` changes. A
+credential write that does not change that identity is invisible to a running
+session. The session keeps the previous account until it stops.
+
+Every switch therefore republishes the identity. The transaction engine
+publishes it after a committed switch and after an observed unfenced switch.
+Crash recovery publishes it when it finds the target credentials in the
+authority. The engine replaces all identity fields together. It removes a
+`displayName` that the new account does not supply, because the previous
+account's name must not stay beside the new email address.
+
+A failed publication does not undo the switch. The credentials are already in
+the store. The result degrades instead:
+
+| Fact | Value after a failed publication |
+| --- | --- |
+| Outcome | `committed_degraded`, or `observed_target_unfenced` |
+| Existing-session activation | `restart_required` |
+| Message | contains "claude config identity not updated" |
+
+The switch lease is cross-process. `jacked launch` activates an account from
+one process while the dashboard service can activate one from another process.
+A lock file at `~/.claude/jacked-service-v2/credential-switch.lock` separates
+the processes. A thread lock separates the threads inside one process. A switch
+holds both leases. Neither lease waits: a switch that cannot get a lease
+reports `interactive_operation_in_progress` and changes nothing.
+
 ## 6. Canonical resolution
 
 `CanonicalCredentialResolver.resolve()` reads the declared authority and every

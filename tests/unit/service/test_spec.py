@@ -261,65 +261,146 @@ def test_homebrew_admin_group_writable_prefix_is_trusted(tmp_path):
     assert _spec(runtime_path=str(link)).runtime_target_path == str(target)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
-def test_trusted_group_ids_cover_root_equivalent_and_private_groups(monkeypatch):
+class _Group:
+    def __init__(self, name, gid, members=()):
+        self.gr_name, self.gr_gid, self.gr_mem = name, gid, list(members)
+
+
+class _User:
+    def __init__(self, name, uid, gid):
+        self.pw_name, self.pw_uid, self.pw_gid = name, uid, gid
+
+
+def _fake_nss(monkeypatch, *, groups, users, uid, platform, os_release=""):
+    """Install a fake user database and platform; the real one is never read."""
     import grp
     import pwd
 
     from jacked.service import spec as spec_module
 
-    class _Group:
-        def __init__(self, name, gid, members=()):
-            self.gr_name, self.gr_gid, self.gr_mem = name, gid, list(members)
+    by_name = {g.gr_name: g for g in groups}
+    by_gid = {g.gr_gid: g for g in groups}
 
-    class _User:
-        def __init__(self, name, uid, gid):
-            self.pw_name, self.pw_uid, self.pw_gid = name, uid, gid
+    def _getgrnam(name):
+        if name not in by_name:
+            raise KeyError(name)
+        return by_name[name]
 
-    groups = {"admin": _Group("admin", 80, ["alice"]), "jack": _Group("jack", 1001)}
-    by_gid = {80: groups["admin"], 1001: groups["jack"], 20: _Group("staff", 20)}
-    users = [_User("jack", 1001, 1001), _User("alice", 1002, 20)]
+    def _getgrgid(gid):
+        if gid not in by_gid:
+            raise KeyError(gid)
+        return by_gid[gid]
 
-    monkeypatch.setattr(os, "getuid", lambda: 1001)
-    monkeypatch.setattr(grp, "getgrnam", lambda name: groups[name])
-    monkeypatch.setattr(grp, "getgrgid", lambda gid: by_gid[gid])
-    monkeypatch.setattr(pwd, "getpwuid", lambda uid: next(u for u in users if u.pw_uid == uid))
-    monkeypatch.setattr(pwd, "getpwnam", lambda name: next(u for u in users if u.pw_name == name))
-    monkeypatch.setattr(pwd, "getpwall", lambda: list(users))
-    spec_module._trusted_group_ids.cache_clear()
-    spec_module._trusted_owner_ids.cache_clear()
-    try:
-        assert spec_module._trusted_group_ids() == frozenset({0, 80, 1001})
-        # alice is an admin member: a path she owns cannot escalate anyone.
-        assert spec_module._trusted_owner_ids() == frozenset({0, 1001, 1002})
-        # staff (20) is shared, so a staff-writable path stays untrusted.
-        assert 20 not in spec_module._trusted_group_ids()
-    finally:
-        spec_module._trusted_group_ids.cache_clear()
-        spec_module._trusted_owner_ids.cache_clear()
+    def _getpwnam(name):
+        for user in users:
+            if user.pw_name == name:
+                return user
+        raise KeyError(name)
+
+    def _getpwuid(value):
+        for user in users:
+            if user.pw_uid == value:
+                return user
+        raise KeyError(value)
+
+    def _never_enumerate():
+        raise AssertionError("the boot gate must not enumerate the user database")
+
+    monkeypatch.setattr(os, "getuid", lambda: uid)
+    monkeypatch.setattr(grp, "getgrnam", _getgrnam)
+    monkeypatch.setattr(grp, "getgrgid", _getgrgid)
+    monkeypatch.setattr(pwd, "getpwnam", _getpwnam)
+    monkeypatch.setattr(pwd, "getpwuid", _getpwuid)
+    monkeypatch.setattr(pwd, "getpwall", _never_enumerate)
+    monkeypatch.setattr(spec_module, "_HOST_IS_DARWIN", platform == "darwin")
+    monkeypatch.setattr(spec_module.sys, "platform", platform)
+    monkeypatch.setattr(
+        spec_module, "_linux_family_ids", lambda: frozenset(os_release.split())
+    )
+    return spec_module
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
-def test_private_group_is_not_trusted_when_shared(monkeypatch):
-    import grp
-    import pwd
-
-    from jacked.service import spec as spec_module
-
-    class _Group:
-        def __init__(self, name, gid, members=()):
-            self.gr_name, self.gr_gid, self.gr_mem = name, gid, list(members)
-
-    class _User:
-        def __init__(self, name, uid, gid):
-            self.pw_name, self.pw_uid, self.pw_gid = name, uid, gid
-
-    users = [_User("jack", 1001, 1001), _User("bob", 1002, 1001)]
-    monkeypatch.setattr(os, "getuid", lambda: 1001)
-    monkeypatch.setattr(grp, "getgrgid", lambda gid: _Group("jack", 1001))
-    monkeypatch.setattr(pwd, "getpwuid", lambda uid: users[0])
-    monkeypatch.setattr(pwd, "getpwall", lambda: list(users))
+def test_darwin_trusts_admin_and_wheel_members_without_enumerating(monkeypatch):
+    spec_module = _fake_nss(
+        monkeypatch,
+        groups=[_Group("admin", 80, ["root", "jack", "alice"]), _Group("wheel", 0), _Group("staff", 20)],
+        users=[_User("root", 0, 0), _User("jack", 501, 20), _User("alice", 502, 20)],
+        uid=501,
+        platform="darwin",
+    )
+    assert spec_module._trusted_group_ids() == frozenset({0, 80})
+    # alice is an admin member: a path she owns cannot escalate anyone.
+    assert spec_module._trusted_owner_ids() == frozenset({0, 501, 502})
+    # staff is shared, so a staff-writable path stays untrusted.
+    assert 20 not in spec_module._trusted_group_ids()
     assert spec_module._user_private_group_id() is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
+@pytest.mark.parametrize(
+    ("os_release", "wheel_trusted"),
+    [("debian", False), ("ubuntu debian", False), ("arch", False), ("alpine", False),
+     ("rhel fedora", True), ("fedora", True), ("amzn rhel fedora", True), ("opensuse-leap suse opensuse", True)],
+)
+def test_linux_wheel_is_trusted_only_where_the_family_grants_sudo(
+    monkeypatch, os_release, wheel_trusted
+):
+    spec_module = _fake_nss(
+        monkeypatch,
+        groups=[_Group("sudo", 27, ["jack"]), _Group("wheel", 10, ["bob"]), _Group("admin", 900, ["mallory"]), _Group("jack", 1001)],
+        users=[_User("root", 0, 0), _User("jack", 1001, 1001), _User("bob", 1002, 100), _User("mallory", 1003, 100)],
+        uid=1001,
+        platform="linux",
+        os_release=os_release,
+    )
+    gids = spec_module._trusted_group_ids()
+    owners = spec_module._trusted_owner_ids()
+    assert 27 in gids and 1001 in gids  # sudo + the user-private group
+    assert (10 in gids) is wheel_trusted
+    assert (1002 in owners) is wheel_trusted
+    # A Linux "admin" group is an ordinary group and never trusted by name.
+    assert 900 not in gids and 1003 not in owners
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
+def test_user_private_group_requires_same_name_no_members_and_a_user_range_gid(monkeypatch):
+    base = dict(users=[_User("jack", 1001, 1001)], uid=1001, platform="linux")
+    assert _fake_nss(monkeypatch, groups=[_Group("jack", 1001)], **base)._user_private_group_id() == 1001
+    assert _fake_nss(monkeypatch, groups=[_Group("jack", 1001, ["bob"])], **base)._user_private_group_id() is None
+    assert _fake_nss(monkeypatch, groups=[_Group("users", 1001)], **base)._user_private_group_id() is None
+    low = dict(users=[_User("jack", 501, 501)], uid=501, platform="linux")
+    assert _fake_nss(monkeypatch, groups=[_Group("jack", 501)], **low)._user_private_group_id() is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
+def test_trust_sets_are_not_cached_across_calls(monkeypatch):
+    spec_module = _fake_nss(
+        monkeypatch,
+        groups=[_Group("admin", 80, ["jack", "alice"]), _Group("wheel", 0)],
+        users=[_User("jack", 501, 20), _User("alice", 502, 20)],
+        uid=501,
+        platform="darwin",
+    )
+    assert 502 in spec_module._trusted_owner_ids()
+    _fake_nss(
+        monkeypatch,
+        groups=[_Group("admin", 80, ["jack"]), _Group("wheel", 0)],
+        users=[_User("jack", 501, 20), _User("alice", 502, 20)],
+        uid=501,
+        platform="darwin",
+    )
+    # A demoted administrator loses trust on the next validation, not on restart.
+    assert 502 not in spec_module._trusted_owner_ids()
+
+
+def test_linux_family_ids_parses_id_and_id_like(tmp_path, monkeypatch):
+    from jacked.service import spec as spec_module
+
+    release = tmp_path / "os-release"
+    release.write_text('NAME="Rocky Linux"\nID="rocky"\nID_LIKE="rhel centos fedora"\n', encoding="utf-8")
+    monkeypatch.setattr(spec_module, "Path", lambda _p: release)
+    assert spec_module._linux_family_ids() == frozenset({"rocky", "rhel", "centos", "fedora"})
 
 
 def test_artifact_marker_requires_exact_owner_and_generation():

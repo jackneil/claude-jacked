@@ -15,6 +15,7 @@ import pytest
 
 from jacked import statusline
 from jacked.api.credential_helpers import (
+    ClaudeConfigUnwritable,
     _ClaudeConfigAccount,
     _update_claude_config_account,
     build_oauth_data,
@@ -665,10 +666,10 @@ def test_update_claude_config_email_creates_file():
         assert result["oauthAccount"]["displayName"] == "New User"
 
 
-def test_update_claude_config_email_preserves_keys():
-    """Preserves other keys in existing .claude.json.
+def test_update_claude_config_email_preserves_unrelated_keys():
+    """Preserves other keys, but never a name that belongs to another account.
 
-    >>> test_update_claude_config_email_preserves_keys()
+    >>> test_update_claude_config_email_preserves_unrelated_keys()
     """
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
         tmp_path = Path(tmp)
@@ -688,8 +689,77 @@ def test_update_claude_config_email_preserves_keys():
 
         result = json.loads(config_path.read_text(encoding="utf-8"))
         assert result["oauthAccount"]["emailAddress"] == "new@test.com"
-        assert result["oauthAccount"]["displayName"] == "Old"  # preserved
+        # The previous account's name must not survive the identity change:
+        # Claude Code would label the new email with the old person's name.
+        assert "displayName" not in result["oauthAccount"]
         assert result["someOtherKey"] == "preserved"
+
+
+def test_two_sequential_switches_replace_the_display_name():
+    """The second account's name replaces the first one's, never merges.
+
+    >>> test_two_sequential_switches_replace_the_display_name()
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        config_path = tmp_path / ".claude.json"
+
+        with mock.patch(
+            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
+        ):
+            update_claude_config_email("first@test.com", "First Person")
+            first = json.loads(config_path.read_text(encoding="utf-8"))
+            update_claude_config_email("second@test.com", "Second Person")
+
+        assert first["oauthAccount"]["displayName"] == "First Person"
+        result = json.loads(config_path.read_text(encoding="utf-8"))
+        assert result["oauthAccount"]["emailAddress"] == "second@test.com"
+        assert result["oauthAccount"]["displayName"] == "Second Person"
+
+
+def test_strict_update_raises_when_the_config_is_a_symlink():
+    """Strict callers must learn that the identity did not land.
+
+    >>> test_strict_update_raises_when_the_config_is_a_symlink()
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        target = tmp_path / "target.json"
+        target.write_text("{}", encoding="utf-8")
+        try:
+            (tmp_path / ".claude.json").symlink_to(target)
+        except OSError:
+            return  # Symlinks may require privileges on Windows
+
+        with pytest.raises(ClaudeConfigUnwritable):
+            update_claude_config_email("evil@test.com", home=tmp_path, strict=True)
+
+        assert json.loads(target.read_text(encoding="utf-8")) == {}
+
+
+def test_strict_update_raises_when_the_config_cannot_be_written():
+    """A directory where the config belongs makes every write fail.
+
+    >>> test_strict_update_raises_when_the_config_cannot_be_written()
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        (tmp_path / ".claude.json").mkdir()
+
+        with pytest.raises(ClaudeConfigUnwritable):
+            update_claude_config_email("blocked@test.com", home=tmp_path, strict=True)
+
+
+def test_a_non_strict_update_still_logs_and_continues():
+    """Existing callers keep the log-and-continue behaviour.
+
+    >>> test_a_non_strict_update_still_logs_and_continues()
+    """
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        (tmp_path / ".claude.json").mkdir()
+
+        update_claude_config_email("blocked@test.com", home=tmp_path)  # no raise
 
 
 def test_update_claude_config_account_replaces_tier_field_for_organization():

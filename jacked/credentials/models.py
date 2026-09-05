@@ -208,6 +208,12 @@ class PendingSwitchRecord:
     canonicalizer_version: int
     before_hmac: str
     target_hmac: str
+    # Non-secret identity, carried so crash recovery can republish it to
+    # Claude's config. They are optional: a row written by an older jacked
+    # has none, and recovery then finalizes without republishing the identity.
+    email: str | None = None
+    display_name: str | None = None
+    organization_name: str | None = None
 
 
 @dataclass(frozen=True)

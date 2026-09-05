@@ -1649,3 +1649,84 @@ class TestReleaseOwnership:
 
         ownership.close.assert_called_once()
         assert runner._ownership is None
+
+
+class TestAbandonedUpdateRecovery:
+    """An update interrupted after the old tray exited must be surfaced at boot.
+
+    `update_status.read_status` hides a stale in_progress file so the dashboard
+    shows no zombie banner; before this the tray never told the user either.
+    """
+
+    def _write_status(self, path, phase, age_seconds):
+        import json
+        import os
+        import time
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"overall": "in_progress", "current_phase": phase}),
+            encoding="utf-8",
+        )
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+
+    def test_stale_in_progress_status_writes_recovery_file_and_fails_status(self):
+        from jacked.service import update_status as us
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        self._write_status(
+            us.UPDATE_STATUS_FILE, "migrating_settings", us.STALE_IN_PROGRESS_SECONDS + 60
+        )
+        ServiceRunner(host="127.0.0.1", port=8321)._record_abandoned_update()
+
+        text = updater.RECOVERY_FILE.read_text(encoding="utf-8")
+        assert "interrupted at phase migrating_settings" in text
+        assert "jacked upgrade" in text
+        import json
+
+        record = json.loads(us.UPDATE_STATUS_FILE.read_text(encoding="utf-8"))
+        assert record["overall"] == "failed"
+        assert "migrating_settings" in (record.get("error") or "")
+
+    def test_fresh_in_progress_status_is_left_alone(self):
+        from jacked.service import update_status as us
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        self._write_status(us.UPDATE_STATUS_FILE, "preflight", 5)
+        ServiceRunner(host="127.0.0.1", port=8321)._record_abandoned_update()
+
+        assert not updater.RECOVERY_FILE.exists()
+        import json
+
+        assert json.loads(us.UPDATE_STATUS_FILE.read_text())["overall"] == "in_progress"
+
+    def test_missing_status_is_a_no_op(self):
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        ServiceRunner(host="127.0.0.1", port=8321)._record_abandoned_update()
+        assert not updater.RECOVERY_FILE.exists()
+
+    def test_run_checks_for_an_abandoned_update_before_provisioning(self):
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        order = []
+        with (
+            patch.object(runner, "_install_tray_file_logger"),
+            patch.object(
+                runner, "_record_abandoned_update", side_effect=lambda: order.append("abandoned")
+            ),
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                side_effect=lambda *a, **k: (order.append("provision"), (_ for _ in ()).throw(ValueError("stop here")))[1],
+            ),
+            patch.object(runner, "_abort_refused_contract", side_effect=SystemExit(0)),
+        ):
+            with pytest.raises(SystemExit):
+                runner.run()
+        assert order[:2] == ["abandoned", "provision"]
+

@@ -196,6 +196,20 @@ def _validated_version(version: str) -> str:
     return version
 
 
+def safe_version_label(version: str, fallback: str = "previous") -> str:
+    """Return `version` when it is safe to interpolate, else `fallback`.
+
+    The Windows helpers write a version string into cmd.exe batch lines and
+    into recovery text. Validate the string ONCE, at the top of the generator,
+    and use the result everywhere: a version that fails the check must never
+    reach a shell line at all, not even in an echo.
+    """
+    try:
+        return _validated_version(version)
+    except ValueError:
+        return fallback
+
+
 def rollback_command(extras: str = "tray", version: str = "") -> list[str]:
     """Return the argv list that reinstalls an EXACT previous version.
 

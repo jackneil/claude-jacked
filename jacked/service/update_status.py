@@ -95,6 +95,38 @@ def read_status(path: Path) -> Optional[dict]:
     return data
 
 
+def abandoned_status(path: Path) -> Optional[dict]:
+    """Return the raw record of an update that was interrupted, else None.
+
+    `read_status` hides an `in_progress` file older than
+    STALE_IN_PROGRESS_SECONDS so the dashboard shows no zombie banner. Hiding
+    it is not the same as telling the user: the machine may be running a build
+    whose settings never migrated. The tray reads this at boot and turns it
+    into a recovery file.
+
+    >>> import json, os, tempfile, time
+    >>> from pathlib import Path
+    >>> with tempfile.TemporaryDirectory() as d:
+    ...     p = Path(d) / "status.json"
+    ...     _ = p.write_text(json.dumps({"overall": "in_progress",
+    ...                                  "current_phase": "migrating_settings"}))
+    ...     old = time.time() - STALE_IN_PROGRESS_SECONDS - 60
+    ...     os.utime(p, (old, old))
+    ...     abandoned_status(p)["current_phase"]
+    'migrating_settings'
+    """
+    data = _read_raw(path)
+    if data is None or data.get("overall") != "in_progress":
+        return None
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return None
+    if age <= STALE_IN_PROGRESS_SECONDS:
+        return None
+    return data
+
+
 def read_status_with_mtime(path: Path) -> tuple[Optional[dict], Optional[str]]:
     """Returns (data, mtime_iso). Used by /api/update/status."""
     data = read_status(path)

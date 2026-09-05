@@ -74,8 +74,35 @@ def record_start_failure(
         {"at": failure.at, "reason": failure.reason} for failure in failures
     ]
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    _write_atomic(path, json.dumps(payload))
     return len(failures)
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Replace ``path`` in one step so a crash never leaves a partial file.
+
+    A partial file would read as an empty history and re-arm the supervisor's
+    retry loop. The temporary file is created 0600 and renamed over the target.
+    """
+    import os
+    import tempfile
+
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def clear_start_failures(path: Path) -> None:

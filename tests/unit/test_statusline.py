@@ -2766,3 +2766,25 @@ def test_statusline_doctests_run():
     results = doctest.testmod(statusline)
     assert results.attempted > 0
     assert results.failed == 0
+
+
+
+def test_service_probe_treats_a_dead_manifest_pid_as_down(tmp_path, monkeypatch):
+    """A crashed service leaves a valid manifest; only a live PID is 'up'."""
+    from types import SimpleNamespace
+
+    from jacked import statusline_account
+
+    monkeypatch.setattr(
+        "jacked.service.lifecycle.discover_service",
+        lambda paths: SimpleNamespace(source="manifest", reason=""),
+    )
+    monkeypatch.setattr(
+        "jacked.service.instance.manifest_is_proven_stale", lambda path: True
+    )
+    assert statusline_account._service_is_discoverable(str(tmp_path)) is False
+    monkeypatch.setattr(
+        "jacked.service.instance.manifest_is_proven_stale", lambda path: False
+    )
+    assert statusline_account._service_is_discoverable(str(tmp_path)) is True
+

@@ -6,6 +6,7 @@ from jacked.credentials.models import (
     CredentialCapability,
     ExecutableIdentity,
     PendingSwitchRecord,
+    SessionActivationState,
     StoreDeclaration,
     StoreRole,
     SwitchContext,
@@ -122,3 +123,123 @@ def test_missing_recovery_key_is_indeterminate() -> None:
     ).recover("op-1")
 
     assert result.outcome is SwitchOutcome.INDETERMINATE
+
+
+class _Publisher:
+    """Stand-in for the Claude config identity publisher."""
+
+    def __init__(self, fail: Exception | None = None) -> None:
+        self.requests: list[object] = []
+        self.fail = fail
+
+    def __call__(self, request) -> None:
+        self.requests.append(request)
+        if self.fail is not None:
+            raise self.fail
+
+
+def _identity_pending(
+    before: CredentialPayload, target: CredentialPayload
+) -> PendingSwitchRecord:
+    return build_pending_record(
+        operation_id="op-1",
+        account_id=2,
+        organization_id="org-2",
+        context=SwitchContext.MANUAL,
+        before=before,
+        target=target,
+        capability=_capability(),
+        machine_install_id="machine-1",
+        install_key=b"k" * 32,
+        email="two@example.com",
+        display_name="Two Example",
+        organization_name="Example Org",
+    )
+
+
+def test_recovered_commit_republishes_the_identity_claude_watches() -> None:
+    before = _payload(1, "before")
+    target = _payload(2, "target")
+    repository = InMemoryCredentialSwitchRepository()
+    repository.create_pending(_identity_pending(before, target))
+    publisher = _Publisher()
+
+    result = CredentialRecovery(
+        repository,
+        MemoryCredentialStore("auth", target),
+        StaticInstallKeyProvider(b"k" * 32),
+        "machine-1",
+        identity_publisher=publisher,
+    ).recover("op-1")
+
+    assert result.outcome is SwitchOutcome.COMMITTED
+    assert [r.email for r in publisher.requests] == ["two@example.com"]
+    assert publisher.requests[0].display_name == "Two Example"
+    assert publisher.requests[0].organization_name == "Example Org"
+    assert publisher.requests[0].organization_id == "org-2"
+    assert (
+        result.existing_session_activation
+        is SessionActivationState.PENDING_NEXT_ACTIVITY
+    )
+
+
+def test_recovered_commit_degrades_when_the_identity_cannot_be_published() -> None:
+    before = _payload(1, "before")
+    target = _payload(2, "target")
+    repository = InMemoryCredentialSwitchRepository()
+    repository.create_pending(_identity_pending(before, target))
+
+    result = CredentialRecovery(
+        repository,
+        MemoryCredentialStore("auth", target),
+        StaticInstallKeyProvider(b"k" * 32),
+        "machine-1",
+        identity_publisher=_Publisher(fail=OSError("read-only config")),
+    ).recover("op-1")
+
+    assert result.outcome is SwitchOutcome.COMMITTED_DEGRADED
+    assert "claude config identity not updated" in result.message
+    assert result.existing_session_activation is SessionActivationState.RESTART_REQUIRED
+    assert repository.finalized[0].outcome is SwitchOutcome.COMMITTED_DEGRADED
+
+
+def test_a_row_without_identity_fields_degrades_instead_of_guessing() -> None:
+    """An older jacked wrote the pending row before the identity was carried."""
+    before = _payload(1, "before")
+    target = _payload(2, "target")
+    repository = InMemoryCredentialSwitchRepository()
+    repository.create_pending(_pending(before, target))
+    publisher = _Publisher()
+
+    result = CredentialRecovery(
+        repository,
+        MemoryCredentialStore("auth", target),
+        StaticInstallKeyProvider(b"k" * 32),
+        "machine-1",
+        identity_publisher=publisher,
+    ).recover("op-1")
+
+    assert result.outcome is SwitchOutcome.COMMITTED_DEGRADED
+    assert publisher.requests == []
+    assert "identity not recorded" in result.message
+    assert result.existing_session_activation is SessionActivationState.RESTART_REQUIRED
+
+
+def test_a_preserved_recovery_never_publishes_an_identity() -> None:
+    before = _payload(1, "before")
+    target = _payload(2, "target")
+    repository = InMemoryCredentialSwitchRepository()
+    repository.create_pending(_identity_pending(before, target))
+    publisher = _Publisher()
+
+    result = CredentialRecovery(
+        repository,
+        MemoryCredentialStore("auth", before),
+        StaticInstallKeyProvider(b"k" * 32),
+        "machine-1",
+        identity_publisher=publisher,
+    ).recover("op-1")
+
+    assert result.outcome is SwitchOutcome.FAILED_PRESERVED
+    assert publisher.requests == []
+    assert result.existing_session_activation is SessionActivationState.UNCHANGED

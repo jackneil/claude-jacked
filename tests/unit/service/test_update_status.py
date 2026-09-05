@@ -428,3 +428,61 @@ def test_cli_update_status_exits_1_on_unknown_phase(tmp_path, monkeypatch):
     monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
     result = CliRunner().invoke(main, ["_update_status", "nonexistent_phase", "ok"])
     assert result.exit_code == 1
+
+
+class TestAbandonedStatus:
+    """A crash mid-update must be reported, not just hidden."""
+
+    @staticmethod
+    def _write(path, overall, phase, age_seconds):
+        import json
+        import os
+        import time
+
+        path.write_text(
+            json.dumps(
+                {
+                    "overall": overall,
+                    "current_phase": phase,
+                    "from_version": "0.95.0",
+                    "to_version": "0.100.0",
+                    "phases": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+
+    def test_a_stale_in_progress_file_is_reported_as_abandoned(self, tmp_path):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, "in_progress", "migrating_settings",
+                    us.STALE_IN_PROGRESS_SECONDS + 60)
+
+        # read_status hides it so the dashboard shows no zombie banner...
+        assert us.read_status(path) is None
+        # ...but the raw record is still available to warn the user.
+        record = us.abandoned_status(path)
+        assert record is not None
+        assert record["current_phase"] == "migrating_settings"
+
+    def test_a_fresh_in_progress_file_is_not_abandoned(self, tmp_path):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, "in_progress", "installing_package", 5)
+        assert us.abandoned_status(path) is None
+
+    def test_a_finished_update_is_never_abandoned(self, tmp_path):
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        self._write(path, "failed", None, us.STALE_IN_PROGRESS_SECONDS + 60)
+        assert us.abandoned_status(path) is None
+
+    def test_a_missing_file_is_never_abandoned(self, tmp_path):
+        from jacked.service import update_status as us
+
+        assert us.abandoned_status(tmp_path / "nope.json") is None

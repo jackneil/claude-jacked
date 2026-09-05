@@ -12,6 +12,7 @@ import logging
 import subprocess
 import sys
 import time
+from typing import NamedTuple
 
 from jacked.findbin import find_bin
 from jacked.service import CLAUDE_DIR
@@ -20,6 +21,33 @@ from jacked.winproc import NO_WINDOW
 
 UPDATE_LOG = CLAUDE_DIR / "jacked-update.log"
 RECOVERY_FILE = CLAUDE_DIR / "jacked-update-failed.txt"
+
+# Rollback step names. A partial restoration must say WHICH step failed, so the
+# names reach the update status, the recovery file and the Windows batch.
+ROLLBACK_STEP_PACKAGE = "package rollback"
+ROLLBACK_STEP_INSTALL = "settings migration"
+ROLLBACK_STEP_RESTART = "service restart"
+
+# How long the preflight gate may run before it counts as a refusal. A build
+# that cannot answer in two minutes cannot be trusted with the old service.
+PREFLIGHT_TIMEOUT_SECONDS = 120
+
+
+class RollbackResult(NamedTuple):
+    """Outcome of one rollback attempt.
+
+    `package_ok` - the previous version is back on disk.
+    `install_ok` - the restored build migrated its settings.
+    `step`       - the first step that failed, or None when both succeeded.
+    """
+
+    package_ok: bool
+    install_ok: bool
+    step: "str | None"
+
+    @property
+    def ok(self) -> bool:
+        return self.package_ok and self.install_ok
 
 # One-second sleep for a detached batch. NOT `timeout /t 1 /nobreak`: timeout
 # reads the keyboard, so the moment stdin is anything but a real console — and
@@ -417,21 +445,24 @@ def run_update(
 
         _rolled_back = [False]
 
-        def _rollback(reason: str) -> bool:
+        def _rollback(reason: str) -> "RollbackResult":
             """Reinstall the version that was running. At most once per run.
 
-            Returns True when the previous version is back on disk.
+            Returns a :class:`RollbackResult`. The package reinstall and the
+            settings migration are checked SEPARATELY: a rollback that put the
+            package back but could not migrate its settings has not restored
+            the machine, and callers must not report it as if it had.
             """
             if _rolled_back[0]:
                 log("Rollback already attempted once; refusing a second pass")
-                return False
+                return RollbackResult(False, False, ROLLBACK_STEP_PACKAGE)
             _rolled_back[0] = True
             try:
                 rb_cmd = rollback_command(extras, _current_version)
                 rb_label = rollback_command_label(extras, _current_version)
             except ValueError as exc:
                 log(f"ERROR: cannot build a rollback command: {exc}")
-                return False
+                return RollbackResult(False, False, ROLLBACK_STEP_PACKAGE)
             if method == "uv":
                 rb_uv = find_bin("uv")
                 if rb_uv:
@@ -453,21 +484,43 @@ def run_update(
                     recovery=rb_label,
                 )
                 log(f"ERROR: rollback command returned {rb.returncode}")
-                return False
+                return RollbackResult(False, False, ROLLBACK_STEP_PACKAGE)
             restored = find_bin("jacked") or jacked
-            subprocess.run(
+            migrate = subprocess.run(
                 [restored, "install", "--force"],
                 stdout=log_fh,
                 stderr=log_fh,
                 check=False,
                 creationflags=NO_WINDOW,
             )
+            if migrate.returncode != 0:
+                _end(
+                    "rolling_back",
+                    "failed",
+                    error=(
+                        "the restored build could not migrate its settings "
+                        f"(jacked install --force exit {migrate.returncode})"
+                    ),
+                    recovery="jacked install --force",
+                )
+                log(
+                    "ERROR: jacked install --force returned "
+                    f"{migrate.returncode} for the restored build"
+                )
+                return RollbackResult(True, False, ROLLBACK_STEP_INSTALL)
             _end("rolling_back", "ok")
-            log(f"Rollback to v{_current_version} complete")
-            return True
+            log(f"Rollback to v{_current_version} reinstalled the package")
+            return RollbackResult(True, True, None)
 
-        def _fail_and_recover(what: str, rolled: bool) -> None:
-            """Record a failed update and tell the user what state they are in."""
+        def _fail_and_recover(
+            what: str, rolled: bool, failed_step: "str | None" = None
+        ) -> None:
+            """Record a failed update and tell the user what state they are in.
+
+            `rolled` is True ONLY when the package rollback, the settings
+            migration AND the restarted service all succeeded. Anything less
+            names the step that failed and the command that repairs it.
+            """
             if rolled:
                 error = f"{what}; rolled back to v{_current_version}"
                 recovery = (
@@ -475,7 +528,11 @@ def run_update(
                     "then report the preflight output."
                 )
             else:
-                error = f"{what}; rollback did not complete"
+                step = failed_step or ROLLBACK_STEP_PACKAGE
+                error = (
+                    f"{what}; the rollback to v{_current_version} stopped at "
+                    f"the {step} step"
+                )
                 recovery = (
                     f'uv tool install "claude-jacked[{extras}]=={_current_version}" '
                     "--force --refresh && jacked install --force && jacked service start"
@@ -498,24 +555,39 @@ def run_update(
         # can provision its service contract before the old service is gone.
         _begin("preflight")
         log(f"Running: {jacked} service preflight")
-        preflight = subprocess.run(
-            [jacked, "service", "preflight"],
-            capture_output=True,
-            text=True,
-            check=False,
-            creationflags=NO_WINDOW,
-        )
-        preflight_output = (
-            (preflight.stdout or "") + (preflight.stderr or "")
-        ).strip()
+        # A hung or unlaunchable preflight is a REFUSAL, not a crash: the old
+        # service is still up at this point, and the rollback path is what puts
+        # the machine back. Without the timeout the detached helper could wait
+        # forever with the tray already gone.
+        try:
+            preflight = subprocess.run(
+                [jacked, "service", "preflight"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=PREFLIGHT_TIMEOUT_SECONDS,
+                creationflags=NO_WINDOW,
+            )
+            preflight_code = preflight.returncode
+            preflight_output = (
+                (preflight.stdout or "") + (preflight.stderr or "")
+            ).strip()
+        except subprocess.TimeoutExpired:
+            preflight_code = -1
+            preflight_output = (
+                f"preflight did not answer within {PREFLIGHT_TIMEOUT_SECONDS}s"
+            )
+        except OSError as exc:
+            preflight_code = -1
+            preflight_output = f"preflight could not run: {exc}"
         if preflight_output:
             log(f"preflight output: {preflight_output}")
-        log(f"preflight returncode: {preflight.returncode}")
-        if preflight.returncode != 0:
+        log(f"preflight returncode: {preflight_code}")
+        if preflight_code != 0:
             first_line = (
                 preflight_output.splitlines()[0]
                 if preflight_output
-                else f"exit {preflight.returncode}"
+                else f"exit {preflight_code}"
             )
             _end(
                 "preflight",
@@ -523,10 +595,16 @@ def run_update(
                 error=f"new build refused to provision its service contract: {first_line}",
                 recovery=f'uv tool install "claude-jacked[{extras}]=={_current_version}" --force --refresh',
             )
-            rolled = _rollback("preflight refused")
+            rollback = _rollback("preflight refused")
             # Bring the restored version back up through the native lifecycle.
-            _start_and_verify()
-            _fail_and_recover(f"v{_target} refused to start: {first_line}", rolled)
+            # A restored build that never binds the port has not restored the
+            # machine, so its verdict decides whether this was a rollback.
+            restored_ready = _start_and_verify() == "ok"
+            _fail_and_recover(
+                f"v{_target} refused to start: {first_line}",
+                rollback.ok and restored_ready,
+                rollback.step or (None if restored_ready else ROLLBACK_STEP_RESTART),
+            )
             return
         _end("preflight", "ok")
 
@@ -549,17 +627,22 @@ def run_update(
                 error=f"jacked install exit {migrate_result.returncode}",
                 recovery="jacked install --force",
             )
-            _write_recovery(
-                f"Jacked auto-update: package upgrade succeeded but "
-                f"`jacked install --force` returned {migrate_result.returncode}.\n"
-                f"settings.json may be in a partial state. A backup was saved "
-                f"at ~/.claude/settings.json.bak-*.\n"
-                f"See {UPDATE_LOG} for details.\n\n"
-                "Recovery:\n"
-                "  jacked install --force\n"
-                "  jacked service start\n"
+            log(
+                "Settings migration failed. Rolling back to "
+                f"v{_current_version}"
             )
-            log("NOT restarting service — jacked install failed")
+            # The old tray is already gone at this point. Returning here left
+            # the machine with a build whose settings never migrated AND no
+            # running service, so this is a transaction failure like any other.
+            rollback = _rollback("settings migration failed")
+            restored_ready = _start_and_verify() == "ok"
+            _fail_and_recover(
+                f"v{_target} could not migrate settings "
+                f"(jacked install exit {migrate_result.returncode}); "
+                "backups are at ~/.claude/settings.json.bak-*",
+                rollback.ok and restored_ready,
+                rollback.step or (None if restored_ready else ROLLBACK_STEP_RESTART),
+            )
             return
         _end("migrating_settings", "ok")
 
@@ -594,12 +677,14 @@ def run_update(
         else:
             # The new service never came up. Put the previous version back and
             # restart it, so the user keeps a working tray.
-            rolled = _rollback("new service never became ready")
-            if rolled:
-                _start_and_verify()
+            rollback = _rollback("new service never became ready")
+            # Start whatever is on disk either way: a machine with no service
+            # is the worst outcome. Only the verdict decides "rolled back".
+            restored_ready = _start_and_verify() == "ok"
             _fail_and_recover(
                 f"v{_target} never became ready on :{port}",
-                rolled,
+                rollback.ok and restored_ready,
+                rollback.step or (None if restored_ready else ROLLBACK_STEP_RESTART),
             )
     finally:
         # Best-effort recovery: ensure the service comes back up even when an
@@ -691,6 +776,32 @@ def spawn_updater_from_tray(
     )
 
 
+_FAILED_FILE_PATH = '"%USERPROFILE%\\.claude\\jacked-update-failed.txt"'
+
+
+def _tray_rollback_failed_label(
+    label: str, step: str, repair: str, drift_guard: str
+) -> str:
+    """Return the cmd.exe label that reports ONE failed rollback step.
+
+    Reached only by `goto`, from a rollback step that returned a non-zero
+    errorlevel. It marks the phase failed, names the step, gives the command
+    that repairs it, and exits 1. It never writes "rolled back".
+    """
+    return (
+        ":" + label + "\r\n"
+        'jacked _update_status rolling_back failed --error "the rollback '
+        + 'stopped at the ' + step + ' step" --recovery "' + repair + '"\r\n'
+        + drift_guard
+        + "echo Jacked tray update failed, and the rollback stopped at the "
+        + step + " step. See %LOGFILE%. > " + _FAILED_FILE_PATH + "\r\n"
+        "echo Run this first: " + repair + " >> " + _FAILED_FILE_PATH + "\r\n"
+        "echo Then: jacked install --force ^&^& jacked service start >> "
+        + _FAILED_FILE_PATH + "\r\n"
+        "exit /b 1\r\n"
+    )
+
+
 def _spawn_windows_tray_updater(
     parent_pid: int,
     extras: str,
@@ -713,6 +824,7 @@ def _spawn_windows_tray_updater(
         detect_install_method,
         rollback_command,
         rollback_command_label,
+        safe_version_label,
         upgrade_command,
         upgrade_command_label,
     )
@@ -744,15 +856,21 @@ def _spawn_windows_tray_updater(
     label_for_batch = label.replace('"', "'")
     upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
     to_version = target_version or "next"
-    current_version = __import__("jacked").__version__
+    # Validate the running version ONCE, before any batch line is built, and
+    # use the validated label everywhere below - including the status-init line
+    # and every echo. A version that fails the check must never reach cmd.exe.
+    running_version = __import__("jacked").__version__
+    current_version = safe_version_label(running_version)
 
     # Rollback argv for the version running right now. Built in Python so the
-    # batch never composes a requirement specifier itself.
+    # batch never composes a requirement specifier itself. It is built from the
+    # RAW version: an unusable one raises here and leaves the batch with no
+    # rollback path at all, which is the safe outcome.
     rollback_line = ""
     rollback_label = ""
     try:
-        rb_cmd = rollback_command(extras, current_version)
-        rollback_label = rollback_command_label(extras, current_version)
+        rb_cmd = rollback_command(extras, running_version)
+        rollback_label = rollback_command_label(extras, running_version)
     except ValueError as exc:
         logger.warning("No rollback command available: %s", exc)
         rb_cmd = []
@@ -810,14 +928,19 @@ def _spawn_windows_tray_updater(
         + DRIFT_GUARD
     )
     if rollback_line:
+        # Every rollback step is checked, and `rolling_back ok` is written ONLY
+        # after the restored service answers /api/version. A batch that marked
+        # the phase ok before the restart claimed a restoration it had not made.
         rollback_block += (
             rollback_line + " 2>&1\r\n"
-            "if errorlevel 1 goto rollback_failed\r\n"
+            "if errorlevel 1 goto rollback_failed_package\r\n"
             "jacked install --force 2>&1\r\n"
-            "jacked _update_status rolling_back ok\r\n"
-            + DRIFT_GUARD
+            "if errorlevel 1 goto rollback_failed_install\r\n"
             + 'start "" /B jacked service start\r\n'
             + _verify_service_block(port)
+            + "if errorlevel 1 goto rollback_failed_verify\r\n"
+            "jacked _update_status rolling_back ok\r\n"
+            + DRIFT_GUARD
             + "echo Jacked tray update: v" + to_version
             + " could not start; rolled back to v" + current_version
             + ". See %LOGFILE%. > " + _FAILED_FILE + "\r\n"
@@ -825,13 +948,18 @@ def _spawn_windows_tray_updater(
             + " ^&^& jacked install --force ^&^& jacked service start >> "
             + _FAILED_FILE + "\r\n"
             "exit /b 1\r\n"
-            ":rollback_failed\r\n"
-            'jacked _update_status rolling_back failed --error "rollback command failed" --recovery "'
-            + rollback_label_for_batch + '"\r\n'
-            + DRIFT_GUARD
-            + "echo Jacked tray update failed AND the rollback failed. See %LOGFILE%. > "
-            + _FAILED_FILE + "\r\n"
-            "exit /b 1\r\n"
+            + _tray_rollback_failed_label(
+                "rollback_failed_package", ROLLBACK_STEP_PACKAGE,
+                rollback_label_for_batch, DRIFT_GUARD,
+            )
+            + _tray_rollback_failed_label(
+                "rollback_failed_install", ROLLBACK_STEP_INSTALL,
+                "jacked install --force", DRIFT_GUARD,
+            )
+            + _tray_rollback_failed_label(
+                "rollback_failed_verify", ROLLBACK_STEP_RESTART,
+                "jacked service start", DRIFT_GUARD,
+            )
         )
     else:
         rollback_block += (

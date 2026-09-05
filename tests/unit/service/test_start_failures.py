@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import json
 
 from jacked.service.start_failures import (
@@ -100,3 +102,31 @@ def test_clear_removes_file_and_is_idempotent(tmp_path):
     clear_start_failures(path)
 
     assert not path.exists()
+
+
+
+def test_record_is_atomic_and_private(tmp_path, monkeypatch):
+    import os
+    import stat as stat_module
+
+    from jacked.service import start_failures
+
+    path = tmp_path / "start-failures.json"
+    start_failures.record_start_failure(path, 100.0, reason="first")
+    mode = path.stat().st_mode & 0o777
+    if os.name == "posix":
+        assert mode == 0o600
+    before = path.read_text(encoding="utf-8")
+
+    def _crash(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", _crash)
+    with pytest.raises(OSError):
+        start_failures.record_start_failure(path, 101.0, reason="second")
+    # The previous history survives intact and no temporary file is left behind.
+    assert path.read_text(encoding="utf-8") == before
+    leftovers = [p.name for p in tmp_path.iterdir() if "start-failures" in p.name]
+    assert leftovers == ["start-failures.json"]
+    assert stat_module.S_ISREG(path.stat().st_mode)
+

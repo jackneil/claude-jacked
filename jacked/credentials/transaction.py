@@ -66,6 +66,11 @@ class SwitchRequest:
 
 IdentityPublisher = Callable[[SwitchRequest], None]
 
+# Reported whenever the identity mirror did not land. Running Claude Code
+# sessions keep their cached token until they restart, so the caller must see
+# this text instead of a clean success.
+IDENTITY_FAILURE_MESSAGE = "claude config identity not updated"
+
 
 @dataclass(frozen=True)
 class TransactionDependencies:
@@ -119,8 +124,16 @@ def build_pending_record(
     capability: CredentialCapability,
     machine_install_id: str,
     install_key: bytes,
+    email: str | None = None,
+    display_name: str | None = None,
+    organization_name: str | None = None,
 ) -> PendingSwitchRecord:
-    """Build a secret-free pending record with transcript-bound verifiers."""
+    """Build a secret-free pending record with transcript-bound verifiers.
+
+    The identity arguments are not secrets and are not part of the transcript.
+    They let crash recovery republish the switched identity to Claude's config,
+    which is the only thing running sessions watch.
+    """
     unsigned = PendingSwitchRecord(
         operation_id=operation_id,
         account_id=account_id,
@@ -133,6 +146,9 @@ def build_pending_record(
         canonicalizer_version=capability.canonicalizer_version,
         before_hmac="",
         target_hmac="",
+        email=email,
+        display_name=display_name,
+        organization_name=organization_name,
     )
     return PendingSwitchRecord(
         **{
@@ -527,6 +543,9 @@ class CredentialTransactionEngine:
             capability=capability,
             machine_install_id=self._deps.machine_install_id,
             install_key=key,
+            email=request.email,
+            display_name=request.display_name,
+            organization_name=request.organization_name,
         )
         self._deps.repository.create_pending(pending)
         write = self._deps.authority.write(request.payload, request.interaction)
@@ -651,7 +670,7 @@ class CredentialTransactionEngine:
                 "Could not publish the switched identity to Claude's config: %s",
                 exc,
             )
-            return False, f"claude config identity not updated ({type(exc).__name__})"
+            return False, f"{IDENTITY_FAILURE_MESSAGE} ({type(exc).__name__})"
         return True, ""
 
     def _publish_mirrors(self, request: SwitchRequest) -> tuple[SwitchOutcome, str]:

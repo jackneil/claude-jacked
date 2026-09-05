@@ -129,21 +129,57 @@ def _validate_darwin_link_acl(path: Path) -> None:
         raise ValueError("runtime_path symlink has a mutating extended ACL")
 
 
-# Groups whose members can already act as root on the host. macOS ships
-# ``%admin ALL=(ALL) ALL`` in /etc/sudoers and Homebrew makes its prefix
-# admin group-writable by design, so every Homebrew-installed Python lives
-# under such a directory. Linux distributions use ``sudo`` or ``wheel``.
-_ROOT_EQUIVALENT_GROUP_NAMES = ("root", "wheel", "admin", "sudo")
+def _root_equivalent_group_names() -> tuple[str, ...]:
+    """Groups whose members can already act as root on THIS host.
+
+    Root-equivalence is a sudoers property, not a group-name property, so the
+    list is scoped per platform to what the platform itself guarantees:
+
+    - macOS ships ``%admin ALL=(ALL) ALL`` and Homebrew makes its prefix admin
+      group-writable by design, so every Homebrew-installed Python lives under
+      such a directory. ``wheel`` is root's group there.
+    - Debian-family Linux ships ``%sudo``; RHEL, Fedora, SUSE and Amazon Linux
+      ship ``%wheel``. Arch, Alpine, Void and Gentoo ship ``wheel`` with the
+      sudoers grant commented out, so ``wheel`` is trusted only on the families
+      that enable it. A Linux ``admin`` group is an ordinary group and is never
+      trusted by name.
+    """
+    if _HOST_IS_DARWIN:
+        return ("wheel", "admin")
+    if sys.platform.startswith("linux"):
+        families = _linux_family_ids()
+        names = ["sudo"]
+        if families & {"rhel", "fedora", "centos", "rocky", "almalinux", "amzn", "suse", "opensuse", "sles"}:
+            names.append("wheel")
+        return tuple(names)
+    return ()
+
+
+def _linux_family_ids() -> frozenset[str]:
+    """``ID`` and ``ID_LIKE`` tokens from /etc/os-release, lowercase."""
+    try:
+        text = Path("/etc/os-release").read_text(encoding="utf-8")
+    except OSError:
+        return frozenset()
+    tokens: set[str] = set()
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() in {"ID", "ID_LIKE"}:
+            tokens.update(value.strip().strip('"').lower().split())
+    return frozenset(tokens)
 
 
 def _user_private_group_id() -> int | None:
-    """Return the caller's primary gid when no other account can use it.
+    """Return the caller's primary gid when it is a Linux user-private group.
 
-    Linux creates one group per user (same name, no other members, no other
-    account with it as primary group). Writes granted to that group reach
-    only the user, so it is as trusted as the user. macOS ``staff`` fails
-    every one of these tests, which keeps staff-writable paths untrusted.
+    Linux creates one group per user: same name as the user, no other members.
+    Writes granted to that group reach only the user, so it is as trusted as
+    the user. The check is bounded on purpose: it never enumerates the user
+    database, which can block for a directory-service timeout on hosts bound
+    to LDAP or Active Directory. macOS never has such groups (``staff``).
     """
+    if _HOST_IS_DARWIN:
+        return None
     import grp
     import pwd
 
@@ -153,27 +189,25 @@ def _user_private_group_id() -> int | None:
         group = grp.getgrgid(user.pw_gid)
     except KeyError:
         return None
-    if group.gr_name != user.pw_name:
+    if group.gr_name != user.pw_name or group.gr_gid < 1000:
         return None
     if any(member != user.pw_name for member in group.gr_mem):
         return None
-    for other in pwd.getpwall():
-        if other.pw_gid == group.gr_gid and other.pw_uid != uid:
-            return None
     return group.gr_gid
 
 
-@lru_cache(maxsize=1)
 def _trusted_group_ids() -> frozenset[int]:
     """Groups a writable bit may grant without opening a privilege boundary.
 
     A directory writable only by principals who can already become root is
     not an escalation path: any of them could replace it with ``sudo``.
+    Computed on every validation (three call sites per boot); a cache would
+    only let a demoted administrator's files stay trusted for the tray's life.
     """
     import grp
 
     trusted = {0}
-    for name in _ROOT_EQUIVALENT_GROUP_NAMES:
+    for name in _root_equivalent_group_names():
         try:
             trusted.add(grp.getgrnam(name).gr_gid)
         except KeyError:
@@ -184,28 +218,28 @@ def _trusted_group_ids() -> frozenset[int]:
     return frozenset(trusted)
 
 
-@lru_cache(maxsize=1)
 def _trusted_owner_ids() -> frozenset[int]:
-    """Root, the caller, and every member of a root-equivalent group."""
+    """Root, the caller, and the listed members of root-equivalent groups.
+
+    Only ``gr_mem`` is consulted. Users whose PRIMARY group is root-equivalent
+    are not enumerated: that needs ``pwd.getpwall()``, which walks every
+    directory-service record and can block a boot gate. Such a user is trusted
+    through the group-writable rule instead when the path is group-writable.
+    """
     import grp
     import pwd
 
     trusted = {0, os.getuid()}
-    root_equivalent_gids = set()
-    for name in _ROOT_EQUIVALENT_GROUP_NAMES:
+    for name in _root_equivalent_group_names():
         try:
             group = grp.getgrnam(name)
         except KeyError:
             continue
-        root_equivalent_gids.add(group.gr_gid)
         for member in group.gr_mem:
             try:
                 trusted.add(pwd.getpwnam(member).pw_uid)
             except KeyError:
                 continue
-    for user in pwd.getpwall():
-        if user.pw_gid in root_equivalent_gids:
-            trusted.add(user.pw_uid)
     return frozenset(trusted)
 
 

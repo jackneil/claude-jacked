@@ -46,6 +46,11 @@ class DatabaseCredentialSwitchRepository:
                 "canonicalizer_version": record.canonicalizer_version,
                 "before_hmac": record.before_hmac,
                 "target_hmac": record.target_hmac,
+                # Non-secret identity, kept so recovery can republish it to
+                # Claude's config after a crash.
+                "email": record.email,
+                "display_name": record.display_name,
+                "organization_name": record.organization_name,
                 "phase": "pending",
             }
         )
@@ -216,6 +221,11 @@ class DatabaseCredentialSwitchRepository:
             canonicalizer_version=row["canonicalizer_version"],
             before_hmac=row.get("before_hmac") or "",
             target_hmac=row["target_hmac"],
+            # Rows written before these columns existed carry no identity;
+            # recovery then finalizes without republishing it.
+            email=row.get("email"),
+            display_name=row.get("display_name"),
+            organization_name=row.get("organization_name"),
         )
 
     def get_pending(self, operation_id: str) -> PendingSwitchRecord | None:
