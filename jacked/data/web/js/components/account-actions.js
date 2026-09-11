@@ -444,35 +444,29 @@ async function pollCredentialOperation(actionId, operationId, pageSessionId, ema
     showToast(`Credential operation ${operationId} is still running. Check again before starting another switch.`, 'warning', 10000);
 }
 
-async function activateAccountFromDashboard(id, email, sourceButton) {
-    if (window.jackedState._accountActionInFlight) {
-        showToast('Another action is still running. Finish it, or cancel the sign-in banner above, then try again.', 'warning', 4000);
-        return;
-    }
-    window.jackedState._accountActionInFlight = true;
-    if (sourceButton) {
-        sourceButton.disabled = true;
-        sourceButton.textContent = 'Switching\u2026';
-    }
-    const actionId = crypto.randomUUID();
-    const operationId = crypto.randomUUID();
+// Mint the three idempotency ids for one credential switch. The page-session
+// id outlives the switch, so it is persisted; the other two are per-attempt.
+function mintSwitchIds() {
+    const actionId = generateUuid();
+    const operationId = generateUuid();
     let pageSessionId = sessionStorage.getItem('jacked-page-session-id');
     if (!pageSessionId) {
-        pageSessionId = crypto.randomUUID();
+        pageSessionId = generateUuid();
         sessionStorage.setItem('jacked-page-session-id', pageSessionId);
     }
+    return { actionId, operationId, pageSessionId };
+}
+
+// Send the switch and turn whatever comes back into one truthful message.
+async function requestSwitch(id, email, ids) {
+    const { actionId, operationId, pageSessionId } = ids;
+    const headers = {
+        'X-Jacked-Action-Id': actionId,
+        'X-Jacked-Operation-Id': operationId,
+        'X-Jacked-Page-Session': pageSessionId,
+    };
     try {
-        const result = await api.post(
-            `/api/auth/accounts/${id}/use`,
-            undefined,
-            {
-                headers: {
-                    'X-Jacked-Action-Id': actionId,
-                    'X-Jacked-Operation-Id': operationId,
-                    'X-Jacked-Page-Session': pageSessionId,
-                },
-            },
-        );
+        const result = await api.post(`/api/auth/accounts/${id}/use`, undefined, { headers });
         showCredentialActivationResult(result, email);
         await loadActiveCredential();
     } catch (e) {
@@ -488,11 +482,39 @@ async function activateAccountFromDashboard(id, email, sourceButton) {
         } else if (outcome.status === 'observed_target_unfenced') {
             showCredentialActivationResult(outcome, email);
         } else {
-            showToast(outcome.message || e.message, 'error');
+            // Mostly the 403 local-only refusal, which is long: give it the
+            // same reading time as its siblings, and never render `undefined`.
+            showToast(outcome.message || e.message || 'The switch could not be completed.', 'error', 8000);
         }
+    }
+}
+
+async function activateAccountFromDashboard(id, email, sourceButton) {
+    if (window.jackedState._accountActionInFlight) {
+        showToast('Another action is still running. Finish it, or cancel the sign-in banner above, then try again.', 'warning', 4000);
+        return;
+    }
+    window.jackedState._accountActionInFlight = true;
+    const originalButtonText = sourceButton ? sourceButton.textContent : '';
+    if (sourceButton) {
+        sourceButton.disabled = true;
+        sourceButton.textContent = 'Switching\u2026';
+    }
+    try {
+        // Minted inside the try: generateUuid() and sessionStorage can both
+        // throw, and a throw out here would strand the button on "Switching"
+        // and latch _accountActionInFlight true for the life of the page.
+        await requestSwitch(id, email, mintSwitchIds());
+    } catch (e) {
+        console.error('Account switch failed:', e);
+        showToast('Could not start the switch: ' + (e && e.message ? e.message : String(e)), 'error', 8000);
     } finally {
+        if (sourceButton) {
+            sourceButton.disabled = false;
+            sourceButton.textContent = originalButtonText;
+        }
         window.jackedState._accountActionInFlight = false;
-        await refreshAndRender();
+        await refreshAndRender().catch((err) => showToast('The page could not refresh: ' + (err && err.message ? err.message : String(err)), 'warning', 8000));
     }
 }
 
@@ -703,7 +725,7 @@ function bindAccountEvents() {
                 if (ok) {
                     showToast(`Copied: ${cmd}`, 'success', 2000);
                 } else {
-                    showToast(`Copy failed \u2014 run manually: ${cmd}`, 'warning', 4000);
+                    showToast(`Copy failed. Run manually: ${cmd}`, 'warning', 4000);
                 }
             }
         });

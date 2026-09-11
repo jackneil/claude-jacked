@@ -1,21 +1,154 @@
+import json
+import re
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
+
+from tests.unit.test_web_js_swap_ui import _HARNESS
 
 WEB_JS = Path(__file__).resolve().parents[2] / "jacked" / "data" / "web" / "js"
+UTILS_JS = WEB_JS / "utils.js"
+ACCOUNT_ACTIONS_JS = WEB_JS / "components" / "account-actions.js"
+
+UUID_V4_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 
 
 def test_use_account_sends_distinct_idempotency_headers() -> None:
+    """Ids come from ``generateUuid`` and are minted inside the ``try``.
+
+    Regression 2026-09-11: ``crypto.randomUUID`` is secure-context only, so
+    on ``http://<hostname>:8321`` (remote access on) the three id calls threw
+    a ``TypeError`` *before* the ``try``, leaving the button stuck on
+    "Switching..." and ``_accountActionInFlight`` latched true forever.
+    """
     source = (WEB_JS / "components" / "account-actions.js").read_text()
 
-    assert "const actionId = crypto.randomUUID()" in source
-    assert "const operationId = crypto.randomUUID()" in source
-    assert "'X-Jacked-Action-Id': actionId" in source
-    assert "'X-Jacked-Operation-Id': operationId" in source
-    assert "sessionStorage.getItem('jacked-page-session-id')" in source
-    assert "'X-Jacked-Page-Session': pageSessionId" in source
-    action_index = source.index("const actionId = crypto.randomUUID()")
-    assert action_index < source.index("try {", action_index)
+    minter = source.split("function mintSwitchIds()", 1)[1].split(
+        "async function requestSwitch", 1
+    )[0]
+    assert "const actionId = generateUuid()" in minter
+    assert "const operationId = generateUuid()" in minter
+    assert "pageSessionId = generateUuid()" in minter
+    assert "sessionStorage.getItem('jacked-page-session-id')" in minter
+    assert "crypto.randomUUID()" not in source
+
+    requester = source.split("async function requestSwitch", 1)[1].split(
+        "async function activateAccountFromDashboard", 1
+    )[0]
+    assert "'X-Jacked-Action-Id': actionId" in requester
+    assert "'X-Jacked-Operation-Id': operationId" in requester
+    assert "'X-Jacked-Page-Session': pageSessionId" in requester
     assert "/api/auth/credential-operations/${actionId}" in source
+
+    # The ids are minted INSIDE the outer try, after the latch is set and
+    # before the POST that carries them.
+    activate = source.index("async function activateAccountFromDashboard")
+    flag_index = source.index("_accountActionInFlight = true", activate)
+    try_index = source.index("try {", flag_index)
+    mint_index = source.index("mintSwitchIds()", try_index)
+    post_index = source.index("`/api/auth/accounts/${id}/use`", 0)
+    assert flag_index < try_index < mint_index
+    assert requester.index("const { actionId") < requester.index(
+        "`/api/auth/accounts/${id}/use`"
+    )
+    assert post_index < activate  # the POST lives in requestSwitch
+
+
+OUTER_CATCH_TOAST = (
+    "showToast('Could not start the switch: '"
+)
+
+
+def test_use_account_restores_the_button_and_clears_the_in_flight_flag() -> None:
+    """A failure must not strand the button or the in-flight latch."""
+    source = (WEB_JS / "components" / "account-actions.js").read_text()
+    body = source.split("async function activateAccountFromDashboard", 1)[1].split(
+        "function showAutoSwapRecommendation", 1
+    )[0]
+
+    assert "const originalButtonText = sourceButton" in body
+    finally_block = body.split("} finally {", 1)[1]
+    assert "sourceButton.disabled = false" in finally_block
+    assert "sourceButton.textContent = originalButtonText" in finally_block
+    restore_index = finally_block.index("sourceButton.disabled = false")
+    clear_index = finally_block.index("_accountActionInFlight = false")
+    assert restore_index < clear_index
+    assert clear_index < finally_block.index("refreshAndRender()")
+
+
+def test_use_account_reports_a_synchronous_failure_instead_of_swallowing_it() -> None:
+    """The wrapper's own catch, not the API outcome handler, owns this."""
+    source = (WEB_JS / "components" / "account-actions.js").read_text()
+    body = source.split("async function activateAccountFromDashboard", 1)[1].split(
+        "function showAutoSwapRecommendation", 1
+    )[0]
+
+    outer_catch = body.rsplit("} catch (e) {", 1)[1].split("} finally {", 1)[0]
+    assert "console.error('Account switch failed:', e)" in outer_catch
+    assert OUTER_CATCH_TOAST in outer_catch
+    assert "'error', 8000" in outer_catch
+
+    # The API outcome handler must not be the thing that reports it.
+    requester = source.split("async function requestSwitch", 1)[1].split(
+        "async function activateAccountFromDashboard", 1
+    )[0]
+    assert OUTER_CATCH_TOAST not in requester
+
+
+def test_use_account_gives_the_403_outcome_the_long_toast_and_a_final_fallback() -> None:
+    """CREDENTIAL_MUTATION_LOCAL_ONLY is what most remote users hit.
+
+    Its message is long, so it needs the same 8000 ms the sibling branches
+    use, and the branch must never be able to render the literal
+    ``undefined``.
+    """
+    source = (WEB_JS / "components" / "account-actions.js").read_text()
+    requester = source.split("async function requestSwitch", 1)[1].split(
+        "async function activateAccountFromDashboard", 1
+    )[0]
+    fallback = requester.rsplit("} else {", 1)[1]
+
+    assert (
+        "showToast(outcome.message || e.message || "
+        "'The switch could not be completed.', 'error', 8000)"
+    ) in fallback
+
+
+def test_finally_refresh_failure_is_reported_rather_than_unhandled() -> None:
+    """A dropped GET over the tailnet must not become an unhandled rejection."""
+    source = (WEB_JS / "components" / "account-actions.js").read_text()
+    body = source.split("async function activateAccountFromDashboard", 1)[1].split(
+        "function showAutoSwapRecommendation", 1
+    )[0]
+    finally_block = body.split("} finally {", 1)[1]
+
+    assert "await refreshAndRender().catch(" in finally_block
+    assert "'The page could not refresh: '" in finally_block
+    assert "'warning', 8000" in finally_block
+
+
+def test_copy_command_fallback_is_reachable_without_navigator_clipboard() -> None:
+    """``navigator.clipboard`` is undefined in a non-secure context.
+
+    The property access must therefore happen *inside* the ``try`` so the
+    resulting TypeError lands in the ``execCommand`` fallback.
+    """
+    source = (WEB_JS / "components" / "account-actions.js").read_text()
+    handler = source.split(".btn-copy-cmd", 1)[1].split("btn-dismiss-tip", 1)[0]
+
+    try_index = handler.index("try {")
+    assert try_index < handler.index("navigator.clipboard.writeText(cmd)")
+    catch_block = handler.split("} catch {", 1)[1]
+    assert "document.execCommand('copy')" in catch_block
+    # User-facing copy: no em-dashes in the toasts (comments are exempt).
+    toasts = [ln for ln in handler.splitlines() if "showToast(" in ln]
+    assert toasts
+    assert all("\u2014" not in ln for ln in toasts)
+    assert "Copy failed. Run manually:" in handler
 
 
 def test_use_account_ui_handles_truthful_outcomes_without_blanket_switched_claim() -> None:
@@ -109,3 +242,135 @@ def test_use_account_ui_tells_the_user_whether_open_sessions_follow() -> None:
         assert "sessionsFollowCopy(" in branch
         assert "result.message ||" not in branch
 
+
+
+# ---------------------------------------------------------------------------
+# Behavioral tests: the fix is a runtime invariant, so drive the real function
+# under node with a non-secure-context crypto (getRandomValues, no randomUUID).
+# ---------------------------------------------------------------------------
+_STUBS = """
+const { webcrypto } = require('node:crypto');
+// A crypto WITHOUT randomUUID is exactly what a non-secure context (plain
+// http on a hostname) hands the page. Node exposes globalThis.crypto through a
+// getter-only accessor, so a plain assignment is a silent no-op: replace the
+// property instead, and count fallback calls so the test can prove which
+// branch of generateUuid actually ran.
+let _fallbackCalls = 0;
+Object.defineProperty(globalThis, 'crypto', {
+    value: { getRandomValues: (a) => { _fallbackCalls++; return webcrypto.getRandomValues(a); } },
+    configurable: true,
+    writable: true,
+});
+const _session = {};
+global.sessionStorage = {
+    getItem: (k) => Object.prototype.hasOwnProperty.call(_session, k) ? _session[k] : null,
+    setItem: (k, v) => { _session[k] = String(v); },
+};
+const _posts = [];
+let _refreshed = 0;
+global.refreshAndRender = async () => { _refreshed++; };
+loadActiveCredential = async () => {};
+let _shownResults = 0;
+showCredentialActivationResult = () => { _shownResults++; };
+const btn = __makeEl('button');
+btn.textContent = 'Use Account';
+btn.disabled = false;
+window.jackedState._accountActionInFlight = false;
+const report = () => ({
+    text: btn.textContent,
+    disabled: btn.disabled,
+    inFlight: window.jackedState._accountActionInFlight,
+    posts: _posts.map(p => ({ url: p.url, headers: p.opts && p.opts.headers })),
+    toasts: __getToasts(),
+    refreshed: _refreshed,
+    shownResults: _shownResults,
+    randomUUID: typeof crypto.randomUUID,
+    fallbackCalls: _fallbackCalls,
+});
+"""
+
+
+def _run_switch(tmp_path, snippet):
+    """Eval utils.js then account-actions.js in the swap-ui DOM harness."""
+    program = (
+        _HARNESS.replace("__TARGET__", json.dumps(str(ACCOUNT_ACTIONS_JS)))
+        + "\neval(fs.readFileSync(%s, 'utf8'));\n" % json.dumps(str(UTILS_JS))
+        + _STUBS
+        + snippet
+    )
+    script = tmp_path / "switch-harness.js"
+    script.write_text(program, encoding="utf-8")
+    proc = subprocess.run(
+        ["node", str(script)], capture_output=True, text=True,
+        encoding="utf-8", timeout=30,
+    )
+    assert proc.returncode == 0, (
+        f"node failed:\nstderr={proc.stderr}\nstdout={proc.stdout}"
+    )
+    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
+    return json.loads(lines[-1])
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_switch_over_plain_http_recovers_from_a_403_without_stranding_the_button(
+    tmp_path,
+) -> None:
+    result = _run_switch(tmp_path, """
+const MSG = 'Credential switching is local-only on this host. Open the dashboard on the Mac running jacked, or enable remote credential mutation, then try again.';
+global.api.post = async (url, body, opts) => {
+    _posts.push({ url, opts });
+    const err = new Error(MSG);
+    err.status = 403;
+    err.code = 'CREDENTIAL_MUTATION_LOCAL_ONLY';
+    err.payload = { error: { code: 'CREDENTIAL_MUTATION_LOCAL_ONLY' } };
+    throw err;
+};
+activateAccountFromDashboard('5', 'x@y', btn).then(() => out(report()));
+""")
+
+    assert result["text"] == "Use Account"
+    assert result["disabled"] is False
+    assert result["inFlight"] is False
+    assert result["refreshed"] == 1
+
+    assert len(result["posts"]) == 1
+    headers = result["posts"][0]["headers"]
+    ids = [
+        headers["X-Jacked-Action-Id"],
+        headers["X-Jacked-Operation-Id"],
+        headers["X-Jacked-Page-Session"],
+    ]
+    for value in ids:
+        assert UUID_V4_RE.match(value), value
+    assert len(set(ids)) == 3
+    # Prove the non-secure-context branch ran: randomUUID was absent and the
+    # three ids came from the getRandomValues fallback.
+    assert result["randomUUID"] == "undefined"
+    assert result["fallbackCalls"] == 3
+
+    assert len(result["toasts"]) == 1
+    toast = result["toasts"][0]
+    assert "local-only" in toast["message"]
+    assert toast["type"] == "error"
+    assert toast["duration"] == 8000
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_switch_over_plain_http_restores_the_button_on_the_success_path(
+    tmp_path,
+) -> None:
+    result = _run_switch(tmp_path, """
+global.api.post = async (url, body, opts) => {
+    _posts.push({ url, opts });
+    return { status: 'committed', existing_sessions: 'pending_next_activity' };
+};
+activateAccountFromDashboard('5', 'x@y', btn).then(() => out(report()));
+""")
+
+    assert result["text"] == "Use Account"
+    assert result["disabled"] is False
+    assert result["inFlight"] is False
+    assert result["shownResults"] == 1
+    assert result["refreshed"] == 1
+    assert len(result["posts"]) == 1
+    assert result["toasts"] == []

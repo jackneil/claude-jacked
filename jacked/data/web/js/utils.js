@@ -108,3 +108,30 @@ function formatTimeAgo(isoStr) {
         return '';
     }
 }
+
+// ---------------------------------------------------------------------------
+// UUID generation
+//
+// crypto.randomUUID() only exists in a secure context (https, or http on
+// localhost/127.0.0.1). With remote access on, the dashboard is served over
+// plain http on a hostname or tailnet IP, where the property is undefined and
+// calling it throws a TypeError. crypto.getRandomValues() is available in
+// every context, so build the v4 UUID from raw bytes when randomUUID is gone.
+// ---------------------------------------------------------------------------
+function generateUuid() {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+    if (typeof crypto === 'undefined' || typeof crypto.getRandomValues !== 'function') {
+        throw new Error('This browser cannot generate a request id.');
+    }
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;  // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;  // RFC 4122 variant
+    const hex = [];
+    for (let i = 0; i < bytes.length; i++) {
+        hex.push(bytes[i].toString(16).padStart(2, '0'));
+    }
+    const s = hex.join('');
+    return `${s.slice(0, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}-${s.slice(16, 20)}-${s.slice(20)}`;
+}
