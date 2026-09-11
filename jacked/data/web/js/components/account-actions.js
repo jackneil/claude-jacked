@@ -450,47 +450,61 @@ async function activateAccountFromDashboard(id, email, sourceButton) {
         return;
     }
     window.jackedState._accountActionInFlight = true;
+    const originalButtonText = sourceButton ? sourceButton.textContent : '';
     if (sourceButton) {
         sourceButton.disabled = true;
         sourceButton.textContent = 'Switching\u2026';
     }
-    const actionId = crypto.randomUUID();
-    const operationId = crypto.randomUUID();
-    let pageSessionId = sessionStorage.getItem('jacked-page-session-id');
-    if (!pageSessionId) {
-        pageSessionId = crypto.randomUUID();
-        sessionStorage.setItem('jacked-page-session-id', pageSessionId);
-    }
     try {
-        const result = await api.post(
-            `/api/auth/accounts/${id}/use`,
-            undefined,
-            {
-                headers: {
-                    'X-Jacked-Action-Id': actionId,
-                    'X-Jacked-Operation-Id': operationId,
-                    'X-Jacked-Page-Session': pageSessionId,
-                },
-            },
-        );
-        showCredentialActivationResult(result, email);
-        await loadActiveCredential();
-    } catch (e) {
-        const outcome = e.payload || {};
-        if (e.code === 'TIMEOUT') {
-            await pollCredentialOperation(
-                actionId, operationId, pageSessionId, email
-            );
-        } else if (outcome.status === 'interactive_required') {
-            showToast(outcome.message || 'Credential access needs foreground confirmation. Try again and approve the prompt.', 'warning', 8000);
-        } else if (outcome.status === 'unsupported') {
-            showToast(outcome.message || 'This Claude build is not certified for credential switching.', 'error', 8000);
-        } else if (outcome.status === 'observed_target_unfenced') {
-            showCredentialActivationResult(outcome, email);
-        } else {
-            showToast(outcome.message || e.message, 'error');
+        // Minted inside the try: generateUuid() and sessionStorage can both
+        // throw, and a throw out here would strand the button on "Switching"
+        // and latch _accountActionInFlight true for the life of the page.
+        const actionId = generateUuid();
+        const operationId = generateUuid();
+        let pageSessionId = sessionStorage.getItem('jacked-page-session-id');
+        if (!pageSessionId) {
+            pageSessionId = generateUuid();
+            sessionStorage.setItem('jacked-page-session-id', pageSessionId);
         }
+        try {
+            const result = await api.post(
+                `/api/auth/accounts/${id}/use`,
+                undefined,
+                {
+                    headers: {
+                        'X-Jacked-Action-Id': actionId,
+                        'X-Jacked-Operation-Id': operationId,
+                        'X-Jacked-Page-Session': pageSessionId,
+                    },
+                },
+            );
+            showCredentialActivationResult(result, email);
+            await loadActiveCredential();
+        } catch (e) {
+            const outcome = e.payload || {};
+            if (e.code === 'TIMEOUT') {
+                await pollCredentialOperation(
+                    actionId, operationId, pageSessionId, email
+                );
+            } else if (outcome.status === 'interactive_required') {
+                showToast(outcome.message || 'Credential access needs foreground confirmation. Try again and approve the prompt.', 'warning', 8000);
+            } else if (outcome.status === 'unsupported') {
+                showToast(outcome.message || 'This Claude build is not certified for credential switching.', 'error', 8000);
+            } else if (outcome.status === 'observed_target_unfenced') {
+                showCredentialActivationResult(outcome, email);
+            } else {
+                showToast(outcome.message || e.message, 'error');
+            }
+        }
+    } catch (e) {
+        // Not an ApiError: a synchronous failure before the request went out.
+        // Say so, rather than leaving the click with no visible result.
+        showToast(e.message || String(e), 'error');
     } finally {
+        if (sourceButton) {
+            sourceButton.disabled = false;
+            sourceButton.textContent = originalButtonText;
+        }
         window.jackedState._accountActionInFlight = false;
         await refreshAndRender();
     }
