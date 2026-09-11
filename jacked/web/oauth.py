@@ -712,7 +712,12 @@ class OAuthFlow:
                     {
                         "activation_status": "local_only",
                         "activation_message": (
-                            "Account saved; credential activation is local-only."
+                            # Not "local-only" any more: activation follows the
+                            # remote-access scope gate, so a browser inside an
+                            # enabled scope DOES get it. Say what happened to
+                            # THIS request instead of stating a global rule.
+                            "Account saved. Credential activation is not "
+                            "allowed from this browser."
                         ),
                     }
                 )

@@ -515,13 +515,18 @@ def test_completed_remote_flow_keeps_local_only_activation_truth():
         "account_id": 7,
         "email": "jack@example.com",
         "activation_status": "local_only",
-        "activation_message": "Account saved; credential activation is local-only.",
+        "activation_message": "Account saved. Credential activation is not allowed from this browser.",
     }
 
     status = flow.get_status()
 
     assert status["activation_status"] == "local_only"
-    assert status["activation_message"].endswith("local-only.")
+    assert status["activation_message"] == (
+        "Account saved. Credential activation is not allowed from this browser."
+    )
+    # Says what happened to THIS request; activation is no longer a blanket
+    # local-only rule, it follows the remote-access scope gate.
+    assert "local-only" not in status["activation_message"]
     assert "activation_operation_id" not in status
 
 

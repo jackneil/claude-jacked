@@ -364,6 +364,7 @@ class ServiceRunner:
 
         from jacked.service.bind import (
             create_sockets,
+            log_remote_exposure,
             resolve_bind,
             set_active_plan,
         )
@@ -427,6 +428,10 @@ class ServiceRunner:
         # Publish only after sockets are successfully reserved. The manifest
         # therefore never advertises a port this process failed to bind.
         set_active_plan(plan)
+        # One line when reachability goes past loopback, naming who may switch
+        # credentials through it. Emitted on every (re)start, so a GUI toggle
+        # that widens the bind is visible in the log it produces.
+        log_remote_exposure(plan)
         os.environ["JACKED_HOST"] = plan.primary_host
         os.environ["JACKED_PORT"] = str(self.port)
         # Keep the two-release legacy diagnostic file from clobbering a live
@@ -478,6 +483,15 @@ class ServiceRunner:
             host=plan.primary_host,
             port=self.port,
             log_level="warning",
+            # Proxy-header trust is pinned, never inherited: uvicorn would
+            # otherwise read FORWARDED_ALLOW_IPS from the environment, and
+            # request.client.host is what the credential gate authorizes on.
+            # proxy_headers stays TRUE on purpose: `tailscale serve` proxies
+            # from loopback and rewrites X-Forwarded-For to the real tailnet
+            # source, so honoring a loopback proxy's forwarding is what keeps
+            # a serve viewer from inheriting loopback's permissions.
+            proxy_headers=True,
+            forwarded_allow_ips="127.0.0.1",
         )
         server = uvicorn.Server(config)
         self._uvicorn_server = server

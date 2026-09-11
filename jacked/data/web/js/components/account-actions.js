@@ -481,6 +481,12 @@ async function requestSwitch(id, email, ids) {
             showToast(outcome.message || 'This Claude build is not certified for credential switching.', 'error', 8000);
         } else if (outcome.status === 'observed_target_unfenced') {
             showCredentialActivationResult(outcome, email);
+        } else if (e.code === 'CREDENTIAL_SWITCH_RATE_LIMITED') {
+            // A remote peer hit the per-browser switch cap. Not the user's
+            // mistake and the wait IS the message, so warn rather than error,
+            // with the same long reading time as its siblings. (ApiError
+            // already carries error.message/error.code from the body.)
+            showToast(e.message || 'Too many account switches from this browser. Wait a minute and try again.', 'warning', 8000);
         } else {
             // Mostly the 403 local-only refusal, which is long: give it the
             // same reading time as its siblings, and never render `undefined`.
@@ -676,6 +682,12 @@ function bindAccountEvents() {
     // evidence-qualified outcome determines what the UI may claim.
     document.querySelectorAll('.btn-use-account').forEach(btn => {
         btn.addEventListener('click', async () => {
+            // A disabled button fires no click, but the flag can flip between
+            // the render and the click (the poll loop re-reads it every cycle),
+            // so check the live flag as well as the rendered attributes rather
+            // than start a switch the server will refuse.
+            if (window.jackedState.credentialActivationAllowed === false) return;
+            if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return;
             const id = btn.dataset.id;
             const email = btn.dataset.email || '';
             await activateAccountFromDashboard(id, email, btn);
@@ -1265,7 +1277,20 @@ async function loadActiveCredential() {
     try {
         const data = await api.get('/api/auth/active-credential');
         window.jackedState.activeCredentialAccountId = data.account_id || null;
+        // Whether THIS browser may switch accounts: loopback always may, a
+        // remote browser only while remote access is on and its address is in
+        // the enabled scope. Only an explicit false locks the UI, so a server
+        // that predates the field keeps behaving as it always has.
+        window.jackedState.credentialActivationAllowed = (data.allow_credential_activation !== false);
+        // Why not, when not: 'remote_access_off' or 'outside_scope'. The two
+        // have different fixes, so the UI words them differently.
+        window.jackedState.credentialActivationReason = data.credential_activation_reason || null;
     } catch {
         window.jackedState.activeCredentialAccountId = null;
+        // Never lock the local UI because a GET failed. The server is the real
+        // gate and answers 403 when a switch is not permitted; a dead network
+        // must not also grey out the buttons on the host machine itself.
+        window.jackedState.credentialActivationAllowed = true;
+        window.jackedState.credentialActivationReason = null;
     }
 }

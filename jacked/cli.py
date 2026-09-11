@@ -324,22 +324,41 @@ def webux(host: str | None, port: int, no_browser: bool, reload: bool):
             port=port,
             reload=True,
             reload_dirs=["jacked"],
+            # Proxy-header trust is pinned, never inherited: uvicorn would
+            # otherwise read FORWARDED_ALLOW_IPS from the environment, and
+            # request.client.host is what the credential gate authorizes on.
+            # proxy_headers stays TRUE on purpose: `tailscale serve` proxies
+            # from loopback and rewrites X-Forwarded-For to the real tailnet
+            # source, so honoring a loopback proxy's forwarding is what keeps
+            # a serve viewer from inheriting loopback's permissions.
+            proxy_headers=True,
+            forwarded_allow_ips="127.0.0.1",
         )
         return
 
     # Normal path: resolve the bind plan (explicit --host > DB setting >
     # loopback), pre-bind its sockets, and hand them to uvicorn. JACKED_HOST
     # (dynamic CORS / WebSocket origin / CSRF) comes from the plan's primary host.
-    from jacked.service.bind import create_sockets, resolve_bind, set_active_plan
+    from jacked.service.bind import (
+        create_sockets,
+        log_remote_exposure,
+        resolve_bind,
+        set_active_plan,
+    )
 
     plan = resolve_bind(host, port)
     # Publish the live plan so the settings API reports the real effective bind.
     set_active_plan(plan)
+    # One line when reachability goes past loopback. An explicit --host
+    # bypasses the settings read entirely, so this is the only place the two
+    # decisions (who can reach it, who may switch credentials) are stated
+    # together.
     _os.environ["JACKED_HOST"] = plan.primary_host
     _os.environ["JACKED_PORT"] = str(port)
 
     try:
         socks = create_sockets(plan)
+        log_remote_exposure(plan)
     except OSError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         console.print(f"Is another process already using port {port}?")
@@ -371,6 +390,15 @@ def webux(host: str | None, port: int, no_browser: bool, reload: bool):
         host=plan.primary_host,
         port=port,
         log_level="warning",
+        # Proxy-header trust is pinned, never inherited: uvicorn would
+        # otherwise read FORWARDED_ALLOW_IPS from the environment, and
+        # request.client.host is what the credential gate authorizes on.
+        # proxy_headers stays TRUE on purpose: `tailscale serve` proxies
+        # from loopback and rewrites X-Forwarded-For to the real tailnet
+        # source, so honoring a loopback proxy's forwarding is what keeps
+        # a serve viewer from inheriting loopback's permissions.
+        proxy_headers=True,
+        forwarded_allow_ips="127.0.0.1",
     )
     server = uvicorn.Server(config)
     server.run(sockets=socks)

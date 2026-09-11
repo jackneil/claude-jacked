@@ -380,6 +380,10 @@ function startPolling() {
         if (window.jackedState._usageRefreshInProgress) return;
         await loadAccounts();
         await loadActiveSessions();
+        // Re-read who may switch accounts: a scope change made at the host
+        // must reach an open remote page on its own, or the page keeps
+        // offering a Use Account button the server now refuses.
+        await loadActiveCredential();
         rerenderAccountsView();
     }, _currentPollInterval());
 }

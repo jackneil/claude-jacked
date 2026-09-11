@@ -351,6 +351,27 @@ function renderAccountMenu(acct) {
     `;
 }
 
+// Why this browser may not switch accounts, in the user's words. One sentence
+// per server reason, used twice each: as the disabled button's tooltip and as
+// the single muted hint on the accounts view. The two denials have different
+// fixes (flip a toggle vs widen a scope), so they must not share a sentence.
+// No em-dashes: this is user-facing copy.
+const CREDENTIAL_SWITCH_HINTS = {
+    remote_access_off: "Account switching from this browser is off. Turn on remote access under Settings > Advanced on the host machine.",
+    outside_scope: "This browser's address is outside the remote access scope. Widen the scope under Settings > Advanced on the host machine.",
+};
+
+// An older server sends no reason with the denial; the toggle is the likelier
+// cause and the safer thing to point at, so it is the fallback.
+function credentialSwitchHint() {
+    const reason = window.jackedState.credentialActivationReason;
+    // Own-property lookup only: a reason the server never sends must not
+    // resolve through Object.prototype into a title attribute.
+    return Object.prototype.hasOwnProperty.call(CREDENTIAL_SWITCH_HINTS, reason)
+        ? CREDENTIAL_SWITCH_HINTS[reason]
+        : CREDENTIAL_SWITCH_HINTS.remote_access_off;
+}
+
 /**
  * Render the action row for an account card: the one action people take often
  * (Use Account) on the left, everything else behind the kebab on the right.
@@ -365,7 +386,18 @@ function renderActionButtons(acct) {
     if (isActiveInCC) {
         setActiveHtml = '<span class="text-xs px-3 py-1.5 bg-green-600/20 text-green-400 border border-green-600/30 rounded font-medium">Active in Claude Code</span>';
     } else if (acct.is_active) {
-        setActiveHtml = `<button class="btn-use-account text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 hover:bg-teal-600/40 border border-teal-600/30 rounded font-medium transition active:scale-[0.96]" data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}">Use Account</button>`;
+        // A remote browser can only switch accounts while remote access is on
+        // and its address is inside the enabled scope (the server publishes
+        // that as allow_credential_activation). Render the same button at the
+        // same size either way so the card row never shifts, but make the
+        // denied one inert and say why in the tooltip.
+        const base = 'btn-use-account text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 border border-teal-600/30 rounded font-medium transition';
+        const data = `data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}"`;
+        if (window.jackedState.credentialActivationAllowed === false) {
+            setActiveHtml = `<button class="${base} opacity-50 cursor-not-allowed" ${data} disabled aria-disabled="true" title="${credentialSwitchHint()}">Use Account</button>`;
+        } else {
+            setActiveHtml = `<button class="${base} hover:bg-teal-600/40 active:scale-[0.96]" ${data}>Use Account</button>`;
+        }
     }
 
     return `
@@ -517,6 +549,12 @@ function renderAccounts(accounts) {
         `;
     }
 
+    // One line, muted, only when this browser may not switch accounts — so the
+    // greyed-out Use Account buttons below have a stated reason.
+    const switchLockedHint = window.jackedState.credentialActivationAllowed === false
+        ? `<div id="credential-switch-hint" class="text-xs text-slate-500 mb-4">${credentialSwitchHint()}</div>`
+        : '';
+
     const sorted = [...visible].sort((a, b) => (a.priority || 0) - (b.priority || 0));
     const cardsHtml = sorted.map((acct, idx) => renderAccountCard(acct, idx, sorted.length)).join('');
 
@@ -541,6 +579,7 @@ function renderAccounts(accounts) {
                     </button>
                 </div>
             </div>
+            ${switchLockedHint}
             ${typeof renderAutoSwapPanel === 'function' ? renderAutoSwapPanel() : ''}
             ${tipHtml}
             ${bannerHtml}

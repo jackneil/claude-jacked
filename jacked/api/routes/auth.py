@@ -21,6 +21,15 @@ from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from jacked.api.remote_access import (
+    LOOPBACK_HOSTS,
+    REASON_OUTSIDE_SCOPE,
+    REASON_REMOTE_ACCESS_OFF,
+    SwitchRateLimiter,
+    credential_mutation_decision,
+    credential_policy_editable,
+    read_enabled_scope,
+)
 from jacked.web.auth import (
     fetch_usage,
     refresh_account_token,
@@ -260,7 +269,8 @@ class SubmitCodeRequest(BaseModel):
     code: str
 
 
-_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
+# Single definition, shared with the credential-mutation policy.
+_LOOPBACK_HOSTS = LOOPBACK_HOSTS
 
 
 def _manual_oauth(request: Request, remote: bool) -> bool:
@@ -278,11 +288,94 @@ def _manual_oauth(request: Request, remote: bool) -> bool:
     return host not in _LOOPBACK_HOSTS
 
 
-def _local_mutation_allowed(request: Request) -> bool:
-    """Credential mutation is local-only until remote auth and TLS exist."""
+# Reason-keyed denial copy. The two denials have different fixes, so they get
+# different sentences: one is a toggle, the other is a scope. No em-dashes
+# (user-facing). The error CODES stay stable; only the prose varies.
+_SWITCH_DENIED_MESSAGES = {
+    REASON_REMOTE_ACCESS_OFF: (
+        "Account switching from this browser is off. Turn on remote access "
+        "under Settings > Advanced on the host machine."
+    ),
+    REASON_OUTSIDE_SCOPE: (
+        "This browser's address is outside the remote access scope. Widen the "
+        "scope under Settings > Advanced on the host machine."
+    ),
+}
+_STATUS_DENIED_MESSAGES = {
+    REASON_REMOTE_ACCESS_OFF: (
+        "Credential operation status from this browser is off. Turn on remote "
+        "access under Settings > Advanced on the host machine."
+    ),
+    REASON_OUTSIDE_SCOPE: (
+        "This browser's address is outside the remote access scope. Widen the "
+        "scope under Settings > Advanced on the host machine."
+    ),
+}
+
+
+def _credential_mutation_decision(
+    request: Request, *, audit: str | None = None
+) -> tuple[bool, str | None, str | None]:
+    """Resolve ``(allowed, reason, client_host)`` for this request.
+
+    Loopback always may. A remote client may only when the persisted
+    remote-access setting is on AND its address is inside the enabled scope,
+    so the Settings toggle is the one visible switch that hands out credential
+    control. No DB, or a settings DB that will not read, means loopback only.
+
+    Pass ``audit`` (a short action name) from the routes that mutate or expose
+    a mutation: every non-loopback decision then leaves one INFO line naming
+    the client and the reason, so a remote switch is attributable after the
+    fact. Loopback is deliberately silent, since the local dashboard switches
+    accounts all day. Only addresses and setting values are logged, never
+    tokens or account secrets.
+
+    The policy itself lives in ``jacked/api/remote_access.py``; this wrapper
+    only resolves the inputs off the Request and records the outcome.
+    """
     client = request.client
-    host = client.host.lower() if client and client.host else ""
-    return host in _LOOPBACK_HOSTS
+    host = client.host if client and client.host else None
+    enabled, scope = read_enabled_scope(_get_db(request))
+    allowed, reason = credential_mutation_decision(host, enabled, scope)
+    if audit and not credential_policy_editable(host):
+        if allowed:
+            logger.info(
+                "Remote credential mutation ALLOWED (%s) for client %s "
+                "(remote access on, scope=%s)",
+                audit,
+                host,
+                scope,
+            )
+        else:
+            logger.info(
+                "Remote credential mutation DENIED (%s) for client %s: %s "
+                "(enabled=%s, scope=%s)",
+                audit,
+                host,
+                reason,
+                enabled,
+                scope,
+            )
+    return allowed, reason, host
+
+
+def _credential_mutation_allowed(request: Request) -> bool:
+    """Boolean half of :func:`_credential_mutation_decision`, for the OAuth
+    flow sites that only need to know whether to offer activation."""
+    return _credential_mutation_decision(request)[0]
+
+
+def _switch_rate_limiter(request: Request) -> SwitchRateLimiter:
+    """Per-process limiter for remote switches, created on first use.
+
+    Lives on app.state rather than at module scope so a test app (and the
+    tray's rebuilt app) gets a clean budget instead of inheriting one.
+    """
+    limiter = getattr(request.app.state, "switch_rate_limiter", None)
+    if limiter is None:
+        limiter = SwitchRateLimiter()
+        request.app.state.switch_rate_limiter = limiter
+    return limiter
 
 
 class RefreshResponse(BaseModel):
@@ -328,6 +421,16 @@ class ActiveCredentialResponse(BaseModel):
     email: Optional[str] = None
     state: str = "unknown"
     evidence: list[str] = Field(default_factory=list)
+    # Whether THIS client may switch accounts. The dashboard reads it to
+    # disable the Use Account button instead of offering one that always 403s.
+    # REQUIRED (no default) on purpose: a return path that forgets it is a
+    # construction error here, not a silently-enabled button in a remote
+    # browser. The JS side defaults a MISSING field to true instead, so an
+    # older server stays usable.
+    allow_credential_activation: bool
+    # Why not, when not: 'remote_access_off' or 'outside_scope' (None when
+    # allowed). The two have different fixes, so the UI words them differently.
+    credential_activation_reason: Optional[str] = None
 
 
 _ACTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
@@ -667,7 +770,7 @@ async def start_add_account(
     flow = OAuthFlow(
         db,
         manual=_manual_oauth(request, remote),
-        allow_credential_activation=_local_mutation_allowed(request),
+        allow_credential_activation=_credential_mutation_allowed(request),
     )
     result = await flow.start()
 
@@ -718,7 +821,7 @@ async def start_reauth(account_id: int, request: Request, remote: bool = False):
         purpose="primary",
         target_account_id=account_id,
         manual=_manual_oauth(request, remote),
-        allow_credential_activation=_local_mutation_allowed(request),
+        allow_credential_activation=_credential_mutation_allowed(request),
     )
     result = await flow.start()
 
@@ -1433,7 +1536,7 @@ async def start_cc_auth(account_id: int, request: Request, remote: bool = False)
         purpose="claude_code",
         target_account_id=account_id,
         manual=_manual_oauth(request, remote),
-        allow_credential_activation=_local_mutation_allowed(request),
+        allow_credential_activation=_credential_mutation_allowed(request),
     )
     result = await flow.start()
     return result
@@ -1452,20 +1555,50 @@ async def use_account(account_id: int, request: Request):
     Rejects disabled accounts, accounts with invalid validation status,
     and accounts without CC tokens (which would be un-refreshable).
     """
-    if not _local_mutation_allowed(request):
+    allowed, reason, client_host = _credential_mutation_decision(
+        request, audit="switch"
+    )
+    if not allowed:
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
             content={
                 "error": {
-                    "message": (
-                        "Account switching is available only from this computer. "
-                        "Remote dashboards are read-only for credentials."
-                    ),
+                    "message": _SWITCH_DENIED_MESSAGES[reason],
                     "code": "CREDENTIAL_MUTATION_LOCAL_ONLY",
                 }
             },
             headers={"Cache-Control": "no-store"},
         )
+
+    # Rate limit remote peers only, and only AFTER the gate: a client that may
+    # not switch never consumes the budget of one that may. Every accepted
+    # switch drives a Keychain write plus settings writes on the host, and a
+    # fresh action id per attempt defeats the idempotency replay, so without a
+    # cap one reachable peer can thrash the live credential store.
+    if not credential_policy_editable(client_host):
+        ok, retry_after = _switch_rate_limiter(request).check(client_host or "")
+        if not ok:
+            logger.warning(
+                "Rate-limited account switch from client %s (retry after %ss)",
+                client_host,
+                int(retry_after),
+            )
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={
+                    "error": {
+                        "message": (
+                            "Too many account switches from this browser. "
+                            "Wait a minute and try again."
+                        ),
+                        "code": "CREDENTIAL_SWITCH_RATE_LIMITED",
+                    }
+                },
+                headers={
+                    "Cache-Control": "no-store",
+                    "Retry-After": str(int(retry_after)),
+                },
+            )
 
     db = _get_db(request)
     if db is None:
@@ -1683,6 +1816,11 @@ async def use_account(account_id: int, request: Request):
 
         prev_acct = db.get_account(outgoing_id) if outgoing_id else None
         reason = f"user switched to {format_account_label(account)}"
+        # Attribute a remote switch so Swap History can tell it apart from one
+        # made at the machine. (This route writes no swap_log row itself; the
+        # reason travels on the broadcast that drives the history view.)
+        if not credential_policy_editable(client_host):
+            reason = f"{reason} from {client_host}"
         ws_registry = getattr(request.app.state, "ws_registry", None)
         if ws_registry:
             await ws_registry.broadcast(
@@ -1709,13 +1847,20 @@ async def use_account(account_id: int, request: Request):
 
 @router.get("/credential-operations/{identifier}")
 async def get_credential_operation(identifier: str, request: Request):
-    """Return local, secret-free status for a credential action/operation."""
-    if not _local_mutation_allowed(request):
+    """Return secret-free status for a credential action/operation.
+
+    Same scope gate as the switch itself: loopback always, a remote client
+    only while remote access is on and its address is in the enabled scope.
+    """
+    allowed, reason, _host = _credential_mutation_decision(
+        request, audit="switch-status"
+    )
+    if not allowed:
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
             content={
                 "error": {
-                    "message": "Credential operation status is local-only.",
+                    "message": _STATUS_DENIED_MESSAGES[reason],
                     "code": "CREDENTIAL_STATUS_LOCAL_ONLY",
                 }
             },
@@ -1792,9 +1937,18 @@ async def get_credential_operation(identifier: str, request: Request):
 @router.get("/active-credential", response_model=ActiveCredentialResponse)
 async def get_active_credential(request: Request):
     """Return the canonical evidence-qualified credential observation."""
+    # Computed once, up front: every return path below carries it, or a
+    # remote dashboard on an unresolved/conflicting path would silently
+    # re-enable a button the server will reject. Not audited: this route is
+    # polled, so one INFO line per poll would be noise, not a trail.
+    allow_activation, activation_reason, _host = _credential_mutation_decision(request)
+    activation = {
+        "allow_credential_activation": allow_activation,
+        "credential_activation_reason": activation_reason,
+    }
     db = _get_db(request)
     if db is None:
-        return ActiveCredentialResponse()
+        return ActiveCredentialResponse(**activation)
     from jacked.credentials.resolver import ResolverState
     from jacked.credentials.runtime import resolve_active_identity
 
@@ -1803,7 +1957,9 @@ async def get_active_credential(request: Request):
     evidence = list(observation.evidence)
     if observation.state is not ResolverState.RESOLVED:
         return ActiveCredentialResponse(
-            state=observation.state.value, evidence=evidence
+            state=observation.state.value,
+            evidence=evidence,
+            **activation,
         )
     identity = observation.identity
     account = db.get_account(identity.account_id) if identity.account_id else None
@@ -1811,6 +1967,7 @@ async def get_active_credential(request: Request):
         return ActiveCredentialResponse(
             state=ResolverState.UNUSABLE.value,
             evidence=[*evidence, "account-stamp-not-found"],
+            **activation,
         )
     observed_org = identity.organization_id or ""
     account_org = account.get("organization_uuid") or ""
@@ -1818,12 +1975,14 @@ async def get_active_credential(request: Request):
         return ActiveCredentialResponse(
             state=ResolverState.CONFLICT.value,
             evidence=[*evidence, "account-organization-conflict"],
+            **activation,
         )
     return ActiveCredentialResponse(
         account_id=account["id"],
         email=account["email"],
         state=ResolverState.RESOLVED.value,
         evidence=evidence,
+        **activation,
     )
 
 

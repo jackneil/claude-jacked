@@ -50,7 +50,12 @@ _ALL_INTERFACES = "0.0.0.0"
 # Tailscale hands every node an address in the CGNAT range 100.64.0.0/10, and
 # routes 100.100.100.100 to its local service endpoint (used as the UDP
 # route-trick target). ipaddress does the membership test.
-_TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+#
+# Public because it is also the authority for "is this HTTP client on the
+# tailnet?" in jacked/api/remote_access.py. One definition, so the bind plan
+# and the credential-mutation gate can never disagree about what a tailnet
+# address is.
+TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _TAILSCALE_SERVICE_IP = "100.100.100.100"
 
 
@@ -128,6 +133,88 @@ def _loopback_plan(port: int) -> BindPlan:
     )
 
 
+def describe_remote_exposure(plan: "BindPlan", enabled: bool, scope: str) -> str | None:
+    """One startup line when reachability goes past loopback, else ``None``.
+
+    Worth saying out loud because the two decisions are independent: the bind
+    says who can REACH the dashboard, the persisted setting says who may
+    SWITCH CREDENTIALS through it. ``--host``/``JACKED_HOST`` short-circuits
+    the settings read entirely (``mode="cli"``), so a one-shot wide bind can
+    meet a stale ``remote_access_enabled=true`` row and re-grant remote
+    credential control with no fresh confirmation. This names both halves.
+
+    >>> loopback = BindPlan('loopback', ('127.0.0.1',), 8321, '127.0.0.1')
+    >>> describe_remote_exposure(loopback, True, 'all') is None
+    True
+    >>> wide = BindPlan('cli', ('0.0.0.0',), 8321, '0.0.0.0')
+    >>> describe_remote_exposure(wide, False, 'tailscale')
+    ... # doctest: +ELLIPSIS
+    'Listening beyond loopback on 0.0.0.0:8321, but remote access is off: ...'
+    >>> 'any peer that can reach the port' in describe_remote_exposure(wide, True, 'all')
+    True
+    >>> 'wider than the saved scope' in describe_remote_exposure(wide, True, 'tailscale')
+    True
+    """
+    reachable = [a for a in plan.addresses if a not in (_LOOPBACK, "::1")]
+    if not reachable:
+        return None
+    where = ", ".join(f"{a}:{plan.port}" for a in reachable)
+
+    if not enabled:
+        return (
+            f"Listening beyond loopback on {where}, but remote access is off: "
+            "the setting, not the bind, decides credential switching, so every "
+            "remote peer is denied account switching and upgrades."
+        )
+
+    audience = (
+        "any peer that can reach the port"
+        if scope == "all"
+        else "peers on your tailnet (100.64.0.0/10)"
+    )
+    message = (
+        f"Listening beyond loopback on {where} with remote access on "
+        f"(scope {scope}): {audience} can switch accounts and trigger upgrades."
+    )
+    if plan.mode == "cli" and scope != "all":
+        message += (
+            " This bind came from --host or JACKED_HOST and is wider than the "
+            "saved scope; the setting, not the bind, decides credential "
+            "switching, so peers outside the scope are denied."
+        )
+    return message
+
+
+def log_remote_exposure(plan: BindPlan, db=None) -> str | None:
+    """Emit :func:`describe_remote_exposure` once at service start.
+
+    Never raises: a startup log line must not be able to stop the service
+    coming up, so an unreadable settings DB degrades to the fail-closed
+    ``(False, default)`` reading rather than propagating.
+    """
+    try:
+        from jacked.api.remote_access import read_enabled_scope
+
+        if db is None:
+            from jacked.web.database import Database
+
+            db = Database()
+        enabled, scope = read_enabled_scope(db)
+    except Exception as exc:
+        logger.warning(
+            "Could not read remote-access settings for the startup exposure "
+            "check (%s: %s); assuming off.",
+            type(exc).__name__,
+            exc,
+        )
+        enabled, scope = False, "tailscale"
+
+    message = describe_remote_exposure(plan, enabled, scope)
+    if message:
+        logger.warning("%s", message)
+    return message
+
+
 def resolve_bind(cli_host: str | None, port: int, db=None) -> BindPlan:
     """Resolve the bind plan. Read-only: this never persists anything.
 
@@ -146,13 +233,22 @@ def resolve_bind(cli_host: str | None, port: int, db=None) -> BindPlan:
     # 2. DB settings. Construct the default Database lazily so importing this
     #    module stays cheap, and wrap the whole read so a broken DB can't stop
     #    the server from coming up on loopback.
+    #    Function-level import: jacked.api.remote_access imports TAILSCALE_CGNAT
+    #    from this module, so a module-level import here would be a cycle.
+    from jacked.api.remote_access import VALID_SCOPES, read_enabled_scope
+
     try:
         if db is None:
             from jacked.web.database import Database
 
             db = Database()
-        enabled = db.get_setting("remote_access_enabled")
-        scope = db.get_setting("remote_access_scope")
+        # Read the raw scope first, inside the guard: read_enabled_scope()
+        # normalizes and never raises, so this is what still surfaces a
+        # locked/corrupt DB as the loopback fallback below, and it is also
+        # what lets us warn about an unrecognized value before it is
+        # silently defaulted.
+        raw_scope = db.get_setting("remote_access_scope")
+        enabled, scope = read_enabled_scope(db)
     except Exception as exc:  # sqlite errors, corrupt DB, unreadable path ...
         logger.warning(
             "Could not read remote-access settings (%s: %s); binding loopback only.",
@@ -162,7 +258,7 @@ def resolve_bind(cli_host: str | None, port: int, db=None) -> BindPlan:
         return _loopback_plan(port)
 
     # 3. Anything other than an explicit 'true' means remote access is off.
-    if enabled != "true":
+    if not enabled:
         return _loopback_plan(port)
 
     if scope == "all":
@@ -173,10 +269,10 @@ def resolve_bind(cli_host: str | None, port: int, db=None) -> BindPlan:
             primary_host=_ALL_INTERFACES,
         )
 
-    # scope == 'tailscale', or a missing/invalid value that defaults to it.
-    if scope != "tailscale":
+    # scope == 'tailscale', or a missing/invalid value that defaulted to it.
+    if raw_scope not in VALID_SCOPES:
         logger.warning(
-            "Unknown remote_access_scope %r; defaulting to 'tailscale'.", scope
+            "Unknown remote_access_scope %r; defaulting to 'tailscale'.", raw_scope
         )
 
     ts_ip = detect_tailscale_ip()
@@ -207,7 +303,7 @@ def resolve_bind(cli_host: str | None, port: int, db=None) -> BindPlan:
 def _in_cgnat_range(ip_str: str) -> bool:
     """True only if ``ip_str`` is a valid IP inside Tailscale's 100.64.0.0/10."""
     try:
-        return ipaddress.ip_address(ip_str) in _TAILSCALE_CGNAT
+        return ipaddress.ip_address(ip_str) in TAILSCALE_CGNAT
     except (ValueError, TypeError):
         return False
 

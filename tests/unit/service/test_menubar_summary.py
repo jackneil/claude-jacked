@@ -201,7 +201,12 @@ def _patch_active(account_id):
     from jacked.api.routes.auth import ActiveCredentialResponse
 
     async def _fake(_request):
-        return ActiveCredentialResponse(account_id=account_id, email=None)
+        # allow_credential_activation is required on the model (a forgotten
+        # kwarg must be a construction error, not a silently-enabled button).
+        # The menu-bar summary ignores it; True is the loopback answer.
+        return ActiveCredentialResponse(
+            account_id=account_id, email=None, allow_credential_activation=True
+        )
 
     return mock.patch("jacked.api.routes.auth.get_active_credential", _fake)
 

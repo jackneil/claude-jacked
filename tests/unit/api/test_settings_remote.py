@@ -403,3 +403,123 @@ def test_csrf_guard_holds_even_when_bound_all_interfaces(client, monkeypatch):
     )
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "CSRF_ORIGIN"
+
+
+# ---------------------------------------------------------------------------
+# The setting is a live authorization bit: only the host may flip it
+#
+# remote_access_enabled/scope now decide, per request, who may switch
+# credentials. A remote peer that could PUT them would grant itself credential
+# control just by reaching the port, and "turn it off" would not revoke
+# anything until the socket is rebound by a restart.
+# ---------------------------------------------------------------------------
+
+TAILNET_IP = "100.116.47.72"
+LAN_IP = "192.168.42.5"
+
+_SETTINGS_LOCAL_ONLY_MESSAGE = (
+    "Remote access settings can only be changed from the machine running "
+    "jacked. Open the dashboard on the host to change them."
+)
+
+
+@pytest.mark.parametrize("host", [TAILNET_IP, LAN_IP])
+def test_put_remote_access_is_rejected_from_a_remote_client(db, host):
+    remote = TestClient(app, client=(host, 1))
+
+    resp = remote.put(
+        "/api/settings/remote-access",
+        json={"enabled": True, "scope": "all"},
+    )
+
+    assert resp.status_code == 403
+    body = resp.json()
+    assert body["error"]["code"] == "REMOTE_ACCESS_SETTINGS_LOCAL_ONLY"
+    assert body["error"]["message"] == _SETTINGS_LOCAL_ONLY_MESSAGE
+    assert "—" not in body["error"]["message"]
+    # And nothing was written.
+    assert db.get_setting("remote_access_enabled") is None
+    assert db.get_setting("remote_access_scope") is None
+
+
+def test_put_remote_access_cannot_be_flipped_off_remotely_either(db):
+    """Not just escalation: a remote peer must not be able to disable the
+    setting out from under the host either."""
+    db.set_setting("remote_access_enabled", "true")
+    db.set_setting("remote_access_scope", "tailscale")
+    remote = TestClient(app, client=(TAILNET_IP, 1))
+
+    resp = remote.put(
+        "/api/settings/remote-access",
+        json={"enabled": False, "scope": "tailscale"},
+    )
+
+    assert resp.status_code == 403
+    assert db.get_setting("remote_access_enabled") == "true"
+
+
+def test_restart_is_rejected_from_a_remote_client(db, monkeypatch):
+    called = threading.Event()
+    set_restart_handler(lambda: called.set())
+    import jacked.service.restart as restart_mod
+
+    execv_called = threading.Event()
+    monkeypatch.setattr(
+        restart_mod.os, "execv", lambda *a, **k: execv_called.set()
+    )
+    remote = TestClient(app, client=(TAILNET_IP, 1))
+
+    resp = remote.post("/api/settings/remote-access/restart")
+
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "REMOTE_ACCESS_SETTINGS_LOCAL_ONLY"
+    assert not called.wait(timeout=2.5), "a remote client restarted the service"
+    assert not execv_called.is_set()
+    # The 403 returns before the lock is taken, so a later local apply works.
+    assert not sr._restart_lock.locked()
+
+
+def test_local_put_and_restart_are_unchanged(client, db, monkeypatch):
+    """The loopback path keeps working exactly as before the gate."""
+    fired = threading.Event()
+    set_restart_handler(lambda: fired.set())
+    import jacked.service.restart as restart_mod
+
+    execv_called = threading.Event()
+    monkeypatch.setattr(
+        restart_mod.os, "execv", lambda *a, **k: execv_called.set()
+    )
+
+    put = client.put(
+        "/api/settings/remote-access",
+        json={"enabled": True, "scope": "all"},
+    )
+    assert put.status_code == 200
+    assert put.json()["editable"] is True
+    assert db.get_setting("remote_access_enabled") == "true"
+    assert db.get_setting("remote_access_scope") == "all"
+
+    restart = client.post("/api/settings/remote-access/restart")
+    assert restart.status_code == 200
+    assert restart.json() == {"status": "started"}
+    # Wait out the handler thread INSIDE the patched window: the restart runs
+    # after a ~1.5s flush sleep, and letting the test end first would leave a
+    # real execv to re-exec the pytest process.
+    assert fired.wait(timeout=4.0), "restart handler was not invoked"
+    assert not execv_called.is_set()
+
+
+def test_get_reports_editable_true_for_loopback(client):
+    body = client.get("/api/settings/remote-access").json()
+    assert body["editable"] is True
+
+
+@pytest.mark.parametrize("host", [TAILNET_IP, LAN_IP])
+def test_get_reports_editable_false_for_a_remote_client(db, host):
+    remote = TestClient(app, client=(host, 1))
+    body = remote.get("/api/settings/remote-access").json()
+    assert body["editable"] is False
+    # The rest of the payload is still readable: a remote viewer may SEE the
+    # policy that applies to it, it just may not change it.
+    assert body["enabled"] is False
+    assert body["scope"] == "tailscale"
