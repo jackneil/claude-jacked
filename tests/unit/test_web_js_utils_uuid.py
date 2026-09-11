@@ -120,7 +120,7 @@ console.log(JSON.stringify(out));
 def test_utils_js_is_the_only_place_that_touches_crypto_random_uuid() -> None:
     """One guarded call site, so no component can regress to the raw API."""
     offenders = sorted(
-        str(path.relative_to(WEB))
+        path.relative_to(WEB).as_posix()  # Windows separators differ
         for path in (WEB / "js").glob("**/*.js")
         if "crypto.randomUUID" in path.read_text(errors="ignore")
     )
