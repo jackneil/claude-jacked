@@ -394,6 +394,7 @@ def test_trust_sets_are_not_cached_across_calls(monkeypatch):
     assert 502 not in spec_module._trusted_owner_ids()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
 def test_linux_family_ids_parses_id_and_id_like(tmp_path, monkeypatch):
     from jacked.service import spec as spec_module
 
@@ -424,6 +425,7 @@ def test_artifact_marker_requires_exact_owner_and_generation():
     assert not spec.matches_artifact_marker({**marker, "owner": "foreign"})
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
 def test_linux_family_ids_fail_closed_on_a_writable_or_unowned_os_release(tmp_path, monkeypatch):
     from jacked.service import spec as spec_module
 

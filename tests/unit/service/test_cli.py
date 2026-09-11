@@ -137,7 +137,7 @@ class TestWebuxHostResolution:
 
 
 class TestServiceStatus:
-    def test_status_when_not_running(self, tmp_path):
+    def test_status_when_not_running(self, tmp_path, absent_autostart):
         from jacked.cli import main
 
         runner = CliRunner()
@@ -146,8 +146,10 @@ class TestServiceStatus:
             result = runner.invoke(main, ["service", "status"])
         assert result.exit_code == 0
         assert "stopped" in result.output.lower()
+        # ABSENT autostart renders as "disabled" (jacked/cli.py service_status).
+        assert "Autostart: disabled" in result.output
 
-    def test_status_when_running(self, tmp_path):
+    def test_status_when_running(self, tmp_path, absent_autostart):
         from types import SimpleNamespace
         from jacked.cli import main
 
@@ -177,7 +179,7 @@ class TestServiceStatus:
         assert "running" in result.output.lower()
         assert "8321" in result.output
 
-    def test_status_reports_starting_without_dashboard_claim(self):
+    def test_status_reports_starting_without_dashboard_claim(self, absent_autostart):
         from types import SimpleNamespace
 
         from jacked.cli import main
@@ -230,7 +232,9 @@ class TestServiceStatus:
         assert "Autostart: unknown" in result.output
         assert "Autostart: disabled" not in result.output
 
-    def test_status_reports_healthy_legacy_without_claiming_control(self):
+    def test_status_reports_healthy_legacy_without_claiming_control(
+        self, absent_autostart
+    ):
         from types import SimpleNamespace
 
         from jacked.cli import main
@@ -1458,7 +1462,7 @@ def _write_breaker(count: int, age_seconds: float = 1.0):
     return breaker
 
 
-def test_service_status_reports_the_start_failure_give_up():
+def test_service_status_reports_the_start_failure_give_up(absent_autostart):
     from jacked.cli import main
     from jacked.service import START_FAILURE_LIMIT
 
@@ -1495,7 +1499,7 @@ def test_service_status_points_a_stopped_legacy_autostart_at_recovery():
     assert "jacked service recover" in result.output
 
 
-def test_service_status_names_the_last_start_failure_reason():
+def test_service_status_names_the_last_start_failure_reason(absent_autostart):
     """A boot refusal must be readable without opening the tray log."""
     import time
 
@@ -1525,7 +1529,7 @@ def test_service_status_names_the_last_start_failure_reason():
     assert "will not retry" not in result.output
 
 
-def test_service_status_falls_back_when_a_failure_has_no_reason():
+def test_service_status_falls_back_when_a_failure_has_no_reason(absent_autostart):
     """Legacy float entries carry no reason and must still read plainly."""
     from jacked.cli import main
 
@@ -1537,7 +1541,7 @@ def test_service_status_falls_back_when_a_failure_has_no_reason():
     assert "Last start failure: did not become ready" in result.output
 
 
-def test_service_status_is_silent_when_the_breaker_has_not_tripped():
+def test_service_status_is_silent_when_the_breaker_has_not_tripped(absent_autostart):
     from jacked.cli import main
     from jacked.service import START_FAILURE_LIMIT, START_FAILURE_WINDOW_SECONDS
 

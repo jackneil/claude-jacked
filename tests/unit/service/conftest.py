@@ -80,3 +80,28 @@ def _isolate_claude_dir(tmp_path, monkeypatch):
         monkeypatch.setattr(mod, attr, value, raising=False)
 
     yield
+
+
+@pytest.fixture
+def absent_autostart():
+    """Report "no autostart artifact" without asking the real supervisor.
+
+    ``jacked service status`` always inspects autostart. On macOS the
+    inspector reads the LaunchAgents plist first and answers ABSENT for the
+    isolated tmp home without touching launchctl, so status tests passed
+    there by accident. On Linux and Windows the inspector must ask
+    ``systemctl --user is-enabled`` / ``schtasks /Query`` (a unit or task
+    can be enabled with no staged file), which the ``_no_real_service_processes``
+    tripwire refuses, failing every status test on those runners. Tests whose
+    subject is the service state, not autostart, opt in here so the autostart
+    axis is a fixed, platform-independent input.
+    """
+    from unittest.mock import patch
+
+    from jacked.service.autostart import AutostartInspection, AutostartState
+
+    with patch(
+        "jacked.service.platform.inspect_autostart",
+        return_value=AutostartInspection(AutostartState.ABSENT),
+    ):
+        yield
