@@ -60,6 +60,8 @@ def _probe_opener(version=None, health=JACKED_HEALTH, status: int = 200):
                 raise OSError("connection refused")
             return _FakeHttpResponse(health, status)
         current = version() if callable(version) else version
+        if isinstance(current, BaseException):
+            raise current
         if current is None:
             raise OSError("connection refused")
         return _FakeHttpResponse(json.dumps({"current": current}).encode("utf-8"))
@@ -75,6 +77,24 @@ def _local_probes(version=None, health=JACKED_HEALTH, status: int = 200):
     opener = _probe_opener(version, health, status)
     with patch("urllib.request.build_opener", return_value=opener):
         yield opener
+
+
+def _free_at_each_tail_start():
+    """Listening oracle: free for the first probe of each restart tail.
+
+    The subprocess count only changes between tails, so the first probe after
+    it moves is that tail's waiting_port_free (free), and every probe until it
+    moves again is that tail's verify (a service answering).
+    """
+    state = {"seen": None}
+
+    def oracle(run):
+        if state["seen"] != run.call_count:
+            state["seen"] = run.call_count
+            return False
+        return True
+
+    return oracle
 
 
 def _comes_up_after(free_polls: int = 1):
@@ -429,7 +449,7 @@ class TestPortStuckRecovery:
         ):
             updater.run_update(parent_pid=12345, extras="tray")
 
-        opener.open.assert_called(), "the listener was never asked to identify itself"
+        assert opener.open.called, "the listener was never asked to identify itself"
         mock_popen.assert_not_called()
         assert (tmp_path / "recovery.txt").exists()
         assert "port 8321" in (tmp_path / "recovery.txt").read_text().lower()
@@ -948,6 +968,100 @@ class TestVerifyingServiceUsesAConnectProbe:
         assert status["overall"] == "succeeded"
         log = (tmp_path / "update.log").read_text(encoding="utf-8")
         assert "Service reports build 0.100.0" in log
+
+    def test_a_hanging_version_route_leaves_the_health_probe_a_budget(
+        self, tmp_path, monkeypatch
+    ):
+        """A wedged /api/version must not eat the whole verify window.
+
+        Given the full window the version read starves the health fallback,
+        and a port that is demonstrably bound gets reported as one that never
+        bound at all.
+        """
+        _run, _popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs(),
+            listen_results=_comes_up_after(1),
+            version_answer=TimeoutError("read timed out"),
+            health_answer=JACKED_HEALTH,
+        )
+
+        phases = {p["name"]: p["status"] for p in status["phases"]}
+        assert phases["verifying_service"] == "ok"
+        assert status["overall"] == "succeeded"
+        assert not recovery.exists()
+        log = (tmp_path / "update.log").read_text(encoding="utf-8")
+        assert "as a jacked service, but its build could not be read" in log
+
+    def test_the_version_read_is_capped_so_health_still_fits(
+        self, tmp_path, monkeypatch
+    ):
+        """Every version read leaves at least the identify budget behind."""
+        from jacked.service import updater
+
+        version_budgets, health_budgets = [], []
+        real_read = updater._read_reported_build
+        real_identify = updater._identify_jacked_listener
+
+        def read_spy(port, budget):
+            version_budgets.append(budget)
+            return real_read(port, budget)
+
+        def identify_spy(port, budget):
+            health_budgets.append(budget)
+            return real_identify(port, budget)
+
+        monkeypatch.setattr(updater, "_read_reported_build", read_spy)
+        monkeypatch.setattr(updater, "_identify_jacked_listener", identify_spy)
+
+        self._run_update(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs(),
+            listen_results=_comes_up_after(1),
+            version_answer=TimeoutError("read timed out"),
+            health_answer=JACKED_HEALTH,
+        )
+
+        assert version_budgets, "the version route was never read"
+        assert max(version_budgets) <= updater.VERSION_READ_TIMEOUT_SECONDS
+        assert max(version_budgets) <= (
+            updater.VERIFY_TIMEOUT_SECONDS - updater.IDENTIFY_TIMEOUT_SECONDS
+        )
+        assert health_budgets, "the health fallback never ran"
+        assert max(health_budgets) > 0, "the fallback was left no budget at all"
+
+    def test_a_bound_port_that_never_identifies_is_not_called_unbound(
+        self, tmp_path, monkeypatch
+    ):
+        _run, _popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs() + [_ok(), _ok()],  # + the rollback pair
+            # Free when each tail waits, then bound but mute: it accepts the
+            # connection and will not say what it is on either route.
+            listen_results=_free_at_each_tail_start(),
+            version_answer=TimeoutError("read timed out"),
+            health_answer=b"<html><body>not jacked</body></html>",
+            clock_step=0.1,
+        )
+
+        verify = [p for p in status["phases"] if p["name"] == "verifying_service"]
+        assert verify and all(p["status"] == "failed" for p in verify)
+        log = (tmp_path / "update.log").read_text(encoding="utf-8")
+        # A port that accepted the connection is never reported as one that
+        # never bound, on either tail.
+        assert log.count(
+            "is bound but the listener never identified itself as jacked"
+        ) == len(verify)
+        assert "did not bind" not in log
+        # LOW 1: both restart tails reject for the SAME reason, and each must
+        # still say so once - a diagnosis set shared across tails silenced the
+        # second one.
+        assert log.count(
+            "is not identified as jacked: /api/health did not answer JSON"
+        ) == len(verify)
+        assert "stopped at the service restart step" in recovery.read_text(
+            encoding="utf-8"
+        )
 
     def test_a_silent_version_endpoint_does_not_fail_the_phase(
         self, tmp_path, monkeypatch

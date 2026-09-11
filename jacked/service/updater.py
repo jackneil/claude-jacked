@@ -47,6 +47,13 @@ PORT_FREE_TIMEOUT_SECONDS = 10.0
 # How long the restarted service has to answer as the expected build.
 VERIFY_TIMEOUT_SECONDS = 20.0
 
+# Ceiling on ONE version read. It has to be generous - /api/version calls PyPI
+# on a cold cache, up to ~6s - but never the whole verify window: a listener
+# that accepts TCP and then says nothing would eat the window and leave the
+# health fingerprint no budget, which then read as "nothing ever bound" for a
+# port that was demonstrably bound.
+VERSION_READ_TIMEOUT_SECONDS = 8.0
+
 # Gap between polls in both waits.
 POLL_INTERVAL_SECONDS = 0.5
 
@@ -594,7 +601,7 @@ def run_update(
             _end("starting_service", "ok")
 
         def _verified_build(
-            expected: "str | None", deadline: float
+            expected: "str | None", deadline: float, known_mismatch: "str | None"
         ) -> "tuple[bool, str | None]":
             """Identity-check the listener once. Returns (accepted, build seen).
 
@@ -603,9 +610,19 @@ def run_update(
             answer in time, which a cold PyPI cache alone can cause - it at
             least fingerprints as a jacked service. `expected` None means the
             caller has no version to compare (the tray can update to "next"),
-            so any readable build counts.
+            so any readable build counts. `known_mismatch` is the build this
+            port already reported, if any: once it has named itself as the
+            wrong build, the fingerprint fallback is closed.
             """
-            seen = _read_reported_build(port, deadline - time.monotonic())
+            # Always leave the health fingerprint its own slice: when less
+            # than the identify budget remains, skip straight to it.
+            seen = _read_reported_build(
+                port,
+                min(
+                    VERSION_READ_TIMEOUT_SECONDS,
+                    deadline - time.monotonic() - IDENTIFY_TIMEOUT_SECONDS,
+                ),
+            )
             if seen is not None:
                 if expected is None or seen == expected:
                     log(f"Service reports build {seen}")
@@ -615,6 +632,11 @@ def run_update(
                     "still waiting for the restart"
                 )
                 return False, seen
+            if known_mismatch is not None:
+                # This port has already told us which build it is, and it is
+                # the wrong one. A health fingerprint the wrong build passes
+                # just as well is not evidence that the restart landed.
+                return False, known_mismatch
             is_jacked, reason = _identify_jacked_listener(
                 port, min(IDENTIFY_TIMEOUT_SECONDS, deadline - time.monotonic())
             )
@@ -645,9 +667,11 @@ def run_update(
             log("Verifying service came up")
             deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS
             mismatch = None
+            was_listening = False
             while time.monotonic() < deadline:
                 if is_port_listening("127.0.0.1", port):
-                    accepted, seen = _verified_build(expected, deadline)
+                    was_listening = True
+                    accepted, seen = _verified_build(expected, deadline, mismatch)
                     if accepted:
                         _end("verifying_service", "ok")
                         return True
@@ -656,6 +680,14 @@ def run_update(
 
             if mismatch is not None:
                 error = f"port {port} answers as build {mismatch}, expected {expected}"
+                recovery = "jacked service status"
+            elif was_listening:
+                # Never call a bound port dead: the operator needs to know
+                # something IS there and would not say what it is.
+                error = (
+                    f"port {port} is bound but the listener never "
+                    "identified itself as jacked"
+                )
                 recovery = "jacked service status"
             else:
                 error = (
@@ -678,6 +710,9 @@ def run_update(
             on the upgrade path, the restored version on a rollback tail, or
             None when the update had no pinned target to compare against.
             """
+            # Per tail: the rollback tail must log its own reasons even when
+            # they read the same as the upgrade tail's.
+            _diagnosed.clear()
             if not _wait_port_free():
                 return "port_busy"
             _spawn_service()
