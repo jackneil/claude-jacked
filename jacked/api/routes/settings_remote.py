@@ -18,6 +18,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from jacked.api.remote_access import read_enabled_scope
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -41,18 +43,12 @@ def _get_db(request: Request):
     return getattr(request.app.state, "db", None)
 
 
-def _read_enabled_scope(db) -> tuple[bool, str]:
-    """Read ``(enabled, scope)`` from the DB using the bare-string convention
-    (``'true'``/``'false'``); absent keys mean off + the default scope. Shared
-    by the GET/PUT response body and the restart broadcast payload."""
-    enabled = False
-    scope = "tailscale"
-    if db is not None:
-        enabled = db.get_setting("remote_access_enabled") == "true"
-        stored_scope = db.get_setting("remote_access_scope")
-        if stored_scope in ("tailscale", "all"):
-            scope = stored_scope
-    return enabled, scope
+# The reader moved to jacked/api/remote_access.py when the credential-mutation
+# gate started reading the same setting: one implementation, so the bind
+# decision and the switching decision can never diverge. Kept under the old
+# module-local name because this module's own call sites (and their tests)
+# resolve it as a module global.
+_read_enabled_scope = read_enabled_scope
 
 
 def _read_state(db) -> dict:

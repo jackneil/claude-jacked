@@ -891,3 +891,183 @@ def test_use_account_committed_switch_records_the_active_pointer(client, db):
 
     assert response.status_code == 200
     assert db.get_setting("active_account_id") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Remote-access scope gate on credential mutation
+#
+# Credential switching is no longer loopback-only: it is allowed from a remote
+# browser exactly when the persisted remote-access setting is on AND the client
+# address falls inside the enabled scope. These tests drive the real route with
+# Starlette's ``client=`` kwarg, which populates ``scope["client"]``.
+# ---------------------------------------------------------------------------
+
+_PAGE_SESSION_HEADERS = {"X-Jacked-Page-Session": "page-session-123456"}
+
+TAILNET_IP = "100.116.47.72"
+LAN_IP = "192.168.42.5"
+
+# (host, remote_access_enabled, remote_access_scope, gate_passes)
+_SCOPE_MATRIX = [
+    ("127.0.0.1", False, "tailscale", True),
+    (TAILNET_IP, False, "tailscale", False),
+    (TAILNET_IP, True, "all", True),
+    (LAN_IP, True, "all", True),
+    (TAILNET_IP, True, "tailscale", True),
+    (LAN_IP, True, "tailscale", False),
+]
+_SCOPE_IDS = [
+    "loopback-off",
+    "tailnet-off",
+    "tailnet-all",
+    "lan-all",
+    "tailnet-tailscale",
+    "lan-tailscale",
+]
+
+
+def _set_remote_access(db, enabled, scope):
+    db.set_setting("remote_access_enabled", "true" if enabled else "false")
+    db.set_setting("remote_access_scope", scope)
+
+
+def _scoped_client(app, host):
+    return TestClient(app, client=(host, 50000), headers=_PAGE_SESSION_HEADERS)
+
+
+@pytest.mark.parametrize(
+    "host,enabled,scope,allowed", _SCOPE_MATRIX, ids=_SCOPE_IDS
+)
+def test_use_account_honours_the_remote_access_scope(app, db, host, enabled, scope, allowed):
+    _set_remote_access(db, enabled, scope)
+    scoped = _scoped_client(app, host)
+
+    with (
+        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        resp = scoped.post("/api/auth/accounts/1/use")
+
+    if allowed:
+        assert resp.status_code == 200, resp.text
+        app.state.credential_switcher.assert_called_once()
+    else:
+        assert resp.status_code == 403
+        assert resp.headers["cache-control"] == "no-store"
+        assert resp.json()["error"]["code"] == "CREDENTIAL_MUTATION_LOCAL_ONLY"
+        app.state.credential_switcher.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "host,enabled,scope,allowed", _SCOPE_MATRIX, ids=_SCOPE_IDS
+)
+def test_credential_operation_status_honours_the_remote_access_scope(
+    app, db, host, enabled, scope, allowed
+):
+    _set_remote_access(db, enabled, scope)
+    scoped = _scoped_client(app, host)
+
+    resp = scoped.get("/api/auth/credential-operations/operation-scope-test-1234")
+
+    if allowed:
+        # Past the scope gate: a well-formed but unknown id is a plain 404.
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["error"]["code"] == "CREDENTIAL_OPERATION_NOT_FOUND"
+    else:
+        assert resp.status_code == 403
+        assert resp.headers["cache-control"] == "no-store"
+        assert resp.json()["error"]["code"] == "CREDENTIAL_STATUS_LOCAL_ONLY"
+
+
+def test_credential_mutation_403_messages_name_the_real_policy(app, db):
+    """The 403 copy must point at the Settings toggle, not claim local-only,
+    and carry no em-dash (user-facing string)."""
+    _set_remote_access(db, False, "tailscale")
+    scoped = _scoped_client(app, LAN_IP)
+
+    switch = scoped.post("/api/auth/accounts/1/use")
+    status_resp = scoped.get(
+        "/api/auth/credential-operations/operation-scope-test-1234"
+    )
+
+    switch_msg = switch.json()["error"]["message"]
+    status_msg = status_resp.json()["error"]["message"]
+    assert switch_msg == (
+        "Account switching from a remote browser is off. Turn on remote access "
+        "in Settings on the host machine, or open the dashboard there."
+    )
+    assert status_msg == (
+        "Credential operation status from a remote browser is off. Turn on "
+        "remote access in Settings on the host machine, or open the dashboard "
+        "there."
+    )
+    assert "—" not in switch_msg
+    assert "—" not in status_msg
+
+
+@pytest.mark.parametrize(
+    "host,enabled,scope,allowed", _SCOPE_MATRIX, ids=_SCOPE_IDS
+)
+def test_active_credential_reports_activation_permission_when_resolved(
+    app, db, host, enabled, scope, allowed
+):
+    """The dashboard reads this flag to decide whether to offer Use Account."""
+    _set_remote_access(db, enabled, scope)
+    app.state.credential_resolver = lambda: ResolverObservation(
+        ResolverState.RESOLVED,
+        CredentialIdentity(account_id=1),
+        ("authority:macOS Keychain:ok",),
+    )
+
+    resp = _scoped_client(app, host).get("/api/auth/active-credential")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["state"] == "resolved"
+    assert data["account_id"] == 1
+    assert data["allow_credential_activation"] is allowed
+
+
+@pytest.mark.parametrize(
+    "host,enabled,scope,allowed", _SCOPE_MATRIX, ids=_SCOPE_IDS
+)
+def test_active_credential_reports_activation_permission_when_unresolved(
+    app, db, host, enabled, scope, allowed
+):
+    """The unresolved early-return path carries the flag too, or a remote
+    dashboard with an unreadable keychain would silently re-enable the button."""
+    _set_remote_access(db, enabled, scope)
+    app.state.credential_resolver = lambda: ResolverObservation(
+        ResolverState.UNSUPPORTED,
+        CredentialIdentity(email="alice@test.com"),
+        ("exact build/config capability is not certified",),
+    )
+
+    resp = _scoped_client(app, host).get("/api/auth/active-credential")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["state"] == "unsupported"
+    assert data["allow_credential_activation"] is allowed
+
+
+def test_active_credential_without_a_db_still_reports_permission():
+    """No DB means no setting to read, so the answer is loopback-only."""
+    from fastapi import FastAPI
+
+    bare = FastAPI()
+    bare.include_router(router, prefix="/api/auth")
+    bare.state.db = None
+
+    local = TestClient(bare, client=("127.0.0.1", 50000))
+    remote = TestClient(bare, client=(TAILNET_IP, 50000))
+
+    assert local.get("/api/auth/active-credential").json()[
+        "allow_credential_activation"
+    ] is True
+    assert remote.get("/api/auth/active-credential").json()[
+        "allow_credential_activation"
+    ] is False

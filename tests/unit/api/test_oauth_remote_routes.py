@@ -54,10 +54,14 @@ def client(db):
 # ---------------------------------------------------------------------------
 
 
-def _request(host):
-    """Minimal stand-in — _manual_oauth only reads request.client.host."""
+def _request(host, db=None):
+    """Minimal stand-in — _manual_oauth reads request.client.host, and
+    _credential_mutation_allowed also reads request.app.state.db to find the
+    remote-access setting. ``db=None`` is the no-DB case: loopback only."""
     client = SimpleNamespace(host=host) if host is not None else None
-    return SimpleNamespace(client=client)
+    return SimpleNamespace(
+        client=client, app=SimpleNamespace(state=SimpleNamespace(db=db))
+    )
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost", "testclient"])
@@ -88,12 +92,15 @@ def test_manual_oauth_defaults_to_manual_without_a_client():
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost", "testclient"])
 def test_credential_activation_allowed_only_for_loopback(host):
-    assert routes_auth._local_mutation_allowed(_request(host)) is True
+    """With no DB there is no remote-access setting to read, so the gate is
+    loopback-only. The scope-gated remote paths live in
+    tests/unit/api/test_remote_access_policy.py and tests/unit/test_use_account.py."""
+    assert routes_auth._credential_mutation_allowed(_request(host)) is True
 
 
-@pytest.mark.parametrize("host", ["10.0.0.5", "192.168.1.20", None])
+@pytest.mark.parametrize("host", ["10.0.0.5", "192.168.1.20", "100.64.0.3", None])
 def test_credential_activation_denied_for_remote_or_unknown_client(host):
-    assert routes_auth._local_mutation_allowed(_request(host)) is False
+    assert routes_auth._credential_mutation_allowed(_request(host)) is False
 
 
 # ---------------------------------------------------------------------------

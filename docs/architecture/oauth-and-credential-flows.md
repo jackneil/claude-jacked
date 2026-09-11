@@ -319,8 +319,26 @@ transport response.
 
 ## 8. Foreground API and pending status
 
-`POST /api/auth/accounts/{account_id}/use` is local-only. It requires a valid
-page-session identifier and accepts separate action and operation IDs through:
+`POST /api/auth/accounts/{account_id}/use` is scope-gated. A loopback client
+(`127.0.0.1`, `::1`, `localhost`, and Starlette's `testclient`) may always call
+it. A remote client may call it only when the persisted remote-access setting
+is enabled *and* its address is inside the enabled scope:
+
+- scope `all`: any address that parses as an IP;
+- scope `tailscale` (also the fallback for an absent or unrecognized scope):
+  IPv4 inside Tailscale's CGNAT range `100.64.0.0/10`, or IPv6 inside
+  `fd7a:115c:a1e0::/48`.
+
+A client host that is missing or does not parse is denied unless it is a
+loopback literal, and no settings DB means loopback only. Denied requests get
+HTTP 403 with code `CREDENTIAL_MUTATION_LOCAL_ONLY`. The policy itself lives in
+`jacked/api/remote_access.py` (`credential_mutation_allowed`) and reads the
+same `remote_access_enabled` / `remote_access_scope` settings the bind planner
+uses, so enabling remote access is the single switch that grants credential
+control, which is what both remote-access confirmation dialogs promise.
+
+The route also requires a valid page-session identifier and accepts separate
+action and operation IDs through:
 
 - `X-Jacked-Page-Session`;
 - `X-Jacked-Action-Id`;
@@ -344,10 +362,18 @@ and `provider_verification`. HTTP status maps as follows:
 | 503 | `failed_preserved`, `indeterminate`, and any unmapped non-success outcome |
 
 `GET /api/auth/credential-operations/{identifier}` accepts either the action
-or operation ID, is local-only and page-session-bound, and returns a secret-free
+or operation ID, is page-session-bound, is gated by the same scope policy (403
+`CREDENTIAL_STATUS_LOCAL_ONLY` when denied), and returns a secret-free
 state. `complete` returns HTTP 200 and its stored result. `claimed` or another
 nonterminal state returns HTTP 202 with `result: null`. An expired action is
 reported as `expired`; the status endpoint does not extend its lifetime.
+
+`GET /api/auth/active-credential` publishes the same decision for the calling
+client as `allow_credential_activation` on every response path, including the
+unresolved and conflicting ones. The dashboard reads it to disable the Use
+Account button and show one hint, rather than offering a control the server
+will reject. The field defaults to `true`, so a client talking to a server that
+predates it behaves as before; the server, not the flag, remains the gate.
 
 This outcome and status contract describes Claude accounts. The Codex branch of
 the same `use` route calls the separate guarded Codex swap implementation and

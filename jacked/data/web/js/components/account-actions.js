@@ -676,6 +676,11 @@ function bindAccountEvents() {
     // evidence-qualified outcome determines what the UI may claim.
     document.querySelectorAll('.btn-use-account').forEach(btn => {
         btn.addEventListener('click', async () => {
+            // A disabled button fires no click, but the flag can flip between
+            // the render and the click (a remote-access change lands over the
+            // websocket), so refuse here too rather than start a switch the
+            // server will 403.
+            if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return;
             const id = btn.dataset.id;
             const email = btn.dataset.email || '';
             await activateAccountFromDashboard(id, email, btn);
@@ -1265,7 +1270,16 @@ async function loadActiveCredential() {
     try {
         const data = await api.get('/api/auth/active-credential');
         window.jackedState.activeCredentialAccountId = data.account_id || null;
+        // Whether THIS browser may switch accounts: loopback always may, a
+        // remote browser only while remote access is on and its address is in
+        // the enabled scope. Only an explicit false locks the UI, so a server
+        // that predates the field keeps behaving as it always has.
+        window.jackedState.credentialActivationAllowed = (data.allow_credential_activation !== false);
     } catch {
         window.jackedState.activeCredentialAccountId = null;
+        // Never lock the local UI because a GET failed. The server is the real
+        // gate and answers 403 when a switch is not permitted; a dead network
+        // must not also grey out the buttons on the host machine itself.
+        window.jackedState.credentialActivationAllowed = true;
     }
 }

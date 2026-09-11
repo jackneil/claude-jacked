@@ -21,6 +21,11 @@ from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from jacked.api.remote_access import (
+    LOOPBACK_HOSTS,
+    credential_mutation_allowed,
+    read_enabled_scope,
+)
 from jacked.web.auth import (
     fetch_usage,
     refresh_account_token,
@@ -260,7 +265,8 @@ class SubmitCodeRequest(BaseModel):
     code: str
 
 
-_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
+# Single definition, shared with the credential-mutation policy.
+_LOOPBACK_HOSTS = LOOPBACK_HOSTS
 
 
 def _manual_oauth(request: Request, remote: bool) -> bool:
@@ -278,11 +284,21 @@ def _manual_oauth(request: Request, remote: bool) -> bool:
     return host not in _LOOPBACK_HOSTS
 
 
-def _local_mutation_allowed(request: Request) -> bool:
-    """Credential mutation is local-only until remote auth and TLS exist."""
+def _credential_mutation_allowed(request: Request) -> bool:
+    """Whether this client may switch credentials (and read a switch's status).
+
+    Loopback always may. A remote client may only when the persisted
+    remote-access setting is on AND its address is inside the enabled scope,
+    so the Settings toggle is the one visible switch that hands out credential
+    control. No DB (nothing to read the setting from) means loopback only.
+
+    The policy itself lives in ``jacked/api/remote_access.py``; this wrapper
+    only resolves the three inputs off the Request.
+    """
     client = request.client
-    host = client.host.lower() if client and client.host else ""
-    return host in _LOOPBACK_HOSTS
+    host = client.host if client and client.host else None
+    enabled, scope = read_enabled_scope(_get_db(request))
+    return credential_mutation_allowed(host, enabled, scope)
 
 
 class RefreshResponse(BaseModel):
@@ -328,6 +344,11 @@ class ActiveCredentialResponse(BaseModel):
     email: Optional[str] = None
     state: str = "unknown"
     evidence: list[str] = Field(default_factory=list)
+    # Whether THIS client may switch accounts. The dashboard reads it to
+    # disable the Use Account button instead of offering one that always 403s.
+    # Defaults true so a client that never sees the field (older server)
+    # behaves as it always has.
+    allow_credential_activation: bool = True
 
 
 _ACTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
@@ -667,7 +688,7 @@ async def start_add_account(
     flow = OAuthFlow(
         db,
         manual=_manual_oauth(request, remote),
-        allow_credential_activation=_local_mutation_allowed(request),
+        allow_credential_activation=_credential_mutation_allowed(request),
     )
     result = await flow.start()
 
@@ -718,7 +739,7 @@ async def start_reauth(account_id: int, request: Request, remote: bool = False):
         purpose="primary",
         target_account_id=account_id,
         manual=_manual_oauth(request, remote),
-        allow_credential_activation=_local_mutation_allowed(request),
+        allow_credential_activation=_credential_mutation_allowed(request),
     )
     result = await flow.start()
 
@@ -1433,7 +1454,7 @@ async def start_cc_auth(account_id: int, request: Request, remote: bool = False)
         purpose="claude_code",
         target_account_id=account_id,
         manual=_manual_oauth(request, remote),
-        allow_credential_activation=_local_mutation_allowed(request),
+        allow_credential_activation=_credential_mutation_allowed(request),
     )
     result = await flow.start()
     return result
@@ -1452,14 +1473,15 @@ async def use_account(account_id: int, request: Request):
     Rejects disabled accounts, accounts with invalid validation status,
     and accounts without CC tokens (which would be un-refreshable).
     """
-    if not _local_mutation_allowed(request):
+    if not _credential_mutation_allowed(request):
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
             content={
                 "error": {
                     "message": (
-                        "Account switching is available only from this computer. "
-                        "Remote dashboards are read-only for credentials."
+                        "Account switching from a remote browser is off. Turn "
+                        "on remote access in Settings on the host machine, or "
+                        "open the dashboard there."
                     ),
                     "code": "CREDENTIAL_MUTATION_LOCAL_ONLY",
                 }
@@ -1710,12 +1732,16 @@ async def use_account(account_id: int, request: Request):
 @router.get("/credential-operations/{identifier}")
 async def get_credential_operation(identifier: str, request: Request):
     """Return local, secret-free status for a credential action/operation."""
-    if not _local_mutation_allowed(request):
+    if not _credential_mutation_allowed(request):
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
             content={
                 "error": {
-                    "message": "Credential operation status is local-only.",
+                    "message": (
+                        "Credential operation status from a remote browser is "
+                        "off. Turn on remote access in Settings on the host "
+                        "machine, or open the dashboard there."
+                    ),
                     "code": "CREDENTIAL_STATUS_LOCAL_ONLY",
                 }
             },
@@ -1792,9 +1818,13 @@ async def get_credential_operation(identifier: str, request: Request):
 @router.get("/active-credential", response_model=ActiveCredentialResponse)
 async def get_active_credential(request: Request):
     """Return the canonical evidence-qualified credential observation."""
+    # Computed once, up front: every return path below carries it, or a
+    # remote dashboard on an unresolved/conflicting path would silently
+    # re-enable a button the server will reject.
+    allow_activation = _credential_mutation_allowed(request)
     db = _get_db(request)
     if db is None:
-        return ActiveCredentialResponse()
+        return ActiveCredentialResponse(allow_credential_activation=allow_activation)
     from jacked.credentials.resolver import ResolverState
     from jacked.credentials.runtime import resolve_active_identity
 
@@ -1803,7 +1833,9 @@ async def get_active_credential(request: Request):
     evidence = list(observation.evidence)
     if observation.state is not ResolverState.RESOLVED:
         return ActiveCredentialResponse(
-            state=observation.state.value, evidence=evidence
+            state=observation.state.value,
+            evidence=evidence,
+            allow_credential_activation=allow_activation,
         )
     identity = observation.identity
     account = db.get_account(identity.account_id) if identity.account_id else None
@@ -1811,6 +1843,7 @@ async def get_active_credential(request: Request):
         return ActiveCredentialResponse(
             state=ResolverState.UNUSABLE.value,
             evidence=[*evidence, "account-stamp-not-found"],
+            allow_credential_activation=allow_activation,
         )
     observed_org = identity.organization_id or ""
     account_org = account.get("organization_uuid") or ""
@@ -1818,12 +1851,14 @@ async def get_active_credential(request: Request):
         return ActiveCredentialResponse(
             state=ResolverState.CONFLICT.value,
             evidence=[*evidence, "account-organization-conflict"],
+            allow_credential_activation=allow_activation,
         )
     return ActiveCredentialResponse(
         account_id=account["id"],
         email=account["email"],
         state=ResolverState.RESOLVED.value,
         evidence=evidence,
+        allow_credential_activation=allow_activation,
     )
 
 

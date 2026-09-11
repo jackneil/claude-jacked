@@ -50,7 +50,12 @@ _ALL_INTERFACES = "0.0.0.0"
 # Tailscale hands every node an address in the CGNAT range 100.64.0.0/10, and
 # routes 100.100.100.100 to its local service endpoint (used as the UDP
 # route-trick target). ipaddress does the membership test.
-_TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+#
+# Public because it is also the authority for "is this HTTP client on the
+# tailnet?" in jacked/api/remote_access.py. One definition, so the bind plan
+# and the credential-mutation gate can never disagree about what a tailnet
+# address is.
+TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _TAILSCALE_SERVICE_IP = "100.100.100.100"
 
 
@@ -207,7 +212,7 @@ def resolve_bind(cli_host: str | None, port: int, db=None) -> BindPlan:
 def _in_cgnat_range(ip_str: str) -> bool:
     """True only if ``ip_str`` is a valid IP inside Tailscale's 100.64.0.0/10."""
     try:
-        return ipaddress.ip_address(ip_str) in _TAILSCALE_CGNAT
+        return ipaddress.ip_address(ip_str) in TAILSCALE_CGNAT
     except (ValueError, TypeError):
         return False
 
