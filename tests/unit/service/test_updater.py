@@ -1,6 +1,7 @@
 """Tests for the auto-updater."""
 
 import itertools
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +19,47 @@ def _ok(stdout: str = "") -> MagicMock:
 
 def _fail(returncode: int = 1, stdout: str = "", stderr: str = "") -> MagicMock:
     return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class _FakeVersionResponse:
+    """Minimal stand-in for the urlopen context manager of /api/version."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeVersionResponse":
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        return False
+
+
+def _version_endpoint(answer: "str | None"):
+    """urlopen stand-in. `answer` None = the endpoint never responds."""
+    if answer is None:
+        def refuse(*_a, **_k):
+            raise OSError("connection refused")
+        return refuse
+
+    body = json.dumps({"current": answer}).encode("utf-8")
+    return lambda *_a, **_k: _FakeVersionResponse(body)
+
+
+def _script_port_mock(mock, results, run_mock) -> None:
+    """Point a port-probe mock at a bool, a finite list, or a run-count oracle."""
+    if isinstance(results, bool):
+        # The verify loop spins with sleep patched out, so a finite
+        # side_effect list would run dry mid-poll.
+        mock.return_value = results
+    elif callable(results):
+        # An oracle reading the subprocess mock, for scripts where the port
+        # answer must change once the rollback has run.
+        mock.side_effect = lambda *_a, **_k: results(run_mock)
+    else:
+        mock.side_effect = list(results)
 
 
 class TestWaitForExit:
@@ -57,11 +99,15 @@ class TestRunUpdate:
             "jacked": "/fake/jacked",
         }.get(name)
         mock_run.return_value = _ok()
-        # Port-wait: free. Verification: False = the port is bound, so the new
-        # service came up and no rollback is owed.
-        mock_port_avail.side_effect = [True, True] + [False] * 100
+        # Port-wait: free. Verification is a CONNECT probe now, so it reads
+        # is_port_listening: True = the new service answers, no rollback owed.
+        mock_port_avail.return_value = True
 
-        with patch.object(updater, "wait_for_exit", return_value=True) as mock_wait:
+        with (
+            patch.object(updater, "wait_for_exit", return_value=True) as mock_wait,
+            patch("jacked.service.updater.is_port_listening", return_value=True),
+            patch("urllib.request.urlopen", side_effect=_version_endpoint(None)),
+        ):
             updater.run_update(parent_pid=12345, extras="tray")
 
         assert mock_wait.called
@@ -227,11 +273,15 @@ class TestPortWaitBeforeServiceStart:
         mock_run.return_value = _ok()
 
         # Port-wait: busy twice, then free (loop check + post-loop confirm).
-        # Verification: False = the port is bound, so the new service came up
-        # and no rollback is owed.
-        mock_port_avail.side_effect = [False, False, True, True] + [False] * 100
+        # Verification reads is_port_listening instead: True = the new service
+        # answers, so no rollback is owed.
+        mock_port_avail.side_effect = [False, False, True, True] + [True] * 100
 
-        with patch.object(updater, "wait_for_exit", return_value=True):
+        with (
+            patch.object(updater, "wait_for_exit", return_value=True),
+            patch("jacked.service.updater.is_port_listening", return_value=True),
+            patch("urllib.request.urlopen", side_effect=_version_endpoint(None)),
+        ):
             updater.run_update(parent_pid=12345, extras="tray")
 
         mock_popen.assert_called_once()
@@ -350,10 +400,14 @@ class TestNewServiceVerification:
         monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
         mock_run.return_value = _ok()
-        # Port-wait: True (free). Then verification phase: always True (never bound).
+        # Port-wait: True (free). Verification: nothing ever answers on the
+        # port, so neither the new build nor the restored one comes up.
         mock_port_avail.return_value = True
 
-        with patch.object(updater, "wait_for_exit", return_value=True):
+        with (
+            patch.object(updater, "wait_for_exit", return_value=True),
+            patch("jacked.service.updater.is_port_listening", return_value=False),
+        ):
             updater.run_update(parent_pid=12345, extras="tray")
 
         # A new build that never binds is rolled back, and the restored build
@@ -369,19 +423,18 @@ class TestNewServiceVerification:
 
 
 def _restored_build_binds(after_run_calls: int):
-    """Port oracle: nothing binds until the rollback ran, then the old build does.
+    """Listening oracle: nothing answers until the rollback reinstalled the old build.
 
-    `is_port_available` is True when the port is FREE. The restored build's
-    start-and-verify tail first waits for the port to be free (two reads), then
-    polls until it is taken - so the oracle answers free, free, then bound.
+    `is_port_listening` is True when something ANSWERS on the port. The new
+    build never comes up, so the verify phase polls to its deadline; once the
+    rollback has run (`run.call_count >= after_run_calls`) the restored build's
+    own start-and-verify tail finds a live listener. The companion
+    `is_port_available` answer stays True (free) throughout: the port is only
+    ever occupied by a service this run started, never by a squatter.
     """
-    state = {"after": 0}
 
     def oracle(run):
-        if run.call_count < after_run_calls:
-            return True
-        state["after"] += 1
-        return state["after"] <= 2
+        return run.call_count >= after_run_calls
 
     return oracle
 
@@ -398,8 +451,16 @@ class TestUpdaterRollback:
                     "--force", "--refresh"]
 
     @staticmethod
-    def _run_update(monkeypatch, tmp_path, run_results, port_results):
-        """Drive run_update with scripted subprocess and port outcomes."""
+    def _run_update(
+        monkeypatch, tmp_path, run_results, port_results, listen_results,
+        version_answer=None,
+    ):
+        """Drive run_update with scripted subprocess, port and listener outcomes.
+
+        `port_results` scripts `is_port_available` (True = free to bind) and
+        `listen_results` scripts `is_port_listening` (True = a service answers).
+        Each accepts a bool, a finite list, or a run-count oracle.
+        """
         from jacked.service import updater, update_status as us_mod
 
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
@@ -417,6 +478,9 @@ class TestUpdaterRollback:
             patch("jacked.service.updater.time.monotonic",
                   side_effect=itertools.count(0.0, 5.0)),
             patch("jacked.service.updater.is_port_available") as port,
+            patch("jacked.service.updater.is_port_listening") as listening,
+            patch("urllib.request.urlopen",
+                  side_effect=_version_endpoint(version_answer)),
             patch("jacked.service.updater.find_bin") as find,
             patch("subprocess.run") as run,
             patch("subprocess.Popen") as popen,
@@ -427,16 +491,8 @@ class TestUpdaterRollback:
                 "uv": "/fake/uv", "jacked": "/fake/jacked",
             }.get(name)
             run.side_effect = list(run_results)
-            if isinstance(port_results, bool):
-                # The verify loop spins with sleep patched out, so a finite
-                # side_effect list would run dry mid-poll.
-                port.return_value = port_results
-            elif callable(port_results):
-                # An oracle reading the subprocess mock, for scripts where the
-                # port answer must change once the rollback has run.
-                port.side_effect = lambda *_a, **_k: port_results(run)
-            else:
-                port.side_effect = list(port_results)
+            _script_port_mock(port, port_results, run)
+            _script_port_mock(listening, listen_results, run)
             updater.run_update(
                 parent_pid=12345, extras="tray", target_version="0.100.0"
             )
@@ -454,8 +510,10 @@ class TestUpdaterRollback:
                 _ok(),                                        # rollback install
                 _ok(),                                        # jacked install --force
             ],
-            # Port free for the wait, then bound so the restored build verifies.
-            port_results=[True, True] + [False] * 100,
+            # The port is free to bind throughout; the restored build answers
+            # on it, so its verify phase passes.
+            port_results=True,
+            listen_results=True,
         )
 
         argvs = [call[0][0] for call in run.call_args_list]
@@ -484,9 +542,10 @@ class TestUpdaterRollback:
                 _ok(),                             # rollback install
                 _ok(),                             # jacked install --force
             ],
-            # The new build never binds. After the rollback the port reads
-            # free for the wait phase, then bound - the restored build is up.
-            port_results=_restored_build_binds(after_run_calls=4),
+            # The new build never answers. After the rollback the restored
+            # build does, so only the second verify passes.
+            port_results=True,
+            listen_results=_restored_build_binds(after_run_calls=4),
         )
 
         argvs = [call[0][0] for call in run.call_args_list]
@@ -515,6 +574,7 @@ class TestUpdaterRollback:
                 _ok(),                             # jacked install --force
             ],
             port_results=True,
+            listen_results=False,
         )
 
         rollback_calls = [
@@ -534,7 +594,8 @@ class TestUpdaterRollback:
                 _fail(1, stderr="[FAIL] ValueError: nope"),
                 _fail(2),                               # rollback install fails
             ],
-            port_results=[True, True] + [False] * 100,
+            port_results=True,
+            listen_results=True,
         )
 
         phases = {p["name"]: p["status"] for p in status["phases"]}
@@ -553,7 +614,8 @@ class TestUpdaterRollback:
                 _ok("[OK] Service contract OK"),
                 _ok(),
             ],
-            port_results=[True, True] + [False] * 100,
+            port_results=True,
+            listen_results=True,
         )
 
         assert status["overall"] == "succeeded"
@@ -581,7 +643,8 @@ class TestUpdaterPartialRollback:
                 _ok(),                                  # rollback install: ok
                 _fail(5),                               # its jacked install: fails
             ],
-            port_results=[True, True] + [False] * 100,
+            port_results=True,
+            listen_results=True,
         )
 
         phases = {p["name"]: p["status"] for p in status["phases"]}
@@ -603,14 +666,108 @@ class TestUpdaterPartialRollback:
                 _ok(),                                  # rollback install
                 _ok(),                                  # jacked install --force
             ],
-            # The port stays free forever: nothing ever comes up.
+            # Nothing ever answers on the port: no service comes up.
             port_results=True,
+            listen_results=False,
         )
 
         assert status["overall"] == "failed"
         body = recovery.read_text(encoding="utf-8")
         assert "stopped at the service restart step" in body
         assert "rolled back to v0.95.0" not in body
+
+
+def _healthy_runs():
+    """uv install, a passing preflight, jacked install --force."""
+    return [_ok(), _ok("[OK] Service contract OK"), _ok()]
+
+
+class TestVerifyingServiceUsesAConnectProbe:
+    """Verification asks whether the service ANSWERS, not whether a bind fits.
+
+    With the dashboard bound to 0.0.0.0 (remote access on) a 127.0.0.1 bind
+    probe still succeeds next to the wildcard listener, so the old check
+    rolled healthy upgrades back. Every test here keeps `is_port_available`
+    True (the port is bindable) and lets the connect probe decide.
+    """
+
+    _run_update = staticmethod(TestUpdaterRollback._run_update)
+
+    def test_a_listening_service_passes_verification(self, tmp_path, monkeypatch):
+        from jacked.service import update_status as us_mod
+
+        succeeded = []
+        real_mark = us_mod.mark_succeeded
+
+        def spy(*args, **kwargs):
+            succeeded.append(args)
+            return real_mark(*args, **kwargs)
+
+        monkeypatch.setattr(us_mod, "mark_succeeded", spy)
+
+        _run, popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs(),
+            port_results=True,
+            listen_results=True,
+        )
+
+        phases = {p["name"]: p["status"] for p in status["phases"]}
+        assert phases["verifying_service"] == "ok"
+        assert status["overall"] == "succeeded"
+        assert succeeded, "mark_succeeded never ran for a service that answers"
+        assert not recovery.exists()
+        popen.assert_called_once()
+
+    def test_a_service_that_never_answers_fails_verification(
+        self, tmp_path, monkeypatch
+    ):
+        _run, _popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs() + [_ok(), _ok()],  # + rollback install
+            port_results=True,
+            listen_results=False,
+        )
+
+        verify = [p for p in status["phases"] if p["name"] == "verifying_service"]
+        assert verify, "the verify phase never ran"
+        assert all(p["status"] == "failed" for p in verify)
+        assert status["overall"] == "failed"
+        assert recovery.exists()
+        assert "never became ready" in recovery.read_text(encoding="utf-8")
+
+    def test_the_reported_build_is_logged_when_version_answers(
+        self, tmp_path, monkeypatch
+    ):
+        _run, _popen, status, _recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs(),
+            port_results=True,
+            listen_results=True,
+            version_answer="0.100.0",
+        )
+
+        assert status["overall"] == "succeeded"
+        log = (tmp_path / "update.log").read_text(encoding="utf-8")
+        assert "Service reports build 0.100.0" in log
+
+    def test_a_silent_version_endpoint_does_not_fail_the_phase(
+        self, tmp_path, monkeypatch
+    ):
+        _run, _popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs(),
+            port_results=True,
+            listen_results=True,
+            version_answer=None,   # /api/version refuses the connection
+        )
+
+        phases = {p["name"]: p["status"] for p in status["phases"]}
+        assert phases["verifying_service"] == "ok"
+        assert status["overall"] == "succeeded"
+        assert not recovery.exists()
+        log = (tmp_path / "update.log").read_text(encoding="utf-8")
+        assert "version could not be read" in log
 
 
 class TestPreflightSubprocessGuards:
@@ -639,8 +796,9 @@ class TestPreflightSubprocessGuards:
             patch("jacked.service.updater.time.sleep", lambda _s: None),
             patch("jacked.service.updater.time.monotonic",
                   side_effect=itertools.count(0.0, 5.0)),
-            patch("jacked.service.updater.is_port_available",
-                  side_effect=[True, True] + [False] * 100),
+            patch("jacked.service.updater.is_port_available", return_value=True),
+            patch("jacked.service.updater.is_port_listening", return_value=True),
+            patch("urllib.request.urlopen", side_effect=_version_endpoint(None)),
             patch("jacked.service.updater.find_bin") as find,
             patch("subprocess.run", side_effect=fake_run),
             patch("subprocess.Popen"),
@@ -759,7 +917,8 @@ class TestJackedInstallFailure:
                 _ok(),                             # rollback install
                 _ok(),                             # jacked install --force
             ],
-            port_results=[True, True] + [False] * 100,
+            port_results=True,
+            listen_results=True,
         )
 
         argvs = [call[0][0] for call in run.call_args_list]
@@ -942,12 +1101,15 @@ class TestUpdaterWritesStatus:
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
         mock_run.return_value = _ok()
 
-        # Port-wait phase: True (port is free, break loop) — may be called
-        # twice (loop check + post-loop confirmation). Verify phase: False
-        # (port is bound = service came up).
-        mock_port_avail.side_effect = [True, True] + [False] * 100
+        # Port-wait phase: True (port is free, break loop). Verify phase asks
+        # is_port_listening: True = a service answers = it came up.
+        mock_port_avail.return_value = True
 
-        with patch.object(updater, "wait_for_exit", return_value=True):
+        with (
+            patch.object(updater, "wait_for_exit", return_value=True),
+            patch("jacked.service.updater.is_port_listening", return_value=True),
+            patch("urllib.request.urlopen", side_effect=_version_endpoint(None)),
+        ):
             updater.run_update(parent_pid=12345, extras="tray", target_version="0.41.19")
 
         data = us_mod.read_status(tmp_path / "status.json")
@@ -1223,7 +1385,7 @@ class TestRunUpdateReusesTrayPreInit:
         monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
         mock_run.return_value = _ok()
-        mock_port_avail.side_effect = [True, True] + [False] * 100
+        mock_port_avail.return_value = True
 
         us_mod.init_status(
             us_mod.UPDATE_STATUS_FILE,
@@ -1233,7 +1395,11 @@ class TestRunUpdateReusesTrayPreInit:
             preinit=True,
         )
 
-        with patch.object(updater, "wait_for_exit", return_value=True):
+        with (
+            patch.object(updater, "wait_for_exit", return_value=True),
+            patch("jacked.service.updater.is_port_listening", return_value=True),
+            patch("urllib.request.urlopen", side_effect=_version_endpoint(None)),
+        ):
             updater.run_update(parent_pid=12345, extras="tray", target_version="0.41.20")
 
         data = us_mod.read_status(us_mod.UPDATE_STATUS_FILE)
@@ -1326,13 +1492,17 @@ class TestRunUpdateTerminalStatus:
         monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", tmp_path / "status.json")
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
         mock_run.return_value = _ok()
-        mock_port_avail.side_effect = [True, True] + [False] * 100
+        mock_port_avail.return_value = True
 
         def boom(*_args, **_kw):
             raise OSError("disk full")
         monkeypatch.setattr(us_mod, "mark_succeeded", boom)
 
-        with patch.object(updater, "wait_for_exit", return_value=True):
+        with (
+            patch.object(updater, "wait_for_exit", return_value=True),
+            patch("jacked.service.updater.is_port_listening", return_value=True),
+            patch("urllib.request.urlopen", side_effect=_version_endpoint(None)),
+        ):
             updater.run_update(parent_pid=12345, extras="tray", target_version="0.41.20")
 
         data = us_mod.read_status(tmp_path / "status.json")
@@ -1429,7 +1599,8 @@ class TestUpdaterRollbackStepsThatCannotSpawn:
     @staticmethod
     def _run_update(monkeypatch, tmp_path, run_results):
         return TestUpdaterRollback._run_update(
-            monkeypatch, tmp_path, run_results, port_results=True
+            monkeypatch, tmp_path, run_results,
+            port_results=True, listen_results=False,
         )
 
     def test_a_package_rollback_that_cannot_spawn_is_recorded(
@@ -1533,7 +1704,8 @@ class TestUpdaterHoldsTheExclusiveLock:
         from jacked.service.update_status import acquire_update_lock
 
         TestUpdaterRollback._run_update(
-            monkeypatch, tmp_path, [_ok(), _ok(), _ok()], port_results=False
+            monkeypatch, tmp_path, [_ok(), _ok(), _ok()],
+            port_results=False, listen_results=True,
         )
         handle = acquire_update_lock(tmp_path / "status.json")
         assert handle is not None, "run_update never released the update lock"

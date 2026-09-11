@@ -64,9 +64,17 @@ class TestUpdaterUsesNativeRestart:
             "jacked": "/fake/jacked",
         }.get(name)
         mock_run.return_value = MagicMock(returncode=0)
-        mock_port_avail.side_effect = [True, True] + [False] * 100
+        # The port is free to bind; verification is a connect probe, so the
+        # service that came up is seen through is_port_listening. Both are
+        # pinned here: without the listening patch the phase would probe the
+        # developer's own :8321.
+        mock_port_avail.return_value = True
 
-        with patch.object(updater, "wait_for_exit", return_value=True):
+        with (
+            patch.object(updater, "wait_for_exit", return_value=True),
+            patch("jacked.service.updater.is_port_listening", return_value=True),
+            patch("urllib.request.urlopen", side_effect=OSError("no endpoint")),
+        ):
             updater.run_update(
                 parent_pid=12345, extras="tray", target_version="0.41.22"
             )
@@ -117,9 +125,17 @@ class TestUpdaterUsesNativeRestart:
             "jacked": "/fake/jacked",
         }.get(name)
         mock_run.return_value = MagicMock(returncode=0)
-        mock_port_avail.side_effect = [True, True] + [False] * 100
+        # The port is free to bind; verification is a connect probe, so the
+        # service that came up is seen through is_port_listening. Both are
+        # pinned here: without the listening patch the phase would probe the
+        # developer's own :8321.
+        mock_port_avail.return_value = True
 
-        with patch.object(updater, "wait_for_exit", return_value=True):
+        with (
+            patch.object(updater, "wait_for_exit", return_value=True),
+            patch("jacked.service.updater.is_port_listening", return_value=True),
+            patch("urllib.request.urlopen", side_effect=OSError("no endpoint")),
+        ):
             updater.run_update(
                 parent_pid=12345, extras="tray", target_version="0.41.22"
             )

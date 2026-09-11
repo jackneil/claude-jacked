@@ -8,15 +8,21 @@ migrates settings.json via `jacked install`, then spawns a fresh
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
 import time
+import urllib.request
 from typing import NamedTuple
 
 from jacked.findbin import find_bin
 from jacked.service import CLAUDE_DIR
-from jacked.service.process import is_process_alive, is_port_available
+from jacked.service.process import (
+    is_process_alive,
+    is_port_available,
+    is_port_listening,
+)
 from jacked.winproc import NO_WINDOW
 
 UPDATE_LOG = CLAUDE_DIR / "jacked-update.log"
@@ -453,19 +459,53 @@ def run_update(
                 _restart_attempted[0] = True
             _end("starting_service", "ok")
 
+        def _log_reported_build(deadline: float) -> None:
+            """Log the build the live service reports. Never raises.
+
+            Informational only: the listening probe alone decides the phase,
+            so a dashboard that is up but slow to answer /api/version is still
+            a healthy service.
+            """
+            budget = min(2.0, max(0.0, deadline - time.monotonic()))
+            build = None
+            if budget > 0:
+                try:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/api/version", timeout=budget
+                    ) as response:
+                        build = json.loads(response.read().decode("utf-8")).get(
+                            "current"
+                        )
+                except Exception:  # noqa: BLE001 - never fail the phase on this
+                    build = None
+            if build:
+                log(f"Service reports build {build}")
+            else:
+                log(
+                    f"Service is listening on :{port}, "
+                    "but its version could not be read"
+                )
+
         def _verify_service() -> bool:
-            """Wait for the new service to bind the port. True when it did."""
+            """Wait for the new service to answer on the port. True when it did.
+
+            Connect-based: with remote access on, the service listens on
+            ``*:port``, and a 127.0.0.1 bind probe succeeds right next to that
+            wildcard listener - which had this phase declare a healthy upgrade
+            dead and roll it back.
+            """
             _begin("verifying_service")
             log("Verifying service came up")
             verify_deadline = time.monotonic() + 20.0
             came_up = False
             while time.monotonic() < verify_deadline:
-                if not is_port_available("127.0.0.1", port):
+                if is_port_listening("127.0.0.1", port):
                     came_up = True
                     break
                 time.sleep(0.5)
 
             if came_up:
+                _log_reported_build(verify_deadline)
                 _end("verifying_service", "ok")
                 return True
             _end(

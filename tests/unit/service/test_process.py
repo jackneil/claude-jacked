@@ -247,6 +247,70 @@ class TestCheckPort:
         finally:
             sock.close()
 
+    @staticmethod
+    def _listener(host: str):
+        """A real listening socket on an ephemeral port. Returns (sock, port).
+
+        The backlog is deliberately larger than 1: nothing here accepts, and
+        each probe leaves its connection queued, so a backlog of 1 would have
+        the SECOND probe time out and read as "no listener".
+        """
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind((host, 0))
+        sock.listen(8)
+        return sock, sock.getsockname()[1]
+
+    def test_wildcard_listener_is_seen_as_in_use(self):
+        """A 0.0.0.0 listener must not read as an available 127.0.0.1 port.
+
+        On macOS/BSD a specific-address bind with SO_REUSEADDR succeeds right
+        next to a wildcard listener, so the bind probe alone said "available"
+        while the dashboard was answering on that very port.
+        """
+        from jacked.service.process import is_port_available, is_port_listening
+        sock, port = self._listener("0.0.0.0")
+        try:
+            assert is_port_listening("127.0.0.1", port) is True
+            assert is_port_available("127.0.0.1", port) is False
+        finally:
+            sock.close()
+        # The connect above may leave a TIME_WAIT entry; SO_REUSEADDR must
+        # still call the released port available.
+        assert is_port_available("127.0.0.1", port) is True
+
+    def test_loopback_listener_is_seen_as_in_use(self):
+        from jacked.service.process import is_port_available, is_port_listening
+        sock, port = self._listener("127.0.0.1")
+        try:
+            assert is_port_listening("127.0.0.1", port) is True
+            assert is_port_available("127.0.0.1", port) is False
+        finally:
+            sock.close()
+        assert is_port_available("127.0.0.1", port) is True
+
+    def test_port_with_no_listener_is_not_listening(self):
+        import socket
+        from jacked.service.process import is_port_listening
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        assert is_port_listening("127.0.0.1", port) is False
+
+    def test_wildcard_host_probes_loopback_for_a_listener(self):
+        """is_port_available("0.0.0.0", port) asks 127.0.0.1 whether anyone answers."""
+        from jacked.service import process
+        seen = []
+
+        def fake_listening(host, port, timeout=0.5):
+            seen.append((host, port))
+            return True
+
+        with patch.object(process, "is_port_listening", fake_listening):
+            assert process.is_port_available("0.0.0.0", 59998) is False
+        assert seen == [("127.0.0.1", 59998)]
+
 
 class TestStopProcess:
     def test_returns_false_for_no_pid_file(self, tmp_path):
