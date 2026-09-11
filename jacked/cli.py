@@ -353,12 +353,12 @@ def webux(host: str | None, port: int, no_browser: bool, reload: bool):
     # bypasses the settings read entirely, so this is the only place the two
     # decisions (who can reach it, who may switch credentials) are stated
     # together.
-    log_remote_exposure(plan)
     _os.environ["JACKED_HOST"] = plan.primary_host
     _os.environ["JACKED_PORT"] = str(port)
 
     try:
         socks = create_sockets(plan)
+        log_remote_exposure(plan)
     except OSError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         console.print(f"Is another process already using port {port}?")

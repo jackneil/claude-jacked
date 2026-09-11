@@ -192,9 +192,9 @@ def log_remote_exposure(plan: BindPlan, db=None) -> str | None:
     coming up, so an unreadable settings DB degrades to the fail-closed
     ``(False, default)`` reading rather than propagating.
     """
-    from jacked.api.remote_access import read_enabled_scope
-
     try:
+        from jacked.api.remote_access import read_enabled_scope
+
         if db is None:
             from jacked.web.database import Database
 

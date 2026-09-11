@@ -218,9 +218,18 @@ def test_read_enabled_scope_fails_closed_on_a_broken_db(caplog):
     assert "remote-access" in caplog.text.lower()
 
 
-def test_read_enabled_scope_error_log_carries_no_secret():
+def test_read_enabled_scope_error_log_carries_no_secret(caplog):
+    import logging
+
     db = _BrokenDB()
-    assert read_enabled_scope(db) == (False, DEFAULT_SCOPE)
+    with caplog.at_level(logging.WARNING, logger="jacked.api.remote_access"):
+        assert read_enabled_scope(db) == (False, DEFAULT_SCOPE)
+    text = caplog.text
+    # The failure class is named so an operator can act on it ...
+    assert "OperationalError" in text or "database is locked" in text
+    # ... and no setting value or credential-looking token is echoed.
+    for secret in ("remote_access_scope", "sk-ant", "refresh_token", "true"):
+        assert secret not in text, secret
 
 
 # ---------------------------------------------------------------------------

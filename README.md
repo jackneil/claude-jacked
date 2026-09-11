@@ -199,7 +199,7 @@ A network bind is hardened server-side: CORS is never wildcarded (the frontend i
 - `JACKED_ALLOWED_ORIGINS`: extra exact origins (`scheme://host[:port]`) allowed cross-origin API/WebSocket access. Needed behind a reverse proxy that rewrites `Host` to the loopback upstream (symptom: page loads but every write and the live WebSocket fail with 403; `tailscale serve` preserves `Host` and needs nothing).
 - `JACKED_ALLOWED_HOSTS`: extra hostnames accepted in the `Host` header, e.g. a custom DNS name pointing at the machine.
 
-Prefer not to rebind at all? `tailscale serve --bg 8321` proxies the loopback-bound dashboard to your tailnet over HTTPS with no jacked configuration changes.
+Prefer not to rebind at all? `tailscale serve --bg 8321` proxies the loopback-bound dashboard to your tailnet over HTTPS with no jacked configuration changes. Viewers still arrive as their tailnet address, so the dashboard is view-only for them until the remote access toggle is on: the toggle, not the proxy, grants account switching.
 
 ### Account switching, auto-swap, and session truth
 

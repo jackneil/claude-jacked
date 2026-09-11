@@ -365,7 +365,11 @@ const CREDENTIAL_SWITCH_HINTS = {
 // cause and the safer thing to point at, so it is the fallback.
 function credentialSwitchHint() {
     const reason = window.jackedState.credentialActivationReason;
-    return CREDENTIAL_SWITCH_HINTS[reason] || CREDENTIAL_SWITCH_HINTS.remote_access_off;
+    // Own-property lookup only: a reason the server never sends must not
+    // resolve through Object.prototype into a title attribute.
+    return Object.prototype.hasOwnProperty.call(CREDENTIAL_SWITCH_HINTS, reason)
+        ? CREDENTIAL_SWITCH_HINTS[reason]
+        : CREDENTIAL_SWITCH_HINTS.remote_access_off;
 }
 
 /**
