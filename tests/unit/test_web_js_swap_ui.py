@@ -19,6 +19,7 @@ AUTO_SWAP_JS = WEB_JS / "components" / "auto-swap.js"
 ACCOUNTS_JS = WEB_JS / "components" / "accounts.js"
 ACCOUNT_ACTIONS_JS = WEB_JS / "components" / "account-actions.js"
 WEBSOCKET_JS = WEB_JS / "websocket.js"
+UTILS_JS = WEB_JS / "utils.js"
 
 EM_DASH = "—"
 
@@ -146,7 +147,7 @@ def _run_js(tmp_path, snippet, js_file=AUTO_SWAP_JS):
 
 @pytest.mark.parametrize(
     "js_file",
-    [AUTO_SWAP_JS, ACCOUNTS_JS, ACCOUNT_ACTIONS_JS, WEBSOCKET_JS],
+    [AUTO_SWAP_JS, ACCOUNTS_JS, ACCOUNT_ACTIONS_JS, WEBSOCKET_JS, UTILS_JS],
     ids=lambda p: p.name,
 )
 def test_node_syntax_check(js_file):

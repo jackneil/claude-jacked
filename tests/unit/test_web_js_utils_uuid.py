@@ -27,7 +27,11 @@ UUID_V4_RE = re.compile(
 
 
 def _generate_uuid_source() -> str:
-    """Return the text of the ``generateUuid`` declaration in utils.js."""
+    """Return the text of the ``generateUuid`` declaration in utils.js.
+
+    Brace-counting, so the body must stay brace-balanced outside ``${}``
+    (template-literal placeholders count their own braces here too).
+    """
     source = UTILS_JS.read_text()
     start = source.index("function generateUuid(")
     depth = 0
@@ -99,7 +103,11 @@ __GENERATE_UUID__
 console.log(JSON.stringify(out));
 """.replace("__GENERATE_UUID__", _generate_uuid_source())
     proc = subprocess.run(
-        ["node", "-e", program], capture_output=True, text=True, check=True
+        ["node", "-e", program], capture_output=True, text=True,
+        encoding="utf-8", timeout=30,
+    )
+    assert proc.returncode == 0, (
+        f"node failed:\nstderr={proc.stderr}\nstdout={proc.stdout}"
     )
     uuids = json.loads(proc.stdout)
 
@@ -107,3 +115,14 @@ console.log(JSON.stringify(out));
     for value in uuids:
         assert UUID_V4_RE.match(value), value
     assert len(set(uuids)) == 200
+
+
+def test_utils_js_is_the_only_place_that_touches_crypto_random_uuid() -> None:
+    """One guarded call site, so no component can regress to the raw API."""
+    offenders = sorted(
+        str(path.relative_to(WEB))
+        for path in (WEB / "js").glob("**/*.js")
+        if "crypto.randomUUID" in path.read_text(errors="ignore")
+    )
+
+    assert offenders == ["js/utils.js"]

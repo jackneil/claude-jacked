@@ -444,6 +444,51 @@ async function pollCredentialOperation(actionId, operationId, pageSessionId, ema
     showToast(`Credential operation ${operationId} is still running. Check again before starting another switch.`, 'warning', 10000);
 }
 
+// Mint the three idempotency ids for one credential switch. The page-session
+// id outlives the switch, so it is persisted; the other two are per-attempt.
+function mintSwitchIds() {
+    const actionId = generateUuid();
+    const operationId = generateUuid();
+    let pageSessionId = sessionStorage.getItem('jacked-page-session-id');
+    if (!pageSessionId) {
+        pageSessionId = generateUuid();
+        sessionStorage.setItem('jacked-page-session-id', pageSessionId);
+    }
+    return { actionId, operationId, pageSessionId };
+}
+
+// Send the switch and turn whatever comes back into one truthful message.
+async function requestSwitch(id, email, ids) {
+    const { actionId, operationId, pageSessionId } = ids;
+    const headers = {
+        'X-Jacked-Action-Id': actionId,
+        'X-Jacked-Operation-Id': operationId,
+        'X-Jacked-Page-Session': pageSessionId,
+    };
+    try {
+        const result = await api.post(`/api/auth/accounts/${id}/use`, undefined, { headers });
+        showCredentialActivationResult(result, email);
+        await loadActiveCredential();
+    } catch (e) {
+        const outcome = e.payload || {};
+        if (e.code === 'TIMEOUT') {
+            await pollCredentialOperation(
+                actionId, operationId, pageSessionId, email
+            );
+        } else if (outcome.status === 'interactive_required') {
+            showToast(outcome.message || 'Credential access needs foreground confirmation. Try again and approve the prompt.', 'warning', 8000);
+        } else if (outcome.status === 'unsupported') {
+            showToast(outcome.message || 'This Claude build is not certified for credential switching.', 'error', 8000);
+        } else if (outcome.status === 'observed_target_unfenced') {
+            showCredentialActivationResult(outcome, email);
+        } else {
+            // Mostly the 403 local-only refusal, which is long: give it the
+            // same reading time as its siblings, and never render `undefined`.
+            showToast(outcome.message || e.message || 'The switch could not be completed.', 'error', 8000);
+        }
+    }
+}
+
 async function activateAccountFromDashboard(id, email, sourceButton) {
     if (window.jackedState._accountActionInFlight) {
         showToast('Another action is still running. Finish it, or cancel the sign-in banner above, then try again.', 'warning', 4000);
@@ -459,54 +504,17 @@ async function activateAccountFromDashboard(id, email, sourceButton) {
         // Minted inside the try: generateUuid() and sessionStorage can both
         // throw, and a throw out here would strand the button on "Switching"
         // and latch _accountActionInFlight true for the life of the page.
-        const actionId = generateUuid();
-        const operationId = generateUuid();
-        let pageSessionId = sessionStorage.getItem('jacked-page-session-id');
-        if (!pageSessionId) {
-            pageSessionId = generateUuid();
-            sessionStorage.setItem('jacked-page-session-id', pageSessionId);
-        }
-        try {
-            const result = await api.post(
-                `/api/auth/accounts/${id}/use`,
-                undefined,
-                {
-                    headers: {
-                        'X-Jacked-Action-Id': actionId,
-                        'X-Jacked-Operation-Id': operationId,
-                        'X-Jacked-Page-Session': pageSessionId,
-                    },
-                },
-            );
-            showCredentialActivationResult(result, email);
-            await loadActiveCredential();
-        } catch (e) {
-            const outcome = e.payload || {};
-            if (e.code === 'TIMEOUT') {
-                await pollCredentialOperation(
-                    actionId, operationId, pageSessionId, email
-                );
-            } else if (outcome.status === 'interactive_required') {
-                showToast(outcome.message || 'Credential access needs foreground confirmation. Try again and approve the prompt.', 'warning', 8000);
-            } else if (outcome.status === 'unsupported') {
-                showToast(outcome.message || 'This Claude build is not certified for credential switching.', 'error', 8000);
-            } else if (outcome.status === 'observed_target_unfenced') {
-                showCredentialActivationResult(outcome, email);
-            } else {
-                showToast(outcome.message || e.message, 'error');
-            }
-        }
+        await requestSwitch(id, email, mintSwitchIds());
     } catch (e) {
-        // Not an ApiError: a synchronous failure before the request went out.
-        // Say so, rather than leaving the click with no visible result.
-        showToast(e.message || String(e), 'error');
+        console.error('Account switch failed:', e);
+        showToast('Could not start the switch: ' + (e && e.message ? e.message : String(e)), 'error', 8000);
     } finally {
         if (sourceButton) {
             sourceButton.disabled = false;
             sourceButton.textContent = originalButtonText;
         }
         window.jackedState._accountActionInFlight = false;
-        await refreshAndRender();
+        await refreshAndRender().catch((err) => showToast('The page could not refresh: ' + (err && err.message ? err.message : String(err)), 'warning', 8000));
     }
 }
 
@@ -717,7 +725,7 @@ function bindAccountEvents() {
                 if (ok) {
                     showToast(`Copied: ${cmd}`, 'success', 2000);
                 } else {
-                    showToast(`Copy failed \u2014 run manually: ${cmd}`, 'warning', 4000);
+                    showToast(`Copy failed. Run manually: ${cmd}`, 'warning', 4000);
                 }
             }
         });
