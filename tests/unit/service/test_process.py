@@ -208,6 +208,27 @@ class TestIsProcessAlive:
         with patch("os.kill", side_effect=PermissionError):
             assert _posix_process_liveness(12345) is True
 
+    def test_windows_host_never_probes_with_os_kill(self, monkeypatch):
+        """``os.kill(pid, 0)`` on Windows is ``GenerateConsoleCtrlEvent``.
+
+        Signal 0 is ``CTRL_C_EVENT`` there, so the POSIX probe would interrupt
+        every process on the console, pytest included. Tests routinely fake
+        ``sys.platform`` to drive the POSIX upgrade path, so the dispatch must
+        follow the real OS as well: a Windows host takes the handle-based
+        probe even while ``sys.platform`` claims to be darwin.
+        """
+        from jacked.service import process
+
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(process, "_windows_process_liveness", lambda pid: True)
+
+        def _never(*_args):
+            raise AssertionError("os.kill must not be used as a probe on Windows")
+
+        monkeypatch.setattr(os, "kill", _never)
+        assert process.process_liveness(12345) is True
+
 
 class TestCheckPort:
     def test_unused_port_is_available(self):

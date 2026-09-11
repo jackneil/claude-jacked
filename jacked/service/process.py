@@ -277,7 +277,13 @@ def process_liveness(pid: int) -> bool | None:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or pid > _PID_MAX:
         return False
     try:
-        if sys.platform == "win32":
+        # The real OS decides the probe, not just ``sys.platform``: on Windows
+        # ``os.kill(pid, 0)`` is not a probe at all. Signal 0 is
+        # ``CTRL_C_EVENT``, so it becomes ``GenerateConsoleCtrlEvent`` and
+        # interrupts every process sharing the console (this one included).
+        # A test that fakes ``sys.platform`` on a Windows host must still
+        # never reach that call.
+        if sys.platform == "win32" or os.name == "nt":
             return _windows_process_liveness(pid)
         return _posix_process_liveness(pid)
     except (OSError, OverflowError, ValueError):
