@@ -251,8 +251,16 @@ def test_use_account_ui_tells_the_user_whether_open_sessions_follow() -> None:
 _STUBS = """
 const { webcrypto } = require('node:crypto');
 // A crypto WITHOUT randomUUID is exactly what a non-secure context (plain
-// http on a hostname) hands the page.
-global.crypto = { getRandomValues: (a) => webcrypto.getRandomValues(a) };
+// http on a hostname) hands the page. Node exposes globalThis.crypto through a
+// getter-only accessor, so a plain assignment is a silent no-op: replace the
+// property instead, and count fallback calls so the test can prove which
+// branch of generateUuid actually ran.
+let _fallbackCalls = 0;
+Object.defineProperty(globalThis, 'crypto', {
+    value: { getRandomValues: (a) => { _fallbackCalls++; return webcrypto.getRandomValues(a); } },
+    configurable: true,
+    writable: true,
+});
 const _session = {};
 global.sessionStorage = {
     getItem: (k) => Object.prototype.hasOwnProperty.call(_session, k) ? _session[k] : null,
@@ -276,6 +284,8 @@ const report = () => ({
     toasts: __getToasts(),
     refreshed: _refreshed,
     shownResults: _shownResults,
+    randomUUID: typeof crypto.randomUUID,
+    fallbackCalls: _fallbackCalls,
 });
 """
 
@@ -333,6 +343,10 @@ activateAccountFromDashboard('5', 'x@y', btn).then(() => out(report()));
     for value in ids:
         assert UUID_V4_RE.match(value), value
     assert len(set(ids)) == 3
+    # Prove the non-secure-context branch ran: randomUUID was absent and the
+    # three ids came from the getRandomValues fallback.
+    assert result["randomUUID"] == "undefined"
+    assert result["fallbackCalls"] == 3
 
     assert len(result["toasts"]) == 1
     toast = result["toasts"][0]
