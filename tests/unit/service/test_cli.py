@@ -146,6 +146,8 @@ class TestServiceStatus:
             result = runner.invoke(main, ["service", "status"])
         assert result.exit_code == 0
         assert "stopped" in result.output.lower()
+        # ABSENT autostart renders as "disabled" (jacked/cli.py service_status).
+        assert "Autostart: disabled" in result.output
 
     def test_status_when_running(self, tmp_path, absent_autostart):
         from types import SimpleNamespace

@@ -253,6 +253,19 @@ def _windows_process_liveness(pid: int) -> bool | None:
         kernel32.CloseHandle(handle)
 
 
+def _windows_host() -> bool:
+    """True when the real OS is Windows, whatever ``sys.platform`` claims.
+
+    The signal paths must follow the real OS, not just ``sys.platform``: on
+    Windows ``os.kill`` is never a POSIX signal. Signal 0 is ``CTRL_C_EVENT``,
+    so ``os.kill(pid, 0)`` becomes ``GenerateConsoleCtrlEvent`` and interrupts
+    every process sharing the console (this one included), and any other
+    signal number is ``TerminateProcess``. A test that fakes ``sys.platform``
+    on a Windows host must still never reach those calls.
+    """
+    return sys.platform == "win32" or os.name == "nt"
+
+
 def _posix_process_liveness(pid: int) -> bool | None:
     """Probe a POSIX PID without conflating access denial with absence."""
     try:
@@ -277,13 +290,7 @@ def process_liveness(pid: int) -> bool | None:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or pid > _PID_MAX:
         return False
     try:
-        # The real OS decides the probe, not just ``sys.platform``: on Windows
-        # ``os.kill(pid, 0)`` is not a probe at all. Signal 0 is
-        # ``CTRL_C_EVENT``, so it becomes ``GenerateConsoleCtrlEvent`` and
-        # interrupts every process sharing the console (this one included).
-        # A test that fakes ``sys.platform`` on a Windows host must still
-        # never reach that call.
-        if sys.platform == "win32" or os.name == "nt":
+        if _windows_host():
             return _windows_process_liveness(pid)
         return _posix_process_liveness(pid)
     except (OSError, OverflowError, ValueError):
@@ -334,7 +341,7 @@ def stop_process(pid_file: Path) -> bool:
         remove_pid(pid_file)
         return False
 
-    if sys.platform == "win32":
+    if _windows_host():
         import subprocess
 
         subprocess.run(
@@ -391,7 +398,7 @@ def stop_process_graceful(
         remove_pid(pid_file)
         return {"was_running": False, "died": True, "killed": False}
 
-    if sys.platform == "win32":
+    if _windows_host():
         import subprocess
 
         # Graceful first — no /F. Sends WM_CLOSE to GUI procs / CTRL_BREAK to consoles.
@@ -412,7 +419,7 @@ def stop_process_graceful(
         return {"was_running": True, "died": True, "killed": False}
 
     # Escalate.
-    if sys.platform == "win32":
+    if _windows_host():
         import subprocess
 
         subprocess.run(

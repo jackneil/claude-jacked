@@ -223,11 +223,12 @@ class TestIsProcessAlive:
         monkeypatch.setattr(sys, "platform", "darwin")
         monkeypatch.setattr(process, "_windows_process_liveness", lambda pid: True)
 
-        def _never(*_args):
-            raise AssertionError("os.kill must not be used as a probe on Windows")
-
-        monkeypatch.setattr(os, "kill", _never)
+        forbidden: list[tuple] = []
+        monkeypatch.setattr(os, "kill", lambda *args: forbidden.append(args))
         assert process.process_liveness(12345) is True
+        # process_liveness swallows probe exceptions, so a raising stub would
+        # only surface as an opaque None; record the call and assert instead.
+        assert forbidden == [], "os.kill must not be used as a probe on Windows"
 
 
 class TestCheckPort:
@@ -261,6 +262,7 @@ class TestStopProcess:
         assert result is False
         assert not pid_file.exists()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
     @patch("os.kill")
     def test_sends_sigterm_on_unix(self, mock_kill, tmp_path):
         pid_file = tmp_path / "test.pid"
@@ -271,6 +273,33 @@ class TestStopProcess:
                 result = stop_process(pid_file)
         mock_kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
         assert result is True
+
+    def test_windows_host_never_signals_with_os_kill(self, tmp_path, monkeypatch):
+        """Any ``os.kill`` on Windows is ``TerminateProcess``, never SIGTERM.
+
+        Same rule as the liveness probe: a Windows host takes the ``taskkill``
+        path even while ``sys.platform`` is faked to darwin.
+        """
+        import subprocess
+
+        from jacked.service import process
+
+        pid_file = tmp_path / "test.pid"
+        pid_file.write_text(f"{os.getpid()}\n8321")
+        monkeypatch.setattr(os, "name", "nt")
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(process, "NO_WINDOW", 0, raising=False)
+        monkeypatch.setattr(process, "is_process_alive", lambda pid: True)
+        forbidden: list[tuple] = []
+        monkeypatch.setattr(os, "kill", lambda *args: forbidden.append(args))
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(
+            subprocess, "run", lambda argv, **kw: spawned.append(list(argv))
+        )
+
+        assert process.stop_process(pid_file) is True
+        assert spawned == [["taskkill", "/PID", str(os.getpid()), "/F"]]
+        assert forbidden == [], "os.kill must not signal a process on Windows"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
