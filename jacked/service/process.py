@@ -304,17 +304,65 @@ def is_process_alive(pid: int) -> bool:
     return process_liveness(pid) is True
 
 
+# Bind addresses that mean "every interface". A bind probe against one of
+# these is not a question about a single address, so the listening probe has
+# to ask loopback instead. IPv4 only, like every probe here: "::" is absent
+# because the AF_INET fallback bind below could never succeed for it anyway.
+_WILDCARD_HOSTS = ("0.0.0.0", "")
+
+
+def is_port_listening(host: str, port: int, timeout: float = 0.5) -> bool:
+    """Return True only when a TCP connect to ``(host, port)`` succeeds.
+
+    Connect-based on purpose: it sees a WILDCARD listener (``0.0.0.0:port``,
+    what the dashboard binds when remote access is on) that a bind probe
+    misses. On macOS/BSD a specific-address bind with SO_REUSEADDR succeeds
+    right next to a wildcard listener, so the bind test answers "available"
+    while a server is happily serving that very port.
+
+    IPv4 by design: every BindPlan address is IPv4 and ``bind.create_sockets``
+    opens AF_INET sockets, so there is no v6 listener of ours to miss.
+
+    The socket is always closed. Any OSError (connection refused, unreachable
+    host) or timeout answers False.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+        return True
+    except OSError:
+        # socket.timeout is an OSError subclass, so a slow host lands here too.
+        return False
+    finally:
+        sock.close()
+
+
 def is_port_available(host: str, port: int) -> bool:
     """Check if a TCP port is available for binding.
 
-    Uses SO_REUSEADDR so a port in TIME_WAIT (recently-closed by a
-    previous server) probes as available — matching what uvicorn
-    actually does when binding (it sets reuse_address=True on POSIX).
-    Without this, ``is_port_available`` returned False for ~30s after
-    a tray restart even though the new server would bind cleanly,
-    causing the auto-updater to abort with "port could not be freed"
+    Asks :func:`is_port_listening` first: a live listener owns the port even
+    when the bind test disagrees. When the dashboard is bound to ``0.0.0.0``
+    (remote access on) the service listens on ``*:port``, and on macOS/BSD a
+    ``127.0.0.1`` bind with SO_REUSEADDR still succeeds next to it - which had
+    the auto-updater conclude the healthy new service "did not bind :8321",
+    roll a good upgrade back, then call the rollback dead too. A wildcard
+    *host* has no single address to connect to, so loopback is probed instead.
+
+    Nothing listening falls through to the bind test, which binds the host the
+    caller passed (the wildcard substitution above applies only to the connect
+    probe, since a wildcard bind is exactly the question being asked here) and
+    uses SO_REUSEADDR so a port in TIME_WAIT (recently-closed by a previous
+    server) probes as available - matching what uvicorn actually does when binding (it sets
+    reuse_address=True on POSIX). Without this, ``is_port_available`` returned
+    False for ~30s after a tray restart even though the new server would bind
+    cleanly, causing the auto-updater to abort with "port could not be freed"
     and leave the service down.
     """
+    probe_host = "127.0.0.1" if host in _WILDCARD_HOSTS else host
+    if is_port_listening(probe_host, port):
+        return False
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -8,15 +8,18 @@ migrates settings.json via `jacked install`, then spawns a fresh
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from typing import NamedTuple
 
 from jacked.findbin import find_bin
 from jacked.service import CLAUDE_DIR
-from jacked.service.process import is_process_alive, is_port_available
+from jacked.service.process import is_process_alive, is_port_listening
 from jacked.winproc import NO_WINDOW
 
 UPDATE_LOG = CLAUDE_DIR / "jacked-update.log"
@@ -31,6 +34,115 @@ ROLLBACK_STEP_RESTART = "service restart"
 # How long the preflight gate may run before it counts as a refusal. A build
 # that cannot answer in two minutes cannot be trusted with the old service.
 PREFLIGHT_TIMEOUT_SECONDS = 120
+
+# How long one identification probe may take. The listener is on loopback and
+# /api/health is a pure local handler, so a jacked service answers in
+# milliseconds; anything slower is, for this decision, a stranger.
+IDENTIFY_TIMEOUT_SECONDS = 2.0
+
+# How long the old listener has to release the port before it has to identify
+# itself instead.
+PORT_FREE_TIMEOUT_SECONDS = 10.0
+
+# How long the restarted service has to answer as the expected build.
+VERIFY_TIMEOUT_SECONDS = 20.0
+
+# Ceiling on ONE version read. It has to be generous - /api/version calls PyPI
+# on a cold cache, up to ~6s - but never the whole verify window: a listener
+# that accepts TCP and then says nothing would eat the window and leave the
+# health fingerprint no budget, which then read as "nothing ever bound" for a
+# port that was demonstrably bound.
+VERSION_READ_TIMEOUT_SECONDS = 8.0
+
+# Gap between polls in both waits.
+POLL_INTERVAL_SECONDS = 0.5
+
+# Ceiling on a probe body. A jacked health answer is a few dozen bytes; the
+# cap stops a hostile listener streaming a body at the updater.
+_PROBE_BODY_LIMIT = 4_096
+
+
+def _health_fingerprint(body: bytes) -> "tuple[bool, str]":
+    """Judge a /api/health body. Exactly jacked's shape, or it is a stranger."""
+    if len(body) > _PROBE_BODY_LIMIT:
+        return False, "/api/health answered a body too large to be jacked's"
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False, "/api/health did not answer JSON"
+    if (
+        isinstance(payload, dict)
+        and set(payload) == {"status", "db"}
+        and payload["status"] == "ok"
+        and isinstance(payload["db"], bool)
+    ):
+        return True, "answered /api/health as a jacked service"
+    return False, "/api/health answered a shape that is not jacked's"
+
+
+def _identify_jacked_listener(port: int, budget: float) -> "tuple[bool, str]":
+    """Ask whether the listener on *port* is a jacked service.
+
+    Deliberately /api/health, NOT /api/version: the version route calls PyPI
+    on a cold cache (two fetches, 3s each), so a perfectly healthy jacked
+    service would miss this budget and read as a stranger - the exact misread
+    this probe exists to prevent. Health is a pure local handler answering
+    exactly ``{"status": "ok", "db": <bool>}``, the same fingerprint
+    ``service.legacy.probe_legacy_health`` pins, and the body read is bounded
+    the same way so a hostile listener cannot stream at us.
+
+    Proxy handlers are stripped: an ``http_proxy`` in the environment must
+    never route a 127.0.0.1 probe through someone else's server.
+
+    Returns ``(is_jacked, reason)``; the reason names the failure class so a
+    refused update can say WHY the port holder was not recognised. Never raises.
+    """
+    if budget <= 0:
+        return False, "no time left to identify the listener"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(
+            f"http://127.0.0.1:{port}/api/health", timeout=budget
+        ) as response:
+            status = getattr(response, "status", 200)
+            if status != 200:
+                return False, f"/api/health answered HTTP {status}"
+            body = response.read(_PROBE_BODY_LIMIT + 1)
+    except urllib.error.HTTPError as exc:
+        return False, f"/api/health answered HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        return False, f"/api/health unreachable ({exc.reason})"
+    except TimeoutError:
+        return False, f"/api/health did not answer within {budget:.1f}s"
+    except Exception as exc:  # noqa: BLE001 - an unreadable listener is the answer
+        return False, f"/api/health probe failed ({type(exc).__name__})"
+
+    return _health_fingerprint(body)
+
+
+def _read_reported_build(port: int, budget: float) -> "str | None":
+    """Ask whatever listens on *port* which jacked build it is.
+
+    A jacked service answers ``/api/version`` with JSON carrying ``current``.
+    Anything else - no answer within *budget*, a listener that is not jacked,
+    malformed JSON - reads as None. Never raises: callers use this to identify
+    a port owner or to enrich a log line, never to fail a phase.
+    """
+    if budget <= 0:
+        return None
+    # Same proxy-free, bounded read as the health probe: this answer decides
+    # whether the update verified, so an http_proxy in the environment must
+    # not get to answer for 127.0.0.1.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(
+            f"http://127.0.0.1:{port}/api/version", timeout=budget
+        ) as response:
+            payload = json.loads(response.read(_PROBE_BODY_LIMIT + 1))
+    except Exception:  # noqa: BLE001 - an unidentifiable listener is the answer
+        return None
+    current = payload.get("current") if isinstance(payload, dict) else None
+    return current if isinstance(current, str) and current else None
 
 
 class RollbackResult(NamedTuple):
@@ -73,11 +185,13 @@ logger = logging.getLogger(__name__)
 def _verify_service_block(port: int) -> str:
     """Batch line that polls ``/api/version`` for up to 20s. Exit 0 = healthy."""
     return (
-        'powershell -NoProfile -Command "for ($i=0;$i -lt 40;$i++)'
+        'powershell -NoProfile -Command "for ($i=0;$i -lt '
+        f"{int(VERIFY_TIMEOUT_SECONDS / POLL_INTERVAL_SECONDS)};$i++)"
         "{try{$r=Invoke-WebRequest -UseBasicParsing "
         f"http://127.0.0.1:{port}/api/version"
         " -TimeoutSec 1 -ErrorAction Stop; if($r.StatusCode -eq 200){exit 0}}catch{}"
-        'Start-Sleep -Milliseconds 500} exit 1"\r\n'
+        f'Start-Sleep -Milliseconds {int(POLL_INTERVAL_SECONDS * 1000)}'
+        '} exit 1"\r\n'
     )
 
 
@@ -396,26 +510,59 @@ def run_update(
 
         # The restart + verify tail. It runs for the successful path AND for
         # the rolled-back path, so the machine always ends with a service.
+        _diagnosed: set = set()
+
+        def _log_once(message: str) -> None:
+            """Log a diagnosis the first time it is seen.
+
+            Both waits poll, so an unchanged reason would repeat dozens of
+            times; it must still be logged, because for a refused update this
+            line is the only account of WHY the port holder was rejected.
+            """
+            if message not in _diagnosed:
+                _diagnosed.add(message)
+                log(message)
+
         def _wait_port_free() -> bool:
-            """Wait for the old listener to release the port. True when free."""
+            """Wait until the port is ours to take. True when the start may run.
+
+            Free is the easy answer. A port that is still LISTENING is not
+            automatically a squatter: `jacked install --force` activates the
+            tray, so the build this update just installed is usually already
+            serving by the time this phase runs, and under launchd KeepAlive
+            the previous build can be too. A listener that fingerprints as a
+            jacked service is one of those, and the restart replaces it. Only
+            a listener that will not identify itself by the deadline stops the
+            update, and no pid is looked up or signalled either way.
+            """
             _begin("waiting_port_free")
             log("Waiting for port to become available")
-            port_deadline = time.monotonic() + 10.0
-            while time.monotonic() < port_deadline:
-                if is_port_available("127.0.0.1", port):
-                    break
-                time.sleep(0.5)
-            if not is_port_available("127.0.0.1", port):
-                _end(
-                    "waiting_port_free",
-                    "failed",
-                    error=f"port {port} remains occupied by an unverified listener",
-                    recovery="run `jacked service status`; v2 services use discoverable quarantine",
+            deadline = time.monotonic() + PORT_FREE_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                if not is_port_listening("127.0.0.1", port):
+                    log(f"Port {port} is free")
+                    _end("waiting_port_free", "ok")
+                    return True
+                is_jacked, reason = _identify_jacked_listener(
+                    port, min(IDENTIFY_TIMEOUT_SECONDS, deadline - time.monotonic())
                 )
-                log(f"ABORT: port {port} is ambiguous; no process was signalled")
-                return False
-            _end("waiting_port_free", "ok")
-            return True
+                if is_jacked:
+                    log(
+                        f"Port {port} is held by a jacked service; "
+                        "a native restart will be attempted"
+                    )
+                    _end("waiting_port_free", "ok")
+                    return True
+                _log_once(f"Port {port} holder is not identified as jacked: {reason}")
+                time.sleep(POLL_INTERVAL_SECONDS)
+            _end(
+                "waiting_port_free",
+                "failed",
+                error=f"port {port} remains occupied by an unverified listener",
+                recovery="run `jacked service status`; v2 services use discoverable quarantine",
+            )
+            log(f"ABORT: port {port} is ambiguous; no process was signalled")
+            return False
 
         def _spawn_service() -> None:
             """Start the service through the platform's own lifecycle manager."""
@@ -453,41 +600,123 @@ def run_update(
                 _restart_attempted[0] = True
             _end("starting_service", "ok")
 
-        def _verify_service() -> bool:
-            """Wait for the new service to bind the port. True when it did."""
+        def _verified_build(
+            expected: "str | None", deadline: float, known_mismatch: "str | None"
+        ) -> "tuple[bool, str | None]":
+            """Identity-check the listener once. Returns (accepted, build seen).
+
+            Accepted means this listener ends verification ok: it reports the
+            build this update installed, or - when its version route will not
+            answer in time, which a cold PyPI cache alone can cause - it at
+            least fingerprints as a jacked service. `expected` None means the
+            caller has no version to compare (the tray can update to "next"),
+            so any readable build counts. `known_mismatch` is the build this
+            port already reported, if any: once it has named itself as the
+            wrong build, the fingerprint fallback is closed.
+            """
+            # Always leave the health fingerprint its own slice: when less
+            # than the identify budget remains, skip straight to it.
+            seen = _read_reported_build(
+                port,
+                min(
+                    VERSION_READ_TIMEOUT_SECONDS,
+                    deadline - time.monotonic() - IDENTIFY_TIMEOUT_SECONDS,
+                ),
+            )
+            if seen is not None:
+                if expected is None or seen == expected:
+                    log(f"Service reports build {seen}")
+                    return True, seen
+                _log_once(
+                    f"Port {port} answers as build {seen}, expected {expected}; "
+                    "still waiting for the restart"
+                )
+                return False, seen
+            if known_mismatch is not None:
+                # This port has already told us which build it is, and it is
+                # the wrong one. A health fingerprint the wrong build passes
+                # just as well is not evidence that the restart landed.
+                return False, known_mismatch
+            is_jacked, reason = _identify_jacked_listener(
+                port, min(IDENTIFY_TIMEOUT_SECONDS, deadline - time.monotonic())
+            )
+            if is_jacked:
+                log(
+                    f"Service is listening on :{port} as a jacked service, "
+                    "but its build could not be read"
+                )
+                return True, None
+            _log_once(f"Listener on :{port} is not identified as jacked: {reason}")
+            return False, None
+
+        def _verify_service(expected: "str | None") -> bool:
+            """Wait for the EXPECTED build to answer on the port. True when it does.
+
+            Connect-based, because with remote access on the service listens
+            on ``*:port`` and a 127.0.0.1 bind probe succeeds right next to
+            that wildcard listener. 127.0.0.1 is always the right probe
+            address: every bind plan covers loopback (see BindPlan.probe_host
+            in service/bind.py).
+
+            Identity-aware, because a listener alone proves nothing: the
+            previous build under launchd KeepAlive, a hand-run `jacked webux`,
+            or the failed new build can all be answering here, and accepting
+            any of them let the rollback claim a restore that never happened.
+            """
             _begin("verifying_service")
             log("Verifying service came up")
-            verify_deadline = time.monotonic() + 20.0
-            came_up = False
-            while time.monotonic() < verify_deadline:
-                if not is_port_available("127.0.0.1", port):
-                    came_up = True
-                    break
-                time.sleep(0.5)
+            deadline = time.monotonic() + VERIFY_TIMEOUT_SECONDS
+            mismatch = None
+            was_listening = False
+            while time.monotonic() < deadline:
+                if is_port_listening("127.0.0.1", port):
+                    was_listening = True
+                    accepted, seen = _verified_build(expected, deadline, mismatch)
+                    if accepted:
+                        _end("verifying_service", "ok")
+                        return True
+                    mismatch = seen if seen is not None else mismatch
+                time.sleep(POLL_INTERVAL_SECONDS)
 
-            if came_up:
-                _end("verifying_service", "ok")
-                return True
-            _end(
-                "verifying_service",
-                "failed",
-                error=f"service did not bind :{port} within 20s",
-                recovery="jacked service start",
-            )
-            log(f"WARNING: service did not bind :{port} within 20s")
+            if mismatch is not None:
+                error = f"port {port} answers as build {mismatch}, expected {expected}"
+                recovery = "jacked service status"
+            elif was_listening:
+                # Never call a bound port dead: the operator needs to know
+                # something IS there and would not say what it is.
+                error = (
+                    f"port {port} is bound but the listener never "
+                    "identified itself as jacked"
+                )
+                recovery = "jacked service status"
+            else:
+                error = (
+                    f"service did not bind :{port} "
+                    f"within {VERIFY_TIMEOUT_SECONDS:g}s"
+                )
+                recovery = "jacked service start"
+            _end("verifying_service", "failed", error=error, recovery=recovery)
+            log(f"WARNING: {error}")
             return False
 
-        def _start_and_verify() -> str:
-            """Start the service and wait for it. Returns the outcome name.
+        def _start_and_verify(expected: "str | None") -> str:
+            """Start the service and wait for *expected* to answer.
 
-            'ok'        - the service is listening.
+            'ok'        - the expected build is serving the port.
             'port_busy' - the port stayed occupied by an unverified listener.
-            'not_ready' - the service never bound the port in time.
+            'not_ready' - the expected build never answered in time.
+
+            `expected` is the build this tail is starting: the target version
+            on the upgrade path, the restored version on a rollback tail, or
+            None when the update had no pinned target to compare against.
             """
+            # Per tail: the rollback tail must log its own reasons even when
+            # they read the same as the upgrade tail's.
+            _diagnosed.clear()
             if not _wait_port_free():
                 return "port_busy"
             _spawn_service()
-            return "ok" if _verify_service() else "not_ready"
+            return "ok" if _verify_service(expected) else "not_ready"
 
         _rolled_back = [False]
 
@@ -665,7 +894,7 @@ def run_update(
             # Bring the restored version back up through the native lifecycle.
             # A restored build that never binds the port has not restored the
             # machine, so its verdict decides whether this was a rollback.
-            restored_ready = _start_and_verify() == "ok"
+            restored_ready = _start_and_verify(_current_version) == "ok"
             _fail_and_recover(
                 f"v{_target} refused to start: {first_line}",
                 rollback.ok and restored_ready,
@@ -701,7 +930,7 @@ def run_update(
             # the machine with a build whose settings never migrated AND no
             # running service, so this is a transaction failure like any other.
             rollback = _rollback("settings migration failed")
-            restored_ready = _start_and_verify() == "ok"
+            restored_ready = _start_and_verify(_current_version) == "ok"
             _fail_and_recover(
                 f"v{_target} could not migrate settings "
                 f"(jacked install exit {migrate_result.returncode}); "
@@ -712,7 +941,7 @@ def run_update(
             return
         _end("migrating_settings", "ok")
 
-        outcome = _start_and_verify()
+        outcome = _start_and_verify(target_version)
         if outcome == "ok":
             log(f"Updater done - new service is listening on :{port}")
             if RECOVERY_FILE.exists():
@@ -746,7 +975,7 @@ def run_update(
             rollback = _rollback("new service never became ready")
             # Start whatever is on disk either way: a machine with no service
             # is the worst outcome. Only the verdict decides "rolled back".
-            restored_ready = _start_and_verify() == "ok"
+            restored_ready = _start_and_verify(_current_version) == "ok"
             _fail_and_recover(
                 f"v{_target} never became ready on :{port}",
                 rollback.ok and restored_ready,
@@ -1162,7 +1391,7 @@ def _spawn_windows_tray_updater(
         "if errorlevel 1 (\r\n"
         '    jacked _update_status verifying_service failed --error "service did not bind :'
         + str(port)
-        + ' in 20s" --recovery "jacked service start"\r\n'
+        + f' in {VERIFY_TIMEOUT_SECONDS:g}s" --recovery "jacked service start"\r\n'
         '    echo Jacked tray update: service did not come up. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
         "    set FAILREASON=the new service never bound the port\r\n"
         "    goto rollback_now\r\n"
