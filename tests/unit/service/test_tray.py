@@ -1804,3 +1804,33 @@ class TestAbandonedUpdateRecovery:
                 runner.run()
         assert order[:2] == ["abandoned", "provision"]
 
+
+
+class TestTrayProxyHeaderTrustIsPinned:
+    """Same pinning as the CLI path: the credential gate trusts
+    request.client.host, so the set of peers whose X-Forwarded-For is honored
+    must be fixed in code, not inherited from FORWARDED_ALLOW_IPS."""
+
+    @patch("jacked.service.bind.create_sockets", return_value=[])
+    @patch("jacked.service.tray.pystray", create=True)
+    @patch("jacked.service.tray.uvicorn")
+    def test_start_uvicorn_pins_proxy_headers(
+        self, mock_uvicorn, mock_pystray, mock_socks, monkeypatch
+    ):
+        _skip_if_no_tray()
+        from jacked.service.bind import BindPlan
+        from jacked.service.tray import ServiceRunner
+
+        monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        plan = BindPlan(
+            mode="loopback", addresses=("127.0.0.1",), port=8321,
+            primary_host="127.0.0.1",
+        )
+        with patch("jacked.service.bind.resolve_bind", return_value=plan):
+            thread = runner._start_uvicorn()
+        thread.join(timeout=0.1)
+
+        kwargs = mock_uvicorn.Config.call_args.kwargs
+        assert kwargs["proxy_headers"] is True
+        assert kwargs["forwarded_allow_ips"] == "127.0.0.1"

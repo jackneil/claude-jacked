@@ -27,7 +27,21 @@ ACCOUNT_ACTIONS_JS = WEB_JS / "components" / "account-actions.js"
 REMOTE_ACCESS_JS = WEB_JS / "components" / "remote-access.js"
 
 EM_DASH = "—"
-HINT = "Account switching is local-only until remote access is enabled in Settings"
+
+HINT_OFF = (
+    "Account switching from this browser is off. Turn on remote access under "
+    "Settings > Advanced on the host machine."
+)
+HINT_OUTSIDE = (
+    "This browser's address is outside the remote access scope. Widen the "
+    "scope under Settings > Advanced on the host machine."
+)
+SETTINGS_LOCAL_ONLY = (
+    "Remote access settings can only be changed from the machine running "
+    "jacked. Open the dashboard on the host to change them."
+)
+
+
 
 pytestmark = pytest.mark.skipif(
     shutil.which("node") is None, reason="node not installed"
@@ -138,7 +152,7 @@ out({ denied, allowed, unset });
     assert "btn-use-account" in denied
     assert "disabled" in denied
     assert 'aria-disabled="true"' in denied
-    assert f'title="{HINT}"' in denied
+    assert f'title="{HINT_OFF}"' in denied
     assert "opacity-50" in denied
     assert "cursor-not-allowed" in denied
     assert 'data-id="7"' in denied
@@ -205,10 +219,10 @@ out({ denied, allowed });
 """)
 
     denied = result["denied"]
-    assert denied.count(f">{HINT}<") == 1, "exactly one visible hint on the view"
+    assert denied.count(f">{HINT_OFF}<") == 1, "exactly one visible hint on the view"
     assert "text-slate-500" in denied
-    assert EM_DASH not in HINT
-    assert f">{HINT}<" not in result["allowed"]
+    assert EM_DASH not in HINT_OFF
+    assert f">{HINT_OFF}<" not in result["allowed"]
 
 
 # ---------------------------------------------------------------------------
@@ -248,3 +262,151 @@ def test_remote_access_dialogs_warn_that_viewers_can_switch_accounts():
     assert "switch your accounts and trigger upgrades" in all_interfaces
     assert "switching accounts and triggering upgrades" in tailscale
     assert EM_DASH not in options
+
+
+# ---------------------------------------------------------------------------
+# Reason-specific copy
+# ---------------------------------------------------------------------------
+
+def test_load_active_credential_stores_the_reason_too():
+    source = ACCOUNT_ACTIONS_JS.read_text(encoding="utf-8")
+    loader = source.split("async function loadActiveCredential()", 1)[1][:1600]
+
+    assert "credentialActivationReason" in loader
+    catch_block = loader.split("catch", 1)[1]
+    assert "window.jackedState.credentialActivationAllowed = true" in catch_block
+    assert "credentialActivationReason = null" in catch_block
+
+
+def test_reason_specific_hints_are_defined_once_and_clean():
+    source = ACCOUNTS_JS.read_text(encoding="utf-8")
+
+    assert HINT_OFF in source
+    assert HINT_OUTSIDE in source
+    for sentence in (HINT_OFF, HINT_OUTSIDE):
+        assert EM_DASH not in sentence
+        # Declared once as a constant, then reused for title + hint.
+        assert source.count(sentence) == 1
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [("remote_access_off", HINT_OFF), ("outside_scope", HINT_OUTSIDE), (None, HINT_OFF)],
+)
+def test_render_action_buttons_title_follows_the_reason(tmp_path, reason, expected):
+    result = _run_js(tmp_path, """
+const acct = { id: 7, email: 'a@x.com', is_active: 1 };
+window.jackedState.activeCredentialAccountId = null;
+window.jackedState.credentialActivationAllowed = false;
+window.jackedState.credentialActivationReason = __REASON__;
+out({ html: renderActionButtons(acct) });
+""".replace("__REASON__", json.dumps(reason)))
+
+    assert f'title="{expected}"' in result["html"]
+    assert "disabled" in result["html"]
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [("remote_access_off", HINT_OFF), ("outside_scope", HINT_OUTSIDE)],
+)
+def test_accounts_view_hint_follows_the_reason(tmp_path, reason, expected):
+    result = _run_js(tmp_path, """
+for (const fn of ['renderTokenPills', 'renderUsageBar', 'renderActiveSessions',
+                  'providerBadge', 'usageTextClass', 'timeAgoFromUnix',
+                  '_usageUpdateCardDOM']) {
+    global[fn] = () => '';
+}
+global.computeElapsedFraction5h = () => 0;
+global.computeElapsedFraction7d = () => 0;
+localStorage.setItem('jacked_tip_dismissed', '1');
+window.jackedState.activeCredentialAccountId = null;
+window.jackedState.credentialActivationAllowed = false;
+window.jackedState.credentialActivationReason = __REASON__;
+out({ html: renderAccounts([{ id: 1, email: 'a@x.com', is_active: 1 }]) });
+""".replace("__REASON__", json.dumps(reason)))
+
+    assert result["html"].count(f">{expected}<") == 1
+
+
+# ---------------------------------------------------------------------------
+# The click guard reads the real flag, not only the DOM attribute
+# ---------------------------------------------------------------------------
+
+
+def test_use_account_handler_checks_the_flag_and_the_attribute():
+    source = ACCOUNT_ACTIONS_JS.read_text(encoding="utf-8")
+    handler = source.split(".btn-use-account", 1)[1][:900]
+
+    assert "window.jackedState.credentialActivationAllowed === false" in handler
+    assert "btn.disabled" in handler
+    assert handler.index("return") < handler.index("activateAccountFromDashboard")
+    # There is no websocket event that carries a remote-access change, so the
+    # comment must not claim one.
+    assert "websocket" not in handler.lower()
+
+
+# ---------------------------------------------------------------------------
+# The poll loop must re-read the permission
+# ---------------------------------------------------------------------------
+
+
+def test_poll_loop_refreshes_the_activation_permission():
+    """A scope change made at the host must reach an open remote page without
+    a manual refresh, or it keeps offering a button that now 403s."""
+    source = (WEB_JS / "app.js").read_text(encoding="utf-8")
+    body = source.split("function startPolling()", 1)[1].split(
+        "function stopPolling()", 1
+    )[0]
+
+    assert "loadActiveCredential()" in body
+    assert body.index("loadActiveCredential()") < body.index("rerenderAccountsView()")
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit copy reaches the user
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limited_switch_surfaces_the_server_message():
+    source = ACCOUNT_ACTIONS_JS.read_text(encoding="utf-8")
+
+    assert "CREDENTIAL_SWITCH_RATE_LIMITED" in source
+    block = source.split("CREDENTIAL_SWITCH_RATE_LIMITED", 1)[1][:700]
+    assert "showToast(" in block
+    assert "'warning', 8000" in block
+
+
+# ---------------------------------------------------------------------------
+# Remote-access settings controls are host-only
+# ---------------------------------------------------------------------------
+
+
+def test_remote_access_card_disables_controls_when_not_editable():
+    source = REMOTE_ACCESS_JS.read_text(encoding="utf-8")
+
+    assert SETTINGS_LOCAL_ONLY in source
+    assert EM_DASH not in SETTINGS_LOCAL_ONLY
+    card = source.split("function renderRemoteAccessCardHTML", 1)[1].split(
+        "// --- Confirm dialog copy", 1
+    )[0]
+    assert "editable" in card
+    assert "disabled" in card
+
+
+def test_remote_access_state_records_editable_from_the_get():
+    source = REMOTE_ACCESS_JS.read_text(encoding="utf-8")
+    loader = source.split("async function renderRemoteAccessCard", 1)[1][:1200]
+
+    # Absent field (older server) must not lock the host's own controls.
+    assert "state.editable !== false" in loader
+
+
+def test_remote_access_scope_picker_is_disabled_when_not_editable():
+    source = REMOTE_ACCESS_JS.read_text(encoding="utf-8")
+    picker = source.split("function _remoteAccessScopePickerHTML", 1)[1].split(
+        "function _remoteAccessStatusHTML", 1
+    )[0]
+
+    assert "editable" in picker
+    assert "disabled" in picker

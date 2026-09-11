@@ -25,7 +25,16 @@ const _remoteAccessState = {
     scope: 'tailscale',
     effective: null,
     loaded: false,
+    // Whether THIS browser may change the setting. The server allows writes
+    // from the host only, because the setting is a live authorization bit:
+    // it decides who may switch credentials on the very next request. A
+    // remote viewer may see it, not change it.
+    editable: true,
 };
+
+// Shown in place of the controls when this browser may not change them.
+// No em-dashes: user-facing copy.
+const REMOTE_ACCESS_LOCAL_ONLY_NOTE = 'Remote access settings can only be changed from the machine running jacked. Open the dashboard on the host to change them.';
 
 const _REMOTE_ACCESS_URL = '/api/settings/remote-access';
 const _REMOTE_ACCESS_RESTART_URL = '/api/settings/remote-access/restart';
@@ -143,13 +152,19 @@ function _remoteAccessErrorHTML(message) {
     `;
 }
 
-function _remoteAccessScopePickerHTML(scope) {
+function _remoteAccessScopePickerHTML(scope, editable) {
     const tsActive = scope !== 'all';
     const allActive = scope === 'all';
+    // A read-only viewer still SEES which scope is in force; it just cannot
+    // pick another. Keep the same rows so nothing shifts, drop the pointer
+    // affordance, and mute them.
+    const locked = editable === false;
+    const lock = locked ? ' disabled aria-disabled="true"' : '';
+    const rowState = locked ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer';
     return `
         <div class="mt-4 space-y-2" role="radiogroup" aria-label="Remote access scope">
-            <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition active:scale-[0.99] ${tsActive ? 'border-blue-500 bg-blue-900/20' : 'border-slate-700 hover:border-slate-600'}">
-                <input type="radio" name="remote-access-scope" value="tailscale" class="mt-0.5 accent-blue-500" ${tsActive ? 'checked' : ''}>
+            <label class="flex items-start gap-3 p-3 rounded-lg border ${rowState} transition active:scale-[0.99] ${tsActive ? 'border-blue-500 bg-blue-900/20' : 'border-slate-700 hover:border-slate-600'}">
+                <input type="radio" name="remote-access-scope" value="tailscale" class="mt-0.5 accent-blue-500" ${tsActive ? 'checked' : ''}${lock}>
                 <span class="min-w-0 flex-1">
                     <span class="flex items-center gap-2">
                         <span class="text-sm font-medium text-white">Tailscale only</span>
@@ -158,8 +173,8 @@ function _remoteAccessScopePickerHTML(scope) {
                     <span class="block text-xs text-slate-400 mt-0.5 text-pretty">Reachable only over your private tailnet (loopback plus your Tailscale IP). Not exposed to local Wi-Fi or the public internet.</span>
                 </span>
             </label>
-            <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition active:scale-[0.99] ${allActive ? 'border-red-500 bg-red-900/20' : 'border-red-900/40 hover:border-red-700'}">
-                <input type="radio" name="remote-access-scope" value="all" class="mt-0.5 accent-red-500" ${allActive ? 'checked' : ''}>
+            <label class="flex items-start gap-3 p-3 rounded-lg border ${rowState} transition active:scale-[0.99] ${allActive ? 'border-red-500 bg-red-900/20' : 'border-red-900/40 hover:border-red-700'}">
+                <input type="radio" name="remote-access-scope" value="all" class="mt-0.5 accent-red-500" ${allActive ? 'checked' : ''}${lock}>
                 <span class="min-w-0 flex-1">
                     <span class="flex items-center gap-2">
                         <span class="text-sm font-medium text-red-300">All interfaces</span>
@@ -218,17 +233,24 @@ function renderRemoteAccessCardHTML(state) {
     const enabled = !!state.enabled;
     const scope = state.scope === 'all' ? 'all' : 'tailscale';
     const port = _remoteAccessPort();
+    // Only an explicit false locks the controls, so a server that predates
+    // the field leaves the host's own dashboard fully usable.
+    const editable = state.editable !== false;
 
-    const scopePicker = enabled ? _remoteAccessScopePickerHTML(scope) : '';
+    const scopePicker = enabled ? _remoteAccessScopePickerHTML(scope, editable) : '';
+    const lockNote = editable
+        ? ''
+        : `<p class="text-xs text-yellow-300 mt-2 text-pretty">${escapeHtml(REMOTE_ACCESS_LOCAL_ONLY_NOTE)}</p>`;
 
     return `
         <div class="flex items-start justify-between gap-3">
             <div class="min-w-0 flex-1">
                 <h3 class="text-sm font-semibold text-white">Remote access</h3>
                 <p class="text-xs text-slate-400 mt-1 text-pretty">Choose which networks can reach this dashboard. It has no login, so where it listens is the security boundary. Saving a change restarts the jacked service.</p>
+                ${lockNote}
             </div>
-            <label class="toggle-switch flex-shrink-0" title="Allow remote access">
-                <input type="checkbox" id="chk-remote-access" ${enabled ? 'checked' : ''} aria-label="Allow remote access">
+            <label class="toggle-switch flex-shrink-0 ${editable ? '' : 'opacity-60 cursor-not-allowed'}" title="${editable ? 'Allow remote access' : escapeHtml(REMOTE_ACCESS_LOCAL_ONLY_NOTE)}">
+                <input type="checkbox" id="chk-remote-access" ${enabled ? 'checked' : ''} ${editable ? '' : 'disabled aria-disabled="true"'} aria-label="Allow remote access">
                 <span class="toggle-slider"></span>
             </label>
         </div>
@@ -396,6 +418,10 @@ async function _applyRemoteAccessChange(container, pending) {
 function _bindRemoteAccessEvents(container) {
     if (!container || typeof container.querySelector !== 'function') return;
 
+    // The server refuses a remote write with 403 regardless; this keeps the
+    // UI from staging a confirm dialog and a restart that cannot happen.
+    if (_remoteAccessState.editable === false) return;
+
     const toggle = container.querySelector('#chk-remote-access');
     if (toggle) {
         toggle.addEventListener('change', () => {
@@ -437,6 +463,8 @@ async function renderRemoteAccessCard(container) {
         _remoteAccessState.enabled = !!(state && state.enabled);
         _remoteAccessState.scope = (state && state.scope === 'all') ? 'all' : 'tailscale';
         _remoteAccessState.effective = (state && state.effective) || null;
+        // Absent field (older server) must not lock the host's own controls.
+        _remoteAccessState.editable = !state || state.editable !== false;
         _remoteAccessState.loaded = true;
         container.innerHTML = renderRemoteAccessCardHTML(_remoteAccessState);
         _bindRemoteAccessEvents(container);

@@ -176,6 +176,8 @@ Once enabled, browse to `http://<machine>:8321` using the MagicDNS short name, t
 
 Account authorization works from a remote browser. When you open the dashboard from a different machine, the Add Account, Re-auth, and CC-token flows show an authorization link instead of opening a browser on the server. Click the link and approve in your own browser. Claude then shows a code. Copy the code and paste it into the dashboard to finish.
 
+**Turning remote access on also hands out credential control.** A remote browser inside the enabled scope can switch accounts and trigger upgrades, exactly as the confirmation dialog says. That is the point of the setting: it is the one switch that decides who may do it. Outside the scope, and whenever remote access is off, account switching returns 403 and the dashboard greys the **Use Account** button out with the reason. The setting itself is host-only: the toggle and the scope picker are read-only from a remote browser, and `PUT`/restart on the remote-access API are refused with `REMOTE_ACCESS_SETTINGS_LOCAL_ONLY`, so reaching the port is never enough to grant yourself credential control. Remote switches are rate limited per browser and logged with the client address, and Swap History labels them with the machine they came from.
+
 Prefer the CLI? These write the same setting (no more baked hosts in autostart files):
 
 ```bash
@@ -201,7 +203,7 @@ Prefer not to rebind at all? `tailscale serve --bg 8321` proxies the loopback-bo
 
 ### Account switching, auto-swap, and session truth
 
-**Use Account** requests a change to the default Claude credential stores. The result is evidence-qualified: the dashboard says whether the target was committed, merely observed without a complete writer fence, needs interaction, or is unsupported. It never turns a database selection into a false claim that running sessions changed. Credential mutation is local-only, so a remotely opened dashboard can manage and inspect accounts but cannot switch credentials.
+**Use Account** requests a change to the default Claude credential stores. The result is evidence-qualified: the dashboard says whether the target was committed, merely observed without a complete writer fence, needs interaction, or is unsupported. It never turns a database selection into a false claim that running sessions changed. Credential mutation follows the remote-access setting: always allowed from the machine itself, and from a remote browser only while remote access is on and that browser's address is inside the enabled scope (see [Remote Access](#remote-access-tailscale)). Everywhere else it is refused, and the dashboard greys the button out rather than offering one that fails.
 
 Current support is deliberately conservative. Certification is keyed to the credential-store topology per platform and config mode, with a certified build floor: macOS (Keychain plus a required `~/.claude/.credentials.json` mirror), Linux and Windows (the credentials file is the authority), for Claude Code builds from 2.1.0, inspected through 2.1.260. A certified switch can report `observed_target_unfenced`: the requested credentials were read back, but another writer cannot be ruled out, so existing sessions remain unverified and a restart is recommended. An unknown platform or configuration mode, or a build below the floor, fails closed instead of guessing how that Claude Code version stores credentials.
 
@@ -665,7 +667,7 @@ Jacked identifies an eligible account that still has headroom and records an aut
 
 ### Can jacked switch Claude accounts automatically?
 
-Only on a runtime with a certified cooperative credential capability. Auto-swap always watches the 5-hour and 7-day headroom, but current unsupported or unfenced builds stay recommendation-only. Manual **Use Account** requests are local-only and return the exact outcome instead of claiming success from a database setting.
+Only on a runtime with a certified cooperative credential capability. Auto-swap always watches the 5-hour and 7-day headroom, but current unsupported or unfenced builds stay recommendation-only. Manual **Use Account** requests return the exact outcome instead of claiming success from a database setting, and are gated by the remote-access setting (always allowed on the host; from a remote browser only inside the enabled scope).
 
 ### How do I check how much Claude usage I have left?
 
@@ -681,7 +683,7 @@ All three. macOS gets a native menu-bar agent; Windows and Linux get a system-tr
 
 ### Can I open the dashboard from another machine?
 
-Yes, over Tailscale. Remote account authorization works too: the dashboard shows an authorization link instead of trying to open a browser on the server, and you paste back the code Claude gives you.
+Yes, over Tailscale. Remote account authorization works too: the dashboard shows an authorization link instead of trying to open a browser on the server, and you paste back the code Claude gives you. Switching accounts works from there as well, because turning remote access on is what grants it: any browser inside the enabled scope can switch accounts and trigger upgrades, which is why the confirmation dialog says so. Changing the remote-access setting itself stays host-only, so a remote browser can use the permission it was given but cannot widen it.
 
 ### How do I install the slash commands, skills, and review agents?
 

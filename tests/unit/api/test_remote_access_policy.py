@@ -8,14 +8,20 @@ wires the right three values in.
 """
 
 import ipaddress
+import logging
+import sqlite3
 
 import pytest
 
 from jacked.api.remote_access import (
+    DEFAULT_SCOPE,
     LOOPBACK_HOSTS,
     TAILSCALE_ULA,
+    SwitchRateLimiter,
     client_in_scope,
     credential_mutation_allowed,
+    credential_mutation_decision,
+    credential_policy_editable,
     read_enabled_scope,
 )
 
@@ -191,3 +197,172 @@ def test_remote_access_doctests_run():
     results = doctest.testmod(remote_access)
     assert results.failed == 0
     assert results.attempted > 0
+
+
+# ---------------------------------------------------------------------------
+# A settings DB that cannot be read must not 500 the credential routes
+# ---------------------------------------------------------------------------
+
+
+class _BrokenDB:
+    def get_setting(self, key):
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_read_enabled_scope_fails_closed_on_a_broken_db(caplog):
+    """The docstring promises fail-closed, and the sibling read in
+    service/bind.py guards the identical keys. A locked settings DB must
+    deny remote mutation, not turn every polled route into a 500."""
+    with caplog.at_level(logging.WARNING, logger="jacked.api.remote_access"):
+        assert read_enabled_scope(_BrokenDB()) == (False, "tailscale")
+    assert "remote-access" in caplog.text.lower()
+
+
+def test_read_enabled_scope_error_log_carries_no_secret():
+    db = _BrokenDB()
+    assert read_enabled_scope(db) == (False, DEFAULT_SCOPE)
+
+
+# ---------------------------------------------------------------------------
+# credential_policy_editable: who may flip the switch itself
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", list(LOOPBACK_HOSTS))
+def test_policy_is_editable_from_loopback(host):
+    assert credential_policy_editable(host) is True
+
+
+@pytest.mark.parametrize("host", [TAILNET_IP, LAN_IP, TAILNET_IPV6, "hank-llm", "", None])
+def test_policy_is_not_editable_from_anywhere_else(host):
+    """The switch that grants remote credential control is flipped only at
+    the host, whatever the setting currently says."""
+    assert credential_policy_editable(host) is False
+
+
+def test_policy_editable_is_case_insensitive():
+    assert credential_policy_editable("LocalHost") is True
+
+
+# ---------------------------------------------------------------------------
+# credential_mutation_decision: the reason behind the answer
+# ---------------------------------------------------------------------------
+
+
+def test_decision_allows_loopback_with_no_reason():
+    assert credential_mutation_decision("127.0.0.1", False, "tailscale") == (True, None)
+    assert credential_mutation_decision("127.0.0.1", True, "all") == (True, None)
+
+
+def test_decision_reports_remote_access_off():
+    assert credential_mutation_decision(TAILNET_IP, False, "tailscale") == (
+        False,
+        "remote_access_off",
+    )
+    assert credential_mutation_decision(LAN_IP, False, "all") == (
+        False,
+        "remote_access_off",
+    )
+
+
+def test_decision_reports_outside_scope():
+    assert credential_mutation_decision(LAN_IP, True, "tailscale") == (
+        False,
+        "outside_scope",
+    )
+    assert credential_mutation_decision("2001:db8::1", True, "tailscale") == (
+        False,
+        "outside_scope",
+    )
+    # An unparsable host is outside every scope, not "remote access off".
+    assert credential_mutation_decision("hank-llm", True, "all") == (
+        False,
+        "outside_scope",
+    )
+
+
+def test_decision_allows_in_scope_remote_with_no_reason():
+    assert credential_mutation_decision(TAILNET_IP, True, "tailscale") == (True, None)
+    assert credential_mutation_decision(LAN_IP, True, "all") == (True, None)
+
+
+def test_decision_and_boolean_helper_never_disagree():
+    for host in [TAILNET_IP, LAN_IP, TAILNET_IPV6, "127.0.0.1", "hank-llm", None]:
+        for enabled in (True, False):
+            for scope in ("tailscale", "all"):
+                allowed, reason = credential_mutation_decision(host, enabled, scope)
+                assert allowed is credential_mutation_allowed(host, enabled, scope)
+                assert (reason is None) is allowed
+
+
+# ---------------------------------------------------------------------------
+# SwitchRateLimiter
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def test_rate_limiter_allows_up_to_the_limit():
+    clock = _Clock()
+    limiter = SwitchRateLimiter(limit=6, window=60.0, clock=clock)
+    for _ in range(6):
+        assert limiter.check(TAILNET_IP) == (True, 0.0)
+
+
+def test_rate_limiter_blocks_the_next_request_with_a_retry_after():
+    clock = _Clock()
+    limiter = SwitchRateLimiter(limit=6, window=60.0, clock=clock)
+    for _ in range(6):
+        limiter.check(TAILNET_IP)
+    clock.now += 10.0
+    allowed, retry_after = limiter.check(TAILNET_IP)
+    assert allowed is False
+    # The oldest of the six is 10s old, so the budget frees in 50s.
+    assert retry_after == pytest.approx(50.0)
+
+
+def test_rate_limiter_retry_after_is_at_least_one_second():
+    clock = _Clock()
+    limiter = SwitchRateLimiter(limit=1, window=60.0, clock=clock)
+    limiter.check(TAILNET_IP)
+    clock.now += 59.9
+    allowed, retry_after = limiter.check(TAILNET_IP)
+    assert allowed is False
+    assert retry_after >= 1.0
+
+
+def test_rate_limiter_window_rolls_over():
+    clock = _Clock()
+    limiter = SwitchRateLimiter(limit=2, window=60.0, clock=clock)
+    assert limiter.check(TAILNET_IP)[0] is True
+    assert limiter.check(TAILNET_IP)[0] is True
+    assert limiter.check(TAILNET_IP)[0] is False
+    clock.now += 60.1
+    assert limiter.check(TAILNET_IP)[0] is True
+
+
+def test_rate_limiter_is_per_host():
+    clock = _Clock()
+    limiter = SwitchRateLimiter(limit=1, window=60.0, clock=clock)
+    assert limiter.check(TAILNET_IP)[0] is True
+    assert limiter.check(TAILNET_IP)[0] is False
+    # A different peer has its own budget.
+    assert limiter.check("100.64.0.9")[0] is True
+
+
+def test_rate_limiter_does_not_grow_without_bound():
+    """Expired host buckets are dropped, so a scanner cannot grow the map
+    forever just by rotating source addresses."""
+    clock = _Clock()
+    limiter = SwitchRateLimiter(limit=6, window=60.0, clock=clock)
+    for i in range(50):
+        limiter.check(f"100.64.0.{i}")
+    clock.now += 61.0
+    limiter.check(TAILNET_IP)
+    assert len(limiter._hits) == 1

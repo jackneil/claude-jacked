@@ -18,7 +18,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from jacked.api.remote_access import read_enabled_scope
+from jacked.api.remote_access import credential_policy_editable, read_enabled_scope
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +44,43 @@ def _get_db(request: Request):
 
 
 # The reader moved to jacked/api/remote_access.py when the credential-mutation
-# gate started reading the same setting: one implementation, so the bind
-# decision and the switching decision can never diverge. Kept under the old
+# gate started reading the same setting. resolve_bind() calls it too, so the
+# bind decision and the switching decision cannot diverge. Kept under the old
 # module-local name because this module's own call sites (and their tests)
 # resolve it as a module global.
 _read_enabled_scope = read_enabled_scope
+
+
+# This setting is a live authorization bit, not a preference: read_enabled_scope
+# is consulted on every credential-mutation request, so flipping it on grants
+# remote credential control immediately, and flipping it off does NOT revoke
+# reachability until the service restarts and rebinds. Both windows mean a
+# remote peer that could write it would own the host's credentials. So writes
+# are loopback-only, whatever the setting currently says.
+_SETTINGS_LOCAL_ONLY_MESSAGE = (
+    "Remote access settings can only be changed from the machine running "
+    "jacked. Open the dashboard on the host to change them."
+)
+
+
+def _is_loopback_client(request: Request) -> bool:
+    """Whether this request came from the machine running jacked."""
+    client = request.client
+    return credential_policy_editable(client.host if client else None)
+
+
+def _settings_local_only() -> JSONResponse:
+    """403 for a write attempted from anywhere but the host."""
+    return JSONResponse(
+        status_code=403,
+        content={
+            "error": {
+                "message": _SETTINGS_LOCAL_ONLY_MESSAGE,
+                "code": "REMOTE_ACCESS_SETTINGS_LOCAL_ONLY",
+            }
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _read_state(db) -> dict:
@@ -77,19 +109,29 @@ def _read_state(db) -> dict:
 
 @router.get("/remote-access")
 async def get_remote_access(request: Request):
-    """Current remote-access setting plus the live effective bind state."""
-    return _read_state(_get_db(request))
+    """Current remote-access setting plus the live effective bind state.
+
+    Readable from anywhere the dashboard is reachable: a remote viewer may see
+    the policy that applies to it. ``editable`` tells that viewer whether it
+    may CHANGE it, so the UI can disable the controls instead of offering a
+    toggle that 403s.
+    """
+    return {**_read_state(_get_db(request)), "editable": _is_loopback_client(request)}
 
 
 @router.put("/remote-access")
 async def update_remote_access(request: Request, body: RemoteAccessSettings):
     """Persist the remote-access setting. Does NOT restart — the client calls
-    POST /remote-access/restart to apply, so save and apply stay distinct."""
+    POST /remote-access/restart to apply, so save and apply stay distinct.
+
+    Loopback only: see ``_settings_local_only``."""
+    if not _is_loopback_client(request):
+        return _settings_local_only()
     db = _get_db(request)
     if db is not None:
         db.set_setting("remote_access_enabled", "true" if body.enabled else "false")
         db.set_setting("remote_access_scope", body.scope)
-    return _read_state(db)
+    return {**_read_state(db), "editable": True}
 
 
 async def _restart_broadcast(ws_registry, event: str, payload: dict) -> None:
@@ -104,7 +146,15 @@ async def _restart_broadcast(ws_registry, event: str, payload: dict) -> None:
 async def restart_remote_access(request: Request):
     """Broadcast a restart notice, then restart the service to apply the new
     bind. Mirrors POST /api/upgrade: 409 if one is already in flight, a WS
-    ``restart_started`` event, then a delayed restart on a daemon thread."""
+    ``restart_started`` event, then a delayed restart on a daemon thread.
+
+    Loopback only, like the PUT: applying is what makes a saved setting real,
+    and it tears the process down."""
+    if not _is_loopback_client(request):
+        # Checked before the lock, so a refused remote call can never wedge a
+        # later local apply behind a 409.
+        return _settings_local_only()
+
     # Capture the lock instance so the daemon thread releases exactly the one
     # it acquired, even if the module global is later rebound.
     lock = _restart_lock

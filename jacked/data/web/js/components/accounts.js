@@ -351,10 +351,22 @@ function renderAccountMenu(acct) {
     `;
 }
 
-// One sentence, used twice: as the disabled button's tooltip and as the single
-// muted hint on the accounts view. Both appear only when the server has told
-// this browser it may not switch accounts.
-const CREDENTIAL_SWITCH_LOCAL_ONLY_HINT = 'Account switching is local-only until remote access is enabled in Settings';
+// Why this browser may not switch accounts, in the user's words. One sentence
+// per server reason, used twice each: as the disabled button's tooltip and as
+// the single muted hint on the accounts view. The two denials have different
+// fixes (flip a toggle vs widen a scope), so they must not share a sentence.
+// No em-dashes: this is user-facing copy.
+const CREDENTIAL_SWITCH_HINTS = {
+    remote_access_off: "Account switching from this browser is off. Turn on remote access under Settings > Advanced on the host machine.",
+    outside_scope: "This browser's address is outside the remote access scope. Widen the scope under Settings > Advanced on the host machine.",
+};
+
+// An older server sends no reason with the denial; the toggle is the likelier
+// cause and the safer thing to point at, so it is the fallback.
+function credentialSwitchHint() {
+    const reason = window.jackedState.credentialActivationReason;
+    return CREDENTIAL_SWITCH_HINTS[reason] || CREDENTIAL_SWITCH_HINTS.remote_access_off;
+}
 
 /**
  * Render the action row for an account card: the one action people take often
@@ -378,7 +390,7 @@ function renderActionButtons(acct) {
         const base = 'btn-use-account text-xs px-3 py-1.5 bg-teal-600/20 text-teal-400 border border-teal-600/30 rounded font-medium transition';
         const data = `data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}"`;
         if (window.jackedState.credentialActivationAllowed === false) {
-            setActiveHtml = `<button class="${base} opacity-50 cursor-not-allowed" ${data} disabled aria-disabled="true" title="${CREDENTIAL_SWITCH_LOCAL_ONLY_HINT}">Use Account</button>`;
+            setActiveHtml = `<button class="${base} opacity-50 cursor-not-allowed" ${data} disabled aria-disabled="true" title="${credentialSwitchHint()}">Use Account</button>`;
         } else {
             setActiveHtml = `<button class="${base} hover:bg-teal-600/40 active:scale-[0.96]" ${data}>Use Account</button>`;
         }
@@ -536,7 +548,7 @@ function renderAccounts(accounts) {
     // One line, muted, only when this browser may not switch accounts — so the
     // greyed-out Use Account buttons below have a stated reason.
     const switchLockedHint = window.jackedState.credentialActivationAllowed === false
-        ? `<div id="credential-switch-hint" class="text-xs text-slate-500 mb-4">${CREDENTIAL_SWITCH_LOCAL_ONLY_HINT}</div>`
+        ? `<div id="credential-switch-hint" class="text-xs text-slate-500 mb-4">${credentialSwitchHint()}</div>`
         : '';
 
     const sorted = [...visible].sort((a, b) => (a.priority || 0) - (b.priority || 0));

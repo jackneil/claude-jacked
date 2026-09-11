@@ -1,5 +1,7 @@
 """Tests for the /accounts/{id}/use endpoint (dashboard account switching)."""
 
+import logging
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -982,30 +984,22 @@ def test_credential_operation_status_honours_the_remote_access_scope(
         assert resp.json()["error"]["code"] == "CREDENTIAL_STATUS_LOCAL_ONLY"
 
 
-def test_credential_mutation_403_messages_name_the_real_policy(app, db):
-    """The 403 copy must point at the Settings toggle, not claim local-only,
-    and carry no em-dash (user-facing string)."""
-    _set_remote_access(db, False, "tailscale")
-    scoped = _scoped_client(app, LAN_IP)
-
-    switch = scoped.post("/api/auth/accounts/1/use")
-    status_resp = scoped.get(
-        "/api/auth/credential-operations/operation-scope-test-1234"
+def test_credential_denial_copy_is_user_facing_clean():
+    """Every denial sentence must name where to change the policy and carry
+    no em-dash (these strings are shown to a user)."""
+    from jacked.api.routes.auth import (
+        _STATUS_DENIED_MESSAGES,
+        _SWITCH_DENIED_MESSAGES,
     )
 
-    switch_msg = switch.json()["error"]["message"]
-    status_msg = status_resp.json()["error"]["message"]
-    assert switch_msg == (
-        "Account switching from a remote browser is off. Turn on remote access "
-        "in Settings on the host machine, or open the dashboard there."
+    messages = list(_SWITCH_DENIED_MESSAGES.values()) + list(
+        _STATUS_DENIED_MESSAGES.values()
     )
-    assert status_msg == (
-        "Credential operation status from a remote browser is off. Turn on "
-        "remote access in Settings on the host machine, or open the dashboard "
-        "there."
-    )
-    assert "—" not in switch_msg
-    assert "—" not in status_msg
+    assert len(messages) == 4
+    for message in messages:
+        assert "—" not in message
+        assert "Settings > Advanced" in message
+        assert "host machine" in message
 
 
 @pytest.mark.parametrize(
@@ -1071,3 +1065,483 @@ def test_active_credential_without_a_db_still_reports_permission():
     assert remote.get("/api/auth/active-credential").json()[
         "allow_credential_activation"
     ] is False
+
+
+# ---------------------------------------------------------------------------
+# Reason-specific denial copy
+# ---------------------------------------------------------------------------
+
+SWITCH_DENIED = {
+    "remote_access_off": (
+        "Account switching from this browser is off. Turn on remote access "
+        "under Settings > Advanced on the host machine."
+    ),
+    "outside_scope": (
+        "This browser's address is outside the remote access scope. Widen the "
+        "scope under Settings > Advanced on the host machine."
+    ),
+}
+STATUS_DENIED = {
+    "remote_access_off": (
+        "Credential operation status from this browser is off. Turn on remote "
+        "access under Settings > Advanced on the host machine."
+    ),
+    "outside_scope": (
+        "This browser's address is outside the remote access scope. Widen the "
+        "scope under Settings > Advanced on the host machine."
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "host,enabled,scope,reason",
+    [
+        (TAILNET_IP, False, "tailscale", "remote_access_off"),
+        (LAN_IP, True, "tailscale", "outside_scope"),
+    ],
+)
+def test_use_403_message_matches_the_reason(app, db, host, enabled, scope, reason):
+    """The two denials have different fixes (flip a toggle vs widen a scope),
+    so they must not share one sentence."""
+    _set_remote_access(db, enabled, scope)
+
+    resp = _scoped_client(app, host).post("/api/auth/accounts/1/use")
+
+    assert resp.status_code == 403
+    body = resp.json()["error"]
+    assert body["code"] == "CREDENTIAL_MUTATION_LOCAL_ONLY"
+    assert body["message"] == SWITCH_DENIED[reason]
+    assert "—" not in body["message"]
+
+
+@pytest.mark.parametrize(
+    "host,enabled,scope,reason",
+    [
+        (TAILNET_IP, False, "tailscale", "remote_access_off"),
+        (LAN_IP, True, "tailscale", "outside_scope"),
+    ],
+)
+def test_status_403_message_matches_the_reason(app, db, host, enabled, scope, reason):
+    _set_remote_access(db, enabled, scope)
+
+    resp = _scoped_client(app, host).get(
+        "/api/auth/credential-operations/operation-scope-test-1234"
+    )
+
+    assert resp.status_code == 403
+    body = resp.json()["error"]
+    assert body["code"] == "CREDENTIAL_STATUS_LOCAL_ONLY"
+    assert body["message"] == STATUS_DENIED[reason]
+    assert "—" not in body["message"]
+
+
+@pytest.mark.parametrize(
+    "host,enabled,scope,reason",
+    [
+        ("127.0.0.1", False, "tailscale", None),
+        (TAILNET_IP, False, "tailscale", "remote_access_off"),
+        (LAN_IP, True, "tailscale", "outside_scope"),
+        (TAILNET_IP, True, "tailscale", None),
+        (LAN_IP, True, "all", None),
+    ],
+)
+def test_active_credential_publishes_the_reason(app, db, host, enabled, scope, reason):
+    _set_remote_access(db, enabled, scope)
+    app.state.credential_resolver = lambda: ResolverObservation(
+        ResolverState.RESOLVED, CredentialIdentity(account_id=1), ("authority:ok",)
+    )
+
+    data = _scoped_client(app, host).get("/api/auth/active-credential").json()
+
+    assert data["credential_activation_reason"] == reason
+    assert data["allow_credential_activation"] is (reason is None)
+
+
+def test_allow_credential_activation_is_a_required_field():
+    """No default, so a forgotten kwarg on a new return path is a construction
+    error here rather than a silently-enabled button in a remote browser."""
+    from pydantic import ValidationError
+
+    from jacked.api.routes.auth import ActiveCredentialResponse
+
+    with pytest.raises(ValidationError):
+        ActiveCredentialResponse()
+    ok = ActiveCredentialResponse(allow_credential_activation=False)
+    assert ok.credential_activation_reason is None
+
+
+def test_active_credential_stamp_not_found_path_carries_the_flag(app, db):
+    """Mid-function return: the resolver resolved to an account row that is
+    gone."""
+    _set_remote_access(db, False, "tailscale")
+    app.state.credential_resolver = lambda: ResolverObservation(
+        ResolverState.RESOLVED, CredentialIdentity(account_id=999), ("authority:ok",)
+    )
+
+    data = _scoped_client(app, TAILNET_IP).get("/api/auth/active-credential").json()
+
+    assert data["state"] == "unusable"
+    assert "account-stamp-not-found" in data["evidence"]
+    assert data["allow_credential_activation"] is False
+    assert data["credential_activation_reason"] == "remote_access_off"
+
+
+def test_active_credential_org_conflict_path_carries_the_flag(app, db):
+    """Mid-function return: the observed org does not match the account row."""
+    _set_remote_access(db, True, "tailscale")
+    with db._writer() as conn:
+        conn.execute("UPDATE accounts SET organization_uuid='org-aaa' WHERE id=1")
+    app.state.credential_resolver = lambda: ResolverObservation(
+        ResolverState.RESOLVED,
+        CredentialIdentity(account_id=1, organization_id="org-bbb"),
+        ("authority:ok",),
+    )
+
+    denied = _scoped_client(app, LAN_IP).get("/api/auth/active-credential").json()
+    allowed = _scoped_client(app, TAILNET_IP).get("/api/auth/active-credential").json()
+
+    assert denied["state"] == "conflict"
+    assert "account-organization-conflict" in denied["evidence"]
+    assert denied["allow_credential_activation"] is False
+    assert denied["credential_activation_reason"] == "outside_scope"
+    assert allowed["allow_credential_activation"] is True
+    assert allowed["credential_activation_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# A settings DB that cannot be read must deny, not 500
+# ---------------------------------------------------------------------------
+
+
+class _LockedSettingsDB:
+    """Wraps the real DB but raises on the two remote-access reads, the shape
+    a locked or corrupt settings file takes."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def get_setting(self, key):
+        if key.startswith("remote_access_"):
+            raise sqlite3.OperationalError("database is locked")
+        return self._inner.get_setting(key)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+@pytest.fixture
+def locked_settings_app(app, db):
+    app.state.db = _LockedSettingsDB(db)
+    return app
+
+
+def test_locked_settings_db_denies_a_remote_switch_without_a_500(locked_settings_app):
+    resp = _scoped_client(locked_settings_app, TAILNET_IP).post(
+        "/api/auth/accounts/1/use"
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CREDENTIAL_MUTATION_LOCAL_ONLY"
+
+
+def test_locked_settings_db_still_allows_a_local_switch(locked_settings_app):
+    with (
+        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        resp = _scoped_client(locked_settings_app, "127.0.0.1").post(
+            "/api/auth/accounts/1/use"
+        )
+
+    assert resp.status_code == 200
+
+
+def test_locked_settings_db_keeps_active_credential_a_200(locked_settings_app):
+    """This route is polled; a raising settings read must not turn it into a
+    500 storm."""
+    locked_settings_app.state.credential_resolver = lambda: ResolverObservation(
+        ResolverState.RESOLVED, CredentialIdentity(account_id=1), ("authority:ok",)
+    )
+
+    resp = _scoped_client(locked_settings_app, TAILNET_IP).get(
+        "/api/auth/active-credential"
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["allow_credential_activation"] is False
+    assert resp.json()["credential_activation_reason"] == "remote_access_off"
+
+
+# ---------------------------------------------------------------------------
+# CSRF: being in scope is not a licence for a cross-site POST
+# ---------------------------------------------------------------------------
+
+
+def test_in_scope_remote_switch_still_refuses_a_foreign_origin(app, db):
+    from jacked.api.security import HostValidationMiddleware
+
+    _set_remote_access(db, True, "tailscale")
+    guarded = TestClient(
+        HostValidationMiddleware(app),
+        client=(TAILNET_IP, 50000),
+        headers={
+            **_PAGE_SESSION_HEADERS,
+            "Origin": "http://evil.example",
+        },
+    )
+
+    resp = guarded.post("/api/auth/accounts/1/use")
+
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CSRF_ORIGIN"
+    app.state.credential_switcher.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Proxy headers: the forwarded address is the client, and only from loopback
+# ---------------------------------------------------------------------------
+
+
+def _proxied_client(app, peer, forwarded_for):
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    return TestClient(
+        ProxyHeadersMiddleware(app, trusted_hosts="127.0.0.1"),
+        client=(peer, 1),
+        headers={**_PAGE_SESSION_HEADERS, "X-Forwarded-For": forwarded_for},
+    )
+
+
+def test_tailscale_serve_viewer_is_not_treated_as_loopback(app, db):
+    """`tailscale serve` proxies from loopback and rewrites X-Forwarded-For to
+    the real tailnet source. Trusting that rewrite is what stops a serve
+    viewer from inheriting loopback's unconditional permission."""
+    _set_remote_access(db, False, "tailscale")
+
+    resp = _proxied_client(app, "127.0.0.1", TAILNET_IP).post(
+        "/api/auth/accounts/1/use"
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CREDENTIAL_MUTATION_LOCAL_ONLY"
+    app.state.credential_switcher.assert_not_called()
+
+
+def test_forwarded_header_from_an_untrusted_peer_is_ignored(app, db):
+    """A LAN client cannot claim loopback by sending its own X-Forwarded-For:
+    the header is only honored from the trusted loopback proxy."""
+    _set_remote_access(db, False, "tailscale")
+
+    resp = _proxied_client(app, LAN_IP, "127.0.0.1").post("/api/auth/accounts/1/use")
+
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "CREDENTIAL_MUTATION_LOCAL_ONLY"
+    app.state.credential_switcher.assert_not_called()
+
+
+def test_in_scope_forwarded_client_is_allowed_when_remote_access_is_on(app, db):
+    _set_remote_access(db, True, "tailscale")
+
+    with (
+        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        resp = _proxied_client(app, "127.0.0.1", TAILNET_IP).post(
+            "/api/auth/accounts/1/use"
+        )
+
+    assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Rate limit on remote switches
+# ---------------------------------------------------------------------------
+
+
+def _switch_headers(n):
+    return {
+        **_PAGE_SESSION_HEADERS,
+        "X-Jacked-Action-Id": f"action-ratelimit-{n:06d}",
+        "X-Jacked-Operation-Id": f"operation-ratelimit-{n:06d}",
+    }
+
+
+def test_remote_switches_are_rate_limited(app, db):
+    """Each accepted switch drives a Keychain write on the host, and a fresh
+    action id per attempt defeats the idempotency replay, so an in-scope peer
+    could otherwise thrash the live credential store."""
+    _set_remote_access(db, True, "tailscale")
+    remote = _scoped_client(app, TAILNET_IP)
+
+    with (
+        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        codes = [
+            remote.post("/api/auth/accounts/1/use", headers=_switch_headers(i))
+            for i in range(7)
+        ]
+
+    assert [r.status_code for r in codes[:6]] == [200] * 6
+    limited = codes[6]
+    assert limited.status_code == 429
+    assert limited.json()["error"]["code"] == "CREDENTIAL_SWITCH_RATE_LIMITED"
+    assert limited.json()["error"]["message"] == (
+        "Too many account switches from this browser. Wait a minute and try again."
+    )
+    assert int(limited.headers["retry-after"]) >= 1
+
+
+def test_loopback_switches_are_never_rate_limited(app, db):
+    _set_remote_access(db, False, "tailscale")
+    local = _scoped_client(app, "127.0.0.1")
+
+    with (
+        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        codes = [
+            local.post("/api/auth/accounts/1/use", headers=_switch_headers(i)).status_code
+            for i in range(9)
+        ]
+
+    assert codes == [200] * 9
+
+
+def test_a_denied_remote_client_never_consumes_switch_budget(app, db):
+    """The limiter runs AFTER the mutation gate, so a peer that is not allowed
+    to switch cannot burn the budget of one that is."""
+    _set_remote_access(db, False, "tailscale")
+    remote = _scoped_client(app, TAILNET_IP)
+
+    for i in range(10):
+        assert remote.post(
+            "/api/auth/accounts/1/use", headers=_switch_headers(i)
+        ).status_code == 403
+
+    # Now turn remote access on: the full budget is still available.
+    _set_remote_access(db, True, "tailscale")
+    with (
+        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        after = [
+            remote.post(
+                "/api/auth/accounts/1/use", headers=_switch_headers(100 + i)
+            ).status_code
+            for i in range(6)
+        ]
+    assert after == [200] * 6
+
+
+# ---------------------------------------------------------------------------
+# Observability + audit trail
+# ---------------------------------------------------------------------------
+
+
+def test_denied_remote_mutation_is_logged_with_its_reason(app, db, caplog):
+    _set_remote_access(db, True, "tailscale")
+
+    with caplog.at_level(logging.INFO, logger="jacked.api.routes.auth"):
+        _scoped_client(app, LAN_IP).post("/api/auth/accounts/1/use")
+
+    assert LAN_IP in caplog.text
+    assert "outside_scope" in caplog.text
+
+
+def test_allowed_remote_mutation_is_logged(app, db, caplog):
+    _set_remote_access(db, True, "tailscale")
+
+    with (
+        caplog.at_level(logging.INFO, logger="jacked.api.routes.auth"),
+        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        _scoped_client(app, TAILNET_IP).post("/api/auth/accounts/1/use")
+
+    assert TAILNET_IP in caplog.text
+    # Never the credentials themselves.
+    assert "cc_at_1" not in caplog.text
+    assert "at_1" not in caplog.text
+
+
+def test_loopback_mutation_is_not_logged_per_request(app, db, caplog):
+    """Only non-loopback decisions are worth a line; the local dashboard
+    switches accounts all day."""
+    _set_remote_access(db, False, "tailscale")
+
+    with (
+        caplog.at_level(logging.INFO, logger="jacked.api.routes.auth"),
+        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        _scoped_client(app, "127.0.0.1").post("/api/auth/accounts/1/use")
+
+    assert "credential mutation" not in caplog.text.lower()
+
+
+def test_remote_switch_is_attributed_in_the_swap_broadcast(app, db):
+    """Swap History must distinguish a switch made from another machine."""
+    _set_remote_access(db, True, "tailscale")
+    broadcasts = []
+
+    class _Registry:
+        async def broadcast(self, event, payload):
+            broadcasts.append((event, payload))
+
+    app.state.ws_registry = _Registry()
+
+    with (
+        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        _scoped_client(app, TAILNET_IP).post("/api/auth/accounts/1/use")
+
+    reasons = [p["reason"] for e, p in broadcasts if e == "auto_swap_triggered"]
+    assert reasons and reasons[0].endswith(f" from {TAILNET_IP}")
+
+
+def test_local_switch_reason_is_unchanged(app, db):
+    broadcasts = []
+
+    class _Registry:
+        async def broadcast(self, event, payload):
+            broadcasts.append((event, payload))
+
+    app.state.ws_registry = _Registry()
+
+    with (
+        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch("jacked.api.usage_monitor.note_external_swap"),
+    ):
+        _scoped_client(app, "127.0.0.1").post("/api/auth/accounts/1/use")
+
+    reasons = [p["reason"] for e, p in broadcasts if e == "auto_swap_triggered"]
+    assert reasons and " from " not in reasons[0]

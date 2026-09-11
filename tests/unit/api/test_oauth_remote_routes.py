@@ -440,3 +440,84 @@ def test_reopen_surfaces_a_refusal_without_failing_the_request(client, monkeypat
     assert resp.status_code == 200
     assert resp.json()["reopen_error"] == "This flow has no local browser to reopen."
     assert resp.json()["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# allow_credential_activation on the three flow-starting routes
+#
+# A completed OAuth flow can activate the new credentials immediately. That is
+# a credential mutation, so it follows the same scope gate as /use: the flow
+# must not be handed activation rights just because the browser reached the
+# port.
+# ---------------------------------------------------------------------------
+
+TAILNET_IP = "100.116.47.72"
+LAN_IP = "192.168.42.5"
+
+
+def _set_remote_access(db, enabled, scope="tailscale"):
+    db.set_setting("remote_access_enabled", "true" if enabled else "false")
+    db.set_setting("remote_access_scope", scope)
+
+
+def _tailnet_client(host=TAILNET_IP):
+    return TestClient(app, client=(host, 50000))
+
+
+def test_add_account_grants_activation_to_an_in_scope_remote_client(db, started_flows):
+    _set_remote_access(db, True, "tailscale")
+
+    resp = _tailnet_client().post("/api/auth/accounts/add")
+
+    assert resp.status_code == 200
+    assert started_flows[0].allow_credential_activation is True
+
+
+def test_add_account_denies_activation_when_remote_access_is_off(db, started_flows):
+    _set_remote_access(db, False, "tailscale")
+
+    resp = _tailnet_client().post("/api/auth/accounts/add")
+
+    assert resp.status_code == 200
+    assert started_flows[0].allow_credential_activation is False
+
+
+def test_add_account_denies_activation_outside_the_scope(db, started_flows):
+    _set_remote_access(db, True, "tailscale")
+
+    resp = _tailnet_client(LAN_IP).post("/api/auth/accounts/add")
+
+    assert resp.status_code == 200
+    assert started_flows[0].allow_credential_activation is False
+
+
+@pytest.mark.parametrize("enabled,expected", [(True, True), (False, False)])
+def test_reauth_activation_follows_the_scope_gate(db, started_flows, enabled, expected):
+    _set_remote_access(db, enabled, "tailscale")
+    account = _make_account(db, email="reauth@example.com")
+
+    resp = _tailnet_client().post(f"/api/auth/accounts/{account['id']}/reauth")
+
+    assert resp.status_code == 200
+    assert started_flows[0].allow_credential_activation is expected
+
+
+@pytest.mark.parametrize("enabled,expected", [(True, True), (False, False)])
+def test_authorize_cc_activation_follows_the_scope_gate(
+    db, started_flows, enabled, expected
+):
+    _set_remote_access(db, enabled, "tailscale")
+    account = _make_account(db, email="cc@example.com")
+
+    resp = _tailnet_client().post(f"/api/auth/accounts/{account['id']}/authorize-cc")
+
+    assert resp.status_code == 200
+    assert started_flows[0].allow_credential_activation is expected
+
+
+def test_local_flows_always_get_activation(client, db, started_flows):
+    """Loopback is unchanged by the setting."""
+    _set_remote_access(db, False, "tailscale")
+
+    assert client.post("/api/auth/accounts/add").status_code == 200
+    assert started_flows[0].allow_credential_activation is True

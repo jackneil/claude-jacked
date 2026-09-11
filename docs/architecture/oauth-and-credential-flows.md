@@ -43,9 +43,11 @@ cannot rotate Jacked's primary refresh token.
 
 OAuth completion saves the account in SQLite before any local activation. It
 attempts local credential activation only when the new or re-authorized account
-should be the default and the request came from a loopback client. For a remote
-dashboard, `_complete_auth()` saves the account, skips host credential mutation,
-and puts `activation_status=local_only` in its internal completion result.
+should be the default and the requesting client passes the credential-mutation
+scope gate in section 8 (loopback always; a remote client while remote access is
+on and its address is inside the enabled scope). For a client that does not,
+`_complete_auth()` saves the account, skips host credential mutation, and puts
+`activation_status=local_only` in its internal completion result.
 
 `OAuthFlow.get_status()` copies `activation_status`,
 `activation_operation_id`, and `activation_message` from the completed result
@@ -326,12 +328,40 @@ is enabled *and* its address is inside the enabled scope:
 
 - scope `all`: any address that parses as an IP;
 - scope `tailscale` (also the fallback for an absent or unrecognized scope):
-  IPv4 inside Tailscale's CGNAT range `100.64.0.0/10`, or IPv6 inside
-  `fd7a:115c:a1e0::/48`.
+  IPv4 inside Tailscale's CGNAT range `100.64.0.0/10`. The IPv6 ULA prefix
+  `fd7a:115c:a1e0::/48` is accepted too, but defensively: the tailscale-scope
+  bind is IPv4-only today, so no live client arrives from it.
 
 A client host that is missing or does not parse is denied unless it is a
-loopback literal, and no settings DB means loopback only. Denied requests get
-HTTP 403 with code `CREDENTIAL_MUTATION_LOCAL_ONLY`. The policy itself lives in
+loopback literal. No settings DB, and a settings DB that raises on the read,
+both mean loopback only: the reader fails closed rather than propagating, since
+it runs on the polled `/active-credential` too. Denied requests get HTTP 403
+with code `CREDENTIAL_MUTATION_LOCAL_ONLY` and a message chosen by the reason
+(`remote_access_off` or `outside_scope`).
+
+`request.client.host` is the socket peer, or the address a trusted loopback
+proxy forwarded. All three uvicorn launch sites pin `proxy_headers=True,
+forwarded_allow_ips="127.0.0.1"` explicitly rather than inheriting
+`FORWARDED_ALLOW_IPS`: `tailscale serve` proxies from loopback and rewrites
+`X-Forwarded-For` to the real tailnet source, so honoring a loopback proxy is
+what stops a serve viewer from inheriting loopback's unconditional permission,
+and pinning the trusted set stops the environment from widening it.
+
+Accepted remote switches are rate limited per client host (6 per rolling 60
+seconds, 429 `CREDENTIAL_SWITCH_RATE_LIMITED` with `Retry-After`), evaluated
+after the gate so a denied client never consumes budget. Loopback is not
+metered. Every non-loopback decision, allowed or denied, leaves one INFO line
+naming the client, and a remote switch is labeled with its client address in
+the swap broadcast that drives Swap History.
+
+The setting that drives all of this is itself loopback-only to write:
+`PUT /api/settings/remote-access` and `POST /api/settings/remote-access/restart`
+refuse a non-loopback client with 403 `REMOTE_ACCESS_SETTINGS_LOCAL_ONLY`, and
+the GET reports `editable` so the dashboard can render the controls read-only.
+Without that, a remote peer could grant itself credential control by writing the
+bit, and turning remote access off would not revoke anything until the socket is
+rebound by a restart. `POST /api/upgrade` is deliberately NOT gated: the
+remote-access confirmation dialogs promise remote upgrades explicitly. The policy itself lives in
 `jacked/api/remote_access.py` (`credential_mutation_allowed`) and reads the
 same `remote_access_enabled` / `remote_access_scope` settings the bind planner
 uses, so enabling remote access is the single switch that grants credential
@@ -369,8 +399,10 @@ nonterminal state returns HTTP 202 with `result: null`. An expired action is
 reported as `expired`; the status endpoint does not extend its lifetime.
 
 `GET /api/auth/active-credential` publishes the same decision for the calling
-client as `allow_credential_activation` on every response path, including the
-unresolved and conflicting ones. The dashboard reads it to disable the Use
+client as `allow_credential_activation` (a required field on the response
+model) plus `credential_activation_reason` (`remote_access_off`,
+`outside_scope`, or null) on every response path, including the unresolved and
+conflicting ones. The dashboard reads it to disable the Use
 Account button and show one hint, rather than offering a control the server
 will reject. The field defaults to `true`, so a client talking to a server that
 predates it behaves as before; the server, not the flag, remains the gate.
@@ -495,8 +527,10 @@ every switch reports `observed_target_unfenced`, so a rule that acted only on
    write.
 8. Resolver snapshots contain no token, secret, digest, HMAC, password, or
    backend locator fields.
-9. Remote OAuth may save account data, but remote dashboards cannot activate
-   local credentials.
+9. Remote OAuth may save account data. A remote dashboard may activate local
+   credentials only while the persisted remote-access setting is enabled and
+   the client is inside the enabled scope; the setting itself is writable from
+   loopback only, so reaching the port never grants credential control.
 10. Per-account launch directories remain inputs until exact scoped
     consumption is separately certified.
 

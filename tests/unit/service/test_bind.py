@@ -19,7 +19,9 @@ import pytest
 from jacked.service.bind import (
     BindPlan,
     create_sockets,
+    describe_remote_exposure,
     detect_tailscale_ip,
+    log_remote_exposure,
     resolve_bind,
 )
 from jacked.web.database import Database
@@ -580,3 +582,137 @@ def test_create_sockets_uses_exclusiveaddruse_on_windows(monkeypatch):
     create_sockets(plan)
     assert socket.SO_EXCLUSIVEADDRUSE in set_opts
     assert socket.SO_REUSEADDR not in set_opts
+
+
+# ---------------------------------------------------------------------------
+# Startup exposure warning
+#
+# mode="cli" short-circuits before the DB read, so `--host 0.0.0.0` can widen
+# reachability while a stale remote_access row still grants credential
+# switching with no fresh confirmation. One startup line makes that visible.
+# ---------------------------------------------------------------------------
+
+
+def _plan(mode, addresses, primary=None, ts_ip=None):
+    return BindPlan(
+        mode=mode,
+        addresses=tuple(addresses),
+        port=8321,
+        primary_host=primary or addresses[0],
+        tailscale_ip=ts_ip,
+    )
+
+
+def test_no_exposure_line_for_a_loopback_plan():
+    assert describe_remote_exposure(_plan("loopback", ["127.0.0.1"]), False, "tailscale") is None
+    # Even with the setting on: a loopback bind exposes nothing.
+    assert describe_remote_exposure(_plan("loopback", ["127.0.0.1"]), True, "all") is None
+
+
+def test_tailscale_plan_with_remote_access_on_names_the_audience():
+    msg = describe_remote_exposure(
+        _plan("tailscale", ["127.0.0.1", "100.64.9.9"], "100.64.9.9", "100.64.9.9"),
+        True,
+        "tailscale",
+    )
+    assert msg is not None
+    assert "100.64.9.9" in msg
+    assert "tailnet" in msg
+    assert "switch accounts" in msg
+    assert "—" not in msg
+
+
+def test_cli_override_with_remote_access_off_says_the_setting_decides():
+    msg = describe_remote_exposure(_plan("cli", ["0.0.0.0"]), False, "tailscale")
+    assert msg is not None
+    assert "0.0.0.0" in msg
+    assert "remote access is off" in msg
+    assert "setting, not the bind" in msg
+
+
+def test_cli_override_with_scope_all_warns_every_peer_may_switch():
+    msg = describe_remote_exposure(_plan("cli", ["0.0.0.0"]), True, "all")
+    assert msg is not None
+    assert "any peer" in msg
+    assert "switch accounts" in msg
+
+
+def test_cli_override_wider_than_the_saved_scope_is_called_out():
+    msg = describe_remote_exposure(_plan("cli", ["0.0.0.0"]), True, "tailscale")
+    assert msg is not None
+    assert "setting, not the bind" in msg
+    assert "tailnet" in msg
+
+
+def test_cli_override_pinned_to_loopback_is_not_an_exposure():
+    assert describe_remote_exposure(_plan("cli", ["127.0.0.1"]), True, "all") is None
+
+
+def test_log_remote_exposure_emits_one_warning(tmp_path, caplog):
+    db = Database(str(tmp_path / "x.db"))
+    db.set_setting("remote_access_enabled", "true")
+    db.set_setting("remote_access_scope", "all")
+    plan = _plan("all", ["0.0.0.0"])
+
+    with caplog.at_level(logging.WARNING, logger="jacked.service.bind"):
+        message = log_remote_exposure(plan, db=db)
+
+    assert message is not None
+    assert caplog.text.count("switch accounts") == 1
+    db.close()
+
+
+def test_log_remote_exposure_is_silent_on_loopback(tmp_path, caplog):
+    db = Database(str(tmp_path / "x.db"))
+    plan = _plan("loopback", ["127.0.0.1"])
+
+    with caplog.at_level(logging.WARNING, logger="jacked.service.bind"):
+        assert log_remote_exposure(plan, db=db) is None
+
+    # No warning from THIS module (unrelated INFO records from the DB layer
+    # land in caplog too, so assert on the source rather than on emptiness).
+    assert [r for r in caplog.records if r.name == "jacked.service.bind"] == []
+    db.close()
+
+
+def test_log_remote_exposure_survives_a_broken_db(caplog):
+    class _Broken:
+        def get_setting(self, key):
+            raise sqlite3.OperationalError("database is locked")
+
+    with caplog.at_level(logging.WARNING):
+        # Must not raise during startup.
+        assert log_remote_exposure(_plan("cli", ["0.0.0.0"]), db=_Broken()) is not None
+
+
+def test_resolve_bind_uses_the_shared_settings_reader(tmp_path, monkeypatch):
+    """One reader for the bind decision and the credential gate, so they
+    cannot disagree about what the setting says."""
+    import jacked.api.remote_access as ra
+
+    db = Database(str(tmp_path / "x.db"))
+    db.set_setting("remote_access_enabled", "true")
+    db.set_setting("remote_access_scope", "all")
+    seen = []
+    real = ra.read_enabled_scope
+    monkeypatch.setattr(
+        ra, "read_enabled_scope", lambda d: (seen.append(d), real(d))[1]
+    )
+
+    plan = resolve_bind(None, 8321, db=db)
+
+    assert plan.mode == "all"
+    assert seen, "resolve_bind did not go through read_enabled_scope"
+    db.close()
+
+
+def test_bind_doctests_run():
+    """CI runs bare pytest with testpaths=["tests"] and no --doctest-modules,
+    so the exposure-line truth table would otherwise never execute."""
+    import doctest
+
+    from jacked.service import bind as bind_mod
+
+    results = doctest.testmod(bind_mod)
+    assert results.failed == 0
+    assert results.attempted > 0

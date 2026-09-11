@@ -2085,3 +2085,92 @@ class TestRestartRearmsNativeOwner:
         assert calls == []
         spawn.assert_called_once()
 
+
+
+class TestProxyHeaderTrustIsPinned:
+    """The credential gate reads request.client.host, and uvicorn substitutes
+    a forwarded address there when it trusts the peer. `tailscale serve`
+    proxies from loopback and rewrites X-Forwarded-For to the real tailnet
+    source, so trusting loopback forwarding is what keeps a serve viewer from
+    looking like loopback. What must never happen is the trusted set widening
+    silently: uvicorn reads FORWARDED_ALLOW_IPS from the environment, so both
+    kwargs are pinned explicitly at every launch site."""
+
+    def test_webux_pins_proxy_headers_on_the_socket_path(self, monkeypatch):
+        import uvicorn
+        from jacked.cli import main
+        from jacked.service.bind import BindPlan
+
+        plan = BindPlan(
+            mode="loopback", addresses=("127.0.0.1",), port=8321,
+            primary_host="127.0.0.1",
+        )
+        captured = {}
+
+        class _FakeServer:
+            def __init__(self, config):
+                captured["config"] = config
+
+            def run(self, sockets=None):
+                pass
+
+        monkeypatch.setattr("jacked.service.bind.resolve_bind", lambda h, p: plan)
+        monkeypatch.setattr("jacked.service.bind.create_sockets", lambda _p: [])
+        monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: {"a": a, "k": k})
+        monkeypatch.setattr(uvicorn, "Server", _FakeServer)
+        monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+
+        result = CliRunner().invoke(main, ["webux", "--no-browser"])
+
+        assert result.exit_code == 0, result.output
+        kwargs = captured["config"]["k"]
+        assert kwargs["proxy_headers"] is True
+        assert kwargs["forwarded_allow_ips"] == "127.0.0.1"
+
+    def test_webux_reload_pins_proxy_headers_too(self, monkeypatch):
+        import uvicorn
+        from jacked.cli import main
+
+        captured = {}
+        monkeypatch.setattr(
+            uvicorn, "run", lambda *a, **k: captured.update(kwargs=k)
+        )
+        monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+
+        result = CliRunner().invoke(main, ["webux", "--no-browser", "--reload"])
+
+        assert result.exit_code == 0, result.output
+        assert captured["kwargs"]["proxy_headers"] is True
+        assert captured["kwargs"]["forwarded_allow_ips"] == "127.0.0.1"
+
+
+class TestStartupExposureWarning:
+    def test_webux_logs_the_exposure_line_after_resolving_the_plan(self, monkeypatch):
+        import uvicorn
+        from jacked.cli import main
+        from jacked.service.bind import BindPlan
+
+        plan = BindPlan(
+            mode="cli", addresses=("0.0.0.0",), port=8321, primary_host="0.0.0.0",
+        )
+        seen = []
+
+        class _FakeServer:
+            def __init__(self, config):
+                pass
+
+            def run(self, sockets=None):
+                pass
+
+        monkeypatch.setattr("jacked.service.bind.resolve_bind", lambda h, p: plan)
+        monkeypatch.setattr("jacked.service.bind.create_sockets", lambda _p: [])
+        monkeypatch.setattr(
+            "jacked.service.bind.log_remote_exposure", lambda p, db=None: seen.append(p)
+        )
+        monkeypatch.setattr(uvicorn, "Config", lambda *a, **k: {"a": a, "k": k})
+        monkeypatch.setattr(uvicorn, "Server", _FakeServer)
+
+        result = CliRunner().invoke(main, ["webux", "--no-browser", "--host", "0.0.0.0"])
+
+        assert result.exit_code == 0, result.output
+        assert seen == [plan]
