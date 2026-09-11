@@ -306,8 +306,9 @@ def is_process_alive(pid: int) -> bool:
 
 # Bind addresses that mean "every interface". A bind probe against one of
 # these is not a question about a single address, so the listening probe has
-# to ask loopback instead.
-_WILDCARD_HOSTS = ("0.0.0.0", "", "::")
+# to ask loopback instead. IPv4 only, like every probe here: "::" is absent
+# because the AF_INET fallback bind below could never succeed for it anyway.
+_WILDCARD_HOSTS = ("0.0.0.0", "")
 
 
 def is_port_listening(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -318,6 +319,9 @@ def is_port_listening(host: str, port: int, timeout: float = 0.5) -> bool:
     misses. On macOS/BSD a specific-address bind with SO_REUSEADDR succeeds
     right next to a wildcard listener, so the bind test answers "available"
     while a server is happily serving that very port.
+
+    IPv4 by design: every BindPlan address is IPv4 and ``bind.create_sockets``
+    opens AF_INET sockets, so there is no v6 listener of ours to miss.
 
     The socket is always closed. Any OSError (connection refused, unreachable
     host) or timeout answers False.
@@ -345,9 +349,11 @@ def is_port_available(host: str, port: int) -> bool:
     roll a good upgrade back, then call the rollback dead too. A wildcard
     *host* has no single address to connect to, so loopback is probed instead.
 
-    Nothing listening falls through to the bind test, which uses SO_REUSEADDR
-    so a port in TIME_WAIT (recently-closed by a previous server) probes as
-    available - matching what uvicorn actually does when binding (it sets
+    Nothing listening falls through to the bind test, which binds the host the
+    caller passed (the wildcard substitution above applies only to the connect
+    probe, since a wildcard bind is exactly the question being asked here) and
+    uses SO_REUSEADDR so a port in TIME_WAIT (recently-closed by a previous
+    server) probes as available - matching what uvicorn actually does when binding (it sets
     reuse_address=True on POSIX). Without this, ``is_port_available`` returned
     False for ~30s after a tray restart even though the new server would bind
     cleanly, causing the auto-updater to abort with "port could not be freed"

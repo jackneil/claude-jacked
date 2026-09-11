@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+from tests.unit.service.test_updater import _comes_up_after, _local_probes
+
 
 def test_native_restart_uses_exact_lifecycle_contract():
     from jacked.service import platform as plat
@@ -36,7 +38,7 @@ class TestUpdaterUsesNativeRestart:
         "jacked.service.platform.native_restart",
         return_value=(True, "launchctl kickstart"),
     )
-    @patch("jacked.service.updater.is_port_available")
+    @patch("jacked.service.updater.is_port_listening")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
@@ -45,7 +47,7 @@ class TestUpdaterUsesNativeRestart:
         mock_popen,
         mock_run,
         mock_find,
-        mock_port_avail,
+        mock_listening,
         mock_native,
         mock_gate,
         mock_method,
@@ -64,16 +66,14 @@ class TestUpdaterUsesNativeRestart:
             "jacked": "/fake/jacked",
         }.get(name)
         mock_run.return_value = MagicMock(returncode=0)
-        # The port is free to bind; verification is a connect probe, so the
-        # service that came up is seen through is_port_listening. Both are
-        # pinned here: without the listening patch the phase would probe the
-        # developer's own :8321.
-        mock_port_avail.return_value = True
+        # The port is free while the tail waits, then the restarted service
+        # answers as the version this update targeted. Pinned here because an
+        # unpatched probe would ask the developer's own :8321.
+        mock_listening.side_effect = _comes_up_after(1)
 
         with (
             patch.object(updater, "wait_for_exit", return_value=True),
-            patch("jacked.service.updater.is_port_listening", return_value=True),
-            patch("urllib.request.urlopen", side_effect=OSError("no endpoint")),
+            _local_probes(version="0.41.22"),
         ):
             updater.run_update(
                 parent_pid=12345, extras="tray", target_version="0.41.22"
@@ -97,7 +97,7 @@ class TestUpdaterUsesNativeRestart:
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.service.platform.native_restart", return_value=(False, "no plist"))
-    @patch("jacked.service.updater.is_port_available")
+    @patch("jacked.service.updater.is_port_listening")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")
     @patch("subprocess.Popen")
@@ -106,7 +106,7 @@ class TestUpdaterUsesNativeRestart:
         mock_popen,
         mock_run,
         mock_find,
-        mock_port_avail,
+        mock_listening,
         mock_native,
         mock_gate,
         mock_method,
@@ -125,16 +125,14 @@ class TestUpdaterUsesNativeRestart:
             "jacked": "/fake/jacked",
         }.get(name)
         mock_run.return_value = MagicMock(returncode=0)
-        # The port is free to bind; verification is a connect probe, so the
-        # service that came up is seen through is_port_listening. Both are
-        # pinned here: without the listening patch the phase would probe the
-        # developer's own :8321.
-        mock_port_avail.return_value = True
+        # The port is free while the tail waits, then the restarted service
+        # answers as the version this update targeted. Pinned here because an
+        # unpatched probe would ask the developer's own :8321.
+        mock_listening.side_effect = _comes_up_after(1)
 
         with (
             patch.object(updater, "wait_for_exit", return_value=True),
-            patch("jacked.service.updater.is_port_listening", return_value=True),
-            patch("urllib.request.urlopen", side_effect=OSError("no endpoint")),
+            _local_probes(version="0.41.22"),
         ):
             updater.run_update(
                 parent_pid=12345, extras="tray", target_version="0.41.22"
