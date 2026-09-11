@@ -336,7 +336,14 @@ class TestPortStuckRecovery:
         mock_run.return_value = MagicMock(returncode=0)
         mock_port_avail.return_value = False
 
-        with patch.object(updater, "wait_for_exit", return_value=True):
+        with (
+            patch.object(updater, "wait_for_exit", return_value=True),
+            patch("jacked.service.updater.time.monotonic",
+                  side_effect=itertools.count(0.0, 5.0)),
+            # The squatter never identifies itself as a jacked service, so the
+            # port stays ambiguous and nothing may be signalled.
+            patch("urllib.request.urlopen", side_effect=_version_endpoint(None)),
+        ):
             updater.run_update(parent_pid=12345, extras="tray")
 
         mock_port_pids.assert_not_called()
@@ -366,12 +373,20 @@ class TestPortStuckRecovery:
         mock_find.side_effect = lambda name: {"uv": "/fake/uv", "jacked": "/fake/jacked"}.get(name)
         mock_run.return_value = MagicMock(returncode=0)
 
-        with patch.object(updater, "wait_for_exit", return_value=True):
+        with (
+            patch.object(updater, "wait_for_exit", return_value=True),
+            patch("jacked.service.updater.time.monotonic",
+                  side_effect=itertools.count(0.0, 5.0)),
+            # The listener never answers /api/version, so it is NOT a jacked
+            # service the restart would replace - it stays a squatter.
+            patch("urllib.request.urlopen", side_effect=_version_endpoint(None)),
+        ):
             updater.run_update(parent_pid=12345, extras="tray")
 
         mock_popen.assert_not_called()
         assert (tmp_path / "recovery.txt").exists()
         assert "port 8321" in (tmp_path / "recovery.txt").read_text().lower()
+        assert "unverified listener" in (tmp_path / "recovery.txt").read_text()
 
 
 class TestNewServiceVerification:
@@ -453,7 +468,7 @@ class TestUpdaterRollback:
     @staticmethod
     def _run_update(
         monkeypatch, tmp_path, run_results, port_results, listen_results,
-        version_answer=None,
+        version_answer=None, clock_step=5.0,
     ):
         """Drive run_update with scripted subprocess, port and listener outcomes.
 
@@ -476,7 +491,7 @@ class TestUpdaterRollback:
             # A fake clock: sleep is a no-op, so a real 20s verify deadline
             # would busy-spin for 20 real seconds per attempt.
             patch("jacked.service.updater.time.monotonic",
-                  side_effect=itertools.count(0.0, 5.0)),
+                  side_effect=itertools.count(0.0, clock_step)),
             patch("jacked.service.updater.is_port_available") as port,
             patch("jacked.service.updater.is_port_listening") as listening,
             patch("urllib.request.urlopen",
@@ -680,6 +695,76 @@ class TestUpdaterPartialRollback:
 def _healthy_runs():
     """uv install, a passing preflight, jacked install --force."""
     return [_ok(), _ok("[OK] Service contract OK"), _ok()]
+
+
+class TestWaitingPortFreeIdentifiesTheListener:
+    """A port held by a jacked service is not a squatter.
+
+    `jacked install --force` (the migrating_settings phase) activates the tray,
+    so the new service is often ALREADY listening when waiting_port_free runs -
+    exactly what the 2026-09-11 log shows. The old bind probe was blind to that
+    wildcard listener and sailed through; an honest probe must identify the
+    owner instead of aborting the upgrade.
+    """
+
+    _run_update = staticmethod(TestUpdaterRollback._run_update)
+
+    def test_a_jacked_listener_after_migrate_is_not_a_squatter(
+        self, tmp_path, monkeypatch
+    ):
+        from jacked.service import update_status as us_mod
+
+        succeeded = []
+        real_mark = us_mod.mark_succeeded
+
+        def spy(*args, **kwargs):
+            succeeded.append(args)
+            return real_mark(*args, **kwargs)
+
+        monkeypatch.setattr(us_mod, "mark_succeeded", spy)
+
+        _run, popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs(),
+            # The port never reads free: `jacked install` already activated a
+            # service on it, and /api/version says that service is ours.
+            port_results=False,
+            listen_results=True,
+            version_answer="0.100.0",
+            clock_step=0.1,
+        )
+
+        phases = {p["name"]: p["status"] for p in status["phases"]}
+        assert phases["waiting_port_free"] == "ok"
+        assert phases["starting_service"] == "ok"
+        assert phases["verifying_service"] == "ok"
+        assert status["overall"] == "succeeded"
+        assert succeeded, "mark_succeeded never ran for a healthy upgrade"
+        assert not recovery.exists()
+        popen.assert_called_once()
+        log = (tmp_path / "update.log").read_text(encoding="utf-8")
+        assert "held by a jacked service (build 0.100.0)" in log
+
+    def test_a_listener_that_will_not_identify_is_still_a_squatter(
+        self, tmp_path, monkeypatch
+    ):
+        _run, popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs(),
+            port_results=False,
+            listen_results=True,
+            version_answer=None,   # it never answers /api/version
+            clock_step=0.1,
+        )
+
+        phases = {p["name"]: p["status"] for p in status["phases"]}
+        assert phases["waiting_port_free"] == "failed"
+        # No start is attempted against a port whose owner is unknown.
+        assert "starting_service" not in phases
+        popen.assert_not_called()
+        assert recovery.exists()
+        body = recovery.read_text(encoding="utf-8")
+        assert "occupied by an unverified listener" in body
 
 
 class TestVerifyingServiceUsesAConnectProbe:

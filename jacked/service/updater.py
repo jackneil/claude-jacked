@@ -39,6 +39,27 @@ ROLLBACK_STEP_RESTART = "service restart"
 PREFLIGHT_TIMEOUT_SECONDS = 120
 
 
+def _read_reported_build(port: int, budget: float) -> "str | None":
+    """Ask whatever listens on *port* which jacked build it is.
+
+    A jacked service answers ``/api/version`` with JSON carrying ``current``.
+    Anything else - no answer within *budget*, a listener that is not jacked,
+    malformed JSON - reads as None. Never raises: callers use this to identify
+    a port owner or to enrich a log line, never to fail a phase.
+    """
+    if budget <= 0:
+        return None
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/version", timeout=budget
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 - an unidentifiable listener is the answer
+        return None
+    current = payload.get("current") if isinstance(payload, dict) else None
+    return current if isinstance(current, str) and current else None
+
+
 class RollbackResult(NamedTuple):
     """Outcome of one rollback attempt.
 
@@ -403,25 +424,44 @@ def run_update(
         # The restart + verify tail. It runs for the successful path AND for
         # the rolled-back path, so the machine always ends with a service.
         def _wait_port_free() -> bool:
-            """Wait for the old listener to release the port. True when free."""
+            """Wait until the port is ours to take. True when the start may run.
+
+            Free is the easy answer. A port that is still LISTENING is not
+            automatically a squatter: `jacked install --force` activates the
+            tray, so the build this update just installed is usually already
+            serving by the time this phase runs (and under launchd KeepAlive
+            the previous build can be too). A listener that answers
+            /api/version is a jacked service the native restart replaces, so
+            the upgrade proceeds. Only a listener that will not identify
+            itself by the deadline stops the update, and no pid is ever
+            signalled either way.
+            """
             _begin("waiting_port_free")
             log("Waiting for port to become available")
             port_deadline = time.monotonic() + 10.0
             while time.monotonic() < port_deadline:
                 if is_port_available("127.0.0.1", port):
-                    break
-                time.sleep(0.5)
-            if not is_port_available("127.0.0.1", port):
-                _end(
-                    "waiting_port_free",
-                    "failed",
-                    error=f"port {port} remains occupied by an unverified listener",
-                    recovery="run `jacked service status`; v2 services use discoverable quarantine",
+                    _end("waiting_port_free", "ok")
+                    return True
+                build = _read_reported_build(
+                    port, min(2.0, port_deadline - time.monotonic())
                 )
-                log(f"ABORT: port {port} is ambiguous; no process was signalled")
-                return False
-            _end("waiting_port_free", "ok")
-            return True
+                if build is not None:
+                    log(
+                        f"Port {port} is held by a jacked service (build {build}); "
+                        "the native restart replaces it"
+                    )
+                    _end("waiting_port_free", "ok")
+                    return True
+                time.sleep(0.5)
+            _end(
+                "waiting_port_free",
+                "failed",
+                error=f"port {port} remains occupied by an unverified listener",
+                recovery="run `jacked service status`; v2 services use discoverable quarantine",
+            )
+            log(f"ABORT: port {port} is ambiguous; no process was signalled")
+            return False
 
         def _spawn_service() -> None:
             """Start the service through the platform's own lifecycle manager."""
@@ -466,18 +506,9 @@ def run_update(
             so a dashboard that is up but slow to answer /api/version is still
             a healthy service.
             """
-            budget = min(2.0, max(0.0, deadline - time.monotonic()))
-            build = None
-            if budget > 0:
-                try:
-                    with urllib.request.urlopen(
-                        f"http://127.0.0.1:{port}/api/version", timeout=budget
-                    ) as response:
-                        build = json.loads(response.read().decode("utf-8")).get(
-                            "current"
-                        )
-                except Exception:  # noqa: BLE001 - never fail the phase on this
-                    build = None
+            build = _read_reported_build(
+                port, min(2.0, deadline - time.monotonic())
+            )
             if build:
                 log(f"Service reports build {build}")
             else:
