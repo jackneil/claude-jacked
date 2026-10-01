@@ -78,6 +78,21 @@ def _no_real_service_processes(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _skill_listing_stays_off_the_machine(monkeypatch):
+    """The skill-listing report reads managed settings from a system path and
+    runs ``claude --version``. Tests get neither, plus none of the Claude Code
+    variables that change the report (the suite may run inside Claude Code)."""
+    from jacked import skill_listing
+
+    monkeypatch.setattr(skill_listing, "managed_settings_paths", lambda: [])
+    monkeypatch.setattr(skill_listing, "claude_code_version",
+                        lambda: skill_listing.CALIBRATED_CLAUDE_VERSION)
+    for var in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL", "CLAUDE_CODE_DISABLE_1M_CONTEXT",
+                "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", skill_listing.ENV_BUDGET_VAR):
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _block_keychain_writes():
     """Prevent tests from mutating the real credential authority."""
     def launch_result(account, _db):

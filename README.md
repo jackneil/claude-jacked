@@ -570,6 +570,39 @@ jacked packs update                # refresh enabled packs from upstream
 
 Packs can also be toggled from the dashboard (Settings > Features > Skill Packs). Skills install for Codex too when it is present. Removal is source-checked against the skills CLI lockfile, so a same-named skill you installed yourself from another repo is never touched, and a skill directory you already own is never overwritten. Because packs are on by default, a plain `jacked install` pulls third-party content from those repos' main branch at install time; if that trust boundary matters for your environment, run `jacked install --no-packs` or disable the packs you do not want. A disable is durable: a pack you turn off stays off across future installs.
 
+### Skill Listing Budget (keep every skill visible to Claude)
+
+Claude Code sends Claude a list of your skills and commands in each session. Each entry has a name and a description. The list has a character budget: 1% of the context window by default. When the list is larger than the budget, Claude Code keeps all names but removes descriptions, starting with the skills you use least. Claude rarely selects a skill that has no description. Skill packs add many entries, so they can push the list over the budget.
+
+To see the list status, run this command:
+
+```bash
+jacked skills listing                 # status, skills without a description, YAML warnings
+jacked skills listing --window 200k   # the same report for a 200k context window
+jacked skills listing --apply         # write the recommended settings
+jacked skills listing --reset         # remove the settings (Claude Code defaults apply)
+jacked skills listing --json          # the report as JSON
+```
+
+The dashboard shows the same report in Settings > Features > Skill Packs > Skill listing. Select **Apply recommended** to write the settings. The text next to the button shows the exact values and the token cost.
+
+The budget depends on the context window of your model. jacked reads the `model` setting and uses the window that Claude Code gives that model. If jacked cannot find the model, the report says so and uses 1M. To see the other window, use `--window` or the **Context window** control in the dashboard. Apply uses the window that you see.
+
+jacked reads your user settings and the managed settings, in the same order as Claude Code. If managed settings also set a listing value, that value wins, and the report tells you. Apply and Reset change only your user settings.
+
+The recommendation changes two keys in `~/.claude/settings.json` and no other keys:
+
+| Key | Claude Code default | What it does |
+|-----|---------------------|--------------|
+| `skillListingMaxDescChars` | 1536 | The maximum number of characters for each description. |
+| `skillListingBudgetFraction` | 0.01 | The part of the context window that the list can use. |
+
+jacked first keeps the budget and finds the largest description cap (150 to 1536 characters) that fits. If no cap fits, jacked sets the cap to 250 characters and finds the smallest budget (1.5%, 2%, 2.5% or 3%) that fits. jacked never recommends a budget that is smaller than your current budget. If no change shows more descriptions, jacked does not recommend a change. A new Claude Code session uses the new settings. If `SLASH_COMMAND_TOOL_CHAR_BUDGET` is set, it sets the budget, and the budget setting has no effect.
+
+The report also shows skill files whose frontmatter is not strict YAML. Claude Code reads these files, but other tools, for example Codex, can reject them. Put quotes around a value that contains a colon.
+
+The estimate matches the `/context` output of Claude Code 2.1.287 to within 1%. The descriptions of the built-in Claude Code skills are not on disk, so jacked uses measured values for them. If you run a different Claude Code version, the report tells you. Commands in sub-folders and plugin commands or skills in custom `plugin.json` paths are not counted, and the report lists them.
+
 ### DCR Review Engine (run reviews on Codex, opt in)
 
 `/dcr` spawns several parallel review agents per wave. By default they run on Claude and spend your Anthropic plan. If you have the OpenAI Codex CLI installed and signed in, you can route the volume reviewers to a Codex model instead and pay for review fan-out with your OpenAI subscription:

@@ -485,6 +485,7 @@ from jacked.api.routes import (  # noqa: E402
     permissions,
     menubar,
     packs,
+    skill_listing,
 )
 from jacked.api.routes.settings_swap import router as swap_settings_router  # noqa: E402
 from jacked.api.routes.settings_remote import router as remote_access_router  # noqa: E402
@@ -498,6 +499,7 @@ app.include_router(system.router, prefix="/api", tags=["system"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["analytics"])
 app.include_router(features.router, prefix="/api", tags=["features"])
 app.include_router(packs.router, prefix="/api", tags=["packs"])
+app.include_router(skill_listing.router, prefix="/api", tags=["packs"])
 app.include_router(logs.router, prefix="/api", tags=["logs"])
 app.include_router(permissions.router, prefix="/api", tags=["permissions"])
 app.include_router(menubar.router, prefix="/api", tags=["menubar"])
