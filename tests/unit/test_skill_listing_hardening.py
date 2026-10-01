@@ -64,7 +64,9 @@ def test_alias_bomb_is_bounded_and_warned(tmp_path):
     start = time.monotonic()
     inv = sl.enumerate_entries(tmp_path, sl.read_listing_settings(tmp_path, environ={}),
                                include_builtins=False)
-    assert time.monotonic() - start < 1.0
+    # Generous on purpose: an unbounded expansion runs for minutes or OOMs,
+    # while the bounded loader takes milliseconds even on a loaded machine.
+    assert time.monotonic() - start < 5.0
     by = {e.name: e for e in inv.entries}
     assert by["good"].desc_len == len("Fine.")
     assert "bomb" in {w.name for w in inv.yaml_warnings}
@@ -124,7 +126,10 @@ def test_workflow_meta_scan_is_fast_on_large_input():
     assert len(text) > 2_000_000
     start = time.monotonic()
     meta = sl.parse_workflow_meta(text)
-    assert time.monotonic() - start < 1.0
+    # Generous on purpose: the old quadratic scan took ~36 s at this size and
+    # the linear one well under 1 s, so 5 s separates them without flaking on
+    # a busy machine (it measured 1.25 s under load at a 1 s bound).
+    assert time.monotonic() - start < 5.0
     assert meta == {"name": "big", "description": "End."}
 
 
