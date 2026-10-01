@@ -1,13 +1,13 @@
 ---
 name: coverage-matrix
-description: Use when asked to analyze product completeness, find gaps, figure out what to build next for best-in-class coverage, audit feature depth across user types, or create a prioritized roadmap for a product. Triggers on "what's missing", "gap analysis", "10/10", "best-in-class", "coverage audit", "feature completeness", "what should we build", "is it actually easy to use", "workflow friction", "how automated are we really".
+description: Use to analyze product completeness, find gaps, decide what to build next for best-in-class coverage, audit feature depth across user types, or build a prioritized roadmap. Triggers on "what's missing", "gap analysis", "10/10", "best-in-class", "coverage audit", "feature completeness", "what should we build", "is it actually easy to use", "workflow friction", "how automated are we really".
 ---
 
 # Coverage Matrix Analysis
 
 Systematic product gap analysis using a Roles × Domains scoring matrix. Anchors on the measurable outcome(s) "best-in-class" must move, discovers who uses the product, what contexts they use it in, scores every combination 0-10, identifies cross-cutting levers, and phases a roadmap by maximum cell-lift per effort.
 
-**Why a matrix, not a flat list**: A flat feature list misses the combinatorial explosion. A "denial management" feature might be great for the billing manager working cardiology claims but useless for the compliance auditor reviewing dermatology. The matrix forces you to evaluate every intersection — that's where the real gaps hide.
+**Why a matrix, not a flat list**: a feature can be great for one role in one domain and useless for another role in another domain. The gaps hide in the intersections, so evaluate every one.
 
 ## When to Use
 
@@ -53,7 +53,7 @@ digraph coverage_matrix {
 
 ## Scope: one product at a time (monorepo check)
 
-The matrix scores ONE product — not a repo. A monorepo holds several independent products (a marketing site, an admin dashboard, a CLI, an API), and they do **not** share a persona×domain grid: blending them averages unrelated apps into one meaningless matrix and yields a "cross-cutting lever" computed across products that share no lever.
+The matrix scores ONE product, not a repo. Products in a monorepo (a marketing site, an admin dashboard, a CLI, an API) do **not** share a persona×domain grid; blending them averages unrelated apps into one meaningless matrix.
 
 Detect a multi-product repo: `pnpm-workspace.yaml`, a `package.json` `workspaces` field, `turbo.json`/`lerna.json`/`nx.json`, a Cargo `[workspace]`, `go.work`, or an `apps/*/` + `packages/*/` layout where each app carries its own manifest and user-facing surface.
 
@@ -67,7 +67,7 @@ Shared `packages/*` (design system, db, auth) aren't products with personas — 
 
 ## Step 0: Anchor on the Target Outcome
 
-Before discovering a single role or scoring a single cell, name **what "best-in-class" is supposed to MOVE**. Per Teresa Torres' Opportunity Solution Tree, all gap analysis hangs off a measurable outcome at the root — otherwise you optimize feature parity in a vacuum and ship a beautifully-covered matrix that moves no metric and can't be defended to a stakeholder asking "what does this change?"
+Before discovering a single role or scoring a single cell, name **what "best-in-class" is supposed to MOVE** (Teresa Torres' Opportunity Solution Tree: gap analysis hangs off a measurable outcome at the root). Without it you optimize feature parity in a vacuum.
 
 **Do this:**
 
@@ -95,7 +95,7 @@ Roles are the **user personas** who interact with the product daily. Not job tit
 
 **Output**: A numbered list of 5-15 roles with one-line descriptions.
 
-**Common mistake**: Listing org-chart titles instead of workflow roles. "VP of Finance" and "CFO" are the same role if they use the same screens. Merge by workflow, not hierarchy.
+**Common mistake**: listing org-chart titles instead of workflow roles. "VP of Finance" and "CFO" are one role if they use the same screens.
 
 ---
 
@@ -136,21 +136,36 @@ Include row averages (role strength) and column averages (domain strength). Thes
 
 ## Step 4: Parallel Research
 
-This is where the depth comes from. Dispatch **parallel research streams** — each one focused on a different angle. Use subagents when available.
+This is where the depth comes from. Dispatch **parallel research streams**, each focused on a different angle. Use subagents when available, inside the dispatch budget below.
+
+### Dispatch budget
+
+Every stream agent counts against **the chain-of-command dispatch budget**, for the whole matrix run (streams, re-dispatches, and any reviewer):
+
+- **Full matrix** = LARGE: at most **16 agents** across the run.
+- **Quick read** (one product, a narrowed scope the user asked for) = MEDIUM: at most **8 agents**.
+- A whole-repo request that produces one matrix per product (see Scope) runs each product's matrix as its own run with its own budget.
+
+Fit the streams to the budget, never the budget to the streams:
+
+- **Batch roles and domains into streams.** Group related roles (for example, 3-4 roles that share screens or a pipeline stage) into one persona stream, and related domains into one domain stream. One agent per role or per domain is allowed only when the total still fits.
+- **The experience-walkthrough stream is required** and always gets its own stream. Codebase inventory and competitor analysis are one stream each.
+- **Synthesis and scoring stay in the main loop**, after all streams return. Validating stream claims (does the cited route exist, does the source URL say that) is main-loop work, not a verifier agent.
+- If the planned streams exceed the budget, merge streams further; the main loop does any remainder inline.
 
 ### Required streams:
 
 | Stream | What it researches | Output |
 |--------|-------------------|--------|
 | **Codebase inventory** | What exists today — routes, services, models, tests, UI pages | Feature inventory with status |
-| **Per-role persona research** (one per role, or batched) | What does "10/10" look like for this role? What does their daily workflow need? | Per-role gap list |
-| **Per-domain requirements** (one per domain, or batched) | What domain-specific rules, validations, workflows exist in this vertical? | Per-domain feature requirements |
+| **Per-role persona research** (batched to fit the budget) | What does "10/10" look like for this role? What does their daily workflow need? | Per-role gap list |
+| **Per-domain requirements** (batched to fit the budget) | What domain-specific rules, validations, workflows exist in this vertical? | Per-domain feature requirements |
 | **Competitor analysis** | What do the top 5-10 competitors offer, classified into 4 tiers (direct / indirect / adjacent / **substitute** — see below)? Where are they strong/weak? | Tiered competitive feature matrix |
 | **Experience walkthrough** (at minimum: the highest-frequency persona × their highest-volume workflow) | How the product is actually EXPERIENCED, not what it contains — see "The Experience Walkthrough Stream" below | Walkthrough narrative + journey scores + ranked friction list |
 
 ### The Experience Walkthrough Stream (required — most-skipped, highest-yield)
 
-Every other stream collects *feature existence* evidence. This stream collects *experience* evidence — and without it you will systematically over-score (a real audit found the same product scoring 9/10 on capability and 3.7/10 on experienced workflow; both numbers were true).
+Every other stream collects *feature existence* evidence. This stream collects *experience* evidence; without it you systematically over-score (one audit: 9/10 on capability, 3.7/10 on the experienced workflow, both true).
 
 Method: trace the persona's actual end-to-end job through UI code or a live session (screens visited, buttons clicked, page-leaves where the next step is non-obvious), then role-play their real day/week against that map. Collect, with evidence:
 
@@ -168,11 +183,11 @@ Score the walked journey on the user's terms (e.g., simple / easy / intuitive / 
 - User feedback analysis (support tickets, feature requests, NPS data)
 - Market sizing per domain (which domains are highest revenue?)
 
-**Key principle**: Each stream runs independently and produces its own document. Synthesis happens AFTER all streams complete. This prevents premature convergence.
+**Key principle**: Each stream runs independently and produces its own document. Synthesis happens AFTER all streams complete, which prevents premature convergence.
 
-**Parallelism**: When subagents are available, dispatch one agent per research stream simultaneously. This is the single biggest time savings - 4 streams in parallel takes 1x time, sequentially takes 4x. Even without subagents, keep streams separate and don't let early findings from one stream bias another. **Tiered dispatch:** research streams are volume work - on a Fable-class session (any session model above Opus), spawn each stream agent with explicit `model: "opus"` and keep one agent per stream (independent streams stay unbiased by construction, and the parent loop keeps the Fable-grade work: synthesis and scoring after all streams return). On Opus and below, spawn with the session's model (never below Opus).
+**Parallelism**: When subagents are available, dispatch the (batched) streams simultaneously in one message. Even without subagents, keep streams separate and don't let early findings from one stream bias another. **Tiered dispatch:** research streams are volume work. On a Fable-class session (any session model above Opus), spawn each stream agent with explicit `model: "opus"`; the parent loop keeps synthesis and scoring. On Opus and below, spawn with the session's model (never below Opus).
 
-**Competitor research is mandatory, not optional.** You cannot score "best-in-class" without knowing what class you're in. At minimum, search for the top 5 competitors and what they offer per domain. Marketing pages, G2/Capterra reviews, and analyst reports (KLAS, Gartner, Forrester) are fast sources.
+**Competitor research is mandatory, not optional.** At minimum, search for the top 5 competitors and what they offer per domain. Marketing pages, G2/Capterra reviews, and analyst reports (KLAS, Gartner, Forrester) are fast sources.
 
 **Classify every competitor into one of 4 tiers** (don't ship a flat "top 5-10" list):
 
@@ -183,7 +198,7 @@ Score the walked journey on the user's terms (e.g., simple / easy / intuitive / 
 | **Adjacent** | Overlapping audience, partial feature overlap | An EHR module that bolts on light coding |
 | **Substitute** | The manual / spreadsheet / status-quo the product replaces | A human coder with a reference book and Excel |
 
-The **substitute tier is the most-missed and usually the real bar to beat** — the status-quo process is what every prospect actually compares you against. Always include it and **call substitutes out by name** ("today they do this in a shared Google Sheet + email"). When you set a cell's "best-in-class" (10/10) ceiling per domain, score it against the **strongest tier present in that domain**, not just the easiest competitor — and note which tier set the bar.
+The **substitute tier is the most-missed and usually the real bar to beat**. Always include it and **call substitutes out by name** ("today they do this in a shared Google Sheet + email"). When you set a cell's "best-in-class" (10/10) ceiling per domain, score it against the **strongest tier present in that domain**, not just the easiest competitor — and note which tier set the bar.
 
 **Source tracking is mandatory.** Every competitor claim needs a URL. During research, collect the source URL for every factual claim — product capabilities, market stats, KLAS scores, automation rates, pricing tiers. These will be cited in the final deliverable. Instruct research subagents to include source URLs in their output. No URL = no claim in the final report.
 
@@ -239,7 +254,7 @@ This is the highest-value analytical step. Look for improvements that lift MANY 
 
 **Rank by: (cells_lifted × avg_score_gain × confidence) / effort**
 
-**Confidence is an explicit discount on your guess, not a vibe** (this is RICE's whole point — it kills false precision so a wildly-guessed 50-cell lift doesn't outrank a well-evidenced 20-cell lift):
+**Confidence is an explicit discount on your guess** (RICE: a wildly-guessed 50-cell lift must not outrank a well-evidenced 20-cell lift):
 
 - **High (1.0)** — the `cells_lifted` estimate is backed by walkthrough or competitor evidence (you watched the friction in N cells, or a competitor proves the lift is real).
 - **Med (0.7)** — partial evidence; some cells confirmed, others inferred from the pattern.
@@ -247,11 +262,9 @@ This is the highest-value analytical step. Look for improvements that lift MANY 
 
 **Outcome ladder (required):** every lever names which **Step 0 target outcome** it moves. A lever that ladders to no outcome is a candidate to cut, not ship — surface it rather than ranking it as if feature parity were the goal.
 
-This is the key insight the matrix gives you that a flat list never can — some features are 10x more valuable because they lift dozens of cells simultaneously.
-
 ### Optional: score the levers deterministically (recommended at matrix scale)
 
-At 10 roles × 8 domains = 80 cells, ranking a dozen levers by in-context mental arithmetic is error-prone — a miscounted `cells_lifted` or a dropped `× confidence` silently reorders the roadmap. The ecosystem has standardized on a tiny deterministic scorer for exactly this (e.g. alirezarezvani's `rice_prioritizer.py`). Don't eyeball it — write the levers to a small CSV/JSON and let a script sort them. Example you can drop into the scratchpad and run:
+At 80 cells, ranking a dozen levers by in-context arithmetic is error-prone: a miscounted `cells_lifted` or a dropped `× confidence` silently reorders the roadmap. Write the levers to a small CSV and let a script sort them (same idea as alirezarezvani's `rice_prioritizer.py`):
 
 ```python
 # rank_levers.py — feed it a CSV with header: lever,cells_lifted,avg_score_gain,confidence,effort
@@ -268,8 +281,6 @@ print(f"{'RANK':<5}{'SCORE':<8}{'LEVER':<32}{'CELLS':<7}{'GAIN':<6}{'CONF':<6}{'
 for i, (s, lever, cells, gain, conf, eff) in enumerate(rows, 1):
     print(f"{i:<5}{s:<8}{lever:<32}{cells:<7g}{gain:<6g}{conf:<6g}{eff}")
 ```
-
-This is optional and stays out of the core flow — but at full-matrix scale the deterministic sort is more trustworthy than the in-context one.
 
 ---
 
@@ -289,8 +300,8 @@ For each phase, specify:
 - Concrete deliverables (not vague goals)
 - Which matrix cells lift and by how much
 - **Outcome it advances** — which Step 0 target outcome (and roughly how much) this phase moves. A phase that ladders to no outcome is polish, not priority — say so.
-- **Dependencies** — which earlier phase or cross-cutting lever MUST land first. If a top-ranked phase depends on something parked in a later phase, that's a sequencing bug — reorder or split it. Surface the dependency explicitly; don't let a high-ROI phase look startable when it isn't.
-- **Capacity sanity-check** — one line: does the effort estimate realistically fit the team/sprint window for this horizon? "3 XL levers in one 2-week sprint with two engineers" is not a plan — flag the overcommit instead of pretending it fits.
+- **Dependencies** — which earlier phase or cross-cutting lever MUST land first. A top-ranked phase that depends on something parked in a later phase is a sequencing bug: reorder or split it.
+- **Capacity sanity-check** — one line: does the effort fit the team/sprint window for this horizon? Flag an overcommit instead of pretending it fits.
 - Expected average score after phase completion
 - Effort estimate
 
@@ -318,7 +329,7 @@ This is the working reference document. The HTML report (Step 9) is the presenta
 
 ## Step 9: Generate HTML Report
 
-After the markdown spec is complete, generate a self-contained HTML report alongside it (e.g., `docs/COVERAGE_MATRIX_ANALYSIS.html`). This is the shareable, presentable deliverable — the thing the product owner shows stakeholders.
+After the markdown spec is complete, generate a self-contained HTML report alongside it (e.g., `docs/COVERAGE_MATRIX_ANALYSIS.html`). This is the shareable deliverable the product owner shows stakeholders.
 
 ### Design Requirements
 
@@ -343,7 +354,7 @@ The HTML file must be **fully self-contained** — no external CSS, JS, or fonts
 8. **Workflow experience** — capability-vs-experience score pair per primary persona, walkthrough excerpt, ranked friction
 9. **Competitive position** — tier comparison table that groups competitors into direct / indirect / adjacent / **substitute** (name the status-quo process), and marks which tier sets the 10/10 bar per domain
 10. **Cross-cutting levers** — ranked cards with score/effort badges, a **confidence badge** (High/Med/Low), and the **target outcome** each lever ladders to; ranked by `(cells_lifted × score_gain × confidence) / effort`
-11. **Phased roadmap** — phase cards with colored left borders, a **Now/Next/Later horizon label**, deliverables, projected scores, plus per-phase **dependencies**, a **capacity sanity-check** line, and the **outcome advanced**
+11. **Phased roadmap** — phase cards (no colored edge stripes; the horizon label carries the distinction), a **Now/Next/Later horizon label**, deliverables, projected scores, plus per-phase **dependencies**, a **capacity sanity-check** line, and the **outcome advanced**
 12. **Strategic recommendations** — highlight cards for differentiators and warnings
 13. **Competitor profiles** — see below
 14. **Progress indicator / feature spec** — if there's a key proposed feature, include the visual mockup
@@ -357,8 +368,6 @@ Every competitor mentioned in the analysis gets a profile card in the HTML. Each
 - 2-3 sentence description of what they do
 - **Clickable links** to their product page, marketing materials, KLAS ranking, or analyst reports
 - Key differentiating features
-
-The point: when someone reads "Dolbey is #1 in KLAS," they can click through and see for themselves. Every competitor claim becomes verifiable.
 
 ### Inline Source Citations
 
@@ -439,14 +448,11 @@ If Playwright is not available, open the HTML in the default browser (`open` on 
 | Excuse | Reality |
 |--------|---------|
 | "I'll just list the missing features" | A flat list misses combinatorial gaps. Build the matrix. |
-| "The existing docs already cover this" | Existing docs are INPUT, not the analysis. Build independently. |
-| "I don't have time for parallel research" | Sequential research takes 4x longer AND produces lower-quality scores. |
-| "I can skip competitor research" | Without competitors you're scoring against your imagination, not the market. |
+| "I'll spawn one agent per role and per domain" | That blows the chain-of-command dispatch budget. Batch roles and domains into streams; keep the walkthrough stream. |
 | "The matrix is too large to fill" | That's the point — the gaps hide in the cells you'd skip. Fill every one. |
 | "I'll score the roles first, then add domains later" | The value IS the intersection. Score cells, not rows or columns. |
 | "This product doesn't have domains" | Use workflow stages, use case categories, or customer segments. There's always a second axis. |
 | "The features all exist, so it's a 9" | Existence ≠ experience. A product can score 9 on capability and 4 on the walked workflow — and both are true. Report both. |
-| "The rubric already covers daily workflow" | The rubric *mentions* it; only the walkthrough stream *collects evidence* for it. A feature inventory cannot tell you the user keeps a spreadsheet to track what your product won't show them. |
 | "This product has no UI / no user flow" | Then the walkthrough is the API/CLI consumer's journey: integration effort, error messages, observability. Pure libraries are the only true exemption. |
 
 ---
@@ -459,6 +465,7 @@ Roles (rows)    = WHO uses the product (workflow personas, not job titles)
 Domains (cols)  = WHAT contexts they use it in (verticals, specialties, segments)
 Matrix          = Roles × Domains, every cell scored 0-10
 Two axes        = Capability (what the machine can do) AND experience (the walked workflow) — report both, never average them away
+Research        = streams batched to the chain-of-command dispatch budget (full matrix 16 / quick read 8); walkthrough stream required; synthesis + scoring in the main loop
 Competitors     = 4 tiers: direct / indirect / adjacent / substitute (the status-quo you replace — never skip it)
 Cross-cutting   = Features that lift MANY cells at once (highest ROI)
 Phasing         = Order by (cells_lifted × score_gain × confidence) / effort; label Now/Next/Later; note dependencies + capacity

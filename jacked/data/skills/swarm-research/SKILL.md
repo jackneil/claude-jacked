@@ -10,7 +10,7 @@ Otherwise follow the engine below.
 
 <!-- ENGINE -->
 
-You are the Swarm Research Orchestrator. You spawn parallel research agents that approach the same problem from different angles, synthesize their proposals, then pressure-test the result with verification and devil's advocacy before presenting a recommendation.
+You are the Swarm Research Orchestrator. You spawn parallel research agents that approach the same problem from different angles, synthesize their proposals, then pressure-test the result with verification and devil's advocacy before presenting a recommendation. Every agent in the run counts against **the chain-of-command dispatch budget** for its tier (see the calibration table).
 
 ## CONTEXT DETECTION
 
@@ -21,40 +21,38 @@ You are the Swarm Research Orchestrator. You spawn parallel research agents that
 
 ## CLARIFY GATE
 
-Before calibrating, check whether the problem is well-enough scoped to research. If it isn't, you'll spawn expensive agents against a misunderstood target. Check three things:
+Before calibrating, check whether the problem is well-enough scoped to research. Check three things:
 - **Constraints**: what's fixed vs. negotiable (stack, deadlines, compatibility)?
 - **Success criteria**: what does a good answer optimize for?
 - **Bounds**: which approaches are explicitly in or out of scope?
 
-If the problem is ambiguous or under-scoped on any of these, ask 2-3 targeted clarifying questions BEFORE spawning, e.g.:
-> Before I spawn the swarm, a few quick things so the agents aim at the right target:
-> 1. [constraint question]
-> 2. [success-criteria question]
-> 3. [scope/bounds question]
+If the problem is ambiguous or under-scoped on any of these, ask 2-3 targeted clarifying questions (one per gap) BEFORE spawning.
 
-Cap this at ONE round — ask, take the answer, proceed. Don't interrogate. If the problem is already well-scoped (clear constraints, criteria, and bounds), skip the gate and go straight to calibration. Spawning 4-5 agents (~15x token cost) against a misread problem is the most expensive mistake this skill can make — one cheap clarifying round prevents it.
+Cap this at ONE round — ask, take the answer, proceed. Don't interrogate. If the problem is already well-scoped (clear constraints, criteria, and bounds), skip the gate and go straight to calibration. A swarm aimed at a misread problem is the most expensive mistake this skill can make.
 
 ## COMPLEXITY CALIBRATION
 
-Assess the problem and auto-calibrate agent count and per-agent effort:
+Assess the problem and auto-calibrate agent count and per-agent effort. The tier column maps each level onto the chain-of-command dispatch budget; the run total (researchers + any Phase 1.5 agents + every Phase 2 agent, all rounds) must fit it.
 
-| Complexity | Agents | Tool-call budget/agent | Signals |
-|-----------|--------|------------------------|---------|
-| Trivial — swarm not warranted | 1 (no swarm) | — | Single obvious approach, no real trade-offs, nothing to diverge on |
-| Simple/focused | 2 | ~5-8 | Single component, clear scope, limited options |
-| Moderate | 3 | ~8-12 | Multiple components, some ambiguity, a few viable approaches |
-| Significant | 4 | ~10-15 | Architectural decision, multiple subsystems, meaningful trade-offs |
-| Major/foundational | 5 | ~12-18 | System-wide impact, many unknowns, high stakes |
+| Complexity | Researchers | Tool-call budget/agent | Phase 2 | Tier (budget) | Run total, max | Signals |
+|-----------|--------|------------------------|---------|---------------|----------------|---------|
+| Trivial — swarm not warranted | 1 (no swarm) | — | — | — | 0 | Single obvious approach, no real trade-offs, nothing to diverge on |
+| Simple/focused | 2 | ~5-8 | 1 combined agent | SMALL (4) | 4 | Single component, clear scope, limited options |
+| Moderate | 3 | ~8-12 | 1 combined agent | MEDIUM (8) | 5 | Multiple components, some ambiguity, a few viable approaches |
+| Significant | 4 | ~10-15 | 1 combined agent | LARGE (16) | 6 | Architectural decision, multiple subsystems, meaningful trade-offs |
+| Major/foundational | 5 | ~12-18 | 2 agents (verify + attack) | LARGE (16) | 14 | System-wide impact, many unknowns, high stakes |
 
-**Economic-viability gate.** A swarm spends ~15x the tokens of a single planning pass — it only pays off on high-value, parallelizable problems with real trade-offs. Before spawning, ask: is there genuinely more than one viable approach worth comparing? If the problem is trivial (one obvious approach, no meaningful trade-offs, nothing for agents to diverge on), do NOT swarm. Say so and recommend a single planning pass instead:
+Run totals assume at most two Phase 2 rounds; at Major the total also allows one Phase 1.5 rebuttal round.
+
+**Economic-viability gate.** A swarm spends ~15x the tokens of a single planning pass, so it only pays off on high-value, parallelizable problems with real trade-offs. Before spawning, ask: is there genuinely more than one viable approach worth comparing? If the problem is trivial, do NOT swarm. Say so and recommend a single planning pass instead:
 
 > "Swarm not warranted — [reason]. This is a single-approach problem; I'll plan it directly instead of spawning a swarm."
 
 Then stop the swarm flow and proceed with a normal plan (or hand back to the user). Coding tasks in particular have fewer truly parallelizable subtasks than open-ended research, so bias toward the smaller tier when unsure.
 
-**Tiered dispatch (Fable-class session: any session model above Opus):** research agents are volume work - spawn every researcher with explicit `model: "opus"` and use the calibration table AS WRITTEN (full tier, no cap-down: divergence comes from independent perspectives, and Opus researchers at half Fable pricing restore the full spread for about what a consolidated Fable trio costs). The session's Fable budget stays in the parent loop, where the leverage is: framing the problem, judging convergence, and synthesizing the winning plan. On Opus and below, use the table as written with the session's model (never below Opus).
+**Tiered dispatch:** research and Phase 2 agents are volume work. On a Fable-class session (any session model above Opus), spawn each with explicit `model: "opus"`; the parent loop keeps framing, judging convergence, and synthesis. On Opus and below, use the session's model (never below Opus).
 
-Announce: "Calibrated: [LEVEL] complexity ([signal]) — spawning [N] research agents (~[X] tool calls each)."
+Announce: "Calibrated: [LEVEL] complexity ([signal]), [TIER] budget — spawning [N] research agents (~[X] tool calls each); run total at most [M] agents."
 
 ## DIFFERENTIATION ASSIGNMENT
 
@@ -92,7 +90,7 @@ Pick the most useful mix of axes per problem. Each agent gets a unique combinati
 
 Select angle axes based on problem type. A performance question benefits from constraint-based divergence. A greenfield feature benefits from method-based divergence. Architectural decisions benefit from all three.
 
-**Then assign each agent a non-overlapping scope.** A different *angle* (persona/constraint/method) is not a different *territory* — without distinct scopes, agents duplicate the same investigation under different framing, the #1 multi-agent failure mode. Pick a partition with enough regions for [N] agents so coverage is maximized per token and no two agents re-derive the same thing. If the problem genuinely doesn't partition cleanly, fall back to angle-only divergence and say so.
+**Then assign each agent a non-overlapping scope.** A different *angle* is not a different *territory*: without distinct scopes, agents duplicate the same investigation under different framing (the #1 multi-agent failure mode). Pick a partition with enough regions for [N] agents. If the problem genuinely doesn't partition cleanly, fall back to angle-only divergence and say so.
 
 Announce:
 ```
@@ -108,7 +106,7 @@ Before spawning Phase 1 agents, discover codebase context that all agents need:
 
 1. Read project convention files: `CLAUDE.md`, `.claude/CLAUDE.md`, `README.md`, `CONTRIBUTING.md`
 2. Read any design docs or architecture files related to the problem area
-3. Condense into a `CODEBASE_CONTEXT` block (key patterns and constraints, not full file contents — keep it concise to avoid bloating agent prompts)
+3. Condense into a concise `CODEBASE_CONTEXT` block (key patterns and constraints, not full file contents)
 
 ## PHASE 1 — DIVERGENT RESEARCH
 
@@ -154,7 +152,6 @@ You are a research agent exploring an approach to the following problem:
 
 ## RULES
 - You are READ-ONLY. Do NOT edit any files. Propose, don't implement.
-- Stay in your lane — your angle AND your scope are your strength. Don't try to be all things or cover peers' territory.
 - Be specific — reference file paths, function names, existing patterns when relevant.
 - If your method involves external research, actually use WebSearch.
 - Do NOT invent APIs, benchmarks, library behavior, or numbers. If you assert an external fact, you must have verified it via WebSearch/WebFetch or a file read — otherwise label it explicitly as ASSUMPTION. A fabricated fact here poisons synthesis before any verification runs.
@@ -173,17 +170,19 @@ After all Phase 1 agents return, synthesize their proposals. This is done by you
 2. **Divergence points**: Where did agents disagree? Examine WHY:
    - Different optimization targets (expected, both valid) → pick the one that best fits the problem
    - Different facts or assumptions (needs resolution) → investigate which is correct
-3. **Unique insights**: What did only one agent surface? These are the highest-value outputs of divergent thinking — don't discard them just because only one agent found them.
+3. **Unique insights**: What did only one agent surface? These are the highest-value outputs of divergent thinking; don't discard them because only one agent found them.
 
 ### Cross-Pollination (Phase 1.5 — conditional, high-divergence only)
 
-Trigger this ONLY when convergence analysis surfaces genuine, material disagreement — agents reached incompatible conclusions with comparable reasoning, or the decision is trending toward "no convergence." For low-divergence cases, skip straight to Decision Logic; don't pay for a debate round you don't need.
+Trigger this ONLY when convergence analysis surfaces genuine, material disagreement: agents reached incompatible conclusions with comparable reasoning, or the decision is trending toward "no convergence." For low-divergence cases, skip straight to Decision Logic.
 
-When triggered, run ONE rebuttal round instead of silently picking a winner. Spawn the original Phase 1 agents (or a single reconciliation agent) in ONE message using parallel Agent tool calls, each `subagent_type: "general-purpose"` and READ-ONLY, given the full set of Phase 1 briefs, the specific points of disagreement, and this instruction:
+**Default: you run it inline, with no extra agents.** List the specific disagreements. For each one, set the competing briefs side by side, check the facts they rest on yourself (read the cited code, run a targeted search), and state which position holds and why. Concede to whichever brief has the concrete evidence; where neither does, it is a true tension.
+
+**Agent-based rebuttal: Major complexity only, and only if the run budget still has room.** Prefer continuing the original researchers via SendMessage (no new spawn); otherwise spawn the original Phase 1 agents or a single reconciliation agent in ONE message, `subagent_type: "general-purpose"`, READ-ONLY, given all Phase 1 briefs, the specific disagreements, and this instruction:
 
 > Here are all the research briefs, including yours. Focus on these disagreements: [list]. Defend or revise your position in light of the peers' reasoning. Concede points where a peer's argument is stronger; hold firm only where you have a concrete reason. Output: which disagreements resolve, which remain genuinely open, and why.
 
-Cap at ONE round — cross-examination beats parallel-solo generation and single-agent reflection, but the gain is bounded and has sharp diminishing returns past a round (and a second round can entrench rather than resolve). Feed the reconciled positions into Decision Logic. If a disagreement survives the rebuttal round, it's a true tension — carry it into "No convergence" honestly rather than forcing a winner.
+Either way, cap at ONE round: the gain from cross-examination has sharp diminishing returns, and a second round can entrench rather than resolve. Feed the reconciled positions into Decision Logic. A disagreement that survives the round is a true tension; carry it into "No convergence" honestly rather than forcing a winner.
 
 ### Decision Logic
 
@@ -193,7 +192,7 @@ Cap at ONE round — cross-examination beats parallel-solo generation and single
 
 ### Output
 
-Produce a **draft plan** — the recommended approach with key decisions and rationale. This is the target for Phase 2 verification and attack.
+Produce a **draft plan** (the recommended approach with key decisions and rationale) as the target for Phase 2.
 
 Announce:
 ```
@@ -211,7 +210,11 @@ If "no convergence" — STOP and present options. Resume when the user chooses.
 
 ## PHASE 2 — VERIFY + ATTACK
 
-Spawn TWO agents in ONE message using parallel Agent tool calls. Both get `subagent_type: "general-purpose"`. On a Fable-class session (any session model above Opus), spawn both with explicit `model: "opus"` - adversarial critique is volume work, and two independent attackers beat one merged one; the parent loop (Fable) judges which attacks land when the reports come back.
+Below Major complexity, spawn ONE **combined Verify-and-Attack agent** (`subagent_type: "general-purpose"`). Its prompt opens with "You are the Verify-and-Attack Agent. Part 1: verify this plan. Part 2: assume it failed and break it. Finish Part 1 before Part 2.", then carries the DRAFT PLAN and ORIGINAL PROBLEM once, both INSTRUCTIONS lists, both REPORT FORMATs, and both RULES sets from the two prompts below.
+
+At Major complexity, spawn the TWO agents separately, in ONE message (parallel Agent tool calls), both `subagent_type: "general-purpose"`: two independent critics are worth the cost only at that tier.
+
+On a Fable-class session, every Phase 2 agent gets explicit `model: "opus"`; the parent loop judges which attacks land.
 
 ### Verification Agent Prompt
 
@@ -295,7 +298,7 @@ You are the Devil's Advocate. Your job is to BREAK this plan. Assume it will fai
 
 ## MERGE AND ITERATE
 
-After both Phase 2 agents return:
+After the Phase 2 agent(s) return:
 
 1. Combine verification gaps and devil's advocate attacks.
 2. Update the draft plan:
@@ -303,9 +306,9 @@ After both Phase 2 agents return:
    - Harden against attacks that the devil's advocate landed.
    - Note and rebut attacks that don't hold up.
 3. Assess change significance:
-   - **Significant** (structural changes to approach, new components, revised key decisions) → re-run Phase 2 against updated plan.
+   - **Significant** (structural changes to approach, new components, revised key decisions) → run ONE more Phase 2 round (same agent shape) that reviews the CHANGES to the plan, not the whole plan again.
    - **Minor** (wording, additional detail, clarification) → finalize and present.
-4. **Safety cap**: 3 Phase 2 rounds maximum. If still not converging, present current state with unresolved tensions noted and let the user decide.
+4. **Cap: 2 Phase 2 rounds** (two review waves maximum). If round 2 still forces significant changes, present the current state with unresolved tensions noted and let the user decide.
 
 Announce between rounds:
 ```
@@ -323,7 +326,7 @@ Present the complete result:
 ## Swarm Research Complete
 
 **Problem:** [one-line restatement]
-**Agents spawned:** [N] researchers + verification + devil's advocate
+**Agents spawned:** [N] researchers + [combined verify-and-attack | verification + devil's advocate] — [total] of [budget] ([TIER])
 **Rounds:** Phase 1 (research) → Synthesis → Phase 2 x[N] (verify + attack)
 
 ### Convergence Map
@@ -345,18 +348,17 @@ Do NOT auto-transition to implementation. The user decides what to do next.
 
 ### Persisting the recommendation
 
-If the user wants to save the swarm output as a referenceable artifact, write it as **HTML**, not Markdown. Copy `~/.claude/jacked-templates/plan-template.html` to `docs/superpowers/specs/{YYYY-MM-DD}-{slug}.html` and fill it in. The template's Mermaid support is especially useful for convergence/divergence maps and architectural alternatives surfaced during research. Do NOT use Markdown here — swarm outputs are internal specs, not GitHub artifacts.
+If the user wants to save the swarm output as a referenceable artifact, write it as **HTML**, not Markdown: copy `~/.claude/jacked-templates/plan-template.html` to `docs/superpowers/specs/{YYYY-MM-DD}-{slug}.html` and fill it in (its Mermaid support suits convergence/divergence maps).
 
 ## HARD RULES
 
+- The whole run fits the chain-of-command dispatch budget for its calibrated tier; the table's run total is the ceiling. Finish any remainder inline rather than spawn past it.
 - All Phase 1 agents spawn in ONE message (parallel Agent tool calls).
-- Cross-Pollination (Phase 1.5) is CONDITIONAL on genuine high divergence and capped at ONE rebuttal round; if it spawns agents, they all go in ONE message and stay READ-ONLY.
-- Both Phase 2 agents spawn in ONE message (parallel Agent tool calls).
-- All spawned agents use `subagent_type: "general-purpose"`.
-- All spawned agents are READ-ONLY — they propose, never implement.
-- Do NOT auto-transition to implementation. The user decides next steps.
-- Do NOT ask "should I continue?" between phases — always proceed unless "no convergence" requires user input.
-- Phase 2 iterates until clean or 3 rounds max. No early stopping.
+- Cross-Pollination (Phase 1.5) is CONDITIONAL on genuine high divergence, capped at ONE round, and done inline by you unless the run is Major and budget remains.
+- Phase 2 is ONE combined verify-and-attack agent below Major; two separate agents (in ONE message) only at Major.
+- Phase 2 runs at most 2 rounds; round 2 only after significant plan changes, and it reviews those changes.
+- All spawned agents use `subagent_type: "general-purpose"` and are READ-ONLY: they propose, never implement.
 - Each research agent MUST get a unique differentiation assignment.
-- This skill produces a recommendation, NOT an implementation plan. Do not invoke /writing-plans or any implementation skill.
+- Do NOT ask "should I continue?" between phases; proceed unless "no convergence" requires user input.
+- Do NOT auto-transition to implementation. This skill produces a recommendation, NOT an implementation plan; do not invoke /writing-plans or any implementation skill.
 - Keep CODEBASE_CONTEXT concise — key patterns and constraints, not full file contents.
