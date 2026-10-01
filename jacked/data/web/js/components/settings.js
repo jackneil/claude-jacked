@@ -448,6 +448,11 @@ function bindToggleEvents(container) {
                 if (name === 'statusline' && res && res.took_over_foreign) {
                     showToast('Your previous statusline was saved. Disable to restore it.', 'info');
                 }
+                // Skill enable moves a same-named user skill dir aside before
+                // installing jacked's copy; tell the user where it went.
+                if (enabled && res && res.preserved_backup) {
+                    showToast(`Your existing ${displayName} skill was saved to ${res.preserved_backup}`, 'info', 8000);
+                }
                 if (name === 'statusline' && res && res.restored_previous) {
                     showToast('Your previous statusline is back.', 'info');
                 }

@@ -168,6 +168,9 @@ VALID_PERMISSION_MODES = {"plan", "default", "bypassPermissions", "acceptEdits"}
 
 # Lock for settings.json mutations (single-process, no external deps)
 _settings_lock = asyncio.Lock()
+# Serializes skill dir installs/removals and their install-manifest updates, so
+# two concurrent toggles cannot lose each other's manifest entry.
+_skills_lock = asyncio.Lock()
 
 
 def reset_locks() -> None:
@@ -177,8 +180,9 @@ def reset_locks() -> None:
     guards) but must be rebound here too — one reset_locks per module is the
     contract enforced by tests/unit/api/test_reset_locks.py.
     """
-    global _settings_lock, _dcr_lock
+    global _settings_lock, _skills_lock, _dcr_lock
     _settings_lock = asyncio.Lock()
+    _skills_lock = asyncio.Lock()
     _dcr_lock = asyncio.Lock()
 
 
@@ -733,6 +737,156 @@ async def _toggle_statusline(enabled: bool):
     return {"name": "statusline", "category": "hooks", "enabled": enabled, **result}
 
 
+def _error(status_code: int, message: str, code: str, **extra) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"message": message, "code": code, **extra}},
+    )
+
+
+def _install_skill_sync(skill_name: str, src_dir: Path, skill_dir: Path, manifest_path: Path):
+    """Install one skill dir exactly as `jacked install` does. Returns
+    ``(backup, error, restored)``: where a user's own same-named dir now is (or
+    None), the OSError that stopped the install (or None), and whether that
+    user dir was put back after a failure.
+
+    Same steps as the CLI install loop: move a dir jacked does not own aside,
+    then copy the WHOLE tree (SKILL.md and every sidecar; symlinks in editable
+    mode). When the copy fails into a dir that did not exist before, the partial
+    copy is removed and a user dir that was moved aside is moved back, so a
+    failed toggle leaves the skill as it was. Last, the manifest records the
+    dir, so a later upgrade or uninstall knows that jacked owns it.
+    """
+    from jacked import cli as jacked_cli
+    from jacked import install_manifest as mani
+
+    backup = None
+    fresh = False
+    try:
+        backup = mani.preserve_user_skill_dir(
+            skill_dir, skill_name, src_dir, mani.load(manifest_path),
+        )
+        fresh = not (skill_dir.exists() or skill_dir.is_symlink())
+        jacked_cli._copy_skill_tree(src_dir, skill_dir)
+    except OSError as e:
+        restored = False
+        if fresh:
+            with contextlib.suppress(OSError):
+                jacked_cli._remove_skill_dir(skill_dir)
+            if backup is not None and not (skill_dir.exists() or skill_dir.is_symlink()):
+                try:
+                    shutil.move(str(backup), str(skill_dir))
+                    backup, restored = None, True
+                except OSError as move_err:
+                    logger.warning(
+                        "Could not restore skill %s from %s: %s", skill_name, backup, move_err,
+                    )
+        return backup, e, restored
+    try:
+        recorded = mani.record_installed_skill(manifest_path, skill_name, skill_dir)
+    except OSError as e:
+        recorded = False
+        logger.warning("Could not record skill %s in %s: %s", skill_name, manifest_path, e)
+    if not recorded:
+        # The skill works; only the ownership record is missing. Uninstall then
+        # falls back to its comparison against the packaged source.
+        logger.info(
+            "Install manifest at %s not updated for skill %s (missing or unreadable)",
+            manifest_path, skill_name,
+        )
+    return backup, None, False
+
+
+def _remove_skill_sync(skill_name: str, src_dir: Path, skill_dir: Path, manifest_path: Path) -> str:
+    """Remove one skill dir with the CLI uninstall gate. Returns "" when the dir
+    is gone (or was never there), else the reason it was kept. Raises OSError
+    when an owned dir cannot be removed."""
+    from jacked import cli as jacked_cli
+    from jacked import install_manifest as mani
+
+    manifest, _status = mani.load_with_status(manifest_path)
+    return jacked_cli._remove_skill_if_owned(skill_dir, skill_name, manifest, src_dir)
+
+
+async def _toggle_skill(skill_name: str, src_dir: Path, enabled: bool, name: str):
+    """Enable/disable one skill as a WHOLE directory, with the CLI's rules.
+
+    A skill is a directory: scripts/, references/, agents/ sidecars ship with
+    SKILL.md, so copying SKILL.md alone installs a broken skill, and unlinking
+    it alone strands the sidecars. Enable reuses the CLI's tree copy and
+    user-dir preservation and records the install manifest. Disable removes
+    the dir only when jacked owns it (`skill_removal_decision`). A dir the
+    user changed is kept, and the response is a 409 that says why.
+    """
+    skills_root = CLAUDE_DIR / "skills"
+    skill_dir = skills_root / skill_name
+    manifest_path = CLAUDE_DIR / "jacked-manifest.json"
+    # Path traversal final check. The name is already validated and allowlisted.
+    # The check is on the parent: skill_dir itself can be a symlink to the
+    # package source (editable install), which resolves outside CLAUDE_DIR.
+    # The name must also be one real path component: "." or ".." would pass
+    # the parent/name equality and make skill_dir CLAUDE_DIR itself.
+    from jacked.install_manifest import _is_safe_name
+
+    if (
+        not _is_safe_name(skill_name)
+        or skill_dir.parent != skills_root
+        or skill_dir.name != skill_name
+    ):
+        return _error(status.HTTP_422_UNPROCESSABLE_CONTENT, "Invalid path", "INVALID_FEATURE")
+
+    async with _skills_lock:
+        if enabled:
+            # No resolve() check on skills_root: dotfiles setups link
+            # ~/.claude/skills elsewhere, and the name is already allowlisted.
+            try:
+                skills_root.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                return _error(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    f"Could not install the {skill_name} skill: {e}",
+                    "SKILL_INSTALL_FAILED",
+                )
+            backup, err, restored = await asyncio.to_thread(
+                _install_skill_sync, skill_name, src_dir, skill_dir, manifest_path,
+            )
+            if backup is not None:
+                logger.warning("Preserved your existing skill %s at %s", skill_name, backup)
+            if err is not None:
+                message = f"Could not install the {skill_name} skill: {err}."
+                if restored:
+                    message += f" Your existing {skill_name} skill was restored."
+                elif backup is not None:
+                    message += f" Your earlier copy is at {backup}."
+                return _error(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR, message, "SKILL_INSTALL_FAILED",
+                    **({"preserved_backup": str(backup)} if backup is not None else {}),
+                )
+            result = {"name": name, "category": "knowledge", "enabled": True}
+            if backup is not None:
+                result["preserved_backup"] = str(backup)
+            return result
+
+        try:
+            keep_why = await asyncio.to_thread(
+                _remove_skill_sync, skill_name, src_dir, skill_dir, manifest_path,
+            )
+        except OSError as e:
+            return _error(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                f"Could not remove the {skill_name} skill: {e}",
+                "SKILL_REMOVE_FAILED",
+            )
+        if keep_why:
+            return _error(
+                status.HTTP_409_CONFLICT,
+                f"Kept the {skill_name} skill at {skill_dir}. Reason: {keep_why.rstrip('.')}.",
+                "SKILL_MODIFIED",
+                reason=keep_why,
+            )
+        return {"name": name, "category": "knowledge", "enabled": False}
+
+
 async def _toggle_knowledge(name: str, enabled: bool):
     """Enable/disable a knowledge feature."""
     if name == "rules":
@@ -740,10 +894,9 @@ async def _toggle_knowledge(name: str, enabled: bool):
     if name.startswith("skill_"):
         skill_name = name[len("skill_"):]
         if _validate_name(skill_name):
-            src = DATA_ROOT / "skills" / skill_name / "SKILL.md"
-            dst = CLAUDE_DIR / "skills" / skill_name / "SKILL.md"
-            if src.exists():
-                return await _toggle_file_feature(src, dst, enabled, name, "knowledge")
+            src_dir = DATA_ROOT / "skills" / skill_name
+            if (src_dir / "SKILL.md").exists():
+                return await _toggle_skill(skill_name, src_dir, enabled, name)
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": f"Unknown skill: {skill_name}", "code": "INVALID_FEATURE"}},

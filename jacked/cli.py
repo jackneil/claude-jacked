@@ -5,6 +5,7 @@ Provides command-line interface for indexing, searching, and
 retrieving Claude Code sessions.
 """
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -2108,13 +2109,24 @@ def _link_or_copy(src: Path, dst: Path) -> str:
     Fallback chain (editable mode): symlink → hardlink → copy.
     Windows symlinks need admin; hardlinks need same volume.
 
-    Returns 'symlinked', 'hardlinked', or 'copied'.
+    Returns 'symlinked', 'hardlinked', 'copied', or 'linked-already'.
+
+    'linked-already' means dst is already the SAME file as src (a per-file
+    symlink or hardlink to it, or src itself reached through a symlinked parent
+    dir). Nothing is touched then: unlinking dst in the last case would delete
+    the packaged source file.
 
     >>> isinstance(_link_or_copy.__doc__, str)
     True
     """
     import os as _os
     import shutil as _shutil
+
+    try:
+        if dst.exists() and _os.path.samefile(src, dst):
+            return "linked-already"
+    except OSError:
+        pass
 
     # Remove existing file/symlink at destination
     if dst.is_symlink() or dst.exists():
@@ -2153,17 +2165,170 @@ def _copy_skill_tree(src_skill_root: Path, skill_dir: Path) -> int:
     broke the tray-triggered upgrade when a dev symlink was present). Returns the
     number of files written; raises OSError, which the caller reports per skill.
 
+    A `skill_dir` that is itself a symlink (a hand-made dev link, or an old
+    editable install that linked the whole dir) is unlinked first. Writing
+    into it would go THROUGH the link: `_link_or_copy` unlinks each dst before
+    linking, so it would delete the source files the link points at. Callers run
+    `preserve_user_skill_dir` before this, so a link jacked does not own has
+    already been moved aside by then.
+
     >>> callable(_copy_skill_tree)
     True
     """
+    if skill_dir.is_symlink():
+        skill_dir.unlink()
     skill_dir.mkdir(parents=True, exist_ok=True)
+    root = skill_dir.resolve()
     written = 0
     for src_file in sorted(p for p in src_skill_root.rglob("*") if p.is_file()):
-        dst = skill_dir / src_file.relative_to(src_skill_root)
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        rel = src_file.relative_to(src_skill_root)
+        dst = skill_dir / rel
+        # Every intermediate dir must be a REAL dir inside the skill dir. A
+        # symlinked subdir (`references -> <source>/references`) is replaced by
+        # a real one: only the link is removed, never the bytes it points at.
+        # Editable installs then link each file inside it, as usual.
+        cur = skill_dir
+        for part in rel.parent.parts:
+            cur = cur / part
+            if cur.is_symlink():
+                cur.unlink()
+            cur.mkdir(exist_ok=True)
+        try:
+            dst.parent.resolve().relative_to(root)
+        except ValueError:
+            raise OSError(f"{dst.parent} resolves outside {skill_dir}") from None
         _link_or_copy(src_file, dst)
         written += 1
     return written
+
+
+def _remove_skill_dir(skill_dir: Path) -> None:
+    """Delete one installed skill dir that `skill_removal_decision` cleared.
+
+    A symlink gets unlinked, never rmtree'd: rmtree raises on a symlink
+    argument, and following it would delete the link's target. A real dir is
+    rmtree'd; rmtree removes the per-file editable-mode symlinks inside it
+    without following them, so the packaged source is never touched. Raises
+    OSError, which callers report per skill.
+
+    >>> callable(_remove_skill_dir)
+    True
+    """
+    if skill_dir.is_symlink():
+        skill_dir.unlink()
+    else:
+        shutil.rmtree(skill_dir)
+
+
+def _stage_for_removal(skill_dir: Path, name: str) -> Path:
+    """Atomically rename `skill_dir` out of the live skills tree; return the
+    staged path. Staging goes to ``<skills-parent>/jacked-backups/.staging``.
+    When that dir cannot be made, or is on another filesystem (a symlinked
+    skills root), it goes to a hidden sibling in the same dir instead, so the
+    rename stays atomic."""
+    import errno
+    import uuid
+
+    from jacked import install_manifest as _m
+
+    token = f"{name}-{uuid.uuid4().hex[:12]}"
+    staging = _m.backups_root(skill_dir).parent / ".staging"
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        staging = None  # e.g. jacked-backups is a file: use the in-tree fallback
+    if staging is not None:
+        staged = staging / token
+        try:
+            os.rename(skill_dir, staged)
+            return staged
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+        with contextlib.suppress(OSError):
+            staging.rmdir()
+            staging.parent.rmdir()
+    # Dot-prefixed so the skill loader never sees it as a skill.
+    staged = skill_dir.parent / f".jacked-removing-{token}"
+    os.rename(skill_dir, staged)
+    return staged
+
+
+def _is_packaged_source(skill_dir: Path, src_dir) -> bool:
+    """True when the skill_dir ENTRY (not what a link at it points to) lives in
+    the packaged source: `src_dir`, its skills dir, or jacked's data dir. That
+    happens when ~/.claude/skills or ~/.claude is a symlink into the package.
+    Uninstall must then never move or delete there.
+
+    >>> _is_packaged_source(Path("/nonexistent/a/b"), "/nonexistent/c/d")
+    False
+    """
+    try:
+        entry = skill_dir.parent.resolve() / skill_dir.name
+        roots = {_get_data_root().resolve()}
+        if src_dir is not None:
+            src = Path(src_dir).resolve()
+            roots.update({src, src.parent})
+    except OSError:
+        return False
+    return any(entry == r or r in entry.parents for r in roots)
+
+
+def _remove_skill_if_owned(skill_dir: Path, name: str, manifest, src_dir) -> str:
+    """Remove one installed skill dir only when jacked owns it. Returns "" when
+    the dir is gone (or was never there), else the reason it was kept. Raises
+    OSError when an owned dir cannot be removed. Shared by `jacked uninstall`
+    and the dashboard skill toggle.
+
+    The dir is checked, renamed to a staging path, and checked AGAIN there, so
+    a user edit that lands between the first check and the delete is never
+    deleted. A dir that fails the second check is moved back. A dangling
+    symlink has no content and is unlinked. A whole-dir symlink that passes
+    the check is unlinked in place: a link holds no content, and a RELATIVE
+    link would break if it were renamed into the staging dir. A skill_dir that
+    IS the packaged source (a skills root symlinked into the package) is kept.
+
+    >>> callable(_remove_skill_if_owned)
+    True
+    """
+    from jacked import install_manifest as _m
+
+    if not (skill_dir.exists() or skill_dir.is_symlink()):
+        return ""
+    if _is_packaged_source(skill_dir, src_dir):
+        return "it is the packaged source, reached through a symlinked skills dir"
+    if skill_dir.is_symlink() and not skill_dir.exists():
+        skill_dir.unlink()
+        return ""
+    remove, why = _m.skill_removal_decision(skill_dir, name, manifest, src_dir)
+    if not remove:
+        return why
+    if skill_dir.is_symlink():
+        skill_dir.unlink()
+        return ""
+    staged = _stage_for_removal(skill_dir, name)
+    try:
+        remove, why = _m.skill_removal_decision(staged, name, manifest, src_dir)
+        if remove:
+            try:
+                _remove_skill_dir(staged)
+            except OSError:
+                # Never strand a skill in the staging area: put back whatever
+                # is left, then report the failure.
+                with contextlib.suppress(OSError):
+                    os.rename(staged, skill_dir)
+                raise
+            return ""
+        try:
+            os.rename(staged, skill_dir)
+        except OSError:
+            return f"{why.rstrip('.')}. It was moved to {staged}"
+        return why
+    finally:
+        for leftover in (staged.parent, staged.parent.parent):
+            if leftover.name in (".staging", "jacked-backups"):
+                with contextlib.suppress(OSError):
+                    leftover.rmdir()
 
 
 def _install_asset_dir(
@@ -4987,31 +5152,26 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
         for skill_md in skills_src_dir.glob("*/SKILL.md"):
             skill_name = skill_md.parent.name
             skill_dir = home / ".claude" / "skills" / skill_name
-            if not skill_dir.exists():
+            if not (skill_dir.exists() or skill_dir.is_symlink()):
                 continue
             # Delete only a dir jacked owns: one that still matches the manifest,
             # or (no/unreadable manifest) one whose every file still matches the
-            # packaged source. Anything else stays, with an honest reason.
-            _remove, _keep_why = _mani.skill_removal_decision(
-                skill_dir, skill_name, _uninstall_manifest, skill_md.parent,
-            )
-            if _remove:
-                # A symlink gets unlinked, never rmtree'd: rmtree raises on a
-                # symlink argument, which pre-guard aborted the whole uninstall
-                # on an editable-install skill dir. One unremovable skill is
-                # reported and skipped, not fatal to the uninstall.
-                try:
-                    if skill_dir.is_symlink():
-                        skill_dir.unlink()
-                    else:
-                        shutil.rmtree(skill_dir)
-                    skill_count += 1
-                except OSError as _rm_err:
-                    console.print(
-                        f"[yellow][!][/yellow] Could not remove skill "
-                        f"{skill_name}: {_rm_err}"
-                    )
-            else:
+            # packaged source. Anything else stays, with an honest reason. One
+            # unremovable skill is reported and skipped, not fatal to the
+            # uninstall. The dashboard skill toggle shares this helper.
+            try:
+                _keep_why = _remove_skill_if_owned(
+                    skill_dir, skill_name, _uninstall_manifest, skill_md.parent,
+                )
+            except OSError as _rm_err:
+                _keep_why = None
+                console.print(
+                    f"[yellow][!][/yellow] Could not remove skill "
+                    f"{skill_name}: {_rm_err}"
+                )
+            if _keep_why == "":
+                skill_count += 1
+            elif _keep_why:
                 console.print(
                     f"[yellow][!][/yellow] Kept skill {skill_name}: {_keep_why}"
                 )

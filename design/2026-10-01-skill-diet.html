@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Skill diet: budget beats recursion (2026-10-01)</title>
+<style>
+:root{--fg:#1d1f21;--bg:#fbfaf7;--mute:#5d6166;--line:#d9d6cf;--acc:#2f5d50}
+@media (prefers-color-scheme:dark){:root{--fg:#e6e3dc;--bg:#17191b;--mute:#a3a7ab;--line:#33373b;--acc:#8fc1ad}}
+body{font:16px/1.55 "Iowan Old Style","Palatino Linotype",Georgia,serif;color:var(--fg);background:var(--bg);max-width:58rem;margin:2.5rem auto;padding:0 1.25rem}
+h1,h2{font-family:"Avenir Next","Segoe UI",sans-serif;font-weight:600;letter-spacing:-.01em}
+h1{font-size:1.7rem;margin-bottom:.2rem}h2{font-size:1.15rem;margin-top:2rem;border-bottom:1px solid var(--line);padding-bottom:.25rem}
+code{font:.88em ui-monospace,Menlo,monospace}
+table{border-collapse:collapse;width:100%;font-size:.94rem}td,th{border-bottom:1px solid var(--line);padding:.45rem .5rem;text-align:left;vertical-align:top}
+th{font-family:"Avenir Next","Segoe UI",sans-serif;font-weight:600;color:var(--mute)}
+.meta{color:var(--mute)}
+@media print{body{max-width:none}}
+</style></head><body>
+<h1>Skill diet: the budget wins over the recursion</h1>
+<p class="meta">2026-10-01 · branch <code>jack_20261001_skill_diet</code> · source: hank-krac /doctor findings relayed by a peer session, decisions by Jack in this session</p>
+
+<h2>Problem</h2>
+<p>chain-of-command already caps fan-out (SMALL 4 / MEDIUM 8 / LARGE 16 agents, two review waves). The cap is buried, the dcr description still says "continues until all selected lenses pass clean", /dc spawns agents even for a one-file fix, and the always-loaded jacked-behaviors block pushes ten different follow-up commands. One branch on 2026-10-01 still ran 10 workflows, about 45 agents and four review waves. The skill listing is also over its budget, so Claude Code strips descriptions and skills such as the marketing pack never route.</p>
+
+<h2>Decisions (Jack, this session)</h2>
+<table><tr><th>Question</th><th>Decision</th></tr>
+<tr><td>Retire recursive-10-10, coverage-matrix, swarm, swarm-research?</td><td>Keep all. Slim them so they obey the tier budget.</td></tr>
+<tr><td>Marketing pack default</td><td>Not decided as "off". Jack's point: they never fired because routing never saw their descriptions. Fix the listing budget instead.</td></tr>
+<tr><td>Ultracode vs tier budget</td><td>The budget wins.</td></tr>
+<tr><td>jacked-behaviors block</td><td>Compress every rule, and cut the suggestion nags for /techdebt, /retro, /audit-rules, /canary, /benchmark, /land-and-deploy and /blindspot.</td></tr></table>
+
+<h2>Changes</h2>
+<table><tr><th>#</th><th>File(s)</th><th>Change</th></tr>
+<tr><td>A</td><td><code>skills/dcr/SKILL.md</code> + new <code>references/large-tier.md</code>, <code>references/codex-engine.md</code></td><td>Put a BUDGET block first (tier table with agent budget, two-wave cap, convergence rule, ultracode subordinate). Move the persona pool, wild-card pool, pre-mortem pool and pre-mortem prompt into large-tier.md, read only at LARGE. Move the Codex dispatch detail into codex-engine.md, read only when the engine is codex. Rewrite the description so it no longer says "recursive ... until clean". Keep every contract the tests pin, and point the tests at the file the text now lives in.</td></tr>
+<tr><td>B</td><td><code>skills/chain-of-command/SKILL.md</code>, <code>commands/dc.md</code></td><td>chain-of-command: open with the budget (tier, agents per tier, two waves, ultracode subordinate, incomplete is not clean), then the lanes. Remove duplicated text; this skill auto-loads every session. /dc: tier first; at SMALL the main loop runs the review inline with zero agents; MEDIUM gets one reviewer; LARGE gets the reviewer plus the pre-mortem. Multi-thread spawning stays inside the budget.</td></tr>
+<tr><td>C</td><td>coverage-matrix, recursive-10-10-product-hardening, <code>commands/swarm.md</code>, swarm-research</td><td>Bind each fan-out to the chain-of-command budget. coverage-matrix: batch the per-role and per-domain streams into at most the tier budget. 10-10: one skeptical evaluator per verified batch, not per row. swarm: team size counts against the budget. swarm-research: the rebuttal round is done by the parent, and Phase 2 is one combined verify-and-attack agent below Major. Trim restated rationale.</td></tr>
+<tr><td>D</td><td><code>rules/jacked_behaviors.md</code></td><td>Main loop rewrites it: one sentence per rule plus its trigger. Nags cut per decision. Same rules, same meaning (no tightening, no loosening beyond Jack's call).</td></tr>
+<tr><td>E</td><td><code>api/routes/features.py</code></td><td>Bug fix: the dashboard skill toggle copied only SKILL.md. On enable it now copies the whole skill tree (<code>_copy_skill_tree</code>). On disable it removes only a directory jacked owns (<code>skill_removal_decision</code>). Without this fix, dcr's new references/ folder, plus the existing sidecars of logo-forge, launch-post and night-shift, are lost on a dashboard toggle.</td></tr>
+<tr><td>F</td><td>jacked skill descriptions + a test</td><td>After the listing-budget research comes back: trim jacked-shipped descriptions to what routing needs, and add a test that caps their length against the real listing constraint.</td></tr></table>
+
+<h2>Out of scope</h2>
+<p>~/.claude/CLAUDE.md is not edited by hand. The block updates when jacked installs from the new template. The Claude Code workflow-authoring text is built into Claude Code and is not jacked's. The onboard-hank-service YAML fix shipped separately as hank-codes-admin-webui #302pr.</p>
+
+<h2>Gates</h2>
+<p>Targeted tests per change, then one full <code>uv run python -m pytest</code> on the frozen tree. All shipped YAML frontmatter must parse. One consolidated review pass (MEDIUM tier: one reviewer). Then open a PR and stop; merge needs Jack.</p>
+</body></html>

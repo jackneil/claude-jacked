@@ -18,34 +18,72 @@ def _read(relative: str) -> str:
     return (DATA / relative).read_text(encoding="utf-8")
 
 
+def _budget_section(text: str) -> str:
+    return text.split("## Budget first", 1)[1].split("## The lanes", 1)[0]
+
+
+def test_chain_of_command_opens_with_the_budget_before_the_lanes():
+    """The budget is the most important part and the skill is injected into
+    every session, so it leads: title, one-line purpose, then the budget."""
+    text = _read("skills/chain-of-command/SKILL.md")
+    body = text.split("---", 2)[2]
+    headings = [line for line in body.splitlines() if line.startswith("## ")]
+    assert headings[0] == "## Budget first"
+    assert text.index("## Budget first") < text.index("## The lanes")
+    assert text.index("## Budget first") < text.index("## Hard rules")
+
+
 def test_chain_of_command_carries_the_dispatch_shape_budget():
     text = _read("skills/chain-of-command/SKILL.md")
-    section = text.split("## Dispatch shape", 1)[1].split("## Scope and revocation", 1)[0]
+    section = _budget_section(text)
     assert "SMALL at most 4, MEDIUM at most 8, LARGE at most 16" in section
+    assert "finders, fixers, verifiers, critics" in section
     assert "Tier first" in section
     assert "Finding verification is main-loop work" in section
+    assert "No verifier agents at SMALL or MEDIUM" in section
     assert "never one per raw finding" in section
     assert "Two review waves, maximum" in section
     assert "Incomplete is not clean" in section
     assert "filter(Boolean)" in section and "resumeFromRunId" in section
-    assert "Effort on every `agent()` call" in section
-    assert '"ultracode" is subordinate to the tier' in section
-    assert "Reviewer engine" in section and "Codex" in section
-    assert "Usage-aware fan-out" in section and "jacked usage --json" in section
-    assert "One reviewer per artifact, and continue it" in section
-    assert "SendMessage" in section
-    assert "Research fan-out" in section and "4 lanes by 5 searches" in section
-    # The section binds every mechanism, not just /dcr.
+    # The budget section binds every mechanism, not just /dcr.
     for mechanism in ("Agent tool", "Workflow scripts", "/swarm", "agent teams"):
         assert mechanism in section
+    # The remaining dispatch-shape rules live under Hard rules.
+    assert "Effort on every `agent()` call" in text
+    assert "Reviewer engine" in text and "Codex" in text
+    assert "Usage-aware fan-out" in text and "jacked usage --json" in text
+    assert "One reviewer per artifact, and continue it" in text
+    assert "SendMessage" in text
+    assert "Research fan-out" in text and "4 lanes by 5 searches" in text
+
+
+def test_chain_of_command_makes_ultracode_subordinate_to_the_budget():
+    """Jack, 2026-10-01: the tier budget beats ultracode."""
+    section = _budget_section(_read("skills/chain-of-command/SKILL.md"))
+    assert '"ultracode" is subordinate to the tier' in section
+    assert "a menu of shapes, never a budget" in section
+    assert "this section wins whenever they disagree" in section
+    for pattern in ("loop-until-dry", "N refuters per finding", "judge panels"):
+        assert pattern in section
+    assert '"token cost is not a constraint"' in section
+    # The /goal pointer rule travels with the budget.
+    assert 'never carries "ultracode" or "use dynamic workflows" into a `/goal` pointer' in section
+
+
+def test_chain_of_command_stays_compact():
+    """Injected into every session by the SessionStart hook: every char costs."""
+    from jacked.data.hooks.chain_of_command_context import _strip_frontmatter
+
+    body = _strip_frontmatter(_read("skills/chain-of-command/SKILL.md")).strip()
+    assert len(body) < 9500, len(body)
 
 
 def test_chain_of_command_dispatch_shape_is_injected_by_the_session_hook():
-    """The hook strips frontmatter and injects the whole skill body; the new
-    section must sit inside the body, before the Acknowledgement the hook
-    tells the model to skip."""
+    """The hook strips frontmatter and injects the whole skill body; the budget
+    must sit inside the body, before the Acknowledgement the hook tells the
+    model to skip."""
     text = _read("skills/chain-of-command/SKILL.md")
-    assert text.index("## Dispatch shape") < text.index("## Acknowledgement")
+    assert text.index("## Budget first") < text.index("## Acknowledgement")
 
 
 def test_dcr_validates_findings_in_the_main_loop_by_default():
@@ -93,7 +131,7 @@ def test_backstop_lets_a_review_loop_converge():
 
 def test_chain_of_command_scopes_reviews_and_converges():
     text = _read("skills/chain-of-command/SKILL.md")
-    assert "13. **Scope and provenance on every review dispatch.**" in text
+    assert "**Scope and provenance on every review dispatch.**" in text
     assert "`introduced_by_branch: true|false`" in text
     assert "A review loop converges" in text
     assert "split the PR instead of reviewing again" in text
@@ -108,3 +146,22 @@ def test_dc_planning_loop_converges_instead_of_always_continuing():
     assert "the answer is always yes" not in text
     assert "do NOT run it past convergence either" in text
     assert "reviews the DELTA since the previous cycle" in text
+
+
+def test_dc_classifies_the_tier_first_and_runs_small_inline():
+    text = _read("commands/dc.md")
+    body = text.split("---", 2)[2]
+    first_heading = next(line for line in body.splitlines() if line.startswith("## "))
+    assert "RISK TIER" in first_heading
+    assert "/dcr` RISK TIER" in text
+    assert "**INLINE in the main loop, ZERO agents spawned**" in text
+    assert "Do not spawn any agent at SMALL" in text
+    assert "one double-check-reviewer carrying every selected lens" in text
+    assert "main reviewer + pre-mortem analyst" in text
+    assert "SMALL at most 4, MEDIUM at most 8, LARGE at most 16" in text
+    assert "## MULTI-THREAD SPAWNING (LARGE only, inside the budget)" in text
+    # The inline review keeps the gates the agent path has.
+    assert "DETERMINISM GATE" in text and "NEGATIVE-REQUIREMENTS sub-check" in text
+    assert "same VERDICT format" in text
+    # Grill mode stays interactive and agent-free.
+    assert "GRILL MODE has no tier: it is always inline." in text

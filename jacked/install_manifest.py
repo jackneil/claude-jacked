@@ -352,9 +352,66 @@ def write(path, version: str, current_hashes: dict, now_iso: str) -> None:
         "written_at": now_iso,
         "artifacts": current_hashes,
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    _atomic_write_json(path, data)
+
+
+def _atomic_write_json(path: Path, data) -> None:
+    """Write JSON to `path` through a UNIQUE temp file in the same dir, then
+    `os.replace` it in. A fixed temp name would let `jacked install` and a
+    dashboard toggle in another process overwrite each other's half-written
+    file. The temp file is removed when anything fails."""
+    import os
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def record_installed_skill(path, name: str, skill_dir) -> bool:
+    """Record ONE skill dir that jacked just wrote outside `jacked install`.
+
+    The dashboard toggle installs a single skill. Without this record, a later
+    upgrade or uninstall cannot prove the dir is jacked's once the packaged
+    source moves on, and would back it up or keep it as the user's. Sets the
+    same two entries `install` writes: ``skills[name]`` (the SKILL.md hash)
+    and ``skills_dirs[name]`` (the full-dir hash). Both are hashed from the dir
+    as written, like `hash_installed_skill_dirs`, so a source that moves during
+    the copy cannot make the record disagree with the disk.
+
+    Updates an existing, readable manifest only. A missing manifest means
+    `jacked install` never ran here, and a corrupt one must not be clobbered;
+    both return False and the uninstall gate falls back to its source
+    comparison. Other keys (version, format, other artifacts) are kept as-is.
+    """
+    path = Path(path)
+    if not _is_safe_name(name):
+        return False
+    manifest, status = load_with_status(path)
+    if status != "ok" or not isinstance(manifest, dict):
+        return False
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return False
+    md_hash = skill_dir_hash(skill_dir)
+    dir_hash = skill_content_hash(skill_dir)
+    if md_hash is None or dir_hash is None:
+        return False
+    for key, value in (("skills", md_hash), (SKILLS_DIRS_KEY, dir_hash)):
+        section = artifacts.get(key)
+        if not isinstance(section, dict):
+            section = artifacts[key] = {}
+        section[name] = value
+    _atomic_write_json(path, manifest)
+    return True
 
 
 def _move_aside_flat(target: Path, key: str, now=None) -> Path:
