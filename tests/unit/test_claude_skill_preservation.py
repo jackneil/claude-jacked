@@ -342,6 +342,149 @@ def test_copy_skill_tree_copies_sidecars_and_raises_on_bad_source(tmp_path):
         _copy_skill_tree(src, dest / "SKILL.md" / "nested")
 
 
+@requires_symlinks
+def test_copy_skill_tree_replaces_a_whole_dir_symlink_without_touching_source(tmp_path):
+    """A skill dir that is itself a link to the source must be replaced, never
+    written through: `_link_or_copy` unlinks each dst first, so writing through
+    the link deleted the packaged source files it pointed at."""
+    from jacked.cli import _copy_skill_tree, _remove_skill_dir
+
+    src = _with_sidecar(tmp_path / "src", "qa", "body", "// side")
+    dest = _skills_base(tmp_path) / "qa"
+    dest.symlink_to(src, target_is_directory=True)
+    _copy_skill_tree(src, dest)
+    assert not dest.is_symlink() and dest.is_dir()
+    assert (src / "SKILL.md").read_text() == "body"
+    assert not (src / "SKILL.md").is_symlink()
+
+    # The shared removal helper unlinks a link and rmtrees a dir, and neither
+    # follows into the source.
+    _remove_skill_dir(dest)
+    assert not dest.exists()
+    dest.symlink_to(src, target_is_directory=True)
+    _remove_skill_dir(dest)
+    assert not dest.is_symlink()
+    assert (src / "SKILL.md").read_text() == "body"
+
+
+@requires_symlinks
+@pytest.mark.parametrize("editable", [True, False])
+def test_copy_skill_tree_over_a_symlinked_subdir_keeps_source_bytes(tmp_path, monkeypatch, editable):
+    from jacked import cli as _cli
+
+    monkeypatch.setattr(_cli, "_is_editable_install", lambda: editable)
+    src = _with_sidecar(tmp_path / "src", "qa", "body", "// side")
+    (src / "references").mkdir()
+    (src / "references" / "n.md").write_text("notes", encoding="utf-8")
+    before = {p.relative_to(src): p.read_bytes() for p in src.rglob("*") if p.is_file()}
+    dest = _skills_base(tmp_path) / "qa"
+    dest.mkdir()
+    (dest / "references").symlink_to(src / "references", target_is_directory=True)
+
+    assert _cli._copy_skill_tree(src, dest) == 3
+    for rel, data in before.items():
+        assert (src / rel).is_file() and not (src / rel).is_symlink(), rel
+        assert (src / rel).read_bytes() == data, rel
+    assert not (dest / "references").is_symlink()
+    assert (dest / "references" / "n.md").read_text() == "notes"
+
+
+@requires_symlinks
+def test_link_or_copy_never_unlinks_the_source_it_would_link(tmp_path, monkeypatch):
+    """dst reached through a linked parent IS the source file: unlinking it
+    deletes the source. Same file means already installed."""
+    from jacked import cli as _cli
+
+    monkeypatch.setattr(_cli, "_is_editable_install", lambda: True)
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    src = src_dir / "f.md"
+    src.write_text("keep", encoding="utf-8")
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(src_dir, target_is_directory=True)
+    assert _cli._link_or_copy(src, linked_parent / "f.md") == "linked-already"
+    assert src.is_file() and not src.is_symlink() and src.read_text() == "keep"
+
+    per_file = tmp_path / "per-file.md"
+    per_file.symlink_to(src)
+    assert _cli._link_or_copy(src, per_file) == "linked-already"
+    assert per_file.is_symlink() and src.read_text() == "keep"
+
+
+def test_uninstall_rechecks_ownership_after_staging(tmp_path, monkeypatch):
+    """The shared removal helper stages the dir, then re-decides on the staged
+    copy, so an edit racing the first check is never deleted."""
+    from jacked import cli as _cli
+
+    src = _with_sidecar(tmp_path / "src", "qa", "body", "// side")
+    dest = _skills_base(tmp_path) / "qa"
+    _cli._copy_skill_tree(src, dest)
+    real = m.skill_removal_decision
+    calls = []
+
+    def racy(skill_dir, name, manifest, src_dir):
+        out = real(skill_dir, name, manifest, src_dir)
+        if not calls:
+            (dest / "late.md").write_text("mine", encoding="utf-8")
+        calls.append(skill_dir)
+        return out
+
+    monkeypatch.setattr(m, "skill_removal_decision", racy)
+    why = _cli._remove_skill_if_owned(dest, "qa", None, src)
+    assert why
+    assert (dest / "late.md").read_text() == "mine"
+    assert len(calls) == 2
+
+
+@requires_symlinks
+def test_remove_skill_if_owned_never_deletes_the_packaged_source(tmp_path):
+    """A skills root symlinked into the data skills dir makes skill_dir the
+    source itself. The uninstall helper must keep it, untouched."""
+    from jacked import cli as _cli
+
+    src_skills = tmp_path / "data" / "skills"
+    src = _with_sidecar(src_skills, "qa", "body", "// side")
+    root = tmp_path / ".claude" / "skills"
+    root.parent.mkdir(parents=True)
+    root.symlink_to(src_skills, target_is_directory=True)
+    before = {p.relative_to(src): p.read_bytes() for p in src.rglob("*") if p.is_file()}
+
+    # An owning manifest is the dangerous case: both ownership checks pass, so
+    # without the guard the staged "skill" (the source itself) is rmtree'd.
+    for manifest in (_owning_manifest(src, "qa"), None):
+        why = _cli._remove_skill_if_owned(root / "qa", "qa", manifest, src)
+        assert "packaged source" in why
+    assert {p.relative_to(src): p.read_bytes() for p in src.rglob("*") if p.is_file()} == before
+    assert not (tmp_path / ".claude" / "jacked-backups").exists()
+
+
+@requires_symlinks
+def test_remove_skill_if_owned_unlinks_a_relative_link_in_place(tmp_path):
+    import os
+
+    from jacked import cli as _cli
+
+    src = _with_sidecar(tmp_path / "src", "qa", "body", "// side")
+    dest = _skills_base(tmp_path) / "qa"
+    os.symlink(os.path.relpath(src, dest.parent), dest, target_is_directory=True)
+    assert _cli._remove_skill_if_owned(dest, "qa", None, src) == ""
+    assert not dest.is_symlink()
+    assert (src / "SKILL.md").read_text() == "body"
+
+
+def test_stage_for_removal_falls_back_when_staging_mkdir_fails(tmp_path):
+    from jacked import cli as _cli
+
+    skills = _skills_base(tmp_path)
+    d = _skill(skills, "qa", "body")
+    (tmp_path / ".claude" / "jacked-backups").write_text("file", encoding="utf-8")
+    staged = _cli._stage_for_removal(d, "qa")
+    assert staged.parent == skills
+    assert staged.name.startswith(".")
+    assert (staged / "SKILL.md").read_text() == "body"
+    assert not d.exists()
+
+
 # --- end-to-end through the CLI --------------------------------------------
 
 @pytest.fixture(autouse=True)
@@ -553,7 +696,8 @@ def test_uninstall_unlinks_a_symlinked_skill_and_survives_a_locked_one(
     real_rmtree = _sh.rmtree
 
     def locked(path, *a, **kw):
-        if Path(path).name == "dcr":
+        # Removal stages the dir under a unique name first (dcr-<token>).
+        if Path(path).name == "dcr" or Path(path).name.startswith("dcr-"):
             raise OSError(13, "Permission denied")
         return real_rmtree(path, *a, **kw)
 

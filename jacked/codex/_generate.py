@@ -94,18 +94,58 @@ def _split_command_frontmatter(text: str) -> tuple[dict, str]:
             continue
         key, _, val = line.partition(":")
         val = val.strip()
-        # Multi-line double-quoted scalar: consume until the closing quote.
-        # Our frontmatter never uses escaped \" so endswith('"') is safe.
-        if val.startswith('"') and not (len(val) > 1 and val.endswith('"')):
+        # Multi-line double-quoted scalar: consume until the closing quote. A
+        # line ending in an ESCAPED quote (\") is not the closing quote.
+        if val.startswith('"') and not _closes_double_quoted(val, opening=True):
             parts = [val]
-            while i < len(lines) and not parts[-1].rstrip().endswith('"'):
+            while i < len(lines) and not _closes_double_quoted(parts[-1].rstrip()):
                 parts.append(lines[i].strip())
                 i += 1
             val = " ".join(p for p in parts if p)
         if len(val) > 1 and val[0] == val[-1] == '"':
-            val = val[1:-1]
+            val = _unescape_double_quoted(val[1:-1])
         meta[key.strip()] = val.strip()
     return meta, text[end + len("\n---\n"):]
+
+
+def _closes_double_quoted(line: str, opening: bool = False) -> bool:
+    r"""True when `line` ends a YAML double-quoted scalar: it ends in a quote
+    that an odd run of backslashes does not escape. With `opening`, the line
+    also carries the opening quote, so a lone `"` does not close it.
+
+    >>> _closes_double_quoted('"a b"', opening=True)
+    True
+    >>> _closes_double_quoted('"ends in an escaped backslash \\\\"', opening=True)
+    True
+    >>> _closes_double_quoted('say \\"hi\\"')
+    False
+    >>> _closes_double_quoted('"', opening=True)
+    False
+    """
+    if not line.endswith('"') or (opening and len(line) < 2):
+        return False
+    backslashes = len(line[:-1]) - len(line[:-1].rstrip("\\"))
+    return backslashes % 2 == 0
+
+
+def _unescape_double_quoted(inner: str) -> str:
+    r"""Decode the escapes of a YAML double-quoted scalar's inner text (\n,
+    \", \\, \t, \uXXXX), so Codex sees the same text a YAML parser does.
+    YAML's double-quoted escapes are a superset of JSON's for every escape
+    jacked frontmatter uses; text that is not valid JSON string content is
+    returned unchanged rather than guessed at.
+
+    >>> _unescape_double_quoted('say \\"hi\\"\\nnext')
+    'say "hi"\nnext'
+    >>> _unescape_double_quoted('plain')
+    'plain'
+    """
+    if "\\" not in inner:
+        return inner
+    try:
+        return json.loads('"' + inner + '"')
+    except ValueError:
+        return inner
 
 
 def _first_nonempty_line(text: str) -> str:

@@ -1,13 +1,13 @@
 ---
 name: recursive-10-10-product-hardening
-description: Use when asked to harden a product to verified 10/10 by first deriving its expected behavior FROM the code and then closing the gap between what the code does and what it should do — inventory every feature, write each feature's code-grounded expected behavior into a canonical behavior-spec workbook, dogfood it in a browser, fix the defects at the source, and loop test→fix→retest until every feature is evidence-verified. Triggers on "harden to 10/10", "drive it to verified 10/10", "behavior spec from the code", "derive expected behavior from the code", "spec the product from its code", "production-hardening pass", "dogfood and fix to 10/10", "build a behavior/feature workbook and verify every row". Also triggers with an auto-merge argument ("$recursive-10-10-product-hardening auto-merge", "with auto-merge") which lands each verified batch to master behind green checks. NOT for read-only scoring or gap-analysis (use coverage-matrix), a single-change QA pass (/qa or /ux), or auto-merging the whole coverage matrix overnight (/bhag).
+description: Use to harden a product to verified 10/10. Derives each feature's expected behavior from the code into a behavior-spec workbook, dogfoods it, fixes defects at the source, and retests until every row is evidence-verified. Triggers on "harden to 10/10", "behavior spec from the code". Arg auto-merge lands verified batches. Not for read-only scoring (coverage-matrix) or whole-matrix auto-merge (/bhag).
 ---
 
 # Recursive 10/10 Product Hardening
 
 Drive a product from current reality to **evidence-backed 10/10** by deriving a behavior spec *from the code*, then continuously dogfooding, fixing, and re-verifying the gap between what the code actually does and what it should do. The output is not a cleaner UI or a report — it is a **known-good product state plus a current behavior-spec workbook** that maps every feature to the evidence proving it works.
 
-**Why a code-derived behavior spec, not a checklist:** a checklist tests what someone *remembered* to write down; a code-derived spec tests what the product *actually claims to do*, feature by feature, traced back to the source. The gap between "the code has a path for this" and "a real persona can complete it, verified" is where products quietly fail — and that gap is exactly what this skill catalogs, then closes.
+**Why a code-derived behavior spec, not a checklist:** a checklist tests what someone *remembered* to write down; a code-derived spec tests what the product *actually claims to do*, traced back to the source. The gap between "the code has a path for this" and "a real persona can complete it, verified" is what this skill catalogs, then closes.
 
 ## Core rule
 
@@ -15,9 +15,9 @@ Do not claim 10/10 from inspection, intent, wording, or partial tests. Claim it 
 
 ## When to use
 
-- You want a product driven to genuine, defensible 10/10 — not flagged, *fixed and proven*.
-- You need a canonical, code-grounded behavior spec: every feature → its expected behavior from the source → tested → fixed → verified.
-- You want an autonomous test→fix→retest loop that keeps going until every feature is verified or genuinely blocked.
+- A product driven to defensible 10/10: not flagged, *fixed and proven*.
+- A canonical, code-grounded behavior spec: every feature → expected behavior from the source → tested → fixed → verified.
+- An autonomous test→fix→retest loop that runs until every feature is verified or genuinely blocked.
 
 ## When NOT to use — a sibling already owns it
 
@@ -30,11 +30,7 @@ Do not claim 10/10 from inspection, intent, wording, or partial tests. Claim it 
 | **Build a new feature** end-to-end (brainstorm→spec→TDD→PR) | **`jack-it-up`** | Feature-construction lifecycle, not a behavior-coverage audit of an existing app. |
 | **Auto-merge the entire coverage matrix to main, overnight, unattended** | **`/bhag`** | That is a deliberately-named command with a two-gate auto-merge safety model. **This skill never auto-merges by default**; an explicit `auto-merge` argument enables a per-batch merge loop with the same production guard (see Step 0a). |
 
-This skill is **thin glue** over those pieces. Its only genuinely-new content is the **behavior-spec workbook** and the **autonomous fix loop**. Everything else delegates.
-
-## How this differs from its neighbors
-
-`coverage-matrix` **scores** cells. `/whats-next` **decides** one initiative. `/goal-maker` **forges** a brief for decided work. `/bhag` **loops the whole matrix and auto-merges**. `aesthetic-dogfood-audit`/`/qa`/`/ux` **detect and report** (read-only). This skill's distinct seam: **derive an expected-behavior spec from the code, then harden the gap between actual and spec — fixing in-session and proving each fix with evidence**, ending at a PR by default, or landing each verified batch behind green checks when invoked with `auto-merge`.
+This skill is **thin glue** over those pieces. Its only genuinely-new content is the **behavior-spec workbook** and the **autonomous fix loop**: derive an expected-behavior spec from the code, then harden the gap between actual and spec, fixing in-session and proving each fix with evidence. Everything else delegates.
 
 ## Step 0 — Safety, isolation, and the merge boundary (precondition)
 
@@ -91,19 +87,30 @@ Exit Step 2 only when every discoverable feature has a row, or a documented reas
 
 Do **not** re-derive a scoring rubric. Run `coverage-matrix` and consume its output: the 0–10 cell scores, the **capability-vs-experience split** (a cell can't score 8+ without walkthrough evidence; report both numbers, never average them), and the cross-cutting levers ranked by `(cells_lifted × avg_score_gain × confidence) / effort`. The cells below 10/10 define what is **in scope for hardening**; every behavior-spec row maps to the cell(s) it supports.
 
+## Dispatch budget (binds Steps 4 and 5)
+
+Work in **batches**. A batch is the set of rows one fix round targets; in auto-merge mode it is also the unit that lands as one PR. The initial whole-product crawl in Step 4 is the first batch. Each batch gets **the chain-of-command dispatch budget** for its tier (classify the batch first: a fix batch by its diff with the /dcr RISK TIER; the initial crawl batch, which has no diff, as MEDIUM unless it covers more than 4 personas, then LARGE), and every dispatch in the batch counts against it:
+
+- **Dogfood crawl agents and fixers** count against the batch's budget. Group rows per fixer by area and file ownership; never one fixer per row when that exceeds the budget. Re-crawls after the first batch cover only the batch's rows and personas.
+- **The skeptical evaluator runs ONCE per verified batch** (Step 5, item 5), over every row the batch would set `Verified`. Never one evaluator per row, and never one per loop iteration.
+- **Review of the batch's diff follows `/dcr` tiers**: two waves maximum, finding validation in the main loop.
+- If a batch would overrun its budget, stop fanning out: the main loop finishes the remainder inline or carries the rows into the next batch.
+
+The budget caps how wide one batch is, never how many batches run. The backstop in Step 5 still drives batch after batch until the worklist is exhausted.
+
 ## Step 4 — Dogfood (delegate to `aesthetic-dogfood-audit` + the `/qa` toolchain)
 
-Do **not** reinvent the crawl. Invoke `aesthetic-dogfood-audit` to drive every persona through every workflow end-to-end and feed its defects — functional (modals open AND close, buttons do their one job, actions update the view with no stale data), data-accuracy (totals equal parts, no `NaN`/`undefined`/`[object Object]`), discoverability, and dark-mode contrast — into the fix loop. Reuse its `measure.js` (don't fork it). Use the shared browser toolchain in the siblings' detection order: **Chrome DevTools MCP** (`mcp__chrome-devtools__*`, Chrome 144+) → **Playwright MCP** → **Claude-in-Chrome** → `agent-browser` CLI; if none, print the `jacked install` setup hint and stop. Keyboard Tab-walk + `measure.js` always; inject `axe-core` only if available. Restore state after each area (log out, clear forms, delete created entities).
+Do **not** reinvent the crawl. Its crawl agents count against the batch budget above. Invoke `aesthetic-dogfood-audit` to drive every persona through every workflow end-to-end and feed its defects — functional (modals open AND close, buttons do their one job, actions update the view with no stale data), data-accuracy (totals equal parts, no `NaN`/`undefined`/`[object Object]`), discoverability, and dark-mode contrast — into the fix loop. Reuse its `measure.js` (don't fork it). Use the shared browser toolchain in the siblings' detection order: **Chrome DevTools MCP** (`mcp__chrome-devtools__*`, Chrome 144+) → **Playwright MCP** → **Claude-in-Chrome** → `agent-browser` CLI; if none, print the `jacked install` setup hint and stop. Keyboard Tab-walk + `measure.js` always; inject `axe-core` only if available. Restore state after each area (log out, clear forms, delete created entities).
 
 ## Step 5 — The Quality Loop: test → fix → retest → document → self-check → continue
 
 After the spec baseline is complete, iterate until clean:
 
 1. **Test.** Exercise every story not yet `Verified` with the strongest available method (browser/e2e → existing suites → static only where execution is impossible). Record actual pass/fail and evidence in the canonical workbook. **Do not change app behavior in this step.** An empty / errored / "0 tests collected" run counts as **FAILED, never DONE** — an unrun suite must never masquerade as satisfied.
-2. **Fix.** For each logged defect, find the **root cause** and implement the smallest robust fix aligned with existing patterns. Scope changes to logged defects — no unrelated features or refactors. **Never delete, skip, weaken, or loosen a test or assertion to go green** — gutting a test to pass is a BLOCKED condition, not a fix. Over-test where agent-authored changes statistically fail (Greptile, millions of PRs, Apr 2026): missing tenant checks / IDOR (1.75x the human rate for Claude-authored code), stale docs/comments (1.69x), off-by-one boundaries (1.64x), XSS (1.57x), auth bypass (1.50x) — every fix touching auth, tenancy, rendering, or boundaries gets an explicit adversarial check for its class.
+2. **Fix.** For each logged defect, find the **root cause** and implement the smallest robust fix aligned with existing patterns. Scope changes to logged defects — no unrelated features or refactors. **Never delete, skip, weaken, or loosen a test or assertion to go green** — gutting a test to pass is a BLOCKED condition, not a fix. Over-test where agent-authored changes statistically fail (Greptile, Apr 2026, vs the human rate): missing tenant checks / IDOR (1.75x), stale docs/comments (1.69x), off-by-one boundaries (1.64x), XSS (1.57x), auth bypass (1.50x). Every fix touching auth, tenancy, rendering, or boundaries gets an explicit adversarial check for its class.
 3. **Re-test.** Re-run every story touched by a fix with the same or stronger method. Set `Verified` only when evidence supports it; otherwise return it to `Tested-Fail` with notes.
 4. **Document.** Update the workbook, defect log, test-run ledger, and any human report **in place**.
-5. **Self-check (don't grade your own homework) — a true generator/evaluator split.** The agent that implemented a fix NEVER sets its own row to `Verified`. At loop boundaries, dispatch a **fresh-context evaluator** that has not seen the fixer's conversation, prompted to be skeptical — its job is to find reasons the row FAILS. It re-runs the tests itself and browser-drives any user-facing row before grading (self-evaluation reliably skews positive; a separate evaluator tuned skeptical is tractable where a self-critical fixer is not). If delegation is unavailable, the fallback is a fresh-pass audit against code and evidence in a later, separate loop iteration — never the same pass that made the change.
+5. **Self-check (don't grade your own homework) — a true generator/evaluator split.** The agent that implemented a fix NEVER sets its own row to `Verified`. Once per batch, when the batch's rows are ready to verify, dispatch ONE **fresh-context evaluator** that has not seen the fixer's conversation, prompted to be skeptical — its job is to find reasons each row FAILS. It covers every row the batch claims, re-runs the tests itself, and browser-drives any user-facing row before grading (self-evaluation skews positive). If delegation is unavailable, the fallback is a fresh-pass audit against code and evidence in a later, separate loop iteration — never the same pass that made the change.
 6. **Continue.** Add newly discovered gaps to the worklist and keep going.
 
 **Status flow:** `Spec'd → Tested-Pass / Tested-Fail → Fixed → Verified`. Use the project's existing status vocabulary if it has a comparable one, preserving the semantics.
@@ -170,16 +177,14 @@ If a repo already designates a canonical workbook/spec/scorecard as source of tr
 | Auto-merged a fix to main on a BARE invocation | Default is PR handoff; auto-merge requires the explicit `auto-merge` argument (Step 0a). |
 | In auto-merge mode, merged with checks pending or absent | "No checks yet" is not green. Wait for checks to appear AND pass. |
 | Forked the workbook into `spec-v2.html` because editing was annoying | One canonical artifact, updated in place. |
+| Spawned an evaluator per row, or a fixer per row past the budget | One skeptical evaluator per batch; fixers grouped by area inside the chain-of-command dispatch budget. |
 
 ## Rationalizations to Watch For
 
 | Excuse | Why it's wrong |
 |---|---|
-| "The code clearly handles this, no need to run it" | Existence ≠ behavior. The gap between "has a path" and "a persona can complete it" is the whole point. |
 | "It's a local DB, so writes are safe" | A local DB doesn't stop a real Stripe charge, email blast, or webhook. Confirm outbound side-effects are stubbed. |
 | "I'll just note the workbook is stale as a caveat" | A stale required artifact is not DONE. Fix it, verify it, or stop for user input. |
-| "Tests didn't collect, but the feature looks fine" | An unrun suite is FAILED, never DONE. |
-| "I'll average capability and experience into one score" | Never. A 9-capability / 4-experience row is the most actionable finding — report both. |
 
 ## Quick Reference
 
@@ -189,7 +194,8 @@ If a repo already designates a canonical workbook/spec/scorecard as source of tr
 2  Spec:   every feature → user story → expected-behavior-from-code (cited) → open Qs   [the new work]
 3  Score:  delegate to coverage-matrix → cells <10 are in scope
 4  Dogfood: delegate to aesthetic-dogfood-audit + /qa toolchain (measure.js, Chrome DevTools/Playwright)
-5  Loop:   test → fix(root cause) → retest → document → self-check → continue   [backstop = stuck-only]
+5  Loop:   per batch: test → fix(root cause) → retest → document → ONE skeptical evaluator → continue   [backstop = stuck-only]
+Budget:    each batch fits the chain-of-command dispatch budget (crawlers + fixers + evaluator + /dcr review, two waves max); it caps batch width, never the batch count
 6  Accept: all evidence agrees → /pr handoff (default) | auto-merge mode: PR → checks pass → merge → fresh master
 Artifact:  one canonical HTML behavior-spec workbook (xlsx optional export), updated in place
 DONE = every feature row Verified with evidence, or genuinely blocked. Success never stops the run.

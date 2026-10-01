@@ -261,3 +261,63 @@ def test_remove_or_preserve_flat_gates_on_hash_or_source(tmp_path):
 
     # nothing at the path
     assert m.remove_or_preserve_flat(target, "commands", "dc.md", None, src=src) is None
+
+
+# --- atomic writes: unique temp file, cleaned up on failure ----------------
+
+def _stray_temps(path: Path) -> list:
+    return [p for p in path.parent.iterdir() if p.name != path.name]
+
+
+def test_write_does_not_use_a_fixed_temp_name(tmp_path):
+    """A fixed ``jacked-manifest.json.tmp`` lets `jacked install` and a dashboard
+    toggle in another process clobber each other's half-written file. A blocker
+    at the old fixed name proves the writer no longer depends on it."""
+    path = tmp_path / "jacked-manifest.json"
+    (tmp_path / "jacked-manifest.json.tmp").mkdir()
+    m.write(path, "1.0", {"skills": {}}, "2026-10-01T00:00:00+00:00")
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == "1.0"
+
+
+def test_write_removes_its_temp_file_when_the_replace_fails(tmp_path, monkeypatch):
+    import os
+
+    path = tmp_path / "jacked-manifest.json"
+
+    def boom(src, dst):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "replace", boom)
+    try:
+        m.write(path, "1.0", {"skills": {}}, "now")
+    except OSError:
+        pass
+    assert _stray_temps(path) == []
+    assert not path.exists()
+
+
+def test_record_installed_skill_uses_a_unique_temp_and_cleans_up(tmp_path, monkeypatch):
+    import os
+
+    skill = tmp_path / "skills" / "qa"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("qa", encoding="utf-8")
+    mdir = tmp_path / "m"
+    mdir.mkdir()
+    path = mdir / "jacked-manifest.json"
+    m.write(path, "1.0", {"skills": {}}, "now")
+    (mdir / "jacked-manifest.json.tmp").mkdir()
+    assert m.record_installed_skill(path, "qa", skill) is True
+    assert json.loads(path.read_text())["artifacts"]["skills"]["qa"] == m.skill_dir_hash(skill)
+
+    (mdir / "jacked-manifest.json.tmp").rmdir()
+
+    def boom(src, dst):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "replace", boom)
+    try:
+        m.record_installed_skill(path, "qa", skill)
+    except OSError:
+        pass
+    assert _stray_temps(path) == []
