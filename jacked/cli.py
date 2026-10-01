@@ -5050,7 +5050,6 @@ def doctor():
 def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     """Remove jacked hooks, skill, agents, and commands from Claude Code."""
     import json
-    import shutil
 
     from jacked import install_manifest as _mani
 

@@ -1,15 +1,22 @@
 """Unit tests for dynamic skill discovery and toggle helpers."""
 
 import asyncio
+import json
+from pathlib import Path
 from unittest import mock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from starlette.testclient import TestClient
 
+from jacked import install_manifest as mani
 from jacked.api.routes.features import (
     _get_valid_knowledge_names,
     _get_valid_skill_names,
     _toggle_knowledge,
 )
+from tests._platform import requires_symlinks
 
 
 def _run(coro):
@@ -177,15 +184,6 @@ class TestToggleKnowledgeSkillBranch:
 # disable (orphaned sidecars). It now reuses the CLI installer's tree copy and
 # uninstall gate, and records what it wrote in the install manifest.
 
-import json
-from pathlib import Path
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from starlette.testclient import TestClient
-
-from jacked import install_manifest as mani
-from tests._platform import requires_symlinks
 
 
 @pytest.fixture()
