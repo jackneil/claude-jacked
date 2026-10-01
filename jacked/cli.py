@@ -5401,6 +5401,140 @@ def packs_update(name: str | None):
         raise SystemExit(1)
 
 
+@main.group(name="skills")
+def skills_group():
+    """Inspect how Claude Code lists your skills."""
+
+
+_LISTING_WINDOWS = {"200k": 200_000, "1m": 1_000_000}
+
+
+def _skills_listing_print(report: dict) -> None:
+    """Human-readable skill-listing report (same data as --json)."""
+    from rich.table import Table
+
+    from jacked import skill_listing as _sl
+
+    s = report["settings"]
+    color = "green" if report["fits"] else "yellow"
+    console.print(f"[{color}]{_rich_escape(report['summary'])}[/{color}]")
+
+    if s.get("settings_unreadable"):
+        console.print(
+            f"[yellow][!][/yellow] {_rich_escape(s['settings_path'])} is unreadable. "
+            "The report uses Claude Code's defaults, and changes are refused until it is fixed."
+        )
+    if s.get("model"):
+        console.print(
+            f"Model: {_rich_escape(str(s['model']))} ({report['context_window']:,}-token window, "
+            f"{_rich_escape(report['window_source'])})."
+        )
+    elif not report.get("window_known", True):
+        console.print("Model: not set. The context window is unknown; use --window to choose one.")
+    if report.get("version_note"):
+        console.print(f"[yellow][!][/yellow] {_rich_escape(report['version_note'])}")
+    for path in s.get("listing_keys_overridden_by") or []:
+        console.print(
+            f"[yellow][!][/yellow] {_rich_escape(path)} also sets a listing key and wins over "
+            "your user settings, so --apply and --reset may have no effect there."
+        )
+    max_note = "" if s["max_desc_chars_set"] else " (default)"
+    frac_note = "" if s["budget_fraction_set"] else " (default)"
+    console.print(
+        f"Settings: descriptions capped at {s['max_desc_chars']} characters{max_note}, "
+        f"budget {s['budget_fraction'] * 100:g}% of the context window{frac_note}."
+    )
+    if s.get("env_budget"):
+        console.print(
+            f"[yellow][!][/yellow] {_sl.ENV_BUDGET_VAR}={s['env_budget']} "
+            f"({_rich_escape(str(s.get('env_budget_from')))}) sets the budget. "
+            "The fraction setting has no effect."
+        )
+
+    table = Table(title="Budget by context window")
+    table.add_column("Window", no_wrap=True)
+    table.add_column("Budget (chars)", justify="right")
+    table.add_column("Listing (chars)", justify="right")
+    table.add_column("No description", justify="right")
+    for key in sorted(report["windows"], key=int):
+        w = report["windows"][key]
+        size = w["context_window"]
+        label = f"{size // 1000}k" if size < 1_000_000 else f"{size / 1_000_000:g}M"
+        dropped = w["dropped_count"]
+        table.add_row(label, f"{w['budget_chars']:,}", f"{w['full_chars']:,}",
+                      f"[yellow]{dropped}[/yellow]" if dropped else "0")
+    console.print(table)
+
+    for group in report["dropped_groups"]:
+        names = ", ".join(_rich_escape(n) for n in group["names"])
+        console.print(
+            f"  [bold]{_rich_escape(group['label'])}[/bold] ({len(group['names'])}): {names}"
+        )
+
+    for warn in report["strict_yaml_warnings"]:
+        console.print(
+            f"[yellow][!][/yellow] {_rich_escape(warn['name'])}: the frontmatter is not strict "
+            f"YAML ({_rich_escape(warn['error'])}). Claude Code reads it, but other tools "
+            f"such as Codex can reject it. File: {_rich_escape(warn['path'])}"
+        )
+
+    for item in report.get("not_counted") or []:
+        console.print(
+            f"[dim]Not counted: {_rich_escape(item['path'])} ({_rich_escape(item['reason'])})[/dim]"
+        )
+    console.print(f"[dim]Settings read: {_rich_escape(s.get('settings_scope', ''))}.[/dim]")
+
+    rec = report.get("recommendation")
+    if rec:
+        console.print(f"Recommended: {_rich_escape(rec['summary'])}")
+        console.print("Apply it with: jacked skills listing --apply")
+
+
+@skills_group.command(name="listing")
+@click.option("--json", "as_json", is_flag=True, help="Print the report as JSON.")
+@click.option("--apply", "do_apply", is_flag=True,
+              help="Write the recommended skillListingMaxDescChars and skillListingBudgetFraction.")
+@click.option("--reset", "do_reset", is_flag=True,
+              help="Remove both settings so Claude Code uses its defaults.")
+@click.option("--window", type=click.Choice(sorted(_LISTING_WINDOWS)), default=None,
+              help="Context window to report on. Default: the window of your configured model.")
+def skills_listing(as_json: bool, do_apply: bool, do_reset: bool, window: str | None):
+    """Show which skills Claude Code lists without a description, and fix it."""
+    import json as _json
+
+    from jacked import skill_listing as _sl
+    from jacked.memory.settings_io import SettingsUnreadableError
+
+    if do_apply and do_reset:
+        raise click.UsageError("Use --apply or --reset, not both.")
+
+    home = _jacked_home()
+    context_window = _LISTING_WINDOWS[window] if window else None
+    try:
+        if do_apply or do_reset:
+            report = _sl.apply_action(
+                home, "reset" if do_reset else "recommended",
+                context_window=context_window, data_root=_get_data_root(),
+            )
+        else:
+            report = _sl.build_report(home, context_window=context_window,
+                                      data_root=_get_data_root())
+    except SettingsUnreadableError as exc:
+        console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}")
+        console.print("Nothing was written. Fix the JSON in settings.json, then run this again.")
+        raise SystemExit(1)
+    except _sl.ListingSettingsError as exc:
+        console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}")
+        raise SystemExit(1)
+
+    if as_json:
+        click.echo(_json.dumps(report))
+        return
+    if report.get("message"):
+        console.print(_rich_escape(report["message"]))
+    _skills_listing_print(report)
+
+
 @main.group(name="statusline")
 def statusline_group():
     """Claude Code statusline: model, effort, context, rate limits, account."""

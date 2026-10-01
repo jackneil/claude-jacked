@@ -74,6 +74,7 @@ jacked uninstall [--sounds]                         # Remove from Claude Code (a
 jacked packs list                                   # List skill packs + on/off/default status + install counts
 jacked packs enable NAME / disable NAME             # Install / durably remove a pack via the npx skills CLI
 jacked packs update [NAME]                          # Refresh enabled packs from their upstream repos
+jacked skills listing [--apply|--reset] [--window 200k|1m] [--json]  # Skills Claude sees without a description + fix
 jacked permissions audit [--fix] [--yes]            # Audit permission rules for dangerous wildcards
 jacked check-version                                # Check for newer PyPI version
 jacked webux                                        # Launch the web dashboard

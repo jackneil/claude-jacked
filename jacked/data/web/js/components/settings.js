@@ -666,9 +666,14 @@ async function renderFeaturesTab(container) {
         } catch (e) {
             packsError = e.message || 'Failed to load skill packs';
         }
+        // The skill-listing panel lives with the packs (packs are what push the
+        // listing over budget). It renders from cache (or a loading line) and
+        // refreshes in the background after the tab is on screen, so a slow
+        // scan never delays the rest of the tab.
+        const skillListingPanel = _renderSkillListingPanel(window.jackedState.skillListing || null);
         const packsSection = packsError
-            ? _renderPacksError(packsError)
-            : _renderPacksSection(packsData);
+            ? _renderPacksError(packsError) + skillListingPanel
+            : _renderPacksSection(packsData, skillListingPanel);
 
         // The review-engine card has its own endpoint too. Same isolation rule as
         // packs: a failed fetch renders the card's own inline error with a retry
@@ -785,6 +790,9 @@ async function renderFeaturesTab(container) {
         _bindPackToggleEvents(container);
         _bindDcrEngineEvents(container);
         _bindFeatureFilter(container);
+        const listingPanel = container.querySelector('#skill-listing-panel');
+        if (listingPanel) _bindSkillListingEvents(listingPanel);
+        _refreshSkillListingPanel();
     } catch (e) {
         container.innerHTML = `
             <div class="text-center py-12">
@@ -809,9 +817,9 @@ function _renderPacksError(message) {
     `;
 }
 
-function _renderPacksSection(packsData) {
+function _renderPacksSection(packsData, skillListingPanel = '') {
     const packs = (packsData && packsData.packs) || [];
-    if (packs.length === 0) return '';
+    if (packs.length === 0) return skillListingPanel ? `<div>${skillListingPanel}</div>` : '';
 
     const npxAvailable = !!(packsData && packsData.npx_available);
     const npxNote = npxAvailable
@@ -892,6 +900,7 @@ function _renderPacksSection(packsData) {
             <p class="text-xs text-slate-500 mb-3">Curated skill bundles installed live from upstream GitHub repos via the skills CLI. Toggling a pack runs npx and can take up to a minute. Skills are instructions your agents will follow. Enabling a pack installs content from its upstream repo; review it via the Source link.</p>
             ${npxNote}
             <div class="space-y-2">${rows}</div>
+            ${skillListingPanel}
         </div>
     `;
 }
@@ -907,6 +916,9 @@ async function _runPackToggle(toggle, input, name, displayName, enabled) {
     _packsInFlight.set(name, enabled ? 'enable' : 'disable');
     toggle.classList.add('pending');
     if (input) input.disabled = true;
+    // The listing before the op, to tell the user if the pack pushed it over
+    // budget (see the finally below).
+    const listingBefore = window.jackedState.skillListing || null;
 
     try {
         const res = await api.put(
@@ -931,6 +943,18 @@ async function _runPackToggle(toggle, input, name, displayName, enabled) {
         // rebuilds from the real on-disk status (enabled intent, the "N of M
         // installed" line, partial-repair link), not the spinner.
         _packsInFlight.delete(name);
+        // A pack adds or removes listing entries. Check the listing again and
+        // warn when turning the pack on made Claude lose descriptions. A failed
+        // check stays quiet here; the panel shows its own error on re-render.
+        try {
+            const listingAfter = await loadSkillListing();
+            const warning = enabled
+                ? _skillListingPackWarning(listingBefore, listingAfter, displayName)
+                : null;
+            if (warning) showToast(warning, 'warning', 10000);
+        } catch (_) {
+            console.warn('skill listing check after pack toggle failed', _);
+        }
         try {
             await refreshPacks();
             // Don't hijack the user back to Features if they navigated away
@@ -983,6 +1007,315 @@ function _bindPackToggleEvents(container) {
             _runPackToggle(toggle, input, name, displayName, true);
         });
     });
+}
+
+// --- Skill listing panel (rendered inside the Skill Packs section) ---
+//
+// Claude Code lists every model-visible skill in each session, inside a
+// character budget. Over budget, it keeps the names but drops descriptions,
+// least-used first, and a skill without a description is rarely picked. The
+// panel shows the gap and writes the two settings that close it. Server text
+// (summary, skill names, paths, YAML errors) always goes through escapeHtml.
+
+const SKILL_LISTING_URL = '/api/skill-listing';
+const SKILL_LISTING_WINDOWS = [[200000, '200k'], [1000000, '1M']];
+
+// A PUT is running. Module-level so a re-render during the save keeps the
+// buttons inert (same rule as the review-engine card).
+let _skillListingSaving = false;
+let _skillListingError = null;
+// The window the user picked in the panel; null means "the window of the
+// configured model", which the server works out.
+let _skillListingWindow = null;
+// Request ordering. Every GET start and every PUT result takes the next
+// number. A GET response may write the cache (or show its error) only when it
+// is the newest GET AND it started after the last PUT result landed, so a
+// slow, older GET (a pack-toggle refresh racing Apply, say) can never replace
+// the report a newer GET or a PUT returned. A PUT result always wins.
+let _skillListingSeq = 0;
+let _skillListingLatestGet = 0;
+let _skillListingWriteMark = 0;
+
+function _skillListingGetIsCurrent(seq) {
+    return seq === _skillListingLatestGet && seq > _skillListingWriteMark;
+}
+
+function _skillListingWindowQuery() {
+    return _skillListingWindow ? `?window=${encodeURIComponent(_skillListingWindow)}` : '';
+}
+
+async function loadSkillListing() {
+    const seq = ++_skillListingSeq;
+    _skillListingLatestGet = seq;
+    const data = await api.get(`${SKILL_LISTING_URL}${_skillListingWindowQuery()}`);
+    if (_skillListingGetIsCurrent(seq)) {
+        window.jackedState.skillListing = data;
+        return data;
+    }
+    return window.jackedState.skillListing || data;
+}
+
+function _skillListingWindowLabel(windowSize) {
+    if (windowSize === 1000000) return '1M-token';
+    if (windowSize && windowSize % 1000 === 0 && windowSize < 1000000) return `${windowSize / 1000}k-token`;
+    return windowSize ? `${windowSize}-token` : '';
+}
+
+function _skillListingPlural(n, one, many) {
+    return `${n} ${n === 1 ? one : many}`;
+}
+
+function _renderSkillListingLoading() {
+    return `
+        <div id="skill-listing-panel" class="mt-3 p-3 bg-slate-900/50 rounded border border-slate-700/50">
+            <h4 class="text-sm text-white font-medium">Skill listing</h4>
+            <div class="text-xs text-slate-400 mt-1" role="status" aria-live="polite">Checking the skill listing...</div>
+        </div>
+    `;
+}
+
+function _renderSkillListingError(message) {
+    return `
+        <div id="skill-listing-panel" class="mt-3 p-3 bg-slate-900/50 rounded border border-slate-700/50">
+            <h4 class="text-sm text-white font-medium">Skill listing</h4>
+            <div class="text-xs text-red-400 mt-1">
+                Could not check the skill listing: ${escapeHtml(message)}
+                <a href="#" id="skill-listing-recheck" class="text-blue-400 hover:text-blue-300 ml-2 transition-colors">Try again</a>
+            </div>
+        </div>
+    `;
+}
+
+function _renderSkillListingPanel(data) {
+    if (!data) return _renderSkillListingLoading();
+    const settings = data.settings || {};
+    const unreadable = !!settings.settings_unreadable;
+    const rec = data.recommendation || null;
+    const disabledAttr = (_skillListingSaving || unreadable) ? ' disabled' : '';
+
+    // State lives on the content itself: amber, heavier text when Claude
+    // cannot see some descriptions; quiet text when everything fits.
+    const summaryClass = data.fits
+        ? 'text-xs text-slate-300 mt-1'
+        : 'text-xs text-amber-400 font-medium mt-1';
+    // The panel already carries a "Skill listing" heading, so it shows the
+    // short form (the CLI form starts with that label).
+    const summaryText = data.summary_short || (data.summary || '').replace(/^Skill listing:\s*/, '');
+    const summary = `<p id="skill-listing-summary" class="${summaryClass}" role="status" aria-live="polite">${escapeHtml(summaryText)}</p>`;
+
+    const notes = [];
+    if (unreadable) {
+        notes.push('<p class="text-xs text-yellow-400">~/.claude/settings.json is unreadable, so these numbers use the Claude Code defaults. Fix the file before you change these settings.</p>');
+    }
+    if (settings.env_budget) {
+        notes.push(`<p class="text-xs text-slate-400">The SLASH_COMMAND_TOOL_CHAR_BUDGET variable sets the budget to ${escapeHtml(String(settings.env_budget))} characters. The budget percentage has no effect while it is set.</p>`);
+    }
+    if (data.version_note) {
+        notes.push(`<p class="text-xs text-slate-500">${escapeHtml(String(data.version_note))}</p>`);
+    }
+    const overriders = settings.listing_keys_overridden_by || [];
+    if (overriders.length) {
+        notes.push(`<p class="text-xs text-yellow-400">This file also sets the skill listing values and wins over your user settings: ${overriders.map(p => escapeHtml(String(p))).join(', ')}. Apply and Reset change only your user settings.</p>`);
+    }
+    const notCounted = data.not_counted || [];
+    if (notCounted.length) {
+        const items = notCounted.map(n => `<li>${escapeHtml(String(n.path || ''))} <span class="text-slate-500">${escapeHtml(String(n.reason || ''))}</span></li>`).join('');
+        notes.push(`
+            <details class="text-xs text-slate-400">
+                <summary class="cursor-pointer select-none">${escapeHtml(_skillListingPlural(notCounted.length, 'location is', 'locations are'))} not counted in this estimate</summary>
+                <ul class="mt-1 space-y-1 break-all">${items}</ul>
+            </details>
+        `);
+    }
+
+    let disclosure = '';
+    const groups = data.dropped_groups || [];
+    if (groups.length) {
+        const rows = groups.map(g => {
+            const names = (g.names || []).map(n => escapeHtml(String(n))).join(', ');
+            return `
+                <div class="mt-2">
+                    <div class="text-xs text-slate-300 font-medium">${escapeHtml(String(g.label || ''))} <span class="text-slate-500 font-normal">(${(g.names || []).length})</span></div>
+                    <div class="text-xs text-slate-400 break-words">${names}</div>
+                </div>
+            `;
+        }).join('');
+        disclosure = `
+            <details class="text-xs">
+                <summary class="cursor-pointer text-blue-400 hover:text-blue-300 select-none">Show the ${escapeHtml(_skillListingPlural(data.dropped_count, 'skill', 'skills'))} without a description</summary>
+                <div class="mt-1">${rows}</div>
+            </details>
+        `;
+    }
+
+    let yamlBlock = '';
+    const warnings = data.strict_yaml_warnings || [];
+    if (warnings.length) {
+        const items = warnings.map(w => `
+            <li class="mt-1">
+                <span class="text-slate-200">${escapeHtml(String(w.name || ''))}</span>
+                <span class="text-slate-500">${escapeHtml(String(w.error || ''))}</span>
+                <div class="text-slate-500 font-mono break-all">${escapeHtml(String(w.path || ''))}</div>
+            </li>
+        `).join('');
+        yamlBlock = `
+            <div id="skill-listing-yaml" class="text-xs">
+                <p class="text-yellow-400">${escapeHtml(_skillListingPlural(warnings.length, 'skill file is', 'skill files are'))} not strict YAML. Claude Code reads them, but other tools such as Codex can reject them. Put quotes around a value that contains a colon.</p>
+                <ul class="text-slate-400">${items}</ul>
+            </div>
+        `;
+    }
+
+    const anySet = !!(settings.max_desc_chars_set || settings.budget_fraction_set);
+    const applyBlock = rec ? `
+        <div class="flex flex-wrap items-center gap-3">
+            <button id="skill-listing-apply" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded transition active:scale-[0.96] disabled:opacity-40 disabled:cursor-not-allowed"${disabledAttr}>Apply recommended</button>
+            <span id="skill-listing-rec" class="text-xs text-slate-300 min-w-0 flex-1">${escapeHtml(rec.summary || '')}</span>
+        </div>
+    ` : '';
+    const pct = Math.round((settings.budget_fraction || 0) * 10000) / 100;
+    const resetBlock = anySet ? `
+        <div class="flex flex-wrap items-center gap-3">
+            <button id="skill-listing-reset" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-white text-sm rounded transition active:scale-[0.96] disabled:opacity-40 disabled:cursor-not-allowed"${disabledAttr}>Reset to defaults</button>
+            <span class="text-xs text-slate-500">Now: descriptions capped at ${escapeHtml(String(settings.max_desc_chars))} characters, budget ${escapeHtml(String(pct))}%.</span>
+        </div>
+    ` : '';
+
+    const savingLine = _skillListingSaving
+        ? '<div class="text-xs text-slate-400" role="status" aria-live="polite">Saving...</div>'
+        : '';
+    const errorLine = _skillListingError
+        ? `<div class="text-xs text-red-400">${escapeHtml(_skillListingError)}</div>`
+        : '';
+
+    // A native select, styled like the review-engine selects. The server picks
+    // the default from the configured model; the hint says where it came from.
+    const current = Number(data.context_window);
+    const windowOptions = SKILL_LISTING_WINDOWS.map(([value, label]) =>
+        `<option value="${value}"${current === value ? ' selected' : ''}>${label}</option>`
+    ).join('');
+    let windowHint = '';
+    if (data.window_source === 'model') windowHint = 'from your model';
+    else if (data.window_known === false) windowHint = 'your model is unknown';
+    else if (data.window_source === 'selected') windowHint = 'your choice';
+    const windowControl = `
+        <label class="flex items-center gap-2 text-xs text-slate-400 flex-shrink-0">
+            <span>Context window</span>
+            <select id="skill-listing-window" class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-blue-500" aria-label="Context window for the skill listing"${_skillListingSaving ? ' disabled' : ''}>
+                ${windowOptions}
+            </select>
+            ${windowHint ? `<span class="text-slate-500">${escapeHtml(windowHint)}</span>` : ''}
+        </label>
+    `;
+
+    return `
+        <div id="skill-listing-panel" class="mt-3 p-3 bg-slate-900/50 rounded border border-slate-700/50 space-y-2">
+            <div>
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                    <h4 class="text-sm text-white font-medium">Skill listing</h4>
+                    ${windowControl}
+                </div>
+                ${summary}
+            </div>
+            ${notes.join('')}
+            ${disclosure}
+            ${yamlBlock}
+            ${applyBlock}
+            ${resetBlock}
+            ${savingLine}
+            ${errorLine}
+        </div>
+    `;
+}
+
+// Toast text after a pack is turned on, or null when the change did not make
+// the listing worse. `before` may be null (the panel had not loaded yet).
+function _skillListingPackWarning(before, after, displayName) {
+    if (!after || after.fits) return null;
+    const prevDropped = (before && typeof before.dropped_count === 'number') ? before.dropped_count : 0;
+    const wasFitting = !before || before.fits;
+    if (!wasFitting && after.dropped_count <= prevDropped) return null;
+    const count = _skillListingPlural(after.dropped_count, 'skill now shows', 'skills now show');
+    const label = _skillListingWindowLabel(Number(after.context_window));
+    const where = label ? ` for a ${label} context window` : '';
+    return `${displayName} pushed the skill listing over budget${where}. ${count} without a description. Go to Skill listing below the packs and select Apply recommended.`;
+}
+
+function _swapSkillListingPanel(html) {
+    const el = document.getElementById('skill-listing-panel');
+    if (!el) return;
+    el.outerHTML = html;
+    const fresh = document.getElementById('skill-listing-panel');
+    if (fresh) _bindSkillListingEvents(fresh);
+}
+
+function _rerenderSkillListingPanel() {
+    _swapSkillListingPanel(_renderSkillListingPanel(window.jackedState.skillListing));
+}
+
+// Fetch a fresh report and swap it into the panel. Skills change outside the
+// dashboard (installs, edits), so every Features render checks again.
+async function _refreshSkillListingPanel() {
+    if (_skillListingSaving) return;
+    const pending = loadSkillListing();
+    const seq = _skillListingLatestGet;  // set synchronously by loadSkillListing
+    try {
+        await pending;
+        if (_skillListingGetIsCurrent(seq)) _rerenderSkillListingPanel();
+    } catch (e) {
+        // A newer request (or a PUT) owns the panel now; an older failure
+        // must not replace it with an error.
+        if (!_skillListingGetIsCurrent(seq)) return;
+        _swapSkillListingPanel(_renderSkillListingError(e.message || 'request failed'));
+    }
+}
+
+async function _saveSkillListing(action) {
+    if (_skillListingSaving) return;
+    _skillListingSaving = true;
+    _skillListingError = null;
+    _rerenderSkillListingPanel();
+    try {
+        const res = await api.put(SKILL_LISTING_URL, { action, context_window: _skillListingWindow });
+        // The write is authoritative: it always lands, and every GET that
+        // started before this point is now too old to replace it.
+        _skillListingWriteMark = ++_skillListingSeq;
+        window.jackedState.skillListing = res;
+        showToast((res && res.message) || 'Saved.', 'success', 6000);
+    } catch (e) {
+        _skillListingError = e.message || 'The change was not saved.';
+        showToast(_skillListingError, 'error');
+    } finally {
+        _skillListingSaving = false;
+        _rerenderSkillListingPanel();
+    }
+}
+
+function _bindSkillListingEvents(container) {
+    const apply = container.querySelector('#skill-listing-apply');
+    if (apply && !apply.disabled) {
+        apply.addEventListener('click', () => _saveSkillListing('recommended'));
+    }
+    const reset = container.querySelector('#skill-listing-reset');
+    if (reset && !reset.disabled) {
+        reset.addEventListener('click', () => _saveSkillListing('reset'));
+    }
+    const windowSelect = container.querySelector('#skill-listing-window');
+    if (windowSelect && !windowSelect.disabled) {
+        windowSelect.addEventListener('change', () => {
+            _skillListingWindow = Number(windowSelect.value) || null;
+            _swapSkillListingPanel(_renderSkillListingLoading());
+            _refreshSkillListingPanel();
+        });
+    }
+    const recheck = container.querySelector('#skill-listing-recheck');
+    if (recheck) {
+        recheck.addEventListener('click', (e) => {
+            e.preventDefault();
+            _swapSkillListingPanel(_renderSkillListingLoading());
+            _refreshSkillListingPanel();
+        });
+    }
 }
 
 // --- DCR review engine section (rendered inside the Features tab) ---
