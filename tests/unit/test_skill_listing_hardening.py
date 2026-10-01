@@ -183,7 +183,8 @@ def test_synced_account_dir_is_masked(tmp_path):
     assert rep["dropped_count"] > 0 and rep["strict_yaml_warnings"]
     dumped = json.dumps(rep)
     assert org not in dumped and acct not in dumped
-    assert "synced/<account>/" in dumped
+    # display paths use the platform separator (backslash on Windows, escaped in JSON)
+    assert "synced/<account>/" in dumped or "synced\\\\<account>\\\\" in dumped
 
 
 # --------------------------------------------------------------------------- #
