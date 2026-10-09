@@ -57,10 +57,9 @@ def _norm_path(p: str) -> str:
 
 def _encode_cwd(cwd: str) -> str:
     """Encode a cwd the way current Claude Code names its projects dir:
-    keep the leading separator (becomes a leading dash) and replace both
-    '/' and '.' with '-'."""
-    s = str(cwd).replace("\\", "/")
-    return s.replace("/", "-").replace(".", "-")
+    every non-alphanumeric character (separators, dots, spaces, '@', ':')
+    becomes '-', so the leading separator becomes a leading dash."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
 
 
 def _iter_records(path: Path):
@@ -129,10 +128,19 @@ def resolve_project_dir(cwd, projects_root=None) -> Optional[Path]:
     fast = root / _encode_cwd(str(cwd))
     if fast.is_dir() and _dir_matches_cwd(fast, norm):
         return fast
-    for d in sorted(root.iterdir()):
-        if d.is_dir() and _dir_matches_cwd(d, norm):
-            return d
-    return None
+    # Several dirs can hold transcripts recorded with this cwd (an older
+    # encoding, or a session launched elsewhere that later reported it).
+    # Prefer the one with the most recently written transcript, never the
+    # alphabetically first.
+    matches = [d for d in root.iterdir() if d.is_dir() and _dir_matches_cwd(d, norm)]
+    if not matches:
+        return None
+    return max(matches, key=_newest_mtime)
+
+
+def _newest_mtime(d: Path) -> float:
+    newest = _newest_jsonls(d, n=1)
+    return newest[0].stat().st_mtime if newest else 0.0
 
 
 @dataclass
@@ -145,6 +153,10 @@ class SessionCandidate:
     git_branch: Optional[str] = None
     msg_count: int = 0
     truncated: bool = False
+    # Headless `claude -p` / SDK runs (entrypoint "sdk-*"): hooks and helpers
+    # such as memory triage write these into the same project dir. They are
+    # never a crashed interactive session.
+    headless: bool = False
 
     def to_dict(self, now: Optional[datetime] = None) -> dict:
         return {
@@ -157,6 +169,7 @@ class SessionCandidate:
             "git_branch": self.git_branch,
             "msg_count": self.msg_count,
             "truncated": self.truncated,
+            "headless": self.headless,
         }
 
 
@@ -177,7 +190,7 @@ def _relative_age(ts: Optional[datetime], now: Optional[datetime] = None) -> Opt
 def _scan_candidate(path: Path) -> SessionCandidate:
     """One raw pass over a transcript collecting ranking + preview metadata.
     Reads raw (not via _iter_records) so it can flag a garbled final line."""
-    ai_title = last_prompt = git_branch = None
+    ai_title = last_prompt = git_branch = entrypoint = None
     last_ts: Optional[datetime] = None
     msg_count = 0
     last_line_ok = True
@@ -202,6 +215,8 @@ def _scan_candidate(path: Path) -> SessionCandidate:
                     msg_count += 1
                     if rec_obj.get("gitBranch"):
                         git_branch = rec_obj["gitBranch"]
+                    if entrypoint is None and rec_obj.get("entrypoint"):
+                        entrypoint = str(rec_obj["entrypoint"])
                 ts = _parse_ts(rec_obj.get("timestamp"))
                 if ts and (last_ts is None or ts > last_ts):
                     last_ts = ts
@@ -211,6 +226,7 @@ def _scan_candidate(path: Path) -> SessionCandidate:
         session_id=path.stem, path=path, ai_title=ai_title,
         last_prompt=last_prompt, last_ts=last_ts, git_branch=git_branch,
         msg_count=msg_count, truncated=not last_line_ok,
+        headless=bool(entrypoint and entrypoint.startswith("sdk")),
     )
 
 
@@ -233,10 +249,12 @@ MIN_SUBSTANCE_MSGS = 4
 
 
 def recommend_index(candidates, min_msgs: int = MIN_SUBSTANCE_MSGS) -> int:
-    """Index of the recommended candidate: the newest with real substance.
-    Candidates are newest-first; skip a near-empty newest, else fall back to 0."""
+    """Index of the recommended candidate: the newest interactive session with
+    real substance. Candidates are newest-first; skip near-empty and headless
+    (SDK / `claude -p`) sessions, else fall back to 0. Skipped sessions stay
+    in the list so the user can still pick one."""
     for i, c in enumerate(candidates):
-        if c.msg_count >= min_msgs:
+        if c.msg_count >= min_msgs and not c.headless:
             return i
     return 0
 

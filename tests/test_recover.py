@@ -45,6 +45,37 @@ def test_resolve_returns_none_when_root_missing(tmp_path):
     assert rec.resolve_project_dir("/whatever", projects_root=tmp_path / "nope") is None
 
 
+def test_encode_cwd_replaces_every_non_alphanumeric():
+    # Claude Code maps spaces, '@', '.' and separators all to '-'.
+    cwd = "/Users/jack.neil/Library/CloudStorage/GoogleDrive-jack.neil@hank.ai/My Drive/213SCC Net"
+    assert rec._encode_cwd(cwd) == (
+        "-Users-jack-neil-Library-CloudStorage-GoogleDrive-jack-neil-hank-ai-My-Drive-213SCC-Net")
+    assert rec._encode_cwd("C:\\Users\\me\\repo") == "C--Users-me-repo"
+
+
+def test_resolve_fast_path_with_space_and_at_sign(tmp_path):
+    projects = tmp_path / "projects"
+    cwd = "/Users/j.n/Drive-j.n@x.ai/My Drive/Net"
+    pdir = projects / "-Users-j-n-Drive-j-n-x-ai-My-Drive-Net"
+    _write_session(pdir, SID_A, [_user_line(cwd)])
+    # A decoy dir that sorts first and also recorded this cwd must not win.
+    decoy = projects / "-Users-a-decoy"
+    _write_session(decoy, SID_A, [_user_line(cwd)])
+    assert rec.resolve_project_dir(cwd, projects_root=projects) == pdir
+
+
+def test_resolve_fallback_prefers_dir_with_newest_transcript(tmp_path):
+    import os
+    projects = tmp_path / "projects"
+    cwd = "/odd/path"
+    old = _write_session(projects / "-a-older", SID_A, [_user_line(cwd)])
+    new = _write_session(projects / "-z-newer", SID_A, [_user_line(cwd)])
+    os.utime(old, (1_000_000, 1_000_000))
+    os.utime(new, (2_000_000, 2_000_000))
+    # Neither dir name equals the encoding, so the fallback decides.
+    assert rec.resolve_project_dir(cwd, projects_root=projects) == projects / "-z-newer"
+
+
 SID_B = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
 SID_LIVE = "cccccccc-3333-4333-8333-cccccccccccc"
 
@@ -339,3 +370,17 @@ def test_recommend_falls_back_when_all_tiny():
     cands = [_cand("a", 1, "2026-06-17T12:00:00+00:00"),
              _cand("b", 2, "2026-06-16T09:00:00+00:00")]
     assert rec.recommend_index(cands) == 0
+
+
+def test_recommend_skips_headless_sdk_session(tmp_path):
+    pdir = tmp_path / "p"
+    cwd = "/repo"
+    real = [_user_line(cwd, ts=f"2026-06-15T10:0{i}:00.000Z") for i in range(6)]
+    _write_session(pdir, SID_A, real)
+    headless = [dict(_user_line(cwd, ts=f"2026-06-15T11:0{i}:00.000Z"), entrypoint="sdk-cli")
+                for i in range(6)]
+    _write_session(pdir, SID_B, headless)
+    cands = rec.list_candidates(pdir)
+    assert cands[0].session_id == SID_B and cands[0].headless
+    assert cands[rec.recommend_index(cands)].session_id == SID_A
+    assert cands[0].to_dict()["headless"] is True
