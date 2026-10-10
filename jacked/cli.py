@@ -3352,7 +3352,8 @@ def _install_statusline(home: Path, existing: dict, settings_path: Path) -> None
     a file-only write would be clobbered by a later installer's stale
     copy) and writes atomically. The engine decides what is safe:
     a foreign statusLine is never replaced (the report says how to adopt
-    it), and an explicit disable is never overridden.
+    it) except jacked's own bash predecessor, which is adopted with a
+    backup, and an explicit disable is never overridden.
     """
     from jacked import statusline_setup
 
@@ -3361,6 +3362,12 @@ def _install_statusline(home: Path, existing: dict, settings_path: Path) -> None
         _write_settings_atomic(settings_path, existing)
         verb = "Registered" if outcome == "installed" else "Updated"
         console.print(f"[green][OK][/green] {verb} Claude Code statusline")
+    elif outcome == "adopted_legacy":
+        _write_settings_atomic(settings_path, existing)
+        console.print(
+            "[green][OK][/green] Replaced the old bash statusline.sh with jacked's "
+            "statusline (restore it with `jacked statusline disable`)"
+        )
     elif outcome == "unchanged":
         console.print("[dim][-][/dim] Statusline already registered")
     elif outcome == "skipped_foreign":
@@ -5759,6 +5766,10 @@ def statusline_status():
         settings = {}
     where = statusline_setup.entry_state(settings)
     state = statusline_setup.load_state(home)["state"] or "default (on)"
+    if where == "foreign" and statusline_setup.is_legacy_predecessor(
+        home, settings.get("statusLine")
+    ):
+        where = "foreign (the old bash statusline.sh; `jacked install` replaces it)"
     console.print(f"Registration: {where}")
     console.print(f"Preference:   {state}")
     if where == "ours":

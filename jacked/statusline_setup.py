@@ -13,6 +13,12 @@ Design contracts:
   never replaces it. An explicit enable (dashboard toggle or
   `jacked statusline enable`) takes over but saves the foreign value in
   the state file; disable and uninstall restore it.
+- The one exception is jacked's own bash predecessor
+  (``~/.claude/statusline.sh``, identified by its bytes, see
+  ``is_legacy_predecessor``). It reads the account from ``~/.claude.json``
+  instead of the resolver snapshot and has no model-scoped usage segment,
+  so leaving it in place strands a machine on a wrong account label for
+  good. Install adopts it with the same backup an explicit enable saves.
 - Enable state is three-valued (enabled / disabled / unset) like skill
   packs: unset means "default on", and an explicit disable survives
   upgrades instead of being silently re-enabled.
@@ -36,6 +42,13 @@ STATE_VERSION = 1
 # current form ("<python>" -m jacked.statusline) and any future wrapper
 # must keep it, or uninstall would strand the entry.
 COMMAND_MARKER = "-m jacked.statusline"
+
+# The bash predecessor lived at ~/.claude/statusline.sh. Every copy of it
+# carries this sample render in its header, and a statusline someone else
+# wrote would not, so the file's own bytes prove what it is.
+LEGACY_SCRIPT_NAME = "statusline.sh"
+LEGACY_FINGERPRINT = "ctx 63% (633k/1.0M)"
+_LEGACY_HEAD_BYTES = 4096
 
 
 def jacked_home() -> Path:
@@ -68,6 +81,36 @@ def is_ours(command: object) -> bool:
     False
     """
     return isinstance(command, str) and COMMAND_MARKER in command
+
+
+def is_legacy_predecessor(home: Path, entry: object) -> bool:
+    """True when a statusLine entry runs jacked's bash predecessor.
+
+    Both halves must hold: the command names ``.claude/statusline.sh``
+    (any shell, any slash direction, any quoting), and the script at
+    ``<home>/.claude/statusline.sh`` carries ``LEGACY_FINGERPRINT`` near its
+    top. A missing or unreadable script reads as not legacy, so a statusline
+    jacked cannot prove it wrote stays untouched.
+
+    >>> is_legacy_predecessor(Path("/nonexistent"), {"command": "bash x.sh"})
+    False
+    >>> is_legacy_predecessor(Path("/nonexistent"), None)
+    False
+    """
+    if not isinstance(entry, dict):
+        return False
+    command = entry.get("command")
+    if not isinstance(command, str):
+        return False
+    if f".claude/{LEGACY_SCRIPT_NAME}" not in command.replace("\\", "/"):
+        return False
+    script = home / ".claude" / LEGACY_SCRIPT_NAME
+    try:
+        with open(script, "rb") as fh:
+            head = fh.read(_LEGACY_HEAD_BYTES)
+    except OSError:
+        return False
+    return LEGACY_FINGERPRINT.encode("ascii") in head
 
 
 def current_entry(settings: dict) -> Optional[dict]:
@@ -210,17 +253,26 @@ def sync_on_install(home: Path, settings: dict) -> str:
     """Install-time sync against the CLI's shared in-memory settings dict.
 
     Returns what happened: "installed" | "migrated" | "unchanged" |
-    "skipped_disabled" | "skipped_foreign". Pure dict math on `settings`;
-    the caller owns the atomic write. Install never overrides an explicit
+    "adopted_legacy" | "skipped_disabled" | "skipped_foreign". The caller
+    owns the atomic settings write. Install never overrides an explicit
     disable and never touches a foreign entry (enabling over a foreign
     entry is reserved for the explicit toggle, which records a backup).
+    The bash predecessor is the one foreign entry install adopts; its
+    backup goes to the state file first, so disable and uninstall bring
+    it back. The preference stays unset: install records no choice.
     """
     state = load_state(home)
     if state["state"] == "disabled":
         return "skipped_disabled"
     where = entry_state(settings)
     if where == "foreign":
-        return "skipped_foreign"
+        legacy = settings.get("statusLine")
+        if not is_legacy_predecessor(home, legacy):
+            return "skipped_foreign"
+        state["previous"] = legacy
+        save_state(home, state)
+        ensure_entry(settings, build_command())
+        return "adopted_legacy"
     if where == "ours":
         return "migrated" if ensure_entry(settings, build_command()) else "unchanged"
     ensure_entry(settings, build_command())

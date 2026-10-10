@@ -968,6 +968,124 @@ def test_sync_on_install_skips_a_foreign_entry(home):
     assert json.dumps(settings, sort_keys=True) == snapshot
 
 
+# The head of the real bash predecessor, as it sits on the Mac. The Windows
+# copy has the same sample render with different arrow bytes.
+LEGACY_HEAD = (
+    "#!/usr/bin/env bash\n"
+    "# Claude Code statusline. Reads the session JSON on stdin and prints one line:\n"
+    "#   Fable 5 [xhigh] | ctx 63% (633k/1.0M) | 5h 7%->14:00 | 7d 88%->Sat 02:37"
+    " | me@co.com \u00b7 MyOrg \u00b7 Max 5x\n"
+    "IFS= read -r -d '' input\n"
+)
+LEGACY_MAC = {"type": "command", "command": 'bash "$HOME/.claude/statusline.sh"'}
+LEGACY_WINDOWS = {
+    "type": "command",
+    "command": '"C:\\Program Files\\Git\\bin\\bash.exe" C:/Users/jack/.claude/statusline.sh',
+}
+
+
+def _write_legacy_script(home_dir, text=LEGACY_HEAD) -> Path:
+    path = home_dir / ".claude" / "statusline.sh"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        LEGACY_MAC,
+        LEGACY_WINDOWS,
+        {"type": "command", "command": r"bash C:\Users\jack\.claude\statusline.sh"},
+        {"type": "command", "command": "bash ~/.claude/statusline.sh"},
+    ],
+)
+def test_legacy_predecessor_is_recognized_by_command_and_bytes(home, entry):
+    _write_legacy_script(home)
+    assert statusline_setup.is_legacy_predecessor(home, entry) is True
+
+
+def test_legacy_predecessor_requires_the_script_to_exist(home):
+    assert statusline_setup.is_legacy_predecessor(home, LEGACY_MAC) is False
+
+
+def test_legacy_predecessor_requires_the_fingerprint(home):
+    _write_legacy_script(home, "#!/usr/bin/env bash\n# my own statusline\necho hi\n")
+    assert statusline_setup.is_legacy_predecessor(home, LEGACY_MAC) is False
+
+
+def test_legacy_predecessor_fingerprint_must_sit_in_the_head(home):
+    filler = "# padding\n" * 1000
+    _write_legacy_script(home, "#!/usr/bin/env bash\n" + filler + LEGACY_HEAD)
+    assert statusline_setup.is_legacy_predecessor(home, LEGACY_MAC) is False
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        dict(FOREIGN),
+        {"type": "command", "command": 'bash "$HOME/scripts/statusline.sh"'},
+        {"type": "command", "command": None},
+        {"command": 123},
+        "bash ~/.claude/statusline.sh",
+        None,
+    ],
+)
+def test_legacy_predecessor_rejects_other_commands(home, entry):
+    _write_legacy_script(home)
+    assert statusline_setup.is_legacy_predecessor(home, entry) is False
+
+
+@pytest.mark.parametrize("legacy", [LEGACY_MAC, LEGACY_WINDOWS])
+def test_sync_on_install_adopts_the_legacy_predecessor_with_a_backup(home, legacy):
+    _write_legacy_script(home)
+    settings = {"statusLine": dict(legacy)}
+
+    assert statusline_setup.sync_on_install(home, settings) == "adopted_legacy"
+
+    assert settings["statusLine"] == _ours_entry()
+    state = statusline_setup.load_state(home)
+    assert state["previous"] == legacy
+    # Install records no preference; only the toggle and the CLI do.
+    assert state["state"] == ""
+    # The second install is a no-op on the adopted entry.
+    assert statusline_setup.sync_on_install(home, settings) == "unchanged"
+    assert statusline_setup.load_state(home)["previous"] == legacy
+
+
+def test_sync_on_install_never_adopts_the_legacy_script_over_a_disable(home):
+    _write_legacy_script(home)
+    statusline_setup.save_state(
+        home, {"version": 1, "state": "disabled", "previous": None}
+    )
+    settings = {"statusLine": dict(LEGACY_MAC)}
+
+    assert statusline_setup.sync_on_install(home, settings) == "skipped_disabled"
+
+    assert settings["statusLine"] == LEGACY_MAC
+
+
+def test_disable_after_adoption_restores_the_legacy_script(home):
+    _write_legacy_script(home)
+    settings = {"statusLine": dict(LEGACY_MAC)}
+    statusline_setup.sync_on_install(home, settings)
+    _write_settings_file(home, settings)
+
+    result = statusline_setup.disable(home)
+
+    assert result == {"changed": True, "restored_previous": True}
+    assert _settings(home)["statusLine"] == LEGACY_MAC
+
+
+def test_uninstall_after_adoption_restores_the_legacy_script(home):
+    _write_legacy_script(home)
+    settings = {"statusLine": dict(LEGACY_WINDOWS)}
+    statusline_setup.sync_on_install(home, settings)
+
+    assert statusline_setup.remove_on_uninstall(home, settings) is True
+
+    assert settings["statusLine"] == LEGACY_WINDOWS
+
+
 def test_sync_on_install_never_overrides_an_explicit_disable(home):
     statusline_setup.save_state(
         home, {"version": 1, "state": "disabled", "previous": None}
@@ -1221,6 +1339,18 @@ def test_install_never_replaces_a_foreign_statusline(clienv):
     assert "Kept your existing statusline" in out
 
 
+def test_install_adopts_the_legacy_bash_statusline(clienv):
+    _write_legacy_script(clienv.home)
+    _write_settings_file(clienv.home, {"statusLine": dict(LEGACY_WINDOWS)})
+
+    result, out = _invoke(clienv, INSTALL_ARGS)
+
+    assert result.exit_code == 0, out
+    assert _settings(clienv.home)["statusLine"] == _ours_entry()
+    assert "Replaced the old bash statusline.sh" in out
+    assert statusline_setup.load_state(clienv.home)["previous"] == LEGACY_WINDOWS
+
+
 def test_install_no_statusline_flag_registers_nothing(clienv):
     result, out = _invoke(clienv, INSTALL_ARGS + ["--no-statusline"])
 
@@ -1312,6 +1442,26 @@ def test_statusline_enable_disable_status_round_trip(clienv):
     assert result.exit_code == 0, out
     assert "Registration: absent" in out
     assert "disabled" in out
+
+
+def test_statusline_status_names_the_legacy_predecessor(clienv):
+    _write_legacy_script(clienv.home)
+    _write_settings_file(clienv.home, {"statusLine": dict(LEGACY_MAC)})
+
+    result, out = _invoke(clienv, ["statusline", "status"])
+
+    assert result.exit_code == 0, out
+    assert "the old bash statusline.sh" in out
+
+
+def test_statusline_status_keeps_a_plain_foreign_label(clienv):
+    _write_settings_file(clienv.home, {"statusLine": dict(FOREIGN)})
+
+    result, out = _invoke(clienv, ["statusline", "status"])
+
+    assert result.exit_code == 0, out
+    assert "Registration: foreign" in out
+    assert "statusline.sh" not in out
 
 
 def test_statusline_enable_over_foreign_reports_the_backup_and_restores_it(clienv):
