@@ -21,6 +21,7 @@ import copy
 import json
 import logging
 import os
+import random
 import sys
 import tempfile
 import time
@@ -188,23 +189,45 @@ def _clear_stale_lock(lock_path: Path) -> bool:
     return True
 
 
-def _acquire_lock(lock_path: Path, timeout: float) -> int | None:
-    """Create the lock directory and return its inode, or None on timeout.
+LockToken = tuple  # (st_ino, st_mtime_ns) of the lock directory we created
 
-    Raise OSError for a failure other than "the lock exists". On Windows,
-    ``mkdir`` raises PermissionError while a removed lock directory is
-    still "delete pending". That is a held lock that goes away soon, so the
-    call retries until the deadline. It never clears such a lock as stale.
+
+def _stamp_lock(lock_path: Path) -> LockToken:
+    """Give a fresh lock a unique mtime and return its ownership token.
+
+    An inode alone does not prove ownership: Linux reuses the inode number
+    when a directory is removed and created again at once. The mtime is set
+    to "now" plus a random sub-millisecond offset, so it stays fresh for
+    proper-lockfile's stale rule but another process's new lock cannot match
+    it. The value is read back, because some file systems round it.
+    """
+    stamp = time.time_ns() + random.randrange(1, 1_000_000)
+    try:
+        os.utime(lock_path, ns=(stamp, stamp))
+    except OSError:
+        pass
+    try:
+        st = os.lstat(lock_path)
+    except OSError:
+        return (0, 0)
+    return (st.st_ino, st.st_mtime_ns)
+
+
+def _acquire_lock(lock_path: Path, timeout: float) -> LockToken | None:
+    """Create the lock directory and return its ownership token, or None.
+
+    Return None when the lock stays held until ``timeout``. Raise OSError
+    for a failure other than "the lock exists". On Windows, ``mkdir`` raises
+    PermissionError while a removed lock directory is still "delete
+    pending". That is a held lock that goes away soon, so the call retries
+    until the deadline. It never clears such a lock as stale.
     """
     deadline = time.monotonic() + max(float(timeout), 0.0)
     retried_stale = False
     while True:
         try:
             os.mkdir(lock_path)
-            try:
-                return os.lstat(lock_path).st_ino
-            except OSError:
-                return 0
+            return _stamp_lock(lock_path)
         except FileExistsError:
             # After a stale lock is cleared, always try once more, even when
             # the timeout is zero.
@@ -222,24 +245,25 @@ def _acquire_lock(lock_path: Path, timeout: float) -> int | None:
         time.sleep(min(_LOCK_POLL_SECONDS, remaining))
 
 
-def _release_lock(lock_path: Path, inode: int) -> None:
+def _release_lock(lock_path: Path, token: LockToken) -> None:
     """Remove the lock directory only when it is still the one we created.
 
     Another process can take a lock over when it judges it stale. Removing
-    that lock would break the other holder, so a changed inode is left in
-    place. Removal has a bounded retry for Windows scanners.
+    that lock would break the other holder, so a lock whose inode or mtime
+    differs from ``token`` is left in place. Removal has a bounded retry for
+    Windows scanners.
     """
     for attempt in range(_RELEASE_ATTEMPTS):
         try:
-            current = os.lstat(lock_path).st_ino
+            st = os.lstat(lock_path)
         except FileNotFoundError:
             logger.warning(
                 "Claude config lock was removed by another process before release"
             )
             return
         except OSError:
-            current = inode
-        if inode and current != inode:
+            st = None
+        if st is not None and token != (0, 0) and (st.st_ino, st.st_mtime_ns) != token:
             logger.warning(
                 "Claude config lock was taken over by another process; left in place"
             )
@@ -393,7 +417,7 @@ def write_config_identity(
         return WriteResult(SYMLINK)
     lock_path = _lock_path_for(config_path)
     try:
-        inode = _acquire_lock(lock_path, lock_timeout)
+        token = _acquire_lock(lock_path, lock_timeout)
     except OSError as exc:
         logger.warning(
             "Account %d: could not create the Claude config lock (%s)",
@@ -401,13 +425,13 @@ def write_config_identity(
             type(exc).__name__,
         )
         return WriteResult(WRITE_FAILED)
-    if inode is None:
+    if token is None:
         return WriteResult(LOCKED)
     started = time.monotonic()
     try:
         result = _write_locked(config_path, apply, expected, account_id, started)
     finally:
-        _release_lock(lock_path, inode)
+        _release_lock(lock_path, token)
     if result.status != WRITTEN:
         return result
     diverged = verify(_verify_read(home, scoped=scoped))

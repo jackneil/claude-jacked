@@ -179,15 +179,45 @@ def test_the_write_is_fsynced_before_the_replace(tmp_path, monkeypatch):
 
 def test_a_lock_taken_over_by_another_process_is_left_in_place(tmp_path, caplog):
     lock = tmp_path / ".claude.json.lock"
-    inode = store._acquire_lock(lock, 1.0)
+    token = store._acquire_lock(lock, 1.0)
     os.rmdir(lock)
-    os.mkdir(lock)  # another process now owns a fresh lock
+    os.mkdir(lock)  # another process now owns a fresh lock (Linux may reuse the inode)
 
     with caplog.at_level(logging.WARNING, logger="jacked.api.claude_config_store"):
-        store._release_lock(lock, inode)
+        store._release_lock(lock, token)
 
     assert lock.exists()
     assert "taken over" in caplog.text
+
+
+def test_a_reused_inode_does_not_pass_as_ownership(tmp_path, monkeypatch):
+    # Simulate Linux handing the new lock the same inode number.
+    lock = tmp_path / ".claude.json.lock"
+    token = store._acquire_lock(lock, 1.0)
+    os.rmdir(lock)
+    os.mkdir(lock)
+    real_lstat = os.lstat
+
+    class _Same:
+        def __init__(self, st):
+            self.st_ino = token[0]
+            self.st_mtime_ns = st.st_mtime_ns
+            self.st_mtime = st.st_mtime
+
+    monkeypatch.setattr(store.os, "lstat", lambda p: _Same(real_lstat(p)))
+
+    store._release_lock(lock, token)
+
+    assert lock.exists()
+
+
+def test_our_own_lock_is_released(tmp_path):
+    lock = tmp_path / ".claude.json.lock"
+    token = store._acquire_lock(lock, 1.0)
+
+    store._release_lock(lock, token)
+
+    assert not lock.exists()
 
 
 def test_the_post_write_verify_retries_a_torn_read(tmp_path, monkeypatch):
