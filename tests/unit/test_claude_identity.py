@@ -176,6 +176,8 @@ def test_plan_display_name_is_kept_only_when_it_is_a_non_empty_string() -> None:
 
 
 def test_personal_row_uses_the_user_tier_field_and_a_null_org() -> None:
+    # Neither the row nor the verified profile names an org, so the RESOLVED
+    # org is None and the tier goes under the personal key.
     profile = _profile()
     profile["organization"]["uuid"] = None
     row = _row(
@@ -191,6 +193,36 @@ def test_personal_row_uses_the_user_tier_field_and_a_null_org() -> None:
     assert block.fields["organizationUuid"] is None
     assert block.fields["userRateLimitTier"] == "default_claude_max_5x"
     assert "organizationRateLimitTier" not in block.fields
+
+
+def test_empty_row_org_adopts_the_verified_profile_org_and_its_tier_field() -> None:
+    # The row has no org yet, but the stored profile passed the email guard
+    # and names one. The tier field follows the RESOLVED org, so an org
+    # account never publishes its tier under the personal key.
+    row = _row(organization_uuid="", rate_limit_tier="default_claude_max_20x")
+    profile = _profile(uuid=f"  {ORG_UUID} ")
+    row["profile_json"] = json.dumps(profile)
+
+    block = build_identity_block(row)
+
+    assert block.complete is True
+    assert block.organization_uuid == ORG_UUID
+    assert block.fields["organizationUuid"] == ORG_UUID
+    assert block.fields["organizationRateLimitTier"] == "default_claude_max_20x"
+    assert "userRateLimitTier" not in block.fields
+
+
+def test_profile_org_is_not_adopted_when_the_profile_fails_the_email_guard() -> None:
+    profile = _profile()
+    profile["account"]["email"] = "mallory@example.com"
+
+    block = build_identity_block(
+        _row(organization_uuid="", profile_json=json.dumps(profile))
+    )
+
+    assert block.complete is False
+    assert block.organization_uuid is None
+    assert "organizationUuid" not in block.fields
 
 
 def test_profile_uuid_wins_and_row_uuid_fills_a_missing_one() -> None:
@@ -313,6 +345,25 @@ def test_uuid_shared_with_a_different_email_is_omitted(caplog) -> None:
     assert ACCOUNT_UUID[:8] in caplog.text
     assert ACCOUNT_UUID not in caplog.text
     assert "bob@" not in caplog.text and "alice@" not in caplog.text
+
+
+class _BrokenDb:
+    def list_accounts(self, include_inactive=False, include_deleted=False):
+        raise RuntimeError("database is locked for alice@example.com")
+
+
+def test_failed_shared_uuid_lookup_omits_the_uuid_and_logs_no_email(caplog) -> None:
+    caplog.set_level(logging.WARNING, logger="jacked.api.claude_identity")
+
+    block = build_identity_block(_row(), db=_BrokenDb())
+
+    assert "accountUuid" not in block.fields
+    assert block.account_uuid is None
+    assert block.complete is True
+    assert ACCOUNT_UUID[:8] in caplog.text
+    assert ACCOUNT_UUID not in caplog.text
+    messages = " ".join(record.getMessage() for record in caplog.records)
+    assert "alice" not in messages.lower()
 
 
 def test_uuid_shared_by_the_same_person_in_two_orgs_is_kept() -> None:
@@ -584,6 +635,208 @@ def test_stale_non_empty_lock_dir_is_never_removed(tmp_path) -> None:
     assert (lock / "pid").read_text(encoding="utf-8") == "123"
 
 
+def test_stale_lock_replaced_after_the_age_check_is_never_removed(
+    tmp_path, monkeypatch
+) -> None:
+    """A holder that re-creates the lock inside the stale window keeps it."""
+    from jacked.api import claude_identity
+
+    lock = tmp_path / ".claude.json.lock"
+    lock.mkdir()
+    old = time.time() - 60
+    os.utime(lock, (old, old))
+
+    real_lstat = os.lstat
+    real_rmdir = os.rmdir
+    lock_lstats = []
+    removed = []
+
+    def racing_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if Path(path) == lock:
+            lock_lstats.append(result)
+            if len(lock_lstats) == 1:
+                # Between our age check and our rmdir, the stale holder's
+                # lock goes away and a live process takes a fresh one.
+                real_rmdir(lock)
+                lock.mkdir()
+                (lock / "marker").write_text("live", encoding="utf-8")
+                (lock / "marker").unlink()
+        return result
+
+    def spying_rmdir(path, *args, **kwargs):
+        removed.append(Path(path))
+        return real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(claude_identity.os, "lstat", racing_lstat)
+    monkeypatch.setattr(claude_identity.os, "rmdir", spying_rmdir)
+
+    assert claude_identity._clear_stale_lock(lock) is False
+
+    assert lock.is_dir()
+    assert lock not in removed
+    assert len(lock_lstats) == 2
+    assert time.time() - real_lstat(lock).st_mtime < 10
+
+
+def test_failed_lock_release_logs_a_warning(tmp_path, monkeypatch, caplog) -> None:
+    from jacked.api import claude_identity
+
+    real_rmdir = os.rmdir
+    lock = tmp_path / ".claude.json.lock"
+
+    def stuck_rmdir(path, *args, **kwargs):
+        if Path(path) == lock:
+            raise PermissionError("a scanner holds the directory")
+        return real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(claude_identity.os, "rmdir", stuck_rmdir)
+    monkeypatch.setattr(claude_identity.time, "sleep", lambda _s: None)
+    caplog.set_level(logging.WARNING, logger="jacked.api.claude_identity")
+
+    result = write_identity(tmp_path, build_identity_block(_row()))
+
+    assert result.status == "written"
+    assert "Could not release the Claude config lock" in caplog.text
+    assert "alice" not in caplog.text.lower()
+
+
+class _FakeClock:
+    """A monotonic clock that advances only when the writer sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _patch_clock(monkeypatch) -> _FakeClock:
+    from jacked.api import claude_identity
+
+    clock = _FakeClock()
+    fake_time = SimpleNamespace(
+        monotonic=clock.monotonic, sleep=clock.sleep, time=time.time
+    )
+    monkeypatch.setattr(claude_identity, "time", fake_time)
+    return clock
+
+
+def test_strict_writer_waits_longer_for_the_lock(tmp_path, monkeypatch) -> None:
+    (tmp_path / ".claude.json.lock").mkdir()
+    clock = _patch_clock(monkeypatch)
+    start = clock.now
+
+    with pytest.raises(ClaudeConfigUnwritable):
+        write_identity(tmp_path, build_identity_block(_row()), strict=True)
+
+    waited = clock.now - start
+    assert waited > 5.0
+    assert waited == pytest.approx(10.0, abs=0.1)
+
+
+def test_non_strict_writer_keeps_the_short_lock_wait(tmp_path, monkeypatch) -> None:
+    (tmp_path / ".claude.json.lock").mkdir()
+    clock = _patch_clock(monkeypatch)
+    start = clock.now
+
+    result = write_identity(tmp_path, build_identity_block(_row()))
+
+    assert result.status == "locked"
+    assert clock.now - start == pytest.approx(5.0, abs=0.1)
+
+
+def test_explicit_lock_timeout_wins_for_a_strict_writer(tmp_path, monkeypatch) -> None:
+    (tmp_path / ".claude.json.lock").mkdir()
+    clock = _patch_clock(monkeypatch)
+    start = clock.now
+
+    with pytest.raises(ClaudeConfigUnwritable):
+        write_identity(
+            tmp_path, build_identity_block(_row()), strict=True, lock_timeout=1.0
+        )
+
+    assert clock.now - start == pytest.approx(1.0, abs=0.1)
+
+
+def _windows_mkdir(monkeypatch, failures: int | None):
+    """Make the lock mkdir fail like a delete-pending directory on Windows."""
+    from jacked.api import claude_identity
+
+    real_mkdir = os.mkdir
+    calls = {"n": 0}
+
+    def flaky_mkdir(path, *args, **kwargs):
+        if Path(path).name == ".claude.json.lock":
+            calls["n"] += 1
+            if failures is None or calls["n"] <= failures:
+                raise PermissionError("[WinError 5] Access is denied")
+        return real_mkdir(path, *args, **kwargs)
+
+    def must_not_clear(_lock_path):
+        raise AssertionError("a delete-pending lock is not a stale lock")
+
+    monkeypatch.setattr(claude_identity, "_is_windows", lambda: True)
+    monkeypatch.setattr(claude_identity.os, "mkdir", flaky_mkdir)
+    monkeypatch.setattr(claude_identity, "_clear_stale_lock", must_not_clear)
+    return calls
+
+
+def test_windows_delete_pending_lock_is_retried_until_mkdir_succeeds(
+    tmp_path, monkeypatch
+) -> None:
+    calls = _windows_mkdir(monkeypatch, failures=2)
+
+    result = write_identity(tmp_path, build_identity_block(_row()), lock_timeout=2.0)
+
+    assert result.status == "written"
+    assert calls["n"] == 3
+    assert not (tmp_path / ".claude.json.lock").exists()
+
+
+def test_windows_delete_pending_lock_past_the_deadline_is_locked(
+    tmp_path, monkeypatch
+) -> None:
+    _windows_mkdir(monkeypatch, failures=None)
+
+    result = write_identity(tmp_path, build_identity_block(_row()), lock_timeout=0.2)
+
+    assert result.status == "locked"
+    assert not (tmp_path / ".claude.json").exists()
+
+
+def test_permission_error_off_windows_is_a_write_failure(tmp_path, monkeypatch) -> None:
+    from jacked.api import claude_identity
+
+    _windows_mkdir(monkeypatch, failures=None)
+    monkeypatch.setattr(claude_identity, "_is_windows", lambda: False)
+
+    result = write_identity(tmp_path, build_identity_block(_row()), lock_timeout=0.2)
+
+    assert result.status == "write_failed"
+
+
+@pytest.mark.parametrize(
+    ("os_name", "platform", "expected"),
+    [("nt", "win32", True), ("posix", "win32", True), ("nt", "linux", True),
+     ("posix", "darwin", False)],
+)
+def test_is_windows_reads_os_name_and_sys_platform(
+    monkeypatch, os_name, platform, expected
+) -> None:
+    from jacked.api import claude_identity
+
+    monkeypatch.setattr(
+        claude_identity, "os", SimpleNamespace(name=os_name)
+    )
+    monkeypatch.setattr(claude_identity, "sys", SimpleNamespace(platform=platform))
+
+    assert claude_identity._is_windows() is expected
+
+
 def test_compare_and_swap_aborts_when_the_block_changed(tmp_path) -> None:
     seen = _existing(accountUuid=OTHER_UUID, emailAddress="bob@x.io")
     current = dict(seen, billingType="changed_underneath")
@@ -658,6 +911,34 @@ def test_strict_raises_for_every_failure_status(tmp_path, status_setup) -> None:
 
     assert status_setup in str(raised.value)
     assert "alice" not in str(raised.value)
+
+
+@requires_symlinks
+def test_strict_raises_for_a_symlinked_config(tmp_path) -> None:
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{}", encoding="utf-8")
+    (tmp_path / ".claude.json").symlink_to(target)
+
+    with pytest.raises(ClaudeConfigUnwritable) as raised:
+        write_identity(tmp_path, build_identity_block(_row()), strict=True)
+
+    assert "symlink" in str(raised.value)
+    assert target.read_text(encoding="utf-8") == "{}"
+
+
+def test_strict_raises_for_a_failed_write(tmp_path, monkeypatch) -> None:
+    from jacked.api import claude_identity
+
+    def boom(*_args, **_kwargs):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(claude_identity, "_safe_replace", boom)
+
+    with pytest.raises(ClaudeConfigUnwritable) as raised:
+        write_identity(tmp_path, build_identity_block(_row()), strict=True)
+
+    assert "write_failed" in str(raised.value)
+    assert not (tmp_path / ".claude.json").exists()
 
 
 def test_strict_does_not_raise_for_written_or_unchanged(tmp_path) -> None:

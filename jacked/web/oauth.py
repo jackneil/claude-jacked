@@ -499,9 +499,12 @@ class OAuthFlow:
                 self._result = result
                 self._status = "completed"
             except Exception as e:
+                # The exception text can name emails (the re-auth identity
+                # check does), so the log gets the type only; the UI gets
+                # the text through self._error.
                 logger.error(
-                    f"OAuth completion failed for flow {self.flow_id} "
-                    f"(purpose={self.purpose}): {e}"
+                    "OAuth completion failed for flow %s (purpose=%s): %s",
+                    self.flow_id, self.purpose, type(e).__name__,
                 )
                 self._status = "error"
                 self._error = str(e)
@@ -598,9 +601,10 @@ class OAuthFlow:
                 self._result = result
                 self._status = "completed"
             except Exception as e:
+                # Type only in the log, as in _handle_callback.
                 logger.error(
-                    f"OAuth manual completion failed for flow {self.flow_id} "
-                    f"(purpose={self.purpose}): {e}"
+                    "OAuth manual completion failed for flow %s (purpose=%s): %s",
+                    self.flow_id, self.purpose, type(e).__name__,
                 )
                 self._status = "error"
                 self._error = str(e)
@@ -874,9 +878,29 @@ class OAuthFlow:
         if tokens.get("scopes"):
             scopes_json = json.dumps(tokens["scopes"])
 
+        final_org_uuid = tokens.get("organization_uuid", "")
+        final_org_name = tokens.get("organization_name")
+        account_uuid = tokens.get("account_uuid") or None
+
+        # A profile that does not belong to this login (another email, or
+        # another org) contributes NOTHING: no plan metadata, no display
+        # name, no stored identity. The token response values are used.
+        if profile:
+            from jacked.web.auth import _profile_owner_mismatch
+
+            mismatch = _profile_owner_mismatch(
+                {"email": email, "organization_uuid": final_org_uuid}, profile
+            )
+            if mismatch is not None:
+                logger.warning(
+                    "OAuth profile ignored for flow %s: %s does not match the login",
+                    self.flow_id, mismatch,
+                )
+                profile = {}
+
         # Extract profile data (design doc section 4e mapping)
-        org = profile.get("organization", {})
-        acct_info = profile.get("account", {})
+        org = profile.get("organization") or {}
+        acct_info = profile.get("account") or {}
         org_type = org.get("organization_type", "")
         subscription_type = ORG_TYPE_MAP.get(
             org_type, tokens.get("subscription_type")
@@ -886,10 +910,6 @@ class OAuthFlow:
         )
         has_extra_usage = org.get("has_extra_usage_enabled", False)
         display_name = acct_info.get("display_name")
-
-        final_org_uuid = tokens.get("organization_uuid", "")
-        final_org_name = tokens.get("organization_name")
-        account_uuid = tokens.get("account_uuid") or None
 
         if self._target_account_id:
             # RE-AUTH: Update existing account by ID.
@@ -925,8 +945,8 @@ class OAuthFlow:
                         "Re-auth org mismatch: target account %d (org %s) "
                         "but authorized org %s which matches account %d — "
                         "updating account %d instead",
-                        self._target_account_id, old_org_uuid,
-                        final_org_uuid, existing["id"], existing["id"],
+                        self._target_account_id, (old_org_uuid or "")[:8],
+                        (final_org_uuid or "")[:8], existing["id"], existing["id"],
                     )
                 else:
                     # No active account for this org — clean up soft-deleted ghosts

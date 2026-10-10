@@ -27,6 +27,7 @@ import copy
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -41,6 +42,10 @@ CONFIG_FILENAME = ".claude.json"
 LOCK_SUFFIX = ".lock"
 # proper-lockfile (Claude Code) treats a lock directory as stale after 10 s.
 STALE_LOCK_SECONDS = 10.0
+# Lock patience. A strict caller cannot fall back on a later retry, so it
+# waits longer than a background writer. An explicit ``lock_timeout`` wins.
+DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
+STRICT_LOCK_TIMEOUT_SECONDS = 10.0
 _LOCK_POLL_SECONDS = 0.05
 _RELEASE_ATTEMPTS = 5
 _RELEASE_BACKOFF_SECONDS = 0.05
@@ -329,6 +334,11 @@ def build_identity_block(row: Mapping, *, db=None) -> IdentityBlock | None:
         )
 
     account, organization = profile
+    # The row may not know its org yet. The profile passed the email guard,
+    # so its org is this account's org. Every org-dependent choice below
+    # (the org field, the tier key, the merge predicate) uses this value.
+    if org_uuid is None:
+        org_uuid = _norm_org(organization.get("uuid"))
     fields: dict = {}
     if account_uuid:
         fields["accountUuid"] = account_uuid
@@ -449,19 +459,44 @@ def _lock_path_for(config_path: Path) -> Path:
     return config_path.with_name(config_path.name + LOCK_SUFFIX)
 
 
+def _is_windows() -> bool:
+    """True on Windows, where a lock directory can be "delete pending".
+
+    >>> isinstance(_is_windows(), bool)
+    True
+    """
+    return os.name == "nt" or sys.platform == "win32"
+
+
 def _clear_stale_lock(lock_path: Path) -> bool:
     """Remove an empty lock directory that is older than the stale limit.
 
     Return True when the caller can try ``mkdir`` again at once. A lock
     directory that is not empty is not ours, so it is never removed.
+
+    The lock is examined again immediately before ``rmdir``. When its
+    ``st_mtime`` or ``st_ino`` changed after the age check, another process
+    replaced it, and it is not removed. A small race remains between that
+    second check and ``rmdir``. The compare-and-swap read and the
+    post-write verify in ``write_identity`` cover that race.
     """
     try:
-        age = time.time() - os.lstat(lock_path).st_mtime
+        first = os.lstat(lock_path)
     except FileNotFoundError:
         return True
     except OSError:
         return False
+    age = time.time() - first.st_mtime
     if age <= STALE_LOCK_SECONDS:
+        return False
+    try:
+        second = os.lstat(lock_path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if second.st_mtime != first.st_mtime or second.st_ino != first.st_ino:
+        logger.debug("Claude config lock was replaced during the stale check; kept")
         return False
     try:
         os.rmdir(lock_path)
@@ -477,7 +512,10 @@ def _clear_stale_lock(lock_path: Path) -> bool:
 def _acquire_lock(lock_path: Path, timeout: float) -> bool:
     """Create the lock directory, retrying until ``timeout`` seconds pass.
 
-    Raise OSError for a failure other than "the lock exists".
+    Raise OSError for a failure other than "the lock exists". On Windows,
+    ``mkdir`` raises PermissionError while a removed lock directory is
+    still "delete pending". That is a held lock that goes away soon, so the
+    call retries until the deadline. It never clears such a lock as stale.
     """
     deadline = time.monotonic() + max(float(timeout), 0.0)
     retried_stale = False
@@ -493,6 +531,9 @@ def _acquire_lock(lock_path: Path, timeout: float) -> bool:
             ):
                 retried_stale = True
                 continue
+        except PermissionError:
+            if not _is_windows():
+                raise
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
@@ -645,7 +686,7 @@ def write_identity(
     *,
     strict: bool = False,
     expected: dict | None = None,
-    lock_timeout: float = 5.0,
+    lock_timeout: float | None = None,
 ) -> WriteResult:
     """Write ``block`` into ``<home>/.claude.json`` safely.
 
@@ -656,7 +697,15 @@ def write_identity(
     read again and verified. An existing config that is not a JSON object
     is never overwritten. With ``strict``, every status other than
     ``written`` and ``unchanged`` raises ``ClaudeConfigUnwritable``.
+
+    ``lock_timeout`` is the lock wait in seconds. When it is None, a strict
+    call waits ``STRICT_LOCK_TIMEOUT_SECONDS`` and other calls wait
+    ``DEFAULT_LOCK_TIMEOUT_SECONDS``.
     """
+    if lock_timeout is None:
+        lock_timeout = (
+            STRICT_LOCK_TIMEOUT_SECONDS if strict else DEFAULT_LOCK_TIMEOUT_SECONDS
+        )
     result = _write(Path(home), block, expected, lock_timeout)
     if result.status == WRITTEN:
         logger.info(

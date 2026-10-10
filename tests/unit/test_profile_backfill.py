@@ -212,23 +212,111 @@ class TestProfileBackfill:
         assert "with_uuid=1" in coverage[0]
 
 
-class TestBackfillScheduledAtStartup:
-    def test_lifespan_schedules_backfill_once(self, monkeypatch):
-        """The lifespan starts the backfill as a background task (non-blocking)
-        and cancels it on shutdown."""
-        from fastapi.testclient import TestClient
+    def test_counts_use_the_applied_flag_not_a_row_reread(self, db):
+        """The backfill counts fetched/rejected from the writer's own verdict.
+        Here the helper reports applied=True for a row whose profile_json is
+        still NULL: a re-read of the row would call it rejected."""
+        _add(db, "alice@test.com", "tok-a")
+        helper = AsyncMock(return_value=(_profile("alice@test.com", ALICE_UUID), True))
+        with patch.object(auth, "_fetch_profile_applied", helper):
+            result, _ = _run(db, _client({}), pause_seconds=0)
+        assert result["fetched"] == 1 and result["rejected"] == 0
+        helper.assert_awaited_once()
+        assert helper.await_args.kwargs.get("allow_refresh") is False
 
+    def test_rejected_profile_is_counted_rejected(self, db):
+        _add(db, "alice@test.com", "tok-a")
+        client = _client({"tok-a": _resp(200, _profile("bob@test.com", BOB_UUID))})
+        result, _ = _run(db, client, pause_seconds=0)
+        assert result["rejected"] == 1 and result["fetched"] == 0
+
+    def test_fills_caller_counts_in_place(self, db):
+        _add(db, "alice@test.com", "tok-a")
+        client = _client({"tok-a": _resp(200, _profile("alice@test.com", ALICE_UUID))})
+        counts: dict = {}
+        _run(db, client, pause_seconds=0, counts=counts)
+        assert counts["candidates"] == 1 and counts["fetched"] == 1
+
+
+def _lifespan_node():
+    import ast
+    import inspect
+
+    import jacked.api.main as api_main
+
+    tree = ast.parse(inspect.getsource(api_main))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "lifespan":
+            return node
+    raise AssertionError("lifespan() not found in jacked/api/main.py")
+
+
+class TestBackfillScheduledAtStartup:
+    def test_lifespan_schedules_backfill_once_and_cancels_it(self):
+        """The lifespan starts the backfill as ONE background task
+        (non-blocking) and cancels it on shutdown. Checked on the source, so
+        the test never runs the real lifespan and its real loops."""
+        import ast
+
+        lifespan = _lifespan_node()
+        task_vars = []
+        for node in ast.walk(lifespan):
+            if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+                continue
+            call = node.value
+            if not (isinstance(call.func, ast.Attribute) and call.func.attr == "create_task"):
+                continue
+            inner = call.args[0] if call.args else None
+            if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
+                    and inner.func.id == "_profile_backfill_once"):
+                task_vars.extend(t.id for t in node.targets if isinstance(t, ast.Name))
+        assert len(task_vars) == 1, "lifespan must create exactly one backfill task"
+
+        cancel_list = None
+        for node in ast.walk(lifespan):
+            if (isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "tasks_to_cancel"
+                            for t in node.targets)
+                    and isinstance(node.value, ast.List)):
+                cancel_list = {e.id for e in node.value.elts if isinstance(e, ast.Name)}
+        assert cancel_list is not None, "tasks_to_cancel list not found in lifespan"
+        assert task_vars[0] in cancel_list, "the backfill task must be cancelled on shutdown"
+
+    def test_timeout_still_logs_coverage(self, db, monkeypatch, caplog):
+        """A pass that exceeds the cap is cancelled, and the coverage line is
+        still logged (marked as timed out) with the partial counts."""
         import jacked.api.main as api_main
 
-        calls = []
+        _add(db, "alice@test.com", "tok-a")
+        _add(db, "bob@test.com", "tok-b")
+        real_sleep = asyncio.sleep
 
-        async def _fake_backfill_task(app):
-            calls.append(app)
+        client = _client({
+            "tok-a": _resp(200, _profile("alice@test.com", ALICE_UUID)),
+            "tok-b": _resp(200, _profile("bob@test.com", BOB_UUID)),
+        })
 
-        monkeypatch.setattr(api_main, "_profile_backfill_once", _fake_backfill_task)
-        with TestClient(api_main.app):
-            pass
-        assert len(calls) == 1
+        async def _no_delay(s):
+            if s == api_main.PROFILE_BACKFILL_DELAY:
+                return None
+            await real_sleep(3600)  # the pause between rows hangs
+
+        monkeypatch.setattr(api_main, "SWEEP_PASS_TIMEOUT", 0.2)
+        monkeypatch.setattr(api_main.asyncio, "sleep", _no_delay)
+        app = MagicMock()
+        app.state.db = db
+        with patch.object(auth.httpx, "AsyncClient", return_value=client), \
+             caplog.at_level(logging.INFO):
+            asyncio.run(api_main._profile_backfill_once(app))
+
+        coverage = [r.getMessage() for r in caplog.records
+                    if "identity coverage" in r.getMessage()]
+        assert len(coverage) == 1
+        line = coverage[0]
+        assert "(backfill timed out" in line
+        assert "candidates=2" in line and "fetched=1" in line
+        assert "with_uuid=1" in line
+        assert any("exceeded" in r.getMessage() for r in caplog.records)
 
     def test_backfill_task_waits_then_runs_with_db(self, monkeypatch):
         import jacked.api.main as api_main
@@ -280,3 +368,36 @@ class TestBackfillScheduledAtStartup:
         app = MagicMock()
         app.state.db = object()
         asyncio.run(api_main._profile_backfill_once(app))  # must not raise
+
+
+class TestSuiteNeverTouchesTheRealDatabase:
+    """tests/conftest.py redirects the default database path, so a test that
+    builds ``Database()`` or runs the app lifespan cannot open, migrate or
+    write the developer's real ~/.claude/jacked.db."""
+
+    def test_default_database_is_not_the_real_one(self):
+        from tests.conftest import REAL_HOME
+
+        real = str(REAL_HOME / ".claude" / "jacked.db")
+        d = Database()
+        try:
+            assert d.db_path != real
+            assert not d.db_path.startswith(str(REAL_HOME / ".claude"))
+        finally:
+            d.close()
+
+    def test_isolated_home_still_resolves_under_that_home(self, tmp_path, monkeypatch):
+        """A test that moves HOME keeps the production rule (HOME/.claude)."""
+        from jacked.web import database
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        assert database._default_db_path() == str(tmp_path / ".claude" / "jacked.db")
+
+    def test_original_resolver_is_kept_for_path_tests(self):
+        from pathlib import Path
+
+        from jacked.web import database
+
+        original = database._default_db_path.original
+        assert original() == str(Path.home() / ".claude" / "jacked.db")

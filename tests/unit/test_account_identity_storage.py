@@ -470,7 +470,28 @@ class TestProfileMetadataGuard:
         from jacked.web.auth import _update_profile_metadata
 
         db, _ = _make_db(tmp_path)
-        _update_profile_metadata(9999, _profile(), db)  # must not raise
+        assert _update_profile_metadata(9999, _profile(), db) is False
+
+    def test_returns_whether_the_profile_was_applied(self, tmp_path):
+        from jacked.web.auth import _update_profile_metadata
+
+        db, acct = _make_db(tmp_path)
+        assert _update_profile_metadata(acct["id"], _profile(email="bob@test.com"), db) is False
+        assert _update_profile_metadata(acct["id"], _profile(), db) is True
+
+    def test_personal_profile_without_org_stores_null_org(self, tmp_path):
+        """profile_json holds the organization value exactly as returned: a
+        profile with no organization stores null, not an invented {}."""
+        from jacked.web.auth import _update_profile_metadata
+
+        db, acct = _make_db(tmp_path, org_uuid="")
+        data = _profile()
+        del data["organization"]
+        assert _update_profile_metadata(acct["id"], data, db) is True
+        row = db.get_account(acct["id"])
+        stored = json.loads(row["profile_json"])
+        assert stored == {"account": data["account"], "organization": None}
+        assert row["account_uuid"] == ALICE_UUID
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +551,49 @@ class TestFetchProfileRefreshControl:
         row = db.get_account(acct["id"])
         assert row["account_uuid"] == ALICE_UUID
         assert row["profile_json"] is not None
+
+    def test_logs_applied_or_rejected(self, tmp_path, caplog):
+        import jacked.web.auth as auth
+
+        db, acct = _make_db(tmp_path)
+        with caplog.at_level(logging.INFO, logger="jacked.auth"), \
+             patch.object(auth.httpx, "AsyncClient",
+                          return_value=_client_returning(_resp(200, _profile()))):
+            asyncio.run(auth.fetch_profile(acct["id"], db, allow_refresh=False))
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert f"Profile applied for account {acct['id']}" in text
+        assert "rejected" not in text
+
+        caplog.clear()
+        foreign = _profile(email="bob@test.com")
+        with caplog.at_level(logging.INFO, logger="jacked.auth"), \
+             patch.object(auth.httpx, "AsyncClient",
+                          return_value=_client_returning(_resp(200, foreign))):
+            result = asyncio.run(auth.fetch_profile(acct["id"], db, allow_refresh=False))
+        # Public contract unchanged: the raw profile is still returned.
+        assert result == foreign
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert f"Profile rejected for account {acct['id']}" in text
+        assert "applied for" not in text
+        assert "bob@test.com" not in text
+
+    def test_internal_helper_reports_applied(self, tmp_path):
+        import jacked.web.auth as auth
+
+        db, acct = _make_db(tmp_path)
+        with patch.object(auth.httpx, "AsyncClient",
+                          return_value=_client_returning(
+                              _resp(200, _profile(email="bob@test.com")),
+                              _resp(200, _profile()),
+                          )):
+            rejected = asyncio.run(
+                auth._fetch_profile_applied(acct["id"], db, allow_refresh=False)
+            )
+            applied = asyncio.run(
+                auth._fetch_profile_applied(acct["id"], db, allow_refresh=False)
+            )
+        assert rejected[0] is not None and rejected[1] is False
+        assert applied[0] is not None and applied[1] is True
 
 
 class TestValidateStoresIdentity:
@@ -618,12 +682,95 @@ class TestStorePathsPersistUuid:
 
         db = Database(str(tmp_path / "t.db"))
         flow = OAuthFlow(db, purpose="primary")
-        account = flow._store_account(
-            _tokens_after_exchange(), _profile(email="bob@test.com"), {}
-        )
+        tokens = _tokens_after_exchange()
+        tokens["subscription_type"] = "pro"
+        tokens["rate_limit_tier"] = "token_tier"
+        # The foreign profile says max / 20x / extra usage on / "Alice".
+        account = flow._store_account(tokens, _profile(email="bob@test.com"), {})
         row = db.get_account(account["id"])
         assert row["account_uuid"] == ALICE_UUID  # from the token exchange
         assert row["profile_json"] is None
+        # Plan metadata comes from the token response, never the foreign
+        # profile.
+        assert row["subscription_type"] == "pro"
+        assert row["rate_limit_tier"] == "token_tier"
+        assert not row["has_extra_usage"]
+        assert row["display_name"] is None
+
+    def test_reauth_with_foreign_profile_keeps_token_metadata(self, tmp_path):
+        from jacked.web.oauth import OAuthFlow
+
+        db, acct = _make_db(tmp_path)
+        tokens = _tokens_after_exchange()
+        tokens["subscription_type"] = "pro"
+        tokens["rate_limit_tier"] = "token_tier"
+        flow = OAuthFlow(db, purpose="primary", target_account_id=acct["id"])
+        flow._store_account(
+            tokens, _profile(org_uuid=ORG_B, org_name="Other"), {}
+        )
+        row = db.get_account(acct["id"])
+        assert row["subscription_type"] == "pro"
+        assert row["rate_limit_tier"] == "token_tier"
+        assert not row["has_extra_usage"]
+        assert row["profile_json"] is None
+
+    def test_org_redirect_log_uses_uuid_prefixes(self, tmp_path, caplog):
+        from jacked.web.oauth import OAuthFlow
+
+        db, a = _make_db(tmp_path, org_uuid=ORG_A)
+        db.create_account(
+            "alice@test.com", "tok-b", int(time.time()) + 3600,
+            organization_uuid=ORG_B, organization_name="Beta",
+        )
+        flow = OAuthFlow(db, purpose="primary", target_account_id=a["id"])
+        with caplog.at_level(logging.INFO, logger="jacked.oauth"):
+            flow._store_account(
+                _tokens_after_exchange(org_uuid=ORG_B, org_name="Beta"), {}, {}
+            )
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "Re-auth org mismatch" in text
+        assert ORG_A[:8] in text and ORG_B[:8] in text
+        assert ORG_A not in text and ORG_B not in text
+
+
+class TestOAuthErrorLogging:
+    """A failed completion logs the exception TYPE only. The exception text
+    can carry emails (the re-auth identity check names both), so it goes to
+    the UI error field, never the log."""
+
+    _MSG = "Re-auth email (bob@test.com) does not match target (alice@test.com)"
+
+    def _flow(self):
+        from jacked.web.oauth import OAuthFlow
+
+        flow = OAuthFlow(MagicMock(), purpose="primary")
+        flow._state = "state-1"
+        flow._complete_auth = AsyncMock(side_effect=ValueError(self._MSG))
+        return flow
+
+    def _assert_values_free(self, flow, caplog):
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "the failure must still be logged"
+        text = " ".join(r.getMessage() for r in errors)
+        assert "ValueError" in text
+        assert "bob@test.com" not in text and "alice@test.com" not in text
+        assert flow._status == "error"
+        assert flow._error == self._MSG
+
+    def test_callback_failure_logs_type_only(self, caplog):
+        flow = self._flow()
+        req = MagicMock()
+        req.query = {"code": "c", "state": "state-1"}
+        with caplog.at_level(logging.ERROR, logger="jacked.oauth"):
+            asyncio.run(flow._handle_callback(req))
+        self._assert_values_free(flow, caplog)
+
+    def test_manual_failure_logs_type_only(self, caplog):
+        flow = self._flow()
+        flow.manual = True
+        with caplog.at_level(logging.ERROR, logger="jacked.oauth"):
+            asyncio.run(flow.submit_code("c#state-1"))
+        self._assert_values_free(flow, caplog)
 
     def test_reauth_stores_uuid(self, tmp_path):
         from jacked.web.oauth import OAuthFlow

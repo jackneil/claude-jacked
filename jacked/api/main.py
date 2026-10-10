@@ -142,22 +142,29 @@ async def _profile_backfill_once(app):
     The backfill stores the account uuid and the profile for each Claude
     row that has none (see ``jacked.web.auth.backfill_missing_profiles``).
     It does nothing when the database is not available, and it never raises
-    (cancellation at shutdown is not caught).
+    (cancellation at shutdown is not caught). When the pass exceeds
+    ``SWEEP_PASS_TIMEOUT``, the coverage line is still logged, marked
+    "backfill timed out", with the counts the pass reached.
     """
     await asyncio.sleep(PROFILE_BACKFILL_DELAY)
     db = getattr(app.state, "db", None)
     if db is None:
         return
-    try:
-        from jacked.web import auth as web_auth
+    from jacked.web import auth as web_auth
 
+    # The pass fills these counters as it runs, so a timeout can still log
+    # the coverage line with the partial counts.
+    counts: dict = {}
+    try:
         await asyncio.wait_for(
-            web_auth.backfill_missing_profiles(db), timeout=SWEEP_PASS_TIMEOUT
+            web_auth.backfill_missing_profiles(db, counts=counts),
+            timeout=SWEEP_PASS_TIMEOUT,
         )
     except asyncio.TimeoutError:
         logger.error(
             "Profile backfill exceeded %ds and was cancelled", SWEEP_PASS_TIMEOUT
         )
+        web_auth.log_identity_coverage(db, counts, timed_out=True)
     except Exception as e:
         logger.warning("Profile backfill error: %s", type(e).__name__)
 

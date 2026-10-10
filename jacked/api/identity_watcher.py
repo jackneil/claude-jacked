@@ -5,10 +5,12 @@ whatever token a process holds. After a switch, a stale process can write the
 previous account back into the config, and running sessions then key their
 usage cache, consent and gating on the wrong account.
 
-The service observer calls this watcher after each snapshot publish. When the
-config identity diverges from the account that holds the authority, the
-watcher republishes the identity of that account. It writes only when all of
-these are true:
+The service observer submits each published snapshot to this watcher. The
+watcher runs on one daemon worker thread, so a slow profile lookup or a held
+config lock never delays the observer. A submit while a run is in flight is
+skipped. When the config identity diverges from the block jacked would
+publish for the account that holds the authority, the watcher republishes
+that block. It writes only when all of these are true:
 
 1. The service has no ``CLAUDE_CONFIG_DIR`` and the observation is a
    RESOLVED global observation of a Claude row.
@@ -28,6 +30,7 @@ never emails or tokens.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -47,6 +50,10 @@ TRANSIENT_RETRY_SECONDS = 60.0
 BREAKER_WINDOW_SECONDS = 15 * 60.0
 BREAKER_MAX_REPUBLISHES = 3
 CONFIG_LOCK_TIMEOUT_SECONDS = 1.0
+# How long a "the block already matches the config" verdict is reused for an
+# unchanged row and config. The builder also reads other rows (the shared
+# uuid check), so the verdict is not kept forever.
+SETTLED_TTL_SECONDS = 15 * 60.0
 _OWNER_CACHE_LIMIT = 32
 
 EVIDENCE_PREFIX = "claude-config:identity:"
@@ -98,6 +105,14 @@ class _AccountState:
     breaker_key: tuple[str, int | None] | None = None
     tripped: bool = False
     last_reason: str | None = None
+    # (sha256 of the row and the config, when) for a block that matched.
+    settled: tuple[str, float] | None = None
+
+
+def _settle_key(row: dict, config: dict) -> str:
+    """Digest the row and the config. Only the digest is kept, never a value."""
+    raw = json.dumps([row, config], sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _expiry_ms(raw: Any) -> float | None:
@@ -208,6 +223,37 @@ def _diverged_fields(row: dict, config: dict) -> list[str]:
     return diverged
 
 
+def _strip(value: Any) -> str | None:
+    text = value.strip() if isinstance(value, str) else ""
+    return text or None
+
+
+def _block_diverged_fields(block: Any, config: dict) -> list[str]:
+    """Name the config identity fields that disagree with the block.
+
+    The raw row check above is only a cheap trigger. The builder can
+    legitimately differ from the raw row: it ignores a stored profile that
+    belongs to another person, omits a uuid that another person's row also
+    carries, and takes the account uuid from the stored profile. A field
+    counts here only when the block carries it, so a field the block will
+    never write can never cause a republish loop.
+    """
+    diverged = []
+    if _casefold(config.get("emailAddress")) != _casefold(getattr(block, "email", None)):
+        diverged.append("emailAddress")
+    block_org = _strip(getattr(block, "organization_uuid", None))
+    if block_org is not None and _strip(config.get("organizationUuid")) != block_org:
+        diverged.append("organizationUuid")
+    block_uuid = _text(getattr(block, "account_uuid", None))
+    if block_uuid is not None and config.get("accountUuid") != block_uuid:
+        diverged.append("accountUuid")
+    fields = getattr(block, "fields", None)
+    created_at = _text(fields.get("accountCreatedAt")) if isinstance(fields, dict) else None
+    if created_at is not None and config.get("accountCreatedAt") != created_at:
+        diverged.append("accountCreatedAt")
+    return diverged
+
+
 def _row_for_identity(db, email: Any, organization_uuid: Any) -> int | None:
     """Return the id of the one Claude row with this email (and org), if any."""
     wanted = _casefold(email)
@@ -292,7 +338,10 @@ class IdentityWatcher:
         return drained
 
     def run(self, update: SnapshotUpdate, db, home: Path) -> None:
-        """Check one published snapshot and republish the identity if needed."""
+        """Check one published snapshot on the caller thread.
+
+        A call while another run is in flight returns at once.
+        """
         if not self._run_lock.acquire(blocking=False):
             return
         try:
@@ -300,7 +349,46 @@ class IdentityWatcher:
         finally:
             self._run_lock.release()
 
+    def submit(self, update: SnapshotUpdate, db, home: Path) -> bool:
+        """Check one published snapshot on a daemon worker thread.
+
+        Return True when a worker started. Return False when a run is still
+        in flight; the next snapshot gets the next check. The worker is a
+        daemon, so it never holds up the shutdown of the service. Its
+        evidence is held for :meth:`drain_evidence`.
+        """
+        if not self._run_lock.acquire(blocking=False):
+            return False
+        try:
+            worker = threading.Thread(
+                target=self._work,
+                args=(update, db, Path(home)),
+                name="jacked-identity-watcher",
+                daemon=True,
+            )
+            worker.start()
+        except BaseException:
+            self._run_lock.release()
+            raise
+        return True
+
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        """Wait until no run is in flight. Return False on a timeout."""
+        acquired = self._run_lock.acquire(timeout=-1 if timeout is None else timeout)
+        if acquired:
+            self._run_lock.release()
+        return acquired
+
     # -- internals -----------------------------------------------------------
+
+    def _work(self, update: SnapshotUpdate, db, home: Path) -> None:
+        """Worker body: run one check, then free the worker slot."""
+        try:
+            self._run(update, db, home)
+        except Exception:  # noqa: BLE001 - a worker error must never escape
+            logger.warning("Claude config identity watcher failed", exc_info=True)
+        finally:
+            self._run_lock.release()
 
     def _emit(self, *items: str) -> None:
         with self._evidence_lock:
@@ -346,8 +434,7 @@ class IdentityWatcher:
         if not isinstance(config, dict):
             return
         state = self._states.setdefault(account_id, _AccountState())
-        diverged = _diverged_fields(row, config)
-        if not diverged:
+        if not _diverged_fields(row, config):
             self._transition(account_id, state, "in-sync")
             return
         now = self._clock()
@@ -355,6 +442,27 @@ class IdentityWatcher:
             state.last_attempt is not None
             and now - state.last_attempt < ATTEMPT_MIN_INTERVAL_SECONDS
         ):
+            return
+        # The raw check only triggers. The block decides, because the block is
+        # what a write would put in the config. A matching block stamps no
+        # floor; its verdict is reused while the row and config stay the same,
+        # so the builder does not run (and log) on every pass.
+        settle_key = _settle_key(row, config)
+        if (
+            state.settled is not None
+            and state.settled[0] == settle_key
+            and now - state.settled[1] < SETTLED_TTL_SECONDS
+        ):
+            return
+        state.settled = None
+        block = self._build(row, db=db)
+        if block is None:
+            self._transition(account_id, state, "no-block")
+            return
+        diverged = _block_diverged_fields(block, config)
+        if not diverged:
+            state.settled = (settle_key, now)
+            self._transition(account_id, state, "in-sync")
             return
         # Stamped at the attempt: a failure never shortens the floor.
         state.last_attempt = now
@@ -441,6 +549,10 @@ class IdentityWatcher:
             block = self._build(fresh_row, db=db)
             if block is None:
                 self._transition(account_id, state, "no-block")
+                return
+            diverged = _block_diverged_fields(block, config)
+            if not diverged:
+                self._transition(account_id, state, "in-sync")
                 return
             mtime = _config_mtime(home)
             try:

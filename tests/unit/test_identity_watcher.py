@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -124,7 +125,9 @@ class FakeLease:
 class Harness:
     """A watcher with every collaborator replaced by a recording fake."""
 
-    def __init__(self, tmp_path, *, rows=None, config=None, settings=None):
+    def __init__(
+        self, tmp_path, *, rows=None, config=None, settings=None, real_build=False
+    ):
         self.home = tmp_path
         self.events: list[str] = []
         self.clock = FakeClock()
@@ -137,9 +140,10 @@ class Harness:
         self.write_status = "written"
         self.writes: list[dict] = []
         self.block = SimpleNamespace(
-            fields={}, complete=True, account_id=7, email=EMAIL.lower(),
-            organization_uuid=ORG, account_uuid=ACCOUNT_UUID,
+            fields={"accountCreatedAt": CREATED_AT}, complete=True, account_id=7,
+            email=EMAIL.lower(), organization_uuid=ORG, account_uuid=ACCOUNT_UUID,
         )
+        self.real_build = real_build
         self.builds: list[dict] = []
         self.watcher = IdentityWatcher(
             clock=self.clock,
@@ -168,6 +172,10 @@ class Harness:
 
     def _build(self, row, *, db=None):
         self.builds.append(row)
+        if self.real_build:
+            from jacked.api.claude_identity import build_identity_block
+
+            return build_identity_block(row, db=db)
         return self.block
 
     def _write(self, home, block, *, expected=None, lock_timeout=5.0):
@@ -542,7 +550,12 @@ def test_the_owner_proof_never_refreshes_or_calls_fetch_profile(tmp_path, monkey
     """Regression: the default lookup is one GET, with no refresh path at all."""
     import jacked.web.auth as auth
 
+    calls: list[str] = []
+
     def forbidden(*args, **kwargs):
+        # The watcher swallows lookup errors, so the raise alone proves
+        # nothing; the recorded call is what the test asserts on.
+        calls.append("refresh")
         raise AssertionError("refresh path reached from the identity watcher")
 
     monkeypatch.setattr(auth, "fetch_profile", forbidden)
@@ -582,6 +595,7 @@ def test_the_owner_proof_never_refreshes_or_calls_fetch_profile(tmp_path, monkey
     )
 
     assert harness.run() == ("claude-config:identity:owner-unproven",)
+    assert calls == []
     assert len(requests) == 1
     assert harness.writes == []
 
@@ -638,9 +652,18 @@ def test_a_desired_change_under_the_lease_skips_the_write(tmp_path):
 def test_the_block_is_built_from_the_row_read_under_the_lease(tmp_path):
     harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
 
+    class _RenamingLease(FakeLease):
+        @contextmanager
+        def acquire(self):
+            harness.db.rows[7]["organization_name"] = "Renamed Org"
+            yield True
+
+    harness.lease = _RenamingLease(harness.events)
+
     harness.run()
 
-    assert harness.builds[0]["id"] == 7
+    assert harness.builds[-1]["organization_name"] == "Renamed Org"
+    assert harness.writes[0]["block"] is harness.block
 
 
 # --- logging ------------------------------------------------------------------
@@ -722,3 +745,336 @@ def test_the_unknown_account_warning_names_no_email(caplog):
     assert "@" not in caplog.text
     assert "@" not in result.reason
     assert ORG[:8] in caplog.text
+
+
+# --- divergence is judged against the block jacked would publish -----------
+
+
+def _apply_writes(harness: Harness) -> None:
+    """Make the fake writer merge the block into the config, like the real one."""
+    original = harness._write
+
+    def write(home, block, *, expected=None, lock_timeout=5.0):
+        result = original(home, block, expected=expected, lock_timeout=lock_timeout)
+        harness.config = {**harness.config, **block.fields}
+        return result
+
+    harness.watcher._writer = write
+
+
+def test_a_rejected_stored_profile_never_republishes_forever(tmp_path):
+    """The builder ignores a stored profile of another person, so the block it
+    publishes has no accountCreatedAt. The raw row check still sees one."""
+    row = _row(profile_json=json.dumps(_profile(email="someone.else@example.com")))
+    config = _config(accountCreatedAt=None, billingType=None)
+    harness = Harness(tmp_path, rows=[row], config=config, real_build=True)
+
+    for _ in range(3):
+        assert harness.run() == ()
+        harness.advance(ATTEMPT_MIN_INTERVAL_SECONDS + 1)
+
+    assert harness.writes == []
+    assert harness.lookups == []
+    assert "resolve" not in harness.events
+
+
+def test_a_dropped_shared_uuid_never_republishes_forever(tmp_path):
+    """The builder omits a uuid that another person's row also carries."""
+    other = _row(9, email="kim@example.com", organization_uuid="org-9")
+    harness = Harness(
+        tmp_path, rows=[_row(), other], config=_config(accountUuid=None), real_build=True
+    )
+
+    for _ in range(3):
+        assert harness.run() == ()
+        harness.advance(ATTEMPT_MIN_INTERVAL_SECONDS + 1)
+
+    assert harness.writes == []
+    assert harness.builds[0]["id"] == 7
+
+
+def test_the_profile_identity_used_without_a_row_org_never_republishes_forever(tmp_path):
+    """Without a row org the builder accepts the stored profile and takes its
+    account uuid, so a stale row uuid must not count as a divergence."""
+    harness = Harness(
+        tmp_path,
+        rows=[_row(organization_uuid="", account_uuid="stale-row-uuid")],
+        config=_config(),
+        real_build=True,
+    )
+
+    for _ in range(3):
+        assert harness.run() == ()
+        harness.advance(ATTEMPT_MIN_INTERVAL_SECONDS + 1)
+
+    assert harness.writes == []
+
+
+def test_a_block_org_that_differs_from_the_config_is_republished(tmp_path):
+    """Only the block decides what diverges: here the raw row check fires on
+    accountCreatedAt, but the block agrees with the config on it and differs
+    on the organization alone."""
+    other_created = "2025-01-01T00:00:00.000000Z"
+    harness = Harness(
+        tmp_path,
+        rows=[_row(organization_uuid="")],
+        config=_config(
+            organizationUuid="9e8d7c6b-0000-4000-8000-000000000001",
+            accountCreatedAt=other_created,
+        ),
+    )
+    harness.block = SimpleNamespace(
+        fields={"accountCreatedAt": other_created, "organizationUuid": ORG},
+        complete=True, account_id=7, email=EMAIL.lower(),
+        organization_uuid=ORG, account_uuid=ACCOUNT_UUID,
+    )
+    _apply_writes(harness)
+
+    assert harness.run() == ("claude-config:identity:republished",)
+    assert harness.config["organizationUuid"] == ORG
+    harness.advance(ATTEMPT_MIN_INTERVAL_SECONDS + 1)
+    assert harness.run() == ()
+    assert len(harness.writes) == 1
+
+
+def test_a_block_that_matches_the_config_does_not_stamp_the_floor(tmp_path):
+    other = _row(9, email="kim@example.com", organization_uuid="org-9")
+    harness = Harness(
+        tmp_path, rows=[_row(), other], config=_config(accountUuid=None), real_build=True
+    )
+    assert harness.run() == ()
+
+    # A real divergence right after the no-op pass is not held back by a floor.
+    harness.config = _config(accountUuid=None, emailAddress="old@example.com")
+    assert harness.run()[0] == "claude-config:identity:republished"
+    assert len(harness.writes) == 1
+
+
+def test_a_settled_block_is_not_rebuilt_on_every_pass(tmp_path, caplog):
+    """The shared-uuid builder warns on each build; a settled verdict is
+    reused for an unchanged row and config instead of rebuilt per pass."""
+    from jacked.api.identity_watcher import SETTLED_TTL_SECONDS
+
+    other = _row(9, email="kim@example.com", organization_uuid="org-9")
+    harness = Harness(
+        tmp_path, rows=[_row(), other], config=_config(accountUuid=None), real_build=True
+    )
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):
+            assert harness.run() == ()
+            harness.advance(10)
+    assert len(harness.builds) == 1
+    assert len([r for r in caplog.records if "uuid" in r.getMessage()]) == 1
+
+    harness.advance(SETTLED_TTL_SECONDS)
+    assert harness.run() == ()
+    assert len(harness.builds) == 2
+
+    harness.db.rows[7]["organization_name"] = "Renamed Org"
+    assert harness.run() == ()
+    assert len(harness.builds) == 3
+    assert harness.writes == []
+
+
+def test_a_republished_block_is_in_sync_on_the_next_pass(tmp_path):
+    harness = Harness(
+        tmp_path,
+        config=_config(emailAddress="old@example.com", accountCreatedAt=None),
+        real_build=True,
+    )
+    _apply_writes(harness)
+
+    assert harness.run() == ("claude-config:identity:republished",)
+    for _ in range(3):
+        harness.advance(ATTEMPT_MIN_INTERVAL_SECONDS + 1)
+        assert harness.run() == ()
+
+    assert len(harness.writes) == 1
+
+
+# --- production collaborators -------------------------------------------------
+
+
+def test_the_authority_view_reads_a_stamped_credential_file(tmp_path, monkeypatch):
+    from jacked.api.identity_watcher import _read_authority_view
+    from jacked.credentials.canonical import CredentialPayload
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    payload = {
+        "_jackedAccountId": 7,
+        "claudeAiOauth": {
+            "accessToken": TOKEN,
+            "refreshToken": "sk-ant-ort01-secret-refresh-token",
+            "expiresAt": 1_900_000_000_000,
+        },
+    }
+    root = tmp_path / ".claude"
+    root.mkdir()
+    (root / ".credentials.json").write_text(json.dumps(payload))
+
+    view = _read_authority_view(tmp_path)
+
+    assert view is not None
+    assert view.account_id == 7
+    assert view.digest == CredentialPayload.from_mapping(payload).digest
+    assert view.access_token == TOKEN
+    assert view.expires_at_ms == 1_900_000_000_000.0
+    assert TOKEN not in repr(view)
+    assert "refresh-token" not in repr(view)
+
+
+def test_the_authority_view_is_none_without_a_credential_file(tmp_path, monkeypatch):
+    from jacked.api.identity_watcher import _read_authority_view
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    (tmp_path / ".claude").mkdir()
+
+    assert _read_authority_view(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (1_900_000_000_000, 1_900_000_000_000.0),
+        (1_900_000_000, 1_900_000_000_000.0),
+        (1_900_000_000.5, 1_900_000_000_500.0),
+        (True, None),
+        (False, None),
+        (0, None),
+        (-5, None),
+        ("1900000000000", None),
+        (None, None),
+    ],
+)
+def test_expiry_is_normalized_to_milliseconds(raw, expected):
+    from jacked.api.identity_watcher import _expiry_ms
+
+    assert _expiry_ms(raw) == expected
+
+
+class _FakeHttpResponse:
+    def __init__(self, status_code, body=None, *, bad_json=False):
+        self.status_code = status_code
+        self._body = body
+        self._bad_json = bad_json
+
+    def json(self):
+        if self._bad_json:
+            raise ValueError("not json")
+        return self._body
+
+
+def _fake_httpx(monkeypatch, outcome, seen):
+    class _Client:
+        def __init__(self, timeout):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, headers):
+            seen.append(headers.get("Authorization"))
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(Client=_Client))
+
+
+@pytest.mark.parametrize(
+    ("outcome", "status", "profile"),
+    [
+        (OSError("connection reset"), None, None),
+        (_FakeHttpResponse(503), 503, None),
+        (_FakeHttpResponse(429), 429, None),
+        (_FakeHttpResponse(401), 401, None),
+        (_FakeHttpResponse(200, ["not", "an", "object"]), 200, None),
+        (_FakeHttpResponse(200, bad_json=True), 200, None),
+        (_FakeHttpResponse(200, {"account": {"email": EMAIL}}), 200, {"account": {"email": EMAIL}}),
+    ],
+)
+def test_lookup_profile_maps_each_outcome(monkeypatch, outcome, status, profile):
+    from jacked.api.authority_guard import lookup_profile
+
+    seen: list[str] = []
+    _fake_httpx(monkeypatch, outcome, seen)
+
+    result = lookup_profile(TOKEN)
+
+    assert result.status_code == status
+    assert result.profile == profile
+    assert seen == [f"Bearer {TOKEN}"]
+    assert TOKEN not in repr(result)
+
+
+# --- worker thread -------------------------------------------------------------
+
+
+class _BlockingWatcher(IdentityWatcher):
+    def __init__(self, evidence: str = "claude-config:identity:republished"):
+        super().__init__()
+        self.release = threading.Event()
+        self.started = threading.Event()
+        self.runs = 0
+        self.evidence_item = evidence
+        self.thread_names: list[str] = []
+        self.daemon_flags: list[bool] = []
+
+    def _run(self, update, db, home):
+        self.runs += 1
+        current = threading.current_thread()
+        self.thread_names.append(current.name)
+        self.daemon_flags.append(current.daemon)
+        self.started.set()
+        assert self.release.wait(5)
+        self._emit(self.evidence_item)
+
+
+def test_submit_runs_off_the_caller_thread_on_a_daemon_worker(tmp_path):
+    watcher = _BlockingWatcher()
+
+    assert watcher.submit(Harness(tmp_path).update(), None, tmp_path) is True
+    assert watcher.started.wait(5)
+    assert watcher.drain_evidence() == ()
+
+    watcher.release.set()
+    assert watcher.wait_idle(5)
+    assert watcher.drain_evidence() == ("claude-config:identity:republished",)
+    assert watcher.daemon_flags == [True]
+    assert watcher.thread_names[0] != threading.current_thread().name
+
+
+def test_an_overlapping_submit_is_skipped(tmp_path):
+    watcher = _BlockingWatcher()
+    update = Harness(tmp_path).update()
+
+    assert watcher.submit(update, None, tmp_path) is True
+    assert watcher.started.wait(5)
+    assert watcher.submit(update, None, tmp_path) is False
+
+    watcher.release.set()
+    assert watcher.wait_idle(5)
+    assert watcher.runs == 1
+    assert watcher.submit(update, None, tmp_path) is True
+    assert watcher.wait_idle(5)
+    assert watcher.runs == 2
+
+
+def test_a_failing_worker_run_is_logged_and_frees_the_worker(tmp_path, caplog):
+    class _Exploding(IdentityWatcher):
+        def _run(self, update, db, home):
+            raise RuntimeError("worker exploded")
+
+    watcher = _Exploding()
+
+    with caplog.at_level(logging.WARNING, logger="jacked.api.identity_watcher"):
+        assert watcher.submit(Harness(tmp_path).update(), None, tmp_path) is True
+        assert watcher.wait_idle(5)
+
+    assert "identity watcher failed" in caplog.text
+    assert watcher.submit(Harness(tmp_path).update(), None, tmp_path) is True
+    assert watcher.wait_idle(5)

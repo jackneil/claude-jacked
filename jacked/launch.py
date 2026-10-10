@@ -74,6 +74,8 @@ def _seed_claude_config(config_dir: Path) -> None:
 
     Only runs when .claude.json is missing or incomplete (no hasCompletedOnboarding).
     Copies only UX/onboarding keys — never identity, analytics, or project data.
+    Fails closed: only an ABSENT file starts from {}. A file that cannot be
+    read or parsed, or that is not a JSON object, is never rewritten.
     """
     claude_json = config_dir / ".claude.json"
 
@@ -82,15 +84,24 @@ def _seed_claude_config(config_dir: Path) -> None:
         return
 
     # Read existing per-account config (may not exist yet)
-    local = {}
+    local: dict = {}
     try:
         local = json.loads(claude_json.read_text(encoding="utf-8"))
-        if not isinstance(local, dict):
-            local = {}
     except FileNotFoundError:
-        pass  # Expected on first launch
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.debug("Failed to read per-account .claude.json: %s", exc)
+        local = {}  # Expected on first launch
+    except (ValueError, OSError) as exc:
+        logger.warning(
+            "Per-account .claude.json for %s cannot be read (%s); not seeding it",
+            config_dir.name,
+            type(exc).__name__,
+        )
+        return
+    if not isinstance(local, dict):
+        logger.warning(
+            "Per-account .claude.json for %s is not a JSON object; not seeding it",
+            config_dir.name,
+        )
+        return
 
     if local.get("hasCompletedOnboarding"):
         return  # Already seeded — don't overwrite per-session changes
@@ -156,17 +167,25 @@ def _seed_workspace_trust(config_dir: Path) -> None:
     if not isinstance(global_projects, dict):
         return
 
-    # Read per-account config
-    local = {}
+    # Read per-account config. Fail closed: only an ABSENT file starts from
+    # {}; never clobber a file we cannot parse or that is not an object.
+    local: dict = {}
     try:
         local = json.loads(claude_json.read_text(encoding="utf-8"))
-        if not isinstance(local, dict):
-            local = {}
     except FileNotFoundError:
-        pass
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.debug("Cannot parse per-account .claude.json for trust seeding: %s", exc)
-        return  # Don't clobber a file we can't parse
+        local = {}
+    except (ValueError, OSError) as exc:
+        logger.debug(
+            "Cannot parse per-account .claude.json for trust seeding (%s)",
+            type(exc).__name__,
+        )
+        return
+    if not isinstance(local, dict):
+        logger.debug("Per-account .claude.json is not a JSON object; trust not seeded")
+        return
+    if not isinstance(local.get("projects", {}), dict):
+        logger.debug("Per-account .claude.json projects is not an object; trust not seeded")
+        return
 
     local_projects = local.setdefault("projects", {})
     changed = False
@@ -790,10 +809,10 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                         if _row and _row["email"] and _row["email"].lower() != file_email.lower():
                             logger.warning(
                                 "Token sync BLOCKED for account %d: "
-                                "credential file has email %s but DB has %s "
+                                "oauthAccount.emailAddress differs from the DB row "
                                 "— Claude Code may have re-authenticated as "
                                 "a different account",
-                                account_id, file_email, _row["email"],
+                                account_id,
                             )
                             return
 
@@ -811,8 +830,11 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                             if file_org != db_org:
                                 logger.warning(
                                     "Token sync BLOCKED for account %d: "
-                                    "org mismatch %s != %s",
-                                    account_id, file_org, db_org,
+                                    "oauthAccount.organizationUuid %s differs "
+                                    "from the DB row org %s",
+                                    account_id,
+                                    str(file_org)[:8],
+                                    str(db_org)[:8],
                                 )
                                 return
                     except _sq.OperationalError as exc:

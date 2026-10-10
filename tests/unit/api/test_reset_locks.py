@@ -101,13 +101,18 @@ def test_reset_locks_rebinds_single_global(mod_name: str, attr: str) -> None:
     assert isinstance(after, asyncio.Lock)
 
 
-def test_fastapi_lifespan_actually_runs_reset_locks() -> None:
+def test_fastapi_lifespan_actually_runs_reset_locks(quiet_lifespan) -> None:
     """End-to-end: construct the app and run lifespan via TestClient as a
     context manager. Assert at least one module's lock got rebound and
     the startup counter advanced. Catches regressions where the lifespan
     loop body silently skips everything (bad callable() check, broken
     iteration, etc.) that unit tests of reset_locks() alone would miss.
+
+    ``quiet_lifespan`` (tests/conftest.py) stubs every background loop and
+    moves HOME, so this never touches the real database or the network.
     """
+    assert "_profile_backfill_once" in quiet_lifespan
+    assert "full_sweep_loop" in quiet_lifespan
     # Force all runtime deps available in test env before importing app.
     from fastapi.testclient import TestClient
 

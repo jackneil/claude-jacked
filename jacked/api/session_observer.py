@@ -42,7 +42,9 @@ SESSION_OBSERVER_INTERVAL_SECONDS = 10.0
 SESSION_OBSERVER_BATCH_LIMIT = 100
 
 # The production watcher. It keeps ~/.claude.json oauthAccount true to the
-# account that holds the credential authority. Tests inject their own.
+# account that holds the credential authority. It runs on its own daemon
+# worker thread, so it never holds the observer or the service shutdown.
+# Tests inject their own.
 IDENTITY_WATCHER = IdentityWatcher()
 
 
@@ -201,10 +203,12 @@ def refresh_resolver_snapshot(
 ) -> SnapshotUpdate:
     """Re-observe one authority and atomically publish a secret-free snapshot.
 
-    After the publish, the identity watcher compares the Claude Code config
-    identity with the observed account. The watcher runs after the publish,
-    so a slow or failing watcher never delays or blocks the snapshot. Its
-    evidence goes into the next snapshot.
+    After the publish, the update goes to the identity watcher, which
+    compares the Claude Code config identity with the observed account on
+    its own worker thread. This function does not wait for that check, so a
+    slow or failing watcher never delays or blocks the snapshot. A pass that
+    finds a check still in flight skips the watcher. The evidence of a
+    finished check goes into the next snapshot.
     """
     if config_root is None or scope is None:
         default_root, default_scope = _config_root()
@@ -262,7 +266,7 @@ def refresh_resolver_snapshot(
         try:
             # The config lives beside the config root: ~/.claude.json for
             # ~/.claude. The watcher does nothing in a scoped config.
-            watcher.run(update, db, config_root.parent)
+            watcher.submit(update, db, config_root.parent)
         except Exception:
             logger.warning("Claude config identity watcher failed", exc_info=True)
     return update

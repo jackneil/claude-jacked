@@ -1,6 +1,7 @@
 """Shared fixtures for jacked tests."""
 
 import re
+from pathlib import Path
 
 import pytest
 from unittest.mock import patch
@@ -14,6 +15,98 @@ from jacked.credentials.models import (
     SwitchResult,
 )
 
+
+
+# The developer's real home, captured before any test can move HOME.
+REAL_HOME = Path.home()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_db_path(monkeypatch, tmp_path_factory):
+    """Tripwire: no test may open the developer's real ~/.claude/jacked.db.
+
+    ``Database()`` with no path resolves ``jacked.web.database._default_db_path``.
+    On 2026-10-10 two tests ran the real FastAPI lifespan, which built
+    ``Database()`` against the real home: it migrated the real database and
+    its background loops sent a real window-keeper ping. While HOME is still
+    the real home, the default path now resolves to a per-test temporary
+    file. A test that moves HOME (or USERPROFILE) keeps the production rule,
+    HOME/.claude/jacked.db, because that path is already isolated. A test
+    that must check the real resolver calls ``_default_db_path.original``.
+    """
+    from jacked.web import database
+
+    original = database._default_db_path
+    holder: dict = {}
+
+    def _test_default_db_path() -> str:
+        if Path.home() != REAL_HOME:
+            return original()
+        if "path" not in holder:
+            claude_dir = tmp_path_factory.mktemp("jacked-home") / ".claude"
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            holder["path"] = str(claude_dir / "jacked.db")
+        return holder["path"]
+
+    _test_default_db_path.original = original  # type: ignore[attr-defined]
+    monkeypatch.setattr(database, "_default_db_path", _test_default_db_path)
+
+
+@pytest.fixture
+def quiet_lifespan(monkeypatch, tmp_path):
+    """Let a test run the real app lifespan with no real background work.
+
+    Every coroutine the lifespan hands to ``asyncio.create_task`` is replaced
+    by a no-op coroutine, so no sweep, poll, refresh or keeper loop runs and
+    nothing goes out on the network. The loop names come from the lifespan
+    source (AST), so a loop added later is stubbed too; a name that cannot
+    be resolved fails the test instead of running for real. HOME moves to a
+    temporary directory, so the database and the server log stay off the
+    real ~/.claude. Returns the sorted names that were stubbed.
+    """
+    import ast
+    import importlib
+    import inspect
+
+    from jacked.api import main as api_main
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("JACKED_HOST", "127.0.0.1")
+    monkeypatch.setenv("JACKED_PORT", "8321")
+
+    tree = ast.parse(inspect.getsource(api_main.lifespan))
+    local_imports: dict[str, str] = {}
+    loop_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                local_imports[alias.asname or alias.name] = node.module
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "create_task"
+            and node.args
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Name)
+        ):
+            loop_names.add(node.args[0].func.id)
+    assert loop_names, "found no create_task(...) calls in lifespan()"
+
+    async def _idle(*_args, **_kwargs):
+        return None
+
+    for name in loop_names:
+        if name in local_imports:
+            module = importlib.import_module(local_imports[name])
+        elif hasattr(api_main, name):
+            module = api_main
+        else:
+            raise AssertionError(f"cannot stub lifespan loop {name!r}")
+        monkeypatch.setattr(module, name, _idle)
+    return sorted(loop_names)
 
 
 @pytest.fixture(autouse=True)

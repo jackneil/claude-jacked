@@ -280,6 +280,12 @@ class _Watcher:
         drained, self.held = self.held, ()
         return drained
 
+    def submit(self, update, db, home) -> bool:
+        # The production watcher runs this on a worker thread; the fake runs
+        # it inline so the ordering assertions stay deterministic.
+        self.run(update, db, home)
+        return True
+
     def run(self, update, db, home) -> None:
         import time
 
@@ -463,3 +469,57 @@ def test_the_production_path_runs_the_module_watcher(tmp_path, monkeypatch):
 
     assert order == ["watcher"]
     assert watcher.runs[0][2] == Path(tmp_path)
+
+
+def test_the_snapshot_returns_while_the_watcher_is_still_running(tmp_path):
+    """The real watcher runs off the observer thread. A run blocked on a slow
+    lookup never holds the snapshot, and its evidence reaches the next one."""
+    import threading
+
+    from jacked.api.identity_watcher import IdentityWatcher
+
+    class _BlockedWatcher(IdentityWatcher):
+        def __init__(self):
+            super().__init__()
+            self.release = threading.Event()
+            self.started = threading.Event()
+            self.homes = []
+
+        def _run(self, update, db, home):
+            self.homes.append(home)
+            self.started.set()
+            assert self.release.wait(5)
+            self._emit("claude-config:identity:republished")
+
+    db = Database(str(tmp_path / "jacked.db"))
+    _account(db, 11, "kim@example.com", "org-11")
+    watcher = _BlockedWatcher()
+    sink = MemoryResolverSnapshotSink()
+    common = dict(
+        resolver=_resolved(),
+        sink=sink,
+        config_root=Path(tmp_path) / ".claude",
+        scope="global",
+        heal=lambda _database: None,
+        watcher=watcher,
+    )
+
+    try:
+        first = refresh_resolver_snapshot(db, **common)
+        assert watcher.started.wait(5)
+        # The run is still blocked, and the snapshot was already returned.
+        assert not watcher.release.is_set()
+        assert sink.updates == [first]
+        assert "claude-config:identity:republished" not in first.evidence
+
+        # A pass while the run is in flight publishes and skips the watcher.
+        overlapped = refresh_resolver_snapshot(db, **common)
+        assert "claude-config:identity:republished" not in overlapped.evidence
+    finally:
+        watcher.release.set()
+    assert watcher.wait_idle(5)
+    assert watcher.homes == [Path(tmp_path)]
+
+    second = refresh_resolver_snapshot(db, **common)
+    assert second.evidence[0] == "claude-config:identity:republished"
+    assert watcher.wait_idle(5)

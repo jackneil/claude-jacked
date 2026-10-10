@@ -309,6 +309,23 @@ class TestSeedWorkspaceTrust:
         # File should be unchanged — not clobbered
         assert (config_dir / ".claude.json").read_text() == garbage
 
+    @pytest.mark.parametrize("content", ["[1, 2]", "null", '{"projects": ["/x"]}'])
+    def test_non_object_local_config_or_projects_is_left_alone(self, tmp_path, content):
+        """Only an absent per-account file starts from {}; nothing else is rewritten."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").write_text(content)
+        (tmp_path / ".claude.json").write_text(
+            json.dumps({"projects": {"/proj": {"hasTrustDialogAccepted": True}}})
+        )
+
+        from jacked.launch import _seed_workspace_trust
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_workspace_trust(config_dir)
+
+        assert (config_dir / ".claude.json").read_text() == content
+
 
 # ---------------------------------------------------------------------------
 # _seed_oauth_account
@@ -832,6 +849,117 @@ class TestPrepareAccountDir:
         data = json.loads(cred_path.read_text())
         assert data["someOtherKey"] == "preserved"
         assert "claudeAiOauth" in data
+
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"hasCompletedOnboarding": false, "projects": {"/a": {',
+            '[{"hasCompletedOnboarding": false}]',
+            "null",
+            '"just a string"',
+        ],
+        ids=["torn", "json-array", "json-null", "json-string"],
+    )
+    def test_seed_steps_never_rewrite_an_unreadable_per_account_config(
+        self, tmp_path, content
+    ):
+        """A per-account .claude.json that is not a JSON object stays byte-identical.
+
+        Only an ABSENT file may start from {}. The global config here would
+        make both seed steps write something if they started fresh.
+        """
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".claude.json").write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "autoUpdates": False,
+            "projects": {"/trusted": {"hasTrustDialogAccepted": True}},
+        }))
+        acct_dir = tmp_path / "accounts" / "1"
+        acct_dir.mkdir(parents=True)
+        per_account = acct_dir / ".claude.json"
+        per_account.write_bytes(content.encode("utf-8"))
+        before = per_account.read_bytes()
+
+        with (
+            mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"),
+            mock.patch("jacked.launch.should_refresh", return_value=False),
+            mock.patch.object(Path, "home", return_value=home),
+        ):
+            from jacked.launch import prepare_account_dir
+
+            prepare_account_dir(account, db)
+
+        assert per_account.read_bytes() == before
+        assert not list(acct_dir.glob(".claude_json_tmp_*"))
+
+    def test_seed_steps_start_an_absent_per_account_config_from_empty(self, tmp_path):
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".claude.json").write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "projects": {"/trusted": {"hasTrustDialogAccepted": True}},
+        }))
+
+        with (
+            mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"),
+            mock.patch("jacked.launch.should_refresh", return_value=False),
+            mock.patch.object(Path, "home", return_value=home),
+        ):
+            from jacked.launch import prepare_account_dir
+
+            result = prepare_account_dir(account, db)
+
+        seeded = json.loads((result / ".claude.json").read_text())
+        assert seeded["hasCompletedOnboarding"] is True
+        assert seeded["projects"]["/trusted"] == {"hasTrustDialogAccepted": True}
+        assert seeded["oauthAccount"]["emailAddress"] == "alice@test.com"
+
+
+class TestSeedClaudeConfigFailClosed:
+    @pytest.mark.parametrize("content", ["{torn", "[1, 2]", b"\xff\xfe{"])
+    def test_unreadable_per_account_config_is_not_seeded(self, tmp_path, content):
+        from jacked.launch import _seed_claude_config
+
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        target = config_dir / ".claude.json"
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        else:
+            target.write_text(content)
+        before = target.read_bytes()
+        (tmp_path / ".claude.json").write_text(
+            json.dumps({"hasCompletedOnboarding": True})
+        )
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_claude_config(config_dir)
+
+        assert target.read_bytes() == before
+
+    def test_directory_at_the_per_account_config_path_is_not_seeded(self, tmp_path):
+        from jacked.launch import _seed_claude_config, _seed_workspace_trust
+
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        (config_dir / ".claude.json").mkdir()
+        (tmp_path / ".claude.json").write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "projects": {"/p": {"hasTrustDialogAccepted": True}},
+        }))
+
+        with mock.patch.object(Path, "home", return_value=tmp_path):
+            _seed_claude_config(config_dir)
+            _seed_workspace_trust(config_dir)
+
+        assert (config_dir / ".claude.json").is_dir()
+        assert not list(config_dir.glob(".claude_json_tmp_*"))
 
 
 # ---------------------------------------------------------------------------
@@ -1440,6 +1568,65 @@ class TestTokenSync:
         account = db.get_account(1)
         # Sync should NOT have happened — fail closed
         assert account["cc_access_token"] == "alice_cc_access"  # unchanged
+
+
+    def test_blocked_sync_logs_name_the_field_not_the_values(self, tmp_path, caplog):
+        """Identity-guard warnings carry the row id and the field name only."""
+        import logging
+
+        db = _make_db(tmp_path)
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "bob_token", "expiresAt": 9999999999000}
+        }))
+        (config_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "bob@different.com"}
+        }))
+        caplog.set_level(logging.DEBUG, logger="jacked.launch")
+
+        from jacked.launch import _sync_tokens_from_file
+
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+
+        assert "Token sync BLOCKED for account 1" in caplog.text
+        assert "emailAddress" in caplog.text
+        assert "bob@" not in caplog.text
+        assert "alice@" not in caplog.text
+        assert db.get_account(1)["cc_access_token"] == "alice_cc_access"
+
+    def test_org_mismatch_log_carries_uuid_prefixes_only(self, tmp_path, caplog):
+        import logging
+
+        db_org = "0d1e2f3a-3333-4c4d-9e5f-000000000003"
+        file_org = "9f8e7d6c-2222-4b3c-8d4e-000000000002"
+        db = _make_db(tmp_path)
+        with db._writer() as conn:
+            conn.execute(
+                "UPDATE accounts SET organization_uuid = ? WHERE id = 1", (db_org,)
+            )
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "other_org_token", "expiresAt": 9999999999000}
+        }))
+        (config_dir / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "alice@test.com",
+                "organizationUuid": file_org,
+            }
+        }))
+        caplog.set_level(logging.DEBUG, logger="jacked.launch")
+
+        from jacked.launch import _sync_tokens_from_file
+
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+
+        assert "organizationUuid" in caplog.text
+        assert db_org[:8] in caplog.text and file_org[:8] in caplog.text
+        assert db_org not in caplog.text and file_org not in caplog.text
+        assert "alice@" not in caplog.text
+        assert db.get_account(1)["cc_access_token"] == "alice_cc_access"
 
 
 # ---------------------------------------------------------------------------
