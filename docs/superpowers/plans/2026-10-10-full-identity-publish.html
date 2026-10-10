@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!--
+  jacked artifact template — for plans, specs, research, checkpoints.
+  Replace placeholders, keep what you need, delete sections you don't.
+  Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
+-->
+<title>Full Claude identity publish</title>
+
+<!-- Metadata block — adjust fields per artifact type -->
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="draft">
+<meta name="jacked:branch" content="jack_20261010_full_identity_publish">
+<meta name="jacked:date" content="2026-10-10">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 .25rem;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 .5rem;
+    color: var(--fg-muted);
+  }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+
+  /* Metadata strip under title */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    margin: .5rem 0 2rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    font-size: .9rem;
+  }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+
+  /* Status badges — drop into a <span class="badge X"> */
+  .badge {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 99px;
+    font-size: .8rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .badge.ok       { background: var(--ok-bg);     color: var(--ok); }
+  .badge.warn     { background: var(--warn-bg);   color: var(--warn); }
+  .badge.danger   { background: var(--danger-bg); color: var(--danger); }
+  .badge.info     { background: var(--accent-bg); color: var(--accent); }
+
+  /* Table of contents */
+  nav.toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    margin: 0 0 .5rem;
+    font-size: .9rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--fg-muted);
+    border: none;
+    padding: 0;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.5rem;
+  }
+  nav.toc li { margin: .15rem 0; }
+
+  /* Callouts — drop into <aside class="callout warn"> ... </aside> */
+  aside.callout {
+    margin: 1rem 0;
+    padding: .9rem 1.1rem;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  aside.callout.warn   { border-color: var(--warn);   background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok     { border-color: var(--ok);     background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child  { margin-bottom: 0; }
+
+  /* Code */
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: var(--code-bg);
+    padding: .12em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: .88rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    font-size: .9rem;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  /* Task checklist — use <ul class="tasks"> + <li><input type="checkbox" disabled> ...</li> */
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li {
+    padding: .25rem 0;
+    display: flex;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+
+  /* Mermaid diagram wrappers */
+  .diagram {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  /* If mermaid fails (no network), fall back to showing the source in a code block */
+  .diagram pre.mermaid-source {
+    text-align: left;
+    display: none;
+  }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+
+  blockquote {
+    border-left: 3px solid var(--border);
+    padding: .2rem 1rem;
+    margin: 1rem 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  /* Print: paginate cleanly, drop the dark-mode flip, expand TOC */
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Publish the full Claude identity on every switch, and keep it true</h1>
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">revision 2 (after plan review + pre-mortem)</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-10-10</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">jack_20261010_full_identity_publish</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec + plan</span></div>
+</div>
+
+<h2 id="goal">Goal (user-facing)</h2>
+<p>After any jacked account switch, on macOS, Linux and Windows, <code>~/.claude.json</code> <code>oauthAccount</code> is the COMPLETE profile block of exactly the account whose token sits in the credential store (the same block Claude Code itself would write after a profile fetch), and it stays that way. Running sessions follow the switch; <code>/status</code>, the usage cache, Fable/overage consent, <code>/extra-usage</code> gating and synced skills all key on the right account; a stale Claude Code process can no longer write the previous account back in; and jacked never "repairs" the config toward an account it has not proven owns the stored token.</p>
+
+<div class="callout"><strong>Root cause (verified twice, 2026-10-10).</strong> <code>credential_helpers.py:197</code> <code>_apply_claude_account</code> writes email, displayName, org uuid and org name, never <code>accountUuid</code>, and keeps every other field of the previous account. jacked stores no account uuid. Claude Code 2.1.296's bootstrap merge <code>q()</code> accepts a write only when the bootstrap <code>account_uuid</code> equals the config <code>accountUuid</code>, so after A&rarr;B a process holding A's token writes A's email/org back and B's processes cannot correct it. Nothing in jacked re-reads the config after a switch.</div>
+
+<h3>Claude Code 2.1.296 facts this plan relies on (extracted from the binary, read-only)</h3>
+<ul>
+<li><b>NQt</b> (profile writer, no uuid guard) writes <code>{...old, ...V}</code> with V = accountUuid (<code>account.uuid</code>), emailAddress (<code>account.email</code>), organizationUuid (<code>organization.uuid</code>), hasExtraUsageEnabled (<code>organization.has_extra_usage_enabled ?? false</code>), billingType (<code>organization.billing_type</code>), accountCreatedAt (<code>account.created_at</code>), subscriptionCreatedAt (<code>organization.subscription_created_at</code>), ccOnboardingFlags (<code>organization.cc_onboarding_flags ?? {}</code>), claudeCodeTrialEndsAt / claudeCodeTrialDurationDays (<code>organization.claude_code_trial_*</code> ?? null), seatTier (<code>organization.seat_tier ?? null</code>), planDisplayName (<code>organization.plan_display_name</code>, validated, else omitted), displayName / fullName (<code>account.display_name</code> / <code>account.full_name</code>, only when truthy), profileFetchedAt.</li>
+<li>The init profile fetch (Iho) and the token-refresh profile fetch (RSe) are both SKIPPED while billingType, accountCreatedAt, subscriptionCreatedAt and ccOnboardingFlags are present (Iho also needs profileFetchedAt under 24 h; RSe also needs non-null <code>subscriptionType</code> and <code>rateLimitTier</code> in the credential payload). A minimal block therefore re-arms an unguarded merge in the next process that refreshes, whatever account it holds.</li>
+<li><code>organizationName</code>, <code>organizationRole</code>, <code>workspaceRole</code> come from a separate roles call (merged into the existing block).</li>
+<li>Claude Code writes the config under proper-lockfile: a <code>${configPath}.lock</code> DIRECTORY (mkdir, mtime-based staleness, no files inside).</li>
+<li>Profile endpoint shape (captured live, key paths only): <code>account.{uuid,email,display_name,full_name,created_at,...}</code>, <code>organization.{uuid,name,organization_type,billing_type,rate_limit_tier,seat_tier,has_extra_usage_enabled,subscription_created_at,claude_code_trial_ends_at,claude_code_trial_duration_days,...}</code>. Token exchange uses <code>account.email_address</code>.</li>
+</ul>
+
+<h2 id="acceptance">Acceptance criteria</h2>
+<ol>
+<li><b>AC1 store identity from the source.</b> Migration adds <code>accounts.account_uuid TEXT</code>, <code>accounts.profile_json TEXT</code> (non-secret subset: the <code>account</code> and <code>organization</code> objects only), <code>accounts.profile_fetched_at REAL</code>, placed after the explicit-column org rebuild and also in CREATE TABLE, the update whitelist, the model and <code>create_account</code>. <code>_update_profile_metadata</code> applies NOTHING (uuid, profile, tier, org name, subscription) unless <code>account.email</code> casefold-equals the row email AND (row org empty OR <code>organization.uuid</code> equals row org); a mismatch logs a values-free WARNING naming the row id. Token exchange (add, re-auth, CC flow, org-redirect branch) stores <code>account.uuid</code> on the row it actually updates. A one-shot paced startup backfill fetches the profile (no token refresh on 401) for every <code>provider='claude'</code> row missing <code>profile_json</code>, and logs one coverage line (rows with / without uuid).</li>
+<li><b>AC2 one publisher, row-based.</b> <code>claude_config_identity_publisher(home, db)</code> loads the row by <code>request.account_id</code> (cross-checks email casefold) and builds the block with <code>claude_identity_for_account(row)</code>. Every engine path (dashboard, OAuth, launch global activation, authority_guard reassert/restamp, auto-swap, recovery) gets it for free. <code>launch._seed_oauth_account</code> and <code>sync_credential_to_all_stores</code> use the same builder. The builder refuses non-<code>claude</code> providers and omits a uuid that is stored on rows with different emails.</li>
+<li><b>AC3 complete block.</b> With a stored profile, the builder emits the full NQt field set mapped exactly as above, plus <code>organizationName</code> from the row and tier fields when known; <code>profileFetchedAt</code> = jacked's real fetch time. Without one, it emits the minimal identity (uuid when known, email, org uuid, org name) and the publish reports <code>partial</code>. The writer MERGES (keeps Claude Code's extra fields such as roles) only when the existing block has the same non-empty accountUuid AND same email (casefold, stripped) AND same normalized org (<code>""</code>/None/missing = None); otherwise it REPLACES <code>oauthAccount</code>. Non-identity top-level keys are never touched. The credential payload always carries non-null <code>subscriptionType</code>/<code>rateLimitTier</code> when the row knows them.</li>
+<li><b>AC4 safe config writes.</b> Every identity write: takes a proper-lockfile-compatible <code>&lt;config&gt;.lock</code> mkdir lock (no files inside; stale after 10 s by mtime; bounded retry, longer for strict callers); reads the config under the lock and FAILS CLOSED when an existing file is not a JSON object (no "creating fresh"; only an absent file starts empty); optionally verifies an expected prior <code>oauthAccount</code> (compare-and-swap) and aborts on change; writes atomically.</li>
+<li><b>AC5 watcher.</b> In <code>refresh_resolver_snapshot</code>: only when the service has no <code>CLAUDE_CONFIG_DIR</code>, scope is global, state RESOLVED, an observed Claude row exists, and the config holds an <code>oauthAccount</code>. Divergent when email (casefold) differs, or org differs (compared only when the row org is non-empty), or the row uuid is known and the config uuid differs, or the stored profile's <code>created_at</code> is known and the config <code>accountCreatedAt</code> differs (proof another person's profile was merged). Before writing it (a) try-acquires the switch lease non-blocking and re-resolves under it (held: skip, evidence <code>deferred-switch</code>); (b) proves the stored token belongs to the observed row with a profile lookup cached by authority payload digest (mismatch: no write, WARNING, evidence <code>authority:stamp-mismatch</code>); (c) writes with compare-and-swap. Rate: at most one attempt per 60 s per account, stamped at attempt; breaker trips after 3 republishes in 15 min for the same account (evidence <code>flapping</code>, one WARNING) and resets when the authority digest or desired account changes. Evidence prefix <code>claude-config:identity:</code> plus <code>republished</code>/<code>divergent</code>/<code>partial</code>/<code>uuid-unknown</code>. Logs carry row ids, 8-char uuid prefixes and diverged field NAMES, never emails or tokens; skip reasons log on state transition only. A watcher error never blocks the snapshot publish.</li>
+<li><b>AC6 proof.</b> Unit tests per AC (fixtures use the captured real key shapes), the full local suite once, ruff. Live on the Mac with the branch installed: uuid/profile backfill coverage line; the stale <code>accountUuid</code> block is replaced by a complete block within one observer pass; a same-email two-org round-trip (accounts 2 and 7 here) and a cross-person round-trip each leave a complete correct block; pty probe <code>/status</code> in a session started before the switch shows the target. Windows (mlpc) proof runs once Jack installs the build there (his machine, writes need his go).</li>
+</ol>
+
+<h2 id="non-goals">Non-goals</h2>
+<ul>
+<li>Adopting a stamped-but-foreign store token into the right row (#154i). The watcher DETECTS it and refuses to write; adoption is that issue's work.</li>
+<li><code>skill_listing._synced_dir</code>: it mirrors Claude Code's own folder lookup from the same config, so it becomes right when the config is right.</li>
+<li>Deleting the dead <code>sync_credential_to_all_stores</code> path (zero production callers, ~30 test patch sites); it is routed through the builder here and its removal is filed.</li>
+<li>A durable DB audit row per repair: id-bearing log lines cover the forensics.</li>
+</ul>
+
+<h2 id="architecture">Architecture</h2>
+<div class="diagram"><pre class="mermaid">
+flowchart LR
+  P[profile GET / token exchange / startup backfill] -->|email+org checked| DB[(account_uuid, profile_json, profile_fetched_at)]
+  DB --> B[claude_identity_for_account]
+  S[engine publisher: switch, oauth, launch, guard, auto-swap, recovery] --> B
+  L[launch._seed_oauth_account] --> B
+  W[observer 10s: divergence -> lease -> token-owner proof -> rate/breaker] --> B
+  B --> A[locked fail-closed CAS write: merge iff uuid+email+org equal, else replace]
+  A --> C[~/.claude.json oauthAccount]
+</pre></div>
+
+<h2 id="files">Files</h2>
+<table>
+<tr><th>File</th><th>Change</th></tr>
+<tr><td><code>jacked/web/database.py</code></td><td>3 columns (migration after org rebuild, CREATE TABLE, whitelist, model, <code>create_account</code>); helper listing claude rows missing profile.</td></tr>
+<tr><td><code>jacked/web/auth.py</code></td><td>Whole-update email/org guard in <code>_update_profile_metadata</code>; store uuid/profile/time; <code>fetch_profile(..., allow_refresh=True)</code>; startup backfill function.</td></tr>
+<tr><td><code>jacked/web/oauth.py</code></td><td>Token-exchange <code>account_uuid</code>; persist on add / re-auth / CC flow / org redirect (<code>actual_target_id</code>); fix <code>account.email_address</code> read on the profile at ~1010.</td></tr>
+<tr><td><code>jacked/api/claude_identity.py</code> (new)</td><td>Builder (NQt mapping), merge-or-replace, config lock, fail-closed CAS writer, <code>read_claude_config_identity</code>. Keeps <code>credential_helpers.py</code> from growing.</td></tr>
+<tr><td><code>jacked/api/credential_helpers.py</code></td><td><code>update_claude_config_email</code>/<code>_update_claude_config_account</code> delegate to the new writer; fail-open read removed; sync path uses the builder; stale module docstring fixed.</td></tr>
+<tr><td><code>jacked/credentials/runtime.py</code></td><td>Publisher takes <code>db</code>, builds from the row.</td></tr>
+<tr><td><code>jacked/launch.py</code></td><td><code>_seed_oauth_account</code> via the builder.</td></tr>
+<tr><td><code>jacked/api/session_observer.py</code> + <code>jacked/api/identity_watcher.py</code> (new)</td><td>Watcher (AC5) in its own module; observer calls it.</td></tr>
+<tr><td><code>jacked/api/main.py</code> (or the lifespan that starts loops)</td><td>Schedule the one-shot backfill.</td></tr>
+<tr><td>tests</td><td><code>test_claude_identity.py</code>, <code>test_identity_watcher.py</code>, profile-guard and migration tests, updates to runtime/observer/launch tests.</td></tr>
+</table>
+
+
+<h2 id="rev3">Revision 3 amendments (cycle-2 review; these override AC3-AC5 where they conflict)</h2>
+<ol>
+<li><b>Owner proof (AC5b).</b> Uses <code>authority_guard._default_profile_lookup(access_token)</code> (sync GET, no refresh, no DB write) with the authority payload's own <code>accessToken</code>. Never <code>fetch_profile</code>, never a refresh of either lineage. Payload <code>expiresAt</code> in the past: no GET, evidence <code>owner-unproven</code>. 401/403: unproven, no write, cached per digest. Network/5xx/429: unproven, retried no sooner than 60 s, floor stamped at attempt. Owner = profile <code>account.email</code> casefold equal to the row email AND <code>organization.uuid</code> equal to the row org when the row org is non-empty AND <code>account.uuid</code> equal to the row uuid when known. Regression test: <code>fetch_profile</code> and <code>_try_refresh_primary_token</code> patched to raise are never reached from the watcher.</li>
+<li><b>Order (AC5).</b> detect divergence &rarr; owner proof with NO lease, remembering the proved authority digest &rarr; try the switch lease (held: skip, <code>deferred-switch</code>) &rarr; under the lease re-resolve; require the same digest and the same observed/desired row, else skip &rarr; locked CAS write with a single-try (&le;1 s) config lock.</li>
+<li><b>Placement.</b> The watcher runs AFTER <code>sink.publish(update)</code> and receives the update. Its evidence is held and appended to the NEXT snapshot.</li>
+<li><b>Lock (AC4).</b> Critical section = read, CAS, atomic write (reuse <code>_safe_replace</code>), never network I/O, target under 1 s; release in <code>finally</code> with a bounded-retry <code>rmdir</code>; stale lock (mtime older than 10 s) cleared with <code>rmdir</code> only (never <code>rmtree</code>; a non-empty dir is not ours: fail and retry later). After release, re-read and verify uuid/email/org; mismatch logs <code>post-verify-mismatch</code> and strict callers raise <code>ClaudeConfigUnwritable</code>. Claude Code's storageV5 globalConfig path may not use <code>~/.claude.json.lock</code>; correctness rests on CAS + post-verify, and AC6 adds a live check of whether a Claude Code config save creates the lock dir.</li>
+<li><b>Merge predicate (AC3).</b> MERGE when email (casefold, stripped) and normalized org are equal AND (both uuids equal OR the row uuid is unknown); the merge keeps the existing <code>accountUuid</code> and every field jacked does not know, and overwrites only fields jacked knows. REPLACE when email or org differ, or both uuids are known and differ. Never backfill the row uuid from the config.</li>
+<li><b>createdAt (AC5).</b> Config missing <code>accountCreatedAt</code> while the stored profile has <code>created_at</code> = incomplete: one republish, counted by the breaker. Compare raw strings, no date parsing.</li>
+<li><b>Logging.</b> Fix the raw email in the <code>authority_guard.py</code> WARNING (~368-372) in this PR.</li>
+<li><b>Not done:</b> skipping the GET for jacked-committed digests (L-B) - divergence right after a jacked commit is rare and the proof is cached per digest.</li>
+</ol>
+
+<h2 id="contracts">Interface contracts (parallel tasks code against these)</h2>
+<ul>
+<li>Row keys: <code>account_uuid: str | None</code>; <code>profile_json: str | None</code> = JSON text <code>{"account": {...}, "organization": {...}}</code> exactly as the profile endpoint returned those two objects; <code>profile_fetched_at: float | None</code> epoch seconds.</li>
+<li><code>jacked/api/claude_identity.py</code>: <code>IdentityBlock</code> (frozen: <code>fields: dict</code>, <code>complete: bool</code>, <code>account_id: int</code>, <code>email: str</code>, <code>organization_uuid: str | None</code>, <code>account_uuid: str | None</code>); <code>build_identity_block(row, *, db=None) -&gt; IdentityBlock | None</code> (None for non-claude provider; db used only for the shared-uuid refusal); <code>is_same_account(existing: dict, block) -&gt; bool</code>; <code>apply_identity(config: dict, block) -&gt; None</code>; <code>write_identity(home, block, *, strict=False, expected: dict | None = None, lock_timeout: float = 5.0) -&gt; WriteResult</code> with <code>WriteResult.status</code> in {written, unchanged, cas_aborted, locked, unreadable, symlink, write_failed, post_verify_mismatch}; strict raises <code>ClaudeConfigUnwritable</code> for every status except written/unchanged; <code>read_claude_config_identity(home) -&gt; dict | None</code>.</li>
+<li><code>jacked/api/identity_watcher.py</code>: <code>IdentityWatcher</code> with injectable <code>clock</code>, <code>profile_lookup</code>, <code>lease_factory</code>, <code>resolve</code>, <code>writer</code>; <code>run(update, db, home) -&gt; None</code>; <code>drain_evidence() -&gt; tuple[str, ...]</code>.</li>
+</ul>
+
+<h2 id="tasks">Tasks</h2>
+<h3>Task 1: identity storage (AC1)</h3>
+<ul class="tasks">
+<li><input type="checkbox" disabled> Migration + schema/whitelist/model/create_account; test an old-schema DB (pre-org-uuid too) gains the columns and keeps rows.</li>
+<li><input type="checkbox" disabled> <code>_update_profile_metadata</code> guard + storage; tests: match, email mismatch, org mismatch, empty row org, missing account object.</li>
+<li><input type="checkbox" disabled> Token-exchange uuid on every persistence path incl. CC flow and org redirect; <code>email_address</code> one-liner; tests with real-shaped fixtures.</li>
+<li><input type="checkbox" disabled> Startup backfill (paced, claude rows only, no refresh on 401, coverage log) wired into service start; tests.</li>
+</ul>
+<h3>Task 2: builder + safe writer (AC2-AC4)</h3>
+<ul class="tasks">
+<li><input type="checkbox" disabled> <code>claude_identity.py</code>: NQt mapping, minimal fallback, provider and shared-uuid refusals; tests per field incl. absent optionals.</li>
+<li><input type="checkbox" disabled> Merge-or-replace with the 3-part predicate; tests: cross-person replace, same-email-two-org replace, same account merge keeps roles, top-level keys untouched.</li>
+<li><input type="checkbox" disabled> Config lock (mkdir, empty dir, mtime stale), fail-closed read, CAS; tests: torn JSON leaves the file byte-identical, held lock times out, stale lock cleared, CAS abort.</li>
+<li><input type="checkbox" disabled> Route publisher (row-based), <code>_seed_oauth_account</code>, sync path through it; payload tier non-null; update existing tests.</li>
+</ul>
+<h3>Task 3: watcher (AC5)</h3>
+<ul class="tasks">
+<li><input type="checkbox" disabled> <code>identity_watcher.py</code> with injectable clock, lease, profile lookup and writer; observer integration.</li>
+<li><input type="checkbox" disabled> Tests: each divergence kind; org skip when row org empty; uuid compare only when known; lease held skip; stamp mismatch no write; floor stamped at attempt incl. failure; breaker trip and reset; CLAUDE_CONFIG_DIR / scoped / conflict / missing block do nothing; exception still publishes snapshot; logs contain no email.</li>
+</ul>
+<h3>Task 4: gates and live proof (AC6)</h3>
+<ul class="tasks">
+<li><input type="checkbox" disabled> Full suite once, ruff; /dcr LARGE on the combined diff; /cso (credential path).</li>
+<li><input type="checkbox" disabled> Mac live proof per AC6; file the dead-path issue.</li>
+</ul>
+
+<hr>
+<hr>
+
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated with the <a href="https://github.com/jackneil/claude-jacked">jacked</a>
+  HTML artifact template. Edit freely.
+</p>
+
+</div>
+
+<!-- Mermaid: render diagrams, fail gracefully if CDN unreachable -->
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+  } catch (err) {
+    // Network unreachable or import failed — show source instead of broken diagrams.
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>
