@@ -52,6 +52,119 @@ def _isolate_default_db_path(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(database, "_default_db_path", _test_default_db_path)
 
 
+def _under_real_claude_config(path) -> bool:
+    """True when ``path`` is the real Claude config, its lock, or its legacy file."""
+    target = Path(path).absolute()
+    guarded = {
+        REAL_HOME / ".claude.json",
+        REAL_HOME / ".claude.json.lock",
+        REAL_HOME / ".claude" / ".config.json",
+        REAL_HOME / ".claude" / ".config.json.lock",
+    }
+    return target in guarded or target.parent == REAL_HOME and target.name.startswith(
+        ".claude_json_tmp_"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _tripwire_real_claude_config(monkeypatch):
+    """Tripwire: no test may write or lock the developer's real Claude config."""
+    from jacked.api import claude_config_store
+
+    real_write = claude_config_store._atomic_write_json
+    real_acquire = claude_config_store._acquire_lock
+
+    def guarded_write(config_path, data):
+        if _under_real_claude_config(config_path):
+            raise RuntimeError(f"test tripwire: write to the real {config_path.name}")
+        return real_write(config_path, data)
+
+    def guarded_acquire(lock_path, timeout):
+        if _under_real_claude_config(lock_path):
+            raise RuntimeError(f"test tripwire: lock on the real {lock_path.name}")
+        return real_acquire(lock_path, timeout)
+
+    monkeypatch.setattr(claude_config_store, "_atomic_write_json", guarded_write)
+    monkeypatch.setattr(claude_config_store, "_acquire_lock", guarded_acquire)
+
+
+class _InertIdentityWatcher:
+    """Stands in for the service watcher, which reads the real authority."""
+
+    def submit(self, *args, **kwargs):
+        return False
+
+    def run(self, *args, **kwargs):
+        return None
+
+    def drain_evidence(self):
+        return ()
+
+    def wait_idle(self, timeout=None):
+        return True
+
+    def status(self):
+        return {"disabled": False, "accounts": {}}
+
+
+@pytest.fixture(autouse=True)
+def _tripwire_real_identity_watcher(monkeypatch):
+    """Tripwire: the service identity watcher never runs under test.
+
+    The real watcher reads the real credential authority (the macOS Keychain)
+    and sends its token to the profile endpoint. A test that wants a watcher
+    builds an ``IdentityWatcher`` with fakes, or patches this attribute.
+    """
+    from jacked.api import session_observer
+
+    monkeypatch.setattr(session_observer, "IDENTITY_WATCHER", _InertIdentityWatcher())
+
+
+@pytest.fixture(autouse=True)
+def _tripwire_real_keychain(monkeypatch):
+    """Tripwire: no test may run the real ``security`` tool against the Keychain."""
+    import subprocess
+
+    from jacked.credentials import macos_store
+
+    cls = macos_store.SecurityCliBackend
+    real_invoke = cls._invoke
+
+    def guarded_invoke(self, args, *, is_interactive, stdin=None):
+        if self._run is subprocess.run and self._tool == macos_store.SECURITY_TOOL:
+            raise RuntimeError("test tripwire: real Keychain access via security")
+        return real_invoke(self, args, is_interactive=is_interactive, stdin=stdin)
+
+    monkeypatch.setattr(cls, "_invoke", guarded_invoke)
+
+
+@pytest.fixture(autouse=True)
+def _tripwire_real_anthropic_network(monkeypatch):
+    """Tripwire: no test may send a request to a real Anthropic endpoint."""
+    import httpx
+
+    real_get = httpx.get
+    real_async_send = httpx.AsyncClient.send
+
+    def _guard(url) -> None:
+        host = httpx.URL(str(url)).host or ""
+        if host.endswith(("anthropic.com", "claude.ai", "claude.com")):
+            raise RuntimeError(f"test tripwire: real request to {host}")
+
+    def guarded_get(url, *args, **kwargs):
+        _guard(url)
+        return real_get(url, *args, **kwargs)
+
+    async def guarded_async_send(self, request, *args, **kwargs):
+        transport = getattr(self, "_transport", None)
+        if isinstance(transport, httpx.AsyncHTTPTransport):
+            _guard(request.url)
+        return await real_async_send(self, request, *args, **kwargs)
+
+    monkeypatch.setattr(httpx, "get", guarded_get)
+    monkeypatch.setattr(httpx.AsyncClient, "send", guarded_async_send)
+
+
 @pytest.fixture
 def quiet_lifespan(monkeypatch, tmp_path):
     """Let a test run the real app lifespan with no real background work.

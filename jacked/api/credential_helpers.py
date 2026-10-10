@@ -683,7 +683,15 @@ def sync_credential_to_all_stores(
     try:
         from jacked.api.claude_identity import build_identity_block, write_identity
 
-        block = build_identity_block({**account, "id": account_id, "email": email})
+        row = {**account, "id": account_id, "email": email}
+        if (email or "").strip().casefold() != (
+            account.get("email") or ""
+        ).strip().casefold():
+            # An email override names someone other than the row: neither
+            # the row's uuid nor its stored profile belongs to it.
+            row["account_uuid"] = None
+            row["profile_json"] = None
+        block = build_identity_block(row)
         if block is not None:
             write_identity(Path.home(), block)
     except Exception as exc:

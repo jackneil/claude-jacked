@@ -96,8 +96,10 @@ def _profile_owner_mismatch(row: dict, data: dict) -> Optional[str]:
 
     The profile must hold an account object whose ``email`` is equal to the
     row email (casefold, stripped). When the row has an organization uuid,
-    ``organization.uuid`` must be equal to it. Return None when the profile
-    belongs to the row. The return value is a field name, never a value.
+    ``organization.uuid`` must be equal to it. When the row and the profile
+    both carry an account uuid, they must be equal. Return None when the
+    profile belongs to the row. The return value is a field name, never a
+    value. The rule lives in ``claude_identity.profile_owner_mismatch``.
 
     >>> row = {"email": "a@x.com", "organization_uuid": "o1"}
     >>> _profile_owner_mismatch(row, {"account": {"email": " A@X.com"},
@@ -109,22 +111,14 @@ def _profile_owner_mismatch(row: dict, data: dict) -> Optional[str]:
     ...                               "organization": {"uuid": "o2"}})
     'organization.uuid'
     """
-    acct = data.get("account") if isinstance(data, dict) else None
-    if not isinstance(acct, dict):
-        return "account"
-    profile_email = acct.get("email")
-    row_email = row.get("email")
-    if not isinstance(profile_email, str) or not isinstance(row_email, str):
-        return "account.email"
-    if profile_email.strip().casefold() != row_email.strip().casefold():
-        return "account.email"
-    row_org = row.get("organization_uuid") or ""
-    if row_org:
-        org = data.get("organization")
-        profile_org = org.get("uuid") if isinstance(org, dict) else None
-        if profile_org != row_org:
-            return "organization.uuid"
-    return None
+    from jacked.api.claude_identity import profile_owner_mismatch
+
+    return profile_owner_mismatch(
+        row.get("email"),
+        row.get("organization_uuid"),
+        row.get("account_uuid"),
+        data,
+    )
 
 
 def _update_profile_metadata(account_id: int, data: dict, db) -> bool:

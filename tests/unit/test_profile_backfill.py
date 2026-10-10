@@ -8,6 +8,7 @@ never raises, never refreshes a token, and logs ONE coverage line.
 import asyncio
 import logging
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -268,7 +269,7 @@ class TestBackfillScheduledAtStartup:
                 continue
             inner = call.args[0] if call.args else None
             if (isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)
-                    and inner.func.id == "_profile_backfill_once"):
+                    and inner.func.id == "_profile_backfill_loop"):
                 task_vars.extend(t.id for t in node.targets if isinstance(t, ast.Name))
         assert len(task_vars) == 1, "lifespan must create exactly one backfill task"
 
@@ -281,6 +282,36 @@ class TestBackfillScheduledAtStartup:
                 cancel_list = {e.id for e in node.value.elts if isinstance(e, ast.Name)}
         assert cancel_list is not None, "tasks_to_cancel list not found in lifespan"
         assert task_vars[0] in cancel_list, "the backfill task must be cancelled on shutdown"
+
+    def test_backfill_loop_sweeps_then_repeats_every_hour(self, monkeypatch):
+        """The loop sweeps stale temp files once, then runs a pass, sleeps the
+        retry interval, and runs again."""
+        import jacked.api.main as api_main
+        from jacked.api import claude_config_store
+
+        events: list = []
+        monkeypatch.setattr(
+            claude_config_store, "sweep_stale_temp_files",
+            lambda home: events.append("sweep") or 0,
+        )
+
+        async def fake_once(app):
+            events.append("pass")
+
+        sleeps: list = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) >= 2:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(api_main, "_profile_backfill_once", fake_once)
+        monkeypatch.setattr(api_main.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(api_main._profile_backfill_loop(SimpleNamespace(state=SimpleNamespace())))
+
+        assert events == ["sweep", "pass", "pass"]
+        assert sleeps == [api_main.PROFILE_BACKFILL_RETRY_SECONDS] * 2
 
     def test_timeout_still_logs_coverage(self, db, monkeypatch, caplog):
         """A pass that exceeds the cap is cancelled, and the coverage line is

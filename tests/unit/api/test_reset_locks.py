@@ -111,7 +111,7 @@ def test_fastapi_lifespan_actually_runs_reset_locks(quiet_lifespan) -> None:
     ``quiet_lifespan`` (tests/conftest.py) stubs every background loop and
     moves HOME, so this never touches the real database or the network.
     """
-    assert "_profile_backfill_once" in quiet_lifespan
+    assert "_profile_backfill_loop" in quiet_lifespan
     assert "full_sweep_loop" in quiet_lifespan
     # Force all runtime deps available in test env before importing app.
     from fastapi.testclient import TestClient

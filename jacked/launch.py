@@ -250,7 +250,7 @@ def _seed_oauth_account(config_dir: Path, account: dict, db=None) -> None:
     block = build_identity_block(account, db=db)
     if block is None:
         return
-    result = write_identity(config_dir, block)
+    result = write_identity(config_dir, block, scoped=True)
     if not result.ok:
         logger.debug(
             "Account %s: per-account identity not seeded (%s)",

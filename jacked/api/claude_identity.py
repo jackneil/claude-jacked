@@ -1,11 +1,12 @@
 """Build and publish the Claude ``oauthAccount`` identity block.
 
 Claude Code keeps the identity of the signed-in account in the
-``oauthAccount`` block of ``~/.claude.json``. Claude Code 2.1.296 accepts
-a profile merge into that block only when the account uuid agrees, and it
-skips its own profile fetch while the block holds the full profile. A
-partial block that jacked writes after a switch can therefore let a stale
-process write the previous account back in.
+``oauthAccount`` block of ``~/.claude.json``. In Claude Code 2.1.296 only
+the bootstrap merge checks the account uuid. The profile writers at start
+and at token refresh merge with no uuid check, and they run only while one
+of the gate fields (``COMPLETENESS_GATE_FIELDS``) is missing. A partial
+block that jacked writes after a switch can therefore let a stale process
+write the previous account back in.
 
 This module is the one place that:
 
@@ -13,9 +14,9 @@ This module is the one place that:
   same field mapping as the Claude Code profile writer;
 - decides between a merge and a replace (``is_same_account``,
   ``apply_identity``);
-- writes the block under a lock that is compatible with proper-lockfile,
-  fails closed on a config it cannot read, and verifies the result
-  (``write_identity``).
+- writes the block through ``claude_config_store`` (lock, fail-closed
+  read, whole-file compare-and-swap, fsync, post-write verify) with
+  ``write_identity``.
 
 Logs from this module contain row ids, 8-character uuid prefixes and field
 names. They never contain an email address or a token.
@@ -26,51 +27,53 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import os
-import sys
-import tempfile
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from jacked.api.credential_helpers import ClaudeConfigUnwritable, _safe_replace
+from jacked.api import claude_config_store as store
+from jacked.api.claude_config_store import (  # noqa: F401 - public re-exports
+    CAS_ABORTED,
+    LOCKED,
+    POST_VERIFY_MISMATCH,
+    SYMLINK,
+    UNCHANGED,
+    UNREADABLE,
+    UNSUPPORTED,
+    WRITE_FAILED,
+    WRITE_STATUSES,
+    WRITTEN,
+    WriteResult,
+)
+from jacked.api.credential_helpers import ClaudeConfigUnwritable
 
 logger = logging.getLogger(__name__)
 
-CONFIG_FILENAME = ".claude.json"
-LOCK_SUFFIX = ".lock"
-# proper-lockfile (Claude Code) treats a lock directory as stale after 10 s.
-STALE_LOCK_SECONDS = 10.0
 # Lock patience. A strict caller cannot fall back on a later retry, so it
 # waits longer than a background writer. An explicit ``lock_timeout`` wins.
 DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
 STRICT_LOCK_TIMEOUT_SECONDS = 10.0
-_LOCK_POLL_SECONDS = 0.05
-_RELEASE_ATTEMPTS = 5
-_RELEASE_BACKOFF_SECONDS = 0.05
 
-WRITTEN = "written"
-UNCHANGED = "unchanged"
-CAS_ABORTED = "cas_aborted"
-LOCKED = "locked"
-UNREADABLE = "unreadable"
-SYMLINK = "symlink"
-WRITE_FAILED = "write_failed"
-POST_VERIFY_MISMATCH = "post_verify_mismatch"
-WRITE_STATUSES = frozenset(
+# Claude Code 2.1.296 skips its unguarded profile merges only while every
+# one of these fields is present. A block without one of them is partial.
+COMPLETENESS_GATE_FIELDS = (
+    "billingType",
+    "accountCreatedAt",
+    "subscriptionCreatedAt",
+    "ccOnboardingFlags",
+)
+# Fields that name the account. A merge over a block that Claude Code
+# fetched more recently than jacked's stored profile writes only these.
+IDENTITY_FIELDS = frozenset(
     {
-        WRITTEN,
-        UNCHANGED,
-        CAS_ABORTED,
-        LOCKED,
-        UNREADABLE,
-        SYMLINK,
-        WRITE_FAILED,
-        POST_VERIFY_MISMATCH,
+        "accountUuid",
+        "emailAddress",
+        "organizationUuid",
+        "organizationName",
+        "organizationRateLimitTier",
+        "userRateLimitTier",
     }
 )
-_SUCCESS_STATUSES = frozenset({WRITTEN, UNCHANGED})
 
 MERGE = "merge"
 REPLACE = "replace"
@@ -81,7 +84,8 @@ class IdentityBlock:
     """The ``oauthAccount`` fields for one account, ready to write.
 
     ``fields`` holds the exact keys to put in the config. ``complete`` is
-    True only when the block carries the stored profile. ``account_id`` is
+    True only when the block carries every ``COMPLETENESS_GATE_FIELDS`` key,
+    so Claude Code will not run its unguarded profile merges over it. ``account_id`` is
     the jacked row id (0 when no row is known). ``email``,
     ``organization_uuid`` and ``account_uuid`` are the identity keys that
     the merge predicate and the post-write check use.
@@ -93,27 +97,6 @@ class IdentityBlock:
     email: str
     organization_uuid: str | None
     account_uuid: str | None
-
-
-@dataclass(frozen=True)
-class WriteResult:
-    """The outcome of one ``write_identity`` call.
-
-    ``status`` is one of ``WRITE_STATUSES``. ``mode`` is ``"merge"`` or
-    ``"replace"`` when the block was applied, else None.
-    """
-
-    status: str
-    mode: str | None = field(default=None)
-
-    @property
-    def ok(self) -> bool:
-        """True when the config holds the block after the call.
-
-        >>> WriteResult("written").ok, WriteResult("locked").ok
-        (True, False)
-        """
-        return self.status in _SUCCESS_STATUSES
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +162,62 @@ def _coalesce(value: Any, default: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def profile_owner_mismatch(
+    row_email: Any,
+    row_org: Any,
+    row_uuid: Any,
+    profile: Any,
+    *,
+    require_uuid: bool = True,
+) -> str | None:
+    """Return the first profile field that shows another owner, or None.
+
+    The one owner rule for a profile response or a stored profile: the
+    ``account.email`` must casefold-equal the row email; the
+    ``organization.uuid`` must equal the row org when the row has one; and,
+    with ``require_uuid``, the ``account.uuid`` must equal the row uuid when
+    both are known. The result is a field NAME, safe to log.
+
+    >>> p = {"account": {"email": "A@b.c", "uuid": "u1"}, "organization": {"uuid": "o1"}}
+    >>> profile_owner_mismatch("a@b.c", "o1", "u1", p) is None
+    True
+    >>> profile_owner_mismatch("a@b.c", "o2", None, p)
+    'organization.uuid'
+    >>> profile_owner_mismatch("z@b.c", "", None, p)
+    'account.email'
+    """
+    if not isinstance(profile, Mapping):
+        return "profile"
+    account = profile.get("account")
+    if not isinstance(account, Mapping):
+        return "account"
+    if _norm_email(account.get("email")) is None or _norm_email(
+        account.get("email")
+    ) != _norm_email(row_email):
+        return "account.email"
+    org = _norm_org(row_org)
+    if org is not None:
+        organization = profile.get("organization")
+        profile_org = (
+            _norm_org(organization.get("uuid"))
+            if isinstance(organization, Mapping)
+            else None
+        )
+        if profile_org != org:
+            return "organization.uuid"
+    if require_uuid:
+        own_uuid = _text(row_uuid)
+        profile_uuid = _text(account.get("uuid"))
+        if own_uuid and profile_uuid and own_uuid != profile_uuid:
+            return "account.uuid"
+    return None
+
+
 def _load_profile(row: Mapping, email: str, org_uuid: str | None):
     """Return ``(account, organization)`` from the stored profile, or None.
 
-    The profile is used only when it belongs to the row: the profile email
-    must casefold-equal the row email, and the profile org must equal the
-    row org when both are known.
+    The profile is used only when ``profile_owner_mismatch`` accepts it for
+    the row, and only when it has both objects.
     """
     raw = row.get("profile_json")
     if not raw:
@@ -205,20 +238,29 @@ def _load_profile(row: Mapping, email: str, org_uuid: str | None):
             account_id,
         )
         return None
-    if _norm_email(account.get("email")) != _norm_email(email):
+    mismatch = profile_owner_mismatch(
+        email, org_uuid, row.get("account_uuid"), data, require_uuid=False
+    )
+    if mismatch is not None:
         logger.warning(
-            "Account %s: stored profile email does not match the row; ignored",
+            "Account %s: stored profile does not belong to the row (%s); ignored",
             account_id,
-        )
-        return None
-    profile_org = _norm_org(organization.get("uuid"))
-    if org_uuid and profile_org and profile_org != org_uuid:
-        logger.warning(
-            "Account %s: stored profile organization does not match the row; ignored",
-            account_id,
+            mismatch,
         )
         return None
     return account, organization
+
+
+def stored_profile(row: Mapping) -> tuple[dict, dict] | None:
+    """Return the stored ``(account, organization)`` the builder would use.
+
+    >>> stored_profile({"email": "a@b.c"}) is None
+    True
+    """
+    email = (row.get("email") or "").strip()
+    if not email:
+        return None
+    return _load_profile(row, email, _norm_org(row.get("organization_uuid")))
 
 
 def _uuid_is_shared(db, account_uuid: str, email: str, account_id: int) -> bool:
@@ -295,9 +337,10 @@ def build_identity_block(row: Mapping, *, db=None) -> IdentityBlock | None:
 
     Return None for a row of another provider, or for a row without an
     email. With a stored profile, the block has the field set of the Claude
-    Code profile writer (``complete=True``). Without one, the block has the
-    minimal identity (``complete=False``). When ``db`` is given and the uuid
-    is stored on a Claude row with a different email, the uuid is omitted.
+    Code profile writer. Without one, the block has the minimal identity.
+    ``complete`` is True only when every ``COMPLETENESS_GATE_FIELDS`` key is
+    present. When ``db`` is given and the uuid is stored on a Claude row
+    with a different email, the uuid is omitted.
 
     >>> build_identity_block({"provider": "codex", "email": "a@b.c"}) is None
     True
@@ -334,7 +377,7 @@ def build_identity_block(row: Mapping, *, db=None) -> IdentityBlock | None:
         )
 
     account, organization = profile
-    # The row may not know its org yet. The profile passed the email guard,
+    # The row may not know its org yet. The profile passed the owner guard,
     # so its org is this account's org. Every org-dependent choice below
     # (the org field, the tier key, the merge predicate) uses this value.
     if org_uuid is None:
@@ -347,11 +390,15 @@ def build_identity_block(row: Mapping, *, db=None) -> IdentityBlock | None:
     fields["hasExtraUsageEnabled"] = _coalesce(
         organization.get("has_extra_usage_enabled"), False
     )
-    fields["billingType"] = organization.get("billing_type")
-    fields["accountCreatedAt"] = account.get("created_at")
-    subscription_created = organization.get("subscription_created_at")
-    if subscription_created is not None:
-        fields["subscriptionCreatedAt"] = subscription_created
+    # Claude Code writes these with ``?? void 0``: a missing value leaves
+    # the key out, and a missing key re-arms its profile fetch.
+    for key, value in (
+        ("billingType", organization.get("billing_type")),
+        ("accountCreatedAt", account.get("created_at")),
+        ("subscriptionCreatedAt", organization.get("subscription_created_at")),
+    ):
+        if value is not None:
+            fields[key] = value
     fields["ccOnboardingFlags"] = copy.deepcopy(
         _coalesce(organization.get("cc_onboarding_flags"), {})
     )
@@ -378,7 +425,7 @@ def build_identity_block(row: Mapping, *, db=None) -> IdentityBlock | None:
         fields[tier_key] = tier
     return IdentityBlock(
         fields=fields,
-        complete=True,
+        complete=all(key in fields for key in COMPLETENESS_GATE_FIELDS),
         account_id=account_id,
         email=email,
         organization_uuid=org_uuid,
@@ -415,12 +462,25 @@ def is_same_account(existing: Any, block: IdentityBlock) -> bool:
     return existing.get("accountUuid") == block.account_uuid
 
 
+def _fetched_ms(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
 def _apply(config: dict, block: IdentityBlock) -> str:
     """Apply ``block`` to ``config`` and return the mode that was used."""
     existing = config.get("oauthAccount")
     if is_same_account(existing, block):
         merged = dict(existing)
+        # Claude Code fetched this same account's profile after jacked did.
+        # Its profile fields are fresher, so only the identity keys change.
+        theirs = _fetched_ms(existing.get("profileFetchedAt"))
+        ours = _fetched_ms(block.fields.get("profileFetchedAt"))
+        identity_only = theirs is not None and (ours is None or theirs > ours)
         for key, value in block.fields.items():
+            if identity_only and key not in IDENTITY_FIELDS:
+                continue
             if key == "accountUuid" and not value:
                 continue
             # A case-only difference is the same identity. Keep the stored
@@ -439,8 +499,9 @@ def apply_identity(config: dict, block: IdentityBlock) -> None:
 
     MERGE when ``is_same_account`` is True: the existing uuid and every
     field that the block does not carry stay, and the block fields are
-    written over the rest. REPLACE otherwise. Other top-level keys do not
-    change.
+    written over the rest (only the identity keys when the existing block
+    was fetched after jacked's stored profile). REPLACE otherwise. Other
+    top-level keys do not change.
 
     >>> cfg = {"theme": "dark", "oauthAccount": {"emailAddress": "z@b.c", "x": 1}}
     >>> apply_identity(cfg, minimal_identity_block(1, "a@b.c"))
@@ -450,188 +511,13 @@ def apply_identity(config: dict, block: IdentityBlock) -> None:
     _apply(config, block)
 
 
-# ---------------------------------------------------------------------------
-# Config lock (proper-lockfile compatible: an EMPTY <config>.lock directory)
-# ---------------------------------------------------------------------------
+def diverged_identity_fields(current: dict | None, block: IdentityBlock) -> list[str]:
+    """Return the identity field names where ``current`` differs from ``block``.
 
-
-def _lock_path_for(config_path: Path) -> Path:
-    return config_path.with_name(config_path.name + LOCK_SUFFIX)
-
-
-def _is_windows() -> bool:
-    """True on Windows, where a lock directory can be "delete pending".
-
-    >>> isinstance(_is_windows(), bool)
-    True
+    >>> b = minimal_identity_block(1, "a@b.c", "o1")
+    >>> diverged_identity_fields({"emailAddress": "A@b.c", "organizationUuid": "o2"}, b)
+    ['organizationUuid']
     """
-    return os.name == "nt" or sys.platform == "win32"
-
-
-def _clear_stale_lock(lock_path: Path) -> bool:
-    """Remove an empty lock directory that is older than the stale limit.
-
-    Return True when the caller can try ``mkdir`` again at once. A lock
-    directory that is not empty is not ours, so it is never removed.
-
-    The lock is examined again immediately before ``rmdir``. When its
-    ``st_mtime`` or ``st_ino`` changed after the age check, another process
-    replaced it, and it is not removed. A small race remains between that
-    second check and ``rmdir``. The compare-and-swap read and the
-    post-write verify in ``write_identity`` cover that race.
-    """
-    try:
-        first = os.lstat(lock_path)
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    age = time.time() - first.st_mtime
-    if age <= STALE_LOCK_SECONDS:
-        return False
-    try:
-        second = os.lstat(lock_path)
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    if second.st_mtime != first.st_mtime or second.st_ino != first.st_ino:
-        logger.debug("Claude config lock was replaced during the stale check; kept")
-        return False
-    try:
-        os.rmdir(lock_path)
-    except FileNotFoundError:
-        return True
-    except OSError:
-        logger.debug("Stale Claude config lock is not an empty directory; treated as held")
-        return False
-    logger.info("Removed a stale Claude config lock (age %.0f s)", age)
-    return True
-
-
-def _acquire_lock(lock_path: Path, timeout: float) -> bool:
-    """Create the lock directory, retrying until ``timeout`` seconds pass.
-
-    Raise OSError for a failure other than "the lock exists". On Windows,
-    ``mkdir`` raises PermissionError while a removed lock directory is
-    still "delete pending". That is a held lock that goes away soon, so the
-    call retries until the deadline. It never clears such a lock as stale.
-    """
-    deadline = time.monotonic() + max(float(timeout), 0.0)
-    retried_stale = False
-    while True:
-        try:
-            os.mkdir(lock_path)
-            return True
-        except FileExistsError:
-            # After a stale lock is cleared, always try once more, even when
-            # the timeout is zero.
-            if _clear_stale_lock(lock_path) and (
-                not retried_stale or time.monotonic() < deadline
-            ):
-                retried_stale = True
-                continue
-        except PermissionError:
-            if not _is_windows():
-                raise
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(_LOCK_POLL_SECONDS, remaining))
-
-
-def _release_lock(lock_path: Path) -> None:
-    """Remove the lock directory, with a bounded retry for Windows scanners."""
-    for attempt in range(_RELEASE_ATTEMPTS):
-        try:
-            os.rmdir(lock_path)
-            return
-        except FileNotFoundError:
-            logger.warning(
-                "Claude config lock was removed by another process before release"
-            )
-            return
-        except OSError:
-            if attempt < _RELEASE_ATTEMPTS - 1:
-                time.sleep(_RELEASE_BACKOFF_SECONDS * (attempt + 1))
-    logger.warning("Could not release the Claude config lock")
-
-
-# ---------------------------------------------------------------------------
-# Writer
-# ---------------------------------------------------------------------------
-
-
-def _read_config_for_write(config_path: Path) -> dict | None:
-    """Read the config under the lock.
-
-    An absent file gives an empty dict. A file that cannot be read or that
-    is not a JSON object gives None (fail closed: never start fresh over it).
-    """
-    try:
-        text = config_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return {}
-    except (OSError, ValueError):
-        return None
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _atomic_write_json(config_path: Path, data: dict) -> None:
-    """Write ``data`` to ``config_path`` through a private temp file."""
-    fd, tmp = tempfile.mkstemp(
-        dir=str(config_path.parent), prefix=".claude_json_tmp_", suffix=".json"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        _safe_replace(tmp, str(config_path))
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def _write_locked(
-    config_path: Path, block: IdentityBlock, expected: dict | None
-) -> WriteResult:
-    """Read, compare-and-swap and write. Call this only under the lock."""
-    if config_path.is_symlink():
-        return WriteResult(SYMLINK)
-    config = _read_config_for_write(config_path)
-    if config is None:
-        return WriteResult(UNREADABLE)
-    if expected is not None and config.get("oauthAccount") != expected:
-        return WriteResult(CAS_ABORTED)
-    had_block = "oauthAccount" in config
-    before = copy.deepcopy(config.get("oauthAccount"))
-    mode = _apply(config, block)
-    if had_block and config["oauthAccount"] == before:
-        return WriteResult(UNCHANGED, mode)
-    try:
-        _atomic_write_json(config_path, config)
-    except Exception as exc:  # noqa: BLE001 - every write error is reported
-        logger.warning(
-            "Account %d: could not write the Claude config (%s)",
-            block.account_id,
-            type(exc).__name__,
-        )
-        return WriteResult(WRITE_FAILED, mode)
-    return WriteResult(WRITTEN, mode)
-
-
-def _diverged_fields(current: dict | None, block: IdentityBlock) -> list[str]:
-    """Return the identity field names where ``current`` differs from ``block``."""
     if current is None:
         return ["oauthAccount"]
     diverged = []
@@ -644,40 +530,9 @@ def _diverged_fields(current: dict | None, block: IdentityBlock) -> list[str]:
     return diverged
 
 
-def _write(
-    home: Path, block: IdentityBlock, expected: dict | None, lock_timeout: float
-) -> WriteResult:
-    config_path = home / CONFIG_FILENAME
-    if config_path.is_symlink():
-        return WriteResult(SYMLINK)
-    lock_path = _lock_path_for(config_path)
-    try:
-        acquired = _acquire_lock(lock_path, lock_timeout)
-    except OSError as exc:
-        logger.warning(
-            "Account %d: could not create the Claude config lock (%s)",
-            block.account_id,
-            type(exc).__name__,
-        )
-        return WriteResult(WRITE_FAILED)
-    if not acquired:
-        return WriteResult(LOCKED)
-    try:
-        result = _write_locked(config_path, block, expected)
-    finally:
-        _release_lock(lock_path)
-    if result.status != WRITTEN:
-        return result
-    diverged = _diverged_fields(read_claude_config_identity(home), block)
-    if diverged:
-        logger.warning(
-            "Account %d: post-verify-mismatch after the Claude config write "
-            "(fields: %s); another writer changed the identity",
-            block.account_id,
-            ", ".join(diverged),
-        )
-        return WriteResult(POST_VERIFY_MISMATCH, result.mode)
-    return result
+# ---------------------------------------------------------------------------
+# Write and read
+# ---------------------------------------------------------------------------
 
 
 def write_identity(
@@ -687,16 +542,18 @@ def write_identity(
     strict: bool = False,
     expected: dict | None = None,
     lock_timeout: float | None = None,
+    scoped: bool = False,
 ) -> WriteResult:
-    """Write ``block`` into ``<home>/.claude.json`` safely.
+    """Write ``block`` into the Claude config of ``home`` safely.
 
-    The write takes the ``.claude.json.lock`` directory lock, reads the
-    config, compares ``expected`` with the current ``oauthAccount`` when
-    ``expected`` is given, applies the block and replaces the file
-    atomically with mode 0600. After the lock is released, the identity is
-    read again and verified. An existing config that is not a JSON object
-    is never overwritten. With ``strict``, every status other than
-    ``written`` and ``unchanged`` raises ``ClaudeConfigUnwritable``.
+    ``scoped`` marks ``home`` as a ``CLAUDE_CONFIG_DIR`` directory (a
+    per-account dir) instead of the user's home.
+
+    See ``claude_config_store.write_config_identity`` for the lock, the
+    fail-closed read, the whole-file compare-and-swap and the post-write
+    verify. ``expected`` adds a compare on the ``oauthAccount`` that the
+    caller read. With ``strict``, every status other than ``written`` and
+    ``unchanged`` raises ``ClaudeConfigUnwritable``.
 
     ``lock_timeout`` is the lock wait in seconds. When it is None, a strict
     call waits ``STRICT_LOCK_TIMEOUT_SECONDS`` and other calls wait
@@ -706,7 +563,15 @@ def write_identity(
         lock_timeout = (
             STRICT_LOCK_TIMEOUT_SECONDS if strict else DEFAULT_LOCK_TIMEOUT_SECONDS
         )
-    result = _write(Path(home), block, expected, lock_timeout)
+    result = store.write_config_identity(
+        home,
+        lambda config: _apply(config, block),
+        lambda current: diverged_identity_fields(current, block),
+        account_id=block.account_id,
+        expected=expected,
+        lock_timeout=lock_timeout,
+        scoped=scoped,
+    )
     if result.status == WRITTEN:
         logger.info(
             "Account %d: published the Claude identity (%s, %s, uuid %s)",
@@ -727,19 +592,10 @@ def write_identity(
 
 
 def read_claude_config_identity(home: Path | str) -> dict | None:
-    """Return the ``oauthAccount`` block of ``<home>/.claude.json``, or None.
+    """Return the ``oauthAccount`` block of the Claude config, or None.
 
-    None means a missing file, a symlink, a file that is not a JSON object,
-    or no ``oauthAccount`` object. The read does not take the lock.
+    None means no supported config, a missing file, a symlink, a file that
+    is not a JSON object, or no ``oauthAccount`` object. The read does not
+    take the lock.
     """
-    config_path = Path(home) / CONFIG_FILENAME
-    if config_path.is_symlink():
-        return None
-    try:
-        data = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    block = data.get("oauthAccount")
-    return block if isinstance(block, dict) else None
+    return store.read_config_identity(home)

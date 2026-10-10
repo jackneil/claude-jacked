@@ -639,7 +639,7 @@ def test_stale_lock_replaced_after_the_age_check_is_never_removed(
     tmp_path, monkeypatch
 ) -> None:
     """A holder that re-creates the lock inside the stale window keeps it."""
-    from jacked.api import claude_identity
+    from jacked.api import claude_config_store as claude_identity
 
     lock = tmp_path / ".claude.json.lock"
     lock.mkdir()
@@ -680,7 +680,7 @@ def test_stale_lock_replaced_after_the_age_check_is_never_removed(
 
 
 def test_failed_lock_release_logs_a_warning(tmp_path, monkeypatch, caplog) -> None:
-    from jacked.api import claude_identity
+    from jacked.api import claude_config_store as claude_identity
 
     real_rmdir = os.rmdir
     lock = tmp_path / ".claude.json.lock"
@@ -692,7 +692,7 @@ def test_failed_lock_release_logs_a_warning(tmp_path, monkeypatch, caplog) -> No
 
     monkeypatch.setattr(claude_identity.os, "rmdir", stuck_rmdir)
     monkeypatch.setattr(claude_identity.time, "sleep", lambda _s: None)
-    caplog.set_level(logging.WARNING, logger="jacked.api.claude_identity")
+    caplog.set_level(logging.WARNING, logger="jacked.api.claude_config_store")
 
     result = write_identity(tmp_path, build_identity_block(_row()))
 
@@ -715,7 +715,7 @@ class _FakeClock:
 
 
 def _patch_clock(monkeypatch) -> _FakeClock:
-    from jacked.api import claude_identity
+    from jacked.api import claude_config_store as claude_identity
 
     clock = _FakeClock()
     fake_time = SimpleNamespace(
@@ -764,7 +764,7 @@ def test_explicit_lock_timeout_wins_for_a_strict_writer(tmp_path, monkeypatch) -
 
 def _windows_mkdir(monkeypatch, failures: int | None):
     """Make the lock mkdir fail like a delete-pending directory on Windows."""
-    from jacked.api import claude_identity
+    from jacked.api import claude_config_store as claude_identity
 
     real_mkdir = os.mkdir
     calls = {"n": 0}
@@ -809,7 +809,7 @@ def test_windows_delete_pending_lock_past_the_deadline_is_locked(
 
 
 def test_permission_error_off_windows_is_a_write_failure(tmp_path, monkeypatch) -> None:
-    from jacked.api import claude_identity
+    from jacked.api import claude_config_store as claude_identity
 
     _windows_mkdir(monkeypatch, failures=None)
     monkeypatch.setattr(claude_identity, "_is_windows", lambda: False)
@@ -827,7 +827,7 @@ def test_permission_error_off_windows_is_a_write_failure(tmp_path, monkeypatch) 
 def test_is_windows_reads_os_name_and_sys_platform(
     monkeypatch, os_name, platform, expected
 ) -> None:
-    from jacked.api import claude_identity
+    from jacked.api import claude_config_store as claude_identity
 
     monkeypatch.setattr(
         claude_identity, "os", SimpleNamespace(name=os_name)
@@ -859,12 +859,12 @@ def test_compare_and_swap_writes_when_the_block_is_as_expected(tmp_path) -> None
 
 
 def test_post_verify_catches_a_concurrent_writer(tmp_path, monkeypatch) -> None:
-    from jacked.api import claude_identity
+    from jacked.api import claude_config_store as claude_identity
 
     real_release = claude_identity._release_lock
 
-    def release_then_clobber(lock_path):
-        real_release(lock_path)
+    def release_then_clobber(lock_path, inode):
+        real_release(lock_path, inode)
         # Another process (a stale Claude Code) writes the old person back.
         _write_config(
             tmp_path,
@@ -881,7 +881,7 @@ def test_post_verify_catches_a_concurrent_writer(tmp_path, monkeypatch) -> None:
 
 
 def test_write_failure_is_reported(tmp_path, monkeypatch) -> None:
-    from jacked.api import claude_identity
+    from jacked.api import claude_config_store as claude_identity
 
     def boom(*_args, **_kwargs):
         raise PermissionError("denied")
@@ -927,7 +927,7 @@ def test_strict_raises_for_a_symlinked_config(tmp_path) -> None:
 
 
 def test_strict_raises_for_a_failed_write(tmp_path, monkeypatch) -> None:
-    from jacked.api import claude_identity
+    from jacked.api import claude_config_store as claude_identity
 
     def boom(*_args, **_kwargs):
         raise PermissionError("denied")
@@ -948,7 +948,7 @@ def test_strict_does_not_raise_for_written_or_unchanged(tmp_path) -> None:
 
 
 def test_write_logs_no_email_or_full_uuid(tmp_path, caplog) -> None:
-    caplog.set_level(logging.DEBUG, logger="jacked.api.claude_identity")
+    caplog.set_level(logging.DEBUG, logger="jacked.api.claude_config_store")
     _write_config(tmp_path, "{torn")
     write_identity(tmp_path, build_identity_block(_row()))
     (tmp_path / ".claude.json").unlink()

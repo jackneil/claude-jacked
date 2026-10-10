@@ -6,16 +6,16 @@ previous account back into the config, and running sessions then key their
 usage cache, consent and gating on the wrong account.
 
 The service observer submits each published snapshot to this watcher. The
-watcher runs on one daemon worker thread, so a slow profile lookup or a held
-config lock never delays the observer. A submit while a run is in flight is
-skipped. When the config identity diverges from the block jacked would
-publish for the account that holds the authority, the watcher republishes
-that block. It writes only when all of these are true:
+watcher runs on one long-lived daemon worker thread, so a slow profile lookup
+or a held config lock never delays the observer. A submit while a check is
+queued or running is skipped. When the config identity diverges from the
+block jacked would publish for the account that holds the authority, the
+watcher republishes that block. It writes only when all of these are true:
 
 1. The service has no ``CLAUDE_CONFIG_DIR`` and the observation is a
    RESOLVED global observation of a Claude row.
-2. The stored access token belongs to the observed row. One profile GET
-   proves this. The GET never refreshes a token and never writes the
+2. The stored access token belongs to the observed row and to the block
+   that would be written. One profile GET proves this. The GET never refreshes a token and never writes the
    database. The result is cached per authority payload digest.
 3. The switch lease is free, and under the lease the authority digest and
    the observed and desired accounts are unchanged.
@@ -24,7 +24,9 @@ that block. It writes only when all of these are true:
 
 The watcher makes at most one attempt per account per minute. A breaker stops
 the writes when one account needs more than three republishes in fifteen
-minutes. Logs carry row ids, 8-character uuid prefixes and field names only,
+minutes. A tripped breaker, an unproven owner and a stamp mismatch stay in
+every snapshot while they last, a divergence older than five minutes logs a
+WARNING, and ``status()`` reports each account for diagnostics. Logs carry row ids, 8-character uuid prefixes and field names only,
 never emails or tokens.
 """
 
@@ -34,6 +36,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from collections import OrderedDict
@@ -54,7 +57,23 @@ CONFIG_LOCK_TIMEOUT_SECONDS = 1.0
 # unchanged row and config. The builder also reads other rows (the shared
 # uuid check), so the verdict is not kept forever.
 SETTLED_TTL_SECONDS = 15 * 60.0
+# A divergence that survives this long gets one WARNING, so a watcher that
+# cannot repair (owner unproven, breaker tripped, write locked) is visible.
+LONG_DIVERGENCE_SECONDS = 5 * 60.0
 _OWNER_CACHE_LIMIT = 32
+# The account row columns that decide the published block. A change in any
+# other column (usage caches, timestamps) does not invalidate a verdict.
+IDENTITY_COLUMNS = (
+    "id",
+    "provider",
+    "email",
+    "organization_uuid",
+    "organization_name",
+    "account_uuid",
+    "profile_json",
+    "profile_fetched_at",
+    "rate_limit_tier",
+)
 
 EVIDENCE_PREFIX = "claude-config:identity:"
 EVIDENCE_REPUBLISHED = f"{EVIDENCE_PREFIX}republished"
@@ -65,8 +84,19 @@ EVIDENCE_FLAPPING = f"{EVIDENCE_PREFIX}flapping"
 EVIDENCE_OWNER_UNPROVEN = f"{EVIDENCE_PREFIX}owner-unproven"
 EVIDENCE_DEFERRED_SWITCH = f"{EVIDENCE_PREFIX}deferred-switch"
 EVIDENCE_STAMP_MISMATCH = "authority:stamp-mismatch"
+EVIDENCE_DISABLED = f"{EVIDENCE_PREFIX}disabled"
+# Reasons that stay in every snapshot while they last. One-shot evidence
+# alone vanishes from the snapshot ten seconds later.
+_STICKY_EVIDENCE = {
+    "flapping": EVIDENCE_FLAPPING,
+    "stamp-mismatch": EVIDENCE_STAMP_MISMATCH,
+    "owner-unproven": EVIDENCE_OWNER_UNPROVEN,
+}
 
 _LANDED = "written"
+# A write that landed and was then reverted counts as a republish for the
+# breaker: that is exactly the flapping case.
+_COUNTED_STATUSES = frozenset({"written", "post_verify_mismatch"})
 
 _VERDICT_PROFILE = "profile"
 _VERDICT_UNPROVEN = "unproven"
@@ -105,13 +135,23 @@ class _AccountState:
     breaker_key: tuple[str, int | None] | None = None
     tripped: bool = False
     last_reason: str | None = None
-    # (sha256 of the row and the config, when) for a block that matched.
+    reason_since: float | None = None
+    # (sha256 of the identity columns and the config, when) for a block
+    # that matched.
     settled: tuple[str, float] | None = None
+    divergent_since: float | None = None
+    long_divergence_warned: bool = False
+    last_republish_at: float | None = None
+
+
+def _identity_row(row: dict) -> dict:
+    """Return only the columns that decide the published block."""
+    return {key: row.get(key) for key in IDENTITY_COLUMNS}
 
 
 def _settle_key(row: dict, config: dict) -> str:
-    """Digest the row and the config. Only the digest is kept, never a value."""
-    raw = json.dumps([row, config], sort_keys=True, default=str)
+    """Digest the identity columns and the config. Only the digest is kept."""
+    raw = json.dumps([_identity_row(row), config], sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -192,37 +232,6 @@ def _prefix(value: Any) -> str:
     return value[:8] if isinstance(value, str) and value else "none"
 
 
-def _stored_created_at(row: dict) -> str | None:
-    raw = row.get("profile_json")
-    if not isinstance(raw, str) or not raw:
-        return None
-    try:
-        profile = json.loads(raw)
-    except ValueError:
-        return None
-    account = profile.get("account") if isinstance(profile, dict) else None
-    return _text(account.get("created_at")) if isinstance(account, dict) else None
-
-
-def _diverged_fields(row: dict, config: dict) -> list[str]:
-    """Name the config identity fields that disagree with the row."""
-    diverged = []
-    if _casefold(config.get("emailAddress")) != _casefold(row.get("email")):
-        diverged.append("emailAddress")
-    row_org = _text(row.get("organization_uuid"))
-    if row_org is not None and config.get("organizationUuid") != row_org:
-        diverged.append("organizationUuid")
-    row_uuid = _text(row.get("account_uuid"))
-    if row_uuid is not None and config.get("accountUuid") != row_uuid:
-        diverged.append("accountUuid")
-    created_at = _stored_created_at(row)
-    if created_at is not None and config.get("accountCreatedAt") != created_at:
-        # A missing value is "incomplete": Claude Code then re-arms its
-        # unguarded profile merge, so it gets one republish too.
-        diverged.append("accountCreatedAt")
-    return diverged
-
-
 def _strip(value: Any) -> str | None:
     text = value.strip() if isinstance(value, str) else ""
     return text or None
@@ -231,12 +240,13 @@ def _strip(value: Any) -> str | None:
 def _block_diverged_fields(block: Any, config: dict) -> list[str]:
     """Name the config identity fields that disagree with the block.
 
-    The raw row check above is only a cheap trigger. The builder can
-    legitimately differ from the raw row: it ignores a stored profile that
-    belongs to another person, omits a uuid that another person's row also
-    carries, and takes the account uuid from the stored profile. A field
-    counts here only when the block carries it, so a field the block will
-    never write can never cause a republish loop.
+    The block is what a write would put in the config, so it is the only
+    trigger. A field counts only when the block carries it, so a field the
+    block will never write can never cause a republish loop.
+    ``accountCreatedAt`` is fixed for one person and
+    ``subscriptionCreatedAt`` for one organization subscription: a
+    different value proves that another account's profile was merged in,
+    and a missing value means Claude Code will re-run its unguarded merge.
     """
     diverged = []
     if _casefold(config.get("emailAddress")) != _casefold(getattr(block, "email", None)):
@@ -248,9 +258,11 @@ def _block_diverged_fields(block: Any, config: dict) -> list[str]:
     if block_uuid is not None and config.get("accountUuid") != block_uuid:
         diverged.append("accountUuid")
     fields = getattr(block, "fields", None)
-    created_at = _text(fields.get("accountCreatedAt")) if isinstance(fields, dict) else None
-    if created_at is not None and config.get("accountCreatedAt") != created_at:
-        diverged.append("accountCreatedAt")
+    fields = fields if isinstance(fields, dict) else {}
+    for key in ("accountCreatedAt", "subscriptionCreatedAt"):
+        value = _text(fields.get(key))
+        if value is not None and config.get(key) != value:
+            diverged.append(key)
     return diverged
 
 
@@ -274,14 +286,34 @@ def _row_for_identity(db, email: Any, organization_uuid: Any) -> int | None:
     return int(chosen[0]["id"]) if len(chosen) == 1 else None
 
 
-def _owner_matches(proof: _OwnerProof, row: dict) -> bool:
-    if not proof.email or proof.email != _casefold(row.get("email")):
+def _proof_matches(proof: _OwnerProof, email: Any, org: Any, account_uuid: Any) -> bool:
+    if not proof.email or proof.email != _casefold(email):
         return False
-    row_org = _text(row.get("organization_uuid"))
-    if row_org is not None and proof.organization_uuid != row_org:
+    wanted_org = _strip(org)
+    if wanted_org is not None and _strip(proof.organization_uuid) != wanted_org:
         return False
-    row_uuid = _text(row.get("account_uuid"))
-    return row_uuid is None or proof.account_uuid == row_uuid
+    wanted_uuid = _text(account_uuid)
+    return wanted_uuid is None or proof.account_uuid == wanted_uuid
+
+
+def _owner_matches(proof: _OwnerProof, row: dict, block: Any = None) -> bool:
+    """True when the token's profile owns the row AND the block to write.
+
+    The block can carry an org or a uuid that the row does not (both come
+    from the stored profile), so the proof is checked against both.
+    """
+    if not _proof_matches(
+        proof, row.get("email"), row.get("organization_uuid"), row.get("account_uuid")
+    ):
+        return False
+    if block is None:
+        return True
+    return _proof_matches(
+        proof,
+        getattr(block, "email", None),
+        getattr(block, "organization_uuid", None),
+        getattr(block, "account_uuid", None),
+    )
 
 
 def _status_name(result: Any) -> str:
@@ -290,10 +322,29 @@ def _status_name(result: Any) -> str:
 
 
 def _config_mtime(home: Path) -> str:
+    from jacked.api.claude_config_store import claude_config_path
+
+    path = claude_config_path(home)
     try:
-        return f"{(home / '.claude.json').stat().st_mtime:.0f}"
+        return f"{path.stat().st_mtime:.0f}" if path is not None else "unknown"
     except OSError:
         return "unknown"
+
+
+_DISABLED_WARNED = False
+
+
+def _warn_disabled_once() -> None:
+    """Log once per process that ``CLAUDE_CONFIG_DIR`` disables the watcher."""
+    global _DISABLED_WARNED
+    if _DISABLED_WARNED:
+        return
+    _DISABLED_WARNED = True
+    logger.warning(
+        "The Claude config identity watcher is disabled because CLAUDE_CONFIG_DIR "
+        "is set in the jacked service environment; a stale Claude Code process "
+        "can write a previous account into the config and jacked will not repair it"
+    )
 
 
 class IdentityWatcher:
@@ -329,13 +380,52 @@ class IdentityWatcher:
         self._evidence: list[str] = []
         self._states: dict[int, _AccountState] = {}
         self._owner_cache: OrderedDict[str, _OwnerProof] = OrderedDict()
+        self._disabled = False
+        # One long-lived daemon worker with a queue of one: a submit while a
+        # check is queued or running is skipped.
+        self._queue: queue.Queue = queue.Queue(maxsize=1)
+        self._worker: threading.Thread | None = None
+        self._worker_guard = threading.Lock()
 
     def drain_evidence(self) -> tuple[str, ...]:
-        """Return and clear the evidence of the previous runs, in order."""
+        """Return the evidence for the next snapshot, in order.
+
+        One-shot evidence of the previous runs is cleared. Sticky evidence
+        (a tripped breaker, a stamp mismatch, an unproven owner, a disabled
+        watcher) is returned again on every call while it lasts.
+        """
         with self._evidence_lock:
-            drained = tuple(dict.fromkeys(self._evidence))
+            items = list(self._evidence)
             self._evidence.clear()
-        return drained
+        if self._disabled:
+            items.append(EVIDENCE_DISABLED)
+        for state in list(self._states.values()):
+            sticky = _STICKY_EVIDENCE.get(state.last_reason or "")
+            if sticky:
+                items.append(sticky)
+        return tuple(dict.fromkeys(items))
+
+    def status(self) -> dict:
+        """Return a values-free status for diagnostics.
+
+        Each account entry carries the last reason, how long it has held,
+        the time of the last republish and whether the breaker is tripped.
+        """
+        now = self._clock()
+        accounts = {}
+        for account_id, state in sorted(self._states.items()):
+            accounts[str(account_id)] = {
+                "reason": state.last_reason,
+                "reason_for_seconds": (
+                    round(now - state.reason_since) if state.reason_since else None
+                ),
+                "divergent_for_seconds": (
+                    round(now - state.divergent_since) if state.divergent_since else None
+                ),
+                "last_republish_at": state.last_republish_at,
+                "breaker_tripped": state.tripped,
+            }
+        return {"disabled": self._disabled, "accounts": accounts}
 
     def run(self, update: SnapshotUpdate, db, home: Path) -> None:
         """Check one published snapshot on the caller thread.
@@ -350,45 +440,54 @@ class IdentityWatcher:
             self._run_lock.release()
 
     def submit(self, update: SnapshotUpdate, db, home: Path) -> bool:
-        """Check one published snapshot on a daemon worker thread.
+        """Queue one published snapshot for the daemon worker.
 
-        Return True when a worker started. Return False when a run is still
-        in flight; the next snapshot gets the next check. The worker is a
-        daemon, so it never holds up the shutdown of the service. Its
-        evidence is held for :meth:`drain_evidence`.
+        Return True when the check was queued. Return False when a check is
+        still queued or running; the next snapshot gets the next check. The
+        worker is a daemon, so it never holds up the shutdown of the service.
+        Its evidence is held for :meth:`drain_evidence`.
         """
-        if not self._run_lock.acquire(blocking=False):
+        self._ensure_worker()
+        if self._run_lock.locked():
             return False
         try:
-            worker = threading.Thread(
-                target=self._work,
-                args=(update, db, Path(home)),
-                name="jacked-identity-watcher",
-                daemon=True,
-            )
-            worker.start()
-        except BaseException:
-            self._run_lock.release()
-            raise
+            self._queue.put_nowait((update, db, Path(home)))
+        except queue.Full:
+            return False
         return True
 
     def wait_idle(self, timeout: float | None = None) -> bool:
-        """Wait until no run is in flight. Return False on a timeout."""
-        acquired = self._run_lock.acquire(timeout=-1 if timeout is None else timeout)
-        if acquired:
-            self._run_lock.release()
-        return acquired
+        """Wait until no check is queued or running. Return False on a timeout."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            with self._queue.mutex:
+                if self._queue.unfinished_tasks == 0:
+                    return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
 
     # -- internals -----------------------------------------------------------
 
-    def _work(self, update: SnapshotUpdate, db, home: Path) -> None:
-        """Worker body: run one check, then free the worker slot."""
-        try:
-            self._run(update, db, home)
-        except Exception:  # noqa: BLE001 - a worker error must never escape
-            logger.warning("Claude config identity watcher failed", exc_info=True)
-        finally:
-            self._run_lock.release()
+    def _ensure_worker(self) -> None:
+        with self._worker_guard:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._worker = threading.Thread(
+                target=self._worker_loop, name="jacked-identity-watcher", daemon=True
+            )
+            self._worker.start()
+
+    def _worker_loop(self) -> None:
+        while True:
+            update, db, home = self._queue.get()
+            try:
+                with self._run_lock:
+                    self._run(update, db, home)
+            except Exception:  # noqa: BLE001 - a worker error must never escape
+                logger.warning("Claude config identity watcher failed", exc_info=True)
+            finally:
+                self._queue.task_done()
 
     def _emit(self, *items: str) -> None:
         with self._evidence_lock:
@@ -402,10 +501,13 @@ class IdentityWatcher:
         *,
         level: int = logging.INFO,
     ) -> None:
-        """Log a skip reason only when it differs from the previous one."""
+        """Record a reason; log it only when it differs from the previous one."""
         previous = state.last_reason
         state.last_reason = reason
-        if reason == previous or (previous is None and reason == "in-sync"):
+        if reason == previous:
+            return
+        state.reason_since = self._clock()
+        if previous is None and reason == "in-sync":
             return
         logger.log(
             level,
@@ -414,9 +516,37 @@ class IdentityWatcher:
             reason,
         )
 
+    def _mark_in_sync(self, account_id: int, state: _AccountState) -> None:
+        state.divergent_since = None
+        state.long_divergence_warned = False
+        self._transition(account_id, state, "in-sync")
+
+    def _note_divergence(
+        self, account_id: int, state: _AccountState, diverged: list[str], now: float
+    ) -> None:
+        if state.divergent_since is None:
+            state.divergent_since = now
+            return
+        if (
+            not state.long_divergence_warned
+            and now - state.divergent_since >= LONG_DIVERGENCE_SECONDS
+        ):
+            state.long_divergence_warned = True
+            logger.warning(
+                "Claude config identity for account %d has diverged for %d minutes "
+                "(fields: %s; last reason: %s)",
+                account_id,
+                int((now - state.divergent_since) // 60),
+                ", ".join(diverged),
+                state.last_reason or "none",
+            )
+
     def _run(self, update: SnapshotUpdate, db, home: Path) -> None:
         if os.environ.get("CLAUDE_CONFIG_DIR"):
+            self._disabled = True
+            _warn_disabled_once()
             return
+        self._disabled = False
         if update.scope != "global" or update.state is not ResolverState.RESOLVED:
             return
         observed = update.observed
@@ -434,24 +564,20 @@ class IdentityWatcher:
         if not isinstance(config, dict):
             return
         state = self._states.setdefault(account_id, _AccountState())
-        if not _diverged_fields(row, config):
-            self._transition(account_id, state, "in-sync")
-            return
         now = self._clock()
-        if (
-            state.last_attempt is not None
-            and now - state.last_attempt < ATTEMPT_MIN_INTERVAL_SECONDS
-        ):
-            return
-        # The raw check only triggers. The block decides, because the block is
-        # what a write would put in the config. A matching block stamps no
-        # floor; its verdict is reused while the row and config stay the same,
-        # so the builder does not run (and log) on every pass.
+        # A matching verdict is reused while the identity columns and the
+        # config stay the same, so the builder does not run (and log) on
+        # every pass.
         settle_key = _settle_key(row, config)
         if (
             state.settled is not None
             and state.settled[0] == settle_key
             and now - state.settled[1] < SETTLED_TTL_SECONDS
+        ):
+            return
+        if (
+            state.last_attempt is not None
+            and now - state.last_attempt < ATTEMPT_MIN_INTERVAL_SECONDS
         ):
             return
         state.settled = None
@@ -462,31 +588,17 @@ class IdentityWatcher:
         diverged = _block_diverged_fields(block, config)
         if not diverged:
             state.settled = (settle_key, now)
-            self._transition(account_id, state, "in-sync")
+            self._mark_in_sync(account_id, state)
             return
+        self._note_divergence(account_id, state, diverged, now)
         # Stamped at the attempt: a failure never shortens the floor.
         state.last_attempt = now
-        self._attempt(update, db, home, row, config, diverged, state, now)
+        self._attempt(update, db, home, row, block, config, diverged, state, now)
 
-    def _attempt(
-        self,
-        update: SnapshotUpdate,
-        db,
-        home: Path,
-        row: dict,
-        config: dict,
-        diverged: list[str],
-        state: _AccountState,
-        now: float,
-    ) -> None:
-        account_id = int(row["id"])
-        view = self._resolve(home)
-        if view is None or view.account_id != account_id:
-            self._transition(account_id, state, "authority-changed")
-            return
-
-        desired_id = update.desired.account_id if update.desired is not None else None
-        key = (view.digest, desired_id)
+    def _check_breaker(
+        self, account_id: int, state: _AccountState, key: tuple, now: float
+    ) -> bool:
+        """Return True when the breaker is tripped for this authority."""
         if state.breaker_key != key:
             state.breaker_key = key
             state.republishes.clear()
@@ -504,9 +616,31 @@ class IdentityWatcher:
                 len(state.republishes),
                 int(BREAKER_WINDOW_SECONDS // 60),
             )
-        if state.tripped:
+        return state.tripped
+
+    def _attempt(
+        self,
+        update: SnapshotUpdate,
+        db,
+        home: Path,
+        row: dict,
+        block: Any,
+        config: dict,
+        diverged: list[str],
+        state: _AccountState,
+        now: float,
+    ) -> None:
+        account_id = int(row["id"])
+        view = self._resolve(home)
+        if view is None or view.account_id != account_id:
+            self._transition(account_id, state, "authority-changed")
+            return
+
+        desired_id = update.desired.account_id if update.desired is not None else None
+        if self._check_breaker(account_id, state, (view.digest, desired_id), now):
             self._emit(EVIDENCE_FLAPPING)
-            state.last_reason = "flapping"
+            # The breaker already logged its one WARNING.
+            self._transition(account_id, state, "flapping")
             return
 
         proof = self._prove_owner(view, now)
@@ -514,7 +648,7 @@ class IdentityWatcher:
             self._emit(EVIDENCE_OWNER_UNPROVEN)
             self._transition(account_id, state, "owner-unproven")
             return
-        if not _owner_matches(proof, row):
+        if not _owner_matches(proof, row, block):
             self._emit(EVIDENCE_STAMP_MISMATCH)
             if state.last_reason != "stamp-mismatch":
                 logger.warning(
@@ -525,34 +659,30 @@ class IdentityWatcher:
                     _row_for_identity(db, proof.email, proof.organization_uuid)
                     or "unknown",
                 )
-            state.last_reason = "stamp-mismatch"
+            self._transition(account_id, state, "stamp-mismatch")
             return
 
+        # Everything slow happened above. Under the lease only the authority
+        # digest, the desired account and the identity columns are checked
+        # again, and then the config is written, so a user switch that lands
+        # meanwhile is refused for as short a time as possible.
+        identity = _identity_row(row)
         with self._lease_factory(home).acquire() as acquired:
             if not acquired:
                 self._emit(EVIDENCE_DEFERRED_SWITCH)
                 self._transition(account_id, state, "deferred-switch")
                 return
             fresh = self._resolve(home)
+            fresh_row = db.get_account(account_id)
             if (
                 fresh is None
                 or fresh.digest != view.digest
                 or fresh.account_id != account_id
                 or _desired_account_id(db) != desired_id
+                or not fresh_row
+                or _identity_row(fresh_row) != identity
             ):
                 self._transition(account_id, state, "changed-under-lease")
-                return
-            fresh_row = db.get_account(account_id)
-            if not fresh_row or not _owner_matches(proof, fresh_row):
-                self._transition(account_id, state, "changed-under-lease")
-                return
-            block = self._build(fresh_row, db=db)
-            if block is None:
-                self._transition(account_id, state, "no-block")
-                return
-            diverged = _block_diverged_fields(block, config)
-            if not diverged:
-                self._transition(account_id, state, "in-sync")
                 return
             mtime = _config_mtime(home)
             try:
@@ -563,15 +693,21 @@ class IdentityWatcher:
                     lock_timeout=CONFIG_LOCK_TIMEOUT_SECONDS,
                 )
                 status = _status_name(result)
-            except Exception:  # noqa: BLE001 - reported as divergent evidence
-                logger.debug("Claude config identity write raised", exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - reported as divergent evidence
+                logger.warning(
+                    "Claude config identity write for account %d raised %s",
+                    account_id,
+                    type(exc).__name__,
+                )
                 status = "error"
 
+        if status in _COUNTED_STATUSES:
+            state.republishes.append(now)
         if status != _LANDED:
             self._emit(EVIDENCE_DIVERGENT)
             self._transition(account_id, state, f"write-{status}")
             return
-        state.republishes.append(now)
+        state.last_republish_at = now
         evidence = [EVIDENCE_REPUBLISHED]
         if not getattr(block, "complete", False):
             evidence.append(EVIDENCE_PARTIAL)
@@ -579,6 +715,7 @@ class IdentityWatcher:
             evidence.append(EVIDENCE_UUID_UNKNOWN)
         self._emit(*evidence)
         state.last_reason = "republished"
+        state.reason_since = now
         logger.info(
             "Republished the Claude config identity for account %d (config "
             "identity was account %s; diverged: %s; account uuid %s, config "
@@ -623,7 +760,9 @@ class IdentityWatcher:
             return _OwnerProof(_VERDICT_TRANSIENT, now)
         status = getattr(result, "status_code", None)
         profile = getattr(result, "profile", None)
-        if status in (401, 403):
+        if status == 401:
+            # Only a 401 proves the token is rejected. A 403 can be a
+            # transient or scope problem, so it is retried like a 5xx.
             return _OwnerProof(_VERDICT_UNPROVEN, now)
         if status != 200 or not isinstance(profile, dict):
             return _OwnerProof(_VERDICT_TRANSIENT, now)

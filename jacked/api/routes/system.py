@@ -111,6 +111,27 @@ async def health_check(request: Request):
     return HealthResponse(status="ok", db=db is not None)
 
 
+@router.get("/admin/debug/identity-watcher")
+async def debug_identity_watcher(request: Request):
+    """Report the Claude config identity watcher and the identity coverage.
+
+    Diagnostic-only, values-free: account row ids, reasons, durations and
+    counts. It shows when the watcher cannot repair a config (owner not
+    proven, breaker tripped, CLAUDE_CONFIG_DIR set) and how many Claude
+    accounts still have no stored profile.
+    """
+    from jacked.api.session_observer import IDENTITY_WATCHER
+
+    db = getattr(request.app.state, "db", None)
+    coverage = None
+    if db is not None:
+        try:
+            coverage = await asyncio.to_thread(db.claude_identity_coverage)
+        except Exception as e:  # noqa: BLE001 - diagnostics must still answer
+            coverage = {"error": type(e).__name__}
+    return {"watcher": IDENTITY_WATCHER.status(), "coverage": coverage}
+
+
 @router.get("/admin/debug/tasks")
 async def debug_tasks(request: Request):
     """Dump every asyncio task on the running event loop.

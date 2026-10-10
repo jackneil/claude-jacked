@@ -81,6 +81,7 @@ def _config(**overrides) -> dict:
         "organizationUuid": ORG,
         "organizationName": "Owner Org",
         "accountCreatedAt": CREATED_AT,
+        "subscriptionCreatedAt": "2024-03-02T00:00:00.000000Z",
         "billingType": "stripe_subscription",
     }
     block.update(overrides)
@@ -252,22 +253,48 @@ def test_each_divergence_kind_republishes_once(tmp_path, caplog, config, field):
     assert field in caplog.text
 
 
-def test_the_organization_is_not_compared_when_the_row_has_none(tmp_path):
+def test_an_empty_row_org_is_compared_through_the_profile_org(tmp_path):
+    # The row has no org, so the builder takes the org from the verified
+    # stored profile. A config with another org must be repaired.
     harness = Harness(
         tmp_path,
         rows=[_row(organization_uuid="")],
         config=_config(organizationUuid="9e8d7c6b-0000-4000-8000-000000000001"),
+        real_build=True,
     )
 
-    assert harness.run() == ()
+    evidence = harness.run()
+
+    assert evidence[0] == "claude-config:identity:republished"
+    assert harness.writes[0]["block"].organization_uuid == ORG
+
+
+def test_a_block_org_the_token_does_not_own_is_never_written(tmp_path):
+    # CSO M1: an empty-org row whose stored profile says org Y while the
+    # stored token belongs to org X. The row check alone would pass.
+    other_org = "1a2b3c4d-0000-4000-8000-0000000000aa"
+    harness = Harness(
+        tmp_path,
+        rows=[_row(organization_uuid="")],
+        config=_config(organizationUuid=other_org),
+        real_build=True,
+    )
+    harness.lookup_result = ProfileLookup(200, _profile(org=other_org))
+
+    evidence = harness.run()
+
     assert harness.writes == []
+    assert "authority:stamp-mismatch" in evidence
 
 
 def test_the_account_uuid_is_compared_only_when_the_row_knows_it(tmp_path):
+    # Neither the row nor a stored profile knows the uuid, so the block
+    # carries none and a config uuid cannot diverge.
     harness = Harness(
         tmp_path,
-        rows=[_row(account_uuid=None)],
+        rows=[_row(account_uuid=None, profile_json=None)],
         config=_config(accountUuid="1a2b3c4d-0000-4000-8000-000000000002"),
+        real_build=True,
     )
 
     assert harness.run() == ()
@@ -279,6 +306,7 @@ def test_created_at_is_compared_only_when_a_profile_is_stored(tmp_path):
         tmp_path,
         rows=[_row(profile_json=None)],
         config=_config(accountCreatedAt="2025-01-01T00:00:00.000000Z"),
+        real_build=True,
     )
 
     assert harness.run() == ()
@@ -316,8 +344,11 @@ def test_a_scoped_config_dir_disables_the_watcher(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "scoped"))
     harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
 
-    assert harness.run() == ()
+    # The watcher does nothing, and says so in every snapshot.
+    assert harness.run() == ("claude-config:identity:disabled",)
+    assert harness.run() == ("claude-config:identity:disabled",)
     assert harness.events == []
+    assert harness.watcher.status()["disabled"] is True
 
 
 @pytest.mark.parametrize(
@@ -390,7 +421,7 @@ def test_the_rate_floor_is_per_account(tmp_path):
                  profile_json=None)
     harness = Harness(
         tmp_path, rows=[_row(), other], config=_config(emailAddress="old@example.com"),
-        settings={"desired_account_id": None},
+        settings={"desired_account_id": None}, real_build=True,
     )
     harness.run(desired=None)
     harness.views = [AuthorityView(8, "digest-8", TOKEN, (NOW + 3600) * 1000)]
@@ -466,7 +497,7 @@ def test_an_expired_token_is_never_sent(tmp_path):
     assert harness.writes == []
 
 
-@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("status", [401])
 def test_a_rejected_token_is_unproven_and_cached_per_digest(tmp_path, status):
     harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
     harness.lookup_result = ProfileLookup(status)
@@ -482,7 +513,13 @@ def test_a_rejected_token_is_unproven_and_cached_per_digest(tmp_path, status):
 
 @pytest.mark.parametrize(
     "result",
-    [ProfileLookup(None), ProfileLookup(429), ProfileLookup(503), OSError("network down")],
+    [
+        ProfileLookup(None),
+        ProfileLookup(403),
+        ProfileLookup(429),
+        ProfileLookup(503),
+        OSError("network down"),
+    ],
 )
 def test_a_transient_lookup_failure_is_retried_after_the_floor(tmp_path, result):
     harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
@@ -534,16 +571,23 @@ def test_a_token_owned_by_someone_else_is_never_published(tmp_path, caplog, prof
 
 
 def test_the_owner_check_skips_the_org_and_uuid_the_row_does_not_know(tmp_path):
+    # Neither the row nor the block knows an org or a uuid (no stored
+    # profile), so the proof is checked on the email only.
     harness = Harness(
         tmp_path,
-        rows=[_row(organization_uuid="", account_uuid=None)],
+        rows=[_row(organization_uuid="", account_uuid=None, profile_json=None)],
         config=_config(emailAddress="old@example.com"),
+        real_build=True,
     )
     harness.lookup_result = ProfileLookup(
         200, _profile(org="any-org-uuid", account_uuid="any-account-uuid")
     )
 
-    assert harness.run() == ("claude-config:identity:republished",)
+    assert harness.run() == (
+        "claude-config:identity:republished",
+        "claude-config:identity:partial",
+        "claude-config:identity:uuid-unknown",
+    )
 
 
 def test_the_owner_proof_never_refreshes_or_calls_fetch_profile(tmp_path, monkeypatch):
@@ -649,7 +693,10 @@ def test_a_desired_change_under_the_lease_skips_the_write(tmp_path):
     assert harness.writes == []
 
 
-def test_the_block_is_built_from_the_row_read_under_the_lease(tmp_path):
+def test_an_identity_change_under_the_lease_skips_the_write(tmp_path):
+    # The block is built before the lease, so the lease is held only for the
+    # checks and the write. A row whose identity columns changed meanwhile
+    # is not written; the next pass builds from the new row.
     harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
 
     class _RenamingLease(FakeLease):
@@ -661,9 +708,31 @@ def test_the_block_is_built_from_the_row_read_under_the_lease(tmp_path):
     harness.lease = _RenamingLease(harness.events)
 
     harness.run()
+    assert harness.writes == []
+
+    harness.lease = FakeLease(harness.events)
+    harness.advance(ATTEMPT_MIN_INTERVAL_SECONDS + 1)
+    harness.run()
 
     assert harness.builds[-1]["organization_name"] == "Renamed Org"
-    assert harness.writes[0]["block"] is harness.block
+    assert len(harness.writes) == 1
+
+
+def test_a_usage_column_change_under_the_lease_still_writes(tmp_path):
+    harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
+
+    class _PollingLease(FakeLease):
+        @contextmanager
+        def acquire(self):
+            harness.db.rows[7]["cached_usage_raw"] = "{}"
+            harness.db.rows[7]["usage_cached_at"] = NOW
+            yield True
+
+    harness.lease = _PollingLease(harness.events)
+
+    harness.run()
+
+    assert len(harness.writes) == 1
 
 
 # --- logging ------------------------------------------------------------------
@@ -1078,3 +1147,106 @@ def test_a_failing_worker_run_is_logged_and_frees_the_worker(tmp_path, caplog):
     assert "identity watcher failed" in caplog.text
     assert watcher.submit(Harness(tmp_path).update(), None, tmp_path) is True
     assert watcher.wait_idle(5)
+
+
+# --- review wave 2 -------------------------------------------------------------
+
+
+def test_another_orgs_subscription_merged_in_is_repaired(tmp_path):
+    # Same person, same uuid and createdAt: only the org subscription date
+    # shows that another org's profile was merged into the block.
+    harness = Harness(
+        tmp_path,
+        config=_config(subscriptionCreatedAt="2026-01-01T00:00:00.000000Z"),
+        real_build=True,
+    )
+
+    evidence = harness.run()
+
+    assert evidence[0] == "claude-config:identity:republished"
+    assert "subscriptionCreatedAt" in harness.writes[0]["block"].fields
+
+
+def test_a_post_verify_mismatch_counts_toward_the_breaker(tmp_path):
+    harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
+    harness.write_status = "post_verify_mismatch"
+
+    for _ in range(3):
+        assert harness.run() == ("claude-config:identity:divergent",)
+        harness.advance(ATTEMPT_MIN_INTERVAL_SECONDS + 1)
+
+    assert harness.run() == ("claude-config:identity:flapping",)
+    assert len(harness.writes) == 3
+    assert harness.watcher.status()["accounts"]["7"]["breaker_tripped"] is True
+
+
+def test_sticky_evidence_stays_in_every_snapshot(tmp_path):
+    harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
+    harness.lookup_result = ProfileLookup(401)
+
+    assert harness.run() == ("claude-config:identity:owner-unproven",)
+    # Inside the rate floor nothing runs, but the snapshot still says so.
+    harness.advance(5)
+    assert harness.run() == ("claude-config:identity:owner-unproven",)
+    status = harness.watcher.status()["accounts"]["7"]
+    assert status["reason"] == "owner-unproven"
+    assert status["divergent_for_seconds"] is not None
+
+
+def test_a_long_divergence_warns_once(tmp_path, caplog):
+    harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
+    harness.lookup_result = ProfileLookup(401)
+
+    with caplog.at_level(logging.WARNING, logger="jacked.api.identity_watcher"):
+        for _ in range(8):
+            harness.run()
+            harness.advance(ATTEMPT_MIN_INTERVAL_SECONDS + 1)
+
+    warnings = [r.getMessage() for r in caplog.records if "has diverged for" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "emailAddress" in warnings[0]
+    assert "@" not in warnings[0]
+
+
+def test_in_sync_clears_the_divergence_clock(tmp_path):
+    harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
+    harness.lookup_result = ProfileLookup(401)
+    harness.run()
+    harness.config = _config()
+    harness.advance(ATTEMPT_MIN_INTERVAL_SECONDS + 1)
+
+    harness.run()
+
+    status = harness.watcher.status()["accounts"]["7"]
+    assert status["reason"] == "in-sync"
+    assert status["divergent_for_seconds"] is None
+
+
+def test_submit_reuses_one_worker_thread(tmp_path):
+    harness = Harness(tmp_path, config=_config())
+    names_before = {t.ident for t in threading.enumerate()}
+
+    for _ in range(5):
+        harness.watcher.submit(harness.update(), harness.db, harness.home)
+        assert harness.watcher.wait_idle(2.0)
+
+    new_threads = [
+        t for t in threading.enumerate()
+        if t.ident not in names_before and t.name == "jacked-identity-watcher"
+    ]
+    assert len(new_threads) == 1
+    assert new_threads[0].daemon is True
+
+
+def test_a_writer_exception_is_a_values_free_warning(tmp_path, caplog):
+    harness = Harness(tmp_path, config=_config(emailAddress="old@example.com"))
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full at /Users/someone@example.com")
+
+    harness.watcher._writer = boom
+    with caplog.at_level(logging.WARNING, logger="jacked.api.identity_watcher"):
+        assert harness.run() == ("claude-config:identity:divergent",)
+
+    assert "OSError" in caplog.text
+    assert "@" not in caplog.text

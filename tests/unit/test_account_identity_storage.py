@@ -855,3 +855,63 @@ class TestOAuthErrorLogging:
         flow = OAuthFlow(db, purpose="claude_code", target_account_id=acct["id"])
         with pytest.raises(ValueError, match="does not match"):
             flow._store_cc_tokens(tokens, _profile(email="bob@test.com"))
+
+
+class TestCcTokenIdentityGuards:
+    """Review wave 2: the CC flow must not land a token the published
+    identity would mislabel."""
+
+    def test_empty_org_row_refuses_a_token_for_another_stored_org(self, tmp_path):
+        import json as _json
+
+        from jacked.web.oauth import OAuthFlow
+
+        db, acct = _make_db(tmp_path, org_uuid="")
+        db.update_account(acct["id"], profile_json=_json.dumps(_profile(org_uuid=ORG_A)))
+        flow = OAuthFlow(db, purpose="claude_code", target_account_id=acct["id"])
+
+        with pytest.raises(ValueError, match="organization stored"):
+            flow._store_cc_tokens(_tokens_after_exchange(org_uuid=ORG_B), {})
+        assert db.get_account(acct["id"])["cc_access_token"] is None
+
+    def test_empty_org_row_accepts_the_stored_org(self, tmp_path):
+        import json as _json
+
+        from jacked.web.oauth import OAuthFlow
+
+        db, acct = _make_db(tmp_path, org_uuid="")
+        db.update_account(acct["id"], profile_json=_json.dumps(_profile(org_uuid=ORG_A)))
+        flow = OAuthFlow(db, purpose="claude_code", target_account_id=acct["id"])
+
+        result = flow._store_cc_tokens(_tokens_after_exchange(org_uuid=ORG_A), {})
+        assert result["cc_access_token"] == "sk-ant-oat01-access"
+
+    def test_empty_org_row_without_a_stored_profile_keeps_the_old_rule(self, tmp_path):
+        from jacked.web.oauth import OAuthFlow
+
+        db, acct = _make_db(tmp_path, org_uuid="")
+        flow = OAuthFlow(db, purpose="claude_code", target_account_id=acct["id"])
+
+        result = flow._store_cc_tokens(_tokens_after_exchange(org_uuid=ORG_B), {})
+        assert result["cc_access_token"] == "sk-ant-oat01-access"
+
+    def test_a_token_for_another_account_uuid_is_refused(self, tmp_path):
+        from jacked.web.oauth import OAuthFlow
+
+        db, acct = _make_db(tmp_path)
+        db.update_account(acct["id"], account_uuid="1f1f1f1f-0000-4000-8000-000000000001")
+        flow = OAuthFlow(db, purpose="claude_code", target_account_id=acct["id"])
+
+        with pytest.raises(ValueError, match="account does not match"):
+            flow._store_cc_tokens(_tokens_after_exchange(), {})
+
+
+class TestProfileOwnerUuid:
+    def test_a_known_row_uuid_must_match_the_profile(self, tmp_path):
+        from jacked.web.auth import _profile_owner_mismatch
+
+        row = {"email": "alice@test.com", "organization_uuid": ORG_A,
+               "account_uuid": "1f1f1f1f-0000-4000-8000-000000000001"}
+
+        assert _profile_owner_mismatch(row, _profile()) == "account.uuid"
+        assert _profile_owner_mismatch({**row, "account_uuid": None}, _profile()) is None

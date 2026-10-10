@@ -81,6 +81,21 @@ ORG_TYPE_MAP = {
 }
 
 
+def _stored_profile_org(row: dict) -> str | None:
+    """Return the org uuid of the row's verified stored profile, or None.
+
+    >>> _stored_profile_org({"email": "a@b.c"}) is None
+    True
+    """
+    from jacked.api.claude_identity import stored_profile
+
+    profile = stored_profile(row)
+    if profile is None:
+        return None
+    org = profile[1].get("uuid")
+    return org.strip() if isinstance(org, str) and org.strip() else None
+
+
 def identity_hint_params(account: Optional[dict]) -> dict:
     """Extra authorize-URL params that pre-select the account being re-authed.
 
@@ -1089,6 +1104,20 @@ class OAuthFlow:
                     f"CC auth org ({cc_org}) does not match "
                     f"target account org ({target_org})"
                 )
+        elif cc_org:
+            # A row with no org still has a known org when its stored profile
+            # passed the owner guard. The identity builder publishes that org,
+            # so a token for another org must not land here.
+            stored_org = _stored_profile_org(target)
+            if stored_org and stored_org != cc_org:
+                raise ValueError(
+                    "CC auth org does not match the organization stored for the "
+                    "target account"
+                )
+        target_uuid = target.get("account_uuid")
+        cc_uuid = tokens.get("account_uuid")
+        if target_uuid and cc_uuid and cc_uuid != target_uuid:
+            raise ValueError("CC auth account does not match the target account")
 
         expires_at = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
 
