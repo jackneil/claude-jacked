@@ -14,8 +14,9 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
+from jacked.api.identity_watcher import IdentityWatcher
 from jacked.credentials.file_store import FileCredentialStore
 from jacked.credentials.models import (
     CapabilityMode,
@@ -39,6 +40,10 @@ logger = logging.getLogger(__name__)
 
 SESSION_OBSERVER_INTERVAL_SECONDS = 10.0
 SESSION_OBSERVER_BATCH_LIMIT = 100
+
+# The production watcher. It keeps ~/.claude.json oauthAccount true to the
+# account that holds the credential authority. Tests inject their own.
+IDENTITY_WATCHER = IdentityWatcher()
 
 
 class SessionObservationDatabase(Protocol):
@@ -70,6 +75,28 @@ def _config_root() -> tuple[Path, str]:
     return Path.home() / ".claude", "global"
 
 
+def _build_authority(config_root: Path, scope: str) -> tuple[Any, StoreDeclaration]:
+    """Return the authority store adapter and its declaration for a config root.
+
+    The resolver and the identity watcher both read the authority through
+    this adapter, so both see the same payload and the same digest.
+    """
+    if scope == "global" and sys.platform == "darwin":
+        from jacked.credentials.macos_store import MacOSCredentialStore
+
+        return MacOSCredentialStore(), StoreDeclaration(
+            "macOS Keychain", KEYCHAIN_LOCATOR, StoreRole.AUTHORITY
+        )
+    # The path still comes from config_root so scoped mode keeps working;
+    # only the declaration locator is canonical, because that is the key
+    # the resolver looks the adapter up by.
+    return FileCredentialStore(
+        config_root / ".credentials.json", trusted_root=config_root
+    ), StoreDeclaration(
+        "configured credential file", GLOBAL_FILE_LOCATOR, StoreRole.AUTHORITY
+    )
+
+
 def _build_resolver(config_root: Path, scope: str) -> CanonicalCredentialResolver:
     """Build a read-only resolver for the authority used by this config root."""
     executable = ExecutableIdentity(
@@ -78,25 +105,8 @@ def _build_resolver(config_root: Path, scope: str) -> CanonicalCredentialResolve
         build_version="unknown",
         config_mode=scope,
     )
-    if scope == "global" and sys.platform == "darwin":
-        from jacked.credentials.macos_store import MacOSCredentialStore
-
-        authority = MacOSCredentialStore()
-        declaration = StoreDeclaration(
-            "macOS Keychain", KEYCHAIN_LOCATOR, StoreRole.AUTHORITY
-        )
-        stores = {KEYCHAIN_LOCATOR: authority}
-    else:
-        # The path still comes from config_root so scoped mode keeps working;
-        # only the declaration locator is canonical, because that is the key
-        # the resolver looks the adapter up by.
-        authority = FileCredentialStore(
-            config_root / ".credentials.json", trusted_root=config_root
-        )
-        declaration = StoreDeclaration(
-            "configured credential file", GLOBAL_FILE_LOCATOR, StoreRole.AUTHORITY
-        )
-        stores = {GLOBAL_FILE_LOCATOR: authority}
+    authority, declaration = _build_authority(config_root, scope)
+    stores = {declaration.locator: authority}
 
     capability = CredentialCapability(
         executable=executable,
@@ -187,12 +197,25 @@ def refresh_resolver_snapshot(
     config_root: Path | None = None,
     scope: str | None = None,
     heal: Callable[[SessionObservationDatabase | None], object] | None = None,
+    watcher: IdentityWatcher | None = None,
 ) -> SnapshotUpdate:
-    """Re-observe one authority and atomically publish a secret-free snapshot."""
+    """Re-observe one authority and atomically publish a secret-free snapshot.
+
+    After the publish, the identity watcher compares the Claude Code config
+    identity with the observed account. The watcher runs after the publish,
+    so a slow or failing watcher never delays or blocks the snapshot. Its
+    evidence goes into the next snapshot.
+    """
     if config_root is None or scope is None:
         default_root, default_scope = _config_root()
         config_root = config_root or default_root
         scope = scope or default_scope
+    # Same rule as the heal: an injected resolver means the caller supplied
+    # its own authority, so the default watcher (which reads the real
+    # authority and the real config) stays out of the way.
+    if watcher is None and resolver is None and db is not None:
+        watcher = IDENTITY_WATCHER
+    held_evidence = _drain_watcher_evidence(watcher)
     # Heal first: the published snapshot must describe the healed authority,
     # not the foreign write that this pass is about to repair. An injected
     # resolver means the caller supplied its own authority, so the default
@@ -225,7 +248,7 @@ def refresh_resolver_snapshot(
     update = SnapshotUpdate(
         scope=scope,
         state=state,
-        evidence=evidence + heal_evidence,
+        evidence=held_evidence + evidence + heal_evidence,
         # A revision is an ordering claim. A passive read has no transaction
         # witness, so it intentionally leaves this unknown.
         credential_revision=None,
@@ -235,7 +258,25 @@ def refresh_resolver_snapshot(
     (
         sink or FileResolverSnapshotSink(config_root / "jacked-resolver-snapshot.json")
     ).publish(update)
+    if watcher is not None:
+        try:
+            # The config lives beside the config root: ~/.claude.json for
+            # ~/.claude. The watcher does nothing in a scoped config.
+            watcher.run(update, db, config_root.parent)
+        except Exception:
+            logger.warning("Claude config identity watcher failed", exc_info=True)
     return update
+
+
+def _drain_watcher_evidence(watcher: IdentityWatcher | None) -> tuple[str, ...]:
+    """Return the evidence the watcher held from the previous pass."""
+    if watcher is None:
+        return ()
+    try:
+        return tuple(watcher.drain_evidence())
+    except Exception:
+        logger.warning("Claude config identity evidence drain failed", exc_info=True)
+        return ()
 
 
 def _requeue_observations(db: SessionObservationDatabase, rows: list[dict]) -> None:

@@ -197,7 +197,7 @@ def test_sync_authority_failure_does_not_publish_file_target():
 
 @pytest.mark.parametrize("rate_limit_tier", ["t1", None])
 def test_sync_writes_initial_claude_json_metadata(rate_limit_tier):
-    """First activation writes coherent metadata even without a known tier."""
+    """First activation without a stored profile writes the minimal identity."""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
         tmp_path = Path(tmp)
         cred_dir = tmp_path / ".claude"
@@ -229,12 +229,11 @@ def test_sync_writes_initial_claude_json_metadata(rate_limit_tier):
         config = json.loads(config_path.read_text(encoding="utf-8"))
         oauth = config["oauthAccount"]
         assert oauth["emailAddress"] == "alice@test.com"
-        if rate_limit_tier is None:
-            assert "userRateLimitTier" not in oauth
-            assert "organizationRateLimitTier" not in oauth
-            assert statusline.render({}, home=str(tmp_path)) == "alice@test.com"
-        else:
-            assert oauth["userRateLimitTier"] == rate_limit_tier
+        # The minimal block carries identity only; tier and name come with
+        # the stored profile (complete block).
+        assert "userRateLimitTier" not in oauth
+        assert "organizationRateLimitTier" not in oauth
+        assert statusline.render({}, home=str(tmp_path)) == "alice@test.com"
 
 
 def _prime_cached_statusline_account(tmp_path: Path) -> Path:
@@ -297,6 +296,28 @@ def _sync_statusline_target(
         "rate_limit_tier": "default_claude_max_20x",
         "organization_uuid": "org-new",
         "organization_name": "New Org",
+        "account_uuid": "b0b0b0b0-0000-4000-8000-000000000020",
+        "profile_fetched_at": 1_760_000_000.0,
+        "profile_json": json.dumps({
+            "account": {
+                "uuid": "b0b0b0b0-0000-4000-8000-000000000020",
+                "email": "new@test.com",
+                "display_name": "New User",
+                "full_name": "New Q. User",
+                "created_at": "2024-01-01T00:00:00Z",
+            },
+            "organization": {
+                "uuid": "org-new",
+                "name": "New Org",
+                "billing_type": "stripe_subscription",
+                "rate_limit_tier": "default_claude_max_20x",
+                "seat_tier": None,
+                "has_extra_usage_enabled": False,
+                "subscription_created_at": "2024-02-01T00:00:00Z",
+                "claude_code_trial_ends_at": None,
+                "claude_code_trial_duration_days": None,
+            },
+        }),
     }
     with (
         mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
@@ -332,8 +353,12 @@ def test_sync_switches_cached_statusline_identity_and_tier_coherently():
         assert "old@test.com" not in line
         assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
         assert "userRateLimitTier" not in oauth
+        assert oauth["accountUuid"] == "b0b0b0b0-0000-4000-8000-000000000020"
+        assert oauth["billingType"] == "stripe_subscription"
         assert config["topLevelSetting"] == {"preserve": True}
-        assert oauth["unrelatedAccountSetting"] == ["keep", 7]
+        # The outgoing person's block is replaced, never merged.
+        assert "unrelatedAccountSetting" not in oauth
+        assert oauth["organizationName"] == "New Org"
         assert access_canary in credential_text
         assert refresh_canary in credential_text
         for public_text in (config_text, snapshot_text, line):
@@ -383,7 +408,8 @@ def test_sync_with_unknown_tier_clears_both_outgoing_tier_fields():
         assert oauth["emailAddress"] == "unknown-tier@test.com"
         assert "userRateLimitTier" not in oauth
         assert "organizationRateLimitTier" not in oauth
-        assert oauth["preserved"] == {"nested": "value"}
+        # Another person's leftovers never survive a switch.
+        assert "preserved" not in oauth
         line = statusline.render({}, home=str(tmp_path))
         assert line == "unknown-tier@test.com"
         assert "Max" not in line
@@ -797,7 +823,8 @@ def test_update_claude_config_account_replaces_tier_field_for_organization():
         assert "userRateLimitTier" not in oauth
         assert oauth["organizationUuid"] == "org-20x"
         assert result["topLevel"] == ["unchanged"]
-        assert oauth["unrelated"] == {"unchanged": True}
+        # A different account: the old block is replaced, not merged.
+        assert "unrelated" not in oauth
 
 
 def test_update_claude_config_account_replaces_tier_field_for_personal_account():
@@ -832,7 +859,7 @@ def test_update_claude_config_account_replaces_tier_field_for_personal_account()
         assert "organizationRateLimitTier" not in oauth
         assert "organizationUuid" not in oauth
         assert "organizationName" not in oauth
-        assert oauth["unrelated"] == "keep"
+        assert "unrelated" not in oauth
 
 
 def test_update_claude_config_account_explicit_null_clears_tier_fields():
@@ -867,17 +894,18 @@ def test_update_claude_config_account_explicit_null_clears_tier_fields():
         assert "userRateLimitTier" not in oauth
         assert "organizationRateLimitTier" not in oauth
         assert result["topLevel"] == "keep"
-        assert oauth["unrelated"] == [1, 2, 3]
+        assert "unrelated" not in oauth
 
 
 def test_update_claude_config_email_omitted_tier_preserves_existing_fields():
+    """The same account merges: fields the caller does not supply stay."""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
         tmp_path = Path(tmp)
         config_path = tmp_path / ".claude.json"
         config_path.write_text(
             json.dumps({
                 "oauthAccount": {
-                    "emailAddress": "old@test.com",
+                    "emailAddress": "Identity-Only@test.com",
                     "userRateLimitTier": "default_claude_max_5x",
                     "organizationRateLimitTier": "default_claude_max_20x",
                 },
@@ -893,6 +921,41 @@ def test_update_claude_config_email_omitted_tier_preserves_existing_fields():
         oauth = json.loads(config_path.read_text(encoding="utf-8"))["oauthAccount"]
         assert oauth["userRateLimitTier"] == "default_claude_max_5x"
         assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
+
+
+def test_update_claude_config_email_never_starts_fresh_over_a_torn_config():
+    """A config that is not a JSON object is left byte-identical."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
+        tmp_path = Path(tmp)
+        config_path = tmp_path / ".claude.json"
+        config_path.write_text('{"projects": {"/repo": ', encoding="utf-8")
+        before = config_path.read_bytes()
+
+        update_claude_config_email("new@test.com", home=tmp_path)
+        with pytest.raises(ClaudeConfigUnwritable):
+            update_claude_config_email("new@test.com", home=tmp_path, strict=True)
+
+        assert config_path.read_bytes() == before
+
+
+def test_build_oauth_data_carries_the_row_tier_on_both_branches():
+    """Claude Code skips its refresh-time profile fetch only when the
+    credential payload has non-null subscriptionType and rateLimitTier."""
+    base = {
+        "access_token": "at",
+        "refresh_token": "rt",
+        "expires_at": 100,
+        "scopes": None,
+        "subscription_type": "max",
+        "rate_limit_tier": "default_claude_max_20x",
+    }
+    primary = build_oauth_data(base)
+    cc = build_oauth_data(
+        {**base, "cc_access_token": "cc", "cc_refresh_token": "ccr", "cc_expires_at": 200}
+    )
+    for payload in (primary, cc):
+        assert payload["subscriptionType"] == "max"
+        assert payload["rateLimitTier"] == "default_claude_max_20x"
 
 
 def test_update_claude_config_email_refuses_symlink():

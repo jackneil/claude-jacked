@@ -50,6 +50,9 @@ TOKEN_REFRESH_INTERVAL = 1800  # 30 minutes
 WS_KEEPALIVE_INTERVAL = 30  # seconds between WebSocket pings
 HEAL_SWEEP_INTERVAL = 300  # 5 minutes between heal sweeps
 SWEEP_PASS_TIMEOUT = 600  # hard cap on a single refresh/heal pass
+# Seconds after startup before the one-shot profile backfill runs. The wait
+# lets startup settle, and a short-lived app (a test client) never reaches it.
+PROFILE_BACKFILL_DELAY = 30
 LOG_FILE_MAX_BYTES = 5_000_000  # 5 MB
 LOG_FILE_BACKUP_COUNT = 3
 
@@ -131,6 +134,32 @@ async def _stuck_checking_watchdog_loop(app):
         except Exception:
             logger.warning("Stuck-checking watchdog error", exc_info=True)
         await asyncio.sleep(interval)
+
+
+async def _profile_backfill_once(app):
+    """Run the one-shot Claude profile backfill once, after a short wait.
+
+    The backfill stores the account uuid and the profile for each Claude
+    row that has none (see ``jacked.web.auth.backfill_missing_profiles``).
+    It does nothing when the database is not available, and it never raises
+    (cancellation at shutdown is not caught).
+    """
+    await asyncio.sleep(PROFILE_BACKFILL_DELAY)
+    db = getattr(app.state, "db", None)
+    if db is None:
+        return
+    try:
+        from jacked.web import auth as web_auth
+
+        await asyncio.wait_for(
+            web_auth.backfill_missing_profiles(db), timeout=SWEEP_PASS_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "Profile backfill exceeded %ds and was cancelled", SWEEP_PASS_TIMEOUT
+        )
+    except Exception as e:
+        logger.warning("Profile backfill error: %s", type(e).__name__)
 
 
 @asynccontextmanager
@@ -296,6 +325,7 @@ async def lifespan(app: FastAPI):
     full_sweep_task = asyncio.create_task(full_sweep_loop(app))
     all_accounts_refresh_task = asyncio.create_task(all_accounts_refresh_loop(app))
     stuck_checking_task = asyncio.create_task(_stuck_checking_watchdog_loop(app))
+    profile_backfill_task = asyncio.create_task(_profile_backfill_once(app))
     logger.info("Started background token refresh (every 30min)")
     logger.info("Started session-accounts watcher (every 3s)")
     logger.info("Started session observation resolver (every 10s)")
@@ -307,6 +337,9 @@ async def lifespan(app: FastAPI):
     logger.info("Started full sweep loop")
     logger.info("Started all-accounts refresh loop (every 10min)")
     logger.info("Started stuck-checking watchdog (every 60s)")
+    logger.info(
+        "Scheduled one-shot Claude profile backfill (in %ds)", PROFILE_BACKFILL_DELAY
+    )
 
     # Start analytics scanner + live monitor
     analytics_scan_task = None
@@ -337,6 +370,7 @@ async def lifespan(app: FastAPI):
         full_sweep_task,
         all_accounts_refresh_task,
         stuck_checking_task,
+        profile_backfill_task,
     ]
     if analytics_scan_task is not None:
         tasks_to_cancel.append(analytics_scan_task)

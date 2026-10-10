@@ -328,12 +328,85 @@ class TestSeedOauthAccount:
 
         result = json.loads((config_dir / ".claude.json").read_text())
         assert result["oauthAccount"]["emailAddress"] == "test@example.com"
-        assert result["oauthAccount"]["displayName"] == "Test User"
+        # Without a stored profile the seed is the minimal identity only.
+        assert "displayName" not in result["oauthAccount"]
         # Preserves existing keys
         assert result["hasCompletedOnboarding"] is True
 
-    def test_updates_email_but_preserves_other_fields(self, tmp_path):
-        """Updates emailAddress but preserves Claude Code's other oauthAccount fields."""
+    def test_seeds_the_complete_profile_block(self, tmp_path):
+        """A row with a stored profile seeds the full block, uuid included."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        profile = {
+            "account": {
+                "uuid": "a1b2c3d4-0000-4000-8000-000000000001",
+                "email": "test@example.com",
+                "display_name": "Test User",
+                "full_name": "Test Q. User",
+                "created_at": "2024-05-06T07:08:09Z",
+            },
+            "organization": {
+                "uuid": "org-1",
+                "name": "Org One",
+                "billing_type": "stripe_subscription",
+                "rate_limit_tier": "default_claude_max_5x",
+                "seat_tier": None,
+                "has_extra_usage_enabled": False,
+                "subscription_created_at": "2024-06-01T00:00:00Z",
+                "claude_code_trial_ends_at": None,
+                "claude_code_trial_duration_days": None,
+            },
+        }
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(
+            config_dir,
+            {
+                "id": 3,
+                "email": "test@example.com",
+                "organization_uuid": "org-1",
+                "organization_name": "Org One",
+                "account_uuid": "a1b2c3d4-0000-4000-8000-000000000001",
+                "profile_json": json.dumps(profile),
+            },
+        )
+
+        block = json.loads((config_dir / ".claude.json").read_text())["oauthAccount"]
+        assert block["accountUuid"] == "a1b2c3d4-0000-4000-8000-000000000001"
+        assert block["billingType"] == "stripe_subscription"
+        assert block["accountCreatedAt"] == "2024-05-06T07:08:09Z"
+        assert block["displayName"] == "Test User"
+        assert block["organizationName"] == "Org One"
+
+    def test_same_account_merge_keeps_claude_code_fields(self, tmp_path):
+        """Same email, org and uuid: the seed merges and keeps Claude Code's fields."""
+        config_dir = tmp_path / "acct"
+        config_dir.mkdir()
+        existing = {
+            "oauthAccount": {
+                "emailAddress": "same@example.com",
+                "accountUuid": "uuid-123",
+                "billingType": "pro",
+                "organizationRole": "admin",
+            }
+        }
+        (config_dir / ".claude.json").write_text(json.dumps(existing))
+
+        from jacked.launch import _seed_oauth_account
+
+        _seed_oauth_account(
+            config_dir,
+            {"email": "same@example.com", "account_uuid": "uuid-123", "organization_name": "N"},
+        )
+
+        result = json.loads((config_dir / ".claude.json").read_text())["oauthAccount"]
+        assert result["billingType"] == "pro"
+        assert result["organizationRole"] == "admin"
+        assert result["organizationName"] == "N"
+
+    def test_replaces_another_persons_block(self, tmp_path):
+        """Another person's block is replaced; none of its fields survive."""
         config_dir = tmp_path / "acct"
         config_dir.mkdir()
         existing = {
@@ -350,11 +423,8 @@ class TestSeedOauthAccount:
         _seed_oauth_account(config_dir, {"email": "different@example.com"})
 
         result = json.loads((config_dir / ".claude.json").read_text())
-        # Email updated to match DB account
-        assert result["oauthAccount"]["emailAddress"] == "different@example.com"
-        # Other Claude Code fields preserved
-        assert result["oauthAccount"]["accountUuid"] == "uuid-123"
-        assert result["oauthAccount"]["billingType"] == "pro"
+        # The block now names the DB account and nothing of the old person.
+        assert result["oauthAccount"] == {"emailAddress": "different@example.com"}
 
     def test_handles_non_dict_oauth_account(self, tmp_path):
         """Replaces non-dict oauthAccount with correct seed data."""
@@ -428,8 +498,8 @@ class TestSeedOauthAccount:
 
         result = json.loads((config_dir / ".claude.json").read_text())
         assert result["oauthAccount"]["emailAddress"] == "correct@example.com"
-        # Should preserve other fields
-        assert result["oauthAccount"]["accountUuid"] == "uuid-123"
+        # A block with no email is not the same account: it is replaced.
+        assert "accountUuid" not in result["oauthAccount"]
 
     def test_skips_when_no_email(self, tmp_path):
         """Returns immediately when account has no email."""
@@ -1378,8 +1448,8 @@ class TestTokenSync:
 
 
 class TestSeedOauthAccountEmailUpdate:
-    def test_updates_email_even_when_oauth_account_exists(self, tmp_path):
-        """Always updates emailAddress to match DB, even when oauthAccount exists."""
+    def test_replaces_a_stale_identity_even_when_oauth_account_exists(self, tmp_path):
+        """A stale identity from another account is replaced to match the DB."""
         config_dir = tmp_path / "acct"
         config_dir.mkdir()
         # Claude Code wrote a rich oauthAccount with a STALE email
@@ -1400,12 +1470,14 @@ class TestSeedOauthAccountEmailUpdate:
         result = json.loads((config_dir / ".claude.json").read_text())
         # Email MUST be updated to match DB
         assert result["oauthAccount"]["emailAddress"] == "correct@test.com"
-        # Other Claude Code fields preserved
-        assert result["oauthAccount"]["accountUuid"] == "uuid-123"
-        assert result["oauthAccount"]["billingType"] == "pro"
+        # The stale account's uuid, billing and name must not survive: Claude
+        # Code would merge a later profile into the wrong account's uuid.
+        assert "accountUuid" not in result["oauthAccount"]
+        assert "billingType" not in result["oauthAccount"]
+        assert "displayName" not in result["oauthAccount"]
 
-    def test_preserves_other_oauth_fields(self, tmp_path):
-        """Updating email preserves all other oauthAccount fields from Claude Code."""
+    def test_replacing_the_block_keeps_other_top_level_keys(self, tmp_path):
+        """Replacing another account's block never touches other config keys."""
         config_dir = tmp_path / "acct"
         config_dir.mkdir()
         existing = {
@@ -1425,10 +1497,7 @@ class TestSeedOauthAccountEmailUpdate:
         _seed_oauth_account(config_dir, {"email": "new@test.com"})
 
         result = json.loads((config_dir / ".claude.json").read_text())
-        assert result["oauthAccount"]["emailAddress"] == "new@test.com"
-        assert result["oauthAccount"]["accountUuid"] == "uuid-456"
-        assert result["oauthAccount"]["billingType"] == "max"
-        assert result["oauthAccount"]["organizationType"] == "claude_max"
+        assert result["oauthAccount"] == {"emailAddress": "new@test.com"}
         assert result["hasCompletedOnboarding"] is True
 
 

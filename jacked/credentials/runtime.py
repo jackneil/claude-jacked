@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
 import threading
 from pathlib import Path
 
-from jacked.api.credential_helpers import build_oauth_data, update_claude_config_email
+from jacked.api.claude_identity import (
+    IdentityBlock,
+    build_identity_block,
+    minimal_identity_block,
+    write_identity,
+)
+from jacked.api.credential_helpers import ClaudeConfigUnwritable, build_oauth_data
 from jacked.findbin import find_bin
 from jacked.web.credential_repository import DatabaseCredentialSwitchRepository
 
@@ -53,6 +60,8 @@ from .transaction import (
     TransactionDependencies,
 )
 from .writer_fence import StaticWriterInspector, WriterFence
+
+logger = logging.getLogger(__name__)
 
 _VERSION_PATTERN = re.compile(r"^(\d+\.\d+\.\d+)\b")
 
@@ -251,7 +260,7 @@ def _engine_for(
             repository=DatabaseCredentialSwitchRepository(db),
             authority=authority,
             mirrors=stores,
-            identity_publisher=claude_config_identity_publisher(home),
+            identity_publisher=claude_config_identity_publisher(home, db),
             writer_fence=WriterFence(StaticWriterInspector((), is_complete=False)),
             install_key=key_provider,
             machine_install_id=install_id,
@@ -267,27 +276,64 @@ def _engine_for(
     )
 
 
-def claude_config_identity_publisher(home: Path):
+def _request_matches_row(row: dict, request: SwitchRequest) -> bool:
+    """True when the row still names the identity that the switch wrote."""
+    row_email = (row.get("email") or "").strip().casefold()
+    request_email = (request.email or "").strip().casefold()
+    row_org = (row.get("organization_uuid") or "").strip()
+    request_org = (request.organization_id or "").strip()
+    return bool(row_email) and row_email == request_email and row_org == request_org
+
+
+def _identity_block_for(request: SwitchRequest, db) -> IdentityBlock:
+    """Build the block to publish for one switch request.
+
+    The account row is the source when it still matches the request. A
+    missing row, a missing database or a row that no longer matches gives
+    the minimal block from the request fields.
+    """
+    row = db.get_account(request.account_id) if db is not None else None
+    if row is not None:
+        if _request_matches_row(row, request):
+            block = build_identity_block(row, db=db)
+            if block is None:
+                raise ClaudeConfigUnwritable("the account row is not a Claude account")
+            return block
+        logger.warning(
+            "Account %d: the stored row no longer matches the switch request; "
+            "publishing the request identity only",
+            request.account_id,
+        )
+    if not (request.email or "").strip():
+        raise ClaudeConfigUnwritable("the switch request has no identity to publish")
+    return minimal_identity_block(
+        request.account_id,
+        request.email,
+        request.organization_id,
+        request.organization_name,
+        display_name=request.display_name,
+    )
+
+
+def claude_config_identity_publisher(home: Path, db=None):
     """Return the publisher that mirrors a switch into ``<home>/.claude.json``.
 
     Claude Code keeps its OAuth token in memory and re-reads the credential
     store only when the ``oauthAccount`` identity in its config changes. Every
     switch must therefore republish that identity, or running sessions keep
     the previous account until they restart (regression fixed 2026-09-04).
+
+    With ``db``, the block is built from the account row, so it carries the
+    full stored profile and the account uuid. Claude Code accepts a later
+    profile merge only for the same uuid, so a partial block lets a stale
+    process write the previous account back in.
     """
 
     def publish(request: SwitchRequest) -> None:
         # strict=True: a symlinked or unwritable config must raise, not log.
         # The engine reports "sessions follow" from this call returning, so a
         # silent failure would promise an activation that never happened.
-        update_claude_config_email(
-            request.email,
-            request.display_name,
-            request.organization_id,
-            request.organization_name,
-            home=home,
-            strict=True,
-        )
+        write_identity(home, _identity_block_for(request, db), strict=True)
 
     return publish
 

@@ -752,8 +752,12 @@ class OAuthFlow:
             f"has_refresh={bool(tokens.get('refresh_token'))}"
         )
 
-        # Extract account metadata from response (design doc section 4b)
-        account_data = tokens.get("account", {})
+        # Extract account metadata from response (design doc section 4b).
+        # The token exchange names the email ``email_address`` (the profile
+        # endpoint names it ``email``). account.uuid is the Claude account
+        # uuid; None when the response does not carry it.
+        account_data = tokens.get("account") or {}
+        tokens["account_uuid"] = account_data.get("uuid") or None
         if account_data.get("email_address"):
             tokens["email"] = account_data["email_address"]
         if account_data.get("subscriptionType"):
@@ -763,7 +767,7 @@ class OAuthFlow:
 
         # Extract organization data from token response.
         # Normalize: None/"" → sentinel "" for DB storage.
-        org_data = tokens.get("organization", {})
+        org_data = tokens.get("organization") or {}
         tokens["organization_uuid"] = org_data.get("uuid") or ""
         tokens["organization_name"] = org_data.get("name") or None
 
@@ -885,6 +889,7 @@ class OAuthFlow:
 
         final_org_uuid = tokens.get("organization_uuid", "")
         final_org_name = tokens.get("organization_name")
+        account_uuid = tokens.get("account_uuid") or None
 
         if self._target_account_id:
             # RE-AUTH: Update existing account by ID.
@@ -927,6 +932,12 @@ class OAuthFlow:
                     # No active account for this org — clean up soft-deleted ghosts
                     self.db.hard_delete_duplicate(email, final_org_uuid)
 
+            reauth_updates: dict = {}
+            if account_uuid:
+                # Store the uuid on the row this branch ACTUALLY updates
+                # (the org-redirect target, when there is one). None keeps
+                # the stored uuid.
+                reauth_updates["account_uuid"] = account_uuid
             self.db.update_account(
                 actual_target_id,
                 access_token=tokens["access_token"],
@@ -943,6 +954,7 @@ class OAuthFlow:
                 validation_status="valid",
                 last_validated_at=int(time.time()),
                 last_error=None,
+                **reauth_updates,
             )
             account = self.db.get_account(actual_target_id)
             if actual_target_id != self._target_account_id:
@@ -961,6 +973,7 @@ class OAuthFlow:
                 has_extra_usage=has_extra_usage,
                 organization_uuid=final_org_uuid,
                 organization_name=final_org_name,
+                account_uuid=account_uuid,
             )
 
             # Non-fatal: account already persisted by create_account above
@@ -972,6 +985,25 @@ class OAuthFlow:
             if not updated:
                 logger.warning(
                     f"Validation status update failed for account {account['id']}"
+                )
+
+        # Store the identity from the profile this flow fetched with the new
+        # token. The guarded writer applies nothing unless the profile email
+        # and org match the row, so a foreign profile cannot land here.
+        if profile:
+            from jacked.web.auth import _update_profile_metadata
+
+            try:
+                _update_profile_metadata(account["id"], profile, self.db)
+                refreshed = self.db.get_account(account["id"])
+                if refreshed:
+                    if "_redirected_from" in account:
+                        refreshed["_redirected_from"] = account["_redirected_from"]
+                    account = refreshed
+            except Exception as e:
+                logger.warning(
+                    "Profile identity store failed for account %d (%s)",
+                    account["id"], type(e).__name__,
                 )
 
         # Update usage cache if we got usage data
@@ -987,7 +1019,7 @@ class OAuthFlow:
                 raw=usage,
             )
 
-        logger.info(f"Account stored: {email} (id={account['id']})")
+        logger.info("Account stored: id=%d", account["id"])
         return account
 
     def _store_cc_tokens(self, tokens: dict, profile: dict) -> dict:
@@ -1005,9 +1037,13 @@ class OAuthFlow:
         # CC flows skip API key creation, so _fetch_profile may fail with
         # the raw OAuth access token (returns {}). The token exchange response
         # already contains the email in tokens["email"] from the account field.
+        # The profile key is account.email; email_address is the token
+        # exchange key, kept as a fallback for older callers.
+        profile_account = (profile or {}).get("account") or {}
         cc_email = (
             tokens.get("email")
-            or profile.get("account", {}).get("email_address")
+            or profile_account.get("email")
+            or profile_account.get("email_address")
         )
         if not cc_email:
             raise RuntimeError(
@@ -1036,6 +1072,13 @@ class OAuthFlow:
 
         expires_at = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
 
+        # Email (and org, for an org-scoped row) are verified above, so the
+        # token exchange's account uuid belongs to this row. None keeps the
+        # stored uuid.
+        cc_identity: dict = {}
+        if tokens.get("account_uuid"):
+            cc_identity["account_uuid"] = tokens["account_uuid"]
+
         # Fatal: CC tokens are the sole deliverable of this flow
         updated = self.db.update_account(
             account_id,
@@ -1051,12 +1094,13 @@ class OAuthFlow:
             last_error=None,
             last_error_at=None,
             last_validated_at=int(time.time()),
+            **cc_identity,
         )
         if not updated:
             raise RuntimeError(
                 f"CC token update failed: account {account_id} — 0 rows affected"
             )
 
-        logger.info(f"CC tokens stored for account {account_id} ({cc_email})")
+        logger.info("CC tokens stored for account %d", account_id)
         # Return the full account row so credential sync works
         return self.db.get_account(account_id)

@@ -111,7 +111,7 @@ def _seed_claude_config(config_dir: Path) -> None:
         if key in source:
             local[key] = source[key]
 
-    # Atomic write (matches _seed_workspace_trust / _seed_oauth_account pattern)
+    # Atomic write (matches the _seed_workspace_trust pattern)
     fd, tmp = tempfile.mkstemp(
         dir=str(config_dir), prefix=".claude_json_tmp_", suffix=".json"
     )
@@ -208,94 +208,36 @@ def _seed_workspace_trust(config_dir: Path) -> None:
         logger.debug("Failed to write workspace trust to %s", claude_json)
 
 
-def _seed_oauth_account(config_dir: Path, account: dict) -> None:
-    """Seed oauthAccount identity into per-account .claude.json.
+def _seed_oauth_account(config_dir: Path, account: dict, db=None) -> None:
+    """Seed the account identity into the per-account .claude.json.
 
-    Seeds emailAddress when oauthAccount is absent.  When oauthAccount already
-    exists (Claude Code wrote the richer ~12-field version), preserves all
-    fields but ALWAYS corrects emailAddress to match the DB account.  This
-    prevents token contamination: if Claude Code re-authenticates as a
-    different Claude account inside this per-account dir, the stale email
-    is overwritten on next launch so _sync_tokens_from_file() can detect
+    The block comes from ``claude_identity.build_identity_block``, the same
+    builder as every global switch, so it carries the stored profile and
+    the account uuid when jacked knows them. When the existing block is the
+    same account (same email, org and uuid), the write merges and keeps the
+    fields that Claude Code wrote. Otherwise the write replaces the block.
+    This prevents token contamination: if Claude Code re-authenticates as a
+    different Claude account inside this per-account dir, the stale identity
+    is replaced on the next launch, so _sync_tokens_from_file() can detect
     the mismatch and block the wrong token from polluting the DB.
+
+    A symlinked or malformed .claude.json is never written.
     """
-    email = account.get("email")
-    if not email:
+    if not account.get("email"):
         return
 
-    claude_json = config_dir / ".claude.json"
-    if claude_json.is_symlink():
+    from jacked.api.claude_identity import build_identity_block, write_identity
+
+    block = build_identity_block(account, db=db)
+    if block is None:
         return
-
-    local = {}
-    try:
-        local = json.loads(claude_json.read_text(encoding="utf-8"))
-        if not isinstance(local, dict):
-            local = {}
-    except FileNotFoundError:
-        pass
-    except (json.JSONDecodeError, OSError):
-        return  # Don't clobber a file we can't parse
-
-    org_uuid = account.get("organization_uuid") or None
-    org_name = account.get("organization_name")
-
-    if "oauthAccount" in local and isinstance(local["oauthAccount"], dict):
-        # Claude Code wrote the full version — preserve all fields but
-        # ALWAYS update emailAddress + org identity to match the DB account.
-        # This prevents stale emails/orgs from persisting after Claude Code
-        # re-authenticates inside a per-account directory.
-        changed = False
-        if (local["oauthAccount"].get("emailAddress") or "").lower() != email.lower():
-            local["oauthAccount"]["emailAddress"] = email
-            changed = True
-        # Always sync org identity
-        if org_uuid:
-            if local["oauthAccount"].get("organizationUuid") != org_uuid:
-                local["oauthAccount"]["organizationUuid"] = org_uuid
-                changed = True
-            if org_name and local["oauthAccount"].get("organizationName") != org_name:
-                local["oauthAccount"]["organizationName"] = org_name
-                changed = True
-        else:
-            # Personal account — clear any stale org fields
-            if "organizationUuid" in local["oauthAccount"]:
-                del local["oauthAccount"]["organizationUuid"]
-                changed = True
-            if "organizationName" in local["oauthAccount"]:
-                del local["oauthAccount"]["organizationName"]
-                changed = True
-        if not changed:
-            return  # Already correct — nothing to do
-    else:
-        oauth = {"emailAddress": email}
-        display_name = account.get("display_name")
-        if display_name:
-            oauth["displayName"] = display_name
-        if org_uuid:
-            oauth["organizationUuid"] = org_uuid
-        if org_name:
-            oauth["organizationName"] = org_name
-        local["oauthAccount"] = oauth
-
-    # Atomic write
-    fd, tmp = tempfile.mkstemp(
-        dir=str(config_dir), prefix=".claude_json_tmp_", suffix=".json"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(local, f, indent=2)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        _safe_replace(tmp, str(claude_json))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        logger.debug("Failed to write oauthAccount to %s", claude_json)
+    result = write_identity(config_dir, block)
+    if not result.ok:
+        logger.debug(
+            "Account %s: per-account identity not seeded (%s)",
+            account.get("id"),
+            result.status,
+        )
 
 
 # Shared resources to symlink from global ~/.claude/ into per-account dirs.
@@ -599,7 +541,7 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     # Propagate workspace trust (runs every launch, not gated by onboarding)
     _seed_workspace_trust(config_dir)
     # Seed oauthAccount identity so Claude Code doesn't open browser to verify
-    _seed_oauth_account(config_dir, account)
+    _seed_oauth_account(config_dir, account, db=db)
     # Symlink shared resources (settings, plugins, etc.) from global dir
     _ensure_shared_symlinks(config_dir)
 

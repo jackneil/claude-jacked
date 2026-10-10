@@ -106,8 +106,26 @@ def _default_read_authority() -> dict | None:
     return result.payload.to_mapping()
 
 
-def _default_profile_lookup(access_token: str) -> dict | None:
-    """Identify one access token through the OAuth profile endpoint."""
+@dataclass(frozen=True)
+class ProfileLookup:
+    """Outcome of one profile request. It never carries the access token.
+
+    ``status_code`` is None when the request did not complete (a network
+    failure or a timeout). ``profile`` is the response object only for an
+    HTTP 200 with a JSON object body.
+    """
+
+    status_code: int | None
+    profile: dict | None = None
+
+
+def lookup_profile(access_token: str) -> ProfileLookup:
+    """Identify one access token through the OAuth profile endpoint.
+
+    This function sends one GET request. It never refreshes a token and
+    never writes the database, so a caller can use it to prove who owns a
+    token without changing any refresh lineage.
+    """
     import httpx
 
     from jacked.web.oauth import OAUTH_BETA_HEADER, PROFILE_URL
@@ -122,17 +140,28 @@ def _default_profile_lookup(access_token: str) -> dict | None:
                 },
             )
     except Exception:
-        logger.debug("Foreign authority profile lookup failed", exc_info=True)
-        return None
+        logger.debug("Authority profile lookup failed", exc_info=True)
+        return ProfileLookup(None)
     if response.status_code != 200:
         logger.debug(
-            "Foreign authority profile lookup returned HTTP %d", response.status_code
+            "Authority profile lookup returned HTTP %d", response.status_code
         )
-        return None
+        return ProfileLookup(response.status_code)
     try:
-        return response.json()
+        body = response.json()
     except ValueError:
-        return None
+        return ProfileLookup(200)
+    return ProfileLookup(200, body if isinstance(body, dict) else None)
+
+
+def _default_profile_lookup(access_token: str) -> dict | None:
+    """Identify one access token through the OAuth profile endpoint."""
+    return lookup_profile(access_token).profile
+
+
+def _uuid_prefix(value: Any) -> str:
+    """Return the first 8 characters of a uuid for a values-free log."""
+    return value[:8] if isinstance(value, str) and value else "unknown"
 
 
 def _stamped_account_id(payload: dict) -> int | None:
@@ -376,12 +405,17 @@ def _heal(
         row = _match_account(db, email, organization_uuid)
         if row is None:
             _mark_handled(digest, None, settled=True)
+            # No row matched, so there is no row id to name. The log names the
+            # organization uuid prefix and the payload digest prefix only:
+            # an email is personal data and never goes to the log.
             logger.warning(
-                "A foreign Claude Code write holds the credential authority for %s, "
-                "which is not a known jacked account. jacked will not overwrite it.",
-                email,
+                "A foreign Claude Code write holds the credential authority for an "
+                "account that is not a known jacked account (organization %s, "
+                "payload %s). jacked will not overwrite it.",
+                _uuid_prefix(organization_uuid),
+                digest[:8],
             )
-            return HealResult(ACTION_UNKNOWN_ACCOUNT, reason=f"unknown account {email}")
+            return HealResult(ACTION_UNKNOWN_ACCOUNT, reason="unknown account")
     else:
         row = db.get_account(known_account_id)
         if row is None:
