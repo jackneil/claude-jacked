@@ -59,6 +59,56 @@ def _account() -> dict:
     }
 
 
+_SEVEN_UUID = "7e7e7e7e-0000-4000-8000-000000000007"
+
+
+def _profiled_account() -> dict:
+    """The account row after the profile fetch stored its identity."""
+    account = _account()
+    account.update(
+        provider="claude",
+        account_uuid=_SEVEN_UUID,
+        rate_limit_tier="default_claude_max_20x",
+        profile_fetched_at=1_760_000_000.0,
+        profile_json=json.dumps(
+            {
+                "account": {
+                    "uuid": _SEVEN_UUID,
+                    "email": "seven@example.com",
+                    "display_name": "Seven Example",
+                    "full_name": "Seven Q. Example",
+                    "created_at": "2024-01-02T03:04:05Z",
+                },
+                "organization": {
+                    "uuid": "org-seven",
+                    "name": "Seven Org",
+                    "billing_type": "stripe_subscription",
+                    "rate_limit_tier": "default_claude_max_20x",
+                    "seat_tier": None,
+                    "has_extra_usage_enabled": False,
+                    "subscription_created_at": "2024-02-01T00:00:00Z",
+                    "claude_code_trial_ends_at": None,
+                    "claude_code_trial_duration_days": None,
+                },
+            }
+        ),
+    )
+    return account
+
+
+class _RowDb:
+    """The two database reads the identity publisher makes."""
+
+    def __init__(self, row: dict) -> None:
+        self._row = row
+
+    def get_account(self, account_id: int):
+        return dict(self._row) if account_id == self._row["id"] else None
+
+    def list_accounts(self, include_inactive=False, include_deleted=False):
+        return [dict(self._row)]
+
+
 def test_shipped_registry_resolves_any_build_hash_on_each_platform() -> None:
     darwin = SHIPPED_REGISTRY.resolve(_identity(sha256="f" * 64))
     assert darwin.can_mutate is True
@@ -133,7 +183,8 @@ def test_linux_activation_writes_file_authority_end_to_end(tmp_path: Path) -> No
             lambda _db: InMemoryCredentialSwitchRepository(),
         ),
     ):
-        result = activate_account(object(), _account(), SwitchContext.MANUAL, "op-linux")
+        account = _profiled_account()
+        result = activate_account(_RowDb(account), account, SwitchContext.MANUAL, "op-linux")
 
     assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
     written = home / ".claude" / ".credentials.json"
@@ -152,6 +203,15 @@ def test_linux_activation_writes_file_authority_end_to_end(tmp_path: Path) -> No
     assert config["oauthAccount"]["displayName"] == "Seven Example"
     assert config["oauthAccount"]["organizationUuid"] == "org-seven"
     assert config["oauthAccount"]["organizationName"] == "Seven Org"
+    # The full profile block, uuid included: Claude Code 2.1.296 merges a
+    # later profile only for the same uuid and skips its own fetch while
+    # these fields are present (2026-10-10 identity publish).
+    assert config["oauthAccount"]["accountUuid"] == _SEVEN_UUID
+    assert config["oauthAccount"]["billingType"] == "stripe_subscription"
+    assert config["oauthAccount"]["accountCreatedAt"] == "2024-01-02T03:04:05Z"
+    assert config["oauthAccount"]["subscriptionCreatedAt"] == "2024-02-01T00:00:00Z"
+    assert config["oauthAccount"]["ccOnboardingFlags"] == {}
+    assert config["oauthAccount"]["profileFetchedAt"] == 1_760_000_000_000
     assert result.existing_session_activation is SessionActivationState.PENDING_NEXT_ACTIVITY
 
 
@@ -361,7 +421,9 @@ def _activate_on_linux_home(home: Path):
             lambda _db: InMemoryCredentialSwitchRepository(),
         ),
     ):
-        return activate_account(object(), _account(), SwitchContext.MANUAL, "op-linux")
+        return activate_account(
+            _RowDb(_account()), _account(), SwitchContext.MANUAL, "op-linux"
+        )
 
 
 def _assert_switch_reports_that_sessions_must_restart(result, home: Path) -> None:

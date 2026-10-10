@@ -1,7 +1,10 @@
-"""Credential helpers: unified write path, atomic file I/O, keychain access.
+"""Credential helpers: atomic file I/O, keychain access, credential builders.
 
-All credential writes go through sync_credential_to_all_stores().
-This is the ONLY module that writes to credential stores.
+Account switches write the credential stores through
+``jacked.credentials.transaction.CredentialTransactionEngine``; the
+``sync_credential_to_all_stores()`` wrapper here is a legacy compatibility
+path. The ``oauthAccount`` identity in ``~/.claude.json`` is written only by
+``jacked.api.claude_identity``.
 """
 
 import contextlib
@@ -180,50 +183,32 @@ def _write_credential_file(cred_path: Path, data: dict) -> float:
     return cred_path.stat().st_mtime
 
 
-def _read_claude_config(claude_config: Path) -> dict:
-    """Read Claude's config, retaining the established fresh-file fallback."""
-    config: dict = {}
-    if claude_config.exists():
-        try:
-            config = json.loads(claude_config.read_text(encoding="utf-8"))
-            if not isinstance(config, dict):
-                config = {}
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read ~/.claude.json, creating fresh: %s", exc)
-            config = {}
-    return config
+def _legacy_identity_block(metadata: _ClaudeConfigAccount):
+    """Build an identity block from caller-supplied fields (no account row).
 
+    The caller knows no account uuid and no stored profile, so the block is
+    the minimal identity. A tier that the caller supplies is kept.
+    """
+    from dataclasses import replace
 
-def _apply_claude_account(config: dict, metadata: _ClaudeConfigAccount) -> None:
-    """Replace active identity metadata in an already parsed config."""
-    account = config.setdefault("oauthAccount", {})
-    account["emailAddress"] = metadata.email
-    # Every identity field is replaced, never merged: a leftover displayName
-    # from the previous account would label the new email with the old name.
-    if metadata.display_name:
-        account["displayName"] = metadata.display_name
-    else:
-        account.pop("displayName", None)
+    from jacked.api.claude_identity import minimal_identity_block
 
-    if metadata.organization_uuid:
-        account["organizationUuid"] = metadata.organization_uuid
-    else:
-        account.pop("organizationUuid", None)
-    if metadata.organization_name:
-        account["organizationName"] = metadata.organization_name
-    else:
-        account.pop("organizationName", None)
-
-    if metadata.rate_limit_tier is not _RATE_LIMIT_TIER_UNSET:
-        account.pop("userRateLimitTier", None)
-        account.pop("organizationRateLimitTier", None)
-        if metadata.rate_limit_tier:
-            tier_field = (
-                "organizationRateLimitTier"
-                if metadata.organization_uuid
-                else "userRateLimitTier"
-            )
-            account[tier_field] = metadata.rate_limit_tier
+    block = minimal_identity_block(
+        0,
+        metadata.email,
+        metadata.organization_uuid,
+        metadata.organization_name,
+        display_name=metadata.display_name,
+    )
+    tier = metadata.rate_limit_tier
+    if tier is not _RATE_LIMIT_TIER_UNSET and tier:
+        tier_key = (
+            "organizationRateLimitTier"
+            if block.organization_uuid
+            else "userRateLimitTier"
+        )
+        block = replace(block, fields={**block.fields, tier_key: tier})
+    return block
 
 
 def _update_claude_config_account(
@@ -232,33 +217,19 @@ def _update_claude_config_account(
     home: Path | None = None,
     strict: bool = False,
 ) -> None:
-    """Atomically mirror one account's non-secret metadata to ~/.claude.json.
+    """Write one account's identity to ~/.claude.json through the safe writer.
 
-    ``strict`` makes the outcome explicit. A strict caller gets
-    ``ClaudeConfigUnwritable`` when the identity did not land, which is the
-    only way it can honestly say whether running Claude Code sessions follow
-    the switch. Non-strict callers keep the log-and-continue behaviour.
+    The write merges into the block of the same account and replaces the
+    block of a different account. An existing config that is not a JSON
+    object is never overwritten. ``strict`` makes the outcome explicit: a
+    strict caller gets ``ClaudeConfigUnwritable`` when the identity did not
+    land. Non-strict callers get a logged warning.
     """
-    claude_config = (home or Path.home()) / ".claude.json"
+    from jacked.api.claude_identity import write_identity
 
-    if claude_config.is_symlink():
-        reason = "the Claude config path is a symlink"
-        if strict:
-            raise ClaudeConfigUnwritable(reason)
-        logger.warning("Refusing to write ~/.claude.json - %s", reason)
-        return
-
-    config = _read_claude_config(claude_config)
-    _apply_claude_account(config, metadata)
-
-    try:
-        _write_credential_file(claude_config, config)
-    except Exception as exc:
-        if strict:
-            raise ClaudeConfigUnwritable(
-                f"could not write the Claude config: {exc}"
-            ) from exc
-        logger.warning("Failed to write ~/.claude.json: %s", exc)
+    write_identity(
+        home or Path.home(), _legacy_identity_block(metadata), strict=strict
+    )
 
 
 def update_claude_config_email(
@@ -270,13 +241,19 @@ def update_claude_config_email(
     home: Path | None = None,
     strict: bool = False,
 ):
-    """Update Claude identity while preserving legacy tier metadata.
+    """Write a minimal Claude identity from caller-supplied fields.
 
-    ``home`` selects the config directory; it defaults to the user's home.
-    ``strict`` raises ``ClaudeConfigUnwritable`` instead of logging when the
-    identity cannot be written.
+    Callers that have the account row use ``claude_identity`` directly, so
+    the block carries the stored profile. ``home`` selects the config
+    directory; it defaults to the user's home. ``strict`` raises
+    ``ClaudeConfigUnwritable`` instead of logging when the identity cannot
+    be written.
 
-    >>> update_claude_config_email("test@example.com")  # noqa: no side-effects in test env
+    >>> import tempfile
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     update_claude_config_email("test@example.com", home=Path(tmp))
+    ...     json.loads((Path(tmp) / ".claude.json").read_text())["oauthAccount"]
+    {'emailAddress': 'test@example.com'}
     """
     _update_claude_config_account(
         _ClaudeConfigAccount(
@@ -422,8 +399,8 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
     the refresh token during its session. If so, import the fresh token
     into our DB so we don't lose it.
 
-    Called before sync_credential_to_all_stores() in the swap path and
-    in the use_account endpoint.
+    Called before an account switch moves the credential stores to another
+    account.
 
     SAFETY: Never imports cc_refresh_token when circuit breaker shows
     invalid_grant — the live token is Claude Code's active token and
@@ -631,25 +608,21 @@ def sync_credential_to_all_stores(
     email: str = None,
     display_name: str = None,
 ) -> bool:
-    """Write credential tokens to all stores atomically.
+    """Write credential tokens to all stores (legacy compatibility path).
 
-    This is the ONLY function that writes credentials.  Called from:
-    - OAuth _complete_auth() after _store_account()
-    - "Set Active" / use_account endpoint
-    - Per-account dir preparation (launch.py)
-
-    This compatibility wrapper now returns an honest boolean and stops before
-    file publication when the macOS authority cannot be updated. New callers
-    should use ``CredentialTransactionEngine`` for durable outcomes.
+    No production code calls this wrapper; account switches go through
+    ``CredentialTransactionEngine``. It returns an honest boolean and stops
+    before file publication when the macOS authority cannot be updated. The
+    identity step uses the same row builder and safe writer as the engine.
 
     Args:
         account_id: The account DB id
         account: Full account dict from DB (has access_token, refresh_token, etc.)
         email: Override email (defaults to account["email"])
-        display_name: Override display name
+        display_name: Kept for old callers. The published identity comes
+            from the account row, so this value is not used.
     """
     email = email or account.get("email", "")
-    display_name = display_name or account.get("display_name")
     oauth_data = build_oauth_data(account)
 
     cred_path = Path.home() / ".claude" / ".credentials.json"
@@ -705,19 +678,28 @@ def sync_credential_to_all_stores(
     if sys.platform == "darwin":
         evidence.insert(0, "authority:keychain:readback")
 
-    # 3. Update ~/.claude.json with email + org identity
+    # 3. Publish the identity to ~/.claude.json from the account row, so the
+    # block carries the stored profile and uuid like every engine switch.
     try:
-        _update_claude_config_account(
-            _ClaudeConfigAccount(
-                email=email,
-                display_name=display_name,
-                organization_uuid=account.get("organization_uuid") or None,
-                organization_name=account.get("organization_name"),
-                rate_limit_tier=account.get("rate_limit_tier"),
-            )
-        )
+        from jacked.api.claude_identity import build_identity_block, write_identity
+
+        row = {**account, "id": account_id, "email": email}
+        if (email or "").strip().casefold() != (
+            account.get("email") or ""
+        ).strip().casefold():
+            # An email override names someone other than the row: neither
+            # the row's uuid nor its stored profile belongs to it.
+            row["account_uuid"] = None
+            row["profile_json"] = None
+        block = build_identity_block(row)
+        if block is not None:
+            write_identity(Path.home(), block)
     except Exception as exc:
-        logger.warning("Failed to update ~/.claude.json email: %s", exc)
+        logger.warning(
+            "Failed to update ~/.claude.json identity for account %d: %s",
+            account_id,
+            type(exc).__name__,
+        )
 
     # 4. Write to per-account dir if it exists
     acct_dir = Path.home() / ".claude" / "accounts" / str(account_id)

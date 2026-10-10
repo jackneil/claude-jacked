@@ -71,6 +71,9 @@ class Account(BaseModel):
     cc_expires_at: Optional[int] = None
     refresh_last_failed_at: Optional[int] = None
     refresh_failure_type: Optional[str] = None
+    account_uuid: Optional[str] = None
+    profile_json: Optional[str] = None
+    profile_fetched_at: Optional[float] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -217,6 +220,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     cc_access_token TEXT,
     cc_refresh_token TEXT,
     cc_expires_at INTEGER,
+    account_uuid TEXT,  -- Claude account uuid (profile account.uuid / token exchange account.uuid)
+    profile_json TEXT,  -- Non-secret profile subset: {"account": {...}, "organization": {...}}
+    profile_fetched_at REAL,  -- Epoch seconds of the profile fetch that wrote profile_json
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(provider, email, organization_uuid)
@@ -678,6 +684,25 @@ class Database:
                     )
                 except sqlite3.OperationalError:
                     pass
+            # Migration: add the Claude identity columns (account uuid, the
+            # non-secret profile subset, and its fetch time). This MUST stay
+            # AFTER the explicit-column organization rebuild above: that
+            # rebuild lists its columns by name, so a column added before it
+            # would be dropped on an old pre-organization database.
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols_ident = {row[1] for row in cursor.fetchall()}
+            for col_name, col_def in [
+                ("account_uuid", "TEXT"),
+                ("profile_json", "TEXT"),
+                ("profile_fetched_at", "REAL"),
+            ]:
+                if col_name not in acct_cols_ident:
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE accounts ADD COLUMN {col_name} {col_def}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
             # Migration: add `provider` column + provider-scoped uniqueness.
             # Codex support: the same (email, organization_uuid) can exist under
             # both 'claude' and 'codex'. SQLite can't ALTER a UNIQUE constraint,
@@ -835,6 +860,7 @@ class Database:
         organization_uuid: str = "",  # Sentinel: "" = personal/legacy, non-empty = real org UUID
         organization_name: Optional[str] = None,
         provider: str = "claude",  # 'claude' | 'codex' — the account's CLI provider
+        account_uuid: Optional[str] = None,
     ) -> dict:
         """Create a new account or update if (email, organization_uuid) already exists.
 
@@ -846,6 +872,9 @@ class Database:
         - Existing deleted account with same email+org: undelete and update
         - Existing active account with same email+org: update tokens in place
         - Same email, different org: creates a new separate account
+
+        account_uuid is the Claude account uuid from the token exchange. On a
+        conflict, a known uuid replaces the stored one and None keeps it.
 
         >>> db = Database(":memory:")
         >>> acct = db.create_account("test@example.com", "sk-ant-test", 9999999999)
@@ -878,8 +907,8 @@ class Database:
                     access_token, refresh_token, expires_at, display_name,
                     scopes, subscription_type, rate_limit_tier, has_extra_usage,
                     priority, is_active, is_deleted, consecutive_failures,
-                    validation_status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 'unknown', ?, ?)
+                    validation_status, account_uuid, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 'unknown', ?, ?, ?)
                 ON CONFLICT(provider, email, organization_uuid) DO UPDATE SET
                     access_token = excluded.access_token,
                     refresh_token = excluded.refresh_token,
@@ -889,6 +918,7 @@ class Database:
                     subscription_type = COALESCE(excluded.subscription_type, subscription_type),
                     rate_limit_tier = COALESCE(excluded.rate_limit_tier, rate_limit_tier),
                     has_extra_usage = excluded.has_extra_usage,
+                    account_uuid = COALESCE(excluded.account_uuid, account_uuid),
                     is_active = 1,
                     is_deleted = 0,
                     consecutive_failures = 0,
@@ -909,6 +939,7 @@ class Database:
                     rate_limit_tier,
                     has_extra_usage,
                     priority,
+                    account_uuid,
                     now,
                     now,
                 ),
@@ -1010,6 +1041,53 @@ class Database:
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def list_claude_accounts_missing_profile(self) -> list[dict]:
+        """List the Claude accounts that have no stored profile.
+
+        The list includes inactive rows and excludes deleted rows and other
+        providers. The order is by id.
+
+        >>> db = Database(":memory:")
+        >>> a = db.create_account("u@test.com", "tok", 9999999999)
+        >>> [r["id"] for r in db.list_claude_accounts_missing_profile()] == [a["id"]]
+        True
+        """
+        with self._reader() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM accounts WHERE provider = 'claude' "
+                "AND is_deleted = 0 AND profile_json IS NULL ORDER BY id ASC"
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def claude_identity_coverage(self) -> dict:
+        """Count the Claude accounts with and without a stored identity.
+
+        Only rows that are not deleted are counted. The result holds counts
+        only, never an identity value.
+
+        >>> db = Database(":memory:")
+        >>> _ = db.create_account("u@test.com", "tok", 9999999999)
+        >>> db.claude_identity_coverage()["without_uuid"]
+        1
+        """
+        with self._reader() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), "
+                "COALESCE(SUM(CASE WHEN account_uuid IS NOT NULL "
+                "AND account_uuid != '' THEN 1 ELSE 0 END), 0), "
+                "COALESCE(SUM(CASE WHEN profile_json IS NOT NULL "
+                "THEN 1 ELSE 0 END), 0) "
+                "FROM accounts WHERE provider = 'claude' AND is_deleted = 0"
+            ).fetchone()
+        total, with_uuid, with_profile = int(row[0]), int(row[1]), int(row[2])
+        return {
+            "total": total,
+            "with_uuid": with_uuid,
+            "without_uuid": total - with_uuid,
+            "with_profile": with_profile,
+            "without_profile": total - with_profile,
+        }
+
     # Whitelist of columns allowed in update_account
     _ACCOUNT_UPDATE_COLS = frozenset(
         {
@@ -1041,6 +1119,9 @@ class Database:
             "organization_uuid",
             "refresh_last_failed_at",
             "refresh_failure_type",
+            "account_uuid",
+            "profile_json",
+            "profile_fetched_at",
         }
     )
 

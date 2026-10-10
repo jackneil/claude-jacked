@@ -81,6 +81,21 @@ ORG_TYPE_MAP = {
 }
 
 
+def _stored_profile_org(row: dict) -> str | None:
+    """Return the org uuid of the row's verified stored profile, or None.
+
+    >>> _stored_profile_org({"email": "a@b.c"}) is None
+    True
+    """
+    from jacked.api.claude_identity import stored_profile
+
+    profile = stored_profile(row)
+    if profile is None:
+        return None
+    org = profile[1].get("uuid")
+    return org.strip() if isinstance(org, str) and org.strip() else None
+
+
 def identity_hint_params(account: Optional[dict]) -> dict:
     """Extra authorize-URL params that pre-select the account being re-authed.
 
@@ -499,9 +514,12 @@ class OAuthFlow:
                 self._result = result
                 self._status = "completed"
             except Exception as e:
+                # The exception text can name emails (the re-auth identity
+                # check does), so the log gets the type only; the UI gets
+                # the text through self._error.
                 logger.error(
-                    f"OAuth completion failed for flow {self.flow_id} "
-                    f"(purpose={self.purpose}): {e}"
+                    "OAuth completion failed for flow %s (purpose=%s): %s",
+                    self.flow_id, self.purpose, type(e).__name__,
                 )
                 self._status = "error"
                 self._error = str(e)
@@ -598,9 +616,10 @@ class OAuthFlow:
                 self._result = result
                 self._status = "completed"
             except Exception as e:
+                # Type only in the log, as in _handle_callback.
                 logger.error(
-                    f"OAuth manual completion failed for flow {self.flow_id} "
-                    f"(purpose={self.purpose}): {e}"
+                    "OAuth manual completion failed for flow %s (purpose=%s): %s",
+                    self.flow_id, self.purpose, type(e).__name__,
                 )
                 self._status = "error"
                 self._error = str(e)
@@ -752,8 +771,12 @@ class OAuthFlow:
             f"has_refresh={bool(tokens.get('refresh_token'))}"
         )
 
-        # Extract account metadata from response (design doc section 4b)
-        account_data = tokens.get("account", {})
+        # Extract account metadata from response (design doc section 4b).
+        # The token exchange names the email ``email_address`` (the profile
+        # endpoint names it ``email``). account.uuid is the Claude account
+        # uuid; None when the response does not carry it.
+        account_data = tokens.get("account") or {}
+        tokens["account_uuid"] = account_data.get("uuid") or None
         if account_data.get("email_address"):
             tokens["email"] = account_data["email_address"]
         if account_data.get("subscriptionType"):
@@ -763,7 +786,7 @@ class OAuthFlow:
 
         # Extract organization data from token response.
         # Normalize: None/"" → sentinel "" for DB storage.
-        org_data = tokens.get("organization", {})
+        org_data = tokens.get("organization") or {}
         tokens["organization_uuid"] = org_data.get("uuid") or ""
         tokens["organization_name"] = org_data.get("name") or None
 
@@ -870,9 +893,29 @@ class OAuthFlow:
         if tokens.get("scopes"):
             scopes_json = json.dumps(tokens["scopes"])
 
+        final_org_uuid = tokens.get("organization_uuid", "")
+        final_org_name = tokens.get("organization_name")
+        account_uuid = tokens.get("account_uuid") or None
+
+        # A profile that does not belong to this login (another email, or
+        # another org) contributes NOTHING: no plan metadata, no display
+        # name, no stored identity. The token response values are used.
+        if profile:
+            from jacked.web.auth import _profile_owner_mismatch
+
+            mismatch = _profile_owner_mismatch(
+                {"email": email, "organization_uuid": final_org_uuid}, profile
+            )
+            if mismatch is not None:
+                logger.warning(
+                    "OAuth profile ignored for flow %s: %s does not match the login",
+                    self.flow_id, mismatch,
+                )
+                profile = {}
+
         # Extract profile data (design doc section 4e mapping)
-        org = profile.get("organization", {})
-        acct_info = profile.get("account", {})
+        org = profile.get("organization") or {}
+        acct_info = profile.get("account") or {}
         org_type = org.get("organization_type", "")
         subscription_type = ORG_TYPE_MAP.get(
             org_type, tokens.get("subscription_type")
@@ -882,9 +925,6 @@ class OAuthFlow:
         )
         has_extra_usage = org.get("has_extra_usage_enabled", False)
         display_name = acct_info.get("display_name")
-
-        final_org_uuid = tokens.get("organization_uuid", "")
-        final_org_name = tokens.get("organization_name")
 
         if self._target_account_id:
             # RE-AUTH: Update existing account by ID.
@@ -920,13 +960,19 @@ class OAuthFlow:
                         "Re-auth org mismatch: target account %d (org %s) "
                         "but authorized org %s which matches account %d — "
                         "updating account %d instead",
-                        self._target_account_id, old_org_uuid,
-                        final_org_uuid, existing["id"], existing["id"],
+                        self._target_account_id, (old_org_uuid or "")[:8],
+                        (final_org_uuid or "")[:8], existing["id"], existing["id"],
                     )
                 else:
                     # No active account for this org — clean up soft-deleted ghosts
                     self.db.hard_delete_duplicate(email, final_org_uuid)
 
+            reauth_updates: dict = {}
+            if account_uuid:
+                # Store the uuid on the row this branch ACTUALLY updates
+                # (the org-redirect target, when there is one). None keeps
+                # the stored uuid.
+                reauth_updates["account_uuid"] = account_uuid
             self.db.update_account(
                 actual_target_id,
                 access_token=tokens["access_token"],
@@ -943,6 +989,7 @@ class OAuthFlow:
                 validation_status="valid",
                 last_validated_at=int(time.time()),
                 last_error=None,
+                **reauth_updates,
             )
             account = self.db.get_account(actual_target_id)
             if actual_target_id != self._target_account_id:
@@ -961,6 +1008,7 @@ class OAuthFlow:
                 has_extra_usage=has_extra_usage,
                 organization_uuid=final_org_uuid,
                 organization_name=final_org_name,
+                account_uuid=account_uuid,
             )
 
             # Non-fatal: account already persisted by create_account above
@@ -972,6 +1020,25 @@ class OAuthFlow:
             if not updated:
                 logger.warning(
                     f"Validation status update failed for account {account['id']}"
+                )
+
+        # Store the identity from the profile this flow fetched with the new
+        # token. The guarded writer applies nothing unless the profile email
+        # and org match the row, so a foreign profile cannot land here.
+        if profile:
+            from jacked.web.auth import _update_profile_metadata
+
+            try:
+                _update_profile_metadata(account["id"], profile, self.db)
+                refreshed = self.db.get_account(account["id"])
+                if refreshed:
+                    if "_redirected_from" in account:
+                        refreshed["_redirected_from"] = account["_redirected_from"]
+                    account = refreshed
+            except Exception as e:
+                logger.warning(
+                    "Profile identity store failed for account %d (%s)",
+                    account["id"], type(e).__name__,
                 )
 
         # Update usage cache if we got usage data
@@ -987,7 +1054,7 @@ class OAuthFlow:
                 raw=usage,
             )
 
-        logger.info(f"Account stored: {email} (id={account['id']})")
+        logger.info("Account stored: id=%d", account["id"])
         return account
 
     def _store_cc_tokens(self, tokens: dict, profile: dict) -> dict:
@@ -1005,9 +1072,13 @@ class OAuthFlow:
         # CC flows skip API key creation, so _fetch_profile may fail with
         # the raw OAuth access token (returns {}). The token exchange response
         # already contains the email in tokens["email"] from the account field.
+        # The profile key is account.email; email_address is the token
+        # exchange key, kept as a fallback for older callers.
+        profile_account = (profile or {}).get("account") or {}
         cc_email = (
             tokens.get("email")
-            or profile.get("account", {}).get("email_address")
+            or profile_account.get("email")
+            or profile_account.get("email_address")
         )
         if not cc_email:
             raise RuntimeError(
@@ -1033,8 +1104,29 @@ class OAuthFlow:
                     f"CC auth org ({cc_org}) does not match "
                     f"target account org ({target_org})"
                 )
+        elif cc_org:
+            # A row with no org still has a known org when its stored profile
+            # passed the owner guard. The identity builder publishes that org,
+            # so a token for another org must not land here.
+            stored_org = _stored_profile_org(target)
+            if stored_org and stored_org != cc_org:
+                raise ValueError(
+                    "CC auth org does not match the organization stored for the "
+                    "target account"
+                )
+        target_uuid = target.get("account_uuid")
+        cc_uuid = tokens.get("account_uuid")
+        if target_uuid and cc_uuid and cc_uuid != target_uuid:
+            raise ValueError("CC auth account does not match the target account")
 
         expires_at = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
+
+        # Email (and org, for an org-scoped row) are verified above, so the
+        # token exchange's account uuid belongs to this row. None keeps the
+        # stored uuid.
+        cc_identity: dict = {}
+        if tokens.get("account_uuid"):
+            cc_identity["account_uuid"] = tokens["account_uuid"]
 
         # Fatal: CC tokens are the sole deliverable of this flow
         updated = self.db.update_account(
@@ -1051,12 +1143,13 @@ class OAuthFlow:
             last_error=None,
             last_error_at=None,
             last_validated_at=int(time.time()),
+            **cc_identity,
         )
         if not updated:
             raise RuntimeError(
                 f"CC token update failed: account {account_id} — 0 rows affected"
             )
 
-        logger.info(f"CC tokens stored for account {account_id} ({cc_email})")
+        logger.info("CC tokens stored for account %d", account_id)
         # Return the full account row so credential sync works
         return self.db.get_account(account_id)

@@ -91,13 +91,76 @@ _PROFILE_REFRESH_INTERVAL = 6 * 3600  # seconds
 _profile_refreshed_at: dict[int, float] = {}
 
 
-def _update_profile_metadata(account_id: int, data: dict, db) -> None:
-    """Update account metadata from a profile API response."""
-    org = data.get("organization", {})
+def _profile_owner_mismatch(row: dict, data: dict) -> Optional[str]:
+    """Return the NAME of the first profile field that does not match the row.
+
+    The profile must hold an account object whose ``email`` is equal to the
+    row email (casefold, stripped). When the row has an organization uuid,
+    ``organization.uuid`` must be equal to it. When the row and the profile
+    both carry an account uuid, they must be equal. Return None when the
+    profile belongs to the row. The return value is a field name, never a
+    value. The rule lives in ``claude_identity.profile_owner_mismatch``.
+
+    >>> row = {"email": "a@x.com", "organization_uuid": "o1"}
+    >>> _profile_owner_mismatch(row, {"account": {"email": " A@X.com"},
+    ...                               "organization": {"uuid": "o1"}}) is None
+    True
+    >>> _profile_owner_mismatch(row, {"account": {"email": "b@x.com"}})
+    'account.email'
+    >>> _profile_owner_mismatch(row, {"account": {"email": "a@x.com"},
+    ...                               "organization": {"uuid": "o2"}})
+    'organization.uuid'
+    """
+    from jacked.api.claude_identity import profile_owner_mismatch
+
+    return profile_owner_mismatch(
+        row.get("email"),
+        row.get("organization_uuid"),
+        row.get("account_uuid"),
+        data,
+    )
+
+
+def _update_profile_metadata(account_id: int, data: dict, db) -> bool:
+    """Update the account row from a profile API response.
+
+    This function applies NOTHING when the profile does not belong to the
+    row (see ``_profile_owner_mismatch``). It then logs a WARNING that names
+    the row id and the field name, never a value. On a match, it stores the
+    plan metadata, the Claude account uuid, the non-secret profile subset
+    (the ``account`` and ``organization`` objects only, exactly as the
+    endpoint returned them; a missing organization is stored as null) and
+    the fetch time.
+
+    Returns True when the profile was applied, False when the row is
+    unknown or the profile does not belong to it.
+    """
+    row = db.get_account(account_id)
+    if not row:
+        return False
+    mismatch = _profile_owner_mismatch(row, data)
+    if mismatch is not None:
+        logger.warning(
+            "Profile for account %d not applied: %s does not match the row",
+            account_id, mismatch,
+        )
+        return False
+
+    acct = data["account"]
+    raw_org = data.get("organization")
+    # The empty-dict fallback is only for reading the plan metadata below;
+    # profile_json keeps the organization value the endpoint returned.
+    org = raw_org if isinstance(raw_org, dict) else {}
     org_type = org.get("organization_type", "")
     subscription_type = ORG_TYPE_MAP.get(org_type)
 
-    updates: dict = {}
+    updates: dict = {
+        "profile_json": json.dumps({"account": acct, "organization": raw_org}),
+        "profile_fetched_at": time.time(),
+    }
+    account_uuid = acct.get("uuid")
+    if isinstance(account_uuid, str) and account_uuid:
+        updates["account_uuid"] = account_uuid
     if subscription_type:
         updates["subscription_type"] = subscription_type
     if org.get("rate_limit_tier"):
@@ -106,8 +169,8 @@ def _update_profile_metadata(account_id: int, data: dict, db) -> None:
         updates["has_extra_usage"] = org["has_extra_usage_enabled"]
     if org.get("name"):
         updates["organization_name"] = org["name"]
-    if updates:
-        db.update_account(account_id, **updates)
+    db.update_account(account_id, **updates)
+    return True
 
 
 @dataclass
@@ -991,17 +1054,45 @@ async def fetch_profile(
     db: Database,
     access_token: Optional[str] = None,
     _refresh_depth: int = 0,
+    allow_refresh: bool = True,
 ) -> Optional[dict]:
     """Fetch profile from the Anthropic Profile API (design doc section 4e).
 
-    Updates account metadata: subscription_type, rate_limit_tier,
-    has_extra_usage, display_name.
+    Updates the account row through ``_update_profile_metadata``: plan
+    metadata (subscription_type, rate_limit_tier, has_extra_usage,
+    organization_name) and the stored identity (account_uuid, profile_json,
+    profile_fetched_at). Nothing is applied when the profile does not
+    belong to the row.
 
-    Returns the raw profile response dict, or None on failure.
+    When ``allow_refresh`` is False, a 401/403 returns None and no token
+    refresh occurs.
+
+    Returns the raw profile response dict, or None on failure. A profile
+    that was fetched but not applied (owner mismatch) is still returned.
+    """
+    data, _applied = await _fetch_profile_applied(
+        account_id, db, access_token=access_token,
+        _refresh_depth=_refresh_depth, allow_refresh=allow_refresh,
+    )
+    return data
+
+
+async def _fetch_profile_applied(
+    account_id: int,
+    db: Database,
+    access_token: Optional[str] = None,
+    _refresh_depth: int = 0,
+    allow_refresh: bool = True,
+) -> tuple[Optional[dict], bool]:
+    """Fetch the profile and apply it, as ``fetch_profile`` does.
+
+    Returns ``(data, applied)``: ``data`` is the raw profile dict or None on
+    failure, and ``applied`` is the verdict of ``_update_profile_metadata``
+    (False when nothing was fetched or the profile was rejected).
     """
     account = db.get_account(account_id)
     if not account:
-        return None
+        return None, False
 
     token = access_token or account["access_token"]
 
@@ -1017,28 +1108,153 @@ async def fetch_profile(
 
             if resp.status_code == 200:
                 data = resp.json()
-                _update_profile_metadata(account_id, data, db)
-                logger.info(f"Profile fetched for account {account_id}")
-                return data
+                applied = _update_profile_metadata(account_id, data, db)
+                if applied:
+                    logger.info("Profile applied for account %d", account_id)
+                else:
+                    logger.info("Profile rejected for account %d", account_id)
+                return data, applied
 
-            if resp.status_code in (401, 403) and _refresh_depth < 1:
+            if (
+                resp.status_code in (401, 403)
+                and allow_refresh
+                and _refresh_depth < 1
+            ):
                 fresh = await _try_refresh_primary_token(
                     account_id, db, stale_token=token,
                 )
                 if fresh:
-                    return await fetch_profile(
+                    return await _fetch_profile_applied(
                         account_id, db, access_token=fresh,
                         _refresh_depth=_refresh_depth + 1,
                     )
 
             logger.warning(
-                f"Profile fetch HTTP {resp.status_code} for account {account_id}"
+                "Profile fetch HTTP %d for account %d", resp.status_code, account_id
             )
-            return None
+            return None, False
 
     except Exception as e:
-        logger.warning(f"Profile fetch failed for account {account_id}: {e}")
+        logger.warning(
+            "Profile fetch failed for account %d (%s)", account_id, type(e).__name__
+        )
+        return None, False
+
+
+PROFILE_BACKFILL_PAUSE_SECONDS = 1.0
+
+
+async def backfill_missing_profiles(
+    db: Database,
+    *,
+    pause_seconds: float = PROFILE_BACKFILL_PAUSE_SECONDS,
+    counts: Optional[dict] = None,
+) -> Optional[dict]:
+    """Fetch the profile for each Claude account that has no stored profile.
+
+    This is a one-shot startup task. It examines the Claude rows that are not
+    deleted (active and inactive) where profile_json is NULL. It calls
+    ``fetch_profile(allow_refresh=False)`` for one row at a time and pauses
+    ``pause_seconds`` between the calls. A 401/403 never refreshes a token.
+    A row whose primary token has expired is skipped without a request.
+
+    At the end, it logs ONE coverage line with counts only (no email, no
+    token, no uuid). It never raises (cancellation is not caught). It
+    returns the counts, or None when the pass could not run.
+
+    When the caller gives a ``counts`` dict, the pass fills it in place as
+    it runs. A caller that cancels the pass (for example on a timeout) can
+    then log the partial counts with ``log_identity_coverage``.
+    """
+    try:
+        rows = db.list_claude_accounts_missing_profile()
+    except Exception as e:
+        logger.warning(
+            "Profile backfill skipped: account list failed (%s)", type(e).__name__
+        )
         return None
+
+    if counts is None:
+        counts = {}
+    counts.update(_empty_backfill_counts())
+    counts["candidates"] = len(rows)
+    now = time.time()
+    attempted = 0
+    for row in rows:
+        account_id = row.get("id")
+        expires_at = row.get("expires_at")
+        if expires_at and expires_at <= now:
+            counts["skipped_expired"] += 1
+            continue
+        if attempted and pause_seconds > 0:
+            await asyncio.sleep(pause_seconds)
+        attempted += 1
+        try:
+            data, applied = await _fetch_profile_applied(
+                account_id, db, allow_refresh=False
+            )
+            if data is None:
+                counts["failed"] += 1
+                continue
+            if applied:
+                counts["fetched"] += 1
+            else:
+                # _update_profile_metadata refused it (owner mismatch) and
+                # already logged the row id and the field name.
+                counts["rejected"] += 1
+        except Exception as e:
+            counts["failed"] += 1
+            logger.warning(
+                "Profile backfill failed for account %s (%s)",
+                account_id, type(e).__name__,
+            )
+
+    log_identity_coverage(db, counts)
+    return counts
+
+
+def _empty_backfill_counts() -> dict:
+    """Return the zeroed backfill counters.
+
+    >>> _empty_backfill_counts()["fetched"]
+    0
+    """
+    return {
+        "candidates": 0,
+        "fetched": 0,
+        "rejected": 0,
+        "failed": 0,
+        "skipped_expired": 0,
+    }
+
+
+def log_identity_coverage(
+    db: Database, counts: Optional[dict] = None, *, timed_out: bool = False
+) -> None:
+    """Log ONE values-free Claude identity coverage line.
+
+    The line holds counts only (no email, no token, no uuid). ``counts`` are
+    the backfill counters (missing keys count as 0). ``timed_out`` marks a
+    pass that was cancelled before it finished. This function never raises.
+    """
+    merged = _empty_backfill_counts()
+    merged.update(counts or {})
+    label = "backfill timed out" if timed_out else "backfill"
+    try:
+        cov = db.claude_identity_coverage()
+        logger.info(
+            "Claude identity coverage: total=%d with_uuid=%d without_uuid=%d "
+            "with_profile=%d without_profile=%d (%s candidates=%d "
+            "fetched=%d rejected=%d failed=%d skipped_expired=%d)",
+            cov["total"], cov["with_uuid"], cov["without_uuid"],
+            cov["with_profile"], cov["without_profile"], label,
+            merged["candidates"], merged["fetched"], merged["rejected"],
+            merged["failed"], merged["skipped_expired"],
+        )
+    except Exception as e:
+        logger.warning(
+            "Claude identity coverage unavailable (%s)", type(e).__name__
+        )
 
 
 def _validate_codex_account(account_id: int, db: Database) -> dict:

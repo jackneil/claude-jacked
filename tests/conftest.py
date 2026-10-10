@@ -1,6 +1,7 @@
 """Shared fixtures for jacked tests."""
 
 import re
+from pathlib import Path
 
 import pytest
 from unittest.mock import patch
@@ -14,6 +15,211 @@ from jacked.credentials.models import (
     SwitchResult,
 )
 
+
+
+# The developer's real home, captured before any test can move HOME.
+REAL_HOME = Path.home()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_db_path(monkeypatch, tmp_path_factory):
+    """Tripwire: no test may open the developer's real ~/.claude/jacked.db.
+
+    ``Database()`` with no path resolves ``jacked.web.database._default_db_path``.
+    On 2026-10-10 two tests ran the real FastAPI lifespan, which built
+    ``Database()`` against the real home: it migrated the real database and
+    its background loops sent a real window-keeper ping. While HOME is still
+    the real home, the default path now resolves to a per-test temporary
+    file. A test that moves HOME (or USERPROFILE) keeps the production rule,
+    HOME/.claude/jacked.db, because that path is already isolated. A test
+    that must check the real resolver calls ``_default_db_path.original``.
+    """
+    from jacked.web import database
+
+    original = database._default_db_path
+    holder: dict = {}
+
+    def _test_default_db_path() -> str:
+        if Path.home() != REAL_HOME:
+            return original()
+        if "path" not in holder:
+            claude_dir = tmp_path_factory.mktemp("jacked-home") / ".claude"
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            holder["path"] = str(claude_dir / "jacked.db")
+        return holder["path"]
+
+    _test_default_db_path.original = original  # type: ignore[attr-defined]
+    monkeypatch.setattr(database, "_default_db_path", _test_default_db_path)
+
+
+def _under_real_claude_config(path) -> bool:
+    """True when ``path`` is the real Claude config, its lock, or its legacy file."""
+    target = Path(path).absolute()
+    guarded = {
+        REAL_HOME / ".claude.json",
+        REAL_HOME / ".claude.json.lock",
+        REAL_HOME / ".claude" / ".config.json",
+        REAL_HOME / ".claude" / ".config.json.lock",
+    }
+    return target in guarded or target.parent == REAL_HOME and target.name.startswith(
+        ".claude_json_tmp_"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _tripwire_real_claude_config(monkeypatch):
+    """Tripwire: no test may write or lock the developer's real Claude config."""
+    from jacked.api import claude_config_store
+
+    real_write = claude_config_store._atomic_write_json
+    real_acquire = claude_config_store._acquire_lock
+
+    def guarded_write(config_path, data):
+        if _under_real_claude_config(config_path):
+            raise RuntimeError(f"test tripwire: write to the real {config_path.name}")
+        return real_write(config_path, data)
+
+    def guarded_acquire(lock_path, timeout):
+        if _under_real_claude_config(lock_path):
+            raise RuntimeError(f"test tripwire: lock on the real {lock_path.name}")
+        return real_acquire(lock_path, timeout)
+
+    monkeypatch.setattr(claude_config_store, "_atomic_write_json", guarded_write)
+    monkeypatch.setattr(claude_config_store, "_acquire_lock", guarded_acquire)
+
+
+class _InertIdentityWatcher:
+    """Stands in for the service watcher, which reads the real authority."""
+
+    def submit(self, *args, **kwargs):
+        return False
+
+    def run(self, *args, **kwargs):
+        return None
+
+    def drain_evidence(self):
+        return ()
+
+    def wait_idle(self, timeout=None):
+        return True
+
+    def status(self):
+        return {"disabled": False, "accounts": {}}
+
+
+@pytest.fixture(autouse=True)
+def _tripwire_real_identity_watcher(monkeypatch):
+    """Tripwire: the service identity watcher never runs under test.
+
+    The real watcher reads the real credential authority (the macOS Keychain)
+    and sends its token to the profile endpoint. A test that wants a watcher
+    builds an ``IdentityWatcher`` with fakes, or patches this attribute.
+    """
+    from jacked.api import session_observer
+
+    monkeypatch.setattr(session_observer, "IDENTITY_WATCHER", _InertIdentityWatcher())
+
+
+@pytest.fixture(autouse=True)
+def _tripwire_real_keychain(monkeypatch):
+    """Tripwire: no test may run the real ``security`` tool against the Keychain."""
+    import subprocess
+
+    from jacked.credentials import macos_store
+
+    cls = macos_store.SecurityCliBackend
+    real_invoke = cls._invoke
+
+    def guarded_invoke(self, args, *, is_interactive, stdin=None):
+        if self._run is subprocess.run and self._tool == macos_store.SECURITY_TOOL:
+            raise RuntimeError("test tripwire: real Keychain access via security")
+        return real_invoke(self, args, is_interactive=is_interactive, stdin=stdin)
+
+    monkeypatch.setattr(cls, "_invoke", guarded_invoke)
+
+
+@pytest.fixture(autouse=True)
+def _tripwire_real_anthropic_network(monkeypatch):
+    """Tripwire: no test may send a request to a real Anthropic endpoint."""
+    import httpx
+
+    real_get = httpx.get
+    real_async_send = httpx.AsyncClient.send
+
+    def _guard(url) -> None:
+        host = httpx.URL(str(url)).host or ""
+        if host.endswith(("anthropic.com", "claude.ai", "claude.com")):
+            raise RuntimeError(f"test tripwire: real request to {host}")
+
+    def guarded_get(url, *args, **kwargs):
+        _guard(url)
+        return real_get(url, *args, **kwargs)
+
+    async def guarded_async_send(self, request, *args, **kwargs):
+        transport = getattr(self, "_transport", None)
+        if isinstance(transport, httpx.AsyncHTTPTransport):
+            _guard(request.url)
+        return await real_async_send(self, request, *args, **kwargs)
+
+    monkeypatch.setattr(httpx, "get", guarded_get)
+    monkeypatch.setattr(httpx.AsyncClient, "send", guarded_async_send)
+
+
+@pytest.fixture
+def quiet_lifespan(monkeypatch, tmp_path):
+    """Let a test run the real app lifespan with no real background work.
+
+    Every coroutine the lifespan hands to ``asyncio.create_task`` is replaced
+    by a no-op coroutine, so no sweep, poll, refresh or keeper loop runs and
+    nothing goes out on the network. The loop names come from the lifespan
+    source (AST), so a loop added later is stubbed too; a name that cannot
+    be resolved fails the test instead of running for real. HOME moves to a
+    temporary directory, so the database and the server log stay off the
+    real ~/.claude. Returns the sorted names that were stubbed.
+    """
+    import ast
+    import importlib
+    import inspect
+
+    from jacked.api import main as api_main
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("JACKED_HOST", "127.0.0.1")
+    monkeypatch.setenv("JACKED_PORT", "8321")
+
+    tree = ast.parse(inspect.getsource(api_main.lifespan))
+    local_imports: dict[str, str] = {}
+    loop_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                local_imports[alias.asname or alias.name] = node.module
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "create_task"
+            and node.args
+            and isinstance(node.args[0], ast.Call)
+            and isinstance(node.args[0].func, ast.Name)
+        ):
+            loop_names.add(node.args[0].func.id)
+    assert loop_names, "found no create_task(...) calls in lifespan()"
+
+    async def _idle(*_args, **_kwargs):
+        return None
+
+    for name in loop_names:
+        if name in local_imports:
+            module = importlib.import_module(local_imports[name])
+        elif hasattr(api_main, name):
+            module = api_main
+        else:
+            raise AssertionError(f"cannot stub lifespan loop {name!r}")
+        monkeypatch.setattr(module, name, _idle)
+    return sorted(loop_names)
 
 
 @pytest.fixture(autouse=True)

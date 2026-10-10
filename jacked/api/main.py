@@ -50,6 +50,13 @@ TOKEN_REFRESH_INTERVAL = 1800  # 30 minutes
 WS_KEEPALIVE_INTERVAL = 30  # seconds between WebSocket pings
 HEAL_SWEEP_INTERVAL = 300  # 5 minutes between heal sweeps
 SWEEP_PASS_TIMEOUT = 600  # hard cap on a single refresh/heal pass
+# Seconds after startup before the one-shot profile backfill runs. The wait
+# lets startup settle, and a short-lived app (a test client) never reaches it.
+PROFILE_BACKFILL_DELAY = 30
+# Rows that a pass could not fill (an expired primary token, a network
+# error) are retried this often. The pass never refreshes a token and only
+# touches rows that still have no stored profile.
+PROFILE_BACKFILL_RETRY_SECONDS = 3600
 LOG_FILE_MAX_BYTES = 5_000_000  # 5 MB
 LOG_FILE_BACKUP_COUNT = 3
 
@@ -131,6 +138,56 @@ async def _stuck_checking_watchdog_loop(app):
         except Exception:
             logger.warning("Stuck-checking watchdog error", exc_info=True)
         await asyncio.sleep(interval)
+
+
+async def _profile_backfill_once(app):
+    """Run the one-shot Claude profile backfill once, after a short wait.
+
+    The backfill stores the account uuid and the profile for each Claude
+    row that has none (see ``jacked.web.auth.backfill_missing_profiles``).
+    It does nothing when the database is not available, and it never raises
+    (cancellation at shutdown is not caught). When the pass exceeds
+    ``SWEEP_PASS_TIMEOUT``, the coverage line is still logged, marked
+    "backfill timed out", with the counts the pass reached.
+    """
+    await asyncio.sleep(PROFILE_BACKFILL_DELAY)
+    db = getattr(app.state, "db", None)
+    if db is None:
+        return
+    from jacked.web import auth as web_auth
+
+    # The pass fills these counters as it runs, so a timeout can still log
+    # the coverage line with the partial counts.
+    counts: dict = {}
+    try:
+        await asyncio.wait_for(
+            web_auth.backfill_missing_profiles(db, counts=counts),
+            timeout=SWEEP_PASS_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "Profile backfill exceeded %ds and was cancelled", SWEEP_PASS_TIMEOUT
+        )
+        web_auth.log_identity_coverage(db, counts, timed_out=True)
+    except Exception as e:
+        logger.warning("Profile backfill error: %s", type(e).__name__)
+
+
+async def _profile_backfill_loop(app):
+    """Run the Claude profile backfill at start, then once an hour.
+
+    Before the first pass, temp files that an interrupted Claude config
+    write left behind are removed. Each pass is ``_profile_backfill_once``.
+    """
+    try:
+        from jacked.api.claude_config_store import sweep_stale_temp_files
+
+        await asyncio.to_thread(sweep_stale_temp_files, Path.home())
+    except Exception as e:  # noqa: BLE001 - a sweep failure must not stop the loop
+        logger.warning("Claude config temp sweep failed: %s", type(e).__name__)
+    while True:
+        await _profile_backfill_once(app)
+        await asyncio.sleep(PROFILE_BACKFILL_RETRY_SECONDS)
 
 
 @asynccontextmanager
@@ -296,6 +353,7 @@ async def lifespan(app: FastAPI):
     full_sweep_task = asyncio.create_task(full_sweep_loop(app))
     all_accounts_refresh_task = asyncio.create_task(all_accounts_refresh_loop(app))
     stuck_checking_task = asyncio.create_task(_stuck_checking_watchdog_loop(app))
+    profile_backfill_task = asyncio.create_task(_profile_backfill_loop(app))
     logger.info("Started background token refresh (every 30min)")
     logger.info("Started session-accounts watcher (every 3s)")
     logger.info("Started session observation resolver (every 10s)")
@@ -307,6 +365,11 @@ async def lifespan(app: FastAPI):
     logger.info("Started full sweep loop")
     logger.info("Started all-accounts refresh loop (every 10min)")
     logger.info("Started stuck-checking watchdog (every 60s)")
+    logger.info(
+        "Scheduled Claude profile backfill (in %ds, then every %ds)",
+        PROFILE_BACKFILL_DELAY,
+        PROFILE_BACKFILL_RETRY_SECONDS,
+    )
 
     # Start analytics scanner + live monitor
     analytics_scan_task = None
@@ -337,6 +400,7 @@ async def lifespan(app: FastAPI):
         full_sweep_task,
         all_accounts_refresh_task,
         stuck_checking_task,
+        profile_backfill_task,
     ]
     if analytics_scan_task is not None:
         tasks_to_cancel.append(analytics_scan_task)
@@ -348,6 +412,15 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+
+    # Let an identity watcher check that is mid-write finish, so a restart
+    # does not leave the config lock or a temp file behind.
+    try:
+        from jacked.api.session_observer import IDENTITY_WATCHER
+
+        await asyncio.to_thread(IDENTITY_WATCHER.wait_idle, 2.0)
+    except Exception as e:  # noqa: BLE001 - shutdown must continue
+        logger.debug("Identity watcher drain failed: %s", type(e).__name__)
 
     # Detach server log capture
     logging.getLogger().removeHandler(_log_handler)
