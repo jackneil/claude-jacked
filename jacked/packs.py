@@ -714,7 +714,41 @@ def _skill_installed(home: Path, name: str) -> bool:
     was a false-negative that made every real install report the pack missing
     and re-run its install forever.
     """
-    return (Path(home) / ".claude" / "skills" / name / "SKILL.md").exists()
+    skill_dir = Path(home) / ".claude" / "skills" / name
+    return _exists_through_link(skill_dir / "SKILL.md", skill_dir)
+
+
+def _exists_through_link(path: Path, link: Path) -> bool:
+    """``path.exists()`` that survives a link Windows refuses to traverse.
+
+    ``Path.exists()`` returns False for "not found" errors but RAISES others.
+    Windows refuses traversal of a junction it does not trust (WinError 448,
+    "untrusted mount point") for some processes, while Claude Code reads the
+    same junction without a problem. Then the skill counts as installed when
+    the link itself exists: re-running the installer would only recreate the
+    same junction. One such link must never fail the whole pack phase.
+    """
+    try:
+        return path.exists()
+    except OSError as exc:
+        try:
+            link_present = os.path.lexists(link)
+        except OSError:
+            link_present = False
+        logger.warning(
+            "Skill entry %s could not be followed (%s); treating it as %s",
+            link.name,
+            type(exc).__name__,
+            "installed" if link_present else "missing",
+        )
+        return link_present
+
+
+def _lexists(path: Path) -> bool:
+    try:
+        return os.path.lexists(path)
+    except OSError:
+        return False
 
 
 def _skill_present(home: Path, name: str) -> bool:
@@ -722,10 +756,8 @@ def _skill_present(home: Path, name: str) -> bool:
     home = Path(home)
     claude_link = home / ".claude" / "skills" / name
     canonical = home / ".agents" / "skills" / name
-    return (
-        claude_link.exists() or claude_link.is_symlink()
-        or canonical.exists() or canonical.is_symlink()
-    )
+    # lexists never follows a link, so an untrusted junction cannot raise here.
+    return _lexists(claude_link) or _lexists(canonical)
 
 
 # Control chars except tab/newline/carriage-return. npx stderr is upstream
