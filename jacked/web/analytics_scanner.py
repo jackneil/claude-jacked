@@ -280,6 +280,22 @@ def _count_project_dirs(data_dirs: list[Path]) -> int:
     return count
 
 
+def _list_project_dirs(data_dir: Path) -> list[Path]:
+    """Return the sorted project directories in *data_dir*.
+
+    Return an empty list when *data_dir* does not exist or cannot be read.
+
+    >>> _list_project_dirs(Path("/nonexistent/jacked/projects"))
+    []
+    """
+    try:
+        if not data_dir.is_dir():
+            return []
+        return [entry for entry in sorted(data_dir.iterdir()) if entry.is_dir()]
+    except (PermissionError, OSError):
+        return []
+
+
 async def scan_all_projects(
     data_dirs: list[Path],
     db: AnalyticsDB,
@@ -287,24 +303,17 @@ async def scan_all_projects(
 ) -> dict:
     """Walk all project directories, scan each, report progress.
 
-    Runs file I/O in a thread pool to avoid blocking the event loop.
+    All file I/O and all SQLite work run in a worker thread, so the event
+    loop (which serves every HTTP route) does not block.
     """
-    total_projects = _count_project_dirs(data_dirs)
+    total_projects = await asyncio.to_thread(_count_project_dirs, data_dirs)
     scanned = 0
     total_messages = 0
 
     for data_dir in data_dirs:
-        try:
-            if not data_dir.is_dir():
-                continue
-            entries = sorted(data_dir.iterdir())
-        except (PermissionError, OSError):
-            continue
+        project_dirs = await asyncio.to_thread(_list_project_dirs, data_dir)
 
-        for project_dir in entries:
-            if not project_dir.is_dir():
-                continue
-
+        for project_dir in project_dirs:
             project_hash = project_dir.name
             count = await asyncio.to_thread(
                 scan_project_dir, project_dir, project_hash, db,
@@ -322,8 +331,8 @@ async def scan_all_projects(
 
             await asyncio.sleep(0)  # yield to event loop
 
-    # Prune stale scan state entries
-    prune_stale_scan_state(db, data_dirs)
+    # Prune stale scan state entries (directory walk + DB write: worker thread)
+    await asyncio.to_thread(prune_stale_scan_state, db, data_dirs)
 
     return {"projects": scanned, "messages": total_messages}
 

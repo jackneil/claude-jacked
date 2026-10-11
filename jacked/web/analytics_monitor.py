@@ -7,13 +7,18 @@ Two async tasks meant to run as background tasks on the FastAPI app:
 - ``live_monitor_loop(app)`` — polls recently-active JSONL files for new data
   and pushes incremental updates to connected dashboards.
 
-All file I/O runs via ``asyncio.to_thread()`` to avoid blocking the event loop.
+All file I/O and all SQLite work run via ``asyncio.to_thread()``. The
+service has ONE event loop for every HTTP route. A slow query on that loop
+stops all routes (the 2026-10-10 Windows outage: the anomaly detector's
+7-day average query blocked the loop on an I/O-saturated machine).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -75,6 +80,109 @@ def _rollup_pending_days(db) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Helper: anomaly pass (runs in a worker thread)
+# ---------------------------------------------------------------------------
+
+# Serializes anomaly passes. ``detect_anomalies`` reads "is a flag already
+# active" and then inserts, and the flags table has no unique constraint. The
+# initial scan's full pass and a live pass run in different worker threads,
+# so without this lock both can insert the same flag. The lock blocks only
+# the other worker thread, never the event loop.
+_ANOMALY_PASS_LOCK = threading.Lock()
+
+
+def _run_anomaly_pass(db, session_ids: list[str] | None = None) -> list[dict]:
+    """Detect anomalies, then auto-resolve stale flags. Return the new flags.
+
+    This function does blocking SQLite work on the analytics DB. Call it
+    through ``asyncio.to_thread`` only, never on the event loop.
+
+    Raises ImportError when the anomaly module is not available.
+    """
+    from jacked.web.analytics_anomalies import auto_resolve_flags, detect_anomalies
+
+    with _ANOMALY_PASS_LOCK:
+        flags = detect_anomalies(db, session_ids=session_ids)
+        auto_resolve_flags(db)
+    return flags
+
+
+def _stat_sizes(paths: list[Path]) -> list[tuple[Path, int]]:
+    """Return (path, size) for each path that can be read.
+
+    The live monitor calls this through ``asyncio.to_thread``, so the stat
+    calls do not block the event loop. A path that fails ``stat`` is skipped.
+
+    >>> _stat_sizes([Path("/nonexistent/jacked/file.jsonl")])
+    []
+    """
+    out: list[tuple[Path, int]] = []
+    for path in paths:
+        try:
+            out.append((path, path.stat().st_size))
+        except OSError:
+            continue
+    return out
+
+
+def _find_active_with_sizes(data_dirs: list[Path], max_age_seconds: int) -> list[tuple[Path, int]]:
+    """Find recently modified JSONL files and return them with their sizes."""
+    from jacked.web.analytics_paths import find_active_jsonl_files
+
+    return _stat_sizes(find_active_jsonl_files(data_dirs, max_age_seconds))
+
+
+#: Minimum time in seconds between two "Live anomaly detection failed"
+#: warnings. The live loop runs each 1 to 5 s, so a persistent failure
+#: without this limit writes a traceback to the log each cycle.
+LIVE_FAILURE_WARN_INTERVAL = 300.0
+
+
+class _WarnLimiter:
+    """Decide if a repeated failure gets a WARNING or a DEBUG record.
+
+    The first failure gets a WARNING. Then one WARNING is permitted each
+    *interval* seconds. ``suppressed`` counts the failures since the last
+    WARNING, so the next WARNING can give that count.
+
+    >>> clock = iter([0.0, 10.0, 400.0]).__next__
+    >>> limiter = _WarnLimiter(300.0, clock=clock)
+    >>> limiter.should_warn(), limiter.should_warn(), limiter.suppressed
+    (True, False, 1)
+    >>> limiter.should_warn(), limiter.take_suppressed(), limiter.suppressed
+    (True, 1, 0)
+    """
+
+    def __init__(self, interval: float, clock=None) -> None:
+        self.interval = interval
+        self._clock = clock or time.monotonic
+        self._last_warn: float | None = None
+        self.suppressed = 0
+
+    def should_warn(self) -> bool:
+        """Return True when this failure must be logged as a WARNING."""
+        now = self._clock()
+        if self._last_warn is None or now - self._last_warn >= self.interval:
+            self._last_warn = now
+            return True
+        self.suppressed += 1
+        return False
+
+    def take_suppressed(self) -> int:
+        """Return the suppressed count and set it to zero."""
+        count, self.suppressed = self.suppressed, 0
+        return count
+
+
+def _open_analytics_db():
+    """Open the analytics DB (schema init and migrations run here)."""
+    from jacked.web.analytics_db import AnalyticsDB
+
+    db_path = str(Path.home() / ".claude" / "jacked-analytics.db")
+    return AnalyticsDB(db_path)
+
+
+# ---------------------------------------------------------------------------
 # Path helpers for the live monitor
 # ---------------------------------------------------------------------------
 
@@ -114,7 +222,6 @@ def _extract_ids_from_jsonl_path(jsonl_path: Path) -> tuple[str, str, bool]:
 
 async def initial_scan_loop(app) -> None:
     """Parse all JSONL files on startup, broadcast progress via WebSocket."""
-    from jacked.web.analytics_db import AnalyticsDB
     from jacked.web.analytics_scanner import scan_all_projects
     from jacked.web.analytics_paths import get_claude_data_dirs
 
@@ -122,11 +229,12 @@ async def initial_scan_loop(app) -> None:
     await asyncio.sleep(5)
 
     try:
-        db_path = str(Path.home() / ".claude" / "jacked-analytics.db")
-        db = AnalyticsDB(db_path)
+        # Schema init runs a migration UPDATE over the messages table, so
+        # the open must not run on the event loop either.
+        db = await asyncio.to_thread(_open_analytics_db)
         app.state.analytics_db = db
 
-        data_dirs = get_claude_data_dirs()
+        data_dirs = await asyncio.to_thread(get_claude_data_dirs)
         if not data_dirs:
             logger.info("No Claude Code data directories found — analytics disabled")
             return
@@ -156,9 +264,7 @@ async def initial_scan_loop(app) -> None:
 
         # Run initial anomaly detection (Task 4 may not be committed yet)
         try:
-            from jacked.web.analytics_anomalies import detect_anomalies, auto_resolve_flags
-            flags = detect_anomalies(db)
-            auto_resolve_flags(db)
+            flags = await asyncio.to_thread(_run_anomaly_pass, db)
             if flags:
                 logger.info(
                     "Analytics: %d anomaly flags raised during initial scan",
@@ -167,18 +273,18 @@ async def initial_scan_loop(app) -> None:
         except ImportError:
             logger.debug("analytics_anomalies not available yet — skipping")
         except Exception:
-            logger.debug("Initial anomaly detection failed", exc_info=True)
+            logger.warning("Initial anomaly detection failed", exc_info=True)
 
         # Rollup any unsummarized days
         await asyncio.to_thread(_rollup_pending_days, db)
 
         # Purge if configured
-        purge_days = db.get_setting("purge_days")
+        purge_days = await asyncio.to_thread(db.get_setting, "purge_days")
         if purge_days:
             try:
                 await asyncio.to_thread(db.purge_messages_older_than, int(purge_days))
-            except (ValueError, Exception):
-                pass
+            except Exception:
+                logger.warning("Analytics purge failed", exc_info=True)
 
         # Broadcast completion
         if ws:
@@ -201,7 +307,7 @@ async def initial_scan_loop(app) -> None:
 
 async def live_monitor_loop(app) -> None:
     """Poll active JSONL files and push updates via WebSocket."""
-    from jacked.web.analytics_paths import get_claude_data_dirs, find_active_jsonl_files
+    from jacked.web.analytics_paths import get_claude_data_dirs
     from jacked.web.analytics_scanner import parse_jsonl_from_offset
 
     # Wait for initial scan to complete (it sets app.state.analytics_db)
@@ -209,8 +315,9 @@ async def live_monitor_loop(app) -> None:
         await asyncio.sleep(5)
 
     db = app.state.analytics_db
-    data_dirs = get_claude_data_dirs()
+    data_dirs = await asyncio.to_thread(get_claude_data_dirs)
     active_files: dict[str, int] = {}  # path -> last_byte_offset
+    detect_failures = _WarnLimiter(LIVE_FAILURE_WARN_INTERVAL)
 
     while True:
         try:
@@ -218,19 +325,16 @@ async def live_monitor_loop(app) -> None:
             has_viewers = ws.has_subscribers("analytics") if ws else False
             interval = 1.0 if has_viewers else 5.0
 
+            # One worker-thread call finds the active files AND reads their
+            # sizes, so no stat() runs on the event loop.
             active = await asyncio.to_thread(
-                find_active_jsonl_files, data_dirs, 600,
+                _find_active_with_sizes, data_dirs, 600,
             )
             new_messages_total: list[dict] = []
             affected_sessions: set[str] = set()
 
-            for jsonl_path in active:
+            for jsonl_path, size in active:
                 path_str = str(jsonl_path)
-                try:
-                    size = jsonl_path.stat().st_size
-                except OSError:
-                    continue
-
                 last_offset = active_files.get(path_str, 0)
 
                 # Handle file rewrites (offset > size)
@@ -266,14 +370,9 @@ async def live_monitor_loop(app) -> None:
             # Run anomaly detection on affected sessions
             if affected_sessions:
                 try:
-                    from jacked.web.analytics_anomalies import (
-                        detect_anomalies,
-                        auto_resolve_flags,
+                    new_flags = await asyncio.to_thread(
+                        _run_anomaly_pass, db, list(affected_sessions),
                     )
-                    new_flags = detect_anomalies(
-                        db, session_ids=list(affected_sessions),
-                    )
-                    auto_resolve_flags(db)
 
                     # Broadcast flag events
                     if ws and new_flags:
@@ -285,7 +384,20 @@ async def live_monitor_loop(app) -> None:
                 except ImportError:
                     pass
                 except Exception:
-                    logger.debug("Live anomaly detection failed", exc_info=True)
+                    if detect_failures.should_warn():
+                        skipped = detect_failures.take_suppressed()
+                        suffix = (
+                            f" ({skipped} more failures since the last warning)"
+                            if skipped
+                            else ""
+                        )
+                        logger.warning(
+                            "Live anomaly detection failed%s",
+                            suffix,
+                            exc_info=True,
+                        )
+                    else:
+                        logger.debug("Live anomaly detection failed", exc_info=True)
 
             # Broadcast live update if new data and viewers connected
             if new_messages_total and ws and has_viewers:

@@ -371,6 +371,16 @@ async def lifespan(app: FastAPI):
         PROFILE_BACKFILL_RETRY_SECONDS,
     )
 
+    # Start the event-loop stall watchdog. It is a daemon THREAD, not a
+    # task, because a stalled loop cannot run a task that reports the stall.
+    # See the 2026-10-10 outage: a blocking SQLite query on the loop starved
+    # every route and the log did not name the cause.
+    from jacked.api.loop_watchdog import LoopWatchdog
+
+    loop_watchdog = LoopWatchdog(asyncio.get_running_loop())
+    loop_watchdog.start()
+    logger.info("Started event-loop stall watchdog")
+
     # Start analytics scanner + live monitor
     analytics_scan_task = None
     analytics_monitor_task = None
@@ -412,6 +422,12 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+        except Exception as e:  # noqa: BLE001 - shutdown must continue
+            # A task that died earlier re-raises here. Keep draining so the
+            # watchdog stop, log detach and DB close below still run.
+            logger.warning(
+                "Background task failed before shutdown: %s", type(e).__name__
+            )
 
     # Let an identity watcher check that is mid-write finish, so a restart
     # does not leave the config lock or a temp file behind.
@@ -421,6 +437,10 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(IDENTITY_WATCHER.wait_idle, 2.0)
     except Exception as e:  # noqa: BLE001 - shutdown must continue
         logger.debug("Identity watcher drain failed: %s", type(e).__name__)
+
+    # Stop the stall watchdog after the task drain, so a slow drain still
+    # gets a named stack in the log.
+    await asyncio.to_thread(loop_watchdog.stop)
 
     # Detach server log capture
     logging.getLogger().removeHandler(_log_handler)
