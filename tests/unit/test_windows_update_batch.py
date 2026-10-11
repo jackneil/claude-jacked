@@ -49,11 +49,24 @@ def _capture_batch(spawn) -> dict:
 
         return _P()
 
-    spawn(fake_popen)
+    seen["result"] = spawn(fake_popen)
     return seen
 
 
-def _tray_batch():
+TRAY_CREATION_ID = "windows-filetime:133000000000000000"
+
+
+def _tray_identity(pid):
+    from jacked.service.instance_models import ProcessIdentity
+
+    return ProcessIdentity(
+        pid=pid, creation_id=TRAY_CREATION_ID, executable=r"C:\py\python.exe"
+    )
+
+
+def _tray_batch(identity=_tray_identity, port=8321):
+    """Build the tray batch. ``identity`` replaces process_identity."""
+
     def spawn(fake_popen):
         from jacked.service import updater
 
@@ -64,15 +77,25 @@ def _tray_batch():
         ), patch(
             "jacked.findbin.find_bin",
             side_effect=lambda n: {"uv": r"C:\uv\uv.exe"}.get(n),
-        ):
+        ), patch(
+            "jacked.service.instance.process_identity", side_effect=identity
+        ), patch.object(updater.sys, "platform", "win32"):
             updater._spawn_windows_tray_updater(
-                4242, "tray", target_version="9.9.9", port=8321
+                4242, "tray", target_version="9.9.9", port=port
             )
 
     return _capture_batch(spawn)
 
 
-def _cli_batch(extra_args=()):
+def _released():
+    from jacked.service.install_release import EXIT_RELEASED, ReleaseResult
+
+    return ReleaseResult(EXIT_RELEASED, "No jacked service is running.")
+
+
+def _cli_batch(extra_args=(), precheck=None):
+    """Build the CLI batch. ``precheck`` replaces release_install in-process."""
+
     def spawn(fake_popen):
         from jacked.cli import main
 
@@ -81,8 +104,12 @@ def _cli_batch(extra_args=()):
         ), patch(
             "jacked.findbin.find_bin",
             side_effect=lambda n: {"uv": r"C:\uv\uv.exe"}.get(n),
+        ), patch(
+            "jacked.service.install_release.release_install",
+            side_effect=precheck or (lambda **_kw: _released()),
         ), patch("subprocess.Popen", fake_popen):
-            CliRunner().invoke(main, ["upgrade", *extra_args])
+            seen_result = CliRunner().invoke(main, ["upgrade", *extra_args])
+        return seen_result
 
     return _capture_batch(spawn)
 
@@ -178,12 +205,16 @@ class TestVerifyRetry:
 
     def test_tray_batch_retries_service_start_once(self):
         body = _tray_batch()["body"]
-        # Two on the success path (first start + one retry), plus one on the
-        # rollback path that brings the restored build back up.
-        success_path, rollback_path = body.split(":rollback_now", 1)
+        # Two on the success path (first start + one retry), one on the
+        # rollback path that brings the restored build back up, and one on
+        # the release-failure path that brings the untouched build back up.
+        success_path, rest = body.split(":rollback_now", 1)
+        rollback_path, release_path = rest.split(":release_failed\r\n", 1)
         assert success_path.count("start \"\" /B jacked service start") == 2
         assert rollback_path.count("start \"\" /B jacked service start") == 1
-        assert "if not errorlevel 1 goto verifyok" in body
+        assert release_path.count("start \"\" /B jacked service start") == 1
+        assert 'if "%ERRORLEVEL%"=="0" goto verifyok' in body
+        assert "if not errorlevel 1 goto verifyok" not in body
         assert ":verifyok" in body
 
     def test_retry_verify_is_not_nested_in_a_paren_block(self):
@@ -535,3 +566,739 @@ def test_cli_batch_claims_the_status_record_before_installing():
     assert body.index("uv.exe", guard) > guard or body.index("tool install", guard) > guard
     assert "exit /b 2" in body[guard:guard + 400]
 
+
+
+# ---------------------------------------------------------------------------
+# Release-before-install, package retry, and package rollback.
+#
+# The 2026-10-10 Windows defect: the batch ran `uv tool install --force` while
+# the owned service still ran from the tool venv. uv deleted part of the venv,
+# stopped with "Access is denied (os error 5)", and the batch hit `exit /b 1`:
+# a broken install, no rollback, and the old service still in memory.
+#
+# The string checks below pin the shape. `_simulate` pins the control flow: it
+# walks the batch the way cmd.exe does for the small subset these batches use
+# (labels, goto, `if [not] errorlevel N`, `if %VAR% GEQ N`, parenthesised
+# `if` blocks, `set /a`, `exit /b`), and asks a fake for each command's exit
+# code. It is not cmd.exe; it proves which lines a given outcome reaches.
+# ---------------------------------------------------------------------------
+
+import re  # noqa: E402
+
+_PACKAGE_MARK = '"tool" "install" "claude-jacked[tray]" '
+_ROLLBACK_MARK = '"claude-jacked[tray]=='
+
+
+class _Run:
+    def __init__(self):
+        self.commands: list[str] = []
+        self.echoes: list[str] = []
+        self.exit_code: "int | None" = None
+        self.env: dict[str, str] = {}
+
+    def ran(self, needle: str) -> int:
+        return sum(1 for c in self.commands if needle in c)
+
+    @property
+    def failed_file(self) -> str:
+        return "\n".join(
+            e for e in self.echoes if "jacked-update-failed.txt" in e
+        )
+
+
+def _simulate(body: str, outcome, max_steps: int = 5000) -> _Run:
+    """Walk *body*; ``outcome(command) -> int`` gives each command's exit code."""
+    lines = [ln.strip() for ln in body.split("\r\n")]
+    labels = {ln[1:]: i for i, ln in enumerate(lines) if ln.startswith(":")}
+    run = _Run()
+    errorlevel = 0
+
+    def expand(text: str) -> str:
+        return re.sub(
+            r"%(\w+)%", lambda m: run.env.get(m.group(1), m.group(0)), text
+        )
+
+    def condition(cond: str) -> bool:
+        m = re.fullmatch(r"(not )?errorlevel (\d+)", cond)
+        if m:
+            hit = errorlevel >= int(m.group(2))
+            return not hit if m.group(1) else hit
+        m = re.fullmatch(r'(not )?"%ERRORLEVEL%"=="(-?\d+)"', cond)
+        if m:
+            hit = errorlevel == int(m.group(2))
+            return not hit if m.group(1) else hit
+        m = re.fullmatch(r"(\S+) GEQ (\d+)", expand(cond))
+        if m:
+            return int(m.group(1)) >= int(m.group(2))
+        raise AssertionError(f"simulator: unsupported condition {cond!r}")
+
+    def block_end(start: int) -> int:
+        depth = 0
+        for j in range(start, len(lines)):
+            if lines[j].endswith("("):
+                depth += 1
+            elif lines[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    return j
+        raise AssertionError("simulator: unbalanced block")
+
+    i, steps = 0, 0
+    while i < len(lines):
+        steps += 1
+        assert steps < max_steps, "simulator: the batch loops forever"
+        line = lines[i]
+        i += 1
+        if not line or line.startswith(":") or line == ")" or line == "@echo off":
+            continue
+        if line.startswith("(goto) 2>nul"):
+            run.exit_code = 0
+            return run
+        m = re.fullmatch(r"if (.+?) \($", line)
+        if m:
+            if not condition(m.group(1)):
+                i = block_end(i - 1) + 1
+            continue
+        m = re.fullmatch(r"if (.+?) goto (\S+)", line)
+        if m:
+            if condition(m.group(1)):
+                i = labels[m.group(2)]
+            continue
+        m = re.fullmatch(r"goto (\S+)", line)
+        if m:
+            i = labels[m.group(1)]
+            continue
+        m = re.fullmatch(r"exit /b (\d+)", line)
+        if m:
+            run.exit_code = int(m.group(1))
+            return run
+        m = re.fullmatch(r"set /a (\w+)=(\d+)", line)
+        if m:
+            run.env[m.group(1)] = m.group(2)
+            continue
+        m = re.fullmatch(r"set /a (\w+)\+=(\d+)", line)
+        if m:
+            run.env[m.group(1)] = str(
+                int(run.env.get(m.group(1), "0")) + int(m.group(2))
+            )
+            continue
+        m = re.fullmatch(r"set (\w+)=(.*)", line)
+        if m:
+            run.env[m.group(1)] = m.group(2)
+            continue
+        if line.startswith("echo "):
+            run.echoes.append(expand(line[5:]))
+            continue
+        if line.startswith("if exist "):
+            continue
+        run.commands.append(line)
+        errorlevel = outcome(line)
+    raise AssertionError("simulator: the batch ran off its end")
+
+
+def _outcomes(**overrides):
+    """Exit codes by command; every unlisted command succeeds.
+
+    A value may be an int or a list, which is consumed one item per call.
+    """
+    table = {
+        "tasklist.exe": 1,  # the parent PID is gone
+        "_release_install": 0,
+        "package": 0,
+        "rollback": 0,
+        "jacked install --force": 0,
+        "jacked service restart": 0,
+        "jacked service preflight": 0,
+        "powershell": 0,
+        **overrides,
+    }
+
+    def key(command: str) -> str:
+        if _ROLLBACK_MARK in command:
+            return "rollback"
+        if _PACKAGE_MARK in command:
+            return "package"
+        for name in table:
+            # "package" and "rollback" match only through their argv marks:
+            # `_update_status installing_package ...` is not the package step.
+            if name not in ("package", "rollback") and name in command:
+                return name
+        return ""
+
+    def outcome(command: str) -> int:
+        value = table.get(key(command), 0)
+        if isinstance(value, list):
+            return value.pop(0) if len(value) > 1 else value[0]
+        return value
+
+    return outcome
+
+
+class TestReleaseRunsBeforeThePackageStep:
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_the_release_step_precedes_the_package_step(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        release = body.index("jacked _release_install --timeout 60 --port 8321")
+        package = body.index(_PACKAGE_MARK)
+        wait_done = body.index(":waitdone")
+        assert wait_done < release < package
+
+    def test_the_cli_skip_service_batch_only_checks(self):
+        body = _cli_batch(("--skip-service",))["body"]
+        release = body.index("jacked _release_install --check-only --timeout 60")
+        assert release < body.index(_PACKAGE_MARK)
+        assert "release_stopped_failed" not in body
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_a_clean_run_releases_installs_and_finishes(self, which):
+        run = _simulate(BATCH_BUILDERS[which]()["body"], _outcomes())
+        assert run.exit_code == 0
+        assert run.ran("_release_install") == 1
+        assert run.ran(_PACKAGE_MARK) == 1
+        assert run.ran(_ROLLBACK_MARK) == 0
+        release = next(
+            i for i, c in enumerate(run.commands) if "_release_install" in c
+        )
+        package = next(
+            i for i, c in enumerate(run.commands) if _PACKAGE_MARK in c
+        )
+        assert release < package
+
+
+class TestAFailedReleaseNeverInstalls:
+    def test_cli_exit_3_restarts_the_service_it_stopped(self):
+        run = _simulate(_cli_batch()["body"], _outcomes(_release_install=3))
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+        assert run.ran(_ROLLBACK_MARK) == 0
+        assert run.ran("jacked service restart") == 1
+        assert "Nothing was installed" in run.failed_file
+
+    @pytest.mark.parametrize("code", [1, 2])
+    def test_cli_exit_1_restarts_nothing(self, code):
+        """Exit 1 (or a usage error) means this step stopped nothing."""
+        run = _simulate(_cli_batch()["body"], _outcomes(_release_install=code))
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+        assert run.ran("jacked service restart") == 0
+        assert run.ran("jacked service start") == 0
+        assert "did not stop it" in run.failed_file
+
+    def test_cli_a_failed_restart_after_exit_3_names_the_step(self):
+        run = _simulate(
+            _cli_batch()["body"],
+            _outcomes(_release_install=3, **{"jacked service restart": 1}),
+        )
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+        assert "service restart step failed" in run.failed_file
+        assert "Run this first: jacked service restart" in run.failed_file
+
+    def test_cli_skip_service_refusal_restarts_nothing(self):
+        run = _simulate(
+            _cli_batch(("--skip-service",))["body"],
+            _outcomes(_release_install=1),
+        )
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+        assert run.ran("jacked service restart") == 0
+        assert "--skip-service" in run.failed_file
+
+    @pytest.mark.parametrize("code", [1, 3])
+    def test_tray_any_failure_starts_the_previous_service(self, code):
+        """The old tray stopped itself, so the tray batch always restarts."""
+        run = _simulate(_tray_batch()["body"], _outcomes(_release_install=code))
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+        assert run.ran(_ROLLBACK_MARK) == 0
+        assert run.ran('start "" /B jacked service start') == 1
+        assert run.ran("_update_status waiting_for_parent failed") == 1
+        assert "Nothing was installed" in run.failed_file
+        assert "running again" in run.failed_file
+
+    def test_tray_a_previous_service_that_does_not_start_is_reported(self):
+        run = _simulate(
+            _tray_batch()["body"],
+            _outcomes(_release_install=3, powershell=1),
+        )
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+        assert "service start step failed" in run.failed_file
+        assert "running again" not in run.failed_file
+
+
+class TestThePackageStepRetries:
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_a_transient_lock_is_retried_and_the_update_finishes(self, which):
+        run = _simulate(
+            BATCH_BUILDERS[which]()["body"], _outcomes(package=[1, 1, 0])
+        )
+        assert run.exit_code == 0
+        assert run.ran(_PACKAGE_MARK) == 3
+        assert run.ran(_ROLLBACK_MARK) == 0
+        attempts = [e for e in run.echoes if "package step: attempt" in e]
+        assert [a.split("attempt ", 1)[1] for a in attempts] == [
+            "1 of 3", "2 of 3", "3 of 3",
+        ]
+        assert sum("WARN: package step attempt" in e for e in run.echoes) == 2
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_attempts_are_separated_by_a_console_free_sleep(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        loop = body.split(":package_attempt", 1)[1].split(":package_done", 1)[0]
+        assert "ping -n 4 127.0.0.1 >NUL" in loop
+        assert "timeout /t" not in loop
+
+
+class TestAFailedPackageStepRollsBack:
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_three_failures_jump_to_the_rollback(self, which):
+        import jacked
+
+        run = _simulate(BATCH_BUILDERS[which]()["body"], _outcomes(package=1))
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 3
+        assert run.ran(f'"claude-jacked[tray]=={jacked.__version__}"') == 1
+        assert run.ran("jacked install --force") == 1
+        restart = "jacked service restart" if which == "cli" else (
+            'start "" /B jacked service start'
+        )
+        assert run.ran(restart) == 1
+        assert run.env["FAILREASON"] == "the package step failed after 3 attempts"
+        assert "the package step failed after 3 attempts" in run.failed_file
+        assert "rolled back" in run.failed_file
+        # Neither batch may reach the preflight or settings migration of a
+        # build that never installed.
+        assert run.ran("jacked service preflight") == 0
+
+    def test_the_tray_marks_the_package_phase_failed(self):
+        run = _simulate(_tray_batch()["body"], _outcomes(package=1))
+        assert run.ran("_update_status installing_package failed") == 1
+        assert run.ran("_update_status installing_package ok") == 0
+        assert run.ran("_update_status rolling_back ok") == 1
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_the_old_exit_without_rollback_is_gone(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        assert "ERROR: upgrade command failed" not in body
+        loop = body.split(":package_attempt", 1)[1].split(":package_done", 1)[0]
+        assert "exit /b" not in loop
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_a_failed_package_rollback_is_reported_by_step(self, which):
+        run = _simulate(
+            BATCH_BUILDERS[which]()["body"], _outcomes(package=1, rollback=1)
+        )
+        assert run.exit_code == 1
+        assert "package rollback step" in run.failed_file
+        assert "rolled back to" not in run.failed_file
+
+
+class TestAFailedPackageStepWithNoRollback:
+    def test_cli_no_rollback_restarts_the_previous_service(self):
+        run = _simulate(
+            _cli_batch(("--no-rollback",))["body"], _outcomes(package=1)
+        )
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 3
+        assert run.ran(_ROLLBACK_MARK) == 0
+        assert run.ran("jacked service restart") == 1
+        assert "no rollback command is available" in run.failed_file
+        assert "rolled back" not in run.failed_file
+        assert "NOT rolled back" not in run.failed_file
+
+    def test_cli_no_rollback_reports_a_failed_restart(self):
+        run = _simulate(
+            _cli_batch(("--no-rollback",))["body"],
+            _outcomes(package=1, **{"jacked service restart": 1}),
+        )
+        assert run.exit_code == 1
+        assert "service restart step failed" in run.failed_file
+
+    def test_cli_no_rollback_with_skip_service_restarts_nothing(self):
+        run = _simulate(
+            _cli_batch(("--no-rollback", "--skip-service"))["body"],
+            _outcomes(package=1),
+        )
+        assert run.exit_code == 1
+        assert run.ran("jacked service restart") == 0
+        assert "no rollback command is available" in run.failed_file
+
+    def test_tray_with_no_rollback_starts_the_previous_service(self):
+        with patch("jacked.__version__", 'evil" & del C:\\ &'):
+            body = _tray_batch()["body"]
+        run = _simulate(body, _outcomes(package=1))
+        assert run.exit_code == 1
+        assert run.ran(_ROLLBACK_MARK) == 0
+        assert run.ran('start "" /B jacked service start') == 1
+        assert "no rollback command is available" in run.failed_file
+        assert "rolled back" not in run.failed_file
+
+
+class TestTheExistingFailurePathsStillWork:
+    """The simulator agrees with the string checks above on the old paths."""
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_a_refused_preflight_rolls_back(self, which):
+        run = _simulate(
+            BATCH_BUILDERS[which]()["body"],
+            _outcomes(**{"jacked service preflight": 1}),
+        )
+        assert run.exit_code == 1
+        assert run.ran(_ROLLBACK_MARK) == 1
+        assert "rolled back" in run.failed_file
+
+    def test_another_updater_in_flight_aborts_before_the_release(self):
+        run = _simulate(
+            _cli_batch()["body"], _outcomes(_update_status_init=2)
+        )
+        assert run.exit_code == 2
+        assert run.ran("_release_install") == 0
+
+
+# A crash exits with a negative NTSTATUS code. "if errorlevel N" means "at
+# least N", so these codes pass every "if errorlevel 1" check.
+_ACCESS_VIOLATION = -1073741819  # 0xC0000005
+_CTRL_C_EXIT = -1073741510  # 0xC000013A
+
+
+class TestANegativeExitIsNotSuccess:
+    @pytest.mark.parametrize("code", [_ACCESS_VIOLATION, _CTRL_C_EXIT])
+    def test_cli_a_crashed_release_step_installs_nothing(self, code):
+        run = _simulate(_cli_batch()["body"], _outcomes(_release_install=code))
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+        # Nothing proves that this step stopped the service: restart nothing.
+        assert run.ran("jacked service restart") == 0
+        assert "did not stop it" in run.failed_file
+
+    @pytest.mark.parametrize("code", [_ACCESS_VIOLATION, _CTRL_C_EXIT])
+    def test_cli_skip_service_a_crashed_check_installs_nothing(self, code):
+        run = _simulate(
+            _cli_batch(("--skip-service",))["body"],
+            _outcomes(_release_install=code),
+        )
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+
+    @pytest.mark.parametrize("code", [_ACCESS_VIOLATION, _CTRL_C_EXIT])
+    def test_tray_a_crashed_release_step_installs_nothing(self, code):
+        run = _simulate(_tray_batch()["body"], _outcomes(_release_install=code))
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+        assert run.ran('start "" /B jacked service start') == 1
+        assert "Nothing was installed" in run.failed_file
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_the_zero_check_follows_the_release_line_directly(self, which):
+        """Nothing between the release line and the check resets ERRORLEVEL."""
+        body = BATCH_BUILDERS[which]()["body"]
+        lines = body.split("\r\n")
+        start = next(
+            i for i, ln in enumerate(lines)
+            if ln.startswith("jacked _release_install")
+        )
+        following = []
+        for ln in lines[start + 1:]:
+            following.append(ln)
+            if ln.startswith('if not "%ERRORLEVEL%"=="0" goto '):
+                break
+        assert following[-1].startswith('if not "%ERRORLEVEL%"=="0" goto ')
+        assert all(ln.startswith("if ") for ln in following), following
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_a_crashed_package_attempt_is_retried_then_rolled_back(self, which):
+        run = _simulate(
+            BATCH_BUILDERS[which]()["body"], _outcomes(package=_ACCESS_VIOLATION)
+        )
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 3
+        assert run.ran(_ROLLBACK_MARK) == 1
+        assert run.ran("jacked service preflight") == 0
+
+
+class TestACrashedStepTakesTheFailurePath:
+    """Every step check catches a negative NTSTATUS exit, not only exit 1."""
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_every_flat_check_is_paired_with_an_exact_compare(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        lines = body.split("\r\n")
+        checks = [
+            i for i, ln in enumerate(lines)
+            if ln.startswith("if errorlevel 1 goto ")
+            and ln != "if errorlevel 1 goto waitdone"
+            and ln != "if errorlevel 1 goto release_refused"
+        ]
+        assert checks, "no step checks found"
+        for i in checks:
+            label = lines[i].rsplit(" ", 1)[1]
+            assert lines[i + 1] == f'if not "%ERRORLEVEL%"=="0" goto {label}', (
+                f"{which}: {lines[i]!r} has no exact compare after it"
+            )
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_no_success_check_reads_a_crash_as_success(self, which):
+        body = BATCH_BUILDERS[which]()["body"]
+        assert "if not errorlevel 1" not in body
+        assert "if errorlevel 1 (" not in body
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    @pytest.mark.parametrize("code", [_ACCESS_VIOLATION, _CTRL_C_EXIT])
+    def test_a_crashed_preflight_rolls_back(self, which, code):
+        run = _simulate(
+            BATCH_BUILDERS[which]()["body"],
+            _outcomes(**{"jacked service preflight": code}),
+        )
+        assert run.exit_code == 1
+        assert run.ran(_ROLLBACK_MARK) == 1
+        assert run.ran("jacked install --force") == 1  # the rollback only
+        assert "rolled back to" in run.failed_file
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_a_crashed_settings_migration_rolls_back(self, which):
+        run = _simulate(
+            BATCH_BUILDERS[which]()["body"],
+            _outcomes(**{"jacked install --force": [_ACCESS_VIOLATION, 0]}),
+        )
+        assert run.exit_code == 1
+        assert run.ran(_ROLLBACK_MARK) == 1
+        assert "settings migration failed" in run.env["FAILREASON"]
+        assert "rolled back to" in run.failed_file
+
+    def test_tray_a_crashed_verify_is_retried_then_rolled_back(self):
+        run = _simulate(
+            _tray_batch()["body"],
+            _outcomes(powershell=[_ACCESS_VIOLATION, _ACCESS_VIOLATION, 0]),
+        )
+        assert run.exit_code == 1
+        # First start, one retry, then the start of the restored build.
+        assert run.ran('start "" /B jacked service start') == 3
+        assert run.ran("_update_status verifying_service failed") == 1
+        assert run.ran("_update_status verifying_service ok") == 0
+        assert run.ran(_ROLLBACK_MARK) == 1
+        assert "rolled back to" in run.failed_file
+
+    def test_tray_a_crashed_first_verify_then_a_good_retry_finishes(self):
+        run = _simulate(
+            _tray_batch()["body"], _outcomes(powershell=[_ACCESS_VIOLATION, 0])
+        )
+        assert run.exit_code == 0
+        assert run.ran('start "" /B jacked service start') == 2
+        assert run.ran(_ROLLBACK_MARK) == 0
+
+    def test_cli_a_crashed_restart_rolls_back(self):
+        run = _simulate(
+            _cli_batch()["body"],
+            _outcomes(**{"jacked service restart": [_ACCESS_VIOLATION, 0]}),
+        )
+        assert run.exit_code == 1
+        assert run.env["FAILREASON"] == "the new service did not restart"
+        assert run.ran(_ROLLBACK_MARK) == 1
+        assert "rolled back to" in run.failed_file
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_a_crashed_package_rollback_is_reported_by_step(self, which):
+        run = _simulate(
+            BATCH_BUILDERS[which]()["body"],
+            _outcomes(package=1, rollback=_ACCESS_VIOLATION),
+        )
+        assert run.exit_code == 1
+        assert "package rollback step" in run.failed_file
+        assert "rolled back to" not in run.failed_file
+
+    @pytest.mark.parametrize("which", ["tray", "cli"])
+    def test_a_crashed_rollback_migration_is_reported_by_step(self, which):
+        run = _simulate(
+            BATCH_BUILDERS[which]()["body"],
+            _outcomes(package=1, **{"jacked install --force": _ACCESS_VIOLATION}),
+        )
+        assert run.exit_code == 1
+        assert "settings migration step" in run.failed_file
+        assert "rolled back to" not in run.failed_file
+
+    def test_tray_a_crashed_rollback_verify_is_reported_by_step(self):
+        run = _simulate(
+            _tray_batch()["body"],
+            _outcomes(package=1, powershell=_ACCESS_VIOLATION),
+        )
+        assert run.exit_code == 1
+        assert run.ran("_update_status rolling_back ok") == 0
+        assert "service restart step" in run.failed_file
+        assert "rolled back to" not in run.failed_file
+
+    def test_cli_a_crashed_rollback_restart_is_reported_by_step(self):
+        run = _simulate(
+            _cli_batch()["body"],
+            _outcomes(package=1, **{"jacked service restart": _ACCESS_VIOLATION}),
+        )
+        assert run.exit_code == 1
+        assert "service restart step" in run.failed_file
+        assert "rolled back to" not in run.failed_file
+
+    def test_cli_a_crashed_restart_after_a_release_timeout_is_reported(self):
+        run = _simulate(
+            _cli_batch()["body"],
+            _outcomes(
+                _release_install=3,
+                **{"jacked service restart": _ACCESS_VIOLATION},
+            ),
+        )
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+        assert "service restart step failed" in run.failed_file
+
+    def test_cli_a_crashed_restart_with_no_rollback_is_reported(self):
+        run = _simulate(
+            _cli_batch(("--no-rollback",))["body"],
+            _outcomes(package=1, **{"jacked service restart": _ACCESS_VIOLATION}),
+        )
+        assert run.exit_code == 1
+        assert "service restart step failed" in run.failed_file
+
+    def test_tray_a_crashed_start_of_the_previous_service_is_reported(self):
+        run = _simulate(
+            _tray_batch()["body"],
+            _outcomes(_release_install=1, powershell=_ACCESS_VIOLATION),
+        )
+        assert run.exit_code == 1
+        assert run.ran(_PACKAGE_MARK) == 0
+        assert "service start step failed" in run.failed_file
+        assert "running again" not in run.failed_file
+
+    def test_tray_a_crashed_status_shim_is_logged_and_the_update_continues(self):
+        run = _simulate(
+            _tray_batch()["body"],
+            _outcomes(
+                **{"_update_status waiting_for_parent in_progress": _ACCESS_VIOLATION}
+            ),
+        )
+        assert run.exit_code == 0
+        assert any("_update_status shim returned non-zero" in e for e in run.echoes)
+
+
+class TestTheTrayReleaseStepWaitsForTheTray:
+    def test_the_release_line_carries_the_tray_identity_and_port(self):
+        body = _tray_batch(port=9555)["body"]
+        line = next(
+            ln for ln in body.split("\r\n")
+            if ln.startswith("jacked _release_install")
+        )
+        assert "--port 9555" in line
+        assert f"--wait-process 4242:{TRAY_CREATION_ID}" in line
+
+    def test_an_unreadable_identity_still_checks_the_port(self):
+        def gone(_pid):
+            raise ProcessLookupError(_pid)
+
+        body = _tray_batch(identity=gone)["body"]
+        line = next(
+            ln for ln in body.split("\r\n")
+            if ln.startswith("jacked _release_install")
+        )
+        assert "--wait-process" not in line
+        assert "--port 8321" in line
+
+    def test_an_identity_that_is_unsafe_for_cmd_is_not_written(self):
+        from jacked.service.instance_models import ProcessIdentity
+
+        def odd(pid):
+            return ProcessIdentity(pid, "windows-filetime:1 & del x", "x")
+
+        body = _tray_batch(identity=odd)["body"]
+        assert "del x" not in body
+        assert "--wait-process" not in body
+
+    def test_the_cli_release_line_names_the_default_port(self):
+        from jacked.service import DEFAULT_PORT
+
+        body = _cli_batch()["body"]
+        assert f"jacked _release_install --timeout 60 --port {DEFAULT_PORT}" in body
+        assert "--wait-process" not in body
+
+
+class TestTheCliBatchClosesTheStatusRecord:
+    """The CLI batch claims the record, so every exit must close it."""
+
+    def test_a_clean_run_marks_the_update_succeeded(self):
+        run = _simulate(_cli_batch()["body"], _outcomes())
+        assert run.exit_code == 0
+        assert run.ran("jacked _update_status_succeed") == 1
+        assert run.ran("_update_status_fail") == 0
+
+    @pytest.mark.parametrize(
+        ("args", "overrides", "reason"),
+        [
+            ((), {"_release_install": 1}, "still in use"),
+            ((), {"_release_install": 3}, "did not release the install"),
+            (
+                (),
+                {"_release_install": 3, "jacked service restart": 1},
+                "did not restart",
+            ),
+            ((), {"package": 1}, "rolled back"),
+            ((), {"package": 1, "rollback": 1}, "package rollback step"),
+            ((), {"jacked service preflight": 1}, "preflight failed"),
+            (("--no-rollback",), {"package": 1}, "after 3 attempts"),
+            (
+                ("--no-rollback",),
+                {"package": 1, "jacked service restart": 1},
+                "after 3 attempts",
+            ),
+            (("--no-rollback",), {"jacked service preflight": 1}, "disabled"),
+            (("--skip-service",), {"_release_install": 1}, "still in use"),
+        ],
+    )
+    def test_every_failure_exit_marks_the_update_failed(
+        self, args, overrides, reason
+    ):
+        run = _simulate(_cli_batch(args)["body"], _outcomes(**overrides))
+        assert run.exit_code == 1
+        marks = [c for c in run.commands if "_update_status_fail" in c]
+        assert len(marks) == 1, marks
+        assert run.ran("jacked _update_status_succeed") == 0
+        expanded = re.sub(
+            r"%(\w+)%", lambda m: run.env.get(m.group(1), m.group(0)), marks[0]
+        )
+        assert reason in expanded, expanded
+        # The mark is the last command before the exit.
+        assert "_update_status_fail" in run.commands[-1]
+
+    def test_another_updater_in_flight_does_not_touch_its_record(self):
+        run = _simulate(_cli_batch()["body"], _outcomes(_update_status_init=2))
+        assert run.exit_code == 2
+        assert run.ran("_update_status_fail") == 0
+
+
+class TestUpdateStatusFailCommand:
+    def test_it_marks_the_record_failed(self, tmp_path, monkeypatch):
+        import json
+
+        from jacked.cli import main
+        from jacked.service import update_status as us
+
+        path = tmp_path / "update-status.json"
+        path.write_text(json.dumps({"overall": "in_progress"}), encoding="utf-8")
+        monkeypatch.setattr(us, "UPDATE_STATUS_FILE", path)
+        result = CliRunner().invoke(
+            main, ["_update_status_fail", "--error", "the install is in use"]
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["overall"] == "failed"
+        assert data["error"] == "the install is in use"
+
+    def test_a_missing_record_is_left_alone(self, tmp_path, monkeypatch):
+        from jacked.cli import main
+        from jacked.service import update_status as us
+
+        path = tmp_path / "update-status.json"
+        monkeypatch.setattr(us, "UPDATE_STATUS_FILE", path)
+        result = CliRunner().invoke(main, ["_update_status_fail", "--error", "x"])
+        assert result.exit_code == 0
+        assert not path.exists()
+
+    def test_the_command_is_hidden(self):
+        from jacked.cli import main
+
+        assert main.commands["_update_status_fail"].hidden

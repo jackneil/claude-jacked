@@ -857,6 +857,8 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
     # Windows can't overwrite a running .exe. Spawn a detached cmd.exe that
     # waits for this process to die, then does the install + migrate + restart.
     if sys.platform == "win32":
+        if skip_service:
+            _refuse_windows_skip_service_if_held()
         _spawn_windows_upgrade_helper(
             cmd, label, extras, skip_service,
             previous_version=__version__, no_rollback=no_rollback,
@@ -1474,6 +1476,51 @@ def _upgrade_preflight_or_rollback(plan, new_version: str, no_rollback: bool) ->
 _WIN_FAILED_FILE = '"%USERPROFILE%\\.claude\\jacked-update-failed.txt"'
 
 
+def _refuse_windows_skip_service_if_held() -> None:
+    """Refuse `jacked upgrade --skip-service` now when a service holds the install.
+
+    On Windows a running service locks the tool environment, and with
+    --skip-service the helper must not stop it. The helper refuses too, but
+    only its log shows that refusal. This check runs in this process, before
+    the helper starts, so the user sees the refusal at once. The helper's
+    `--check-only` step stays as the second check.
+    """
+    from jacked.service import install_release
+
+    try:
+        result = install_release.release_install(stop=False, timeout=0)
+    except Exception as exc:  # noqa: BLE001 - refuse when the owner is unknown
+        console.print(
+            "[red]Upgrade refused:[/red] cannot find the owner of the install "
+            f"({type(exc).__name__}). No process was signalled. Nothing was "
+            "installed."
+        )
+        sys.exit(install_release.EXIT_NOT_STOPPED)
+    if result.released:
+        return
+    console.print(f"[red]Upgrade refused:[/red] {result.message}")
+    console.print(
+        "Nothing was installed. On Windows, a running service locks the "
+        "install. Run `jacked service stop` first, or upgrade without "
+        "`--skip-service`."
+    )
+    sys.exit(result.exit_code or install_release.EXIT_NOT_STOPPED)
+
+
+def _cli_status_failed(error: str = "%FAILREASON%") -> str:
+    """Return the batch line that marks the update status record failed.
+
+    The CLI batch claims the record with `_update_status_init`. Without a
+    final write, the dashboard shows "in progress" until the record goes
+    stale. Each failure exit writes this line just before `exit /b 1`.
+    ``error`` must be fixed text (or %FAILREASON%) with no double quote.
+
+    >>> _cli_status_failed("the install is still in use")
+    'jacked _update_status_fail --error "the install is still in use"\\r\\n'
+    """
+    return 'jacked _update_status_fail --error "' + error + '"\r\n'
+
+
 def _rollback_failed_label(
     label: str, step: str, repair: str, previous: str
 ) -> str:
@@ -1492,7 +1539,136 @@ def _rollback_failed_label(
         'echo Run this first: ' + repair + ' >> ' + _WIN_FAILED_FILE + '\r\n'
         'echo Then: jacked install --force ^&^& jacked service restart >> '
         + _WIN_FAILED_FILE + '\r\n'
-        'exit /b 1\r\n'
+        + _cli_status_failed('the rollback stopped at the ' + step + ' step')
+        + 'exit /b 1\r\n'
+    )
+
+
+def _cli_release_abort_blocks(skip_service: bool) -> str:
+    """Return the cmd.exe labels for a release step that did not succeed.
+
+    The batch reaches these labels before the package step, so nothing was
+    installed. ``:release_refused`` (exit 1, or any other non-zero exit) means
+    that the release step did not stop the service: the batch restarts
+    nothing. ``:release_stopped_failed`` (exit 3) means that the service
+    accepted the stop but did not exit in time: the batch restarts the
+    service, because this batch stopped it. With --skip-service the release
+    step only checks, so exit 3 cannot occur and that label is not written.
+    """
+    from jacked.service.install_release import RELEASE_TIMEOUT_SECONDS
+
+    failed = _WIN_FAILED_FILE
+    if skip_service:
+        recovery = (
+            'echo Recovery: run jacked upgrade without --skip-service, or run '
+            'jacked service stop first, then update again. >> ' + failed + '\r\n'
+        )
+    else:
+        recovery = (
+            'echo Recovery: jacked service status, then jacked service stop '
+            '^&^& jacked upgrade >> ' + failed + '\r\n'
+        )
+    blocks = (
+        ':release_refused\r\n'
+        'echo [%date% %time%] ERROR: the install is still in use; the package '
+        'step did not run\r\n'
+        'echo Jacked upgrade stopped before the package step: the install is '
+        'still in use, and this upgrade did not stop it. The log gives the '
+        'reason. Nothing was installed. See %LOGFILE%. > ' + failed + '\r\n'
+        + recovery
+        + _cli_status_failed(
+            "the install is still in use, so nothing was installed"
+        )
+        + 'exit /b 1\r\n'
+    )
+    if skip_service:
+        return blocks
+    return blocks + (
+        ':release_stopped_failed\r\n'
+        'echo [%date% %time%] ERROR: the old service accepted the stop but did '
+        f'not release the install within {RELEASE_TIMEOUT_SECONDS} seconds; '
+        'the package step did not run\r\n'
+        'echo Jacked upgrade stopped before the package step: the old service '
+        f'did not release the install within {RELEASE_TIMEOUT_SECONDS} seconds. '
+        'Nothing was installed. See %LOGFILE%. > ' + failed + '\r\n'
+        'echo [%date% %time%] restarting the previous service, which this '
+        'upgrade stopped\r\n'
+        'jacked service restart 2>&1\r\n'
+        'if errorlevel 1 goto release_restart_failed\r\n'
+        'if not "%ERRORLEVEL%"=="0" goto release_restart_failed\r\n'
+        'echo Recovery: close every jacked process, then: jacked upgrade >> '
+        + failed + '\r\n'
+        + _cli_status_failed(
+            "the old service did not release the install, so nothing was "
+            "installed"
+        )
+        + 'exit /b 1\r\n'
+        ':release_restart_failed\r\n'
+        'echo [%date% %time%] ERROR: the service restart step failed after the '
+        'upgrade stopped\r\n'
+        'echo Jacked upgrade stopped before the package step, and the service '
+        'restart step failed. Nothing was installed. See %LOGFILE%. > '
+        + failed + '\r\n'
+        'echo Run this first: jacked service restart >> ' + failed + '\r\n'
+        + _cli_status_failed(
+            "the old service did not release the install, and the service "
+            "did not restart"
+        )
+        + 'exit /b 1\r\n'
+    )
+
+
+def _cli_package_failed_block(
+    label: str, skip_service: bool, has_rollback: bool
+) -> str:
+    """Return the cmd.exe label for a package step that failed every attempt.
+
+    With a rollback command, the label goes to the shared rollback, which
+    reinstalls the previous version, migrates its settings, and restarts the
+    service. Without one, the label writes a failure message that does not
+    claim a rollback. Unless --skip-service is set, it also tries to restart
+    the previous service: the release step stopped it, and the failed step
+    can leave the install unchanged.
+    """
+    from jacked.service.updater import PACKAGE_FAILED_REASON
+
+    block = (
+        ':package_failed\r\n'
+        'echo [%date% %time%] ERROR: ' + PACKAGE_FAILED_REASON + '\r\n'
+        'set FAILREASON=' + PACKAGE_FAILED_REASON + '\r\n'
+    )
+    if has_rollback:
+        return block + 'goto do_rollback\r\n'
+    failed = _WIN_FAILED_FILE
+    block += (
+        'echo [%date% %time%] no rollback command is available\r\n'
+        'echo Jacked upgrade failed (%FAILREASON%), and no rollback command is '
+        'available. The install can be incomplete. See %LOGFILE%. > '
+        + failed + '\r\n'
+        'echo Recovery: ' + label + ' ^&^& jacked install --force ^&^& '
+        'jacked service restart >> ' + failed + '\r\n'
+    )
+    if skip_service:
+        return block + _cli_status_failed() + 'exit /b 1\r\n'
+    return block + (
+        'echo [%date% %time%] restarting the previous service, which this '
+        'upgrade stopped\r\n'
+        'jacked service restart 2>&1\r\n'
+        'if errorlevel 1 goto package_restart_failed\r\n'
+        'if not "%ERRORLEVEL%"=="0" goto package_restart_failed\r\n'
+        + _cli_status_failed()
+        + 'exit /b 1\r\n'
+        ':package_restart_failed\r\n'
+        'echo [%date% %time%] ERROR: the service restart step failed after the '
+        'package step failed\r\n'
+        'echo Jacked upgrade failed (%FAILREASON%), no rollback command is '
+        'available, and the service restart step failed. The install can be '
+        'incomplete. See %LOGFILE%. > ' + failed + '\r\n'
+        'echo Run this first: ' + label + ' >> ' + failed + '\r\n'
+        'echo Then: jacked install --force ^&^& jacked service restart >> '
+        + failed + '\r\n'
+        + _cli_status_failed()
+        + 'exit /b 1\r\n'
     )
 
 
@@ -1509,12 +1685,19 @@ def _spawn_windows_upgrade_helper(
 
     Helper steps:
       1. Wait for our PID to exit (avoids racing against the .exe lock).
-      2. Run the detected upgrade command (uv / pipx / pip).
-      3. `jacked service preflight` (prove the new build can provision its
+      2. `jacked _release_install` with the OLD build: stop the owned service
+         and wait until it exits, because a live service locks the tool venv
+         and uv then half-deletes it ("Access is denied"). With
+         --skip-service it only checks. A failure aborts before anything is
+         installed, and restarts the service only when this step stopped it.
+      3. Run the detected upgrade command (uv / pipx / pip), up to
+         PACKAGE_ATTEMPTS times. The last failure rolls back to
+         `previous_version`.
+      4. `jacked service preflight` (prove the new build can provision its
          service contract). A refusal rolls back to `previous_version`.
-      4. `jacked install --force` (migrate settings.json).
-      5. `jacked service restart` (unless --skip-service).
-      6. Append progress to ~/.claude/jacked-update.log.
+      5. `jacked install --force` (migrate settings.json).
+      6. `jacked service restart` (unless --skip-service).
+      7. Append progress to ~/.claude/jacked-update.log.
     """
     import os
     import subprocess
@@ -1525,8 +1708,13 @@ def _spawn_windows_upgrade_helper(
         rollback_command_label,
         safe_version_label,
     )
-    from jacked.service import CLAUDE_DIR
-    from jacked.service.updater import UPDATE_LOG, wait_for_parent_block
+    from jacked.service import CLAUDE_DIR, DEFAULT_PORT
+    from jacked.service.updater import (
+        UPDATE_LOG,
+        package_retry_block,
+        release_install_line,
+        wait_for_parent_block,
+    )
 
     my_pid = os.getpid()
     # Validate the version string ONCE, here, and use the result in every batch
@@ -1581,6 +1769,7 @@ def _spawn_windows_upgrade_helper(
             'echo [%date% %time%] service restart\r\n'
             'jacked service restart 2>&1\r\n'
             'if errorlevel 1 goto restart_failed\r\n'
+            'if not "%ERRORLEVEL%"=="0" goto restart_failed\r\n'
         )
     )
     # Rollback path. Reached only by `goto`, so the success path never touches
@@ -1601,6 +1790,13 @@ def _spawn_windows_upgrade_helper(
         'set FAILREASON=its service preflight failed\r\n'
         'goto do_rollback\r\n'
     )
+    if rollback_line:
+        # The package step failed every attempt: roll back through the shared
+        # body. A failed attempt can already have deleted part of the venv,
+        # so "exit /b 1" here would leave a broken install.
+        preflight_failed_block += _cli_package_failed_block(
+            label, skip_service, has_rollback=True
+        )
     if not skip_service:
         preflight_failed_block += (
             ':restart_failed\r\n'
@@ -1622,15 +1818,18 @@ def _spawn_windows_upgrade_helper(
                 'echo [%date% %time%] service restart\r\n'
                 'jacked service restart 2>&1\r\n'
                 'if errorlevel 1 goto rollback_restart_failed\r\n'
+                'if not "%ERRORLEVEL%"=="0" goto rollback_restart_failed\r\n'
             )
         )
         preflight_failed_block += (
             'echo [%date% %time%] rolling back to v' + safe_previous + '\r\n'
             + rollback_line + ' 2>&1\r\n'
             'if errorlevel 1 goto rollback_package_failed\r\n'
+            'if not "%ERRORLEVEL%"=="0" goto rollback_package_failed\r\n'
             'echo [%date% %time%] running jacked install --force\r\n'
             'jacked install --force 2>&1\r\n'
             'if errorlevel 1 goto rollback_install_failed\r\n'
+            'if not "%ERRORLEVEL%"=="0" goto rollback_install_failed\r\n'
             + _rb_restart +
             ':rollback_done\r\n'
             'echo Jacked upgrade failed (%FAILREASON%); rolled back to v'
@@ -1638,7 +1837,10 @@ def _spawn_windows_upgrade_helper(
             'echo Recovery: ' + rollback_label
             + ' ^&^& jacked install --force ^&^& jacked service restart >> '
             + _failed_file + '\r\n'
-            'exit /b 1\r\n'
+            + _cli_status_failed(
+                "%FAILREASON%; the upgrade rolled back to v" + safe_previous
+            )
+            + 'exit /b 1\r\n'
             + _rollback_failed_label(
                 'rollback_package_failed', 'package rollback', rollback_label,
                 safe_previous,
@@ -1659,7 +1861,8 @@ def _spawn_windows_upgrade_helper(
             'See %LOGFILE%. > ' + _failed_file + '\r\n'
             'echo Recovery: jacked service preflight ^&^& jacked service status >> '
             + _failed_file + '\r\n'
-            'exit /b 1\r\n'
+            + _cli_status_failed("%FAILREASON%; rollback is disabled")
+            + 'exit /b 1\r\n'
         )
 
     batch_body = (
@@ -1686,29 +1889,51 @@ def _spawn_windows_upgrade_helper(
         '    exit /b 2\r\n'
         ')\r\n'
         + wait_for_parent_block(my_pid) +
-        'echo [%date% %time%] parent exited, running upgrade command\r\n'
-        + upgrade_line + ' 2>&1\r\n'
-        'if errorlevel 1 (\r\n'
-        '    echo [%date% %time%] ERROR: upgrade command failed\r\n'
-        '    echo Jacked upgrade failed. See %LOGFILE% for details. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
-        '    echo Recovery: ' + label + ' ^&^& jacked install --force >> "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
-        '    exit /b 1\r\n'
-        ')\r\n'
+        'echo [%date% %time%] parent exited; releasing the install\r\n'
+        # The owned service runs from the tool venv and locks its files. Stop
+        # it (or, with --skip-service, only check) BEFORE the package step.
+        # Exit 3: this step stopped the service, so restart it. Any other
+        # non-zero exit: this step stopped nothing, so restart nothing.
+        + release_install_line(check_only=skip_service, port=DEFAULT_PORT)
+        + ('' if skip_service else 'if errorlevel 3 goto release_stopped_failed\r\n')
+        + 'if errorlevel 1 goto release_refused\r\n'
+        # "if errorlevel N" is "at least N", so a negative NTSTATUS exit (a
+        # crash) passes both checks above. "if" does not change ERRORLEVEL,
+        # so this line still reads the release command's exit code.
+        + 'if not "%ERRORLEVEL%"=="0" goto release_refused\r\n'
+        'echo [%date% %time%] install released, running upgrade command\r\n'
+        + package_retry_block(upgrade_line, 'package_failed')
         # Transaction gate: the new build must prove it can provision its
         # service contract before the old service is replaced.
-        'echo [%date% %time%] running jacked service preflight\r\n'
+        + 'echo [%date% %time%] running jacked service preflight\r\n'
+        # Every step check below is two lines (updater.goto_on_failure): a
+        # crash exits with a negative code, which passes "if errorlevel 1",
+        # so the exact compare on the next line catches it.
         'jacked service preflight --timeout 120 2>&1\r\n'
         'if errorlevel 1 goto preflight_failed\r\n'
+        'if not "%ERRORLEVEL%"=="0" goto preflight_failed\r\n'
         'echo [%date% %time%] running jacked install --force\r\n'
         'jacked install --force 2>&1\r\n'
         'if errorlevel 1 goto migrate_failed\r\n'
+        'if not "%ERRORLEVEL%"=="0" goto migrate_failed\r\n'
         + restart_line +
         # A clean upgrade retires the breadcrumb an earlier failure left
         # behind, so nothing warns about a failure already repaired.
         'if exist ' + _WIN_FAILED_FILE + ' del ' + _WIN_FAILED_FILE + '\r\n'
         'echo [%date% %time%] upgrade complete\r\n'
+        # Close the status record that _update_status_init claimed, so the
+        # dashboard does not show "in progress" until the record goes stale.
+        'jacked _update_status_succeed\r\n'
         '(goto) 2>nul & del "%~f0"\r\n'
         + preflight_failed_block
+        + (
+            ''
+            if rollback_line
+            else _cli_package_failed_block(
+                label, skip_service, has_rollback=False
+            )
+        )
+        + _cli_release_abort_blocks(skip_service)
     )
 
     # Write the batch file to %TEMP% — it deletes itself at the end.
@@ -1781,9 +2006,15 @@ def _spawn_windows_upgrade_helper(
     )
     console.print(f"[dim]Watching log: {log_path}[/dim]")
     console.print(
-        f"The helper will run `{label}` + `jacked install --force`"
+        "After this process exits, the helper will "
+        + (
+            "check that no service holds the install"
+            if skip_service
+            else "stop the service"
+        )
+        + f", then run `{label}` + `jacked install --force`"
         + ("" if skip_service else " + `jacked service restart`")
-        + " after this process exits."
+        + "."
     )
     # Exit immediately so the lock on jacked.exe releases.
     sys.exit(0)
@@ -1870,6 +2101,109 @@ def _update_status_succeed_shim():
     """Internal: mark overall=succeeded on the update-status file."""
     from jacked.service import update_status as us_mod
     us_mod.mark_succeeded(us_mod.UPDATE_STATUS_FILE)
+
+
+@main.command(name="_update_status_fail", hidden=True)
+@click.option("--error", required=True)
+@click.option("--recovery", default=None)
+def _update_status_fail_shim(error, recovery):
+    """Internal: mark overall=failed on the update-status file.
+
+    The Windows `jacked upgrade` batch runs this command at each failure
+    exit. It opens no phase, so it uses mark_failed, not end_phase. When the
+    status file does not exist, the command does nothing.
+    """
+    from jacked.service import update_status as us_mod
+
+    try:
+        us_mod.mark_failed(us_mod.UPDATE_STATUS_FILE, error=error, recovery=recovery)
+    except Exception as exc:  # noqa: BLE001 - the batch exits 1 next anyway
+        click.echo(
+            f"[update-status] cannot mark the update failed: {type(exc).__name__}",
+            err=True,
+        )
+        sys.exit(1)
+
+
+def _parse_wait_process_option(value):
+    """Return the parsed ``--wait-process`` value, or None when it is absent.
+
+    Raise a usage error, with no value in the message, when the text is not
+    a valid ``PID:CREATION_ID``.
+    """
+    if value is None:
+        return None
+    from jacked.service.install_release import parse_wait_process
+
+    try:
+        return parse_wait_process(value)
+    except ValueError:
+        raise click.BadParameter("the process identity is not valid") from None
+
+
+@main.command(name="_release_install", hidden=True)
+@click.option(
+    "--timeout",
+    default=60.0,
+    type=click.FloatRange(min=0),
+    show_default=True,
+    help="Maximum time, in seconds, for the service to exit.",
+)
+@click.option(
+    "--check-only",
+    is_flag=True,
+    help="Do not stop the service. Refuse when a live service holds the install.",
+)
+@click.option(
+    "--port",
+    default=None,
+    type=click.IntRange(1, 65535),
+    help="Service port to check when no service manifest exists.",
+)
+@click.option(
+    "--wait-process",
+    default=None,
+    metavar="PID:CREATION_ID",
+    callback=lambda _ctx, _param, value: _parse_wait_process_option(value),
+    help="A process that must exit before the install is free.",
+)
+def _release_install_shim(timeout, check_only, port, wait_process):
+    """Internal: make sure no jacked service holds the install.
+
+    The Windows update batches run this command with the old build, before
+    the package step. It stops the owned service through the authenticated
+    control channel. Then it waits until the service exits and no jacked
+    service holds its port. When no manifest exists, it waits until no jacked
+    service holds the port and until the ``--wait-process`` process exits. A
+    program on the port that is clearly not jacked does not lock the install.
+    A program that cannot be identified counts as a holder. Exit 0 when the
+    install is free.
+    Exit 1 when this command did not stop the service. Exit 3 when the
+    service accepted the stop but did not release the install in time. The
+    batch must restart the service on exit 3.
+    """
+    from jacked.service import DEFAULT_PORT
+    from jacked.service.install_release import (
+        EXIT_NOT_STOPPED,
+        release_install,
+    )
+
+    try:
+        result = release_install(
+            timeout=timeout,
+            stop=not check_only,
+            port=DEFAULT_PORT if port is None else port,
+            wait_process=wait_process,
+        )
+    except Exception as exc:  # noqa: BLE001 - the batch needs an exit code
+        click.echo(
+            "[release-install] cannot find the owner of the install "
+            f"({type(exc).__name__}). No process was signalled.",
+            err=True,
+        )
+        sys.exit(EXIT_NOT_STOPPED)
+    click.echo(f"[release-install] {result.message}")
+    sys.exit(result.exit_code)
 
 
 @main.command(

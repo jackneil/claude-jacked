@@ -8,6 +8,7 @@ migrates settings.json via `jacked install`, then spawns a fresh
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import subprocess
@@ -80,6 +81,67 @@ def _health_fingerprint(body: bytes) -> "tuple[bool, str]":
     return False, "/api/health answered a shape that is not jacked's"
 
 
+# The three answers of :func:`classify_jacked_listener`.
+LISTENER_JACKED = "jacked"
+LISTENER_FOREIGN = "foreign"
+LISTENER_UNKNOWN = "unknown"
+
+# Errors that come from a listener that refuses or drops an HTTP request. A
+# jacked service always speaks HTTP, so these listeners are not jacked.
+_STRANGER_ERRORS = (
+    ConnectionRefusedError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    http.client.BadStatusLine,
+)
+
+
+def classify_jacked_listener(port: int, budget: float) -> "tuple[str, str]":
+    """Ask /api/health which kind of listener is on *port*.
+
+    Return ``(verdict, reason)``. The verdict is one of these values:
+
+    * ``LISTENER_JACKED``: the body has the exact jacked health shape.
+    * ``LISTENER_FOREIGN``: the listener is clearly a different program. It
+      sent an HTTP error status, a body that is not JSON, a body with the
+      wrong shape, or it refused or reset the connection.
+    * ``LISTENER_UNKNOWN``: the probe proves nothing. For example, the
+      listener did not answer in the time limit.
+
+    The reason names the failure class and contains no body text. The
+    function never raises.
+
+    >>> classify_jacked_listener(8321, 0)
+    ('unknown', 'no time left to identify the listener')
+    """
+    if budget <= 0:
+        return LISTENER_UNKNOWN, "no time left to identify the listener"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(
+            f"http://127.0.0.1:{port}/api/health", timeout=budget
+        ) as response:
+            status = getattr(response, "status", 200)
+            if status != 200:
+                return LISTENER_FOREIGN, f"/api/health answered HTTP {status}"
+            body = response.read(_PROBE_BODY_LIMIT + 1)
+    except urllib.error.HTTPError as exc:
+        return LISTENER_FOREIGN, f"/api/health answered HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        stranger = isinstance(exc.reason, _STRANGER_ERRORS)
+        verdict = LISTENER_FOREIGN if stranger else LISTENER_UNKNOWN
+        return verdict, f"/api/health unreachable ({exc.reason})"
+    except TimeoutError:
+        return LISTENER_UNKNOWN, f"/api/health did not answer within {budget:.1f}s"
+    except _STRANGER_ERRORS as exc:
+        return LISTENER_FOREIGN, f"/api/health dropped the request ({type(exc).__name__})"
+    except Exception as exc:  # noqa: BLE001 - an unreadable listener is the answer
+        return LISTENER_UNKNOWN, f"/api/health probe failed ({type(exc).__name__})"
+
+    is_jacked, reason = _health_fingerprint(body)
+    return (LISTENER_JACKED if is_jacked else LISTENER_FOREIGN), reason
+
+
 def _identify_jacked_listener(port: int, budget: float) -> "tuple[bool, str]":
     """Ask whether the listener on *port* is a jacked service.
 
@@ -95,29 +157,12 @@ def _identify_jacked_listener(port: int, budget: float) -> "tuple[bool, str]":
     never route a 127.0.0.1 probe through someone else's server.
 
     Returns ``(is_jacked, reason)``; the reason names the failure class so a
-    refused update can say WHY the port holder was not recognised. Never raises.
+    refused update can say WHY the port holder was not recognised. Never
+    raises. An unknown verdict counts as "not jacked" here: for the squatter
+    decision, a listener that cannot prove it is jacked is a stranger.
     """
-    if budget <= 0:
-        return False, "no time left to identify the listener"
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    try:
-        with opener.open(
-            f"http://127.0.0.1:{port}/api/health", timeout=budget
-        ) as response:
-            status = getattr(response, "status", 200)
-            if status != 200:
-                return False, f"/api/health answered HTTP {status}"
-            body = response.read(_PROBE_BODY_LIMIT + 1)
-    except urllib.error.HTTPError as exc:
-        return False, f"/api/health answered HTTP {exc.code}"
-    except urllib.error.URLError as exc:
-        return False, f"/api/health unreachable ({exc.reason})"
-    except TimeoutError:
-        return False, f"/api/health did not answer within {budget:.1f}s"
-    except Exception as exc:  # noqa: BLE001 - an unreadable listener is the answer
-        return False, f"/api/health probe failed ({type(exc).__name__})"
-
-    return _health_fingerprint(body)
+    verdict, reason = classify_jacked_listener(port, budget)
+    return verdict == LISTENER_JACKED, reason
 
 
 def _read_reported_build(port: int, budget: float) -> "str | None":
@@ -171,6 +216,124 @@ class RollbackResult(NamedTuple):
 # `ping -n 2 127.0.0.1` needs no console and sleeps ~1s between its two pings.
 _SLEEP_1S = "ping -n 2 127.0.0.1 >NUL\r\n"
 
+# About three seconds, the same console-free idiom: four pings, one second
+# apart. The pause between two package attempts.
+_SLEEP_3S = "ping -n 4 127.0.0.1 >NUL\r\n"
+
+# How many times a Windows batch runs the package step before it rolls back.
+# One failed attempt is not proof of a broken update: Claude Code runs the
+# statusline as `<tool venv>\Scripts\python.exe -m jacked.statusline` on every
+# refresh, and that short-lived process locks venv files for a moment.
+PACKAGE_ATTEMPTS = 3
+
+# The text both batches put in FAILREASON, the log and the status record when
+# the package step fails on its last attempt.
+PACKAGE_FAILED_REASON = (
+    f"the package step failed after {PACKAGE_ATTEMPTS} attempts"
+)
+
+
+def release_install_line(
+    *,
+    check_only: bool = False,
+    port: int = 8321,
+    wait_process: str = "",
+) -> str:
+    """Return the batch line that frees the install before the package step.
+
+    The line runs ``jacked _release_install`` with the OLD build. Exit 0 means
+    that no jacked service holds the install. Exit 1 means that the command
+    did not stop the service. Exit 3 means that the service accepted the stop
+    but did not exit in time. Use ``check_only`` when the batch must not stop
+    the service: the command then refuses when a live service holds the
+    install. ``port`` is the service port that the command checks when no
+    manifest exists. ``wait_process`` is a ``PID:CREATION_ID`` value (from
+    :func:`jacked.service.install_release.format_wait_process`) for a process
+    that must exit first. An empty value adds no option.
+
+    >>> release_install_line()
+    'jacked _release_install --timeout 60 --port 8321 2>&1\\r\\n'
+    >>> release_install_line(check_only=True, port=9000)
+    'jacked _release_install --check-only --timeout 60 --port 9000 2>&1\\r\\n'
+    >>> release_install_line(wait_process="7:windows-filetime:1")
+    'jacked _release_install --timeout 60 --port 8321 --wait-process 7:windows-filetime:1 2>&1\\r\\n'
+    >>> release_install_line(wait_process="7:a b")
+    Traceback (most recent call last):
+    ...
+    ValueError: the process identity is not valid
+    """
+    from jacked.service.install_release import (
+        RELEASE_TIMEOUT_SECONDS,
+        parse_wait_process,
+    )
+
+    flag = " --check-only" if check_only else ""
+    wait = ""
+    if wait_process:
+        # Validate again here: this text goes into a cmd.exe line.
+        parse_wait_process(wait_process)
+        wait = f" --wait-process {wait_process}"
+    return (
+        f"jacked _release_install{flag} --timeout {RELEASE_TIMEOUT_SECONDS}"
+        f" --port {int(port)}{wait} 2>&1\r\n"
+    )
+
+
+def goto_on_failure(label: str) -> str:
+    """Return the batch lines that jump to *label* when a step did not succeed.
+
+    Put these lines directly after the step. ``if errorlevel 1`` means "the
+    exit code is 1 or more". A crash exits with a negative NTSTATUS code,
+    which passes that check. The second line compares the exact value, so
+    every exit code that is not 0 goes to *label*. ``if`` does not change
+    ERRORLEVEL, so the second line still reads the exit code of the step.
+    Both lines are flat: ``goto`` out of a parenthesised block is a cmd.exe
+    parsing trap.
+
+    >>> goto_on_failure("preflight_failed").split("\\r\\n")
+    ['if errorlevel 1 goto preflight_failed', 'if not "%ERRORLEVEL%"=="0" goto preflight_failed', '']
+    """
+    return (
+        f"if errorlevel 1 goto {label}\r\n"
+        f'if not "%ERRORLEVEL%"=="0" goto {label}\r\n'
+    )
+
+
+def package_retry_block(upgrade_line: str, failed_label: str) -> str:
+    """Return batch lines that run the package step up to PACKAGE_ATTEMPTS times.
+
+    The block logs each attempt and pauses about three seconds between two
+    attempts. When an attempt succeeds, the batch continues after the block.
+    When the last attempt fails, the batch jumps to ``failed_label``. The
+    lines are flat: ``goto`` out of a parenthesised block is a cmd.exe
+    parsing trap.
+
+    >>> block = package_retry_block('"uv" "tool" "install"', "package_failed")
+    >>> block.count('"uv" "tool" "install" 2>&1')
+    1
+    >>> "if %JACKED_PKG_TRY% GEQ 3 goto package_failed" in block
+    True
+    >>> 'if "%ERRORLEVEL%"=="0" goto package_done' in block
+    True
+    """
+    return (
+        "set /a JACKED_PKG_TRY=0\r\n"
+        ":package_attempt\r\n"
+        "set /a JACKED_PKG_TRY+=1\r\n"
+        "echo [%date% %time%] package step: attempt %JACKED_PKG_TRY% of "
+        f"{PACKAGE_ATTEMPTS}\r\n"
+        + upgrade_line + " 2>&1\r\n"
+        # An exact compare, not "if not errorlevel 1": a negative NTSTATUS
+        # exit (a crash) is below 1 and would read as success.
+        'if "%ERRORLEVEL%"=="0" goto package_done\r\n'
+        "echo [%date% %time%] WARN: package step attempt %JACKED_PKG_TRY% of "
+        f"{PACKAGE_ATTEMPTS} failed\r\n"
+        f"if %JACKED_PKG_TRY% GEQ {PACKAGE_ATTEMPTS} goto {failed_label}\r\n"
+        + _SLEEP_3S
+        + "goto package_attempt\r\n"
+        ":package_done\r\n"
+    )
+
 # Absolute paths for the two tools whose EXIT CODE steers the wait loop. Git
 # Bash, Cygwin and GnuWin32 all put a `find` on PATH that takes different flags
 # and returns different codes; if one shadows System32's, `if errorlevel 1`
@@ -213,6 +376,9 @@ def wait_for_parent_block(pid: int) -> str:
         "set /a JACKED_WAITED=0\r\n"
         ":wait\r\n"
         f'{_TASKLIST} /FI "PID eq {pid}" 2>NUL | {_FIND} "{pid}" >NUL\r\n'
+        # Only "if errorlevel 1" here, on purpose: exit 1 from find.exe means
+        # "the PID is not listed". A crashed find.exe (a negative exit) proves
+        # nothing, so the loop keeps waiting, up to the 120 s cap below.
         "if errorlevel 1 goto waitdone\r\n"
         "set /a JACKED_WAITED+=1\r\n"
         "if %JACKED_WAITED% GEQ 120 (\r\n"
@@ -1040,9 +1206,12 @@ def spawn_updater_from_tray(
     Windows exclusive-file-lock). Instead spawn a detached cmd.exe batch
     that:
       1. Waits for the tray PID to exit.
-      2. Runs `uv tool install --force`.
-      3. Runs `jacked install --force`.
-      4. Runs `jacked service start` (detached).
+      2. Runs `jacked _release_install` (old build): no service may hold
+         the tool venv. A failure starts the previous service again.
+      3. Runs `uv tool install --force`, up to PACKAGE_ATTEMPTS times; the
+         last failure rolls back to the running version.
+      4. Runs `jacked install --force`.
+      5. Runs `jacked service start` (detached).
     cmd.exe is a system binary we don't own, so it survives whatever uv
     does to the jacked venv. Same trick as `jacked upgrade` on Windows.
     """
@@ -1096,6 +1265,135 @@ def _tray_rollback_failed_label(
         + _FAILED_FILE_PATH + "\r\n"
         "exit /b 1\r\n"
     )
+
+
+def _tray_start_previous_service(port: int, failed_label: str) -> str:
+    """Return batch lines that start the service again and verify it.
+
+    The batch uses these lines on an abort path where nothing was installed,
+    or where the install did not change. A second start is safe: the port
+    guard makes it a no-op when a service already serves the port. When the
+    service does not answer, the batch jumps to ``failed_label``.
+    """
+    return (
+        "echo [%date% %time%] starting the previous service again\r\n"
+        'start "" /B jacked service start\r\n'
+        + _verify_service_block(port)
+        + goto_on_failure(failed_label)
+    )
+
+
+def _tray_release_failed_block(
+    port: int, to_version: str, drift_guard: str
+) -> str:
+    """Return the tray batch tail for a release step that did not succeed.
+
+    The batch reaches ``:release_failed`` before the package step, so nothing
+    was installed. The old tray stopped itself before the batch started, so
+    the batch starts the previous service again for every non-zero exit. The
+    port guard makes that start a no-op when a different service still runs.
+    """
+    return (
+        ":release_failed\r\n"
+        'jacked _update_status waiting_for_parent failed --error "the old '
+        'service did not release the install" --recovery "jacked service '
+        'start"\r\n'
+        + drift_guard
+        + "echo [%date% %time%] ERROR: the old service did not release the "
+        "install; the package step did not run\r\n"
+        + _tray_start_previous_service(port, "release_restart_failed")
+        + "echo Jacked tray update to v" + to_version + " stopped before the "
+        "package step: the old service did not release the install. Nothing "
+        "was installed, and the previous service is running again. See "
+        "%LOGFILE%. > " + _FAILED_FILE_PATH + "\r\n"
+        "echo Recovery: close every jacked process, then update again from "
+        "the tray. >> " + _FAILED_FILE_PATH + "\r\n"
+        "exit /b 1\r\n"
+        ":release_restart_failed\r\n"
+        "echo [%date% %time%] ERROR: the previous service did not start "
+        "again\r\n"
+        "echo Jacked tray update to v" + to_version + " stopped before the "
+        "package step, and the service start step failed. Nothing was "
+        "installed. See %LOGFILE%. > " + _FAILED_FILE_PATH + "\r\n"
+        "echo Run this first: jacked service start >> " + _FAILED_FILE_PATH
+        + "\r\n"
+        "exit /b 1\r\n"
+    )
+
+
+def _tray_package_failed_block(
+    *, port: int, label: str, drift_guard: str, has_rollback: bool
+) -> str:
+    """Return the tray batch tail for a package step that failed every attempt.
+
+    With a rollback command, the block goes to the shared rollback, which
+    reinstalls the previous version, migrates its settings, and starts and
+    verifies its service. Without one, the block tries to start the previous
+    service (the failed step can leave the install unchanged) and writes a
+    failure message that does not claim a rollback.
+    """
+    block = (
+        ":package_failed\r\n"
+        'jacked _update_status installing_package failed --error "'
+        + PACKAGE_FAILED_REASON + '" --recovery "' + label + '"\r\n'
+        + drift_guard
+        + "echo [%date% %time%] ERROR: " + PACKAGE_FAILED_REASON + "\r\n"
+        "set FAILREASON=" + PACKAGE_FAILED_REASON + "\r\n"
+    )
+    if has_rollback:
+        return block + "goto rollback_now\r\n"
+    return (
+        block
+        + "echo [%date% %time%] no rollback command is available\r\n"
+        + _tray_start_previous_service(port, "package_restart_failed")
+        + "echo Jacked tray update failed (%FAILREASON%), and no rollback "
+        "command is available. The previous service is running again. See "
+        "%LOGFILE%. > " + _FAILED_FILE_PATH + "\r\n"
+        "echo Recovery: " + label + " ^&^& jacked install --force ^&^& "
+        "jacked service start >> " + _FAILED_FILE_PATH + "\r\n"
+        "exit /b 1\r\n"
+        ":package_restart_failed\r\n"
+        "echo [%date% %time%] ERROR: the previous service did not start "
+        "again\r\n"
+        "echo Jacked tray update failed (%FAILREASON%), no rollback command "
+        "is available, and the service start step failed. The install can be "
+        "incomplete. See %LOGFILE%. > " + _FAILED_FILE_PATH + "\r\n"
+        "echo Run this first: " + label + " >> " + _FAILED_FILE_PATH + "\r\n"
+        "echo Then: jacked install --force ^&^& jacked service start >> "
+        + _FAILED_FILE_PATH + "\r\n"
+        "exit /b 1\r\n"
+    )
+
+
+def _tray_wait_process(parent_pid: int) -> str:
+    """Return the ``--wait-process`` value for the tray process, or "".
+
+    The tray is the service process, and it deletes its manifest before its
+    interpreter exits. The release step must therefore wait for the tray
+    process itself, by its creation identity, so that a reused PID cannot
+    look like the tray. When the identity cannot be read, or cannot go
+    safely into a batch line, return "": the release step then still waits
+    until the service port is free.
+
+    Only Windows runs this batch, and only the Windows identity
+    (``windows-filetime:<ticks>``) is safe in a batch line. On other
+    platforms the function returns "" and starts no probe process.
+    """
+    if sys.platform != "win32":
+        return ""
+    from jacked.service.install_release import format_wait_process
+    from jacked.service.instance import process_identity
+
+    try:
+        identity = process_identity(parent_pid)
+        return format_wait_process(identity.pid, identity.creation_id)
+    except Exception as exc:  # noqa: BLE001 - the port check still applies
+        logger.warning(
+            "Tray updater: the tray process identity is not available (%s); "
+            "the release step checks only the port",
+            type(exc).__name__,
+        )
+        return ""
 
 
 def _spawn_windows_tray_updater(
@@ -1152,6 +1450,9 @@ def _spawn_windows_tray_updater(
     label_for_batch = label.replace('"', "'")
     upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
     to_version = safe_version_label(target_version or "next", fallback="next")
+    # Read the tray's creation identity NOW, while the tray is alive: the
+    # release step waits for this exact process to exit.
+    wait_process = _tray_wait_process(parent_pid)
     # Validate the running version ONCE, before any batch line is built, and
     # use the validated label everywhere below - including the status-init line
     # and every echo. A version that fails the check must never reach cmd.exe.
@@ -1207,12 +1508,14 @@ def _spawn_windows_tray_updater(
     # Bare output is correct here: it lands on cmd's stdout, which IS the log.
     # %LOGFILE% survives only as text inside the recovery-file messages, and the
     # recovery file itself is a DIFFERENT path that nothing else holds open.
+    # An exact compare, so a crashed shim (a negative exit) is logged too.
     DRIFT_GUARD = (
-        "if errorlevel 1 (\r\n"
+        'if not "%ERRORLEVEL%"=="0" (\r\n'
         "    echo [%date% %time%] WARN: _update_status shim returned non-zero (continuing)\r\n"
         ")\r\n"
     )
-    # Rollback path. Reached only by `goto`, from a refused preflight or from a
+    # Rollback path. Reached only by `goto`, from a package step that failed
+    # every attempt, a refused preflight, a failed settings migration, or a
     # new service that never bound the port. Flat lines only: nesting
     # parentheses inside a parenthesised block is a cmd.exe parsing trap.
     _FAILED_FILE = '"%USERPROFILE%\\.claude\\jacked-update-failed.txt"'
@@ -1220,8 +1523,17 @@ def _spawn_windows_tray_updater(
     # old tray is already gone, so returning here left the machine on a build
     # whose settings never migrated, with no service and no breadcrumb. Route
     # it into the shared rollback, naming its own step for the failed file.
+    package_failed_block = _tray_package_failed_block(
+        port=port,
+        label=label_for_batch,
+        drift_guard=DRIFT_GUARD,
+        has_rollback=bool(rollback_line),
+    )
     migrate_failed_block = (
-        ":preflight_failed\r\n"
+        # With a rollback command this is a short entry label that goes to
+        # :rollback_now; without one it is a full block in the tail.
+        (package_failed_block if rollback_line else "")
+        + ":preflight_failed\r\n"
         "echo [%date% %time%] ERROR: jacked service preflight failed for the "
         "new build\r\n"
         "set FAILREASON=the new build refused to provision its service "
@@ -1239,8 +1551,8 @@ def _spawn_windows_tray_updater(
     rollback_block = (
         migrate_failed_block
         + ":rollback_now\r\n"
-        "echo [%date% %time%] the new version cannot run; rolling back to v"
-        + current_version + "\r\n"
+        "echo [%date% %time%] the update cannot finish (%FAILREASON%); "
+        "rolling back to v" + current_version + "\r\n"
         "jacked _update_status rolling_back in_progress\r\n"
         + DRIFT_GUARD
     )
@@ -1250,13 +1562,13 @@ def _spawn_windows_tray_updater(
         # the phase ok before the restart claimed a restoration it had not made.
         rollback_block += (
             rollback_line + " 2>&1\r\n"
-            "if errorlevel 1 goto rollback_failed_package\r\n"
-            "jacked install --force 2>&1\r\n"
-            "if errorlevel 1 goto rollback_failed_install\r\n"
+            + goto_on_failure("rollback_failed_package")
+            + "jacked install --force 2>&1\r\n"
+            + goto_on_failure("rollback_failed_install")
             + 'start "" /B jacked service start\r\n'
             + _verify_service_block(port)
-            + "if errorlevel 1 goto rollback_failed_verify\r\n"
-            "jacked _update_status rolling_back ok\r\n"
+            + goto_on_failure("rollback_failed_verify")
+            + "jacked _update_status rolling_back ok\r\n"
             + DRIFT_GUARD
             + "echo Jacked tray update to v" + to_version
             + " failed (%FAILREASON%); rolled back to v" + current_version
@@ -1317,26 +1629,32 @@ def _spawn_windows_tray_updater(
         "jacked _update_status waiting_for_parent in_progress\r\n"
         + DRIFT_GUARD
         + wait_for_parent_block(parent_pid)
-        + "jacked _update_status waiting_for_parent ok\r\n"
+        + "echo [%date% %time%] parent exited; releasing the install\r\n"
+        # The parent is the tray, and the tray stops its own service before
+        # it exits. This step still proves, through the owned-instance
+        # manifest, the port, and the tray's own creation identity, that no
+        # service holds the tool venv: a service that is still alive locks
+        # venv files, and uv then deletes half the venv and stops with
+        # "Access is denied". The tray deletes its manifest before its
+        # interpreter exits, and the parent wait above gives up after 120 s,
+        # so the identity wait is what proves the tray is gone. Any non-zero
+        # exit goes to :release_failed, which starts the previous service
+        # again.
+        + release_install_line(port=port, wait_process=wait_process)
+        + "if errorlevel 1 goto release_failed\r\n"
+        # "if errorlevel 1" is "at least 1", so a negative NTSTATUS exit (a
+        # crash) passes it. No command runs between the release line and
+        # this line, so ERRORLEVEL is still the release command's.
+        + 'if not "%ERRORLEVEL%"=="0" goto release_failed\r\n'
+        "jacked _update_status waiting_for_parent ok\r\n"
         + DRIFT_GUARD
-        + "echo [%date% %time%] parent exited\r\n"
-        # Phase: installing_package
+        + "echo [%date% %time%] install released\r\n"
+        # Phase: installing_package. Retried, then rolled back: a failed
+        # attempt can already have deleted part of the venv.
         "jacked _update_status installing_package in_progress\r\n"
         + DRIFT_GUARD
-        + upgrade_line
-        + " 2>&1\r\n"
-        "if errorlevel 1 (\r\n"
-        '    jacked _update_status installing_package failed --error "upgrade command failed" --recovery "'
-        + label_for_batch
-        + '"\r\n'
-        "    echo [%date% %time%] ERROR: upgrade command failed\r\n"
-        '    echo Jacked tray update failed. See %LOGFILE%. > "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
-        "    echo Recovery: "
-        + label
-        + ' ^&^& jacked install --force >> "%USERPROFILE%\\.claude\\jacked-update-failed.txt"\r\n'
-        "    exit /b 1\r\n"
-        ")\r\n"
-        "jacked _update_status installing_package ok\r\n"
+        + package_retry_block(upgrade_line, "package_failed")
+        + "jacked _update_status installing_package ok\r\n"
         + DRIFT_GUARD
         +
         # Phase: preflight - the transaction gate. The new build must prove it
@@ -1344,16 +1662,16 @@ def _spawn_windows_tray_updater(
         "jacked _update_status preflight in_progress\r\n"
         + DRIFT_GUARD
         + "jacked service preflight --timeout 120 2>&1\r\n"
-        "if errorlevel 1 goto preflight_failed\r\n"
-        "jacked _update_status preflight ok\r\n"
+        + goto_on_failure("preflight_failed")
+        + "jacked _update_status preflight ok\r\n"
         + DRIFT_GUARD
         +
         # Phase: migrating_settings
         "jacked _update_status migrating_settings in_progress\r\n"
         + DRIFT_GUARD
         + "jacked install --force 2>&1\r\n"
-        "if errorlevel 1 goto migrate_failed\r\n"
-        "jacked _update_status migrating_settings ok\r\n"
+        + goto_on_failure("migrate_failed")
+        + "jacked _update_status migrating_settings ok\r\n"
         + DRIFT_GUARD
         +
         # Phase: waiting_port_free
@@ -1383,12 +1701,16 @@ def _spawn_windows_tray_updater(
         # powershell one-liner stuffed with parentheses, and burying it inside a
         # parenthesised block is exactly the kind of cmd.exe parsing trap that
         # produced this bug in the first place.
-        "if not errorlevel 1 goto verifyok\r\n"
+        # An exact compare, not "if not errorlevel 1": a crashed verify (a
+        # negative exit) is below 1 and would read as success.
+        'if "%ERRORLEVEL%"=="0" goto verifyok\r\n'
         "echo [%date% %time%] verify failed; retrying service start once\r\n"
         'start "" /B jacked service start\r\n'
         + _verify_service_block(port)
         + ":verifyok\r\n"
-        "if errorlevel 1 (\r\n"
+        # Neither a label nor a skipped line changes ERRORLEVEL, so this
+        # reads the exit code of the last verify that ran.
+        'if not "%ERRORLEVEL%"=="0" (\r\n'
         '    jacked _update_status verifying_service failed --error "service did not bind :'
         + str(port)
         + f' in {VERIFY_TIMEOUT_SECONDS:g}s" --recovery "jacked service start"\r\n'
@@ -1405,6 +1727,8 @@ def _spawn_windows_tray_updater(
         + "echo [%date% %time%] tray update complete\r\n"
         '(goto) 2>nul & del "%~f0"\r\n'
         + rollback_block
+        + ("" if rollback_line else package_failed_block)
+        + _tray_release_failed_block(port, to_version, DRIFT_GUARD)
     )
 
     fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-tray-update-")

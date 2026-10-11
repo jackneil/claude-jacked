@@ -1,6 +1,7 @@
 """Tests for the auto-updater."""
 
 import contextlib
+import http.client
 import itertools
 import json
 import os
@@ -1883,7 +1884,9 @@ def test_windows_batch_checks_errorlevel_after_status_writes(
                 candidate = lines[j].strip()
                 if not candidate:
                     continue
-                assert candidate.startswith("if errorlevel"), (
+                # The exact compare: a crashed shim exits with a negative
+                # code, which "if errorlevel 1" does not see.
+                assert candidate == 'if not "%ERRORLEVEL%"=="0" (', (
                     f"first line after `_update_status {phase} in_progress` "
                     f"is not an errorlevel guard — got: {candidate!r}"
                 )
@@ -2111,3 +2114,44 @@ class TestUpdaterLockFailsClosed:
         assert "del C:" not in body
         assert '"next"' in body
 
+
+
+class TestClassifyJackedListener:
+    """The three-way /api/health verdict that the install release uses."""
+
+    @pytest.mark.parametrize(
+        "error, verdict",
+        [
+            (TimeoutError("SECRET"), "unknown"),
+            (OSError("SECRET"), "unknown"),
+            (ConnectionRefusedError("SECRET"), "foreign"),
+            (ConnectionResetError("SECRET"), "foreign"),
+            (http.client.RemoteDisconnected("SECRET"), "foreign"),
+            (http.client.BadStatusLine("SECRET"), "foreign"),
+        ],
+        ids=["timeout", "other", "refused", "reset", "remote-closed", "not-http"],
+    )
+    def test_errors_map_to_a_verdict(self, error, verdict):
+        from jacked.service import updater
+
+        opener = MagicMock()
+        opener.open.side_effect = error
+        with patch("urllib.request.build_opener", return_value=opener):
+            got, reason = updater.classify_jacked_listener(8321, 2.0)
+        assert got == verdict
+        assert "SECRET" not in reason
+
+    def test_a_jacked_body_is_jacked_and_the_wrapper_agrees(self):
+        from jacked.service import updater
+
+        with _local_probes(health=JACKED_HEALTH):
+            assert updater.classify_jacked_listener(8321, 2.0)[0] == "jacked"
+            assert updater._identify_jacked_listener(8321, 2.0)[0] is True
+
+    def test_an_unknown_verdict_is_not_jacked_for_the_squatter_check(self):
+        from jacked.service import updater
+
+        opener = MagicMock()
+        opener.open.side_effect = TimeoutError()
+        with patch("urllib.request.build_opener", return_value=opener):
+            assert updater._identify_jacked_listener(8321, 2.0)[0] is False
