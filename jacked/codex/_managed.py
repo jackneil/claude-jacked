@@ -180,6 +180,23 @@ def ensure_chrome_devtools_mcp(
     # alongside ours would be a TOML duplicate-key error and never reach here.)
     begin_ct = _marker_line_count(text, _MCP_BEGIN)
     end_ct = _marker_line_count(text, _MCP_END)
+    if begin_ct == 0 and end_ct:
+        # Another tool (the Codex app re-serializes config.toml) dropped our
+        # BEGIN line and left a stray END comment. There is no block of ours
+        # to manage, so the normal rules apply: an existing chrome-devtools
+        # entry is left alone, and a write first removes the stray line (it
+        # is ours) so the next run does not find an END without its BEGIN.
+        logger.debug(
+            "Codex config.toml at %s has a stray jacked END marker without a "
+            "BEGIN marker; treating the file as unmarked",
+            cfg,
+        )
+        begin_ct = end_ct = 0
+        text = "".join(
+            line
+            for line in text.splitlines(keepends=True)
+            if line.strip() != _MCP_END
+        ).rstrip("\n")
     if begin_ct or end_ct:
         extracted = _extract_block(text, _MCP_BEGIN, _MCP_END)
         if extracted is None:

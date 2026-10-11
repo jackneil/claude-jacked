@@ -705,12 +705,101 @@ class TestUpgradeWindows:
             created.append(path)
             return fd, path
         monkeypatch.setattr(_tempfile, "mkstemp", fake_mkstemp)
+        from jacked.service import install_release as _ir
+
+        # The in-process --skip-service check finds the install free.
+        monkeypatch.setattr(
+            _ir,
+            "release_install",
+            lambda **_kw: _ir.ReleaseResult(_ir.EXIT_RELEASED, "free"),
+        )
 
         runner = CliRunner()
         runner.invoke(main, ["upgrade", "--skip-service"])
 
         batch = open(created[0]).read()
         assert "set SKIP_SERVICE=1" in batch
+
+    @patch("sys.platform", "win32")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.findbin.find_bin")
+    @patch("subprocess.Popen")
+    def test_windows_skip_service_refuses_at_once_when_a_service_runs(
+        self, mock_popen, mock_find, mock_method, monkeypatch,
+    ):
+        """With --skip-service, a live service is refused in THIS process.
+
+        The detached helper also refuses, but only its log shows that. The
+        user must see the refusal in the terminal, and no helper may start.
+        """
+        from jacked.cli import main
+        from jacked.service import install_release as _ir
+
+        mock_find.side_effect = lambda name: {"uv": r"C:\uv\uv.exe"}.get(name)
+        calls = []
+
+        def held(**kwargs):
+            calls.append(kwargs)
+            return _ir.ReleaseResult(
+                _ir.EXIT_NOT_STOPPED,
+                "The jacked service is running from this install. No process "
+                "was signalled. Stop the service first.",
+            )
+
+        monkeypatch.setattr(_ir, "release_install", held)
+        result = CliRunner().invoke(main, ["upgrade", "--skip-service"])
+
+        assert result.exit_code == _ir.EXIT_NOT_STOPPED, result.output
+        assert calls == [{"stop": False, "timeout": 0}]
+        assert "Upgrade refused" in result.output
+        assert "running from this install" in result.output
+        assert "--skip-service" in result.output
+        mock_popen.assert_not_called()
+
+    @patch("sys.platform", "win32")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.findbin.find_bin")
+    @patch("subprocess.Popen")
+    def test_windows_skip_service_refuses_when_the_owner_is_unknown(
+        self, mock_popen, mock_find, mock_method, monkeypatch,
+    ):
+        from jacked.cli import main
+        from jacked.service import install_release as _ir
+
+        mock_find.side_effect = lambda name: {"uv": r"C:\uv\uv.exe"}.get(name)
+
+        def broken(**_kwargs):
+            raise RuntimeError("secret detail")
+
+        monkeypatch.setattr(_ir, "release_install", broken)
+        result = CliRunner().invoke(main, ["upgrade", "--skip-service"])
+
+        assert result.exit_code == _ir.EXIT_NOT_STOPPED
+        assert "RuntimeError" in result.output
+        assert "secret detail" not in result.output
+        mock_popen.assert_not_called()
+
+    @patch("sys.platform", "win32")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.findbin.find_bin")
+    @patch("subprocess.Popen")
+    def test_windows_without_skip_service_does_not_precheck(
+        self, mock_popen, mock_find, mock_method, monkeypatch,
+    ):
+        """Without --skip-service the helper stops the service itself."""
+        from jacked.cli import main
+        from jacked.service import install_release as _ir
+
+        mock_find.side_effect = lambda name: {"uv": r"C:\uv\uv.exe"}.get(name)
+
+        def must_not_run(**_kwargs):
+            raise AssertionError("the precheck ran without --skip-service")
+
+        monkeypatch.setattr(_ir, "release_install", must_not_run)
+        result = CliRunner().invoke(main, ["upgrade"])
+
+        assert result.exit_code == 0, result.output
+        mock_popen.assert_called_once()
 
     @patch("sys.platform", "win32")
     @patch("jacked.install_method.detect_install_method", return_value="uv")
@@ -741,8 +830,10 @@ class TestUpgradeWindows:
         assert ":waitdone" in batch
         assert "GEQ 120" in batch
         assert "goto wait" in batch  # the loop itself still exists
-        # the old unbounded form is gone
-        assert "if not errorlevel 1" not in batch
+        # The old unbounded form is gone. Match the exact jump the spin loop
+        # used: the package retry loop has its own, bounded
+        # `if not errorlevel 1 goto package_done`.
+        assert "if not errorlevel 1 goto wait" not in batch
 
 
 class TestUpgradePreflightSubprocessGuards:

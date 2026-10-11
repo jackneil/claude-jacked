@@ -436,17 +436,21 @@ The command provisions the service contract and prints the runtime path, the run
 
 ### Options
 
-- `jacked upgrade --skip-service` - just swap the package and migrate settings, don't restart the running service. The preflight gate still runs, and a refusal still rolls back.
+- `jacked upgrade --skip-service` - just swap the package and migrate settings, don't restart the running service. The preflight gate still runs, and a refusal still rolls back. On Windows, a running service locks the install, so the helper refuses to install while the service runs. Stop the service first, or upgrade without `--skip-service`.
 - `jacked upgrade --no-rollback` - keep the new version installed even when its preflight or its restart fails. Use this only to debug a bad build.
 
 ### Cross-platform notes
 
 - **macOS/Linux:** runs inline. Your terminal shows live output from each step.
-- **Windows:** spawns a detached `cmd.exe` helper and exits immediately. Windows can't overwrite a running `.exe`, so this process has to step out of the way before `uv tool install` replaces `jacked.exe`. The helper waits for this process to exit, then runs the four steps with output appended to `~/.claude/jacked-update.log`. The helper also carries the rollback: it pins the previous version itself, so a refused preflight is undone without the original process. You can `type %USERPROFILE%\.claude\jacked-update.log` to follow along.
+- **Windows:** spawns a detached `cmd.exe` helper and exits immediately. Windows can't overwrite a running `.exe`, so this process has to step out of the way before `uv tool install` replaces `jacked.exe`. The helper waits for this process to exit. Then it runs five steps: it releases the install, and then it runs the four steps above. The helper appends its output to `~/.claude/jacked-update.log`.
+
+  Before the package step, the helper runs `jacked _release_install` with the old version. A running service locks files in the tool environment, and `uv tool install --force` then stops with "Access is denied" after it removes part of that environment. The command stops the service through its authenticated control channel. Then it waits up to 60 seconds until the service process exits and no jacked service uses the port. If the service has no instance record, the command still waits until no jacked service uses the port. When a program uses the port, the command asks that program for its `/api/health` answer. A program that is clearly not jacked does not stop the upgrade, and the log says that a different program uses the port. A program that does not give a clear answer counts as a jacked service, so the command waits. If the service does not stop, the helper installs nothing. It restarts the service only when it stopped that service.
+
+  The helper runs the package step up to three times, with a pause of about three seconds between attempts. A short file lock (for example, the Claude Code statusline, which runs from the tool environment) does not stop the upgrade. If all three attempts fail, the helper rolls back to the previous version. The helper pins the previous version itself, so it can roll back without the original process. You can `type %USERPROFILE%\.claude\jacked-update.log` to follow along.
 
 ### Tray upgrades
 
-If you're running the background service, you can also click **Update to vX.Y.Z ->** in the tray menu when a newer version is available on PyPI. Same four-step sequence, fully detached - survives its own binary being replaced mid-update. The progress page shows a **Checking the new version can start** step, and adds a **Rolling back to the previous version** step only if the update has to undo itself.
+If you're running the background service, you can also click **Update to vX.Y.Z ->** in the tray menu when a newer version is available on PyPI. The tray uses the same steps as `jacked upgrade`, and it runs fully detached, so it survives when its own binary is replaced during the update. On Windows, the tray helper also releases the install first and retries the package step, as described above. The release step also waits until the old tray process exits, because the tray removes its instance record before the process ends. If the old service does not release the install, the helper installs nothing and starts the previous service again. The progress page shows a **Checking the new version can start** step, and adds a **Rolling back to the previous version** step only if the update has to undo itself.
 
 ### What changed in this update
 

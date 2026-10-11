@@ -1099,3 +1099,43 @@ def test_registry_source_rejects_trailing_newline(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         reg = packs.load_registry(tmp_path)
     assert set(reg) == {"good"}
+
+
+# --- Windows untrusted junctions (WinError 448), seen live 2026-10-10 --------
+
+
+def test_skill_installed_survives_an_untrusted_junction(tmp_path, monkeypatch, caplog):
+    import logging
+    from pathlib import Path as _P
+
+    from jacked import packs as _packs
+
+    link = tmp_path / ".claude" / "skills" / "improve-animations"
+    link.mkdir(parents=True)
+    real_exists = _P.exists
+
+    def refusing_exists(self, *args, **kwargs):
+        if self.name == "SKILL.md":
+            raise OSError(448, "The path cannot be traversed because it contains an untrusted mount point")
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(_P, "exists", refusing_exists)
+    with caplog.at_level(logging.WARNING, logger="jacked.packs"):
+        assert _packs._skill_installed(tmp_path, "improve-animations") is True
+        assert _packs._skill_installed(tmp_path, "never-installed") is False
+    assert "could not be followed" in caplog.text
+
+
+def test_skill_present_never_follows_the_link(tmp_path, monkeypatch):
+    from pathlib import Path as _P
+
+    from jacked import packs as _packs
+
+    (tmp_path / ".claude" / "skills" / "x").mkdir(parents=True)
+
+    def boom(self, *args, **kwargs):
+        raise OSError(448, "untrusted mount point")
+
+    monkeypatch.setattr(_P, "exists", boom)
+    assert _packs._skill_present(tmp_path, "x") is True
+    assert _packs._skill_present(tmp_path, "y") is False

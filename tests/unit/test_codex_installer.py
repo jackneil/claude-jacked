@@ -1394,6 +1394,41 @@ def test_mcp_updates_changed_marked_block(homes):
     assert text.count(ins._MCP_BEGIN) == 1
 
 
+def test_mcp_stray_end_marker_after_codex_rewrite_is_not_unparseable(homes):
+    """The Codex app re-serializes config.toml: it keeps the chrome-devtools
+    table, drops our BEGIN line and leaves the END comment at the bottom
+    (seen live on macOS and Windows, 2026-10-10). That is an unmarked entry,
+    not an unparseable file: it is left alone and reported as preexisting."""
+    home = _mkhome(homes)
+    cfg = _cfg(homes)
+    rewritten = (
+        'model = "gpt-5"\n\n'
+        "[mcp_servers.chrome-devtools]\n"
+        'command = "npx"\n'
+        'args = ["chrome-devtools-mcp@latest", "--autoConnect"]\n\n'
+        "[tui.model_availability_nux]\n"
+        '"gpt-5.5" = 4\n'
+        + ins._MCP_END + "\n"
+    )
+    cfg.write_bytes(rewritten.encode())
+
+    assert ins.ensure_chrome_devtools_mcp(home) == "preexisting"
+    assert cfg.read_bytes() == rewritten.encode()
+
+
+def test_mcp_stray_end_marker_without_an_entry_gets_a_fresh_block(homes):
+    home = _mkhome(homes)
+    cfg = _cfg(homes)
+    rewritten = 'model = "gpt-5"\n' + ins._MCP_END + "\n"
+    cfg.write_bytes(rewritten.encode())
+
+    assert ins.ensure_chrome_devtools_mcp(home) == "added"
+    data = tomllib.loads(cfg.read_text())
+    assert "chrome-devtools" in data["mcp_servers"]
+    # The next install must manage that block, not trip on the old stray END.
+    assert ins.ensure_chrome_devtools_mcp(home) == "unchanged"
+
+
 def test_mcp_unparseable_config_untouched(homes):
     """A config.toml tomllib can't parse is left byte-untouched; status is
     'skipped-unparseable' (never touch, never break the user's file)."""

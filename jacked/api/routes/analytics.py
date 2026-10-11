@@ -1,5 +1,14 @@
-"""Analytics routes — agents, hooks, lessons, usage dashboards."""
+"""Analytics routes — agents, hooks, lessons, usage dashboards.
 
+Every handler that reads or writes SQLite (the main jacked DB or the
+analytics DB) is a plain ``def``. FastAPI runs a plain ``def`` handler in its
+threadpool, so a slow query does not block the event loop. The event loop
+serves every route; one blocking query on it stops the whole service (the
+2026-10-10 Windows outage). Keep new DB handlers as plain ``def``, or run the
+DB call through ``asyncio.to_thread``.
+"""
+
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -68,7 +77,7 @@ def _db_unavailable():
 # --- Routes ---
 
 @router.get("/agents", response_model=AgentStats)
-async def agent_stats(request: Request, days: int = Query(default=7, ge=1, le=365)):
+def agent_stats(request: Request, days: int = Query(default=7, ge=1, le=365)):
     """Agent invocation stats -- spawn frequency, duration."""
     db = _get_db(request)
     if db is None:
@@ -113,7 +122,7 @@ async def agent_stats(request: Request, days: int = Query(default=7, ge=1, le=36
 
 
 @router.get("/hooks", response_model=HookStats)
-async def hook_stats(request: Request, days: int = Query(default=7, ge=1, le=365)):
+def hook_stats(request: Request, days: int = Query(default=7, ge=1, le=365)):
     """Hook execution stats -- success rate, avg duration."""
     db = _get_db(request)
     if db is None:
@@ -167,7 +176,7 @@ async def hook_stats(request: Request, days: int = Query(default=7, ge=1, le=365
 
 
 @router.get("/lessons", response_model=LessonStats)
-async def lesson_stats(request: Request, days: int = Query(default=7, ge=1, le=365)):
+def lesson_stats(request: Request, days: int = Query(default=7, ge=1, le=365)):
     """Lesson tracking stats -- active/graduated counts, top tags."""
     import json
 
@@ -222,7 +231,7 @@ async def lesson_stats(request: Request, days: int = Query(default=7, ge=1, le=3
 
 
 @router.get("/usage-overview")
-async def get_usage_overview(request: Request, days: int = Query(default=1, ge=1, le=365)):
+def get_usage_overview(request: Request, days: int = Query(default=1, ge=1, le=365)):
     """Overview: today's totals, cache health, project breakdown, active flags."""
     db = _get_analytics_db(request)
     if db is None:
@@ -234,7 +243,7 @@ async def get_usage_overview(request: Request, days: int = Query(default=1, ge=1
 
 
 @router.get("/usage-sessions")
-async def get_usage_sessions(
+def get_usage_sessions(
     request: Request,
     days: int = Query(default=1, ge=1, le=365),
     project: str = Query(default=None),
@@ -250,7 +259,7 @@ async def get_usage_sessions(
 
 
 @router.get("/usage-session-detail/{session_id}")
-async def get_usage_session_detail(request: Request, session_id: str):
+def get_usage_session_detail(request: Request, session_id: str):
     """Message-level detail for a single session."""
     db = _get_analytics_db(request)
     if db is None:
@@ -261,7 +270,7 @@ async def get_usage_session_detail(request: Request, session_id: str):
 
 
 @router.get("/usage-trends")
-async def get_usage_trends(request: Request, days: int = Query(default=7, ge=1, le=365)):
+def get_usage_trends(request: Request, days: int = Query(default=7, ge=1, le=365)):
     """Daily summaries for trends chart."""
     db = _get_analytics_db(request)
     if db is None:
@@ -272,7 +281,7 @@ async def get_usage_trends(request: Request, days: int = Query(default=7, ge=1, 
 
 
 @router.get("/usage-flags")
-async def get_usage_flags(request: Request):
+def get_usage_flags(request: Request):
     """Active anomaly flags."""
     db = _get_analytics_db(request)
     if db is None:
@@ -282,7 +291,7 @@ async def get_usage_flags(request: Request):
 
 
 @router.post("/usage-flag-dismiss/{flag_id}")
-async def dismiss_usage_flag(request: Request, flag_id: int):
+def dismiss_usage_flag(request: Request, flag_id: int):
     """Dismiss an anomaly flag."""
     db = _get_analytics_db(request)
     if db is None:
@@ -293,7 +302,7 @@ async def dismiss_usage_flag(request: Request, flag_id: int):
 
 
 @router.post("/usage-flag-snooze/{flag_type}")
-async def snooze_usage_flag_type(request: Request, flag_type: str, hours: int = Query(default=24)):
+def snooze_usage_flag_type(request: Request, flag_type: str, hours: int = Query(default=24)):
     """Snooze a flag type for N hours."""
     db = _get_analytics_db(request)
     if db is None:
@@ -305,7 +314,7 @@ async def snooze_usage_flag_type(request: Request, flag_type: str, hours: int = 
 
 
 @router.get("/usage-scan-status")
-async def get_usage_scan_status(request: Request):
+def get_usage_scan_status(request: Request):
     """Current scan status and DB info."""
     db = _get_analytics_db(request)
     if db is None:
@@ -335,9 +344,11 @@ async def update_usage_settings(request: Request):
     body = await request.json()
     purge_days = body.get("purge_days")
     if purge_days is not None:
+        # The handler stays async to await the body; the DB write runs in a
+        # worker thread so it does not block the event loop.
         if purge_days == 0 or purge_days is False:
-            db.set_setting("purge_days", None)
+            await asyncio.to_thread(db.set_setting, "purge_days", None)
         else:
-            db.set_setting("purge_days", str(int(purge_days)))
+            await asyncio.to_thread(db.set_setting, "purge_days", str(int(purge_days)))
 
     return {"updated": True}
