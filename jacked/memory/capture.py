@@ -57,6 +57,11 @@ _TRIAGE_TIMEOUT = 120
 # from stored metadata and dropped from the queue.
 _MAX_ATTEMPTS = 3
 
+# Flags that leave the triage session with no tool it could run and no MCP
+# server. `--tools ""` disables the built-in set; `--strict-mcp-config` with no
+# `--mcp-config` loads no MCP server. Structured output still works.
+_NO_TOOLS_ARGS = ("--tools", "", "--strict-mcp-config")
+
 _GIT_TIMEOUT = 15
 
 _ALLOWED_SEMANTIC_TYPES = ("decision", "convention", "vision", "reference")
@@ -460,7 +465,12 @@ def call_claude(
     ARG_MAX as an argv).
     """
     claude_bin = find_bin("claude") or "claude"
-    argv = [claude_bin, "-p", "--model", model]
+    # NO TOOLS, NO MCP. The prompt is a transcript, and DATA_FRAMING alone does
+    # not hold: a pre-compaction excerpt ends in "continue the task" text, and a
+    # tool-enabled triage session obeyed it (it killed a running gate and
+    # started its own in the user's worktree, 2026-10-12). Triage only writes
+    # JSON, so it gets nothing it could act with.
+    argv = [claude_bin, "-p", "--model", model, *_NO_TOOLS_ARGS]
     if schema is not None:
         argv += ["--output-format", "json", "--json-schema", json.dumps(schema)]
     try:

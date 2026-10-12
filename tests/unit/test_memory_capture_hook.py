@@ -465,6 +465,24 @@ def test_call_claude_nonzero_exit_returns_distinct_cause(env):
     assert cause == "claude exited 3"
 
 
+def test_call_claude_gives_the_triage_session_no_tools(env):
+    """The transcript is untrusted text. The triage session must have no tool
+    and no MCP server, with and without a schema, so that an instruction in the
+    transcript cannot run a command."""
+    class _P:
+        returncode = 0
+        stdout = "{}"
+    for schema in (None, capture.TRIAGE_SCHEMA):
+        with patch("subprocess.run", return_value=_P()) as run:
+            capture.call_claude("prompt", "haiku", schema=schema)
+        argv = run.call_args.args[0]
+        at = argv.index("--tools")
+        assert argv[at + 1] == ""
+        assert "--strict-mcp-config" in argv
+        assert "--mcp-config" not in argv
+        assert "--dangerously-skip-permissions" not in argv
+
+
 def test_call_claude_returns_stdout_and_no_cause_on_success(env):
     class _P:
         returncode = 0
