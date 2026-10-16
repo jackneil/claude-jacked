@@ -152,7 +152,8 @@ write is sent as hex when that command line fits the tool's 4095-byte stdin
 limit, then as escaped JSON with `-w` when that form fits. Otherwise the write
 passes the hex payload as a process argument and warns once per process. Claude
 Code writes the same item this way, and the item grows with the OAuth tokens of
-each MCP server (`mcpOAuth`). Set `JACKED_KEYCHAIN_ARGV_FALLBACK=0` to refuse
+each MCP server (`mcpOAuth`). Set `JACKED_KEYCHAIN_ARGV_FALLBACK` to `0`, `false`,
+`no` or `off` to refuse
 the argument write. That refusal stops every account switch on a large item. Reads decode the
 tool's hex output. Background calls are guarded by a prompt-free lock-status probe, a 2 s
 subprocess timeout (the child is killed on expiry), and a 10 minute cooling

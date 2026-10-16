@@ -322,7 +322,8 @@ def test_security_cli_oversized_payload_uses_argv_by_default(monkeypatch, caplog
     assert caplog.text.count("process argument") == 1  # warned once per process
 
 
-def test_security_cli_oversized_payload_refused_when_argv_opted_out(monkeypatch) -> None:
+@pytest.mark.parametrize("value", ["0", "false", "No", " OFF "])
+def test_security_cli_oversized_payload_refused_when_argv_opted_out(monkeypatch, value) -> None:
     calls = []
 
     def run(args, **kwargs):
@@ -330,7 +331,7 @@ def test_security_cli_oversized_payload_refused_when_argv_opted_out(monkeypatch)
         return _completed(0)
 
     huge = b'{"a":"' + b"x" * 5000 + b'"}'
-    monkeypatch.setenv("JACKED_KEYCHAIN_ARGV_FALLBACK", "0")
+    monkeypatch.setenv("JACKED_KEYCHAIN_ARGV_FALLBACK", value)
     status, reason = SecurityCliBackend(run=run).update(
         service="s", account="a", data=huge, is_interactive=True
     )

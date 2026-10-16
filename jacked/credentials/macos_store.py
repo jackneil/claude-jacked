@@ -120,6 +120,27 @@ def _ascii_json(data: bytes) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
+_ARGV_FALLBACK_REFUSALS = frozenset({"0", "false", "no", "off"})
+
+
+def _argv_fallback_refused() -> bool:
+    """True when JACKED_KEYCHAIN_ARGV_FALLBACK names any common "off" spelling.
+
+    >>> import os
+    >>> os.environ["JACKED_KEYCHAIN_ARGV_FALLBACK"] = " False "
+    >>> _argv_fallback_refused()
+    True
+    >>> os.environ["JACKED_KEYCHAIN_ARGV_FALLBACK"] = "1"
+    >>> _argv_fallback_refused()
+    False
+    >>> del os.environ["JACKED_KEYCHAIN_ARGV_FALLBACK"]
+    >>> _argv_fallback_refused()
+    False
+    """
+    value = os.environ.get("JACKED_KEYCHAIN_ARGV_FALLBACK", "")
+    return value.strip().lower() in _ARGV_FALLBACK_REFUSALS
+
+
 _argv_fallback_warned = False
 
 
@@ -263,7 +284,7 @@ class SecurityCliBackend:
             return StoreStatus.ERROR, "Keychain locator part contains unquotable characters"
         if len(command) <= SECURITY_STDIN_MAX_LINE:
             args, stdin = ["-i"], command
-        elif os.environ.get("JACKED_KEYCHAIN_ARGV_FALLBACK") != "0":
+        elif not _argv_fallback_refused():
             # argv is briefly visible to same-user processes and endpoint
             # agents. Claude Code writes this same item through argv, with no
             # opt-in, whenever its payload passes the stdin limit, and the item
