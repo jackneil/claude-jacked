@@ -301,7 +301,7 @@ def test_security_cli_medium_payload_uses_escaped_json_on_stdin() -> None:
     assert medium.hex().encode() not in line
 
 
-def test_security_cli_oversized_payload_fails_closed_unless_argv_opt_in(monkeypatch, caplog) -> None:
+def test_security_cli_oversized_payload_uses_argv_by_default(monkeypatch, caplog) -> None:
     calls = []
 
     def run(args, **kwargs):
@@ -312,26 +312,39 @@ def test_security_cli_oversized_payload_fails_closed_unless_argv_opt_in(monkeypa
     huge = b'{"a":"' + b"x" * 5000 + b'"}'
 
     monkeypatch.delenv("JACKED_KEYCHAIN_ARGV_FALLBACK", raising=False)
-    status, reason = backend.update(service="s", account="a", data=huge, is_interactive=True)
-    assert status is StoreStatus.UNUSABLE
-    assert "stdin line limit" in reason and "5008 bytes" in reason
-    assert calls == []
-
-    monkeypatch.setenv("JACKED_KEYCHAIN_ARGV_FALLBACK", "1")
     with caplog.at_level("WARNING"):
         status, _ = backend.update(service="s", account="a", data=huge, is_interactive=True)
         backend.update(service="s", account="a", data=huge, is_interactive=True)
     assert status is StoreStatus.OK
     assert calls[0][0][:3] == ["/usr/bin/security", "add-generic-password", "-U"]
+    assert calls[0][0][-1] == huge.hex()
     assert "input" not in calls[0][1]
     assert caplog.text.count("process argument") == 1  # warned once per process
+
+
+def test_security_cli_oversized_payload_refused_when_argv_opted_out(monkeypatch) -> None:
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return _completed(0)
+
+    huge = b'{"a":"' + b"x" * 5000 + b'"}'
+    monkeypatch.setenv("JACKED_KEYCHAIN_ARGV_FALLBACK", "0")
+    status, reason = SecurityCliBackend(run=run).update(
+        service="s", account="a", data=huge, is_interactive=True
+    )
+    assert status is StoreStatus.UNUSABLE
+    assert "stdin line limit" in reason and "5008 bytes" in reason
+    assert huge.hex() not in reason
+    assert calls == []
 
 
 def test_security_cli_timeout_on_argv_path_never_exposes_the_command(monkeypatch, caplog) -> None:
     def run(args, **kwargs):
         raise subprocess.TimeoutExpired(args, kwargs["timeout"])
 
-    monkeypatch.setenv("JACKED_KEYCHAIN_ARGV_FALLBACK", "1")
+    monkeypatch.delenv("JACKED_KEYCHAIN_ARGV_FALLBACK", raising=False)
     huge = b'{"a":"' + b"x" * 5000 + b'"}'
     with caplog.at_level("DEBUG"):
         status, reason = SecurityCliBackend(run=run).update(

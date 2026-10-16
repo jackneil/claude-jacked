@@ -501,10 +501,9 @@ def write_platform_credentials(data: dict) -> bool:
     macOS: a Keychain generic-password entry written through the signed
     /usr/bin/security tool, addressed by the full service/account locator.
     Bytes are handed to the tool on stdin. A payload too large for the tool's
-    stdin line limit is refused unless the explicit
-    JACKED_KEYCHAIN_ARGV_FALLBACK=1 opt-in is set, and under that opt-in the
-    bytes do appear in a subprocess argument, briefly readable by other local
-    processes.
+    stdin line limit goes in a subprocess argument instead, the same way
+    Claude Code writes this item, so the bytes are briefly visible to other
+    local processes. JACKED_KEYCHAIN_ARGV_FALLBACK=0 refuses that write.
 
     Linux/Windows: no-op (they use .credentials.json)
 
