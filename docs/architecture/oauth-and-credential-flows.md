@@ -520,18 +520,24 @@ row only when it can prove the owner:
 
 - A live access or refresh token that the row already holds proves the owner,
   with no network request.
-- Any other live token is identified once through the OAuth profile endpoint,
+- Any other live token is identified through the OAuth profile endpoint,
   with the shared owner rule `profile_owner_mismatch()`. The email must match
   the row, and so must the organization uuid and the account uuid when both
-  sides record them. A profile that names another owner stops the import.
-- When the profile cannot decide (an expired or rejected token, a failed
-  request, or a call from an event-loop thread), the `oauthAccount` identity
-  in `~/.claude.json` decides. Claude Code rewrites that block on `/login` to
-  another account and does not change it on a token refresh. So a rotation
-  that expired while the computer slept is still kept, and a token from a
-  `/login` to another account is not imported.
-- When neither source proves the owner, reconcile imports nothing. The async
-  callers, and the dashboard account list, run reconcile in a worker thread.
+  sides record them. The verdict is cached for each token, and a failed
+  request is retried after 5 minutes.
+- Nothing else is proof. The stamp survives Claude Code's writes, and jacked
+  rewrites the `~/.claude.json` identity on every switch, so neither names the
+  owner of the tokens.
+- An expired token, a failed request, or a call from an event-loop thread
+  proves nothing, so reconcile imports nothing. The async callers, and the
+  dashboard account list, run reconcile in a worker thread.
+- Reconcile never imports a payload that expires before the tokens the row
+  already holds.
+
+One case still loses a refresh lineage. Claude Code rotates the token, and the
+access token expires before any reconcile pass sees it (for example, the
+computer sleeps). A switch then overwrites the item. Reconcile logs a warning
+when it refuses a payload whose refresh token jacked does not hold (#154).
 
 The guard never raises. Each failure is logged and reported as a skipped heal.
 The observer publishes the repair as snapshot evidence, for example

@@ -399,13 +399,6 @@ def _ownership_lookup(access_token: str):
     return lookup_profile(access_token)
 
 
-def _config_identity() -> dict | None:
-    """Return the ``oauthAccount`` block of ~/.claude.json (test seam)."""
-    from jacked.api.claude_config_store import read_config_identity
-
-    return read_config_identity(Path.home())
-
-
 def _owner_mismatch(account: dict, profile) -> str | None:
     from jacked.api.claude_identity import profile_owner_mismatch
 
@@ -417,91 +410,94 @@ def _owner_mismatch(account: dict, profile) -> str | None:
     )
 
 
+# Profile verdicts by (account id, sha256 of the access token). A settled
+# verdict (proven, or another owner) is kept for the token's life; a failed
+# request is retried after _OWNERSHIP_RETRY_SECONDS. Without the cache every
+# dashboard poll would send a profile request for a rejected foreign token.
+_OWNERSHIP_RETRY_SECONDS = 300.0
+_OWNERSHIP_CACHE_LIMIT = 64
+_ownership_cache: dict[tuple, tuple[bool | None, float]] = {}
+
+
+def clear_ownership_cache() -> None:
+    """Forget every cached ownership verdict (tests and account changes)."""
+    _ownership_cache.clear()
+
+
 def _live_tokens_belong_to(
     account: dict, live_access: str, live_refresh: str | None, live_expires
 ) -> bool:
     """True when the live tokens provably belong to ``account``.
 
-    The checks run in order, and the first that decides wins:
+    A token the row already holds proves ownership with no network call.
+    Any other token is identified through the OAuth profile endpoint with the
+    shared owner rule. Nothing else counts as proof: the stamp survives Claude
+    Code's own writes, and jacked itself rewrites ~/.claude.json on every
+    switch, so neither one names the token's owner.
 
-    1. A token the row already holds proves ownership with no network call.
-    2. The OAuth profile endpoint identifies a live, unexpired token. A
-       profile that names another owner rejects the import, whatever comes
-       after. The request is skipped on an event-loop thread, because it can
-       block for the full request timeout.
-    3. When the profile cannot decide (an expired or rejected token, a failed
-       request, or an event-loop caller), the ``oauthAccount`` identity in
-       ~/.claude.json decides. Claude Code rewrites that block on ``/login``
-       to another account and leaves it alone on a token refresh, so it tells
-       a rotation of this account from a login to another one without a
-       request.
-
-    Every case that nothing proves returns False, so the caller imports
-    nothing.
+    An expired token, a failed request, or a call on an event-loop thread
+    proves nothing, and the result is False, so the caller imports nothing.
 
     >>> row = {"cc_access_token": "a1", "cc_refresh_token": "r1"}
     >>> _live_tokens_belong_to(row, "a1", "r9", None)
     True
     >>> _live_tokens_belong_to(row, "a9", "r1", None)
     True
+    >>> _live_tokens_belong_to(row, "a9", "r9", 1)  # expired, cannot prove
+    False
     """
     if live_access == account.get("cc_access_token"):
         return True
     if live_refresh and live_refresh == account.get("cc_refresh_token"):
         return True
-
-    expired = False
     if live_expires:
         expires_s = live_expires / 1000 if live_expires > 1e12 else live_expires
-        expired = expires_s <= time.time()
-    on_loop = True
+        if expires_s <= time.time():
+            return False
     try:
         import asyncio
 
         asyncio.get_running_loop()
     except RuntimeError:
-        on_loop = False
+        pass
+    else:
+        logger.warning(
+            "Account %s: credential ownership check skipped on the event loop",
+            account.get("id"),
+        )
+        return False
 
-    if not expired and not on_loop:
-        result = _ownership_lookup(live_access)
-        if result.status_code == 200 and isinstance(result.profile, dict):
-            field = _owner_mismatch(account, result.profile)
-            if field is None:
-                return True
+    import hashlib
+
+    key = (account.get("id"), hashlib.sha256(live_access.encode("utf-8")).hexdigest())
+    now = time.time()
+    cached = _ownership_cache.get(key)
+    if cached is not None:
+        verdict, at = cached
+        if verdict is not None or now - at < _OWNERSHIP_RETRY_SECONDS:
+            return bool(verdict)
+
+    result = _ownership_lookup(live_access)
+    if result.status_code == 200 and isinstance(result.profile, dict):
+        field = _owner_mismatch(account, result.profile)
+        verdict = field is None
+        if not verdict:
             logger.warning(
                 "Account %s: live token profile names another owner (%s)",
                 account.get("id"),
                 field,
             )
-            return False
+    else:
+        verdict = None
         logger.info(
-            "Account %s: credential ownership lookup returned %s; "
-            "checking the Claude config identity",
+            "Account %s: credential ownership lookup returned %s",
             account.get("id"),
             result.status_code,
         )
-
-    block = _config_identity()
-    if not isinstance(block, dict):
-        return False
-    field = _owner_mismatch(
-        account,
-        {
-            "account": {
-                "email": block.get("emailAddress"),
-                "uuid": block.get("accountUuid"),
-            },
-            "organization": {"uuid": block.get("organizationUuid")},
-        },
-    )
-    if field is not None:
-        logger.warning(
-            "Account %s: Claude config identity names another owner (%s)",
-            account.get("id"),
-            field,
-        )
-        return False
-    return True
+    _ownership_cache[key] = (verdict, now)
+    while len(_ownership_cache) > _OWNERSHIP_CACHE_LIMIT:
+        _ownership_cache.pop(next(iter(_ownership_cache)))
+    return bool(verdict)
 
 
 def reconcile_credentials_from_live_store(account_id: int, db) -> None:
@@ -563,10 +559,29 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
     if not _live_tokens_belong_to(account, live_access, live_refresh, live_expires):
         logger.warning(
             "Account %d: live credentials carry its stamp but ownership is not "
-            "proven; not importing them",
+            "proven; not importing them%s",
             account_id,
+            (
+                " (their refresh token is not one jacked holds, and a switch "
+                "would overwrite it)"
+                if live_refresh and live_refresh != account.get("cc_refresh_token")
+                else ""
+            ),
         )
         return
+
+    # Never move a row backward: a stale payload (for example the file mirror
+    # read after a failed Keychain read) must not replace newer tokens.
+    row_expires = account.get("cc_expires_at") or 0
+    if live_expires and row_expires:
+        live_expires_s = int(live_expires / 1000) if live_expires > 1e12 else int(live_expires)
+        if live_expires_s < row_expires:
+            logger.info(
+                "Account %d: live credentials are older than the stored ones; "
+                "not importing them",
+                account_id,
+            )
+            return
 
     db_cc_refresh = account.get("cc_refresh_token")
 
