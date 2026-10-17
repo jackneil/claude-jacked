@@ -395,12 +395,12 @@ def _no_reconcile_ownership_network():
     """
     from jacked.api.authority_guard import ProfileLookup
 
+    from jacked.api.credential_helpers import clear_ownership_cache
+
+    clear_ownership_cache()
     with patch(
         "jacked.api.credential_helpers._ownership_lookup",
         return_value=ProfileLookup(None),
-    ), patch(
-        # The offline fallback reads ~/.claude.json; never the developer's own.
-        "jacked.api.credential_helpers._config_identity",
-        return_value=None,
     ):
         yield
+    clear_ownership_cache()
