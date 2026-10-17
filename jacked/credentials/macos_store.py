@@ -120,6 +120,27 @@ def _ascii_json(data: bytes) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
+_ARGV_FALLBACK_REFUSALS = frozenset({"0", "false", "no", "off"})
+
+
+def _argv_fallback_refused() -> bool:
+    """True when JACKED_KEYCHAIN_ARGV_FALLBACK names any common "off" spelling.
+
+    >>> import os
+    >>> os.environ["JACKED_KEYCHAIN_ARGV_FALLBACK"] = " False "
+    >>> _argv_fallback_refused()
+    True
+    >>> os.environ["JACKED_KEYCHAIN_ARGV_FALLBACK"] = "1"
+    >>> _argv_fallback_refused()
+    False
+    >>> del os.environ["JACKED_KEYCHAIN_ARGV_FALLBACK"]
+    >>> _argv_fallback_refused()
+    False
+    """
+    value = os.environ.get("JACKED_KEYCHAIN_ARGV_FALLBACK", "")
+    return value.strip().lower() in _ARGV_FALLBACK_REFUSALS
+
+
 _argv_fallback_warned = False
 
 
@@ -129,7 +150,7 @@ def _warn_argv_fallback_once() -> None:
         _argv_fallback_warned = True
         logger.warning(
             "Keychain payload exceeds the security stdin line limit; "
-            "passing it as a process argument (JACKED_KEYCHAIN_ARGV_FALLBACK=1)"
+            "passing it as a process argument (set JACKED_KEYCHAIN_ARGV_FALLBACK=0 to refuse)"
         )
 
 
@@ -263,9 +284,14 @@ class SecurityCliBackend:
             return StoreStatus.ERROR, "Keychain locator part contains unquotable characters"
         if len(command) <= SECURITY_STDIN_MAX_LINE:
             args, stdin = ["-i"], command
-        elif os.environ.get("JACKED_KEYCHAIN_ARGV_FALLBACK") == "1":
-            # argv is readable by other local users through setuid ps and by
-            # endpoint agents, so it is opt-in only.
+        elif not _argv_fallback_refused():
+            # argv is briefly visible to same-user processes and endpoint
+            # agents. Claude Code writes this same item through argv, with no
+            # opt-in, whenever its payload passes the stdin limit, and the item
+            # grows with every MCP server's OAuth tokens (mcpOAuth). Refusing
+            # here protects nothing Claude Code does not already expose and
+            # breaks every account switch, so argv is the default and
+            # JACKED_KEYCHAIN_ARGV_FALLBACK=0 is the opt-out.
             _warn_argv_fallback_once()
             args = ["add-generic-password", "-U", "-a", account, "-s", service, "-X", data.hex()]
             stdin = None
@@ -273,8 +299,8 @@ class SecurityCliBackend:
             return (
                 StoreStatus.UNUSABLE,
                 f"Keychain payload of {len(data)} bytes exceeds the security tool's "
-                f"{SECURITY_STDIN_MAX_LINE}-byte stdin line limit; set "
-                "JACKED_KEYCHAIN_ARGV_FALLBACK=1 to allow a process-argument write",
+                f"{SECURITY_STDIN_MAX_LINE}-byte stdin line limit and "
+                "JACKED_KEYCHAIN_ARGV_FALLBACK=0 refuses a process-argument write",
             )
         try:
             completed = self._invoke(args, is_interactive=is_interactive, stdin=stdin)
