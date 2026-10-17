@@ -147,7 +147,7 @@ def client(app):
 def test_use_account_success(client, app, tmp_path):
     """Activating a valid account with CC tokens writes credentials to all stores."""
     with (
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -945,7 +945,7 @@ def test_use_account_honours_the_remote_access_scope(app, db, host, enabled, sco
     scoped = _scoped_client(app, host)
 
     with (
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -1246,7 +1246,7 @@ def test_locked_settings_db_denies_a_remote_switch_without_a_500(locked_settings
 
 def test_locked_settings_db_still_allows_a_local_switch(locked_settings_app):
     with (
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -1346,7 +1346,7 @@ def test_in_scope_forwarded_client_is_allowed_when_remote_access_is_on(app, db):
     _set_remote_access(db, True, "tailscale")
 
     with (
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -1380,7 +1380,7 @@ def test_remote_switches_are_rate_limited(app, db):
     remote = _scoped_client(app, TAILNET_IP)
 
     with (
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -1406,7 +1406,7 @@ def test_loopback_switches_are_never_rate_limited(app, db):
     local = _scoped_client(app, "127.0.0.1")
 
     with (
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -1434,7 +1434,7 @@ def test_a_denied_remote_client_never_consumes_switch_budget(app, db):
     # Now turn remote access on: the full budget is still available.
     _set_remote_access(db, True, "tailscale")
     with (
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -1469,7 +1469,7 @@ def test_allowed_remote_mutation_is_logged(app, db, caplog):
 
     with (
         caplog.at_level(logging.INFO, logger="jacked.api.routes.auth"),
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -1490,7 +1490,7 @@ def test_loopback_mutation_is_not_logged_per_request(app, db, caplog):
 
     with (
         caplog.at_level(logging.INFO, logger="jacked.api.routes.auth"),
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -1513,7 +1513,7 @@ def test_remote_switch_is_attributed_in_the_swap_broadcast(app, db):
     app.state.ws_registry = _Registry()
 
     with (
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -1535,7 +1535,7 @@ def test_local_switch_reason_is_unchanged(app, db):
     app.state.ws_registry = _Registry()
 
     with (
-        mock.patch("jacked.api.credential_helpers.reconcile_outgoing_credentials"),
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),

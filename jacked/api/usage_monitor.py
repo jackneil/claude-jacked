@@ -2026,7 +2026,11 @@ async def full_sweep_loop(app):
                                     reconcile_credentials_from_live_store,
                                 )
 
-                                reconcile_credentials_from_live_store(acct["id"], db)
+                                await asyncio.to_thread(
+                                    reconcile_credentials_from_live_store,
+                                    acct["id"],
+                                    db,
+                                )
                                 fresh_acct = db.get_account(acct["id"])
                                 fresh_cc = (
                                     fresh_acct.get("cc_access_token")

@@ -507,6 +507,32 @@ before the pass observes the authority:
   refresh lineage that is already lost; the user re-authenticates the desired
   account to make it the default again.
 
+A stamp does not prove who owns the tokens. Claude Code keeps the top-level
+`_jackedAccountId` when it rewrites the item. A `/login` to another account in
+one session writes that account's tokens under the old stamp (seen on macOS
+on 2026-10-17). On Windows and Linux, a refresh does the same. The guard still
+treats every stamped payload as a jacked write, so it does not repair this
+case (#154). The identity watcher refuses to publish an identity for a
+stamped payload whose token belongs to a different account.
+
+`reconcile_credentials_from_live_store()` imports live tokens into the stamped
+row only when it can prove the owner:
+
+- A live access or refresh token that the row already holds proves the owner,
+  with no network request.
+- Any other live token is identified once through the OAuth profile endpoint,
+  with the shared owner rule `profile_owner_mismatch()`. The email must match
+  the row, and so must the organization uuid and the account uuid when both
+  sides record them. A profile that names another owner stops the import.
+- When the profile cannot decide (an expired or rejected token, a failed
+  request, or a call from an event-loop thread), the `oauthAccount` identity
+  in `~/.claude.json` decides. Claude Code rewrites that block on `/login` to
+  another account and does not change it on a token refresh. So a rotation
+  that expired while the computer slept is still kept, and a token from a
+  `/login` to another account is not imported.
+- When neither source proves the owner, reconcile imports nothing. The async
+  callers, and the dashboard account list, run reconcile in a worker thread.
+
 The guard never raises. Each failure is logged and reported as a skipped heal.
 The observer publishes the repair as snapshot evidence, for example
 `authority:foreign-write:reasserted`.
