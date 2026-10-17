@@ -13,8 +13,27 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 import jacked.web.auth as mod
 from jacked.web.auth import TokenExchangeResult, fetch_usage
+
+
+@pytest.fixture(autouse=True)
+def _no_profile_piggyback():
+    """Keep the throttled profile refresh out of the GET counts.
+
+    A successful usage fetch piggybacks a profile GET when the module-level
+    ``_profile_refreshed_at`` has no recent stamp for the account. These
+    tests count usage GETs only, so they must not depend on whether an
+    earlier test in the same process left a stamp behind.
+    """
+    saved = dict(mod._profile_refreshed_at)
+    mod._profile_refreshed_at.clear()
+    mod._profile_refreshed_at[1] = time.time()
+    yield
+    mod._profile_refreshed_at.clear()
+    mod._profile_refreshed_at.update(saved)
 
 
 # ---------------------------------------------------------------------------

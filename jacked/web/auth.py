@@ -952,7 +952,9 @@ async def fetch_usage(
                     # Refresh failed — try live credential import for active account
                     try:
                         from jacked.api.credential_helpers import reconcile_credentials_from_live_store
-                        reconcile_credentials_from_live_store(account_id, db)
+                        await asyncio.to_thread(
+                            reconcile_credentials_from_live_store, account_id, db
+                        )
                         refreshed_acct = db.get_account(account_id)
                         if refreshed_acct:
                             live_token = refreshed_acct.get("access_token")
@@ -1554,7 +1556,9 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
         )
         active_id = read_active_account_id()
         if active_id is not None:
-            reconcile_credentials_from_live_store(active_id, db)
+            await asyncio.to_thread(
+                reconcile_credentials_from_live_store, active_id, db
+            )
     except Exception:
         logger.debug("Periodic credential reconciliation failed", exc_info=True)
 
@@ -1675,13 +1679,9 @@ async def heal_invalid_accounts() -> dict:
             # Try reconciling from live credentials before validate
             try:
                 from jacked.api.credential_helpers import reconcile_credentials_from_live_store
-                reconcile_credentials_from_live_store(account_id, db)
-            except ImportError:
-                try:
-                    from jacked.api.credential_helpers import reconcile_outgoing_credentials
-                    reconcile_outgoing_credentials(account_id, db)
-                except (ImportError, Exception):
-                    pass
+                await asyncio.to_thread(
+                    reconcile_credentials_from_live_store, account_id, db
+                )
             except Exception:
                 logger.debug("Credential reconciliation failed for account %d", account_id)
 
