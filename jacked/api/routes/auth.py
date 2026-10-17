@@ -902,7 +902,11 @@ async def list_accounts(request: Request, include_inactive: bool = False):
         return _db_unavailable()
 
     rows = db.list_accounts(include_inactive=include_inactive)
-    return [_account_to_response(row, db=db) for row in rows]
+    # _account_to_response can reconcile the active account, which reads the
+    # Keychain and may call the profile endpoint. Keep both off the loop.
+    return await asyncio.to_thread(
+        lambda: [_account_to_response(row, db=db) for row in rows]
+    )
 
 
 @router.patch("/accounts/{account_id}")

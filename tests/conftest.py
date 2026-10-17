@@ -398,5 +398,9 @@ def _no_reconcile_ownership_network():
     with patch(
         "jacked.api.credential_helpers._ownership_lookup",
         return_value=ProfileLookup(None),
+    ), patch(
+        # The offline fallback reads ~/.claude.json; never the developer's own.
+        "jacked.api.credential_helpers._config_identity",
+        return_value=None,
     ):
         yield

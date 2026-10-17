@@ -357,20 +357,19 @@ class TestReconcileOwnershipProof:
         from jacked.api.credential_helpers import invalidate_live_cred_cache
         invalidate_live_cred_cache()
 
-    def _account(self, tmp_path, **cols):
+    def _account(self, tmp_path, org="org-a", account_uuid="uuid-a"):
         db = Database(str(tmp_path / "test.db"))
         acct = db.create_account("owner@test.com", "tok", int(time.time()) + 3600)
         db.update_account(
             acct["id"],
             cc_access_token="old-access",
             cc_refresh_token="old-refresh",
-            organization_uuid="org-a",
-            account_uuid="uuid-a",
-            **cols,
+            organization_uuid=org,
+            account_uuid=account_uuid,
         )
         return db, acct["id"]
 
-    def _live(self, account_id, access, refresh, expires_s=None):
+    def _live(self, account_id, access="new-access", refresh="new-refresh", expires_s=None):
         return {
             "_jackedAccountId": account_id,
             "claudeAiOauth": {
@@ -380,7 +379,7 @@ class TestReconcileOwnershipProof:
             },
         }
 
-    def _reconcile(self, db, account_id, live, lookup):
+    def _reconcile(self, db, account_id, live, lookup, config=None):
         from unittest.mock import patch
 
         from jacked.api.credential_helpers import reconcile_credentials_from_live_store
@@ -388,67 +387,146 @@ class TestReconcileOwnershipProof:
         with patch("jacked.api.credential_helpers.read_platform_credentials",
                    return_value=live), \
              patch("jacked.api.credential_helpers._ownership_lookup",
-                   return_value=lookup) as spy:
+                   return_value=lookup) as spy, \
+             patch("jacked.api.credential_helpers._config_identity",
+                   return_value=config):
             reconcile_credentials_from_live_store(account_id, db)
         return spy
+
+    @staticmethod
+    def _config(email="owner@test.com", org="org-a", account_uuid="uuid-a"):
+        return {"emailAddress": email, "organizationUuid": org, "accountUuid": account_uuid}
+
+    @staticmethod
+    def _no_answer():
+        from jacked.api.authority_guard import ProfileLookup
+
+        return ProfileLookup(None)
+
+    def _imported(self, db, aid):
+        return db.get_account(aid)["cc_refresh_token"] == "new-refresh"
 
     def test_foreign_token_with_our_stamp_is_not_imported(self, tmp_path):
         """A /login to another account keeps our stamp; never import it."""
         db, aid = self._account(tmp_path)
-        live = self._live(aid, "other-access", "other-refresh")
-        self._reconcile(db, aid, live, _owner_profile("other@test.com", "org-b", "uuid-b"))
+        self._reconcile(db, aid, self._live(aid),
+                        _owner_profile("other@test.com", "org-b", "uuid-b"))
         row = db.get_account(aid)
         assert row["cc_access_token"] == "old-access"
         assert row["cc_refresh_token"] == "old-refresh"
 
+    def test_profile_verdict_beats_a_matching_config(self, tmp_path):
+        db, aid = self._account(tmp_path)
+        self._reconcile(db, aid, self._live(aid),
+                        _owner_profile("other@test.com", "org-b", "uuid-b"),
+                        config=self._config())
+        assert not self._imported(db, aid)
+
     def test_same_email_other_org_is_not_imported(self, tmp_path):
         db, aid = self._account(tmp_path)
-        live = self._live(aid, "new-access", "new-refresh")
-        self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-b", "uuid-a"))
-        assert db.get_account(aid)["cc_refresh_token"] == "old-refresh"
+        self._reconcile(db, aid, self._live(aid),
+                        _owner_profile("owner@test.com", "org-b", "uuid-a"))
+        assert not self._imported(db, aid)
+
+    def test_only_email_differs_is_not_imported(self, tmp_path):
+        db, aid = self._account(tmp_path)
+        self._reconcile(db, aid, self._live(aid),
+                        _owner_profile("other@test.com", "org-a", "uuid-a"))
+        assert not self._imported(db, aid)
 
     def test_proven_rotation_is_imported(self, tmp_path):
         db, aid = self._account(tmp_path)
-        live = self._live(aid, "new-access", "new-refresh")
-        self._reconcile(db, aid, live, _owner_profile("OWNER@test.com", "org-a", "uuid-a"))
+        self._reconcile(db, aid, self._live(aid),
+                        _owner_profile("OWNER@test.com", " org-a ", "uuid-a"))
         row = db.get_account(aid)
         assert row["cc_access_token"] == "new-access"
         assert row["cc_refresh_token"] == "new-refresh"
 
-    def test_lookup_failure_imports_nothing(self, tmp_path):
-        from jacked.api.authority_guard import ProfileLookup
+    def test_personal_account_row_skips_the_org_check(self, tmp_path):
+        db, aid = self._account(tmp_path, org="", account_uuid=None)
+        self._reconcile(db, aid, self._live(aid),
+                        _owner_profile("owner@test.com", "org-personal", "uuid-x"))
+        assert self._imported(db, aid)
 
+    def test_profile_without_account_uuid_still_proves_email_and_org(self, tmp_path):
         db, aid = self._account(tmp_path)
-        live = self._live(aid, "new-access", "new-refresh")
-        self._reconcile(db, aid, live, ProfileLookup(None))
-        assert db.get_account(aid)["cc_access_token"] == "old-access"
+        self._reconcile(db, aid, self._live(aid),
+                        _owner_profile("owner@test.com", "org-a", None))
+        assert self._imported(db, aid)
+
+    def test_lookup_failure_without_config_imports_nothing(self, tmp_path):
+        db, aid = self._account(tmp_path)
+        self._reconcile(db, aid, self._live(aid), self._no_answer())
+        assert not self._imported(db, aid)
+
+    def test_lookup_failure_falls_back_to_matching_config(self, tmp_path):
+        db, aid = self._account(tmp_path)
+        self._reconcile(db, aid, self._live(aid), self._no_answer(), config=self._config())
+        assert self._imported(db, aid)
 
     def test_known_refresh_token_needs_no_lookup(self, tmp_path):
         """Lineage proves ownership: an access-token refresh is imported offline."""
         db, aid = self._account(tmp_path)
-        live = self._live(aid, "new-access", "old-refresh")
+        live = self._live(aid, refresh="old-refresh")
         spy = self._reconcile(db, aid, live, _owner_profile("nobody@test.com"))
         spy.assert_not_called()
         assert db.get_account(aid)["cc_access_token"] == "new-access"
 
-    def test_expired_unknown_token_is_not_looked_up(self, tmp_path):
+    def test_expired_rotation_is_kept_when_config_names_the_row(self, tmp_path):
+        """A rotation that expired while the laptop slept still survives a switch."""
         db, aid = self._account(tmp_path)
-        live = self._live(aid, "new-access", "new-refresh", expires_s=int(time.time()) - 60)
-        spy = self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"))
+        live = self._live(aid, expires_s=int(time.time()) - 60)
+        spy = self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"),
+                              config=self._config())
         spy.assert_not_called()
-        assert db.get_account(aid)["cc_access_token"] == "old-access"
+        assert self._imported(db, aid)
+
+    def test_expired_token_after_login_elsewhere_is_not_imported(self, tmp_path):
+        """/login to another account rewrites oauthAccount; the stamp is stale."""
+        db, aid = self._account(tmp_path)
+        live = self._live(aid, expires_s=int(time.time()) - 60)
+        self._reconcile(db, aid, live, self._no_answer(),
+                        config=self._config("other@test.com", "org-b", "uuid-b"))
+        assert not self._imported(db, aid)
 
     def test_event_loop_caller_never_blocks_on_the_lookup(self, tmp_path):
         import asyncio
 
         db, aid = self._account(tmp_path)
-        live = self._live(aid, "new-access", "new-refresh")
 
         async def on_loop():
-            return self._reconcile(
-                db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a")
-            )
+            return self._reconcile(db, aid, self._live(aid),
+                                   _owner_profile("owner@test.com", "org-a", "uuid-a"))
 
         spy = asyncio.run(on_loop())
         spy.assert_not_called()
-        assert db.get_account(aid)["cc_access_token"] == "old-access"
+        assert not self._imported(db, aid)
+
+    def test_event_loop_caller_uses_the_config_identity(self, tmp_path):
+        import asyncio
+
+        db, aid = self._account(tmp_path)
+
+        async def on_loop():
+            return self._reconcile(db, aid, self._live(aid), self._no_answer(),
+                                   config=self._config())
+
+        spy = asyncio.run(on_loop())
+        spy.assert_not_called()
+        assert self._imported(db, aid)
+
+    def test_worker_thread_caller_reaches_the_lookup(self, tmp_path):
+        """The async callers use asyncio.to_thread; the lookup must run there."""
+        import asyncio
+
+        db, aid = self._account(tmp_path)
+
+        async def via_thread():
+            return await asyncio.to_thread(
+                self._reconcile, db, aid, self._live(aid),
+                _owner_profile("owner@test.com", "org-a", "uuid-a"),
+            )
+
+        spy = asyncio.run(via_thread())
+        spy.assert_called_once()
+        assert self._imported(db, aid)

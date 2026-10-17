@@ -399,68 +399,107 @@ def _ownership_lookup(access_token: str):
     return lookup_profile(access_token)
 
 
+def _config_identity() -> dict | None:
+    """Return the ``oauthAccount`` block of ~/.claude.json (test seam)."""
+    from jacked.api.claude_config_store import read_config_identity
+
+    return read_config_identity(Path.home())
+
+
+def _owner_mismatch(account: dict, profile) -> str | None:
+    from jacked.api.claude_identity import profile_owner_mismatch
+
+    return profile_owner_mismatch(
+        account.get("email"),
+        account.get("organization_uuid"),
+        account.get("account_uuid"),
+        profile,
+    )
+
+
 def _live_tokens_belong_to(
     account: dict, live_access: str, live_refresh: str | None, live_expires
 ) -> bool:
     """True when the live tokens provably belong to ``account``.
 
-    A token the row already holds proves ownership without a network call.
-    A token the row does not hold (a rotation by Claude Code, or another
-    account's token) is identified through the OAuth profile endpoint and
-    must match the row's email, and its organization and account uuid when
-    the row records them. Every unproven case returns False, so the caller
-    imports nothing. The profile request is refused on an event-loop thread,
-    because it can block for the full request timeout.
+    The checks run in order, and the first that decides wins:
+
+    1. A token the row already holds proves ownership with no network call.
+    2. The OAuth profile endpoint identifies a live, unexpired token. A
+       profile that names another owner rejects the import, whatever comes
+       after. The request is skipped on an event-loop thread, because it can
+       block for the full request timeout.
+    3. When the profile cannot decide (an expired or rejected token, a failed
+       request, or an event-loop caller), the ``oauthAccount`` identity in
+       ~/.claude.json decides. Claude Code rewrites that block on ``/login``
+       to another account and leaves it alone on a token refresh, so it tells
+       a rotation of this account from a login to another one without a
+       request.
+
+    Every case that nothing proves returns False, so the caller imports
+    nothing.
 
     >>> row = {"cc_access_token": "a1", "cc_refresh_token": "r1"}
     >>> _live_tokens_belong_to(row, "a1", "r9", None)
     True
     >>> _live_tokens_belong_to(row, "a9", "r1", None)
     True
-    >>> _live_tokens_belong_to(row, "a9", "r9", 1)  # expired, cannot prove
-    False
     """
     if live_access == account.get("cc_access_token"):
         return True
     if live_refresh and live_refresh == account.get("cc_refresh_token"):
         return True
+
+    expired = False
     if live_expires:
         expires_s = live_expires / 1000 if live_expires > 1e12 else live_expires
-        if expires_s <= time.time():
-            return False
+        expired = expires_s <= time.time()
+    on_loop = True
     try:
         import asyncio
 
         asyncio.get_running_loop()
     except RuntimeError:
-        pass
-    else:
-        logger.warning(
-            "Account %s: credential ownership check skipped on the event loop",
-            account.get("id"),
-        )
-        return False
+        on_loop = False
 
-    result = _ownership_lookup(live_access)
-    if result.status_code != 200 or not isinstance(result.profile, dict):
+    if not expired and not on_loop:
+        result = _ownership_lookup(live_access)
+        if result.status_code == 200 and isinstance(result.profile, dict):
+            field = _owner_mismatch(account, result.profile)
+            if field is None:
+                return True
+            logger.warning(
+                "Account %s: live token profile names another owner (%s)",
+                account.get("id"),
+                field,
+            )
+            return False
         logger.info(
-            "Account %s: credential ownership lookup returned %s",
+            "Account %s: credential ownership lookup returned %s; "
+            "checking the Claude config identity",
             account.get("id"),
             result.status_code,
         )
+
+    block = _config_identity()
+    if not isinstance(block, dict):
         return False
-    profile_account = result.profile.get("account")
-    profile_org = result.profile.get("organization")
-    profile_account = profile_account if isinstance(profile_account, dict) else {}
-    profile_org = profile_org if isinstance(profile_org, dict) else {}
-    email = str(profile_account.get("email") or "").strip().casefold()
-    if not email or email != str(account.get("email") or "").strip().casefold():
-        return False
-    row_org = account.get("organization_uuid")
-    if row_org and profile_org.get("uuid") != row_org:
-        return False
-    row_uuid = account.get("account_uuid")
-    if row_uuid and profile_account.get("uuid") != row_uuid:
+    field = _owner_mismatch(
+        account,
+        {
+            "account": {
+                "email": block.get("emailAddress"),
+                "uuid": block.get("accountUuid"),
+            },
+            "organization": {"uuid": block.get("organizationUuid")},
+        },
+    )
+    if field is not None:
+        logger.warning(
+            "Account %s: Claude config identity names another owner (%s)",
+            account.get("id"),
+            field,
+        )
         return False
     return True
 
