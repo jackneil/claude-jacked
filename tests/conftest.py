@@ -383,3 +383,20 @@ def _block_profile_browser_launch():
     """
     with patch("jacked.web.browser_launch.find_browser", return_value=None):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_reconcile_ownership_network():
+    """Reconcile's ownership check must never reach the real profile endpoint.
+
+    The default answer is "request did not complete", so reconcile imports
+    nothing it cannot prove. A test that needs a proven owner patches
+    ``jacked.api.credential_helpers._ownership_lookup`` itself.
+    """
+    from jacked.api.authority_guard import ProfileLookup
+
+    with patch(
+        "jacked.api.credential_helpers._ownership_lookup",
+        return_value=ProfileLookup(None),
+    ):
+        yield
