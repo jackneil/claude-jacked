@@ -439,7 +439,18 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_action ON decision_log(action);
 
 
 def _default_db_path() -> str:
-    """Return default database path: ~/.claude/jacked.db"""
+    """Return default database path: ~/.claude/jacked.db
+
+    The repo-root ``conftest.py`` gives every doctest a temporary home. When
+    ``JACKED_DOCTEST_GUARD_REAL_HOME`` names the real home (the guard test
+    in tests/unit/test_doctest_isolation.py sets it), this example proves
+    that a doctest never resolves the real database.
+
+    >>> import os
+    >>> real_home = os.environ.get("JACKED_DOCTEST_GUARD_REAL_HOME")
+    >>> real_home is None or not _default_db_path().startswith(real_home)
+    True
+    """
     return str(Path.home() / ".claude" / "jacked.db")
 
 
@@ -494,18 +505,32 @@ class Database:
     def _reader(self) -> Iterator[sqlite3.Connection]:
         yield self._get_connection()
 
+    # Name of the one-time move of legacy shared breakers in the private
+    # schema_migrations table (never in settings: the settings API lists
+    # and writes every settings row).
+    CC_BREAKER_SPLIT_MARKER = "cc_breaker_split"
+
     @staticmethod
     def _migrate_cc_chain_breaker(conn: sqlite3.Connection) -> None:
         """Add the Claude Code chain breaker columns and move legacy failures.
 
         Before this migration one column pair (refresh_last_failed_at,
-        refresh_failure_type) served both refresh lineages. A legacy row
-        whose shared breaker says ``invalid_grant`` while its cc refresh
-        token is gone and its primary refresh token is present is a dead
-        Claude Code chain. The move runs ONCE, in the same pass that adds
-        the columns, so a later primary failure is never reclassified. A
-        moved row whose cc access token has already expired loses that
-        token too: a dead chain keeps no token in service.
+        refresh_failure_type) served both refresh lineages. The old code
+        handled a dead Claude Code chain by clearing only cc_refresh_token:
+        the dead cc_access_token stayed and the shared breaker said
+        ``invalid_grant``. A row in that shape moves its failure to the cc
+        columns.
+
+        The move is gated on a marker row in the private ``schema_migrations``
+        table, not on the column add, so a
+        database that got the columns without the move still gets it. It
+        runs once per database: after it, the shared pair belongs to the
+        primary chain only, and a later primary ``invalid_grant`` on a row
+        that has a cc access token but no cc refresh token (an old seed, or
+        a file sync of a consumed token) must not be reclassified. The
+        UPDATE and the marker share the migration transaction. A moved row
+        whose cc access token has already expired loses that token too: a
+        dead chain keeps no token in service.
 
         >>> conn = sqlite3.connect(":memory:")
         >>> _ = conn.execute(
@@ -519,10 +544,12 @@ class Database:
         ...     "SELECT refresh_failure_type, cc_refresh_failure_type, "
         ...     "cc_refresh_last_failed_at, cc_access_token FROM accounts").fetchone()
         (None, 'invalid_grant', 50, None)
+        >>> conn.execute(
+        ...     "SELECT name FROM schema_migrations").fetchall()
+        [('cc_breaker_split',)]
         """
         cursor = conn.execute("PRAGMA table_info(accounts)")
         cols = {row[1] for row in cursor.fetchall()}
-        added = False
         for col_name, col_def in [
             ("cc_refresh_last_failed_at", "INTEGER"),
             ("cc_refresh_failure_type", "TEXT"),
@@ -530,28 +557,39 @@ class Database:
             if col_name not in cols:
                 try:
                     conn.execute(f"ALTER TABLE accounts ADD COLUMN {col_name} {col_def}")
-                    added = True
                 except sqlite3.OperationalError:
                     pass
-        if not added:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        marker = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?",
+            (Database.CC_BREAKER_SPLIT_MARKER,),
+        ).fetchone()
+        if marker:
             return
-        legacy = (
-            "refresh_failure_type = 'invalid_grant' "
-            "AND cc_refresh_token IS NULL AND refresh_token IS NOT NULL"
+        expired = (
+            "cc_expires_at IS NOT NULL "
+            "AND cc_expires_at <= CAST(strftime('%s','now') AS INTEGER)"
         )
         conn.execute(
             "UPDATE accounts SET "
-            "cc_access_token = CASE WHEN cc_expires_at IS NOT NULL "
-            "AND cc_expires_at <= CAST(strftime('%s','now') AS INTEGER) "
-            "THEN NULL ELSE cc_access_token END, "
-            "cc_expires_at = CASE WHEN cc_expires_at IS NOT NULL "
-            "AND cc_expires_at <= CAST(strftime('%s','now') AS INTEGER) "
-            "THEN NULL ELSE cc_expires_at END, "
+            f"cc_access_token = CASE WHEN {expired} THEN NULL ELSE cc_access_token END, "
+            f"cc_expires_at = CASE WHEN {expired} THEN NULL ELSE cc_expires_at END, "
             "cc_refresh_failure_type = 'invalid_grant', "
             "cc_refresh_last_failed_at = refresh_last_failed_at, "
             "refresh_failure_type = NULL, "
             "refresh_last_failed_at = NULL "
-            f"WHERE {legacy}"
+            "WHERE refresh_failure_type = 'invalid_grant' "
+            "AND cc_refresh_token IS NULL "
+            "AND cc_access_token IS NOT NULL "
+            "AND refresh_token IS NOT NULL "
+            "AND cc_refresh_failure_type IS NULL"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+            (Database.CC_BREAKER_SPLIT_MARKER, datetime.now(timezone.utc).isoformat()),
         )
 
     def _init_schema(self) -> None:

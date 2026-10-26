@@ -127,11 +127,24 @@ The background refresh loop counts only real token exchanges as `refreshed`.
 A token inside the 4 hour buffer but outside the 5 minute refresh window is
 `skipped`.
 
-A one-time migration moves a legacy shared breaker to the `cc` columns. It
-moves a row where `refresh_failure_type` is `invalid_grant`, `cc_refresh_token`
-is null, and `refresh_token` is present. It runs only in the pass that adds the
-`cc` columns, so it never reclassifies a later primary failure. A moved row
-whose `cc` access token has expired also loses that token.
+A one-time migration moves a legacy shared breaker to the `cc` columns. The
+old code handled a dead `cc` chain by clearing only `cc_refresh_token`, so the
+migration moves a row with all of these values:
+
+- `refresh_failure_type` is `invalid_grant`;
+- `cc_refresh_token` is null and `cc_access_token` is present;
+- `refresh_token` is present;
+- `cc_refresh_failure_type` is null.
+
+A marker row (`cc_breaker_split`) in the private `schema_migrations` table
+gates the move. The marker is not a setting, so the settings API cannot list,
+change, or delete it. The move
+does not depend on the pass that adds the columns, so a database that got the
+columns without the move still gets it. The move and the marker write share
+one transaction. After the move, the shared pair belongs to the primary chain
+only. Thus the move runs once for each database and never reclassifies a later
+primary failure. A moved row whose `cc` access token has expired also loses
+that token.
 
 OAuth completion saves the account in SQLite before any local activation. It
 attempts local credential activation only when the new or re-authorized account

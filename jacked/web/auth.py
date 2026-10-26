@@ -1948,7 +1948,9 @@ def reset_locks() -> None:
     _inflight_refresh_tasks.clear()
 
 
-async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
+async def refresh_all_expiring_tokens(
+    buffer_seconds: int = 14400, db: Optional[Database] = None,
+) -> dict:
     """Refresh all account tokens expiring within buffer_seconds.
 
     Called by background task to proactively keep tokens fresh.
@@ -1957,6 +1959,8 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
 
     Args:
         buffer_seconds: Refresh tokens expiring within this many seconds (default 4 hours)
+        db: The database to use. None opens the default database; give an
+            explicit one in tests and examples.
 
     Returns:
         dict with counts: {"checked": N, "refreshed": N, "skipped": N, "failed": N,
@@ -1964,11 +1968,23 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
         "refreshed" counts real exchanges only; a token inside the buffer that
         is not yet inside its refresh window counts as "skipped".
 
-    No doctest runs this function: it opens the default database and reads
-    the live credential store, and a doctest has no test isolation.
-    tests/unit/test_token_refresh.py covers it.
+    The example uses an in-memory database and stubs the active-account
+    read, so it touches no real database and no credential store even when
+    it runs outside pytest.
+
+    >>> import asyncio
+    >>> from unittest.mock import patch
+    >>> with patch("jacked.api.credential_helpers.read_active_account_id",
+    ...            return_value=None):
+    ...     counts = asyncio.run(
+    ...         refresh_all_expiring_tokens(db=Database(":memory:")))
+    >>> sorted(counts)
+    ['cc_failed', 'cc_refreshed', 'checked', 'failed', 'refreshed', 'skipped']
+    >>> counts["checked"]
+    0
     """
-    db = Database()
+    if db is None:
+        db = Database()
     now = int(time.time())
     result = {
         "checked": 0, "refreshed": 0, "skipped": 0, "failed": 0,

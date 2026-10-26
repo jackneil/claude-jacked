@@ -1720,19 +1720,26 @@ class TestChainAwareFlow:
 
 
 class TestCcChainMigration:
-    def _legacy_db(self, tmp_path):
-        """A database from before the per-chain breaker columns existed."""
+    MARKER = Database.CC_BREAKER_SPLIT_MARKER
+
+    def _legacy_db(self, tmp_path, *, drop_columns=True):
+        """A database from before the per-chain breaker split.
+
+        ``drop_columns=False`` is the state of a machine that got the
+        columns without the move (the 2026-10-26 doctest incident).
+        """
         path = tmp_path / "legacy.db"
         db = Database(str(path))
-        db.create_account(email="a@test.com", access_token="pat",
-                          refresh_token="prt", expires_at=int(time.time()) + 3600,
-                          scopes=None)
-        db.create_account(email="b@test.com", access_token="pat2",
-                          refresh_token="prt2", expires_at=int(time.time()) + 3600,
-                          scopes=None)
+        for email, at, rt in (("a@test.com", "pat", "prt"),
+                              ("b@test.com", "pat2", "prt2"),
+                              ("c@test.com", "pat3", "prt3")):
+            db.create_account(email=email, access_token=at, refresh_token=rt,
+                              expires_at=int(time.time()) + 3600, scopes=None)
         conn = sqlite3.connect(str(path))
-        conn.execute("ALTER TABLE accounts DROP COLUMN cc_refresh_failure_type")
-        conn.execute("ALTER TABLE accounts DROP COLUMN cc_refresh_last_failed_at")
+        conn.execute("DROP TABLE IF EXISTS schema_migrations")
+        if drop_columns:
+            conn.execute("ALTER TABLE accounts DROP COLUMN cc_refresh_failure_type")
+            conn.execute("ALTER TABLE accounts DROP COLUMN cc_refresh_last_failed_at")
         # Account 1: legacy dead cc chain, expired dead cc token.
         conn.execute(
             "UPDATE accounts SET refresh_failure_type='invalid_grant', "
@@ -1743,14 +1750,16 @@ class TestCcChainMigration:
             "UPDATE accounts SET refresh_failure_type='network_error', "
             "refresh_last_failed_at=888, cc_access_token='cc2', "
             "cc_refresh_token='ccrt2' WHERE id=2")
+        # Account 3: cc chain never authorized, PRIMARY died: not moved.
+        conn.execute(
+            "UPDATE accounts SET refresh_failure_type='invalid_grant', "
+            "refresh_last_failed_at=999, cc_access_token=NULL, "
+            "cc_refresh_token=NULL WHERE id=3")
         conn.commit()
         conn.close()
         return path
 
-    def test_legacy_shared_invalid_grant_moves_to_the_cc_columns_once(self, tmp_path):
-        path = self._legacy_db(tmp_path)
-
-        db = Database(str(path))
+    def _assert_moved(self, db):
         a = db.get_account(1)
         assert a["cc_refresh_failure_type"] == "invalid_grant"
         assert a["cc_refresh_last_failed_at"] == 777
@@ -1761,15 +1770,44 @@ class TestCcChainMigration:
         b = db.get_account(2)
         assert b["refresh_failure_type"] == "network_error"
         assert b["cc_refresh_failure_type"] is None
+        c = db.get_account(3)
+        assert c["refresh_failure_type"] == "invalid_grant"
+        assert c["refresh_last_failed_at"] == 999
+        assert c["cc_refresh_failure_type"] is None
+        conn = sqlite3.connect(db.db_path)
+        assert conn.execute(
+            "SELECT name FROM schema_migrations WHERE name = ?", (self.MARKER,)
+        ).fetchone() == (self.MARKER,)
+        conn.close()
+        # The marker is private: the settings table never carries it.
+        assert db.get_setting(self.MARKER) is None
 
-        # A later PRIMARY invalid_grant must never be reclassified.
-        db.update_account(1, refresh_failure_type="invalid_grant",
-                          refresh_last_failed_at=999)
-        db2 = Database(str(path))
-        a2 = db2.get_account(1)
-        assert a2["refresh_failure_type"] == "invalid_grant"
-        assert a2["refresh_last_failed_at"] == 999
-        assert a2["cc_refresh_last_failed_at"] == 777
+    def test_legacy_shared_invalid_grant_moves_to_the_cc_columns(self, tmp_path):
+        self._assert_moved(Database(str(self._legacy_db(tmp_path))))
+
+    def test_move_runs_when_the_columns_exist_but_the_move_never_ran(self, tmp_path):
+        path = self._legacy_db(tmp_path, drop_columns=False)
+        self._assert_moved(Database(str(path)))
+
+    def test_a_later_primary_death_is_never_reclassified(self, tmp_path):
+        """After the move, the shared pair means the primary chain. A row with
+        a cc access token but no cc refresh token (an old seed, or a file sync
+        of a consumed token) that takes a real primary invalid_grant keeps it
+        on the primary breaker on every later migration pass."""
+        path = self._legacy_db(tmp_path)
+        db = Database(str(path))
+        db.update_account(2, cc_refresh_token=None,
+                          refresh_failure_type="invalid_grant",
+                          refresh_last_failed_at=1234)
+
+        for _ in range(3):
+            again = Database(str(path))
+        b = again.get_account(2)
+        assert b["refresh_failure_type"] == "invalid_grant"
+        assert b["refresh_last_failed_at"] == 1234
+        assert b["cc_refresh_failure_type"] is None
+        assert b["cc_access_token"] == "cc2"
+        assert again.get_account(1)["cc_refresh_last_failed_at"] == 777
 
 
 @pytest.mark.usefixtures("_fresh_auth_locks")
