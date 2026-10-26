@@ -1273,14 +1273,10 @@ def _validate_codex_account(account_id: int, db: Database) -> dict:
         logger.debug("codex validation read failed for %s", account_id, exc_info=True)
         signed_in = True  # never false-invalidate on a transient read error
     if signed_in:
-        db.update_account(
-            account_id,
-            validation_status="valid",
-            last_validated_at=int(time.time()),
-            consecutive_failures=0,
-            last_error=None,
-            last_error_at=None,
-        )
+        # A signed-in auth.json says nothing about whether usage is readable:
+        # the usage fetch's error and failure counter stay until a successful
+        # fetch clears them (fetch_codex_usage -> clear_account_errors).
+        db.mark_account_validated(account_id)
         return {"valid": True, "error": None}
     db.update_account(
         account_id,
@@ -1328,14 +1324,10 @@ async def validate_account(account_id: int, db: Database) -> dict:
             )
 
             if resp.status_code == 200:
-                db.update_account(
-                    account_id,
-                    validation_status="valid",
-                    last_validated_at=int(time.time()),
-                    consecutive_failures=0,
-                    last_error=None,
-                    last_error_at=None,
-                )
+                # A profile 200 proves the token, not that usage is readable:
+                # the usage path's error and failure counter stay until a
+                # successful usage fetch clears them (clear_account_errors).
+                db.mark_account_validated(account_id)
                 _update_profile_metadata(account_id, resp.json(), db)
                 return {"valid": True, "error": None}
 
@@ -1352,14 +1344,8 @@ async def validate_account(account_id: int, db: Database) -> dict:
                         },
                     )
                     if retry_resp.status_code == 200:
-                        db.update_account(
-                            account_id,
-                            validation_status="valid",
-                            last_validated_at=int(time.time()),
-                            consecutive_failures=0,
-                            last_error=None,
-                            last_error_at=None,
-                        )
+                        # Same rule as the first-try 200 above.
+                        db.mark_account_validated(account_id)
                         _update_profile_metadata(account_id, retry_resp.json(), db)
                         return {"valid": True, "error": None}
 

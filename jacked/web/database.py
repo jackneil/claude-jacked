@@ -1429,6 +1429,51 @@ class Database:
             )
             return cursor.rowcount > 0
 
+    def mark_account_validated(self, account_id: int) -> bool:
+        """Record a successful credential validation without hiding usage failures.
+
+        Validation owns ``validation_status`` and ``last_validated_at``. It
+        never resets ``consecutive_failures``: that counter belongs to the
+        usage fetch and the token refresh, and only their own success clears
+        it (``clear_account_errors``). A validation success proves the
+        credential, not that usage is readable (a signed-in Codex auth.json
+        says nothing about whether the ``codex`` CLI can run).
+
+        ``last_error`` is cleared only when no counted failure stands behind
+        it (``consecutive_failures`` is 0), which removes the stale messages
+        validation itself and the watchdog write. The check and the write
+        are one statement, so a concurrent usage failure is never wiped.
+
+        >>> db = Database(":memory:")
+        >>> acct = db.create_account("u@t.com", "tok", 9999999999)
+        >>> _ = db.record_account_error(acct["id"], "usage failed")
+        >>> db.mark_account_validated(acct["id"])
+        True
+        >>> row = db.get_account(acct["id"])
+        >>> row["validation_status"], row["last_error"], row["consecutive_failures"]
+        ('valid', 'usage failed', 1)
+        >>> _ = db.clear_account_errors(acct["id"])
+        >>> _ = db.update_account(acct["id"], last_error="validation timed out")
+        >>> _ = db.mark_account_validated(acct["id"])
+        >>> db.get_account(acct["id"])["last_error"] is None
+        True
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE accounts SET
+                    validation_status = 'valid',
+                    last_validated_at = ?,
+                    last_error = CASE WHEN COALESCE(consecutive_failures, 0) = 0
+                                      THEN NULL ELSE last_error END,
+                    last_error_at = CASE WHEN COALESCE(consecutive_failures, 0) = 0
+                                         THEN NULL ELSE last_error_at END,
+                    updated_at = ?
+                   WHERE id = ? AND is_deleted = 0""",
+                (int(time.time()), now, account_id),
+            )
+            return cursor.rowcount > 0
+
     def list_stuck_checking_accounts(self, threshold_seconds: int) -> list[dict]:
         """Return non-deleted accounts where validation_status='checking'
         AND (updated_at is NULL OR updated_at older than threshold_seconds).

@@ -1083,7 +1083,10 @@ def launch_claude(
     except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
         pass
 
-    proc = subprocess.Popen(["claude", *claude_args], env=env)
+    # resolve_account checks find_bin("claude"), which also finds the standalone
+    # install in ~/.local/bin when PATH misses it; spawn that same binary.
+    claude_bin = find_bin("claude") or "claude"
+    proc = subprocess.Popen([claude_bin, *claude_args], env=env)
 
     if db_path:
         sync_thread = threading.Thread(

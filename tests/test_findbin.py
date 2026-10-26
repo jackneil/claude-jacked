@@ -80,3 +80,129 @@ def test_xdg_bin_home_override(tmp_path):
         result = find_bin("uv")
         assert result is not None
         assert result == str(target)
+
+
+# ---------------------------------------------------------------------------
+# Name guard: a lookup name is a bare command name, never a path
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", ["", "a/b", "../codex", "/usr/bin/codex", "a\\b", "co\x00dex"])
+def test_rejects_names_that_are_not_bare(bad):
+    """A path-shaped name would let PATH lookup resolve an arbitrary file."""
+    with patch("jacked.findbin.shutil.which") as which:
+        assert find_bin(bad) is None
+    which.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Fallback trust: off-PATH candidates must sit in a directory only the
+# current user (or root) can change, exactly like the service's own runtime
+# validation in jacked.service.spec
+# ---------------------------------------------------------------------------
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+
+
+def _local_bin_exe(home: Path, name: str) -> Path:
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    exe = local_bin / name
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
+    return exe
+
+
+def test_home_override_is_used_for_fallback_dirs(tmp_path):
+    target_name = "uv.exe" if sys.platform == "win32" else "uv"
+    exe = _local_bin_exe(tmp_path, target_name)
+    with patch("jacked.findbin.shutil.which", return_value=None), \
+         patch("jacked.findbin._home_dir", return_value="/nonexistent"):
+        assert find_bin("uv", home=str(tmp_path)) == str(exe)
+
+
+@posix_only
+def test_refuses_world_writable_fallback_dir(tmp_path, caplog):
+    exe = _local_bin_exe(tmp_path, "codex")
+    exe.parent.chmod(0o777)
+    try:
+        with patch("jacked.findbin.shutil.which", return_value=None), \
+             patch("jacked.findbin._home_dir", return_value=str(tmp_path)), \
+             caplog.at_level("WARNING", logger="jacked.findbin"):
+            assert find_bin("codex") is None
+    finally:
+        exe.parent.chmod(0o755)
+    text = caplog.text
+    assert "codex" in text and "world-writable" in text
+    assert str(tmp_path) not in text  # values-free: no user path in the log
+
+
+@posix_only
+def test_refuses_group_writable_fallback_dir_with_untrusted_group(tmp_path, caplog):
+    exe = _local_bin_exe(tmp_path, "codex")
+    exe.parent.chmod(0o775)
+    try:
+        with patch("jacked.findbin.shutil.which", return_value=None), \
+             patch("jacked.findbin._home_dir", return_value=str(tmp_path)), \
+             patch("jacked.findbin._trusted_group_ids", return_value=frozenset()), \
+             caplog.at_level("WARNING", logger="jacked.findbin"):
+            assert find_bin("codex") is None
+    finally:
+        exe.parent.chmod(0o755)
+    assert "group-writable" in caplog.text
+
+
+@posix_only
+def test_refuses_fallback_dir_owned_by_another_user(tmp_path, caplog):
+    _local_bin_exe(tmp_path, "codex")
+    other_uid = os.getuid() + 4242
+    with patch("jacked.findbin.shutil.which", return_value=None), \
+         patch("jacked.findbin._home_dir", return_value=str(tmp_path)), \
+         patch("jacked.findbin._current_uid", return_value=other_uid), \
+         caplog.at_level("WARNING", logger="jacked.findbin"):
+        assert find_bin("codex") is None
+    text = caplog.text
+    assert "codex" in text and "not owned" in text
+    assert str(tmp_path) not in text
+
+
+@posix_only
+def test_refuses_world_writable_binary_file(tmp_path, caplog):
+    exe = _local_bin_exe(tmp_path, "codex")
+    exe.chmod(0o777)
+    with patch("jacked.findbin.shutil.which", return_value=None), \
+         patch("jacked.findbin._home_dir", return_value=str(tmp_path)), \
+         caplog.at_level("WARNING", logger="jacked.findbin"):
+        assert find_bin("codex") is None
+    assert "world-writable" in caplog.text
+
+
+@posix_only
+def test_follows_symlink_and_checks_target_directory(tmp_path):
+    """~/.local/bin/codex is a symlink into ~/.codex/packages/...: a trusted
+    link into a world-writable target directory must still be refused."""
+    real_dir = tmp_path / "pkg" / "bin"
+    real_dir.mkdir(parents=True)
+    real = real_dir / "codex"
+    real.write_text("#!/bin/sh\nexit 0\n")
+    real.chmod(0o755)
+    local_bin = tmp_path / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    (local_bin / "codex").symlink_to(real)
+
+    with patch("jacked.findbin.shutil.which", return_value=None), \
+         patch("jacked.findbin._home_dir", return_value=str(tmp_path)):
+        assert find_bin("codex") == str(local_bin / "codex")
+        real_dir.chmod(0o777)
+        try:
+            assert find_bin("codex") is None
+        finally:
+            real_dir.chmod(0o755)
+
+
+@posix_only
+def test_path_hit_is_not_subject_to_fallback_trust(tmp_path):
+    """PATH is the caller's own trusted environment; only the off-PATH
+    fallback widens the search, so only it carries the extra check."""
+    with patch("jacked.findbin.shutil.which", return_value="/usr/bin/codex"), \
+         patch("jacked.findbin._current_uid", return_value=os.getuid() + 4242):
+        assert find_bin("codex") == "/usr/bin/codex"

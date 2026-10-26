@@ -29,11 +29,11 @@ import json
 import logging
 import math
 import os
-import shutil
 import time
 from pathlib import Path
 from typing import Mapping, Optional
 
+from jacked.findbin import find_bin
 from jacked.service.menubar_summary import _epoch_to_iso
 
 from .credentials import codex_home
@@ -254,7 +254,7 @@ async def read_codex_rate_limits(
     Raises ``CodexUsageError`` on any failure.
     """
     home = home if home is not None else codex_home(env)
-    codex = codex_bin or shutil.which("codex")
+    codex = codex_bin or find_bin("codex")
     if not codex:
         raise CodexUsageError("the `codex` CLI is not installed or not on PATH")
 

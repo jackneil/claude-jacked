@@ -310,7 +310,7 @@ def test_parse_subject(subject, pr, branch):
 
 
 def test_fetch_pr_gh_absent(monkeypatch, tmp_path):
-    monkeypatch.setattr(merge_capture.shutil, "which", lambda name: None)
+    monkeypatch.setattr(merge_capture, "find_bin", lambda name: None)
     assert merge_capture._fetch_pr(tmp_path, "12") == (None, None, False)
 
 
@@ -319,7 +319,7 @@ def test_fetch_pr_no_pr_number(tmp_path):
 
 
 def test_fetch_pr_gh_failure_tolerated(monkeypatch, tmp_path):
-    monkeypatch.setattr(merge_capture.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(merge_capture, "find_bin", lambda name: "/usr/bin/gh")
 
     def boom(*a, **k):
         raise OSError("no gh")
@@ -435,7 +435,7 @@ def test_capture_merge_pr_subject_gh_absent(env, monkeypatch):
     repo = _merge_repo(env.tmp / "widget")
     _do_merge(repo, message="Merge pull request #12 from o/b")
     # gh truly absent -> tolerated; distillation still runs.
-    monkeypatch.setattr(merge_capture.shutil, "which", lambda name: None)
+    monkeypatch.setattr(merge_capture, "find_bin", lambda name: None)
     _mock_distill(monkeypatch, '{"title": "Landed PR 12", "body": "PR 12 body.", "tags": []}')
 
     merge_capture.capture_merge(str(repo))
@@ -548,7 +548,7 @@ def test_pr_merge_note_carries_pr_provenance_tag(env, monkeypatch):
     _init_vault(env)
     repo = _merge_repo(env.tmp / "widget")
     _do_merge(repo, message="Merge pull request #77 from o/b")
-    monkeypatch.setattr(merge_capture.shutil, "which", lambda name: None)
+    monkeypatch.setattr(merge_capture, "find_bin", lambda name: None)
     _mock_distill(monkeypatch, '{"title": "Landed PR 77", "body": "PR body.", "tags": ["x"]}')
 
     merge_capture.capture_merge(str(repo))
