@@ -153,7 +153,8 @@ def pick_best_target(
 
     Inputs read from each account: ``id``, ``is_active``, ``is_deleted``,
     ``consecutive_failures``, ``validation_status``, ``cc_access_token``,
-    ``auto_swap_enabled``, ``cached_5h_resets_at``, ``cached_7d_resets_at``,
+    ``cc_refresh_failure_type`` (a dead Claude Code chain is never a swap
+    target: its refresh token is spent), ``auto_swap_enabled``, ``cached_5h_resets_at``, ``cached_7d_resets_at``,
     ``cached_usage_5h``, ``cached_usage_7d``. Nothing else is consulted —
     do NOT add fields here without updating callers and tests.
     """
@@ -171,6 +172,8 @@ def pick_best_target(
         if a.get("validation_status") == "invalid":
             continue
         if a.get("cc_access_token") is None:
+            continue
+        if a.get("cc_refresh_failure_type") == "invalid_grant":
             continue
         if a.get("auto_swap_enabled") == 0:
             continue

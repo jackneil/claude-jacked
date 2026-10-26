@@ -457,6 +457,8 @@ def _clamp_poll_interval(
             continue
         if a.get("cc_access_token") is None:
             continue
+        if a.get("cc_refresh_failure_type") == "invalid_grant":
+            continue  # same eligibility as select_target: no dead cc chain
         if a.get("auto_swap_enabled") == 0:
             continue
         tier = tier_for(a, now=now, prev_tier=prev_tiers.get(a["id"]))
@@ -1857,9 +1859,12 @@ async def all_accounts_refresh_loop(app):
     keeper being enabled.
 
     Pacing/safety: fetch_usage enforces its own hard per-account rate-limit
-    ceiling (no 429s), we skip the active account, skip Claude accounts without a
-    CC token (Codex accounts have none but are polled via the app-server), and
-    sleep between accounts. Never crashes — errors are logged per account/tick.
+    ceiling (no 429s), we skip the active account, pick each Claude account's
+    token through ``choose_usage_token`` (a live CC token, else the primary
+    token; a dead CC chain is never resent), skip a Claude account with no
+    usable token (Codex accounts have none but are polled via the app-server),
+    and sleep between accounts. Never crashes — errors are logged per
+    account/tick.
     """
     while True:
         # Sleep first — at startup the active loop + login already populate caches.
@@ -1868,7 +1873,7 @@ async def all_accounts_refresh_loop(app):
             db = getattr(app.state, "db", None)
             if db is None:
                 continue
-            from jacked.web.auth import fetch_usage
+            from jacked.web.auth import choose_usage_token, fetch_usage
 
             active_id = getattr(app.state, "active_poll_account_id", None)
             refreshed = 0
@@ -1876,18 +1881,19 @@ async def all_accounts_refresh_loop(app):
                 if acct.get("id") == active_id:
                     continue  # covered (more often) by active_account_poll_loop
                 is_codex = (acct.get("provider") or "claude") == "codex"
-                cc_at = acct.get("cc_access_token")
-                # Claude accounts fetch usage with their CC token; a Claude account
-                # without one can't be polled. Codex usage comes from the
-                # app-server (no token), so it must NOT be skipped here — that
-                # CC-token skip is exactly why Codex usage stayed at 0%.
-                if not is_codex and not cc_at:
+                # Claude accounts fetch usage with the token the shared chooser
+                # picks (a live CC token, else the primary token). Codex usage
+                # comes from the app-server (no token), so it must NOT be
+                # skipped here — a token skip is exactly why Codex usage stayed
+                # at 0%.
+                choice = None if is_codex else choose_usage_token(acct)
+                if not is_codex and choice is None:
                     continue
                 try:
                     # fetch_usage dispatches on provider; for codex it ignores the
                     # token and only polls the live codex account (others no-op).
                     await fetch_usage(
-                        acct["id"], db, access_token=None if is_codex else cc_at
+                        acct["id"], db, access_token=None if is_codex else choice.token
                     )
                     refreshed += 1
                 except Exception:

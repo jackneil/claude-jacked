@@ -32,6 +32,13 @@ from jacked.web.database import Database
 
 
 @pytest.fixture(autouse=True)
+def _network_up():
+    """The heal sweep probes the token host; no test reaches the network."""
+    with patch("jacked.web.auth._network_reachable", AsyncMock(return_value=True)):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _fresh_locks():
     """Each test runs in its own event loop — drop locks bound to old loops."""
     auth.reset_locks()

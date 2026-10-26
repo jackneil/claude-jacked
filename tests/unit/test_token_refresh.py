@@ -11,9 +11,18 @@ Covers:
 import sqlite3
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from jacked.web.database import Database
+
+
+@pytest.fixture(autouse=True)
+def _network_up():
+    """The heal sweep probes the token host; no test reaches the network."""
+    with patch("jacked.web.auth._network_reachable", AsyncMock(return_value=True)):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +304,8 @@ class TestReconciliationSafetyGuard:
         db = Database(str(tmp_path / "test.db"))
         acct = db.create_account("recon@test.com", "tok", int(time.time()) + 3600)
         db.update_account(acct["id"],
-                          refresh_last_failed_at=int(time.time()),
-                          refresh_failure_type="invalid_grant",
+                          cc_refresh_last_failed_at=int(time.time()),
+                          cc_refresh_failure_type="invalid_grant",
                           cc_access_token="old-access",
                           cc_refresh_token=None)
 
@@ -523,3 +532,254 @@ class TestReconcileOwnershipProof:
         live = self._live(aid, expires_s=int(time.time()) + 600)
         self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"))
         assert not self._imported(db, aid)
+
+
+# ---------------------------------------------------------------------------
+# B6: exchange outcome classification (not_sent vs reply_lost)
+# ---------------------------------------------------------------------------
+
+
+def _post_raising(exc):
+    client = AsyncMock()
+    client.post.side_effect = exc
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    return client
+
+
+class TestExchangeClassification:
+    @pytest.mark.parametrize(
+        "exc_factory, expected",
+        [
+            (lambda h: h.ConnectError("dns failure"), "not_sent"),
+            (lambda h: h.ConnectTimeout("connect"), "not_sent"),
+            (lambda h: h.PoolTimeout("pool"), "not_sent"),
+            (lambda h: h.ReadTimeout("read"), "reply_lost"),
+            (lambda h: h.WriteTimeout("write"), "reply_lost"),
+            (lambda h: h.RemoteProtocolError("eof"), "reply_lost"),
+            (lambda h: RuntimeError("unknown"), "network_error"),
+        ],
+    )
+    def test_exception_maps_to_a_breaker_type(self, exc_factory, expected):
+        import asyncio
+
+        import httpx
+
+        from jacked.web.auth import _exchange_refresh_token
+
+        with patch("jacked.web.auth.httpx.AsyncClient",
+                   return_value=_post_raising(exc_factory(httpx))):
+            result = asyncio.run(_exchange_refresh_token("rt"))
+        assert result.success is False
+        assert result.error == expected
+        assert result.detail  # exception class name, never a token
+
+    def test_unreadable_200_body_is_reply_lost(self):
+        import asyncio
+
+        from jacked.web.auth import _exchange_refresh_token
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.side_effect = ValueError("not json")
+        client = AsyncMock()
+        client.post.return_value = resp
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            result = asyncio.run(_exchange_refresh_token("rt"))
+        assert result.error == "reply_lost"
+
+    def test_reply_lost_has_the_longer_cooldown(self):
+        from jacked.web.auth import CIRCUIT_BREAKER_COOLDOWNS
+
+        assert CIRCUIT_BREAKER_COOLDOWNS["reply_lost"] > CIRCUIT_BREAKER_COOLDOWNS["not_sent"]
+        assert CIRCUIT_BREAKER_COOLDOWNS["not_sent"] == 60
+
+    def test_reply_lost_marks_the_primary_chain_suspect(self, tmp_path):
+        import asyncio
+
+        import httpx
+
+        from jacked.web import auth
+        from jacked.web.auth import RefreshMode, _refresh_token_flow
+
+        auth.reset_locks()
+        db = _make_db(tmp_path)
+        with patch("jacked.web.auth.httpx.AsyncClient",
+                   return_value=_post_raising(httpx.ReadTimeout("slow"))):
+            result = asyncio.run(_refresh_token_flow(1, db, RefreshMode.PRIMARY))
+        assert result.error == "reply_lost"
+        row = db.get_account(1)
+        assert row["refresh_failure_type"] == "reply_lost"
+        assert row["refresh_last_failed_at"] is not None
+        assert row["refresh_token"] == "alice_rt"
+
+
+class TestHealRespectsNetworkBreaker:
+    def _invalid_with_breaker(self, tmp_path, failure_type, failed_at):
+        db = Database(str(tmp_path / "test.db"))
+        acct = db.create_account("heal@test.com", "tok", int(time.time()) + 3600,
+                                 refresh_token="rt-test")
+        db.update_account(acct["id"], validation_status="invalid",
+                          refresh_failure_type=failure_type,
+                          refresh_last_failed_at=failed_at)
+        return db, acct["id"]
+
+    @pytest.mark.parametrize("failure_type", ["not_sent", "reply_lost", "network_error"])
+    def test_network_breaker_in_cooldown_is_not_cleared_or_forced(
+        self, tmp_path, failure_type,
+    ):
+        import asyncio
+
+        from jacked.web.auth import heal_invalid_accounts
+
+        db, account_id = self._invalid_with_breaker(
+            tmp_path, failure_type, int(time.time()) - 5)
+        flow = AsyncMock()
+        with patch("jacked.web.auth.Database", return_value=db), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            result = asyncio.run(heal_invalid_accounts())
+
+        flow.assert_not_awaited()
+        assert result["deferred"] == 1
+        row = db.get_account(account_id)
+        assert row["refresh_failure_type"] == failure_type
+
+    def test_unreachable_network_defers_the_forced_renewal(self, tmp_path):
+        """2026-10-20: 76 forced renewals on account 1 while DNS was down."""
+        import asyncio
+
+        from jacked.web.auth import heal_invalid_accounts
+
+        db, account_id = self._invalid_with_breaker(tmp_path, "invalid_grant",
+                                                    int(time.time()) - 5)
+        flow = AsyncMock()
+        probe = AsyncMock(return_value=False)
+        with patch("jacked.web.auth.Database", return_value=db), \
+             patch("jacked.web.auth._refresh_token_flow", flow), \
+             patch("jacked.web.auth._network_reachable", probe):
+            result = asyncio.run(heal_invalid_accounts())
+
+        flow.assert_not_awaited()
+        probe.assert_awaited_once()
+        assert result["deferred"] == 1
+        assert db.get_account(account_id)["refresh_failure_type"] == "invalid_grant"
+
+    def test_expired_network_breaker_heals_normally(self, tmp_path):
+        import asyncio
+
+        from jacked.web.auth import TokenExchangeResult, heal_invalid_accounts
+
+        db, account_id = self._invalid_with_breaker(
+            tmp_path, "not_sent", int(time.time()) - 3600)
+        flow = AsyncMock(return_value=TokenExchangeResult(success=True, access_token="a"))
+        with patch("jacked.web.auth.Database", return_value=db), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            result = asyncio.run(heal_invalid_accounts())
+
+        flow.assert_awaited_once()
+        assert result["healed"] == 1
+
+    def test_probe_runs_once_per_pass(self, tmp_path):
+        import asyncio
+
+        from jacked.web.auth import heal_invalid_accounts
+
+        db = Database(str(tmp_path / "test.db"))
+        for n in range(3):
+            acct = db.create_account(f"h{n}@test.com", f"tok{n}",
+                                     int(time.time()) + 3600, refresh_token=f"rt{n}")
+            db.update_account(acct["id"], validation_status="invalid")
+        probe = AsyncMock(return_value=False)
+        with patch("jacked.web.auth.Database", return_value=db), \
+             patch("jacked.web.auth._refresh_token_flow", AsyncMock()), \
+             patch("jacked.web.auth._network_reachable", probe):
+            result = asyncio.run(heal_invalid_accounts())
+        assert probe.await_count == 1
+        assert result["deferred"] == 3
+
+
+# ---------------------------------------------------------------------------
+# B7: honest refresh accounting
+# ---------------------------------------------------------------------------
+
+
+class TestHonestRefreshAccounting:
+    def test_token_two_hours_from_expiry_is_skipped_not_refreshed(self, tmp_path):
+        import asyncio
+
+        from jacked.web import auth
+        from jacked.web.auth import refresh_all_expiring_tokens
+
+        auth.reset_locks()
+        db = Database(str(tmp_path / "test.db"))
+        db.create_account("two@test.com", "tok", int(time.time()) + 2 * 3600,
+                          refresh_token="rt")
+        flow = AsyncMock()
+        with patch("jacked.web.auth.Database", return_value=db), \
+             patch("jacked.api.credential_helpers.read_active_account_id",
+                   return_value=None), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            result = asyncio.run(refresh_all_expiring_tokens(buffer_seconds=14400))
+
+        flow.assert_not_awaited()
+        assert result["refreshed"] == 0
+        assert result["skipped"] == 1
+        assert result["failed"] == 0
+
+    def test_only_a_real_exchange_counts_as_refreshed(self, tmp_path):
+        import asyncio
+
+        from jacked.web import auth
+        from jacked.web.auth import (
+            RefreshOutcome,
+            TokenExchangeResult,
+            refresh_account_token_result,
+        )
+
+        auth.reset_locks()
+        db = Database(str(tmp_path / "test.db"))
+        acct = db.create_account("due@test.com", "tok", 0, refresh_token="rt")
+        exchanged = TokenExchangeResult(success=True, access_token="a", exchanged=True)
+        already = TokenExchangeResult(success=True, access_token="a")
+        with patch("jacked.web.auth._refresh_token_flow", AsyncMock(return_value=exchanged)):
+            assert asyncio.run(refresh_account_token_result(acct["id"], db)) \
+                is RefreshOutcome.EXCHANGED
+        with patch("jacked.web.auth._refresh_token_flow", AsyncMock(return_value=already)):
+            assert asyncio.run(refresh_account_token_result(acct["id"], db)) \
+                is RefreshOutcome.SKIPPED_NOT_DUE
+        failed = TokenExchangeResult(success=False, error="not_sent")
+        with patch("jacked.web.auth._refresh_token_flow", AsyncMock(return_value=failed)):
+            assert asyncio.run(refresh_account_token_result(acct["id"], db)) \
+                is RefreshOutcome.FAILED
+
+    def test_loop_log_reports_skipped_separately(self, caplog):
+        import asyncio
+        import logging
+
+        from jacked.api import main
+
+        results = iter([{"checked": 3, "refreshed": 1, "skipped": 2, "failed": 0,
+                         "cc_refreshed": 0, "cc_failed": 0}])
+
+        async def fake_refresh(buffer_seconds):
+            return next(results)
+
+        sleeps = {"n": 0}
+
+        async def fake_sleep(_s):
+            sleeps["n"] += 1
+            if sleeps["n"] > 1:
+                raise asyncio.CancelledError
+
+        with patch("jacked.web.auth.refresh_all_expiring_tokens", fake_refresh), \
+             patch.object(main.asyncio, "sleep", fake_sleep), \
+             caplog.at_level(logging.INFO, logger=main.logger.name):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(main._token_refresh_loop())
+
+        assert any(
+            "Token refresh: checked=3, refreshed=1, skipped=2, failed=0" in r.getMessage()
+            for r in caplog.records
+        )

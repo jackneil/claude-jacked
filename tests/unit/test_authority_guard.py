@@ -69,6 +69,8 @@ def _account(account_id: int, email: str, **overrides) -> dict:
         "cc_expires_at": 1000,
         "refresh_failure_type": None,
         "refresh_last_failed_at": None,
+        "cc_refresh_failure_type": None,
+        "cc_refresh_last_failed_at": None,
     }
     row.update(overrides)
     return row
@@ -192,7 +194,33 @@ def test_unknown_account_is_never_overwritten():
     assert activate.calls == []
 
 
-def test_stamped_payload_is_a_jacked_write():
+def test_stamped_payload_holding_known_tokens_is_a_jacked_write():
+    db = _db()
+    lookup = _profile("carol@test.com", "org-3")
+    activate = _Activator()
+
+    result = heal_foreign_authority(
+        db,
+        now=100.0,
+        profile_lookup=lookup,
+        activate=activate,
+        read_authority=lambda: {
+            "_jackedAccountId": 3,
+            **_foreign_payload(access="db_at_3", refresh="db_rt_3"),
+        },
+    )
+
+    assert result.action == "none"
+    assert result.foreign_account_id == 3
+    assert lookup.calls == []
+    assert db.updates == []
+    assert activate.calls == []
+
+
+def test_stamped_rotation_is_adopted_into_its_owner():
+    """Claude Code keeps the stamp when a session rotates its tokens, so the
+    old "unstamped means foreign" rule never saw a rotation (no adoption
+    line in four log rotations). The rotation is adopted, not reasserted."""
     db = _db()
     lookup = _profile("carol@test.com", "org-3")
     activate = _Activator()
@@ -205,11 +233,76 @@ def test_stamped_payload_is_a_jacked_write():
         read_authority=lambda: {"_jackedAccountId": 3, **_foreign_payload()},
     )
 
-    assert result.action == "none"
+    assert result.action == "rotation_adopted"
     assert result.foreign_account_id == 3
+    assert lookup.calls == ["live_at_3"]
+    assert db.accounts[3]["cc_access_token"] == "live_at_3"
+    assert db.accounts[3]["cc_refresh_token"] == "live_rt_3"
+    assert activate.calls == []
+
+
+def test_stamped_rotation_is_identified_once_per_payload():
+    db = _db()
+    lookup = _profile("nobody@test.com", "org-x")
+    payload = {"_jackedAccountId": 3, **_foreign_payload()}
+
+    for _ in range(3):
+        heal_foreign_authority(
+            db, now=100.0, profile_lookup=lookup, activate=_Activator(),
+            read_authority=lambda: payload,
+        )
+
+    assert lookup.calls == ["live_at_3"]
+    assert db.updates == []
+
+
+def test_stamped_payload_with_another_accounts_tokens_goes_to_the_owner():
+    """A /login to account 11 in a session writes 11's tokens under 3's
+    stamp. They belong in row 11, and row 3 must stay unchanged."""
+    db = _db()
+    activate = _Activator()
+
+    result = heal_foreign_authority(
+        db,
+        now=100.0,
+        profile_lookup=_profile("kim@test.com", "org-11"),
+        activate=activate,
+        read_authority=lambda: {
+            "_jackedAccountId": 3,
+            **_foreign_payload(access="live_at_11", refresh="live_rt_11"),
+        },
+    )
+
+    assert result.action == "rotation_adopted"
+    assert result.foreign_account_id == 11
+    assert db.accounts[11]["cc_access_token"] == "live_at_11"
+    assert db.accounts[3]["cc_access_token"] == "db_at_3"
+    assert db.accounts[3]["cc_refresh_token"] == "db_rt_3"
+    assert activate.calls == []
+
+
+def test_stamped_primary_fallback_publication_is_never_adopted():
+    """A row without cc tokens publishes its PRIMARY access token; that
+    token must never land in the cc_* columns."""
+    db = _db()
+    db.accounts[3].update(cc_access_token=None, cc_refresh_token=None,
+                          access_token="primary_at_3")
+    lookup = _profile("carol@test.com", "org-3")
+
+    result = heal_foreign_authority(
+        db,
+        now=100.0,
+        profile_lookup=lookup,
+        activate=_Activator(),
+        read_authority=lambda: {
+            "_jackedAccountId": 3,
+            "claudeAiOauth": {"accessToken": "primary_at_3", "refreshToken": None},
+        },
+    )
+
+    assert result.action == "none"
     assert lookup.calls == []
     assert db.updates == []
-    assert activate.calls == []
 
 
 def test_unchanged_foreign_payload_is_handled_once():
@@ -277,7 +370,7 @@ def test_second_reassert_within_the_rate_limit_is_skipped():
 
 def test_invalid_grant_keeps_the_refresh_token_out_of_the_database():
     db = _db()
-    db.accounts[3]["refresh_failure_type"] = "invalid_grant"
+    db.accounts[3]["cc_refresh_failure_type"] = "invalid_grant"
     activate = _Activator()
 
     result = heal_foreign_authority(
@@ -291,13 +384,29 @@ def test_invalid_grant_keeps_the_refresh_token_out_of_the_database():
     assert result.action == "reasserted"
     assert db.accounts[3]["cc_access_token"] == "live_at_3"
     assert db.accounts[3]["cc_refresh_token"] == "db_rt_3"
+    assert db.accounts[3]["cc_refresh_failure_type"] == "invalid_grant"
+
+
+def test_a_primary_chain_invalid_grant_does_not_block_a_cc_rotation():
+    db = _db()
+    db.accounts[3]["refresh_failure_type"] = "invalid_grant"
+
+    heal_foreign_authority(
+        db,
+        now=100.0,
+        profile_lookup=_profile("carol@test.com", "org-3"),
+        activate=_Activator(),
+        read_authority=lambda: _foreign_payload(),
+    )
+
+    assert db.accounts[3]["cc_refresh_token"] == "live_rt_3"
     assert db.accounts[3]["refresh_failure_type"] == "invalid_grant"
 
 
 def test_a_live_rotation_clears_the_failure_breaker():
     db = _db()
-    db.accounts[3]["refresh_failure_type"] = "server_error"
-    db.accounts[3]["refresh_last_failed_at"] = 12345.0
+    db.accounts[3]["cc_refresh_failure_type"] = "server_error"
+    db.accounts[3]["cc_refresh_last_failed_at"] = 12345.0
     activate = _Activator()
 
     heal_foreign_authority(
@@ -309,8 +418,8 @@ def test_a_live_rotation_clears_the_failure_breaker():
     )
 
     assert db.accounts[3]["cc_refresh_token"] == "live_rt_3"
-    assert db.accounts[3]["refresh_failure_type"] is None
-    assert db.accounts[3]["refresh_last_failed_at"] is None
+    assert db.accounts[3]["cc_refresh_failure_type"] is None
+    assert db.accounts[3]["cc_refresh_last_failed_at"] is None
 
 
 @pytest.mark.parametrize(
@@ -593,3 +702,45 @@ def test_a_held_switch_lease_is_retried_on_the_next_pass():
     assert second.action == "reasserted"
     assert len(lookup.calls) == 1
     assert len(free.calls) == 1
+
+
+def test_unstamped_payload_whose_profile_fails_the_owner_rule_is_not_adopted():
+    """The shared owner rule also checks the account uuid when both sides
+    carry one; a matched email alone does not prove the owner."""
+    db = _db()
+    db.accounts[3]["account_uuid"] = "uuid-carol"
+
+    def lookup(access_token):
+        return {
+            "account": {"email": "carol@test.com", "uuid": "uuid-someone-else"},
+            "organization": {"uuid": "org-3"},
+        }
+
+    heal_foreign_authority(
+        db,
+        now=100.0,
+        profile_lookup=lookup,
+        activate=_Activator(),
+        read_authority=lambda: _foreign_payload(),
+    )
+
+    assert db.accounts[3]["cc_access_token"] == "db_at_3"
+    assert db.accounts[3]["cc_refresh_token"] == "db_rt_3"
+
+
+def test_adoption_logs_a_values_free_info_line(caplog):
+    import logging
+
+    db = _db()
+    with caplog.at_level(logging.INFO, logger="jacked.api.authority_guard"):
+        heal_foreign_authority(
+            db,
+            now=100.0,
+            profile_lookup=_profile("carol@test.com", "org-3"),
+            activate=_Activator(),
+            read_authority=lambda: {"_jackedAccountId": 3, **_foreign_payload()},
+        )
+
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("Adopted rotated Claude Code tokens for account 3" in m for m in lines)
+    assert not any("live_at_3" in m or "live_rt_3" in m for m in lines)

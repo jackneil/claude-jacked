@@ -99,8 +99,8 @@ class TestUsageCeiling:
         assert result is None
         assert mod._get_usage_state(1)["backoff_until"] > time.time()
 
-    def test_429_backoff_capped_at_900s(self):
-        """429 with huge retry-after is capped at 900s (15 min)."""
+    def test_429_backoff_honors_retry_after_up_to_the_bound(self):
+        """A huge retry-after is honored, up to the 6h sanity bound."""
         import jacked.web.auth as mod
         mod._account_usage_state.clear()
         state = mod._get_usage_state(1)
@@ -111,7 +111,8 @@ class TestUsageCeiling:
              patch("jacked.web.auth._try_refresh_on_429", AsyncMock(return_value=None)):
             asyncio.run(fetch_usage(1, db))
         backoff = mod._get_usage_state(1)["backoff_until"] - time.time()
-        assert backoff <= 901
+        assert mod._USAGE_RETRY_AFTER_MAX_SECONDS - 5 <= backoff
+        assert backoff <= mod._USAGE_RETRY_AFTER_MAX_SECONDS + 1
 
 
 # ---------------------------------------------------------------------------
@@ -477,3 +478,231 @@ class TestEscalatingBackoff:
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
             asyncio.run(fetch_usage(1, db))
         assert state["consecutive_429s"] == 0
+
+
+# ---------------------------------------------------------------------------
+# B3: a 401 refreshes ONLY the lineage that owns the failing token
+# ---------------------------------------------------------------------------
+
+
+def _real_db(tmp_path, **cc):
+    """A real Database with one Claude account that holds both chains."""
+    from jacked.web.database import Database
+
+    db = Database(str(tmp_path / "chains.db"))
+    db.create_account(
+        email="alice@test.com",
+        access_token="primary_at",
+        refresh_token="primary_rt",
+        expires_at=int(time.time()) + 6 * 3600,
+        scopes=None,
+    )
+    db.update_account(
+        1,
+        cc_access_token=cc.get("cc_access_token", "cc_at"),
+        cc_refresh_token=cc.get("cc_refresh_token", "cc_rt"),
+        cc_expires_at=cc.get("cc_expires_at", int(time.time()) + 6 * 3600),
+        cc_refresh_failure_type=cc.get("cc_refresh_failure_type"),
+    )
+    return db
+
+
+def _seq_client(*statuses):
+    """Usage GETs answer the given statuses in order; records the tokens sent."""
+    sent: list[str] = []
+    resps = []
+    for status in statuses:
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = {}
+        resp.json.return_value = (
+            {"five_hour": {"utilization": 5.0, "resets_at": "R5"},
+             "seven_day": {"utilization": 6.0, "resets_at": "R7"}}
+            if status == 200 else {}
+        )
+        resps.append(resp)
+
+    async def get(url, headers=None, **_kw):
+        sent.append(headers["Authorization"].removeprefix("Bearer "))
+        return resps.pop(0)
+
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(side_effect=get)
+    return client, sent
+
+
+class TestCcToken401Ownership:
+    def setup_method(self):
+        import jacked.web.auth as mod
+
+        mod._account_usage_state.clear()
+        mod._profile_refreshed_at[1] = time.time()  # no piggybacked profile GET
+        mod.reset_locks()
+
+    def test_cc_401_on_active_account_falls_back_to_primary_and_records_cc_failure(
+        self, tmp_path,
+    ):
+        """The active account's cc chain belongs to Claude Code (I2): a 401
+        on its cc token must not rotate it, must not take the primary
+        circuit-breaker path, must record the cc failure, and the retry
+        uses the primary token."""
+        from jacked.web.auth import RefreshMode
+
+        db = _real_db(tmp_path)
+        client, sent = _seq_client(401, 200)
+        flow = AsyncMock()
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._active_account_id", AsyncMock(return_value=1)), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            result = asyncio.run(fetch_usage(1, db, access_token="cc_at"))
+
+        assert result is not None and "five_hour" in result
+        assert sent == ["cc_at", "primary_at"]
+        assert all(c.args[2] != RefreshMode.PRIMARY_CIRCUIT_BREAKER for c in flow.await_args_list)
+        flow.assert_not_awaited()
+        row = db.get_account(1)
+        assert row["cc_refresh_failure_type"] == "auth_rejected"
+        assert row["cc_refresh_last_failed_at"] is not None
+        # Primary chain untouched.
+        assert row["refresh_token"] == "primary_rt"
+        assert row["refresh_failure_type"] is None
+
+    def test_after_a_cc_401_the_chooser_stops_picking_the_cc_token(self, tmp_path):
+        from jacked.web.auth import choose_usage_token
+
+        db = _real_db(tmp_path)
+        client, _sent = _seq_client(401, 200)
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._active_account_id", AsyncMock(return_value=1)):
+            asyncio.run(fetch_usage(1, db, access_token="cc_at"))
+
+        choice = choose_usage_token(db.get_account(1))
+        assert choice.chain == "primary"
+        assert choice.token == "primary_at"
+
+    def test_cc_401_on_inactive_account_rotates_only_the_cc_chain(self, tmp_path):
+        from jacked.web.auth import RefreshMode, TokenExchangeResult
+
+        db = _real_db(tmp_path)
+        client, sent = _seq_client(401, 200)
+        calls: list = []
+
+        async def flow(account_id, db_, mode):
+            calls.append(mode)
+            db_.update_account(account_id, cc_access_token="cc_at_new")
+            return TokenExchangeResult(
+                success=True, access_token="cc_at_new", exchanged=True, chain="cc",
+            )
+
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._active_account_id", AsyncMock(return_value=7)), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            asyncio.run(fetch_usage(1, db, access_token="cc_at"))
+
+        assert calls == [RefreshMode.CC]
+        assert sent == ["cc_at", "cc_at_new"]
+        assert db.get_account(1)["cc_refresh_failure_type"] is None
+
+    def test_primary_401_still_uses_the_primary_circuit_breaker(self, tmp_path):
+        from jacked.web.auth import RefreshMode, TokenExchangeResult
+
+        db = _real_db(tmp_path)
+        client, _sent = _seq_client(401, 200)
+        calls: list = []
+
+        async def flow(account_id, db_, mode):
+            calls.append(mode)
+            return TokenExchangeResult(success=True, access_token="primary_at_new")
+
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            asyncio.run(fetch_usage(1, db))
+
+        assert calls == [RefreshMode.PRIMARY_CIRCUIT_BREAKER]
+        assert db.get_account(1)["cc_refresh_failure_type"] is None
+
+    def test_429_on_cc_token_never_rotates_the_primary_chain(self, tmp_path):
+        """The old cc_429 path silently renewed the PRIMARY chain whenever
+        the cc refresh token was gone."""
+        db = _real_db(tmp_path, cc_refresh_token=None)
+        client, _sent = _seq_client(429)
+        flow = AsyncMock()
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            assert asyncio.run(fetch_usage(1, db, access_token="cc_at")) is None
+        flow.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# B5: null windows and null resets_at
+# ---------------------------------------------------------------------------
+
+
+class TestNullWindows:
+    def setup_method(self):
+        import jacked.web.auth as mod
+
+        mod._account_usage_state.clear()
+        mod._profile_refreshed_at[1] = time.time()
+
+    def _fetch(self, db, body):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.json.return_value = body
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock(return_value=resp)
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            return asyncio.run(fetch_usage(1, db))
+
+    def test_null_top_level_window_does_not_raise_and_clears_it(self, tmp_path):
+        db = _real_db(tmp_path)
+        db.update_account_usage_cache(
+            1, five_hour=40.0, five_hour_resets_at="2026-10-17T10:00:00Z")
+        db.update_account(1, usage_cached_at=0)
+
+        body = {"five_hour": None, "seven_day": {"utilization": 12.0, "resets_at": "R7"}}
+        assert self._fetch(db, body) == body
+
+        row = db.get_account(1)
+        assert row["cached_usage_5h"] is None
+        assert row["cached_5h_resets_at"] is None
+        assert row["cached_usage_7d"] == 12.0
+        assert row["cached_7d_resets_at"] == "R7"
+
+    def test_null_resets_at_clears_the_stale_reset_and_keeps_utilization(self, tmp_path):
+        """Account 1 kept a 10-17 reset for 9 days while the API said
+        resets_at: null."""
+        db = _real_db(tmp_path)
+        db.update_account_usage_cache(
+            1, five_hour=40.0, five_hour_resets_at="2026-10-17T10:00:00Z",
+            seven_day=50.0, seven_day_resets_at="2026-10-20T10:00:00Z")
+        db.update_account(1, usage_cached_at=0)
+
+        body = {
+            "five_hour": {"utilization": 0.0, "resets_at": None},
+            "seven_day": {"utilization": 51.0, "resets_at": None},
+        }
+        self._fetch(db, body)
+
+        row = db.get_account(1)
+        assert row["cached_usage_5h"] == 0.0
+        assert row["cached_5h_resets_at"] is None
+        assert row["cached_usage_7d"] == 51.0
+        assert row["cached_7d_resets_at"] is None
+
+    def test_missing_window_key_keeps_the_old_cache(self, tmp_path):
+        db = _real_db(tmp_path)
+        db.update_account_usage_cache(
+            1, seven_day=50.0, seven_day_resets_at="R7-old")
+        db.update_account(1, usage_cached_at=0)
+
+        self._fetch(db, {"five_hour": {"utilization": 3.0, "resets_at": "R5"}})
+
+        row = db.get_account(1)
+        assert row["cached_usage_7d"] == 50.0
+        assert row["cached_7d_resets_at"] == "R7-old"
