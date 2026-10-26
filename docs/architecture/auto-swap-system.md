@@ -227,6 +227,48 @@ backoff, circuit-breaker state, invalid-account healing, and window-keeper
 activity. Those mechanisms update usage and account health, but they do not
 authorize auto-swap credential mutation.
 
+### 11.1 Window keeper
+
+The window keeper opens a 5-hour window on each enabled account when the
+window has lapsed. It runs in `full_sweep_loop`
+(`jacked/api/usage_monitor.py`) at the `usage_check_interval`. The wait
+between sweeps uses the wall clock, so a closed laptop does not stretch it.
+
+The keeper pings an account only inside active hours. The pre-wake pass runs
+once on each local date: on the first sweep at or after the pre-wake time and
+before active hours. The setting `window_keeper_prewake_done` holds the local
+date of the last pre-wake pass.
+
+The keeper pings with the Claude Code token. It uses the primary token when
+the account has no Claude Code token. A rejected token (401 or 403) starts
+this sequence:
+
+1. Get a new token for the chain that owns the rejected token. For the active
+   account, reconcile from the live store. Do not rotate its Claude Code
+   refresh token.
+2. Ping one time with the new token.
+3. Ping with the primary token if the keeper did not try it yet.
+4. If all tokens fail, set the state `needs_reauth`. The keeper stops for
+   that account until its token changes.
+
+A 429 does not rotate a token. The next attempt comes from `retry-after`, then
+from the `anthropic-ratelimit-unified-5h-reset` header, then from the
+exponential backoff. A network error or a 5xx retries on the next sweep and
+does not increase the backoff. The backoff records a fingerprint of the token
+that failed. A new token clears the backoff. Each path that stores new tokens
+calls `clear_ping_backoff`, which also starts a sweep at once.
+
+After a successful ping, the keeper stores the window from the ping's reset
+header. Then it reads usage with the token that worked
+(`fetch_usage(..., post_ping=True)`). That read skips the 180-second ceiling
+but keeps the 20-second manual floor.
+
+The keeper writes its state for each account to `accounts.keeper_state`
+(JSON; see `Database.set_keeper_state`). The accounts API returns it as
+`keeper_state`, without the token fingerprint. The dashboard uses it to show
+why a window has no future reset, for example "needs re-auth",
+"retrying 3:45 PM", or "paused until 06:00".
+
 Legacy compatibility helpers still exist for narrowly scoped refresh and
 reconciliation paths. `_execute_swap()` must not fall back to them when no
 certified transaction engine exists.

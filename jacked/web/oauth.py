@@ -81,6 +81,16 @@ ORG_TYPE_MAP = {
 }
 
 
+def _clear_keeper_backoff(account_id: int) -> None:
+    """Drop the window keeper's ping backoff for an account with new tokens."""
+    try:
+        from jacked.api.usage_monitor import clear_ping_backoff
+
+        clear_ping_backoff(account_id)
+    except Exception:  # noqa: BLE001 - never fail a token store over this
+        logger.debug("Could not clear the keeper backoff", exc_info=True)
+
+
 def _stored_profile_org(row: dict) -> str | None:
     """Return the org uuid of the row's verified stored profile, or None.
 
@@ -1055,6 +1065,9 @@ class OAuthFlow:
             )
 
         logger.info("Account stored: id=%d", account["id"])
+        # New tokens: the window keeper must re-ping at once, not wait out a
+        # backoff armed against the old token.
+        _clear_keeper_backoff(account["id"])
         return account
 
     def _store_cc_tokens(self, tokens: dict, profile: dict) -> dict:
@@ -1151,5 +1164,6 @@ class OAuthFlow:
             )
 
         logger.info("CC tokens stored for account %d", account_id)
+        _clear_keeper_backoff(account_id)
         # Return the full account row so credential sync works
         return self.db.get_account(account_id)

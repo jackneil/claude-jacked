@@ -88,12 +88,44 @@ _STALL_USAGE_STALENESS_SECONDS = 1800
 _STALL_WARNING_COOLDOWN_SECONDS = 1800
 
 # Window-keeper ping backoff: account_id -> {"fails": int, "skip_until": float
-# (monotonic)}. A consecutively-failing ping (e.g. an exhausted account
-# answering 429) must not be retried every sweep forever — 2026-06 incident:
-# one account pinged every 120s for hours, 429 every time. Exponential
-# backoff capped at 1h; cleared on the first successful ping.
+# (wall-clock epoch), "token_fp": str | None}. A consecutively-failing ping
+# (e.g. an exhausted account answering 429) must not be retried every sweep
+# forever — 2026-06 incident: one account pinged every 120s for hours, 429
+# every time. Exponential backoff capped at 1h; cleared on the first
+# successful ping, and dropped as soon as the account's token fingerprint
+# changes (a re-auth must never wait out the old token's backoff). Wall
+# clock, not monotonic: macOS monotonic time stops while the lid is closed,
+# which would stretch a 1h backoff across a whole night of dark wakes.
+# Transport errors and 5xx never increment ``fails``.
 _ping_backoff: dict[int, dict] = {}
 _PING_BACKOFF_CAP_SECONDS = 3600
+# Seconds between a keeper pass's per-ping pacing sleeps.
+_KEEPER_PING_PACING_SECONDS = 2
+# Upper bound on a single wall-clock wait slice. Short slices let a dark
+# wake (a few seconds every ~15 min with the lid closed) notice that the
+# deadline has passed.
+_SWEEP_SLEEP_SLICE_SECONDS = 5.0
+# Settings key holding the local ISO date of the last pre-wake pass.
+_PREWAKE_DONE_KEY = "window_keeper_prewake_done"
+# Consecutive auth failures with a rotation still in flight before the
+# keeper gives up and asks for a re-auth.
+_AUTH_FAILURES_BEFORE_REAUTH = 3
+
+
+def clear_ping_backoff(account_id: int) -> None:
+    """Forget an account's keeper ping backoff and wake the sweep.
+
+    Called by every path that stores new tokens for an account (OAuth
+    add/re-auth, CC token store, live-store reconcile, authority-guard
+    import) so the keeper re-pings at once instead of waiting out a backoff
+    armed against the old token. Safe from a worker thread: the sweep only
+    polls ``_sweep_wake.is_set()``, so ``set()`` has no waiters to wake.
+    """
+    try:
+        _ping_backoff.pop(int(account_id), None)
+    except (TypeError, ValueError):
+        return
+    _sweep_wake.set()
 
 
 def reset_locks() -> None:
@@ -1913,8 +1945,527 @@ async def all_accounts_refresh_loop(app):
 # -----------------------------------------------------------------------
 
 
+async def _sleep_until(deadline: float) -> None:
+    """Wait until the WALL-CLOCK *deadline* or until ``_sweep_wake`` is set.
+
+    The old wait counted nominal 5 s increments, so every slice that the
+    process spent asleep (lid closed, dark wakes of a few seconds every
+    ~15 min) still counted as 5 s and a 5-minute wait took hours of real
+    time. ``time.time()`` is the wall clock: it keeps advancing across
+    system sleep, where macOS monotonic time does not.
+    """
+    while not _sweep_wake.is_set():
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(_SWEEP_SLEEP_SLICE_SECONDS, remaining))
+
+
+def _keeper_state_of(acct: dict) -> dict:
+    from jacked.web.database import Database
+
+    return Database.parse_keeper_state(acct.get("keeper_state"))
+
+
+def _write_keeper_state(db, account_id: int, **fields) -> None:
+    """Persist keeper state; a DB hiccup must never break the sweep."""
+    try:
+        db.set_keeper_state(account_id, **fields)
+    except Exception:
+        logger.warning(
+            "Window keeper: could not persist state for account %s",
+            account_id,
+            exc_info=True,
+        )
+
+
+def _note_keeper_skip(
+    db, acct: dict, state: dict, reason: str | None, next_attempt_at=None
+) -> None:
+    """Record why the keeper did not ping an account — only on change."""
+    if state.get("skip_reason") == reason and (
+        reason != "backoff" or state.get("next_attempt_at") == next_attempt_at
+    ):
+        return
+    fields: dict = {"skip_reason": reason}
+    if reason == "backoff" or next_attempt_at is not None:
+        fields["next_attempt_at"] = next_attempt_at
+    if reason is not None and not state.get("last_status"):
+        fields["last_status"] = "skipped"
+    _write_keeper_state(db, acct["id"], **fields)
+    state.update(fields)
+
+
+def _arm_ping_backoff(
+    account_id: int, token_fp: str | None, check_interval: float, now: float
+) -> float:
+    """Escalate the account's backoff by one failure; return skip_until."""
+    entry = _ping_backoff.setdefault(
+        account_id, {"fails": 0, "skip_until": 0.0, "token_fp": token_fp}
+    )
+    entry["token_fp"] = token_fp
+    entry["fails"] += 1
+    delay = min(check_interval * 2 ** entry["fails"], _PING_BACKOFF_CAP_SECONDS)
+    entry["skip_until"] = now + delay
+    logger.info(
+        "Window keeper: ping failed for account %d — backing off %.0fs "
+        "(%d consecutive failures)",
+        account_id,
+        delay,
+        entry["fails"],
+    )
+    return entry["skip_until"]
+
+
+def _ping_window_cache_fields(result) -> dict:
+    """update_account_usage_cache kwargs from a successful ping's headers."""
+    fields: dict = {}
+    reset_5h = result.reset_5h_iso()
+    reset_7d = result.reset_7d_iso()
+    if reset_5h:
+        fields["five_hour_resets_at"] = reset_5h
+    if reset_7d:
+        fields["seven_day_resets_at"] = reset_7d
+    # Utilization headers are a 0..1 fraction; the usage API (and the cache
+    # columns) use percent. Only written next to a reset, so a stamp of
+    # usage_cached_at always comes with real window data.
+    for header, key in (
+        ("anthropic-ratelimit-unified-5h-utilization", "five_hour"),
+        ("anthropic-ratelimit-unified-7d-utilization", "seven_day"),
+    ):
+        raw = result.rate_limit.get(header)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= value <= 1.0:
+            fields[key] = round(value * 100.0, 2)
+    if "five_hour_resets_at" not in fields and "seven_day_resets_at" not in fields:
+        return {}
+    return fields
+
+
+async def _keeper_auth_ladder(db, acct: dict, failed_token: str, failed_is_cc: bool, tried: set):
+    """Recover from a 401/403 ping. Returns (good_token, last_result, lock_held).
+
+    1. Get a new token for the chain that owns the failed token: the active
+       account reconciles from Claude Code's live store (never rotate its CC
+       refresh token: Claude Code holds that single-use token and would hit
+       invalid_grant, see tests/unit/test_active_account_cc_skip.py); another
+       account force-rotates its CC chain; a failed PRIMARY token rotates the
+       primary chain (jacked's own, never handed to Claude Code).
+    2. Re-ping once with that token.
+    3. Ping with the primary access token if it is present and untried.
+    """
+    from jacked.web import auth as auth_mod
+    from jacked.web import window_keeper as wk
+
+    account_id = acct["id"]
+    candidate = None
+    last = None
+    lock_held = False
+
+    from jacked.api.credential_helpers import read_active_account_id
+
+    is_active = read_active_account_id() == account_id
+    if is_active:
+        logger.info(
+            "Window keeper: skipping CC refresh for active account %d — "
+            "reconciling instead",
+            account_id,
+        )
+        try:
+            from jacked.api.credential_helpers import (
+                reconcile_credentials_from_live_store,
+            )
+
+            await asyncio.to_thread(
+                reconcile_credentials_from_live_store, account_id, db
+            )
+            fresh = db.get_account(account_id) or {}
+            candidate = fresh.get("cc_access_token")
+        except Exception:
+            logger.exception(
+                "Window keeper reconcile failed for active account %d", account_id
+            )
+    if (candidate is None or candidate in tried) and failed_is_cc and not is_active:
+        res = await auth_mod.refresh_cc_token_result(account_id, db, force=True)
+        logger.info(
+            "Window keeper: forced CC rotation for account %d: %s",
+            account_id,
+            res.outcome.value,
+        )
+        lock_held = res.outcome is auth_mod.CCRefreshOutcome.LOCK_HELD
+        candidate = res.access_token if res.new_token else None
+    elif (candidate is None or candidate in tried) and not failed_is_cc:
+        try:
+            candidate = await auth_mod._try_refresh_primary_token(
+                account_id, db, stale_token=failed_token
+            )
+        except Exception:
+            logger.warning(
+                "Window keeper: primary rotation raised for account %d",
+                account_id,
+                exc_info=True,
+            )
+            candidate = None
+        logger.info(
+            "Window keeper: primary rotation for account %d: %s",
+            account_id,
+            "new token" if candidate and candidate not in tried else "no new token",
+        )
+
+    if candidate and candidate not in tried:
+        tried.add(candidate)
+        last = await wk.ping_account(candidate, account_id=account_id)
+        if last.ok:
+            return candidate, last, lock_held
+        if not last.is_auth_failure:
+            return None, last, lock_held
+
+    row = db.get_account(account_id) or acct
+    primary = row.get("access_token")
+    if primary and primary not in tried:
+        tried.add(primary)
+        logger.info(
+            "Window keeper: trying the primary token for account %d", account_id
+        )
+        last = await wk.ping_account(primary, account_id=account_id)
+        if last.ok:
+            return primary, last, lock_held
+    return None, last, lock_held
+
+
+async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
+    """Run the keeper for one account. Returns 'pinged', 'failed' or 'skipped'."""
+    from jacked.web import auth as auth_mod
+    from jacked.web import window_keeper as wk
+
+    account_id = acct["id"]
+    state = _keeper_state_of(acct)
+
+    if (acct.get("provider") or "claude") == "codex":
+        _note_keeper_skip(db, acct, state, "codex_no_keeper")
+        return "skipped"
+
+    needs_5h = wk.needs_ping(acct.get("cached_5h_resets_at"))
+    needs_7d = wk.needs_7d_ping(
+        acct.get("cached_7d_resets_at"), acct.get("usage_cached_at")
+    )
+    if (
+        needs_7d
+        and not needs_5h
+        and acct.get("cached_7d_resets_at") is None
+        and state.get("last_status") == "ok"
+        and time.time() - float(state.get("last_ping_at") or 0) < 5 * 3600
+    ):
+        # A successful ping inside the open 5h window already started the
+        # 7d window; a usage read that reports no 7d reset is not a reason
+        # to ping again every sweep.
+        needs_7d = False
+    if not needs_5h and not needs_7d:
+        if state.get("skip_reason"):
+            _note_keeper_skip(db, acct, state, None)
+        return "skipped"
+    if not acct.get("auto_swap_enabled"):
+        _note_keeper_skip(db, acct, state, "auto_swap_disabled")
+        return "skipped"
+
+    cc_token = acct.get("cc_access_token")
+    # Workstream B records a dead CC chain per chain; treat it like a
+    # missing CC token and go straight to the primary token.
+    if acct.get("cc_refresh_failure_type") == "invalid_grant":
+        cc_token = None
+    primary_token = acct.get("access_token")
+    first_token = cc_token or primary_token
+    if not first_token:
+        _note_keeper_skip(db, acct, state, "no_token")
+        return "skipped"
+    first_is_cc = bool(cc_token)
+    fp = wk.token_fingerprint(first_token)
+    now = time.time()
+
+    if state.get("last_status") == "needs_reauth" and state.get("token_fp") == fp:
+        logger.debug(
+            "Window keeper: account %d needs re-auth — waiting for a new token",
+            account_id,
+        )
+        if state.get("skip_reason"):
+            _note_keeper_skip(db, acct, state, None)
+        return "skipped"
+
+    entry = _ping_backoff.get(account_id)
+    if entry is not None and entry.get("token_fp") != fp:
+        logger.info(
+            "Window keeper: account %d has a new token — dropping its ping backoff",
+            account_id,
+        )
+        _ping_backoff.pop(account_id, None)
+        entry = None
+    skip_until = entry["skip_until"] if entry is not None else None
+    if (
+        skip_until is None
+        and state.get("token_fp") == fp
+        and state.get("last_status") in ("rate_limited", "auth_failed", "error", "ping_ok_no_window")
+    ):
+        # Restart: honor the schedule persisted before the process died.
+        skip_until = state.get("next_attempt_at")
+    if skip_until and skip_until > now:
+        logger.debug(
+            "Window keeper: account %d in ping backoff for %.0fs more — skipping",
+            account_id,
+            skip_until - now,
+        )
+        _note_keeper_skip(db, acct, state, "backoff", next_attempt_at=skip_until)
+        return "skipped"
+
+    logger.info(
+        "Window keeper: pinging account %d (%s)%s%s",
+        account_id,
+        acct.get("email", "?"),
+        " [5h expired]" if needs_5h else "",
+        " [7d reset]" if needs_7d else "",
+    )
+    tried = {first_token}
+    result = await wk.ping_account(first_token, account_id=account_id)
+    good_token = first_token if result.ok else None
+    lock_held = False
+    if not result.ok and result.is_auth_failure:
+        good_token, ladder_last, lock_held = await _keeper_auth_ladder(
+            db, acct, first_token, first_is_cc, tried
+        )
+        if good_token is not None:
+            result = ladder_last
+        elif ladder_last is not None:
+            result = ladder_last
+
+    now = time.time()
+    if good_token is not None:
+        _ping_backoff.pop(account_id, None)
+        cache_fields = _ping_window_cache_fields(result)
+        if cache_fields:
+            try:
+                db.update_account_usage_cache(account_id, **cache_fields)
+            except Exception:
+                logger.warning(
+                    "Window keeper: could not store the ping's window for "
+                    "account %d",
+                    account_id,
+                    exc_info=True,
+                )
+        try:
+            await asyncio.wait_for(
+                auth_mod.fetch_usage(
+                    account_id, db, access_token=good_token, post_ping=True
+                ),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Full sweep: fetch_usage for account %d exceeded 10s — moving on",
+                account_id,
+            )
+        fresh = db.get_account(account_id) or {}
+        window_open = not wk.needs_ping(fresh.get("cached_5h_resets_at"))
+        fields = {
+            "last_ping_at": int(now),
+            "last_status": "ok" if window_open else "ping_ok_no_window",
+            "error_type": None,
+            "request_id": result.request_id,
+            "consecutive_auth_failures": 0,
+            "next_attempt_at": None,
+            "skip_reason": None,
+            "token_fp": wk.token_fingerprint(good_token),
+        }
+        if not window_open:
+            logger.warning(
+                "Window keeper: ping for account %d succeeded but no open 5h "
+                "window is recorded (no reset header, usage read-back did not "
+                "land)",
+                account_id,
+            )
+            fields["next_attempt_at"] = _arm_ping_backoff(
+                account_id, fields["token_fp"], check_interval, now
+            )
+        _write_keeper_state(db, account_id, **fields)
+        return "pinged"
+
+    # -- Failure classification (by the LAST attempt) ---------------------
+    base = {
+        "last_ping_at": int(now),
+        "error_type": result.error_type,
+        "request_id": result.request_id,
+        "skip_reason": None,
+        "token_fp": fp,
+    }
+    auth_failures = int(state.get("consecutive_auth_failures") or 0)
+    if result.is_auth_failure:
+        auth_failures += 1
+        if lock_held and auth_failures < _AUTH_FAILURES_BEFORE_REAUTH:
+            # A CC rotation is in flight; its new token may land any moment.
+            skip_until = _arm_ping_backoff(account_id, fp, check_interval, now)
+            _write_keeper_state(
+                db,
+                account_id,
+                last_status="auth_failed",
+                consecutive_auth_failures=auth_failures,
+                next_attempt_at=skip_until,
+                **base,
+            )
+            return "failed"
+        _ping_backoff.pop(account_id, None)
+        fresh = db.get_account(account_id) or acct
+        fresh_cc = fresh.get("cc_access_token")
+        if fresh.get("cc_refresh_failure_type") == "invalid_grant":
+            fresh_cc = None
+        base["token_fp"] = wk.token_fingerprint(fresh_cc or fresh.get("access_token"))
+        logger.warning(
+            "Window keeper: every token for account %d was rejected "
+            "(status=%s error_type=%s) — re-auth needed; pings stop until "
+            "the account gets a new token",
+            account_id,
+            result.status,
+            result.error_type,
+        )
+        _write_keeper_state(
+            db,
+            account_id,
+            last_status="needs_reauth",
+            consecutive_auth_failures=auth_failures,
+            next_attempt_at=None,
+            **base,
+        )
+        return "failed"
+
+    if result.is_rate_limited:
+        retry_at = None
+        if result.retry_after is not None:
+            retry_at = now + result.retry_after
+        else:
+            reset_iso = result.reset_5h_iso()
+            if reset_iso:
+                try:
+                    reset_ts = datetime.fromisoformat(reset_iso).timestamp()
+                except ValueError:
+                    reset_ts = None
+                if reset_ts and reset_ts > now:
+                    retry_at = reset_ts
+        if retry_at is None:
+            retry_at = _arm_ping_backoff(account_id, fp, check_interval, now)
+        else:
+            entry = _ping_backoff.setdefault(
+                account_id, {"fails": 0, "skip_until": 0.0, "token_fp": fp}
+            )
+            entry["token_fp"] = fp
+            entry["skip_until"] = retry_at
+        base["error_type"] = result.error_type or "rate_limited"
+        _write_keeper_state(
+            db,
+            account_id,
+            last_status="rate_limited",
+            next_attempt_at=retry_at,
+            **base,
+        )
+        return "failed"
+
+    if result.is_transient:
+        # Network or server trouble says nothing about the account: retry on
+        # the next sweep and leave the escalation count alone.
+        entry = _ping_backoff.get(account_id)
+        if entry is not None:
+            entry["skip_until"] = 0.0
+        _write_keeper_state(
+            db,
+            account_id,
+            last_status="transport",
+            next_attempt_at=now + check_interval,
+            **base,
+        )
+        return "failed"
+
+    skip_until = _arm_ping_backoff(account_id, fp, check_interval, now)
+    _write_keeper_state(
+        db,
+        account_id,
+        last_status="error",
+        next_attempt_at=skip_until,
+        **base,
+    )
+    return "failed"
+
+
+async def _run_window_keeper(db, check_interval: float) -> int:
+    """One keeper pass over every enabled account. Returns windows pinged."""
+    from jacked.web import window_keeper as wk
+
+    accounts = db.list_accounts(include_inactive=False)
+    wk_start = _setting_str(db, "window_keeper_active_start", "06:00")
+    wk_end = _setting_str(db, "window_keeper_active_end", "23:00")
+    wk_prewake = _setting_str(db, "window_keeper_prewake", "04:00")
+
+    # Local time intentional: users configure active hours in their local
+    # timezone (e.g. "06:00" means local 6am).
+    now_local = datetime.now()
+    active = wk.is_active_hours(now_local, start=wk_start, end=wk_end)
+    prewake = False
+    if not active:
+        prewake = wk.prewake_due(
+            now_local,
+            prewake=wk_prewake,
+            active_start=wk_start,
+            active_end=wk_end,
+            done_date=db.get_setting(_PREWAKE_DONE_KEY),
+        )
+        if prewake:
+            db.set_setting(_PREWAKE_DONE_KEY, now_local.date().isoformat())
+            logger.info(
+                "Window keeper: pre-wake pass for %s", now_local.date().isoformat()
+            )
+
+    pinged = 0
+    for acct in accounts:
+        try:
+            if not (active or prewake):
+                _note_keeper_skip(
+                    db, acct, _keeper_state_of(acct), "outside_active_hours"
+                )
+                continue
+            outcome = await _keeper_process_account(db, acct, check_interval)
+            if outcome == "pinged":
+                pinged += 1
+            if outcome != "skipped":
+                await asyncio.sleep(_KEEPER_PING_PACING_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # One bad row must never skip every later account.
+            logger.exception(
+                "Window keeper: account %s failed this sweep — continuing",
+                acct.get("id") if isinstance(acct, dict) else "?",
+            )
+    return pinged
+
+
+def _note_keeper_disabled(db) -> None:
+    """Record 'keeper_disabled' on every account whose reason differs."""
+    try:
+        accounts = db.list_accounts(include_inactive=False)
+    except Exception:
+        logger.debug("Window keeper: could not list accounts", exc_info=True)
+        return
+    for acct in accounts:
+        try:
+            _note_keeper_skip(db, acct, _keeper_state_of(acct), "keeper_disabled")
+        except Exception:
+            logger.debug(
+                "Window keeper: could not record keeper_disabled", exc_info=True
+            )
+
+
 async def full_sweep_loop(app):
-    """Fetch usage for all non-active accounts and run window keeper.
+    """Run the window keeper over all accounts on a wall-clock schedule.
 
     Runs at the user-configurable ``usage_check_interval`` (default 300s).
     Never crashes — all errors are caught and logged per tick.
@@ -1929,178 +2480,25 @@ async def full_sweep_loop(app):
         iter_count += 1
         logger.info("Full-sweep heartbeat: iter=%d", iter_count)
         check_interval = _default_interval
+        deadline = time.time() + check_interval
         try:
             db = getattr(app.state, "db", None)
             if db is None:
                 await asyncio.sleep(60)
                 continue
 
-            # -- Settings ------------------------------------------------
             window_keeper_enabled = _setting_bool(db, "window_keeper_enabled", False)
             check_interval = _setting_float(db, "usage_check_interval", 300)
+            deadline = time.time() + check_interval
 
             if not window_keeper_enabled:
-                await asyncio.sleep(check_interval)
-                continue
-
-            # -- Late imports --------------------------------------------
-            from jacked.web.auth import fetch_usage
-            from jacked.web.window_keeper import (
-                is_active_hours,
-                is_prewake_time,
-                needs_ping,
-                needs_7d_ping,
-                ping_account,
-            )
-
-            # -- Window keeper -------------------------------------------
-            accounts = db.list_accounts(include_inactive=False)
-            sweep_pinged = 0
-
-            wk_start = _setting_str(db, "window_keeper_active_start", "06:00")
-            wk_end = _setting_str(db, "window_keeper_active_end", "23:00")
-            wk_prewake = _setting_str(db, "window_keeper_prewake", "04:00")
-
-            # Local time intentional: users configure active hours in
-            # their local timezone (e.g. "06:00" means local 6am).
-            now = datetime.now()
-            should_ping = is_active_hours(
-                now, start=wk_start, end=wk_end
-            ) or is_prewake_time(
-                now,
-                prewake=wk_prewake,
-                check_interval_min=check_interval / 60,
-            )
-
-            if should_ping:
-                for acct in accounts:
-                    needs_5h = needs_ping(acct.get("cached_5h_resets_at"))
-                    needs_7d = needs_7d_ping(
-                        acct.get("cached_7d_resets_at"),
-                        acct.get("usage_cached_at"),
-                    )
-                    if not needs_5h and not needs_7d:
-                        continue
-                    if not acct.get("auto_swap_enabled"):
-                        continue
-                    cc_at = acct.get("cc_access_token")
-                    if not cc_at:
-                        continue
-                    _backoff = _ping_backoff.get(acct["id"])
-                    if _backoff and _backoff["skip_until"] > time.monotonic():
-                        logger.debug(
-                            "Window keeper: account %d in ping backoff for "
-                            "%.0fs more (%d consecutive failures) — skipping",
-                            acct["id"],
-                            _backoff["skip_until"] - time.monotonic(),
-                            _backoff["fails"],
-                        )
-                        continue
-
-                    logger.info(
-                        "Window keeper: pinging account %d (%s)%s%s",
-                        acct["id"],
-                        acct.get("email", "?"),
-                        " [5h expired]" if needs_5h else "",
-                        " [7d reset]" if needs_7d else "",
-                    )
-                    success = await ping_account(cc_at)
-                    if not success and acct.get("cc_refresh_token"):
-                        # Never rotate the active account's CC refresh token —
-                        # Claude Code still holds the pre-rotation value in its
-                        # Keychain and will hit invalid_grant on next refresh.
-                        # See architecture doc §7.3 and invariant I2.
-                        # For the active account, reconcile from live creds
-                        # instead (Claude Code keeps its own token fresh).
-                        from jacked.api.credential_helpers import read_active_account_id
-
-                        active_id_now = read_active_account_id()
-                        if active_id_now == acct["id"]:
-                            logger.info(
-                                "Window keeper: skipping CC refresh for "
-                                "active account %d — reconciling instead",
-                                acct["id"],
-                            )
-                            try:
-                                from jacked.api.credential_helpers import (
-                                    reconcile_credentials_from_live_store,
-                                )
-
-                                await asyncio.to_thread(
-                                    reconcile_credentials_from_live_store,
-                                    acct["id"],
-                                    db,
-                                )
-                                fresh_acct = db.get_account(acct["id"])
-                                fresh_cc = (
-                                    fresh_acct.get("cc_access_token")
-                                    if fresh_acct
-                                    else None
-                                )
-                                if fresh_cc and fresh_cc != cc_at:
-                                    success = await ping_account(fresh_cc)
-                            except Exception:
-                                logger.exception(
-                                    "Window keeper reconcile failed for active account %d",
-                                    acct["id"],
-                                )
-                        else:
-                            from jacked.web.auth import refresh_cc_token
-
-                            refreshed = await refresh_cc_token(acct["id"], db)
-                            if refreshed:
-                                fresh_acct = db.get_account(acct["id"])
-                                fresh_cc = (
-                                    fresh_acct.get("cc_access_token")
-                                    if fresh_acct
-                                    else None
-                                )
-                                if fresh_cc and fresh_cc != cc_at:
-                                    success = await ping_account(fresh_cc)
-                    if success:
-                        _ping_backoff.pop(acct["id"], None)
-                        sweep_pinged += 1
-                        # Fetch fresh usage so cached_5h_resets_at updates
-                        # and needs_ping returns False next sweep.
-                        # Pass access_token to bypass the cache freshness guard.
-                        try:
-                            await asyncio.wait_for(
-                                fetch_usage(acct["id"], db, access_token=cc_at),
-                                timeout=10.0,
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "Full sweep: fetch_usage for account %d "
-                                "exceeded 10s — moving on",
-                                acct["id"],
-                            )
-                    else:
-                        # Still failing after the refresh/reconcile fallbacks
-                        # above — arm exponential backoff so the next sweeps
-                        # skip this account instead of hammering it.
-                        _backoff = _ping_backoff.setdefault(
-                            acct["id"],
-                            {"fails": 0, "skip_until": 0.0},
-                        )
-                        _backoff["fails"] += 1
-                        _delay = min(
-                            check_interval * 2 ** _backoff["fails"],
-                            _PING_BACKOFF_CAP_SECONDS,
-                        )
-                        _backoff["skip_until"] = time.monotonic() + _delay
-                        logger.info(
-                            "Window keeper: ping failed for account %d — "
-                            "backing off %.0fs (%d consecutive failures)",
-                            acct["id"],
-                            _delay,
-                            _backoff["fails"],
-                        )
-                    await asyncio.sleep(2)  # pacing
-
-            logger.info(
-                "Full sweep complete: pinged %d windows",
-                sweep_pinged,
-            )
+                _note_keeper_disabled(db)
+            else:
+                sweep_pinged = await _run_window_keeper(db, check_interval)
+                logger.info(
+                    "Full sweep complete: pinged %d windows",
+                    sweep_pinged,
+                )
 
         except asyncio.CancelledError:
             logger.info("Full sweep loop cancelled — shutting down")
@@ -2108,13 +2506,10 @@ async def full_sweep_loop(app):
         except Exception:
             logger.warning("Full sweep loop error", exc_info=True)
 
-        # Sleep in short increments, checking wake signal between each.
-        # This lets settings changes (e.g. toggling window keeper on)
-        # trigger an immediate sweep instead of waiting the full interval.
-        _slept = 0.0
-        while _slept < check_interval and not _sweep_wake.is_set():
-            await asyncio.sleep(min(5, check_interval - _slept))
-            _slept += 5
+        # Wait on the WALL CLOCK, checking the wake signal between short
+        # slices, so settings changes and new tokens trigger an immediate
+        # sweep and a closed lid cannot stretch the interval.
+        await _sleep_until(deadline)
         if _sweep_wake.is_set():
             _sweep_wake.clear()
-            logger.info("Full sweep woken early by settings change")
+            logger.info("Full sweep woken early")

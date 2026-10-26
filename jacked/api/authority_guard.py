@@ -257,6 +257,12 @@ def _import_rotated_tokens(db, row: dict, payload: dict) -> int:
             "authority write",
             account_id,
         )
+        try:
+            from jacked.api.usage_monitor import clear_ping_backoff
+
+            clear_ping_backoff(account_id)
+        except Exception:  # noqa: BLE001 - never fail an import over this
+            logger.debug("Could not clear the keeper backoff", exc_info=True)
     return len(updates)
 
 
