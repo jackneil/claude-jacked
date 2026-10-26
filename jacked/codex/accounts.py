@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable, Mapping, Optional
+
+from jacked.findbin import find_bin
 
 from .credentials import (
     codex_home,
@@ -105,7 +106,7 @@ def import_codex_account(
 
 def _run_codex_login(home: Path, env: Optional[Mapping[str, str]]) -> None:
     """Drive the interactive ``codex login`` browser OAuth flow."""
-    codex = shutil.which("codex")
+    codex = find_bin("codex")
     if not codex:
         raise CodexImportError("the `codex` CLI is not installed or not on PATH")
     run_env = dict(env if env is not None else os.environ)

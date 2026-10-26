@@ -344,6 +344,15 @@ _FIND = "%SystemRoot%\\System32\\find.exe"
 
 logger = logging.getLogger(__name__)
 
+# Install methods whose upgrade argv starts with a user-installed tool. The
+# updater runs under the service's system-only PATH, so argv[0] must be the
+# path find_bin resolved (``~/.local/bin/uv``, ``~/.local/bin/pipx``), never
+# the bare name. Value: the install hint for the "tool missing" recovery.
+_TOOL_INSTALL_HINTS = {
+    "uv": "Install uv from https://docs.astral.sh/uv/",
+    "pipx": "Install pipx from https://pipx.pypa.io/",
+}
+
 
 def _verify_service_block(port: int) -> str:
     """Batch line that polls ``/api/version`` for up to 20s. Exit 0 = healthy."""
@@ -601,19 +610,20 @@ def run_update(
             )
             return
 
-        if method == "uv":
-            uv = find_bin("uv")
-            if not uv:
-                msg = "Could not find `uv` on PATH. Install uv from https://docs.astral.sh/uv/"
+        if method in _TOOL_INSTALL_HINTS:
+            tool = find_bin(method)
+            if not tool:
+                hint = _TOOL_INSTALL_HINTS[method]
+                msg = f"Could not find `{method}` on PATH. {hint}"
                 log(f"ERROR: {msg}")
                 try:
                     _us.mark_failed(
                         _us.UPDATE_STATUS_FILE,
-                        error="uv not found on PATH",
-                        recovery="Install uv from https://docs.astral.sh/uv/ and re-run",
+                        error=f"{method} not found on PATH",
+                        recovery=f"{hint} and re-run",
                     )
                 except Exception:
-                    logger.exception("mark_failed after uv-missing failed")
+                    logger.exception("mark_failed after %s-missing failed", method)
                 _write_recovery(
                     f"Jacked auto-update failed:\n{msg}\n\n"
                     "Manual recovery:\n"
@@ -622,7 +632,7 @@ def run_update(
                     "  jacked service start\n"
                 )
                 return
-            cmd[0] = uv
+            cmd[0] = tool
 
         # Phase: installing_package
         _begin("installing_package")
@@ -914,10 +924,10 @@ def run_update(
             except ValueError as exc:
                 log(f"ERROR: cannot build a rollback command: {exc}")
                 return str(exc)
-            if method == "uv":
-                rb_uv = find_bin("uv")
-                if rb_uv:
-                    rb_cmd[0] = rb_uv
+            if method in _TOOL_INSTALL_HINTS:
+                rb_tool = find_bin(method)
+                if rb_tool:
+                    rb_cmd[0] = rb_tool
             _begin("rolling_back")
             log(f"Rolling back to v{_current_version} ({reason}): {rb_label}")
             code, detail = _run_rollback_step(rb_cmd)
@@ -1439,10 +1449,10 @@ def _spawn_windows_tray_updater(
     method = detect_install_method()
     cmd = upgrade_command(extras)
 
-    if method == "uv":
-        resolved_uv = find_bin("uv")
-        if resolved_uv:
-            cmd[0] = resolved_uv
+    if method in _TOOL_INSTALL_HINTS:
+        resolved_tool = find_bin(method)
+        if resolved_tool:
+            cmd[0] = resolved_tool
 
     label = upgrade_command_label(extras)
     # Recovery string goes inside a cmd.exe argument between double quotes;
@@ -1472,10 +1482,10 @@ def _spawn_windows_tray_updater(
         logger.warning("No rollback command available: %s", exc)
         rb_cmd = []
     if rb_cmd:
-        if method == "uv":
-            rb_uv = find_bin("uv")
-            if rb_uv:
-                rb_cmd[0] = rb_uv
+        if method in _TOOL_INSTALL_HINTS:
+            rb_tool = find_bin(method)
+            if rb_tool:
+                rb_cmd[0] = rb_tool
         rollback_line = " ".join(f'"{arg}"' for arg in rb_cmd)
     rollback_label_for_batch = rollback_label.replace('"', "'")
 

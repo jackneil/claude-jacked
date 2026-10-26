@@ -620,6 +620,50 @@ class TestValidateStoresIdentity:
         assert row["profile_json"] is None
 
 
+class TestValidateKeepsUsageErrors:
+    """A 200 from the profile API proves the token, not that usage is
+    readable. Validation must leave the usage path's error and failure
+    counter alone; only a successful usage fetch clears them."""
+
+    def test_success_keeps_usage_error_and_counter(self, tmp_path):
+        import jacked.web.auth as auth
+
+        db, acct = _make_db(tmp_path)
+        db.record_account_error(acct["id"], "Usage fetch failed (HTTP 500)")
+        db.record_account_error(acct["id"], "Usage fetch failed (HTTP 500)")
+        with patch.object(auth.httpx, "AsyncClient",
+                          return_value=_client_returning(_resp(200, _profile()))):
+            result = asyncio.run(auth.validate_account(acct["id"], db))
+        assert result == {"valid": True, "error": None}
+        row = db.get_account(acct["id"])
+        assert row["validation_status"] == "valid"
+        assert row["last_validated_at"]
+        assert row["last_error"] == "Usage fetch failed (HTTP 500)"
+        assert row["last_error_at"] is not None
+        assert row["consecutive_failures"] == 2
+
+        db.clear_account_errors(acct["id"])  # what a successful fetch_usage does
+        row = db.get_account(acct["id"])
+        assert row["last_error"] is None and row["consecutive_failures"] == 0
+
+    def test_success_after_refresh_keeps_usage_error_and_counter(self, tmp_path):
+        import jacked.web.auth as auth
+
+        db, acct = _make_db(tmp_path)
+        db.record_account_error(acct["id"], "Usage fetch failed (HTTP 500)")
+        with patch.object(auth.httpx, "AsyncClient",
+                          return_value=_client_returning(
+                              _resp(401), _resp(200, _profile()))), \
+             patch.object(auth, "_try_refresh_primary_token",
+                          AsyncMock(return_value="fresh-token")):
+            result = asyncio.run(auth.validate_account(acct["id"], db))
+        assert result == {"valid": True, "error": None}
+        row = db.get_account(acct["id"])
+        assert row["validation_status"] == "valid"
+        assert row["last_error"] == "Usage fetch failed (HTTP 500)"
+        assert row["consecutive_failures"] == 1
+
+
 # ---------------------------------------------------------------------------
 # OAuth token exchange + persistence paths
 # ---------------------------------------------------------------------------

@@ -9,6 +9,8 @@ import tempfile
 from pathlib import Path
 from typing import Mapping, Optional
 
+from jacked.findbin import find_bin
+
 from .credentials import codex_home
 
 
@@ -87,7 +89,7 @@ def _extract_block(
 
 def codex_present(env: Optional[Mapping[str, str]] = None) -> bool:
     """True if Codex looks installed (binary on PATH, or a CODEX_HOME exists)."""
-    return shutil.which("codex") is not None or codex_home(env).exists()
+    return find_bin("codex") is not None or codex_home(env).exists()
 
 
 def agents_skills_dir(agents_home: Optional[Path] = None) -> Path:

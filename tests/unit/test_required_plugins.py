@@ -39,7 +39,9 @@ class TestRequiredPluginIds:
 
 class TestRunClaudePlugin:
     def test_returns_none_when_claude_missing(self, monkeypatch):
-        monkeypatch.setattr("shutil.which", lambda _name: None)
+        # find_bin, not shutil.which: the fallback would find a real
+        # ~/.local/bin/claude on a developer machine.
+        monkeypatch.setattr("jacked.findbin.find_bin", lambda _name: None)
         assert _run_claude_plugin("list") is None
 
     def test_invokes_claude_plugin_with_closed_stdin(self, monkeypatch):
@@ -68,7 +70,7 @@ class TestRunClaudePlugin:
 
 class TestInstallRequiredPlugins:
     def test_skips_when_claude_missing(self, monkeypatch):
-        monkeypatch.setattr("shutil.which", lambda _name: None)
+        monkeypatch.setattr("jacked.findbin.find_bin", lambda _name: None)
         calls = []
         monkeypatch.setattr("jacked.cli._run_claude_plugin", lambda *a, **k: calls.append(a))
         _install_required_plugins()
