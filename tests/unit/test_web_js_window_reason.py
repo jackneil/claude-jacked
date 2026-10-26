@@ -94,7 +94,7 @@ class TestWindowReason:
         "skip, text",
         [
             ("keeper_disabled", "keeper off"),
-            ("no_token", "no Claude Code token"),
+            ("no_token", "no token, re-auth"),
             ("auto_swap_disabled", "auto-swap off"),
         ],
     )

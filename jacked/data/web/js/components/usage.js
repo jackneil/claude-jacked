@@ -164,7 +164,7 @@ function computeElapsedFraction7d(resetsAt) {
 // Why a window has no future reset (window keeper state)
 // ---------------------------------------------------------------------------
 
-/** Usage older than this reads as stale: three 10-minute poll intervals. */
+/** Usage older than this reads as stale: six 5-minute poll intervals (usage_check_interval default 300s). */
 const USAGE_STALE_SECS = 30 * 60;
 
 /** Short local time ("3:45 PM"), with the date when it is not today. */
@@ -223,7 +223,7 @@ function windowReason(acct, resetsAt, nowMs) {
     if (!ks) return null;
     switch (ks.skip_reason) {
         case 'keeper_disabled': return reason('keeper off');
-        case 'no_token': return reason('no Claude Code token');
+        case 'no_token': return reason('no token, re-auth');
         case 'outside_active_hours': return reason('paused until ' + _keeperActiveStart());
         case 'auto_swap_disabled': return reason('auto-swap off');
         default: break;
