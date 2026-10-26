@@ -171,6 +171,20 @@ class TestRefreshMode:
         assert CIRCUIT_BREAKER_COOLDOWNS["invalid_grant"] == 600
         assert CIRCUIT_BREAKER_COOLDOWNS["network_error"] == 60
 
+    def test_http_5xx_cooldown_matches_by_status_class(self):
+        """An exchange records a 5xx as http_<status>; the http_5xx entry
+        must still apply (it never matched by exact key before)."""
+        from jacked.web.auth import (
+            _DEFAULT_CB_COOLDOWN,
+            CIRCUIT_BREAKER_COOLDOWNS,
+            breaker_cooldown,
+        )
+        assert breaker_cooldown("http_502") == CIRCUIT_BREAKER_COOLDOWNS["http_5xx"]
+        assert breaker_cooldown("http_503") == CIRCUIT_BREAKER_COOLDOWNS["http_5xx"]
+        assert breaker_cooldown("http_429") == CIRCUIT_BREAKER_COOLDOWNS["http_429"]
+        assert breaker_cooldown("http_418") == _DEFAULT_CB_COOLDOWN
+        assert breaker_cooldown(None) == _DEFAULT_CB_COOLDOWN
+
 
 # ---------------------------------------------------------------------------
 # refresh_account_token: 2-strike invalid-marking policy
@@ -706,7 +720,9 @@ class TestHealRespectsNetworkBreaker:
 
 
 class TestHonestRefreshAccounting:
-    def test_token_two_hours_from_expiry_is_skipped_not_refreshed(self, tmp_path):
+    def test_token_inside_loop_buffer_is_exchanged(self, tmp_path):
+        """The loop passes its 4h buffer down: a token it selected is
+        exchanged, not skipped by the 5-minute default window."""
         import asyncio
 
         from jacked.web import auth
@@ -715,6 +731,32 @@ class TestHonestRefreshAccounting:
         auth.reset_locks()
         db = Database(str(tmp_path / "test.db"))
         db.create_account("two@test.com", "tok", int(time.time()) + 2 * 3600,
+                          refresh_token="rt")
+        from jacked.web.auth import TokenExchangeResult
+
+        flow = AsyncMock(return_value=TokenExchangeResult(
+            success=True, access_token="a", exchanged=True))
+        with patch("jacked.web.auth.Database", return_value=db), \
+             patch("jacked.api.credential_helpers.read_active_account_id",
+                   return_value=None), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            result = asyncio.run(refresh_all_expiring_tokens(buffer_seconds=14400))
+
+        flow.assert_awaited_once()
+        assert result["refreshed"] == 1
+        assert result["skipped"] == 0
+        assert result["failed"] == 0
+
+    def test_token_outside_loop_buffer_is_skipped(self, tmp_path):
+        """A token 6h out is outside the 4h buffer: no exchange, counted skipped."""
+        import asyncio
+
+        from jacked.web import auth
+        from jacked.web.auth import refresh_all_expiring_tokens
+
+        auth.reset_locks()
+        db = Database(str(tmp_path / "test.db"))
+        db.create_account("six@test.com", "tok", int(time.time()) + 6 * 3600,
                           refresh_token="rt")
         flow = AsyncMock()
         with patch("jacked.web.auth.Database", return_value=db), \

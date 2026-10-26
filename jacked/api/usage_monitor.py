@@ -2179,10 +2179,13 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
         _note_keeper_skip(db, acct, state, "auto_swap_disabled")
         return "skipped"
 
+    from jacked.api.credential_helpers import CC_TOKEN_UNUSABLE_FAILURES
+
     cc_token = acct.get("cc_access_token")
-    # Workstream B records a dead CC chain per chain; treat it like a
-    # missing CC token and go straight to the primary token.
-    if acct.get("cc_refresh_failure_type") == "invalid_grant":
+    # Workstream B records a dead CC chain (invalid_grant) and an API-refused
+    # CC token (auth_rejected) per chain; treat either like a missing CC
+    # token and go straight to the primary token.
+    if acct.get("cc_refresh_failure_type") in CC_TOKEN_UNUSABLE_FAILURES:
         cc_token = None
     primary_token = acct.get("access_token")
     first_token = cc_token or primary_token
@@ -2324,7 +2327,7 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
         _ping_backoff.pop(account_id, None)
         fresh = db.get_account(account_id) or acct
         fresh_cc = fresh.get("cc_access_token")
-        if fresh.get("cc_refresh_failure_type") == "invalid_grant":
+        if fresh.get("cc_refresh_failure_type") in CC_TOKEN_UNUSABLE_FAILURES:
             fresh_cc = None
         base["token_fp"] = wk.token_fingerprint(fresh_cc or fresh.get("access_token"))
         logger.warning(

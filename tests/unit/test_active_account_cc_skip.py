@@ -48,7 +48,7 @@ class TestBackgroundLoopSkipsActiveCC:
             result = asyncio.run(auth.refresh_all_expiring_tokens())
 
         # Only the inactive account should have been refreshed
-        mock_refresh_cc.assert_called_once_with(2, mock_db)
+        mock_refresh_cc.assert_called_once_with(2, mock_db, buffer_seconds=14400)
         assert result["cc_refreshed"] == 1
         # Active account was checked and counted, just not CC-refreshed
         assert result["checked"] == 2

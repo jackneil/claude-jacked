@@ -385,6 +385,19 @@ class TestRecoveryLadder:
             assert asyncio.run(um._keeper_process_account(db, acct, 300)) == "pinged"
         assert pings.calls == ["pri-tok"]
 
+    def test_api_rejected_cc_token_skips_straight_to_primary(self, db):
+        """auth_rejected (the API refused the CC token and jacked could not
+        replace it) is as unusable as a dead chain: ping with the primary."""
+        aid = _mk(db)
+        acct = dict(db.get_account(aid), cc_refresh_failure_type="auth_rejected")
+        pings = _Pings({"pri-tok": _ok()})
+        with (
+            patch("jacked.web.window_keeper.ping_account", new=pings),
+            patch("jacked.web.auth.fetch_usage", AsyncMock(return_value={"_cached": True})),
+        ):
+            assert asyncio.run(um._keeper_process_account(db, acct, 300)) == "pinged"
+        assert pings.calls == ["pri-tok"]
+
     def test_429_schedules_from_retry_after_without_escalating(self, db):
         aid = _mk(db)
         pings = _Pings({"cc-tok": _err(429, "rate_limit_error", retry_after=120.0)})
@@ -538,8 +551,11 @@ class TestBackoffTokenIdentity:
 
         aid = _mk(db)
         um._ping_backoff[aid] = {"fails": 2, "skip_until": time.time() + 3600, "token_fp": "x"}
+        # Ownership is proven by the profile the guard already fetched for
+        # this payload (workstream B's shared ownership rule).
         payload = {"claudeAiOauth": {"accessToken": "cc-rotated", "refreshToken": "cc-rt2"}}
-        assert _import_rotated_tokens(db, db.get_account(aid), payload) >= 1
+        profile = {"account": {"email": "a@test.com"}}
+        assert _import_rotated_tokens(db, db.get_account(aid), payload, profile=profile) >= 1
         assert aid not in um._ping_backoff
         assert um._sweep_wake.is_set()
 

@@ -13,6 +13,7 @@ All API interactions follow design doc section 4 header matrix.
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -223,6 +224,24 @@ CIRCUIT_BREAKER_COOLDOWNS: dict[str, int] = {
     "http_5xx": 120,
 }
 _DEFAULT_CB_COOLDOWN = 300
+
+
+def breaker_cooldown(failure_type: str | None) -> int:
+    """Cooldown seconds for a breaker failure type.
+
+    An exchange records a 5xx as ``http_<status>`` (``http_502``), so the
+    ``http_5xx`` entry is matched by status class here, not by exact key.
+
+    >>> breaker_cooldown("invalid_grant")
+    600
+    >>> breaker_cooldown("http_503") == CIRCUIT_BREAKER_COOLDOWNS["http_5xx"]
+    True
+    >>> breaker_cooldown("http_418") == _DEFAULT_CB_COOLDOWN
+    True
+    """
+    if isinstance(failure_type, str) and re.fullmatch(r"http_5\d\d", failure_type):
+        return CIRCUIT_BREAKER_COOLDOWNS["http_5xx"]
+    return CIRCUIT_BREAKER_COOLDOWNS.get(failure_type, _DEFAULT_CB_COOLDOWN)
 
 # Breaker failure types that describe the network, not the credential.
 NETWORK_FAILURE_TYPES = frozenset({"network_error", "not_sent", "reply_lost"})
@@ -540,7 +559,7 @@ async def _run_chain_flow(
                 last_failed = current.get("refresh_last_failed_at")
                 failure_type = current.get("refresh_failure_type")
                 if last_failed is not None:
-                    cooldown = CIRCUIT_BREAKER_COOLDOWNS.get(failure_type, _DEFAULT_CB_COOLDOWN)
+                    cooldown = breaker_cooldown(failure_type)
                     remaining = cooldown - (time.time() - last_failed)
                     if remaining > 0:
                         logger.info(
@@ -645,7 +664,7 @@ async def _run_chain_flow(
             # ----------------------------------------------------------
             # Other errors — this chain's breaker only.
             # ----------------------------------------------------------
-            cooldown = CIRCUIT_BREAKER_COOLDOWNS.get(result.error, _DEFAULT_CB_COOLDOWN)
+            cooldown = breaker_cooldown(result.error)
             db.update_account(account_id, **_breaker_updates(chain, result.error))
             if result.error == "reply_lost":
                 logger.warning(
@@ -888,8 +907,11 @@ def compute_urgency_tier(
 
 
 
-def should_refresh(account: dict) -> bool:
+def should_refresh(account: dict, buffer_seconds: int | None = None) -> bool:
     """Check if an account's token needs refreshing.
+
+    ``buffer_seconds`` widens the window (the background loop passes its
+    own buffer so a token it selected is exchanged, not skipped).
 
     Rules:
     - API key accounts (refresh_token is None) cannot be refreshed
@@ -911,10 +933,11 @@ def should_refresh(account: dict) -> bool:
         return False
     if not account.get("refresh_token"):
         return False
-    return account["expires_at"] < time.time() + REFRESH_BUFFER_SECONDS
+    buffer = REFRESH_BUFFER_SECONDS if buffer_seconds is None else buffer_seconds
+    return account["expires_at"] < time.time() + buffer
 
 
-def should_refresh_cc(account: dict) -> bool:
+def should_refresh_cc(account: dict, buffer_seconds: int | None = None) -> bool:
     """Check if CC (Claude Code) tokens need refresh.
 
     Returns False if cc_refresh_token is NULL — can't refresh without one.
@@ -937,7 +960,8 @@ def should_refresh_cc(account: dict) -> bool:
     cc_expires_at = account.get("cc_expires_at")
     if not cc_expires_at:
         return True
-    return cc_expires_at < time.time() + REFRESH_BUFFER_SECONDS
+    buffer = REFRESH_BUFFER_SECONDS if buffer_seconds is None else buffer_seconds
+    return cc_expires_at < time.time() + buffer
 
 
 class CCRefreshOutcome(str, Enum):
@@ -967,6 +991,7 @@ class CCRefreshResult:
 
 async def refresh_cc_token_result(
     account_id: int, db: Database, *, force: bool = False,
+    buffer_seconds: int | None = None,
 ) -> CCRefreshResult:
     """Refresh the CC token pair and say exactly what happened.
 
@@ -979,7 +1004,7 @@ async def refresh_cc_token_result(
         return CCRefreshResult(CCRefreshOutcome.FAILED, error="account_not_found")
     if (account.get("provider") or "claude") == "codex" or not account.get("cc_refresh_token"):
         return CCRefreshResult(CCRefreshOutcome.NO_REFRESH_TOKEN)
-    if not force and not should_refresh_cc(account):
+    if not force and not should_refresh_cc(account, buffer_seconds):
         return CCRefreshResult(CCRefreshOutcome.SKIPPED_NOT_DUE)
 
     lock = _get_cc_refresh_lock(account_id)
@@ -997,14 +1022,16 @@ async def refresh_cc_token_result(
     return CCRefreshResult(outcome, access_token=result.access_token)
 
 
-async def refresh_cc_token(account_id: int, db: Database) -> bool:
+async def refresh_cc_token(
+    account_id: int, db: Database, *, buffer_seconds: int | None = None,
+) -> bool:
     """Refresh CC token pair independently. Updates cc_* columns only.
 
     Bool wrapper over ``refresh_cc_token_result`` for existing callers:
     True unless the attempt FAILED (not-due, no-refresh-token and
     lock-held keep their historical True).
     """
-    result = await refresh_cc_token_result(account_id, db)
+    result = await refresh_cc_token_result(account_id, db, buffer_seconds=buffer_seconds)
     return result.outcome is not CCRefreshOutcome.FAILED
 
 
@@ -1118,7 +1145,9 @@ class RefreshOutcome(str, Enum):
     FAILED = "failed"
 
 
-async def refresh_account_token_result(account_id: int, db: Database) -> RefreshOutcome:
+async def refresh_account_token_result(
+    account_id: int, db: Database, *, buffer_seconds: int | None = None,
+) -> RefreshOutcome:
     """Refresh an account's primary token if needed, and say what happened.
 
     EXCHANGED means a token exchange completed and was stored. SKIPPED_NOT_DUE
@@ -1129,7 +1158,7 @@ async def refresh_account_token_result(account_id: int, db: Database) -> Refresh
     account = db.get_account(account_id)
     if not account:
         return RefreshOutcome.FAILED
-    if not should_refresh(account):
+    if not should_refresh(account, buffer_seconds):
         return RefreshOutcome.SKIPPED_NOT_DUE
     if not account.get("refresh_token"):
         return RefreshOutcome.SKIPPED_NOT_DUE
@@ -2086,7 +2115,10 @@ async def refresh_all_expiring_tokens(
                 # internally and would self-deadlock the loop.
                 try:
                     outcome = await asyncio.wait_for(
-                        refresh_account_token_result(account_id, db), timeout=60,
+                        refresh_account_token_result(
+                            account_id, db, buffer_seconds=buffer_seconds,
+                        ),
+                        timeout=60,
                     )
                 except asyncio.TimeoutError:
                     logger.error(
@@ -2124,8 +2156,10 @@ async def refresh_all_expiring_tokens(
         if active_id == account_id:
             continue
 
-        if should_refresh_cc(account):
-            cc_success = await refresh_cc_token(account_id, db)
+        if should_refresh_cc(account, buffer_seconds):
+            cc_success = await refresh_cc_token(
+                account_id, db, buffer_seconds=buffer_seconds,
+            )
             if cc_success:
                 result["cc_refreshed"] += 1
             else:
@@ -2181,7 +2215,7 @@ async def heal_invalid_accounts() -> dict:
             failure_type = account.get("refresh_failure_type")
             last_failed = account.get("refresh_last_failed_at")
             if failure_type in NETWORK_FAILURE_TYPES and last_failed is not None:
-                cooldown = CIRCUIT_BREAKER_COOLDOWNS.get(failure_type, _DEFAULT_CB_COOLDOWN)
+                cooldown = breaker_cooldown(failure_type)
                 remaining = cooldown - (time.time() - last_failed)
                 if remaining > 0:
                     logger.info(
