@@ -8,6 +8,7 @@ import asyncio
 import logging
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 
 from jacked.api.websocket import WebSocketRegistry
@@ -23,8 +24,9 @@ async def session_accounts_watch_loop(app, interval: int = 3):
     the version changes, and only broadcasts when the actual MAX timestamps
     differ from cached values.
 
-    Also forces a periodic broadcast every ~60s (20 cycles) to handle
-    time-based session expiry.
+    Also forces a periodic broadcast every ~60s of WALL-CLOCK time to handle
+    time-based session expiry. (A cycle count would stretch with system
+    sleep: each sleep slice counts once however long the process slept.)
 
     >>> # Verified via integration test
     """
@@ -43,8 +45,8 @@ async def session_accounts_watch_loop(app, interval: int = 3):
     last_data_version: int | None = None
     last_max_detected: str | None = None
     last_max_ended: str | None = None
-    cycle_counter = 0
-    FORCE_BROADCAST_EVERY = 20  # ~60s at 3s interval
+    force_broadcast_seconds = 60.0
+    last_forced_at = time.time()
 
     # Seed initial values
     try:
@@ -60,13 +62,12 @@ async def session_accounts_watch_loop(app, interval: int = 3):
     try:
         while True:
             await asyncio.sleep(interval)
-            cycle_counter += 1
             try:
                 should_broadcast = False
 
                 # Periodic forced broadcast for time-based session expiry
-                if cycle_counter >= FORCE_BROADCAST_EVERY:
-                    cycle_counter = 0
+                if time.time() - last_forced_at >= force_broadcast_seconds:
+                    last_forced_at = time.time()
                     should_broadcast = True
 
                 dv = await asyncio.to_thread(

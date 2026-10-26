@@ -721,22 +721,72 @@ def should_refresh_cc(account: dict) -> bool:
     return cc_expires_at < time.time() + REFRESH_BUFFER_SECONDS
 
 
-async def refresh_cc_token(account_id: int, db: Database) -> bool:
-    """Refresh CC token pair independently. Updates cc_* columns only."""
+class CCRefreshOutcome(str, Enum):
+    """What ``refresh_cc_token_result`` actually did."""
+
+    ROTATED = "rotated"  # this call exchanged the CC refresh token
+    PEER_ROTATED = "peer_rotated"  # another path already holds a newer token
+    SKIPPED_NOT_DUE = "skipped_not_due"  # clock gate: token not near expiry
+    NO_REFRESH_TOKEN = "no_refresh_token"  # nothing to exchange
+    LOCK_HELD = "lock_held"  # another CC refresh is in flight
+    FAILED = "failed"  # exchange failed, or the account is gone
+
+
+@dataclass(frozen=True)
+class CCRefreshResult:
+    """Explicit result of a CC refresh attempt. ``access_token`` is the
+    token now stored for the CC chain after ROTATED / PEER_ROTATED."""
+
+    outcome: CCRefreshOutcome
+    access_token: Optional[str] = None
+    error: Optional[str] = None
+
+    @property
+    def new_token(self) -> bool:
+        return self.outcome in (CCRefreshOutcome.ROTATED, CCRefreshOutcome.PEER_ROTATED)
+
+
+async def refresh_cc_token_result(
+    account_id: int, db: Database, *, force: bool = False,
+) -> CCRefreshResult:
+    """Refresh the CC token pair and say exactly what happened.
+
+    ``force=True`` bypasses only the ``should_refresh_cc`` clock gate (a
+    401 on an unexpired token must still rotate). The no-refresh-token and
+    lock-held guards always apply.
+    """
     account = db.get_account(account_id)
     if not account:
-        return False
-    if not should_refresh_cc(account):
-        return True
-    if not account.get("cc_refresh_token"):
-        return True
+        return CCRefreshResult(CCRefreshOutcome.FAILED, error="account_not_found")
+    if (account.get("provider") or "claude") == "codex" or not account.get("cc_refresh_token"):
+        return CCRefreshResult(CCRefreshOutcome.NO_REFRESH_TOKEN)
+    if not force and not should_refresh_cc(account):
+        return CCRefreshResult(CCRefreshOutcome.SKIPPED_NOT_DUE)
 
     lock = _get_cc_refresh_lock(account_id)
     if lock.locked():
-        return True  # Another refresh in progress
+        return CCRefreshResult(CCRefreshOutcome.LOCK_HELD)
 
     result = await _refresh_token_flow(account_id, db, RefreshMode.CC)
-    return result.success
+    if not result.success:
+        return CCRefreshResult(CCRefreshOutcome.FAILED, error=result.error)
+    # Only a real exchange returns the rotated refresh token; the
+    # already-refreshed and live-recovery paths return an access token only.
+    outcome = (
+        CCRefreshOutcome.ROTATED if result.refresh_token else CCRefreshOutcome.PEER_ROTATED
+    )
+    return CCRefreshResult(outcome, access_token=result.access_token)
+
+
+async def refresh_cc_token(account_id: int, db: Database) -> bool:
+    """Refresh CC token pair independently. Updates cc_* columns only.
+
+    Bool wrapper over ``refresh_cc_token_result`` for existing callers:
+    True unless the attempt FAILED (not-due, no-refresh-token and
+    lock-held keep their historical True).
+    """
+    result = await refresh_cc_token_result(account_id, db)
+    return result.outcome is not CCRefreshOutcome.FAILED
 
 
 async def refresh_account_token(account_id: int, db: Database) -> bool:
@@ -799,6 +849,7 @@ async def fetch_usage(
     access_token: Optional[str] = None,
     manual: bool = False,
     _retry_depth: int = 0,
+    post_ping: bool = False,
 ) -> Optional[dict]:
     """Fetch usage data from the Anthropic Usage API (design doc section 4f).
 
@@ -807,6 +858,14 @@ async def fetch_usage(
     upstream API; manual=True gets the shorter _USAGE_MANUAL_FLOOR_SECONDS
     floor instead of a full bypass.  Only the single bounded 401/429 retry
     (_retry_depth > 0) skips pacing, and it never resets pacing state.
+
+    post_ping=True is the window keeper's read-back right after a
+    successful ping: it skips the ceiling but keeps the manual floor,
+    measured against this process's own last attempt only (the keeper has
+    just stamped usage_cached_at from the ping's reset header, so the DB
+    stamp says nothing about the last upstream usage call). The 429
+    backoff still applies, and pacing state is stamped exactly as for any
+    other attempt.
 
     Updates the account's cached usage fields in the database.
 
@@ -832,7 +891,16 @@ async def fetch_usage(
     # token — let it through WITHOUT touching last_fetched_at (the old
     # "reset to 0 before retry" un-paced the account and turned every
     # 429 into a license for the next client request to fetch again).
-    if _retry_depth == 0:
+    if _retry_depth == 0 and post_ping:
+        elapsed = now - state["last_fetched_at"]
+        if elapsed < _USAGE_MANUAL_FLOOR_SECONDS:
+            logger.debug(
+                f"Post-ping usage floor for account {account_id}: "
+                f"{int(elapsed)}s < {_USAGE_MANUAL_FLOOR_SECONDS}s, "
+                f"returning cached"
+            )
+            return {"_cached": True}
+    elif _retry_depth == 0:
         # Pace against BOTH the in-memory stamp and the DB's usage_cached_at.
         # The in-memory dict dies with the process, so without the DB check
         # every restart un-paced all accounts and the startup prime fetch

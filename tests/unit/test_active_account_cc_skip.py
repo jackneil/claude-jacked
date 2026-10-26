@@ -166,32 +166,39 @@ class TestWindowKeeperSkipsActiveCC:
 
     @patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store")
     @patch("jacked.api.credential_helpers.read_active_account_id", return_value=7)
+    @patch("jacked.web.auth.refresh_cc_token_result", new_callable=AsyncMock)
     @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
     def test_active_account_reconciles_instead_of_refreshing(
-        self, mock_refresh_cc, mock_read_active, mock_reconcile,
+        self, mock_refresh_cc, mock_refresh_result, mock_read_active, mock_reconcile,
     ):
-        """Simulate the window keeper recovery branch directly.
+        """Drive the real keeper ladder: for the active account a 401 must
+        reconcile from live creds and never touch the CC refresh token."""
+        from jacked.api import usage_monitor
+        from jacked.web.window_keeper import PingResult
 
-        When the active account's ping fails, the path must NOT call
-        refresh_cc_token — it must reconcile from live creds instead.
-        """
-        # We test the exact branch logic in isolation by replicating
-        # the call pattern from usage_monitor.py window keeper.
-        from jacked.api.credential_helpers import (
-            read_active_account_id,
-            reconcile_credentials_from_live_store,
-        )
+        acct = {
+            "id": 7,
+            "cc_access_token": "cc-dead",
+            "cc_refresh_token": "cc-rt",
+            "access_token": "pri-dead",
+        }
+        db = MagicMock()
+        db.get_account.return_value = acct
+        rejected = PingResult(ok=False, status=401, error_type="authentication_error")
+        with patch(
+            "jacked.web.window_keeper.ping_account",
+            new_callable=AsyncMock,
+            return_value=rejected,
+        ):
+            good, last, _lock = asyncio.run(
+                usage_monitor._keeper_auth_ladder(db, acct, "cc-dead", True, {"cc-dead"})
+            )
 
-        acct_id = 7
-        active_id_now = read_active_account_id()
-        assert active_id_now == acct_id  # prerequisite for the skip path
-
-        # Simulate the new skip branch: reconcile, don't refresh.
-        if active_id_now == acct_id:
-            reconcile_credentials_from_live_store(acct_id, MagicMock())
-
-        mock_refresh_cc.assert_not_called()
+        assert good is None
+        assert last.status == 401
         mock_reconcile.assert_called_once()
+        mock_refresh_cc.assert_not_called()
+        mock_refresh_result.assert_not_called()
 
 
 class TestLaunchSkipsActiveCC:

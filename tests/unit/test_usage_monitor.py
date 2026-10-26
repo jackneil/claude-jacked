@@ -480,6 +480,37 @@ class TestCachedResponse:
 # ---------------------------------------------------------------------------
 
 
+def _ping_ok(reset_epoch=None):
+    from jacked.web.window_keeper import PingResult
+
+    rate = (
+        {"anthropic-ratelimit-unified-5h-reset": str(reset_epoch)}
+        if reset_epoch
+        else {}
+    )
+    return PingResult(ok=True, status=200, rate_limit=rate)
+
+
+def _ping_429():
+    from jacked.web.window_keeper import PingResult
+
+    return PingResult(ok=False, status=429, error_type="rate_limit_error")
+
+
+def _sweep_stopper(sweeps):
+    """Replacement for usage_monitor._sleep_until: let *sweeps* sweeps run,
+    then cancel the loop at the next inter-sweep wait."""
+    count = 0
+
+    async def _wait(deadline):
+        nonlocal count
+        count += 1
+        if count >= sweeps:
+            raise asyncio.CancelledError
+
+    return _wait
+
+
 class TestWindowKeeperPings:
     def test_window_keeper_pings_during_active_hours(self):
         """Active hours + needs_ping -> ping_account called."""
@@ -498,29 +529,18 @@ class TestWindowKeeperPings:
         async def _run():
             with (
                 patch(
-                    "jacked.api.usage_monitor.asyncio.sleep",
-                    side_effect=_sleep_canceller(max_sleeps=10),
+                    "jacked.api.usage_monitor._sleep_until",
+                    side_effect=_sweep_stopper(1),
                 ),
-                patch(
-                    "jacked.api.usage_monitor._read_active_account_id",
-                    return_value=1,
-                ),
+                patch("jacked.api.usage_monitor._KEEPER_PING_PACING_SECONDS", 0),
                 patch(
                     "jacked.web.auth.fetch_usage",
                     new_callable=AsyncMock,
                     return_value={"_cached": True},
                 ),
                 patch(
-                    "jacked.api.credential_helpers.read_fresh_active_token",
-                    return_value="tok",
-                ),
-                patch(
                     "jacked.web.window_keeper.is_active_hours",
                     return_value=True,
-                ),
-                patch(
-                    "jacked.web.window_keeper.is_prewake_time",
-                    return_value=False,
                 ),
                 patch(
                     "jacked.web.window_keeper.needs_ping",
@@ -529,82 +549,114 @@ class TestWindowKeeperPings:
                 patch(
                     "jacked.web.window_keeper.ping_account",
                     new_callable=AsyncMock,
-                    return_value=True,
+                    return_value=_ping_ok(),
                 ) as mock_ping,
             ):
                 with pytest.raises(asyncio.CancelledError):
                     await full_sweep_loop(app)
 
-                # ping_account should be called at least once
-                assert mock_ping.call_count >= 1
+                assert mock_ping.call_count == 2
 
         asyncio.run(_run())
 
-    def test_fetch_usage_bypasses_cache_after_successful_ping(self):
-        """After ping succeeds, fetch_usage must be called with access_token
-        to bypass the cache freshness guard and update cached_5h_resets_at."""
-        accounts = [
-            _acct(1, usage_5h=30, resets_at=None, cc_rt="refresh_tok_1"),
-            _acct(2, usage_5h=10, resets_at=None, cc_rt="refresh_tok_2"),
-        ]
-        db = _make_db(
-            settings={
-                "window_keeper_enabled": "true",
-            },
-            accounts=accounts,
+
+class TestPostPingWindowReadBack:
+    """A successful ping must leave cached_5h_resets_at in the future within
+    the SAME sweep — through the real fetch_usage pacing, not a mock — so
+    the next sweep does not re-ping an open window (145 of 148 repeat
+    pings in the 10-26 logs followed a success)."""
+
+    def test_ping_30s_after_a_poll_records_the_window(self, tmp_path):
+        import httpx
+
+        import jacked.web.auth as auth_mod
+        from jacked.web.database import Database
+
+        db = Database(str(tmp_path / "um.db"))
+        acct = db.create_account(
+            email="w@test.com",
+            access_token="pri-tok",
+            refresh_token="pri-rt",
+            expires_at=int(time.time()) + 3600,
         )
-        app = _make_app(db=db)
+        aid = acct["id"]
+        db.update_account(
+            aid,
+            cc_access_token="cc-tok",
+            cc_refresh_token="cc-rt",
+            cc_expires_at=int(time.time()) + 3600,
+        )
+        # The 10-minute poller read usage 30 s ago (window lapsed then).
+        past = _iso(datetime.now(timezone.utc) - timedelta(minutes=10))
+        db.update_account_usage_cache(
+            aid, five_hour=0.0, seven_day=10.0,
+            five_hour_resets_at=past, seven_day_resets_at=_t3_resets_at(),
+        )
+        db.update_account(aid, usage_cached_at=int(time.time()) - 30)
+        state = auth_mod._get_usage_state(aid)
+        state["last_fetched_at"] = time.time() - 30
+        state["backoff_until"] = 0.0
 
-        async def _run():
+        new_reset = _iso(datetime.now(timezone.utc) + timedelta(hours=5))
+        usage_calls = []
+
+        def handler(request):
+            usage_calls.append(request.headers["authorization"])
+            return httpx.Response(
+                200,
+                json={
+                    "five_hour": {"utilization": 1.0, "resets_at": new_reset},
+                    "seven_day": {"utilization": 10.0, "resets_at": _t3_resets_at()},
+                },
+            )
+
+        real_client = httpx.AsyncClient
+
+        def _client(*args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            return real_client(*args, **kwargs)
+
+        import jacked.api.usage_monitor as mod
+
+        ping = AsyncMock(return_value=_ping_ok())  # no reset header
+        try:
             with (
-                patch(
-                    "jacked.api.usage_monitor.asyncio.sleep",
-                    side_effect=_sleep_canceller(max_sleeps=10),
-                ),
-                patch(
-                    "jacked.api.usage_monitor._read_active_account_id",
-                    return_value=1,
-                ),
-                patch(
-                    "jacked.web.auth.fetch_usage",
-                    new_callable=AsyncMock,
-                    return_value={"_cached": False},
-                ) as mock_fetch,
-                patch(
-                    "jacked.web.window_keeper.is_active_hours",
-                    return_value=True,
-                ),
-                patch(
-                    "jacked.web.window_keeper.is_prewake_time",
-                    return_value=False,
-                ),
-                patch(
-                    "jacked.web.window_keeper.needs_ping",
-                    return_value=True,
-                ),
-                patch(
-                    "jacked.web.window_keeper.ping_account",
-                    new_callable=AsyncMock,
-                    return_value=True,
-                ),
+                patch("jacked.web.auth.httpx.AsyncClient", side_effect=_client),
+                patch("jacked.web.auth.fetch_profile", new_callable=AsyncMock),
+                patch("jacked.web.window_keeper.ping_account", ping),
+                patch("jacked.web.window_keeper.is_active_hours", return_value=True),
+                patch.object(mod, "_KEEPER_PING_PACING_SECONDS", 0),
             ):
-                with pytest.raises(asyncio.CancelledError):
-                    await full_sweep_loop(app)
+                asyncio.run(mod._run_window_keeper(db, 300))
+                row = db.get_account(aid)
+                assert row["cached_5h_resets_at"] == new_reset
+                # The read-back used the token that pinged OK.
+                assert usage_calls == ["Bearer cc-tok"]
+                # Next sweep: the window is open, so no second ping.
+                asyncio.run(mod._run_window_keeper(db, 300))
+        finally:
+            auth_mod._account_usage_state.pop(aid, None)
+        assert ping.await_count == 1
 
-                # Find fetch_usage calls that happened AFTER pings
-                # (non-active accounts: id=2 since active=1 is skipped)
-                # The post-ping fetch_usage must pass access_token to bypass cache.
-                post_ping_calls = [
-                    c
-                    for c in mock_fetch.call_args_list
-                    if c[1].get("access_token") is not None
-                ]
-                assert len(post_ping_calls) >= 1, (
-                    f"Expected at least one fetch_usage call with access_token set "
-                    f"(to bypass cache), but got: {mock_fetch.call_args_list}"
+    def test_post_ping_bypass_keeps_the_manual_floor(self, tmp_path):
+        import jacked.web.auth as auth_mod
+        from jacked.web.database import Database
+
+        db = Database(str(tmp_path / "floor.db"))
+        acct = db.create_account(
+            email="f@test.com", access_token="pri", expires_at=int(time.time()) + 3600,
+        )
+        state = auth_mod._get_usage_state(acct["id"])
+        state["last_fetched_at"] = time.time() - 5  # inside the 20 s floor
+        try:
+            with patch("jacked.web.auth.httpx.AsyncClient") as client:
+                result = asyncio.run(
+                    auth_mod.fetch_usage(acct["id"], db, access_token="x", post_ping=True)
                 )
-
-        asyncio.run(_run())
+            client.assert_not_called()
+            assert result == {"_cached": True}
+        finally:
+            auth_mod._account_usage_state.pop(acct["id"], None)
 
 
 # ---------------------------------------------------------------------------
@@ -618,12 +670,22 @@ class TestWindowKeeperPingBackoff:
     forever — 2026-06 incident: account pinged every 120s for hours."""
 
     def _settings(self):
-        # Small interval so the tail sleep loop is a single sleep call,
-        # making per-sweep sleep accounting deterministic.
         return {
             "window_keeper_enabled": "true",
             "usage_check_interval": "5",
         }
+
+    def _patches(self, ping):
+        return (
+            patch("jacked.api.usage_monitor._KEEPER_PING_PACING_SECONDS", 0),
+            patch("jacked.web.window_keeper.is_active_hours", return_value=True),
+            patch("jacked.web.window_keeper.needs_ping", return_value=True),
+            patch("jacked.web.window_keeper.ping_account", ping),
+            patch(
+                "jacked.api.credential_helpers.read_active_account_id",
+                return_value=999,
+            ),
+        )
 
     def test_ping_failure_schedules_backoff_and_next_sweep_skips(self, caplog):
         import jacked.api.usage_monitor as mod
@@ -631,41 +693,13 @@ class TestWindowKeeperPingBackoff:
         accounts = [_acct(1, resets_at=None)]
         db = _make_db(settings=self._settings(), accounts=accounts)
         app = _make_app(db=db)
+        ping = AsyncMock(return_value=_ping_429())
 
         async def _run():
-            with (
-                # Sweep 1: pacing sleep + tail sleep. Sweeps 2/3: tail sleep
-                # only (account skipped). Cancel on the 4th sleep => 3 sweeps.
-                patch(
-                    "jacked.api.usage_monitor.asyncio.sleep",
-                    side_effect=_sleep_canceller(max_sleeps=3),
-                ),
-                patch(
-                    "jacked.web.window_keeper.is_active_hours",
-                    return_value=True,
-                ),
-                patch(
-                    "jacked.web.window_keeper.is_prewake_time",
-                    return_value=False,
-                ),
-                patch(
-                    "jacked.web.window_keeper.needs_ping",
-                    return_value=True,
-                ),
-                patch(
-                    "jacked.web.window_keeper.ping_account",
-                    new_callable=AsyncMock,
-                    return_value=False,
-                ) as mock_ping,
-                patch(
-                    "jacked.api.credential_helpers.read_active_account_id",
-                    return_value=999,
-                ),
-                patch(
-                    "jacked.web.auth.refresh_cc_token",
-                    new_callable=AsyncMock,
-                    return_value=False,
-                ),
+            p1, p2, p3, p4, p5 = self._patches(ping)
+            with p1, p2, p3, p4, p5, patch(
+                "jacked.api.usage_monitor._sleep_until",
+                side_effect=_sweep_stopper(3),
             ):
                 with caplog.at_level(
                     logging.DEBUG,
@@ -674,14 +708,14 @@ class TestWindowKeeperPingBackoff:
                     with pytest.raises(asyncio.CancelledError):
                         await full_sweep_loop(app)
 
-            assert mock_ping.call_count == 1, (
+            assert ping.call_count == 1, (
                 "a failing ping must be skipped on subsequent sweeps while "
-                f"backoff is armed, but ping ran {mock_ping.call_count} times"
+                f"backoff is armed, but ping ran {ping.call_count} times"
             )
             state = mod._ping_backoff.get(1)
             assert state is not None, "ping failure must arm per-account backoff"
             assert state["fails"] == 1
-            assert state["skip_until"] > time.monotonic()
+            assert state["skip_until"] > time.time()
             assert any(
                 r.levelno == logging.DEBUG and "backoff" in r.getMessage().lower()
                 for r in caplog.records
@@ -692,45 +726,30 @@ class TestWindowKeeperPingBackoff:
     def test_ping_success_resets_backoff(self):
         import jacked.api.usage_monitor as mod
 
+        from jacked.web.window_keeper import token_fingerprint
+
         # Expired backoff (skip_until in the past) so the sweep pings again.
-        mod._ping_backoff[1] = {"fails": 3, "skip_until": 0.0}
+        mod._ping_backoff[1] = {
+            "fails": 3, "skip_until": 0.0, "token_fp": token_fingerprint("tok"),
+        }
         accounts = [_acct(1, resets_at=None)]
         db = _make_db(settings=self._settings(), accounts=accounts)
-        app = _make_app(db=db)
+        # The usage read-back after the ping records an open window.
+        db.get_account.return_value = {
+            "cached_5h_resets_at": _iso(datetime.now(timezone.utc) + timedelta(hours=4)),
+        }
+        ping = AsyncMock(return_value=_ping_ok())
 
         async def _run():
-            with (
-                patch(
-                    "jacked.api.usage_monitor.asyncio.sleep",
-                    side_effect=_sleep_canceller(max_sleeps=1),
-                ),
-                patch(
-                    "jacked.web.window_keeper.is_active_hours",
-                    return_value=True,
-                ),
-                patch(
-                    "jacked.web.window_keeper.is_prewake_time",
-                    return_value=False,
-                ),
-                patch(
-                    "jacked.web.window_keeper.needs_ping",
-                    return_value=True,
-                ),
-                patch(
-                    "jacked.web.window_keeper.ping_account",
-                    new_callable=AsyncMock,
-                    return_value=True,
-                ) as mock_ping,
-                patch(
-                    "jacked.web.auth.fetch_usage",
-                    new_callable=AsyncMock,
-                    return_value={"_cached": False},
-                ),
+            p1, p2, _p3, p4, p5 = self._patches(ping)
+            with p1, p2, p4, p5, patch(
+                "jacked.web.auth.fetch_usage",
+                new_callable=AsyncMock,
+                return_value={"_cached": False},
             ):
-                with pytest.raises(asyncio.CancelledError):
-                    await full_sweep_loop(app)
+                await mod._run_window_keeper(db, 5)
 
-            assert mock_ping.call_count == 1
+            assert ping.call_count == 1
             assert 1 not in mod._ping_backoff, (
                 "a successful ping must clear the account's backoff state"
             )
@@ -740,55 +759,27 @@ class TestWindowKeeperPingBackoff:
     def test_backoff_delay_is_exponential_and_capped(self):
         import jacked.api.usage_monitor as mod
 
+        from jacked.web.window_keeper import token_fingerprint
+
         # fails=10 with check_interval=5 would be 5120s uncapped — the cap
         # must hold skip_until to <= now + 3600.
-        mod._ping_backoff[1] = {"fails": 10, "skip_until": 0.0}
+        mod._ping_backoff[1] = {
+            "fails": 10, "skip_until": 0.0, "token_fp": token_fingerprint("tok"),
+        }
         accounts = [_acct(1, resets_at=None)]
         db = _make_db(settings=self._settings(), accounts=accounts)
-        app = _make_app(db=db)
+        ping = AsyncMock(return_value=_ping_429())
 
         async def _run():
-            with (
-                patch(
-                    "jacked.api.usage_monitor.asyncio.sleep",
-                    side_effect=_sleep_canceller(max_sleeps=1),
-                ),
-                patch(
-                    "jacked.web.window_keeper.is_active_hours",
-                    return_value=True,
-                ),
-                patch(
-                    "jacked.web.window_keeper.is_prewake_time",
-                    return_value=False,
-                ),
-                patch(
-                    "jacked.web.window_keeper.needs_ping",
-                    return_value=True,
-                ),
-                patch(
-                    "jacked.web.window_keeper.ping_account",
-                    new_callable=AsyncMock,
-                    return_value=False,
-                ),
-                patch(
-                    "jacked.api.credential_helpers.read_active_account_id",
-                    return_value=999,
-                ),
-                patch(
-                    "jacked.web.auth.refresh_cc_token",
-                    new_callable=AsyncMock,
-                    return_value=False,
-                ),
-            ):
-                with pytest.raises(asyncio.CancelledError):
-                    await full_sweep_loop(app)
+            p1, p2, p3, p4, p5 = self._patches(ping)
+            with p1, p2, p3, p4, p5:
+                await mod._run_window_keeper(db, 5)
 
             state = mod._ping_backoff[1]
             assert state["fails"] == 11
-            assert state["skip_until"] <= time.monotonic() + 3600
+            assert state["skip_until"] <= time.time() + 3600
 
         asyncio.run(_run())
-
 
 # ---------------------------------------------------------------------------
 # TOCTOU guard — bail when active account changes mid-swap

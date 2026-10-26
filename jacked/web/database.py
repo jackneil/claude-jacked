@@ -74,6 +74,7 @@ class Account(BaseModel):
     account_uuid: Optional[str] = None
     profile_json: Optional[str] = None
     profile_fetched_at: Optional[float] = None
+    keeper_state: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -223,6 +224,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     account_uuid TEXT,  -- Claude account uuid (profile account.uuid / token exchange account.uuid)
     profile_json TEXT,  -- Non-secret profile subset: {"account": {...}, "organization": {...}}
     profile_fetched_at REAL,  -- Epoch seconds of the profile fetch that wrote profile_json
+    keeper_state TEXT,  -- Window keeper state JSON (see Database.set_keeper_state)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(provider, email, organization_uuid)
@@ -703,6 +705,18 @@ class Database:
                         )
                     except sqlite3.OperationalError:
                         pass
+            # Migration: add the window keeper's per-account state (one JSON
+            # column: last ping, status, error type, skip reason, next attempt;
+            # see set_keeper_state). Same placement rule as the identity
+            # columns: AFTER the explicit-column organization rebuild, BEFORE
+            # the provider rebuild (which copies every live column).
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols_keeper = {row[1] for row in cursor.fetchall()}
+            if "keeper_state" not in acct_cols_keeper:
+                try:
+                    conn.execute("ALTER TABLE accounts ADD COLUMN keeper_state TEXT")
+                except sqlite3.OperationalError:
+                    pass
             # Migration: add `provider` column + provider-scoped uniqueness.
             # Codex support: the same (email, organization_uuid) can exist under
             # both 'claude' and 'codex'. SQLite can't ALTER a UNIQUE constraint,
@@ -1308,6 +1322,82 @@ class Database:
             )
             row = cursor.fetchone()
             return dict(row) if row else None
+
+    # Keys set_keeper_state accepts. A typo must fail loudly in tests, not
+    # silently grow the JSON blob the dashboard reads.
+    KEEPER_STATE_FIELDS = frozenset(
+        {
+            "last_ping_at",
+            "last_status",
+            "error_type",
+            "request_id",
+            "consecutive_auth_failures",
+            "next_attempt_at",
+            "skip_reason",
+            "token_fp",
+        }
+    )
+
+    @staticmethod
+    def parse_keeper_state(raw: Any) -> dict:
+        """Decode a keeper_state column value; anything malformed is {}.
+
+        >>> Database.parse_keeper_state(None)
+        {}
+        >>> Database.parse_keeper_state('{"last_status": "ok"}')
+        {'last_status': 'ok'}
+        >>> Database.parse_keeper_state("not json")
+        {}
+        """
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not raw or not isinstance(raw, str):
+            return {}
+        try:
+            value = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def set_keeper_state(self, account_id: int, **fields: Any) -> dict:
+        """Merge *fields* into the account's window keeper state.
+
+        The state is one JSON object in ``accounts.keeper_state``. A field
+        passed as None is stored as null (cleared). ``updated_at`` (epoch
+        seconds) is stamped on every write. The read-merge-write runs in one
+        writer transaction. Does not touch ``accounts.updated_at``: keeper
+        bookkeeping is not an account edit. Returns the merged state ({} when
+        the account does not exist).
+
+        >>> db = Database(":memory:")
+        >>> acct = db.create_account("k@test.com", "tok", 9999999999)
+        >>> st = db.set_keeper_state(acct["id"], last_status="ok", last_ping_at=5)
+        >>> st["last_status"], st["last_ping_at"], "updated_at" in st
+        ('ok', 5, True)
+        >>> st = db.set_keeper_state(acct["id"], skip_reason="backoff")
+        >>> st["last_status"], st["skip_reason"]
+        ('ok', 'backoff')
+        >>> Database.parse_keeper_state(db.get_account(acct["id"])["keeper_state"])["skip_reason"]
+        'backoff'
+        """
+        unknown = set(fields) - self.KEEPER_STATE_FIELDS
+        if unknown:
+            raise ValueError(f"Unknown keeper_state fields: {sorted(unknown)}")
+        with self._writer() as conn:
+            row = conn.execute(
+                "SELECT keeper_state FROM accounts WHERE id = ? AND is_deleted = 0",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                return {}
+            state = self.parse_keeper_state(row[0])
+            state.update(fields)
+            state["updated_at"] = int(time.time())
+            conn.execute(
+                "UPDATE accounts SET keeper_state = ? WHERE id = ? AND is_deleted = 0",
+                (json.dumps(state, sort_keys=True), account_id),
+            )
+        return state
 
     def update_account_usage_cache(
         self,

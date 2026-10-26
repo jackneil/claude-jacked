@@ -629,6 +629,17 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
             "Account %d: reconciled %d credential field(s) from live store",
             account_id, len(updates),
         )
+        _clear_keeper_backoff(account_id)
+
+
+def _clear_keeper_backoff(account_id: int) -> None:
+    """Drop the window keeper's ping backoff after a token import."""
+    try:
+        from jacked.api.usage_monitor import clear_ping_backoff
+
+        clear_ping_backoff(account_id)
+    except Exception:  # noqa: BLE001 - never fail a reconcile over this
+        logger.debug("Could not clear the keeper backoff", exc_info=True)
 
 
 # Backward-compatible alias
