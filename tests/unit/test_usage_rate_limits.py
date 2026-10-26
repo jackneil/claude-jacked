@@ -5,8 +5,9 @@ Covers:
   fetch returns {'_cached': True} without an HTTP call
 - 429/401 retries never un-pace the account (no last_fetched_at=0 reset);
   the bounded retry rides _retry_depth>0 through the ceiling instead
-- 429 token rotation throttled to once per _USAGE_429_ROTATION_INTERVAL
-  per account
+- 429 token rotation needs _USAGE_429_ROTATION_MIN_CONSECUTIVE consecutive
+  429s on the same token and is throttled to once per guard interval
+  (several poll periods, read from settings at call time)
 """
 
 import asyncio
@@ -81,6 +82,14 @@ def _mock_client(responses):
     return client
 
 
+def _arm_rotation(state, token="test_access_token", count=None):
+    """Put the 429 counter one 429 short of the rotation threshold."""
+    state["last_429_token_fp"] = mod._token_fingerprint(token)
+    state["consecutive_429s"] = (
+        mod._USAGE_429_ROTATION_MIN_CONSECUTIVE - 1 if count is None else count
+    )
+
+
 _USAGE_200 = {
     "five_hour": {"utilization": 10.0},
     "seven_day": {"utilization": 20.0},
@@ -153,6 +162,7 @@ class TestRetryPacing:
         be left at 0 (the old reset let any client loop hammer the API)."""
         state = mod._get_usage_state(1)
         state["last_fetched_at"] = time.time() - 200
+        _arm_rotation(state)
         db = _mock_db()
         client = _mock_client([(429, {}, {"retry-after": "65"}), (500, {}, {})])
 
@@ -170,6 +180,7 @@ class TestRetryPacing:
         rotated-token retry through — pacing state stays untouched."""
         state = mod._get_usage_state(1)
         state["last_fetched_at"] = time.time() - 30
+        _arm_rotation(state)
         db = _mock_db()
         client = _mock_client([(429, {}, {}), (200, _USAGE_200, {})])
 
@@ -286,12 +297,55 @@ class TestRotationThrottle:
     def setup_method(self):
         mod._account_usage_state.clear()
 
-    def test_rotation_interval_constant(self):
-        assert mod._USAGE_429_ROTATION_INTERVAL == 600
+    def test_rotation_interval_spans_several_poll_periods(self):
+        """The guard is 3 poll periods, floored at the 600s all-accounts poll,
+        so it can never equal the poll period again (the old 600s guard
+        equaled it and throttled nothing)."""
+        assert mod._USAGE_429_ROTATION_INTERVAL == 1800
+        db = MagicMock()
+        db.get_setting.return_value = "300"
+        assert mod._usage_429_rotation_interval(db) == 1800
+        db.get_setting.return_value = "1200"
+        assert mod._usage_429_rotation_interval(db) == 3600
+
+    def test_first_and_second_429_never_rotate(self):
+        """A 429 backs off; it does not rotate. Fewer than 3 consecutive
+        429s on the same token never reach the token endpoint."""
+        db = _mock_db()
+        flow_mock = AsyncMock(
+            return_value=TokenExchangeResult(success=False, error="http_429"))
+        state = mod._get_usage_state(1)
+
+        for _ in range(2):
+            state["last_fetched_at"] = time.time() - 200
+            state["backoff_until"] = 0
+            client = _mock_client([(429, {}, {"retry-after": "0"})])
+            with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+                 patch("jacked.web.auth._refresh_token_flow", flow_mock):
+                assert asyncio.run(fetch_usage(1, db)) is None
+
+        assert flow_mock.call_count == 0
+        assert state["consecutive_429s"] == 2
+        assert state["backoff_until"] > time.time()
+
+    def test_a_new_token_restarts_the_429_count(self):
+        """Consecutive 429s are counted per token."""
+        db = _mock_db()
+        state = mod._get_usage_state(1)
+        _arm_rotation(state, token="some_other_token")
+        state["last_fetched_at"] = time.time() - 200
+        flow_mock = AsyncMock(
+            return_value=TokenExchangeResult(success=False, error="http_429"))
+        client = _mock_client([(429, {}, {"retry-after": "0"})])
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._refresh_token_flow", flow_mock):
+            asyncio.run(fetch_usage(1, db))
+        assert flow_mock.call_count == 0
+        assert state["consecutive_429s"] == 1
 
     def test_second_429_within_interval_skips_rotation(self):
-        """Second 429 within 600s must NOT call _refresh_token_flow again —
-        the incident rotated CC tokens 243 times in 4.5h."""
+        """Once a rotation happened, another one waits a full guard
+        interval — the incident rotated CC tokens 243 times in 4.5h."""
         db = _mock_db()
         flow_mock = AsyncMock(
             return_value=TokenExchangeResult(success=False, error="http_429"))
@@ -305,6 +359,7 @@ class TestRotationThrottle:
                  patch("jacked.web.auth._refresh_token_flow", flow_mock):
                 return asyncio.run(fetch_usage(1, db))
 
+        _arm_rotation(state)
         assert run_429() is None
         assert flow_mock.call_count == 1
 
@@ -321,6 +376,7 @@ class TestRotationThrottle:
         state["last_429_rotation_at"] = (
             time.time() - mod._USAGE_429_ROTATION_INTERVAL - 100
         )
+        _arm_rotation(state)
         client = _mock_client([(429, {}, {"retry-after": "0"})])
 
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
@@ -337,6 +393,7 @@ class TestRotationThrottle:
         state = mod._get_usage_state(1)
         state["last_fetched_at"] = time.time() - 200
         state["last_429_rotation_at"] = time.time()  # rotation just happened
+        _arm_rotation(state)
         client = _mock_client([(429, {}, {"retry-after": "0"})])
 
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
@@ -346,3 +403,58 @@ class TestRotationThrottle:
         assert result is None
         assert flow_mock.call_count == 0
         assert state["backoff_until"] > time.time()
+
+
+# ---------------------------------------------------------------------------
+# Real cadence: the all-accounts poll (600s + jitter) against a token that
+# always 429s
+# ---------------------------------------------------------------------------
+
+
+class TestRotationAtRealCadence:
+    def setup_method(self):
+        mod._account_usage_state.clear()
+
+    def test_always_429_rotates_at_most_once_per_guard_interval(self):
+        """Run fetch_usage every 620s for 12h with a token that always 429s.
+
+        Before the fix every poll rotated (the 600s guard equaled the
+        poll period): ~140 primary renewals a day on account 1.
+        """
+        db = _mock_db()
+        db.get_setting.return_value = "300"
+        clock = {"now": 1_800_000_000.0}
+        rotations: list[float] = []
+
+        async def fake_rotation(account_id, db_, state, stale_token=None):
+            rotations.append(clock["now"])
+            return None  # the token endpoint did not help
+
+        def always_429(*_a, **_k):
+            resp = MagicMock()
+            resp.status_code = 429
+            resp.headers = {}
+            resp.json.return_value = {}
+            return resp
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock(side_effect=always_429)
+
+        polls = 0
+        with patch.object(mod.time, "time", lambda: clock["now"]), \
+             patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth._try_refresh_on_429", fake_rotation):
+            end = clock["now"] + 12 * 3600
+            while clock["now"] < end:
+                asyncio.run(fetch_usage(1, db))
+                polls += 1
+                clock["now"] += 600 + 20
+
+        guard = mod._usage_429_rotation_interval(db)
+        assert polls >= 60
+        assert client.get.call_count >= 30  # backoff skips some polls
+        assert 1 <= len(rotations) <= 12 * 3600 / guard + 1
+        for earlier, later in zip(rotations, rotations[1:]):
+            assert later - earlier >= guard

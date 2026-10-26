@@ -500,6 +500,135 @@ def _live_tokens_belong_to(
     return bool(verdict)
 
 
+# Claude Code chain failure types that mean "do not use this chain". An
+# ``invalid_grant`` is a dead refresh lineage. ``auth_rejected`` is a cc
+# access token the API refused (HTTP 401/403) that jacked could not replace.
+CC_CHAIN_DEAD_FAILURES = frozenset({"invalid_grant"})
+CC_TOKEN_UNUSABLE_FAILURES = frozenset({"invalid_grant", "auth_rejected"})
+
+
+def cc_chain_dead(account: dict) -> bool:
+    """True when the Claude Code refresh lineage of ``account`` is dead.
+
+    >>> cc_chain_dead({"cc_refresh_failure_type": "invalid_grant"})
+    True
+    >>> cc_chain_dead({"refresh_failure_type": "invalid_grant"})
+    False
+    """
+    return account.get("cc_refresh_failure_type") in CC_CHAIN_DEAD_FAILURES
+
+
+def is_primary_publication(account: dict, live_access) -> bool:
+    """True when ``live_access`` is the row's PRIMARY access token.
+
+    ``build_oauth_data`` publishes the primary access token (with a null
+    refresh token) when the row has no usable Claude Code token. That token
+    belongs to the primary lineage: importing it into the cc_* columns
+    would merge the two chains.
+
+    >>> is_primary_publication({"access_token": "p1"}, "p1")
+    True
+    >>> is_primary_publication({"access_token": "p1"}, "c1")
+    False
+    """
+    return bool(live_access) and live_access == account.get("access_token")
+
+
+def _stamp_of(payload: dict):
+    stamp = payload.get("_jackedAccountId")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, str)):
+        return None
+    try:
+        return int(stamp)
+    except (TypeError, ValueError):
+        return None
+
+
+def live_payload_belongs_to(
+    account: dict,
+    payload: dict | None,
+    *,
+    require_stamp: bool = True,
+    profile: dict | None = None,
+) -> bool:
+    """True when the Claude Code tokens in ``payload`` provably belong to ``account``.
+
+    This is the ONE stamp-and-ownership rule for every path that imports
+    live tokens into a row: reconcile, the authority guard, and the
+    invalid_grant live recovery.
+
+    1. When ``require_stamp`` is true, the payload stamp must name the row.
+       The stamp is necessary but never sufficient: Claude Code keeps it
+       when it writes another account's tokens.
+    2. A token the row already holds proves the owner with no network call.
+    3. A ``profile`` that the caller already fetched for this access token
+       proves the owner when the shared owner rule accepts it.
+    4. Otherwise ``_live_tokens_belong_to`` asks the profile endpoint. It
+       refuses on an event-loop thread, so an async caller must use
+       ``asyncio.to_thread``.
+
+    The function never logs a token value.
+
+    >>> row = {"id": 1, "email": "a@x.com", "cc_access_token": "a1"}
+    >>> live_payload_belongs_to(row, {"_jackedAccountId": 1,
+    ...                               "claudeAiOauth": {"accessToken": "a1"}})
+    True
+    >>> live_payload_belongs_to(row, {"_jackedAccountId": 5,
+    ...                               "claudeAiOauth": {"accessToken": "a1"}})
+    False
+    >>> live_payload_belongs_to(row, {"claudeAiOauth": {"accessToken": "z9"}},
+    ...                         require_stamp=False,
+    ...                         profile={"account": {"email": "a@x.com"}})
+    True
+    """
+    if not isinstance(payload, dict):
+        return False
+    if require_stamp and _stamp_of(payload) != account.get("id"):
+        return False
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    live_access = oauth.get("accessToken")
+    if not isinstance(live_access, str) or not live_access:
+        return False
+    live_refresh = oauth.get("refreshToken")
+    if live_access == account.get("cc_access_token"):
+        return True
+    if live_refresh and live_refresh == account.get("cc_refresh_token"):
+        return True
+    if profile is not None:
+        field = _owner_mismatch(account, profile)
+        if field is not None:
+            logger.warning(
+                "Account %s: live token profile names another owner (%s)",
+                account.get("id"),
+                field,
+            )
+            return False
+        return True
+    return _live_tokens_belong_to(
+        account, live_access, live_refresh, oauth.get("expiresAt")
+    )
+
+
+def read_live_credentials() -> dict | None:
+    """Read the live Claude credential payload: Keychain first, then the file.
+
+    Returns None when neither store holds a readable JSON object.
+    """
+    live = read_platform_credentials()
+    if live:
+        return live
+    cred_path = Path.home() / ".claude" / ".credentials.json"
+    if cred_path.exists() and not cred_path.is_symlink():
+        try:
+            data = json.loads(cred_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
+    return None
+
+
 def reconcile_credentials_from_live_store(account_id: int, db) -> None:
     """Read live credentials for the active account and reconcile with DB.
 
@@ -519,15 +648,7 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
 
     if not live:
         # Read live credentials (Keychain first, file fallback)
-        live = read_platform_credentials()
-        if not live:
-            # Fall back to .credentials.json
-            cred_path = Path.home() / ".claude" / ".credentials.json"
-            if cred_path.exists() and not cred_path.is_symlink():
-                try:
-                    live = json.loads(cred_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    return
+        live = read_live_credentials()
         # Cache the result (even if None would be returned early below)
         _cache_live_credentials(account_id, live)
 
@@ -535,7 +656,7 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
         return
 
     # Only reconcile if the credentials belong to the outgoing account
-    if live.get("_jackedAccountId") != account_id:
+    if _stamp_of(live) != account_id:
         return
 
     oauth = live.get("claudeAiOauth", {})
@@ -551,12 +672,16 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
     if not account:
         return
 
+    # jacked's own primary-fallback publication is not a Claude Code token.
+    if is_primary_publication(account, live_access):
+        return
+
     # The stamp alone does not prove ownership: Claude Code keeps jacked's
     # _jackedAccountId on its own writes (a /login to another account, or a
     # refresh by a session that holds another account), so a stamped payload
     # can carry a different account's tokens. Importing those would put one
     # account's tokens in another account's row.
-    if not _live_tokens_belong_to(account, live_access, live_refresh, live_expires):
+    if not live_payload_belongs_to(account, live):
         logger.warning(
             "Account %d: live credentials carry its stamp but ownership is not "
             "proven; not importing them%s",
@@ -601,9 +726,9 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
     # Importing a live CC refresh token during invalid_grant would compete with
     # Claude Code for the single-use token, destroying CC's session.
     if live_refresh:
-        account_row = account
-        cb_failure = account_row.get("refresh_failure_type") if account_row else None
-        if cb_failure == "invalid_grant":
+        # The Claude Code chain breaker guards this import. The primary
+        # chain's breaker says nothing about the Claude Code lineage.
+        if cc_chain_dead(account):
             logger.debug(
                 "Account %d: skipping cc_refresh_token import (invalid_grant active)",
                 account_id,
@@ -622,6 +747,15 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
                 account_id,
             )
             updates["cc_refresh_token"] = live_refresh
+
+    # A newer access token replaces one the API refused, so that refusal no
+    # longer applies. A dead lineage (invalid_grant) stays recorded.
+    if (
+        "cc_access_token" in updates
+        and account.get("cc_refresh_failure_type") == "auth_rejected"
+    ):
+        updates["cc_refresh_failure_type"] = None
+        updates["cc_refresh_last_failed_at"] = None
 
     if updates:
         db.update_account(account_id, **updates)
@@ -702,6 +836,8 @@ def build_oauth_data(account: dict) -> dict:
     True
     >>> build_oauth_data({"access_token": "at", "refresh_token": "rt", "expires_at": 100, "scopes": None, "subscription_type": "max", "rate_limit_tier": "t1", "cc_access_token": "cc_at", "cc_refresh_token": "cc_rt", "cc_expires_at": 200})["accessToken"]
     'cc_at'
+    >>> build_oauth_data({"access_token": "at", "expires_at": 100, "cc_access_token": "cc_at", "cc_refresh_token": "spent", "cc_expires_at": 200, "cc_refresh_failure_type": "invalid_grant"})["accessToken"]
+    'at'
     """
     scopes = None
     raw_scopes = account.get("scopes")
@@ -717,6 +853,12 @@ def build_oauth_data(account: dict) -> dict:
     cc_at = account.get("cc_access_token")
     cc_rt = account.get("cc_refresh_token")
     cc_exp = account.get("cc_expires_at")
+    if cc_chain_dead(account):
+        # A dead lineage never goes to Claude Code: its refresh token is
+        # spent, and handing it out forces a re-login in every session.
+        # A live access token recovered for the dead chain may still serve
+        # until it expires, with no refresh token beside it.
+        cc_rt = None
 
     if cc_at:
         # If CC token is expired AND no refresh token, fall through to primary

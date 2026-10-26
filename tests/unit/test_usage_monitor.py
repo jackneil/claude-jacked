@@ -3051,3 +3051,54 @@ def test_all_accounts_loop_polls_codex_not_just_cc_accounts(monkeypatch):
     assert 2 not in fetched  # claude without CC token → skipped
     assert 3 in fetched  # codex → polled (the fix)
     assert (3, None) in calls  # codex polled with no token (app-server path)
+
+
+def test_all_accounts_loop_never_resends_a_dead_cc_token(monkeypatch):
+    """Account 1, 2026-10-22..26: after the cc chain died, the poller kept
+    sending the dead cc_access_token every cycle. Every token now comes
+    from choose_usage_token: a live cc token, else the primary token."""
+    import time
+    import types
+
+    import jacked.api.usage_monitor as um
+    import jacked.web.auth as auth_mod
+
+    future = int(time.time()) + 3600
+    accounts = [
+        {"id": 1, "provider": "claude", "access_token": "p-1",
+         "cc_access_token": "dead-cc-1", "cc_expires_at": future,
+         "cc_refresh_failure_type": "invalid_grant"},
+        {"id": 2, "provider": "claude", "access_token": "p-2",
+         "cc_access_token": "live-cc-2", "cc_expires_at": future},
+        {"id": 3, "provider": "claude", "access_token": "p-3",
+         "cc_access_token": "expired-cc-3", "cc_expires_at": 1},
+        {"id": 4, "provider": "claude", "access_token": "p-4",
+         "cc_access_token": "refused-cc-4", "cc_expires_at": future,
+         "cc_refresh_failure_type": "auth_rejected"},
+        {"id": 5, "provider": "claude", "access_token": "p-5",
+         "cc_access_token": None},
+    ]
+    fake_db = types.SimpleNamespace(list_accounts=lambda **k: accounts)
+    app = types.SimpleNamespace(
+        state=types.SimpleNamespace(db=fake_db, active_poll_account_id=None)
+    )
+    calls = {}
+
+    async def fake_fetch(aid, db, access_token=None):
+        calls[aid] = access_token
+
+    monkeypatch.setattr(auth_mod, "fetch_usage", fake_fetch)
+    tops = {"n": 0}
+
+    async def fake_sleep(seconds):
+        if seconds == um._ALL_ACCOUNTS_REFRESH_INTERVAL:
+            tops["n"] += 1
+            if tops["n"] >= 2:
+                raise asyncio.CancelledError
+
+    monkeypatch.setattr(um.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(um.all_accounts_refresh_loop(app))
+
+    assert calls == {1: "p-1", 2: "live-cc-2", 3: "p-3", 4: "p-4", 5: "p-5"}
