@@ -611,6 +611,78 @@ def live_payload_belongs_to(
     )
 
 
+def _row_holds_live_tokens(row: dict, live: dict | None) -> bool:
+    """True when ``row``'s Claude Code tokens are the ones in the live payload.
+
+    >>> live = {"claudeAiOauth": {"accessToken": "a1", "refreshToken": "r1"}}
+    >>> _row_holds_live_tokens({"cc_access_token": "a1"}, live)
+    True
+    >>> _row_holds_live_tokens({"cc_refresh_token": "r1"}, live)
+    True
+    >>> _row_holds_live_tokens({"cc_access_token": "zz"}, live)
+    False
+    >>> _row_holds_live_tokens({"cc_access_token": "a1"}, None)
+    False
+    """
+    if not isinstance(live, dict):
+        return False
+    oauth = live.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    access = oauth.get("accessToken")
+    refresh = oauth.get("refreshToken")
+    if access and access == row.get("cc_access_token"):
+        return True
+    return bool(refresh) and refresh == row.get("cc_refresh_token")
+
+
+def live_holder_account_ids(db, live: dict | None = None) -> set[int]:
+    """Ids of the rows whose Claude Code tokens the live authority holds.
+
+    A running Claude Code session refreshes from the tokens in the authority,
+    so every row holding those tokens shares a single-use refresh lineage
+    with that session, whatever the payload's stamp says (the stamp survives
+    Claude Code's writes for other accounts). Reads the live store once when
+    ``live`` is not given.
+    """
+    if live is None:
+        live = read_live_credentials()
+    if not isinstance(live, dict):
+        return set()
+    held: set[int] = set()
+    try:
+        rows = db.list_accounts(include_inactive=True)
+    except Exception:
+        logger.debug("live_holder_account_ids: account list failed", exc_info=True)
+        return held
+    for row in rows:
+        if _row_holds_live_tokens(row, live):
+            held.add(int(row["id"]))
+    return held
+
+
+def cc_rotation_block(account_id: int, db) -> str | None:
+    """Why jacked must NOT exchange this row's Claude Code refresh token now.
+
+    Invariant I2 fails closed: a Claude Code refresh token is single-use and
+    shared with the running sessions, so the rotation is refused unless the
+    active account is known AND it is not this row AND the live authority
+    does not hold this row's tokens. Returns ``None`` when the rotation is
+    allowed, else one of ``"active"``, ``"active_unknown"``,
+    ``"live_session_holds"``. Reads the Keychain/file store; call it off
+    the event loop.
+    """
+    active = read_active_account_id()
+    if active is None:
+        return "active_unknown"
+    if active == account_id:
+        return "active"
+    row = db.get_account(account_id)
+    if row and _row_holds_live_tokens(row, read_live_credentials()):
+        return "live_session_holds"
+    return None
+
+
 def read_live_credentials() -> dict | None:
     """Read the live Claude credential payload: Keychain first, then the file.
 

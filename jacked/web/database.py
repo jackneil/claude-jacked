@@ -536,11 +536,12 @@ class Database:
 
         >>> conn = sqlite3.connect(":memory:")
         >>> _ = conn.execute(
-        ...     "CREATE TABLE accounts (id INTEGER PRIMARY KEY, refresh_token TEXT, "
-        ...     "cc_access_token TEXT, cc_refresh_token TEXT, cc_expires_at INTEGER, "
-        ...     "refresh_last_failed_at INTEGER, refresh_failure_type TEXT)")
+        ...     "CREATE TABLE accounts (id INTEGER PRIMARY KEY, access_token TEXT, "
+        ...     "refresh_token TEXT, cc_access_token TEXT, cc_refresh_token TEXT, "
+        ...     "cc_expires_at INTEGER, refresh_last_failed_at INTEGER, "
+        ...     "refresh_failure_type TEXT)")
         >>> _ = conn.execute(
-        ...     "INSERT INTO accounts VALUES (1, 'rt', 'dead', NULL, 1, 50, 'invalid_grant')")
+        ...     "INSERT INTO accounts VALUES (1, 'at', 'rt', 'dead', NULL, 1, 50, 'invalid_grant')")
         >>> Database._migrate_cc_chain_breaker(conn)
         >>> conn.execute(
         ...     "SELECT refresh_failure_type, cc_refresh_failure_type, "
@@ -586,6 +587,10 @@ class Database:
             "WHERE refresh_failure_type = 'invalid_grant' "
             "AND cc_refresh_token IS NULL "
             "AND cc_access_token IS NOT NULL "
+            # An old seed copied the PRIMARY access token into the cc column
+            # with no cc refresh token: that row never had a cc chain, so its
+            # invalid_grant is a primary failure and stays where it is.
+            "AND cc_access_token IS NOT access_token "
             "AND refresh_token IS NOT NULL "
             "AND cc_refresh_failure_type IS NULL"
         )

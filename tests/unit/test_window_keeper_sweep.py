@@ -18,14 +18,29 @@ import pytest
 import jacked.api.usage_monitor as um
 from jacked.web.auth import CCRefreshOutcome, CCRefreshResult
 from jacked.web.database import Database
-from jacked.web.window_keeper import PingResult, token_fingerprint
+from jacked.web.window_keeper import PingResult
 
 FUTURE_RESET_EPOCH = str(int(time.time()) + 4 * 3600)
 
 
-def _ok(reset: str | None = FUTURE_RESET_EPOCH, request_id: str = "req_ok") -> PingResult:
-    rate = {"anthropic-ratelimit-unified-5h-reset": reset} if reset else {}
+def _ok(
+    reset: str | None = FUTURE_RESET_EPOCH,
+    request_id: str = "req_ok",
+    utilization: str | None = "0.12",
+) -> PingResult:
+    """A 200 ping. Real replies carry the reset AND the utilization header;
+    utilization=None models a reset-only reply."""
+    rate = {}
+    if reset:
+        rate["anthropic-ratelimit-unified-5h-reset"] = reset
+        if utilization is not None:
+            rate["anthropic-ratelimit-unified-5h-utilization"] = utilization
     return PingResult(ok=True, status=200, request_id=request_id, rate_limit=rate)
+
+
+def _fp(db, account_id) -> str:
+    """The keeper's candidate-set fingerprint for the row as stored."""
+    return um._candidate_fingerprint(*um._keeper_candidates(db.get_account(account_id)))
 
 
 def _err(status: int, error_type: str | None = None, **kw) -> PingResult:
@@ -103,6 +118,8 @@ def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True
             "jacked.api.credential_helpers.read_active_account_id",
             return_value=active_id,
         ),
+        # No live store in tests: the rotation gate sees no held tokens.
+        patch("jacked.api.credential_helpers.read_live_credentials", return_value=None),
     ):
         return asyncio.run(um._run_window_keeper(db, 300))
 
@@ -291,7 +308,7 @@ class TestRecoveryLadder:
         fetch.assert_awaited_once_with(aid, db, access_token="cc-new", post_ping=True)
         st = _state(db, aid)
         assert st["last_status"] == "ok"
-        assert st["token_fp"] == token_fingerprint("cc-new")
+        assert st["token_fp"] == _fp(db, aid)
         assert aid not in um._ping_backoff
 
     def test_no_rotation_possible_falls_back_to_primary(self, db):
@@ -304,17 +321,22 @@ class TestRecoveryLadder:
         assert _state(db, aid)["last_status"] == "ok"
 
     @pytest.mark.parametrize(
-        "outcome", [CCRefreshOutcome.FAILED, CCRefreshOutcome.NO_REFRESH_TOKEN]
+        "rotation",
+        [
+            CCRefreshResult(CCRefreshOutcome.FAILED, error="invalid_grant"),
+            CCRefreshResult(CCRefreshOutcome.FAILED, error="http_401"),
+            CCRefreshResult(CCRefreshOutcome.NO_REFRESH_TOKEN),
+        ],
     )
-    def test_every_token_rejected_persists_needs_reauth_and_stops(self, db, outcome):
+    def test_every_token_rejected_persists_needs_reauth_and_stops(self, db, rotation):
         aid = _mk(db)
         pings = _Pings({"cc-tok": _err(401, "authentication_error", request_id="req_1"), "pri-tok": _err(401)})
-        refresh = AsyncMock(return_value=CCRefreshResult(outcome))
+        refresh = AsyncMock(return_value=rotation)
         _run_pass(db, pings, refresh=refresh)
         st = _state(db, aid)
         assert st["last_status"] == "needs_reauth"
         assert st["consecutive_auth_failures"] == 1
-        assert st["token_fp"] == token_fingerprint("cc-tok")
+        assert st["token_fp"] == _fp(db, aid)
 
         # Terminal: the next sweeps do not ping the dead tokens again.
         _run_pass(db, pings, refresh=refresh)
@@ -336,6 +358,134 @@ class TestRecoveryLadder:
         st = _state(db, aid)
         assert st["last_status"] == "auth_failed"
         assert st["next_attempt_at"] > time.time()
+
+    @pytest.mark.parametrize("error", ["not_sent", "reply_lost", "http_503", "circuit_breaker", None])
+    def test_transient_rotation_failure_is_retried_not_terminal(self, db, error):
+        """A rotation that failed for a reason unrelated to the credential
+        (network, 5xx, breaker cooldown) never ends in needs_reauth: the
+        keeper backs off and tries again, however many sweeps it takes."""
+        aid = _mk(db)
+        pings = _Pings({"cc-tok": _err(401), "pri-tok": _err(401)})
+        refresh = AsyncMock(return_value=CCRefreshResult(CCRefreshOutcome.FAILED, error=error))
+        for _ in range(4):
+            _run_pass(db, pings, refresh=refresh)
+            um._ping_backoff.pop(aid, None)
+            db.set_keeper_state(aid, next_attempt_at=None)
+        st = _state(db, aid)
+        assert st["last_status"] == "auth_failed"
+        assert st["consecutive_auth_failures"] == 4
+        assert refresh.await_count == 4
+
+    def test_unknown_active_account_never_rotates_the_cc_chain(self, db):
+        """Invariant I2 fails closed: with no resolved active account the
+        keeper cannot know whose session holds the cc refresh token, so it
+        does not rotate it. The primary token is still tried, and the
+        failure is retryable rather than terminal."""
+        aid = _mk(db)
+        pings = _Pings({"cc-tok": _err(401), "pri-tok": _ok()})
+        refresh = AsyncMock()
+        _run_pass(db, pings, active_id=None, refresh=refresh)
+        refresh.assert_not_awaited()
+        assert pings.calls == ["cc-tok", "pri-tok"]
+        assert _state(db, aid)["last_status"] == "ok"
+
+        pings = _Pings({"cc-tok": _err(401), "pri-tok": _err(401)})
+        db.update_account_usage_cache(aid, clear_five_hour=True)
+        db.set_keeper_state(aid, last_status=None, next_attempt_at=None)
+        _run_pass(db, pings, active_id=None, refresh=refresh)
+        refresh.assert_not_awaited()
+        assert _state(db, aid)["last_status"] == "auth_failed"
+
+    def test_live_session_holding_the_tokens_blocks_rotation(self, db):
+        """A row whose cc tokens the live authority holds shares its
+        single-use refresh lineage with a running session, whatever the
+        payload's stamp says: never rotated."""
+        _mk(db)
+        pings = _Pings({"cc-tok": _err(401), "pri-tok": _ok()})
+        refresh = AsyncMock()
+        live = {"_jackedAccountId": 999, "claudeAiOauth": {"accessToken": "cc-tok", "refreshToken": "cc-rt"}}
+        refresh_stub = AsyncMock(return_value=CCRefreshResult(CCRefreshOutcome.NO_REFRESH_TOKEN))
+        with (
+            patch.object(um, "_KEEPER_PING_PACING_SECONDS", 0),
+            patch("jacked.web.window_keeper.ping_account", new=pings),
+            patch("jacked.web.window_keeper.is_active_hours", return_value=True),
+            patch("jacked.web.auth.refresh_cc_token_result", refresh),
+            patch("jacked.web.auth._try_refresh_primary_token", AsyncMock(return_value=None)),
+            patch("jacked.web.auth.fetch_usage", refresh_stub),
+            patch("jacked.api.credential_helpers.read_active_account_id", return_value=999),
+            patch("jacked.api.credential_helpers.read_live_credentials", return_value=live),
+        ):
+            asyncio.run(um._run_window_keeper(db, 300))
+        refresh.assert_not_awaited()
+        assert pings.calls == ["cc-tok", "pri-tok"]
+
+    def test_primary_only_reauth_releases_needs_reauth(self, db):
+        """needs_reauth is keyed on the WHOLE candidate set: a primary-only
+        re-auth (the cc token unchanged) must let the keeper try the new
+        primary token on the next sweep."""
+        aid = _mk(db)
+        pings = _Pings({"cc-tok": _err(401), "pri-tok": _err(401)})
+        refresh = AsyncMock(return_value=CCRefreshResult(CCRefreshOutcome.NO_REFRESH_TOKEN))
+        _run_pass(db, pings, refresh=refresh)
+        assert _state(db, aid)["last_status"] == "needs_reauth"
+        _run_pass(db, pings, refresh=refresh)
+        assert pings.calls == ["cc-tok", "pri-tok"]  # latched
+
+        db.update_account(aid, access_token="pri-new")
+        pings.answers["pri-new"] = _ok()
+        _run_pass(db, pings, refresh=refresh)
+        assert pings.calls[-2:] == ["cc-tok", "pri-new"]
+        assert _state(db, aid)["last_status"] == "ok"
+
+    def test_tokens_changed_during_the_ladder_are_not_latched(self, db):
+        """A re-auth that lands while the ladder runs must not be recorded
+        as rejected: the attempted set is stale, so the keeper retries at
+        once instead of persisting needs_reauth against the new token."""
+        aid = _mk(db)
+
+        class _ReauthDuringPrimaryPing(_Pings):
+            async def __call__(self, token, timeout=30, *, account_id=None):
+                if token == "pri-tok":
+                    db.update_account(account_id, cc_access_token="cc-reauthed")
+                return await super().__call__(token, timeout, account_id=account_id)
+
+        pings = _ReauthDuringPrimaryPing({"cc-tok": _err(401), "pri-tok": _err(401)})
+        refresh = AsyncMock(return_value=CCRefreshResult(CCRefreshOutcome.NO_REFRESH_TOKEN))
+        _run_pass(db, pings, refresh=refresh)
+        st = _state(db, aid)
+        assert st["last_status"] == "auth_failed"
+        assert st["next_attempt_at"] <= time.time()
+        pings.answers["cc-reauthed"] = _ok()
+        _run_pass(db, pings, refresh=refresh)
+        assert pings.calls[-1] == "cc-reauthed"
+        assert _state(db, aid)["last_status"] == "ok"
+
+    def test_reset_only_ping_does_not_stamp_stale_utilization(self, db):
+        """A reply with a reset but no utilization must not write the new
+        reset over the old window's utilization (that would show the old
+        100% as a fresh reading of the new window)."""
+        aid = _mk(db)
+        db.update_account_usage_cache(aid, five_hour=100.0, five_hour_resets_at="2020-01-01T00:00:00Z")
+        before = db.get_account(aid)["usage_cached_at"]
+        pings = _Pings({"cc-tok": _ok(utilization=None)})
+        _run_pass(db, pings)
+        row = db.get_account(aid)
+        assert row["cached_5h_resets_at"] == "2020-01-01T00:00:00Z"
+        assert row["usage_cached_at"] == before
+        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+
+    def test_far_future_headers_are_bounded(self, db):
+        """A Retry-After or reset far in the future never parks an account."""
+        aid = _mk(db)
+        pings = _Pings({"cc-tok": _err(429, "rate_limit_error", retry_after=99_999_999.0)})
+        _run_pass(db, pings)
+        assert _state(db, aid)["next_attempt_at"] <= time.time() + 6 * 3600 + 1
+
+        db.set_keeper_state(aid, last_status=None, next_attempt_at=None)
+        um._ping_backoff.pop(aid, None)
+        pings = _Pings({"cc-tok": _ok(reset=str(int(time.time()) + 10 * 365 * 86400))})
+        _run_pass(db, pings)
+        assert db.get_account(aid)["cached_5h_resets_at"] is None
 
     def test_active_account_reconciles_and_never_rotates_cc(self, db):
         aid = _mk(db)
@@ -461,7 +611,7 @@ class TestBackoffTokenIdentity:
         um._ping_backoff[aid] = {
             "fails": 6,
             "skip_until": time.time() + 3600,
-            "token_fp": token_fingerprint("cc-tok"),
+            "token_fp": _fp(db, aid),
         }
         pings = _Pings({"cc-new": _ok()})
         _run_pass(db, pings)
@@ -477,7 +627,7 @@ class TestBackoffTokenIdentity:
             aid,
             last_status="rate_limited",
             next_attempt_at=time.time() + 600,
-            token_fp=token_fingerprint("cc-tok"),
+            token_fp=_fp(db, aid),
         )
         pings = _Pings({"cc-tok": _ok()})
         _run_pass(db, pings)  # in-memory backoff is empty (fresh process)

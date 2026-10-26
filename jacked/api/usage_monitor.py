@@ -8,6 +8,7 @@ effect without restart.
 """
 
 import asyncio
+from dataclasses import dataclass
 import json
 import logging
 import random
@@ -1990,7 +1991,8 @@ def _note_keeper_skip(
 ) -> None:
     """Record why the keeper did not ping an account — only on change."""
     if state.get("skip_reason") == reason and (
-        reason != "backoff" or state.get("next_attempt_at") == next_attempt_at
+        (reason != "backoff" and next_attempt_at is None)
+        or state.get("next_attempt_at") == next_attempt_at
     ):
         return
     fields: dict = {"skip_reason": reason}
@@ -2023,92 +2025,212 @@ def _arm_ping_backoff(
     return entry["skip_until"]
 
 
-def _ping_window_cache_fields(result) -> dict:
-    """update_account_usage_cache kwargs from a successful ping's headers."""
+def _bounded_reset(iso: str | None, now: float, max_ahead: float) -> str | None:
+    """An ISO reset that lies in (now, now + max_ahead], else None.
+
+    >>> _bounded_reset("2000-01-01T00:00:00+00:00", 1.7e9, 3600) is None
+    True
+    >>> _bounded_reset(None, 1.7e9, 3600) is None
+    True
+    """
+    if not iso:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso).timestamp()
+    except ValueError:
+        return None
+    if now < ts <= now + max_ahead:
+        return iso
+    return None
+
+
+def _ping_window_cache_fields(result, now: float | None = None) -> dict:
+    """update_account_usage_cache kwargs from a successful ping's headers.
+
+    A window is written only when the ping reports BOTH its reset and its
+    utilization: writing a new reset over the previous window's utilization
+    would stamp that stale reading as a fresh measurement of the new window
+    (the dashboard would show the old 100% against a window that just
+    opened). A reset-only reply leaves the cache to the usage read-back.
+    Resets outside a sane horizon (5h: 6h ahead; 7d: 8d ahead) are ignored.
+    Utilization headers are a 0..1 fraction; the cache columns use percent.
+    """
+    now = time.time() if now is None else now
     fields: dict = {}
-    reset_5h = result.reset_5h_iso()
-    reset_7d = result.reset_7d_iso()
-    if reset_5h:
-        fields["five_hour_resets_at"] = reset_5h
-    if reset_7d:
-        fields["seven_day_resets_at"] = reset_7d
-    # Utilization headers are a 0..1 fraction; the usage API (and the cache
-    # columns) use percent. Only written next to a reset, so a stamp of
-    # usage_cached_at always comes with real window data.
-    for header, key in (
-        ("anthropic-ratelimit-unified-5h-utilization", "five_hour"),
-        ("anthropic-ratelimit-unified-7d-utilization", "seven_day"),
-    ):
-        raw = result.rate_limit.get(header)
-        if raw is None:
-            continue
+    windows = (
+        ("five_hour", result.reset_5h_iso(), _KEEPER_MAX_RETRY_SECONDS,
+         "anthropic-ratelimit-unified-5h-utilization"),
+        ("seven_day", result.reset_7d_iso(), _KEEPER_MAX_7D_RESET_SECONDS,
+         "anthropic-ratelimit-unified-7d-utilization"),
+    )
+    for key, reset_iso, horizon, util_header in windows:
+        reset = _bounded_reset(reset_iso, now, horizon)
+        raw = result.rate_limit.get(util_header)
         try:
-            value = float(raw)
+            value = float(raw) if raw is not None else None
         except (TypeError, ValueError):
-            continue
-        if 0.0 <= value <= 1.0:
+            value = None
+        if reset and value is not None and 0.0 <= value <= 1.0:
+            fields[f"{key}_resets_at"] = reset
             fields[key] = round(value * 100.0, 2)
-    if "five_hour_resets_at" not in fields and "seven_day_resets_at" not in fields:
-        return {}
     return fields
 
 
-async def _keeper_auth_ladder(db, acct: dict, failed_token: str, failed_is_cc: bool, tried: set):
-    """Recover from a 401/403 ping. Returns (good_token, last_result, lock_held).
+@dataclass
+class _LadderOutcome:
+    """What the 401/403 recovery ladder achieved for one account.
 
-    1. Get a new token for the chain that owns the failed token: the active
-       account reconciles from Claude Code's live store (never rotate its CC
-       refresh token: Claude Code holds that single-use token and would hit
-       invalid_grant, see tests/unit/test_active_account_cc_skip.py); another
-       account force-rotates its CC chain; a failed PRIMARY token rotates the
-       primary chain (jacked's own, never handed to Claude Code).
+    ``good_token`` is the token whose ping succeeded (None when every attempt
+    failed). ``last`` is the last PingResult. ``pending`` is set when a
+    rotation that could still produce a usable token did not complete this
+    sweep (lock held by another path, a transient exchange failure, or a
+    rotation refused because the active account is unknown): such a failure
+    is retried with a backoff, never recorded as needs_reauth.
+    """
+
+    good_token: str | None = None
+    last: object | None = None
+    pending: bool = False
+    pending_reason: str | None = None
+
+
+# Exchange errors that say the refresh token itself is dead or refused. Any
+# other FAILED outcome (not_sent, reply_lost, http_5xx, circuit_breaker,
+# lock_timeout, chain_changed, db_write_failed, ...) is transient.
+_ROTATION_TERMINAL_ERRORS = frozenset(
+    {"invalid_grant", "http_400", "http_401", "http_403", "account_not_found"}
+)
+# Ceiling on a server-provided retry or 5h reset the keeper will honor; a
+# 7d reset may lie up to _KEEPER_MAX_7D_RESET_SECONDS ahead.
+_KEEPER_MAX_RETRY_SECONDS = 6 * 3600
+_KEEPER_MAX_7D_RESET_SECONDS = 8 * 86400
+
+
+def _keeper_candidates(acct: dict) -> tuple[str | None, str | None]:
+    """(cc token the keeper may send or None, primary token or None).
+
+    A dead cc chain (invalid_grant) or an API-refused cc token
+    (auth_rejected), both recorded per chain by the usage path, count as no
+    cc token: the keeper goes straight to the primary token.
+    """
+    from jacked.api.credential_helpers import CC_TOKEN_UNUSABLE_FAILURES
+
+    cc = acct.get("cc_access_token")
+    if acct.get("cc_refresh_failure_type") in CC_TOKEN_UNUSABLE_FAILURES:
+        cc = None
+    return (cc or None), (acct.get("access_token") or None)
+
+
+def _candidate_fingerprint(cc: str | None, primary: str | None) -> str | None:
+    """Fingerprint of the keeper's whole candidate set for one account.
+
+    Keyed on BOTH chains so that a change to either one (a primary-only
+    re-auth, a cc rotation) invalidates a persisted verdict or backoff that
+    was recorded against the old set.
+
+    >>> _candidate_fingerprint(None, None) is None
+    True
+    >>> _candidate_fingerprint("a", None) != _candidate_fingerprint("a", "b")
+    True
+    """
+    from jacked.web import window_keeper as wk
+
+    if not cc and not primary:
+        return None
+    return f"{wk.token_fingerprint(cc) or '-'}|{wk.token_fingerprint(primary) or '-'}"
+
+
+def _rotation_is_transient(error: str | None) -> bool:
+    """True when a failed exchange may succeed on a later attempt.
+
+    >>> _rotation_is_transient("not_sent"), _rotation_is_transient("invalid_grant")
+    (True, False)
+    """
+    if error is None:
+        return True
+    if error in _ROTATION_TERMINAL_ERRORS:
+        return False
+    return True
+
+
+async def _keeper_auth_ladder(
+    db, acct: dict, failed_token: str, failed_is_cc: bool, tried: set
+) -> _LadderOutcome:
+    """Recover from a 401/403 ping.
+
+    1. Get a new token for the chain that owns the failed token. The cc
+       chain is rotated only when ``cc_rotation_block`` allows it (invariant
+       I2 fails closed): the active account reconciles from Claude Code's
+       live store instead; an unknown active account or a row whose tokens a
+       running session holds is never rotated. A failed PRIMARY token rotates
+       the primary chain (jacked's own, never handed to Claude Code).
     2. Re-ping once with that token.
     3. Ping with the primary access token if it is present and untried.
     """
+    from jacked.api.credential_helpers import cc_rotation_block
     from jacked.web import auth as auth_mod
     from jacked.web import window_keeper as wk
 
     account_id = acct["id"]
-    candidate = None
-    last = None
-    lock_held = False
+    out = _LadderOutcome()
+    candidate: str | None = None
 
-    from jacked.api.credential_helpers import read_active_account_id
-
-    is_active = read_active_account_id() == account_id
-    if is_active:
-        logger.info(
-            "Window keeper: skipping CC refresh for active account %d — "
-            "reconciling instead",
-            account_id,
-        )
+    if failed_is_cc:
         try:
-            from jacked.api.credential_helpers import (
-                reconcile_credentials_from_live_store,
-            )
-
-            await asyncio.to_thread(
-                reconcile_credentials_from_live_store, account_id, db
-            )
-            fresh = db.get_account(account_id) or {}
-            candidate = fresh.get("cc_access_token")
+            block = await asyncio.to_thread(cc_rotation_block, account_id, db)
         except Exception:
-            logger.exception(
-                "Window keeper reconcile failed for active account %d", account_id
+            logger.debug("Window keeper: rotation check failed", exc_info=True)
+            block = "check_failed"
+        if block == "active":
+            logger.info(
+                "Window keeper: skipping CC refresh for active account %d — "
+                "reconciling instead",
+                account_id,
             )
-    if (candidate is None or candidate in tried) and failed_is_cc and not is_active:
-        res = await auth_mod.refresh_cc_token_result(account_id, db, force=True)
-        logger.info(
-            "Window keeper: forced CC rotation for account %d: %s",
-            account_id,
-            res.outcome.value,
-        )
-        lock_held = res.outcome is auth_mod.CCRefreshOutcome.LOCK_HELD
-        candidate = res.access_token if res.new_token else None
-    elif (candidate is None or candidate in tried) and not failed_is_cc:
+            try:
+                from jacked.api.credential_helpers import (
+                    reconcile_credentials_from_live_store,
+                )
+
+                await asyncio.to_thread(
+                    reconcile_credentials_from_live_store, account_id, db
+                )
+                fresh = db.get_account(account_id) or {}
+                candidate = fresh.get("cc_access_token")
+            except Exception:
+                logger.exception(
+                    "Window keeper reconcile failed for active account %d", account_id
+                )
+        elif block is not None:
+            # Unknown active account, or a running session holds this row's
+            # tokens: rotating would kill that session (I2). Retry later.
+            logger.info(
+                "Window keeper: not rotating the CC chain for account %d (%s)",
+                account_id,
+                block,
+            )
+            out.pending = block == "active_unknown" or block == "check_failed"
+            out.pending_reason = block
+        else:
+            res = await auth_mod.refresh_cc_token_result(account_id, db, force=True)
+            logger.info(
+                "Window keeper: forced CC rotation for account %d: %s%s",
+                account_id,
+                res.outcome.value,
+                f" ({res.error})" if res.error else "",
+            )
+            if res.new_token:
+                candidate = res.access_token
+            elif res.outcome is auth_mod.CCRefreshOutcome.LOCK_HELD:
+                out.pending, out.pending_reason = True, "lock_held"
+            elif res.outcome is auth_mod.CCRefreshOutcome.FAILED and _rotation_is_transient(
+                res.error
+            ):
+                out.pending, out.pending_reason = True, res.error or "transient"
+    else:
         try:
-            candidate = await auth_mod._try_refresh_primary_token(
-                account_id, db, stale_token=failed_token
+            flow = await auth_mod._refresh_token_flow(
+                account_id, db, auth_mod.RefreshMode.PRIMARY_CIRCUIT_BREAKER
             )
         except Exception:
             logger.warning(
@@ -2116,7 +2238,13 @@ async def _keeper_auth_ladder(db, acct: dict, failed_token: str, failed_is_cc: b
                 account_id,
                 exc_info=True,
             )
-            candidate = None
+            flow = None
+        if flow is not None and flow.success and flow.access_token:
+            candidate = flow.access_token
+        elif flow is not None and _rotation_is_transient(flow.error):
+            out.pending, out.pending_reason = True, flow.error or "transient"
+        elif flow is None:
+            out.pending, out.pending_reason = True, "exception"
         logger.info(
             "Window keeper: primary rotation for account %d: %s",
             account_id,
@@ -2125,11 +2253,12 @@ async def _keeper_auth_ladder(db, acct: dict, failed_token: str, failed_is_cc: b
 
     if candidate and candidate not in tried:
         tried.add(candidate)
-        last = await wk.ping_account(candidate, account_id=account_id)
-        if last.ok:
-            return candidate, last, lock_held
-        if not last.is_auth_failure:
-            return None, last, lock_held
+        out.last = await wk.ping_account(candidate, account_id=account_id)
+        if out.last.ok:
+            out.good_token = candidate
+            return out
+        if not out.last.is_auth_failure:
+            return out
 
     row = db.get_account(account_id) or acct
     primary = row.get("access_token")
@@ -2138,23 +2267,15 @@ async def _keeper_auth_ladder(db, acct: dict, failed_token: str, failed_is_cc: b
         logger.info(
             "Window keeper: trying the primary token for account %d", account_id
         )
-        last = await wk.ping_account(primary, account_id=account_id)
-        if last.ok:
-            return primary, last, lock_held
-    return None, last, lock_held
+        out.last = await wk.ping_account(primary, account_id=account_id)
+        if out.last.ok:
+            out.good_token = primary
+    return out
 
 
-async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
-    """Run the keeper for one account. Returns 'pinged', 'failed' or 'skipped'."""
-    from jacked.web import auth as auth_mod
+def _keeper_window_needed(acct: dict, state: dict) -> tuple[bool, bool]:
+    """(5h window lapsed, 7d window lapsed) for one account."""
     from jacked.web import window_keeper as wk
-
-    account_id = acct["id"]
-    state = _keeper_state_of(acct)
-
-    if (acct.get("provider") or "claude") == "codex":
-        _note_keeper_skip(db, acct, state, "codex_no_keeper")
-        return "skipped"
 
     needs_5h = wk.needs_ping(acct.get("cached_5h_resets_at"))
     needs_7d = wk.needs_7d_ping(
@@ -2171,6 +2292,210 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
         # 7d window; a usage read that reports no 7d reset is not a reason
         # to ping again every sweep.
         needs_7d = False
+    return needs_5h, needs_7d
+
+
+async def _keeper_record_success(
+    db, acct: dict, good_token: str, result, check_interval: float, now: float
+) -> None:
+    """Persist the window a successful ping opened, then the keeper state."""
+    from jacked.web import auth as auth_mod
+    from jacked.web import window_keeper as wk
+
+    account_id = acct["id"]
+    _ping_backoff.pop(account_id, None)
+    cache_fields = _ping_window_cache_fields(result)
+    if cache_fields:
+        try:
+            db.update_account_usage_cache(account_id, **cache_fields)
+        except Exception:
+            logger.warning(
+                "Window keeper: could not store the ping's window for account %d",
+                account_id,
+                exc_info=True,
+            )
+    try:
+        await asyncio.wait_for(
+            auth_mod.fetch_usage(
+                account_id, db, access_token=good_token, post_ping=True
+            ),
+            timeout=10.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Full sweep: fetch_usage for account %d exceeded 10s — moving on",
+            account_id,
+        )
+    fresh = db.get_account(account_id) or {}
+    window_open = not wk.needs_ping(fresh.get("cached_5h_resets_at"))
+    # The row may hold a rotated token now: key the state on the CURRENT
+    # candidate set so a persisted backoff survives the next sweep's check.
+    fresh_fp = _candidate_fingerprint(*_keeper_candidates(fresh)) if fresh else None
+    fields = {
+        "last_ping_at": int(now),
+        "last_status": "ok" if window_open else "ping_ok_no_window",
+        "error_type": None,
+        "request_id": result.request_id,
+        "consecutive_auth_failures": 0,
+        "next_attempt_at": None,
+        "skip_reason": None,
+        "token_fp": fresh_fp,
+    }
+    if not window_open:
+        logger.warning(
+            "Window keeper: ping for account %d succeeded but no open 5h "
+            "window is recorded (no reset header, usage read-back did not "
+            "land)",
+            account_id,
+        )
+        fields["next_attempt_at"] = _arm_ping_backoff(
+            account_id, fresh_fp, check_interval, now
+        )
+    _write_keeper_state(db, account_id, **fields)
+
+
+def _keeper_record_failure(
+    db,
+    acct: dict,
+    state: dict,
+    result,
+    ladder: _LadderOutcome | None,
+    fp: str | None,
+    check_interval: float,
+    now: float,
+) -> None:
+    """Classify a failed sweep by its LAST attempt and persist the verdict."""
+    account_id = acct["id"]
+    base = {
+        "last_ping_at": int(now),
+        "error_type": result.error_type,
+        "request_id": result.request_id,
+        "skip_reason": None,
+        "token_fp": fp,
+    }
+    auth_failures = int(state.get("consecutive_auth_failures") or 0)
+    if result.is_auth_failure:
+        auth_failures += 1
+        fresh = db.get_account(account_id) or acct
+        fresh_fp = _candidate_fingerprint(*_keeper_candidates(fresh))
+        if fresh_fp != fp:
+            # A token landed while the ladder ran (a dashboard re-auth, a
+            # reconcile): the attempted set is not the current set, so no
+            # verdict is recorded against the new tokens. Retry at once.
+            logger.info(
+                "Window keeper: account %d got new tokens during recovery — "
+                "retrying next sweep",
+                account_id,
+            )
+            _ping_backoff.pop(account_id, None)
+            _write_keeper_state(
+                db,
+                account_id,
+                last_status="auth_failed",
+                consecutive_auth_failures=auth_failures,
+                next_attempt_at=now,
+                **base,
+            )
+            return
+        if ladder is not None and ladder.pending:
+            # A rotation may still produce a usable token (lock held, a
+            # transient exchange failure, an unknown active account): back
+            # off, never give up on the credential.
+            skip_until = _arm_ping_backoff(account_id, fp, check_interval, now)
+            logger.info(
+                "Window keeper: account %d rejected every token but the %s "
+                "rotation is retryable — backing off",
+                account_id,
+                ladder.pending_reason or "pending",
+            )
+            _write_keeper_state(
+                db,
+                account_id,
+                last_status="auth_failed",
+                consecutive_auth_failures=auth_failures,
+                next_attempt_at=skip_until,
+                **base,
+            )
+            return
+        _ping_backoff.pop(account_id, None)
+        logger.warning(
+            "Window keeper: every token for account %d was rejected "
+            "(status=%s error_type=%s) — re-auth needed; pings stop until "
+            "the account gets a new token",
+            account_id,
+            result.status,
+            result.error_type,
+        )
+        _write_keeper_state(
+            db,
+            account_id,
+            last_status="needs_reauth",
+            consecutive_auth_failures=auth_failures,
+            next_attempt_at=None,
+            **base,
+        )
+        return
+
+    if result.is_rate_limited:
+        retry_at = None
+        if result.retry_after is not None:
+            retry_at = now + min(result.retry_after, _KEEPER_MAX_RETRY_SECONDS)
+        else:
+            reset_iso = result.reset_5h_iso()
+            if reset_iso:
+                try:
+                    reset_ts = datetime.fromisoformat(reset_iso).timestamp()
+                except ValueError:
+                    reset_ts = None
+                if reset_ts and now < reset_ts <= now + _KEEPER_MAX_RETRY_SECONDS:
+                    retry_at = reset_ts
+        if retry_at is None:
+            retry_at = _arm_ping_backoff(account_id, fp, check_interval, now)
+        else:
+            entry = _ping_backoff.setdefault(
+                account_id, {"fails": 0, "skip_until": 0.0, "token_fp": fp}
+            )
+            entry["token_fp"] = fp
+            entry["skip_until"] = retry_at
+        base["error_type"] = result.error_type or "rate_limited"
+        _write_keeper_state(
+            db, account_id, last_status="rate_limited", next_attempt_at=retry_at, **base
+        )
+        return
+
+    if result.is_transient:
+        # Network or server trouble says nothing about the account: retry on
+        # the next sweep and leave the escalation count alone.
+        entry = _ping_backoff.get(account_id)
+        if entry is not None:
+            entry["skip_until"] = 0.0
+        _write_keeper_state(
+            db,
+            account_id,
+            last_status="transport",
+            next_attempt_at=now + check_interval,
+            **base,
+        )
+        return
+
+    skip_until = _arm_ping_backoff(account_id, fp, check_interval, now)
+    _write_keeper_state(
+        db, account_id, last_status="error", next_attempt_at=skip_until, **base
+    )
+
+
+async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
+    """Run the keeper for one account. Returns 'pinged', 'failed' or 'skipped'."""
+    from jacked.web import window_keeper as wk
+
+    account_id = acct["id"]
+    state = _keeper_state_of(acct)
+
+    if (acct.get("provider") or "claude") == "codex":
+        _note_keeper_skip(db, acct, state, "codex_no_keeper")
+        return "skipped"
+
+    needs_5h, needs_7d = _keeper_window_needed(acct, state)
     if not needs_5h and not needs_7d:
         if state.get("skip_reason"):
             _note_keeper_skip(db, acct, state, None)
@@ -2179,21 +2504,15 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
         _note_keeper_skip(db, acct, state, "auto_swap_disabled")
         return "skipped"
 
-    from jacked.api.credential_helpers import CC_TOKEN_UNUSABLE_FAILURES
-
-    cc_token = acct.get("cc_access_token")
-    # Workstream B records a dead CC chain (invalid_grant) and an API-refused
-    # CC token (auth_rejected) per chain; treat either like a missing CC
-    # token and go straight to the primary token.
-    if acct.get("cc_refresh_failure_type") in CC_TOKEN_UNUSABLE_FAILURES:
-        cc_token = None
-    primary_token = acct.get("access_token")
+    cc_token, primary_token = _keeper_candidates(acct)
     first_token = cc_token or primary_token
     if not first_token:
         _note_keeper_skip(db, acct, state, "no_token")
         return "skipped"
     first_is_cc = bool(cc_token)
-    fp = wk.token_fingerprint(first_token)
+    # One fingerprint for the whole candidate set: a change to EITHER chain
+    # (a primary-only re-auth included) releases a persisted verdict.
+    fp = _candidate_fingerprint(cc_token, primary_token)
     now = time.time()
 
     if state.get("last_status") == "needs_reauth" and state.get("token_fp") == fp:
@@ -2240,168 +2559,18 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
     tried = {first_token}
     result = await wk.ping_account(first_token, account_id=account_id)
     good_token = first_token if result.ok else None
-    lock_held = False
+    ladder: _LadderOutcome | None = None
     if not result.ok and result.is_auth_failure:
-        good_token, ladder_last, lock_held = await _keeper_auth_ladder(
-            db, acct, first_token, first_is_cc, tried
-        )
-        if good_token is not None:
-            result = ladder_last
-        elif ladder_last is not None:
-            result = ladder_last
+        ladder = await _keeper_auth_ladder(db, acct, first_token, first_is_cc, tried)
+        good_token = ladder.good_token
+        if ladder.last is not None:
+            result = ladder.last
 
     now = time.time()
     if good_token is not None:
-        _ping_backoff.pop(account_id, None)
-        cache_fields = _ping_window_cache_fields(result)
-        if cache_fields:
-            try:
-                db.update_account_usage_cache(account_id, **cache_fields)
-            except Exception:
-                logger.warning(
-                    "Window keeper: could not store the ping's window for "
-                    "account %d",
-                    account_id,
-                    exc_info=True,
-                )
-        try:
-            await asyncio.wait_for(
-                auth_mod.fetch_usage(
-                    account_id, db, access_token=good_token, post_ping=True
-                ),
-                timeout=10.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Full sweep: fetch_usage for account %d exceeded 10s — moving on",
-                account_id,
-            )
-        fresh = db.get_account(account_id) or {}
-        window_open = not wk.needs_ping(fresh.get("cached_5h_resets_at"))
-        fields = {
-            "last_ping_at": int(now),
-            "last_status": "ok" if window_open else "ping_ok_no_window",
-            "error_type": None,
-            "request_id": result.request_id,
-            "consecutive_auth_failures": 0,
-            "next_attempt_at": None,
-            "skip_reason": None,
-            "token_fp": wk.token_fingerprint(good_token),
-        }
-        if not window_open:
-            logger.warning(
-                "Window keeper: ping for account %d succeeded but no open 5h "
-                "window is recorded (no reset header, usage read-back did not "
-                "land)",
-                account_id,
-            )
-            fields["next_attempt_at"] = _arm_ping_backoff(
-                account_id, fields["token_fp"], check_interval, now
-            )
-        _write_keeper_state(db, account_id, **fields)
+        await _keeper_record_success(db, acct, good_token, result, check_interval, now)
         return "pinged"
-
-    # -- Failure classification (by the LAST attempt) ---------------------
-    base = {
-        "last_ping_at": int(now),
-        "error_type": result.error_type,
-        "request_id": result.request_id,
-        "skip_reason": None,
-        "token_fp": fp,
-    }
-    auth_failures = int(state.get("consecutive_auth_failures") or 0)
-    if result.is_auth_failure:
-        auth_failures += 1
-        if lock_held and auth_failures < _AUTH_FAILURES_BEFORE_REAUTH:
-            # A CC rotation is in flight; its new token may land any moment.
-            skip_until = _arm_ping_backoff(account_id, fp, check_interval, now)
-            _write_keeper_state(
-                db,
-                account_id,
-                last_status="auth_failed",
-                consecutive_auth_failures=auth_failures,
-                next_attempt_at=skip_until,
-                **base,
-            )
-            return "failed"
-        _ping_backoff.pop(account_id, None)
-        fresh = db.get_account(account_id) or acct
-        fresh_cc = fresh.get("cc_access_token")
-        if fresh.get("cc_refresh_failure_type") in CC_TOKEN_UNUSABLE_FAILURES:
-            fresh_cc = None
-        base["token_fp"] = wk.token_fingerprint(fresh_cc or fresh.get("access_token"))
-        logger.warning(
-            "Window keeper: every token for account %d was rejected "
-            "(status=%s error_type=%s) — re-auth needed; pings stop until "
-            "the account gets a new token",
-            account_id,
-            result.status,
-            result.error_type,
-        )
-        _write_keeper_state(
-            db,
-            account_id,
-            last_status="needs_reauth",
-            consecutive_auth_failures=auth_failures,
-            next_attempt_at=None,
-            **base,
-        )
-        return "failed"
-
-    if result.is_rate_limited:
-        retry_at = None
-        if result.retry_after is not None:
-            retry_at = now + result.retry_after
-        else:
-            reset_iso = result.reset_5h_iso()
-            if reset_iso:
-                try:
-                    reset_ts = datetime.fromisoformat(reset_iso).timestamp()
-                except ValueError:
-                    reset_ts = None
-                if reset_ts and reset_ts > now:
-                    retry_at = reset_ts
-        if retry_at is None:
-            retry_at = _arm_ping_backoff(account_id, fp, check_interval, now)
-        else:
-            entry = _ping_backoff.setdefault(
-                account_id, {"fails": 0, "skip_until": 0.0, "token_fp": fp}
-            )
-            entry["token_fp"] = fp
-            entry["skip_until"] = retry_at
-        base["error_type"] = result.error_type or "rate_limited"
-        _write_keeper_state(
-            db,
-            account_id,
-            last_status="rate_limited",
-            next_attempt_at=retry_at,
-            **base,
-        )
-        return "failed"
-
-    if result.is_transient:
-        # Network or server trouble says nothing about the account: retry on
-        # the next sweep and leave the escalation count alone.
-        entry = _ping_backoff.get(account_id)
-        if entry is not None:
-            entry["skip_until"] = 0.0
-        _write_keeper_state(
-            db,
-            account_id,
-            last_status="transport",
-            next_attempt_at=now + check_interval,
-            **base,
-        )
-        return "failed"
-
-    skip_until = _arm_ping_backoff(account_id, fp, check_interval, now)
-    _write_keeper_state(
-        db,
-        account_id,
-        last_status="error",
-        next_attempt_at=skip_until,
-        **base,
-    )
+    _keeper_record_failure(db, acct, state, result, ladder, fp, check_interval, now)
     return "failed"
 
 
@@ -2428,17 +2597,21 @@ async def _run_window_keeper(db, check_interval: float) -> int:
             done_date=db.get_setting(_PREWAKE_DONE_KEY),
         )
         if prewake:
-            db.set_setting(_PREWAKE_DONE_KEY, now_local.date().isoformat())
             logger.info(
                 "Window keeper: pre-wake pass for %s", now_local.date().isoformat()
             )
+    next_start = None if (active or prewake) else _next_active_start_epoch(now_local, wk_start)
 
     pinged = 0
     for acct in accounts:
         try:
             if not (active or prewake):
                 _note_keeper_skip(
-                    db, acct, _keeper_state_of(acct), "outside_active_hours"
+                    db,
+                    acct,
+                    _keeper_state_of(acct),
+                    "outside_active_hours",
+                    next_attempt_at=next_start,
                 )
                 continue
             outcome = await _keeper_process_account(db, acct, check_interval)
@@ -2454,7 +2627,36 @@ async def _run_window_keeper(db, check_interval: float) -> int:
                 "Window keeper: account %s failed this sweep — continuing",
                 acct.get("id") if isinstance(acct, dict) else "?",
             )
+    if prewake:
+        # Marked only after the whole pass: a pass cut short by a restart
+        # runs again on the next sweep (accounts already opened are skipped
+        # by their future reset).
+        db.set_setting(_PREWAKE_DONE_KEY, now_local.date().isoformat())
     return pinged
+
+
+def _next_active_start_epoch(now_local: datetime, start_hhmm: str) -> float | None:
+    """Epoch seconds of the next keeper active start (today or tomorrow).
+
+    >>> from datetime import datetime as _dt
+    >>> n = _dt(2026, 10, 27, 23, 30)
+    >>> _dt.fromtimestamp(_next_active_start_epoch(n, "06:00")).isoformat()
+    '2026-10-28T06:00:00'
+    >>> _dt.fromtimestamp(_next_active_start_epoch(n.replace(hour=3), "06:00")).isoformat()
+    '2026-10-27T06:00:00'
+    >>> _next_active_start_epoch(n, "garbage") is None
+    True
+    """
+    from datetime import timedelta
+
+    try:
+        h, m = (int(x) for x in start_hhmm.split(":"))
+        start = now_local.replace(hour=h, minute=m, second=0, microsecond=0)
+    except (ValueError, TypeError):
+        return None
+    if start <= now_local:
+        start += timedelta(days=1)
+    return start.timestamp()
 
 
 def _note_keeper_disabled(db) -> None:

@@ -554,7 +554,7 @@ class TestCcToken401Ownership:
         client, sent = _seq_client(401, 200)
         flow = AsyncMock()
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
-             patch("jacked.web.auth._active_account_id", AsyncMock(return_value=1)), \
+             patch("jacked.api.credential_helpers.cc_rotation_block", return_value="active"), \
              patch("jacked.web.auth._refresh_token_flow", flow):
             result = asyncio.run(fetch_usage(1, db, access_token="cc_at"))
 
@@ -575,7 +575,7 @@ class TestCcToken401Ownership:
         db = _real_db(tmp_path)
         client, _sent = _seq_client(401, 200)
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
-             patch("jacked.web.auth._active_account_id", AsyncMock(return_value=1)):
+             patch("jacked.api.credential_helpers.cc_rotation_block", return_value="active"):
             asyncio.run(fetch_usage(1, db, access_token="cc_at"))
 
         choice = choose_usage_token(db.get_account(1))
@@ -597,7 +597,7 @@ class TestCcToken401Ownership:
             )
 
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
-             patch("jacked.web.auth._active_account_id", AsyncMock(return_value=7)), \
+             patch("jacked.api.credential_helpers.cc_rotation_block", return_value=None), \
              patch("jacked.web.auth._refresh_token_flow", flow):
             asyncio.run(fetch_usage(1, db, access_token="cc_at"))
 

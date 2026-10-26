@@ -352,6 +352,22 @@ def _error_type_from_body(text: str) -> str | None:
     return None
 
 
+_ID_MAX_CHARS = 128
+
+
+def _bounded_id(value: str | None) -> str | None:
+    """A server-provided id, bounded before it is stored or shown.
+
+    >>> _bounded_id(None) is None
+    True
+    >>> len(_bounded_id("x" * 500))
+    128
+    """
+    if value is None:
+        return None
+    return str(value)[:_ID_MAX_CHARS]
+
+
 def _redact(text: str, token: str) -> str:
     if token and token in text:
         text = text.replace(token, "[redacted]")
@@ -417,7 +433,7 @@ async def ping_account(
         return PingResult(
             ok=True,
             status=200,
-            request_id=lowered.get("request-id"),
+            request_id=_bounded_id(lowered.get("request-id")),
             rate_limit=rate_limit,
         )
 
@@ -433,7 +449,7 @@ async def ping_account(
         status=status,
         error_type=error_type,
         message=_redact(text, access_token)[:_MESSAGE_MAX_CHARS],
-        request_id=lowered.get("request-id"),
+        request_id=_bounded_id(lowered.get("request-id")),
         retry_after=_parse_retry_after(lowered.get("retry-after")),
         rate_limit=rate_limit,
     )

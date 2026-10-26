@@ -2,8 +2,8 @@
 
 Evals utils.js + usage.js under node and asserts on windowReason() and the
 rendered renderUsageBar() HTML: every keeper reason string, the muted
-"last read" form for Codex and stale readings, the compact variant's em-dash
-caption with the reason in its hover title, and no elapsed marker for a
+"last read" form for Codex and stale readings, the compact variant's short
+caption with the full reason in its hover title, and no elapsed marker for a
 lapsed window. Skipped when node is not on PATH.
 """
 import json
@@ -75,39 +75,68 @@ class TestWindowReason:
 
     def test_needs_reauth_uses_the_warning_tone(self, tmp_path):
         r = _reason(tmp_path, _fresh(keeper_state={"last_status": "needs_reauth"}))
-        assert r == {"text": "needs re-auth", "tone": "warn", "muted": False}
+        assert r == {"text": "needs re-auth", "short": "needs re-auth", "tone": "warn", "muted": False}
 
     def test_needs_reauth_beats_a_stale_reading(self, tmp_path):
         acct = _fresh(usage_cached_at=NOW - 86400, keeper_state={"last_status": "needs_reauth"})
         assert _reason(tmp_path, acct)["text"] == "needs re-auth"
 
-    def test_paused_uses_the_default_keeper_start(self, tmp_path):
-        acct = _fresh(keeper_state={"skip_reason": "outside_active_hours"})
-        assert _reason(tmp_path, acct)["text"] == "paused until 06:00"
+    def test_paused_shows_the_servers_next_start_in_local_time(self, tmp_path):
+        """The server attaches the epoch of the next active start; the
+        client renders it in the viewer's zone (never a settings lookup)."""
+        acct = _fresh(keeper_state={"skip_reason": "outside_active_hours", "next_attempt_at": NOW + 3 * 3600})
+        r = _reason(tmp_path, acct)
+        assert r["text"].startswith("paused until ")
+        assert "06:00" not in r["text"]
+        assert r["short"] == "paused"
 
-    def test_paused_uses_the_configured_start(self, tmp_path):
+    def test_paused_without_a_time_is_just_paused(self, tmp_path):
         acct = _fresh(keeper_state={"skip_reason": "outside_active_hours"})
-        r = _reason(tmp_path, acct, settings={"window_keeper_active_start": "07:30"})
-        assert r["text"] == "paused until 07:30"
+        assert _reason(tmp_path, acct)["text"] == "paused"
 
     @pytest.mark.parametrize(
-        "skip, text",
+        "skip, text, short, tone",
         [
-            ("keeper_disabled", "keeper off"),
-            ("no_token", "no token, re-auth"),
-            ("auto_swap_disabled", "auto-swap off"),
+            ("keeper_disabled", "keeper off", "keeper off", "muted"),
+            ("no_token", "no token, re-auth", "no token", "warn"),
+            ("auto_swap_disabled", "auto-swap off", "auto-swap off", "muted"),
         ],
     )
-    def test_skip_reasons(self, tmp_path, skip, text):
+    def test_skip_reasons(self, tmp_path, skip, text, short, tone):
         r = _reason(tmp_path, _fresh(keeper_state={"skip_reason": skip}))
-        assert r == {"text": text, "tone": "muted", "muted": False}
+        assert r == {"text": text, "short": short, "tone": tone, "muted": False}
 
     def test_rate_limited_shows_the_retry_time(self, tmp_path):
         acct = _fresh(keeper_state={
             "last_status": "rate_limited", "skip_reason": "backoff",
             "next_attempt_at": NOW + 600,
         })
-        assert _reason(tmp_path, acct)["text"].startswith("rate limited until ")
+        r = _reason(tmp_path, acct)
+        assert r["text"].startswith("limited until ")
+        assert r["short"] == "rate limited"
+
+    def test_past_next_attempt_is_not_a_promise(self, tmp_path):
+        """A persisted schedule the machine slept through must not read as
+        a future time."""
+        acct = _fresh(keeper_state={"last_status": "rate_limited", "next_attempt_at": NOW - 600})
+        assert _reason(tmp_path, acct)["text"] == "limit lifting"
+        acct = _fresh(keeper_state={"last_status": "error", "next_attempt_at": NOW - 600})
+        assert _reason(tmp_path, acct)["text"] == "retry due"
+
+    def test_every_short_form_fits_the_compact_caption(self, tmp_path):
+        states = [
+            {"last_status": "needs_reauth"},
+            {"skip_reason": "keeper_disabled"}, {"skip_reason": "no_token"},
+            {"skip_reason": "outside_active_hours", "next_attempt_at": NOW + 3600},
+            {"skip_reason": "auto_swap_disabled"},
+            {"last_status": "rate_limited", "next_attempt_at": NOW + 600},
+            {"last_status": "rate_limited"},
+            {"last_status": "error", "next_attempt_at": NOW + 600},
+            {"last_status": "ok"},
+        ]
+        for ks in states:
+            r = _reason(tmp_path, _fresh(keeper_state=ks))
+            assert r is not None and len(r["short"]) <= 14, (ks, r)
 
     def test_rate_limited_without_a_time(self, tmp_path):
         acct = _fresh(keeper_state={"last_status": "rate_limited"})
@@ -116,7 +145,9 @@ class TestWindowReason:
     @pytest.mark.parametrize("status", ["transport", "auth_failed", "error", "ping_ok_no_window"])
     def test_retrying_shows_the_next_attempt(self, tmp_path, status):
         acct = _fresh(keeper_state={"last_status": status, "next_attempt_at": NOW + 300})
-        assert _reason(tmp_path, acct)["text"].startswith("retrying ")
+        r = _reason(tmp_path, acct)
+        assert r["text"].startswith("retry ")
+        assert r["short"] == "retrying"
 
     def test_ok_ping_but_past_reset_is_window_lapsed(self, tmp_path):
         acct = _fresh(keeper_state={"last_status": "ok"})
@@ -126,7 +157,14 @@ class TestWindowReason:
         acct = _fresh(provider="codex", usage_cached_at=NOW - 51 * 86400)
         r = _reason(tmp_path, acct)
         assert r["text"].startswith("last read ")
+        assert r["short"].startswith("read ")
         assert r["muted"] is True
+
+    def test_fresh_codex_reading_is_not_muted(self, tmp_path):
+        """Dimmed means stale; a minute-old Codex reading is current."""
+        r = _reason(tmp_path, _fresh(provider="codex"))
+        assert r["text"].startswith("last read ")
+        assert r["muted"] is False
 
     def test_stale_claude_reading_is_muted(self, tmp_path):
         r = _reason(tmp_path, _fresh(usage_cached_at=NOW - 3600))
@@ -163,16 +201,31 @@ class TestRenderUsageBar:
         assert "resets " in html
         assert "needs re-auth" not in html
 
-    def test_stale_bar_is_muted(self, tmp_path):
+    def test_stale_bar_dims_the_bar_but_not_the_reason_text(self, tmp_path):
         html = self._bar(tmp_path, _fresh(provider="codex", usage_cached_at=NOW - 86400 * 3), PAST)
-        assert "opacity-60" in html
+        assert 'class="usage-bar flex-1 opacity-60"' in html
         assert "last read " in html
+        # The reason text keeps its base tone: it explains the dimming.
+        assert 'reset-text text-xs text-slate-500' in html
+        assert 'mb-1 opacity-60' not in html
 
-    def test_compact_keeps_the_em_dash_caption_with_reason_in_title(self, tmp_path):
-        acct = _fresh(keeper_state={"skip_reason": "outside_active_hours"})
+    def test_reset_column_never_wraps(self, tmp_path):
+        acct = _fresh(keeper_state={"last_status": "rate_limited", "next_attempt_at": NOW + 86400 * 2})
+        html = self._bar(tmp_path, acct, PAST)
+        assert "w-32 text-right whitespace-nowrap truncate" in html
+
+    def test_compact_shows_the_short_reason_with_its_tone(self, tmp_path):
+        acct = _fresh(keeper_state={"last_status": "needs_reauth"})
         html = self._bar(tmp_path, acct, PAST, compact=True)
-        assert ">—</span>" in html
-        assert 'title="5h limit · paused until 06:00"' in html
+        assert ">needs re-auth</span>" in html
+        assert "reset-caption text-[10px] text-amber-400" in html
+        assert 'title="5h limit · needs re-auth"' in html
+        assert "—" not in html
+
+    def test_compact_lapsed_window_without_a_reason_reads_no_window(self, tmp_path):
+        html = self._bar(tmp_path, _fresh(), PAST, compact=True)
+        assert ">no window</span>" in html
+        assert "—" not in html
 
 
 class TestElapsedFraction:

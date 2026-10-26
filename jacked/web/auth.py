@@ -647,7 +647,7 @@ async def _run_chain_flow(
             # ----------------------------------------------------------
             if result.error == "invalid_grant":
                 if chain == "cc":
-                    return await _cc_chain_died(account_id, db, current)
+                    return await _cc_chain_died(account_id, db, current, refresh_token)
                 db.update_account(account_id, **_breaker_updates("primary", "invalid_grant"))
                 if mode == RefreshMode.PRIMARY:
                     db.record_account_error(account_id, "Refresh token consumed (will retry)")
@@ -720,7 +720,9 @@ async def _run_chain_flow(
     return flow_result
 
 
-async def _cc_chain_died(account_id: int, db: Database, account: dict) -> TokenExchangeResult:
+async def _cc_chain_died(
+    account_id: int, db: Database, account: dict, failed_refresh_token: str,
+) -> TokenExchangeResult:
     """Handle invalid_grant on the Claude Code chain (lock held by caller).
 
     The chain is dead either way. Its refresh token is spent, so it leaves
@@ -737,6 +739,22 @@ async def _cc_chain_died(account_id: int, db: Database, account: dict) -> TokenE
     except Exception:
         logger.debug("Account %d: live recovery read failed", account_id, exc_info=True)
         oauth = None
+
+    # The live read ran off the lock's event-loop turn: an OAuth re-auth
+    # (OAuthFlow._store_cc_tokens does not take the chain lock) may have
+    # stored a NEW cc lineage meanwhile. The invalid_grant was about the
+    # token that failed, so a row that no longer holds it is left alone.
+    current = db.get_account(account_id) or {}
+    current_refresh = current.get("cc_refresh_token")
+    if current_refresh and current_refresh != failed_refresh_token:
+        logger.info(
+            "Account %d: the cc chain was re-authorized while the dead chain "
+            "was being cleaned up; keeping the new lineage",
+            account_id,
+        )
+        return TokenExchangeResult(
+            success=True, access_token=current.get("cc_access_token"), chain="cc",
+        )
 
     if oauth:
         live_access = oauth.get("accessToken")
@@ -1122,19 +1140,29 @@ def token_chain(account: dict, token: Optional[str]) -> Optional[str]:
     return None
 
 
-async def _active_account_id() -> Optional[int]:
-    """Return the resolved active account id off the event loop, or None.
+async def _cc_rotation_allowed(account_id: int, db: Database) -> bool:
+    """True when jacked may exchange this row's Claude Code refresh token.
 
-    The Claude Code refresh token of the active account is shared with the
-    running Claude Code sessions; jacked never rotates it (invariant I2).
+    Invariant I2, fail closed: the rotation is refused when the active
+    account is unknown, when this row IS the active account, or when the
+    live authority holds this row's tokens (a running session shares that
+    single-use lineage). Any error refuses. Runs the store reads off the
+    event loop and logs one values-free line per refusal.
     """
     try:
-        from jacked.api.credential_helpers import read_active_account_id
+        from jacked.api.credential_helpers import cc_rotation_block
 
-        return await asyncio.to_thread(read_active_account_id)
+        block = await asyncio.to_thread(cc_rotation_block, account_id, db)
     except Exception:
-        logger.debug("active account lookup failed", exc_info=True)
-        return None
+        logger.debug("cc rotation check failed for account %d", account_id, exc_info=True)
+        block = "check_failed"
+    if block is not None:
+        logger.info(
+            "Account %d: not rotating the Claude Code refresh token (%s)",
+            account_id, block,
+        )
+        return False
+    return True
 
 
 class RefreshOutcome(str, Enum):
@@ -1210,7 +1238,7 @@ async def _try_refresh_on_429(
     primary chain through the circuit breaker.
     """
     account = db.get_account(account_id) or {}
-    if token_chain(account, stale_token) == "cc" and await _active_account_id() != account_id:
+    if token_chain(account, stale_token) == "cc" and await _cc_rotation_allowed(account_id, db):
         result = await _refresh_token_flow(account_id, db, RefreshMode.CC_OR_PRIMARY_429)
     else:
         result = await _refresh_token_flow(account_id, db, RefreshMode.PRIMARY_CIRCUIT_BREAKER)
@@ -1228,7 +1256,8 @@ async def _recover_rejected_cc_token(
     through to the primary token. It never takes the primary circuit-breaker
     path, which used to renew the primary chain once per poll cycle.
 
-    1. A non-active account with a live cc chain rotates that chain.
+    1. An account whose cc chain jacked may rotate (``_cc_rotation_allowed``)
+       rotates that chain.
     2. Otherwise the cc chain records ``auth_rejected`` (unless it already
        records a dead lineage), so ``choose_usage_token`` stops picking the
        refused token, and the primary access token is returned. A primary
@@ -1239,7 +1268,7 @@ async def _recover_rejected_cc_token(
     if (
         account.get("cc_refresh_token")
         and not cc_chain_dead(account)
-        and await _active_account_id() != account_id
+        and await _cc_rotation_allowed(account_id, db)
     ):
         result = await _refresh_token_flow(account_id, db, RefreshMode.CC)
         if result.success and result.access_token and result.access_token != stale_token:
@@ -2082,8 +2111,12 @@ async def refresh_all_expiring_tokens(
     # NameError here would crash the entire refresh pipeline — see
     # architecture doc §7.1).
     active_id: int | None = None
+    # Rows whose Claude Code tokens a running session holds (the live
+    # authority's tokens, whatever its stamp says): never rotate those.
+    live_held: set[int] = set()
     try:
         from jacked.api.credential_helpers import (
+            live_holder_account_ids,
             read_active_account_id,
             reconcile_credentials_from_live_store,
         )
@@ -2092,8 +2125,14 @@ async def refresh_all_expiring_tokens(
             await asyncio.to_thread(
                 reconcile_credentials_from_live_store, active_id, db
             )
+        live_held = await asyncio.to_thread(live_holder_account_ids, db)
     except Exception:
         logger.debug("Periodic credential reconciliation failed", exc_info=True)
+    if active_id is None:
+        logger.info(
+            "Token refresh: the active account is unknown; Claude Code chains "
+            "are not rotated this pass (invariant I2 fails closed)"
+        )
 
     for account in accounts:
         result["checked"] += 1
@@ -2153,7 +2192,7 @@ async def refresh_all_expiring_tokens(
         # schedule; jacked imports rotated tokens via
         # reconcile_credentials_from_live_store at line ~1044 above.
         # See docs/architecture/oauth-and-credential-flows.md §7.1.
-        if active_id == account_id:
+        if active_id is None or active_id == account_id or account_id in live_held:
             continue
 
         if should_refresh_cc(account, buffer_seconds):

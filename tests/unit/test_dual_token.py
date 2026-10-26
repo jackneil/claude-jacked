@@ -1732,7 +1732,8 @@ class TestCcChainMigration:
         db = Database(str(path))
         for email, at, rt in (("a@test.com", "pat", "prt"),
                               ("b@test.com", "pat2", "prt2"),
-                              ("c@test.com", "pat3", "prt3")):
+                              ("c@test.com", "pat3", "prt3"),
+                              ("d@test.com", "pat4", "prt4")):
             db.create_account(email=email, access_token=at, refresh_token=rt,
                               expires_at=int(time.time()) + 3600, scopes=None)
         conn = sqlite3.connect(str(path))
@@ -1755,6 +1756,13 @@ class TestCcChainMigration:
             "UPDATE accounts SET refresh_failure_type='invalid_grant', "
             "refresh_last_failed_at=999, cc_access_token=NULL, "
             "cc_refresh_token=NULL WHERE id=3")
+        # Account 4: the old seed copied the PRIMARY token into the cc
+        # column (no cc refresh token); its invalid_grant is a primary
+        # death: not moved.
+        conn.execute(
+            "UPDATE accounts SET refresh_failure_type='invalid_grant', "
+            "refresh_last_failed_at=1111, cc_access_token='pat4', "
+            "cc_refresh_token=NULL, cc_expires_at=NULL WHERE id=4")
         conn.commit()
         conn.close()
         return path
@@ -1774,6 +1782,11 @@ class TestCcChainMigration:
         assert c["refresh_failure_type"] == "invalid_grant"
         assert c["refresh_last_failed_at"] == 999
         assert c["cc_refresh_failure_type"] is None
+        d = db.get_account(4)
+        assert d["refresh_failure_type"] == "invalid_grant"
+        assert d["refresh_last_failed_at"] == 1111
+        assert d["cc_refresh_failure_type"] is None
+        assert d["cc_access_token"] == "pat4"
         conn = sqlite3.connect(db.db_path)
         assert conn.execute(
             "SELECT name FROM schema_migrations WHERE name = ?", (self.MARKER,)
@@ -1915,3 +1928,51 @@ class TestBuildOauthDataDeadChain:
             cc_expires_at=int(time.time()) + 600,
             refresh_failure_type="invalid_grant"))
         assert result["refreshToken"] == "cc_rt"
+
+
+class TestDeadChainCleanupRace:
+    def test_reauth_during_live_recovery_keeps_the_new_lineage(self, tmp_path):
+        """invalid_grant on the cc chain reads the live store off the lock's
+        turn; an OAuth re-auth that stores a NEW cc pair meanwhile must not
+        be wiped by the cleanup of the OLD lineage."""
+        import asyncio
+        from unittest.mock import patch
+
+        from jacked.web import auth
+
+        db = Database(str(tmp_path / "race.db"))
+        acct = db.create_account("r@test.com", "pat", int(time.time()) + 3600, refresh_token="prt")
+        aid = acct["id"]
+        db.update_account(aid, cc_access_token="cc_old", cc_refresh_token="cc_rt_old",
+                          cc_expires_at=int(time.time()) + 3600)
+        row = db.get_account(aid)
+
+        def _reauth_lands(account_id, account):
+            db.update_account(account_id, cc_access_token="cc_new", cc_refresh_token="cc_rt_new",
+                              cc_expires_at=int(time.time()) + 7200)
+            return None  # the live store holds another account
+
+        with patch("jacked.web.auth._live_recovery_payload", side_effect=_reauth_lands):
+            result = asyncio.run(auth._cc_chain_died(aid, db, row, "cc_rt_old"))
+
+        assert result.success and result.access_token == "cc_new"
+        after = db.get_account(aid)
+        assert after["cc_refresh_token"] == "cc_rt_new"
+        assert after["cc_refresh_failure_type"] is None
+
+    def test_no_reauth_clears_the_dead_lineage(self, tmp_path):
+        import asyncio
+        from unittest.mock import patch
+
+        from jacked.web import auth
+
+        db = Database(str(tmp_path / "dead.db"))
+        acct = db.create_account("s@test.com", "pat", int(time.time()) + 3600, refresh_token="prt")
+        aid = acct["id"]
+        db.update_account(aid, cc_access_token="cc_old", cc_refresh_token="cc_rt_old")
+        with patch("jacked.web.auth._live_recovery_payload", return_value=None):
+            result = asyncio.run(auth._cc_chain_died(aid, db, db.get_account(aid), "cc_rt_old"))
+        assert not result.success and result.error == "invalid_grant"
+        after = db.get_account(aid)
+        assert after["cc_access_token"] is None and after["cc_refresh_token"] is None
+        assert after["cc_refresh_failure_type"] == "invalid_grant"

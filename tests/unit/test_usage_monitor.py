@@ -759,14 +759,14 @@ class TestWindowKeeperPingBackoff:
     def test_backoff_delay_is_exponential_and_capped(self):
         import jacked.api.usage_monitor as mod
 
-        from jacked.web.window_keeper import token_fingerprint
 
         # fails=10 with check_interval=5 would be 5120s uncapped — the cap
         # must hold skip_until to <= now + 3600.
-        mod._ping_backoff[1] = {
-            "fails": 10, "skip_until": 0.0, "token_fp": token_fingerprint("tok"),
-        }
         accounts = [_acct(1, resets_at=None)]
+        mod._ping_backoff[1] = {
+            "fails": 10, "skip_until": 0.0,
+            "token_fp": mod._candidate_fingerprint(*mod._keeper_candidates(accounts[0])),
+        }
         db = _make_db(settings=self._settings(), accounts=accounts)
         ping = AsyncMock(return_value=_ping_429())
 

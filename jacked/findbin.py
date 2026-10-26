@@ -16,11 +16,11 @@ for such a name.
 
 Trust model: PATH hits are returned as-is, because PATH is the caller's own
 environment. The off-PATH fallback directories are user-writable, so a
-fallback candidate is returned only when its directory, its resolved target
-directory, and the target file itself can be changed by nobody but the
-current user or root (the same owner and write-bit rule that
-``jacked.service.spec`` applies to the service's own interpreter, without its
-sticky-directory exemption). The service runs as that user, so executing a
+fallback candidate is returned only when the candidate (a symlink included),
+its resolved target file, and EVERY ancestor directory of both can be changed
+by nobody but the current user or root (the same owner and write-bit rule
+that ``jacked.service.spec`` applies to the service's own interpreter,
+without its sticky-directory exemption). The service runs as that user, so executing a
 binary that only that user can replace crosses no privilege boundary.
 
 Usage:
@@ -92,21 +92,56 @@ def _fallback_refusal(path: str) -> str | None:
         return None
     uid = _current_uid()
     real = os.path.realpath(path)
-    checks = (
-        ("directory", os.path.dirname(path)),
-        ("target directory", os.path.dirname(real)),
-        ("binary", real),
-    )
-    for label, target in checks:
+    # The link itself: a replaced symlink redirects the lookup even when
+    # every directory and the target are sound.
+    try:
+        link_status = os.lstat(path)
+    except OSError:
+        return "candidate cannot be inspected"
+    if stat.S_ISLNK(link_status.st_mode):
+        reason = _untrusted_reason(link_status, uid)
+        if reason:
+            return f"symlink is {reason}"
+    try:
+        status = os.stat(real)
+    except OSError:
+        return "binary cannot be inspected"
+    if not stat.S_ISREG(status.st_mode):
+        return "binary is not a regular file"
+    reason = _untrusted_reason(status, uid)
+    if reason:
+        return f"binary is {reason}"
+    # Every ancestor of the candidate and of its target (same rule as
+    # jacked.service.spec, minus its sticky-directory exemption): a
+    # writable ancestor lets someone swap a whole directory for a symlink.
+    for label, start in (("directory", os.path.dirname(path)),
+                         ("target directory", os.path.dirname(real))):
+        reason = _untrusted_ancestor(start, uid)
+        if reason:
+            return f"{label} {reason}"
+    return None
+
+
+def _untrusted_ancestor(directory: str, uid: int | None) -> str | None:
+    """Why ``directory`` or one of its parents is not trusted, or None.
+
+    Walks from ``directory`` up to the filesystem root.
+    """
+    seen: set[str] = set()
+    current = os.path.abspath(directory)
+    while current not in seen:
+        seen.add(current)
         try:
-            status = os.stat(target)
+            status = os.stat(current)
         except OSError:
-            return f"{label} cannot be inspected"
-        if label == "binary" and not stat.S_ISREG(status.st_mode):
-            return "binary is not a regular file"
+            return "cannot be inspected"
         reason = _untrusted_reason(status, uid)
         if reason:
-            return f"{label} is {reason}"
+            return f"ancestor is {reason}" if current != os.path.abspath(directory) else f"is {reason}"
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
     return None
 
 

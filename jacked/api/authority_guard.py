@@ -348,14 +348,22 @@ def _adopt_stamped_rotation(
     with _state_lock:
         if _stamped_handled["digest"] == digest:
             return HealResult(ACTION_NONE, foreign_account_id=stamp)
-        _stamped_handled["digest"] = digest
+
+    def _settle() -> None:
+        # Only a settled verdict retires the payload. A transient profile
+        # failure or a failed database write (which raises past this point)
+        # leaves the digest unset, so the next observer pass retries: a
+        # rotated single-use refresh token that is never adopted dies with
+        # the next authority overwrite.
+        with _state_lock:
+            _stamped_handled["digest"] = digest
 
     profile = profile_lookup(access_token)
     if not isinstance(profile, dict) or not profile:
         logger.info(
             "Stamped authority payload for account %d carries tokens jacked does "
-            "not hold; the profile lookup failed, so nothing was adopted "
-            "(payload %s)",
+            "not hold; the profile lookup failed, so nothing was adopted yet "
+            "(payload %s); it is retried on the next pass",
             stamp,
             digest[:8],
         )
@@ -371,11 +379,13 @@ def _adopt_stamped_rotation(
         else None
     )
     if not isinstance(email, str) or not email:
+        _settle()
         return HealResult(
             ACTION_SKIPPED, foreign_account_id=stamp, reason="profile carries no email"
         )
     owner = _match_account(db, email, organization_uuid)
     if owner is None:
+        _settle()
         logger.warning(
             "Stamped authority payload for account %d holds tokens of an account "
             "that is not a known jacked account (organization %s, payload %s); "
@@ -397,6 +407,7 @@ def _adopt_stamped_rotation(
             owner_id,
         )
     adopted = _import_rotated_tokens(db, owner, payload, profile=profile)
+    _settle()
     return HealResult(
         ACTION_ROTATION_ADOPTED if adopted else ACTION_NONE,
         foreign_account_id=owner_id,

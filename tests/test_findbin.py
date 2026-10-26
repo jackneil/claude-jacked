@@ -206,3 +206,21 @@ def test_path_hit_is_not_subject_to_fallback_trust(tmp_path):
     with patch("jacked.findbin.shutil.which", return_value="/usr/bin/codex"), \
          patch("jacked.findbin._current_uid", return_value=os.getuid() + 4242):
         assert find_bin("codex") == "/usr/bin/codex"
+
+
+@posix_only
+def test_refuses_a_world_writable_ancestor_directory(tmp_path, caplog):
+    """~/.local/bin itself is sound, but a writable ancestor lets another
+    local user swap the whole directory for a symlink: refused."""
+    home = tmp_path / "home"
+    exe = _local_bin_exe(home, "codex")
+    home.chmod(0o777)
+    try:
+        with patch("jacked.findbin.shutil.which", return_value=None), \
+             patch("jacked.findbin._home_dir", return_value=str(home)), \
+             caplog.at_level("WARNING", logger="jacked.findbin"):
+            assert find_bin("codex") is None
+    finally:
+        home.chmod(0o755)
+    assert "ancestor is world-writable" in caplog.text
+    assert str(exe) not in caplog.text

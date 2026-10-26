@@ -52,7 +52,8 @@ function usageTextClass(colorClass) {
  *   bar/marker/threshold logic is identical, so the two surfaces never diverge.
  *   reason (from windowReason) replaces the bare "no active window" when the
  *   window has no future reset: plain muted text in the reset column (warning
- *   tone for a re-auth), the whole row dimmed when the reading is stale.
+ *   tone for a re-auth). When the reading is stale, the bar and the percent
+ *   are dimmed; the reason text that explains the dimming stays readable.
  * @returns {string} HTML string.
  */
 function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
@@ -70,11 +71,13 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
     let resetDisplay = resetTime ? formatResetTime(resetTime) : '';
     const reason = opts && opts.reason;
     let resetTone = 'text-slate-500';
-    let rowMuted = '';
+    let staleDim = '';
+    let hasReason = false;
     if (reason && reason.text && !/^resets\s+/i.test(resetDisplay)) {
         resetDisplay = reason.text;
+        hasReason = true;
         if (reason.tone === 'warn') resetTone = 'text-amber-400';
-        if (reason.muted) rowMuted = ' opacity-60';
+        if (reason.muted) staleDim = ' opacity-60';
     }
 
     if (compact) {
@@ -84,36 +87,40 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
         // to stay tight; same-day shows the time ("3:45 PM"), other days add the
         // date ("Jun 30 3:45 PM"). Full text still rides the row title on hover.
         // No extra row → the 6-account no-scroll panel fit is preserved.
-        // Only the "resets <time>" form gets a caption; a past/expired window
-        // ("no active window") clamps to a short em-dash so the widest case
-        // can't squeeze the bar — the full text still rides the hover title.
+        // The "resets <time>" form drops its prefix; a keeper reason shows
+        // its short form (the reason strings are at most 14 characters, the
+        // width the panel already accepts for "Oct 27 3:45 PM"); a window
+        // with no reason reads "no window". Full text rides the hover title.
         const isReset = /^resets\s+/i.test(resetDisplay);
-        const resetShort = isReset ? resetDisplay.replace(/^resets\s+/i, '') : (resetDisplay ? '—' : '');
+        let resetShort = '';
+        if (isReset) resetShort = resetDisplay.replace(/^resets\s+/i, '');
+        else if (hasReason) resetShort = reason.short || resetDisplay;
+        else if (resetDisplay) resetShort = 'no window';
         const resetCaption = resetShort
-            ? `<span class="reset-caption text-[10px] text-slate-500 shrink-0 text-right tabular-nums whitespace-nowrap" title="${escapeHtml(resetDisplay)}">${escapeHtml(resetShort)}</span>`
+            ? `<span class="reset-caption text-[10px] ${resetTone} shrink-0 text-right tabular-nums whitespace-nowrap" title="${escapeHtml(resetDisplay)}">${escapeHtml(resetShort)}</span>`
             : '';
         return `
-        <div class="flex items-center gap-2 mb-0.5${rowMuted}" title="${escapeHtml(label || '')}${resetDisplay ? ' · ' + escapeHtml(resetDisplay) : ''}">
+        <div class="flex items-center gap-2 mb-0.5" title="${escapeHtml(label || '')}${resetDisplay ? ' · ' + escapeHtml(resetDisplay) : ''}">
             <span class="text-[10px] text-slate-400 w-10 shrink-0 truncate">${escapeHtml(label || '')}</span>
-            <div class="usage-bar flex-1">
+            <div class="usage-bar flex-1${staleDim}">
                 <div class="fill ${colorClass}" style="width: ${pct.toFixed(1)}%"></div>
                 ${markerHtml}
             </div>
-            <span class="text-[11px] font-mono w-9 text-right tabular-nums ${pctColor}">${Math.round(pct)}%</span>
+            <span class="text-[11px] font-mono w-9 text-right tabular-nums ${pctColor}${staleDim}">${Math.round(pct)}%</span>
             ${resetCaption}
         </div>
     `;
     }
 
     return `
-        <div class="flex items-center gap-3 mb-1${rowMuted}">
+        <div class="flex items-center gap-3 mb-1">
             <span class="text-xs text-slate-400 w-14 shrink-0 truncate" title="${escapeHtml(label || '')}">${escapeHtml(label || '')}</span>
-            <div class="usage-bar flex-1">
+            <div class="usage-bar flex-1${staleDim}">
                 <div class="fill ${colorClass}" style="width: ${pct.toFixed(1)}%"></div>
                 ${markerHtml}
             </div>
-            <span class="text-xs font-mono w-10 text-right tabular-nums ${pctColor}">${Math.round(pct)}%</span>
-            <span class="reset-text text-xs ${resetTone} w-28 text-right" title="${escapeHtml(resetDisplay)}">${escapeHtml(resetDisplay)}</span>
+            <span class="text-xs font-mono w-10 text-right tabular-nums ${pctColor}${staleDim}">${Math.round(pct)}%</span>
+            <span class="reset-text text-xs ${resetTone} w-32 text-right whitespace-nowrap truncate" title="${escapeHtml(resetDisplay)}">${escapeHtml(resetDisplay)}</span>
         </div>
     `;
 }
@@ -184,14 +191,6 @@ function _keeperReadDate(epochSecs) {
     return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-/** The configured keeper start (HH:MM), else the keeper default. */
-function _keeperActiveStart() {
-    const s = (typeof window !== 'undefined' && window.jackedState && window.jackedState.settings) || {};
-    let v = s.window_keeper_active_start;
-    if (typeof v === 'string') v = v.replace(/^"|"$/g, '');
-    return (typeof v === 'string' && /^\d{1,2}:\d{2}$/.test(v)) ? v : '06:00';
-}
-
 /**
  * Explain a usage window that has no future reset, from the account's
  * keeper_state and usage freshness. Returns null when the window is open
@@ -200,7 +199,9 @@ function _keeperActiveStart() {
  * @param {object} acct - Account payload (keeper_state, usage_cached_at, provider).
  * @param {string|null} resetsAt - ISO reset timestamp of this window.
  * @param {number} [nowMs] - Current time in ms (tests).
- * @returns {{text: string, tone: ('warn'|'muted'), muted: boolean}|null}
+ * @returns {{text: string, short: string, tone: ('warn'|'muted'), muted: boolean}|null}
+ *   text is the dashboard column copy; short is the compact-panel caption
+ *   (at most 14 characters); muted marks a stale reading (the bar dims).
  */
 function windowReason(acct, resetsAt, nowMs) {
     if (!acct) return null;
@@ -208,35 +209,51 @@ function windowReason(acct, resetsAt, nowMs) {
     const resetMs = resetsAt ? new Date(resetsAt).getTime() : NaN;
     if (Number.isFinite(resetMs) && resetMs > now) return null;
 
-    const reason = (text, tone, muted) => ({ text, tone: tone || 'muted', muted: !!muted });
+    const reason = (text, tone, muted, short) => ({
+        text, short: short || text, tone: tone || 'muted', muted: !!muted,
+    });
     const ks = acct.keeper_state || null;
     // A dead token also stops usage reads, so the actionable state wins
     // over "last read"; the re-auth control on the card is the fix.
     if (ks && ks.last_status === 'needs_reauth') return reason('needs re-auth', 'warn');
 
+    // A reading older than the stale threshold dims the bar. The keeper never
+    // pings a Codex account, so a lapsed Codex window has only its last read.
     const cachedAt = Number(acct.usage_cached_at) || 0;
     const stale = cachedAt > 0 && (now / 1000 - cachedAt) > USAGE_STALE_SECS;
     if (cachedAt > 0 && (acct.provider === 'codex' || stale)) {
-        return reason('last read ' + _keeperReadDate(cachedAt), 'muted', true);
+        const when = _keeperReadDate(cachedAt);
+        return reason('last read ' + when, 'muted', stale, 'read ' + when);
     }
 
     if (!ks) return null;
+    // Epoch seconds the server attached to the state (next retry, the next
+    // active start): rendered in the viewer's own zone and locale.
+    const next = Number(ks.next_attempt_at) || 0;
+    const due = next > 0 && next * 1000 <= now;
     switch (ks.skip_reason) {
         case 'keeper_disabled': return reason('keeper off');
-        case 'no_token': return reason('no token, re-auth');
-        case 'outside_active_hours': return reason('paused until ' + _keeperActiveStart());
+        case 'no_token': return reason('no token, re-auth', 'warn', false, 'no token');
+        case 'outside_active_hours':
+            return next && !due
+                ? reason('paused until ' + _keeperWhen(next), 'muted', false, 'paused')
+                : reason('paused', 'muted', false, 'paused');
         case 'auto_swap_disabled': return reason('auto-swap off');
         default: break;
     }
-    const next = Number(ks.next_attempt_at) || 0;
     if (ks.last_status === 'rate_limited') {
-        return reason(next ? 'rate limited until ' + _keeperWhen(next) : 'rate limited');
+        if (!next) return reason('rate limited', 'muted', false, 'rate limited');
+        return due
+            ? reason('limit lifting', 'muted', false, 'rate limited')
+            : reason('limited until ' + _keeperWhen(next), 'muted', false, 'rate limited');
     }
     if (next && ['transport', 'auth_failed', 'error', 'ping_ok_no_window'].includes(ks.last_status)) {
-        return reason('retrying ' + _keeperWhen(next));
+        return due
+            ? reason('retry due', 'muted', false, 'retry due')
+            : reason('retry ' + _keeperWhen(next), 'muted', false, 'retrying');
     }
     if (ks.last_status === 'ok' || ks.last_status === 'ping_ok_no_window') {
-        return reason('window lapsed');
+        return reason('window lapsed', 'muted', false, 'lapsed');
     }
     return null;
 }

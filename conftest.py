@@ -97,4 +97,33 @@ def _isolate_doctest_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.setattr(httpx, "get", guarded_get)
     monkeypatch.setattr(httpx.AsyncClient, "send", guarded_async_send)
     monkeypatch.setattr(httpx.Client, "send", guarded_send)
+
+    # No doctest starts a service, drives a supervisor, or runs a jacked
+    # install (the tests/-only tripwire does not reach doctest items).
+    real_popen = subprocess.Popen
+    real_run = subprocess.run
+    supervisors = ("launchctl", "systemctl", "schtasks", "schtasks.exe", "security")
+
+    def _refuse(args) -> None:
+        text = " ".join(str(a) for a in args) if isinstance(args, (list, tuple)) else str(args)
+        head = str(args[0]) if isinstance(args, (list, tuple)) and args else text.split(" ", 1)[0]
+        first = head.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if first in supervisors:
+            raise RuntimeError("doctest tripwire: real supervisor/keychain call: " + first)
+        if "jacked" in text and any(
+            f" {verb}" in text for verb in ("service", " install")
+        ):
+            raise RuntimeError("doctest tripwire: real jacked lifecycle command")
+
+    class _GuardedPopen(real_popen):
+        def __init__(self, args, *popen_args, **popen_kwargs):
+            _refuse(args)
+            super().__init__(args, *popen_args, **popen_kwargs)
+
+    def _guarded_run(args, *run_args, **run_kwargs):
+        _refuse(args)
+        return real_run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _GuardedPopen)
+    monkeypatch.setattr(subprocess, "run", _guarded_run)
     yield

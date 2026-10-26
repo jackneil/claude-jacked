@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!--
+  jacked artifact template — for plans, specs, research, checkpoints.
+  Replace placeholders, keep what you need, delete sections you don't.
+  Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
+-->
+<title>{{TITLE}}</title>
+
+<!-- Metadata block — adjust fields per artifact type -->
+<meta name="jacked:type" content="{{plan|spec|research|checkpoint}}">
+<meta name="jacked:status" content="{{in-progress|complete|draft}}">
+<meta name="jacked:branch" content="{{git branch if relevant}}">
+<meta name="jacked:date" content="{{YYYY-MM-DD}}">
+<meta name="jacked:project" content="{{project-name}}">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 .25rem;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 .5rem;
+    color: var(--fg-muted);
+  }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+
+  /* Metadata strip under title */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    margin: .5rem 0 2rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    font-size: .9rem;
+  }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+
+  /* Status badges — drop into a <span class="badge X"> */
+  .badge {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 99px;
+    font-size: .8rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .badge.ok       { background: var(--ok-bg);     color: var(--ok); }
+  .badge.warn     { background: var(--warn-bg);   color: var(--warn); }
+  .badge.danger   { background: var(--danger-bg); color: var(--danger); }
+  .badge.info     { background: var(--accent-bg); color: var(--accent); }
+
+  /* Table of contents */
+  nav.toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    margin: 0 0 .5rem;
+    font-size: .9rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--fg-muted);
+    border: none;
+    padding: 0;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.5rem;
+  }
+  nav.toc li { margin: .15rem 0; }
+
+  /* Callouts — drop into <aside class="callout warn"> ... </aside> */
+  aside.callout {
+    margin: 1rem 0;
+    padding: .9rem 1.1rem;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  aside.callout.warn   { border-color: var(--warn);   background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok     { border-color: var(--ok);     background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child  { margin-bottom: 0; }
+
+  /* Code */
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: var(--code-bg);
+    padding: .12em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: .88rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    font-size: .9rem;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  /* Task checklist — use <ul class="tasks"> + <li><input type="checkbox" disabled> ...</li> */
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li {
+    padding: .25rem 0;
+    display: flex;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+
+  /* Mermaid diagram wrappers */
+  .diagram {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  /* If mermaid fails (no network), fall back to showing the source in a code block */
+  .diagram pre.mermaid-source {
+    text-align: left;
+    display: none;
+  }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+
+  blockquote {
+    border-left: 3px solid var(--border);
+    padding: .2rem 1rem;
+    margin: 1rem 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  /* Print: paginate cleanly, drop the dark-mode flip, expand TOC */
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Window keeper: keep the windows, recover dead tokens, say why</h1>
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">awaiting approval</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-10-26</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">jack_20261026_window_keeper_recovery (+ 2 sibling branches)</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
+  <div class="kv"><span class="k">Tier:</span><span class="v"><span class="badge warn">LARGE</span> credential handling</span></div>
+</div>
+
+<nav class="toc"><h2>Contents</h2><ol>
+<li><a href="#goal">Goal</a></li><li><a href="#evidence">Evidence</a></li><li><a href="#ws">Workstreams</a></li>
+<li><a href="#gate">Gates and proof</a></li><li><a href="#issues">Filed, not fixed</a></li></ol></nav>
+
+<h2 id="goal">Goal</h2>
+<p>Every Claude account keeps an open 5h window during active hours, even with the lid closed. When the keeper cannot open a window, the card says why and offers the fix. A dead token chain never leaves a dead token in service. The Codex account reads usage again.</p>
+
+<h2 id="evidence">Evidence (running 0.107.3 == origin/master 9def67c)</h2>
+<ul>
+<li><b>Fleet-wide:</b> <code>usage_monitor.py:2114-2117</code> counts nominal 5s sleeps. Under clamshell dark wakes the sweep ran 15:00, 16:48, 18:14 UTC on 10-26 while the 10-min poller ran 8 times. Windows lapse for every account while the lid is closed.</li>
+<li><b>Account 1:</b> CC <code>invalid_grant</code> on 10-22 10:22:14. <code>auth.py:518-528</code> nulls only <code>cc_refresh_token</code>; the dead <code>cc_access_token</code> stays. Keeper pings 401 and skips recovery (<code>usage_monitor.py:2008</code> needs <code>cc_refresh_token</code>). Poller sends the dead token every cycle (<code>:1879</code>); each 401/429 renews the PRIMARY chain under a <code>cc_429</code> label: ~140 needless renewals/day. 10-17..10-21: 429 on every ping, body discarded, cause unrecoverable.</li>
+<li><b>Backoff:</b> in-memory, keyed by id, survived the 22:05:51 re-auth.</li>
+<li><b>Cache lag:</b> post-ping fetch is paced, so the card says "no active window" for an open window (145 of 148 repeat pings followed a success).</li>
+<li><b>Codex:</b> service PATH is system-only; <code>codex/usage.py:257</code> <code>shutil.which</code> misses <code>~/.local/bin/codex</code>. Frozen since 2026-09-05. <code>_validate_codex_account</code> wipes the error.</li>
+<li><b>Data integrity:</b> <code>auth.py:498</code> invalid_grant live recovery imports on the stamp alone, without <code>_live_tokens_belong_to</code>.</li>
+</ul>
+
+<h2 id="ws">Workstreams (parallel worktrees, unit tests only per builder)</h2>
+<h3>A. Keeper scheduling and recovery + UI reason (PR 1)</h3>
+<ul class="tasks">
+<li><input type="checkbox" disabled> Wall-clock deadline sleep in the sweep loop; prewake fires once per local date (persisted marker), on the first sweep at or after prewake.</li>
+<li><input type="checkbox" disabled> <code>ping_account</code> returns a <code>PingResult</code> (status, error type, message[:200], request id, retry-after, unified rate-limit reset headers, transport flag); values-free log line.</li>
+<li><input type="checkbox" disabled> Recovery ladder: 401/403 forces rotation of the chain that owns the failing token (new <code>force=</code> on <code>refresh_cc_token</code>, explicit result enum), re-ping once, then ping with the primary token, then persist <code>needs_reauth</code>. 429 schedules from retry-after / reset header. Transport errors retry short and do not escalate. Per-account try/except.</li>
+<li><input type="checkbox" disabled> Backoff stores the token fingerprint; a changed token drops it. Re-auth / CC-token store / reconcile import clear it and set <code>_sweep_wake</code>.</li>
+<li><input type="checkbox" disabled> After a successful ping, persist the window (reset header, else an explicit bounded post-ping fetch bypass) using the token that succeeded.</li>
+<li><input type="checkbox" disabled> Persist per-account keeper state (last ping time/status/error type/failures/skip reason) and add it to the accounts payload.</li>
+<li><input type="checkbox" disabled> UI: the reset column shows the reason (re-auth needed, retrying at HH:MM, paused until 06:00, no Claude Code token, usage unreadable since DATE) with the existing re-auth control; a past reset gives no elapsed marker; stale rows render muted "last read DATE". /qa in a browser after.</li>
+</ul>
+<h3>B. Token chain correctness (PR 2)</h3>
+<ul class="tasks">
+<li><input type="checkbox" disabled> CC <code>invalid_grant</code> without recovery nulls <code>cc_access_token</code> and <code>cc_expires_at</code> too, and records the CC chain as needing re-auth.</li>
+<li><input type="checkbox" disabled> <code>_refresh_token_flow</code> resolves a <code>chain</code> (cc | primary) once under the lock and uses it for columns, invalid_grant handling, log text, and the early-return token. Per-chain breaker columns with a migration.</li>
+<li><input type="checkbox" disabled> Usage poller: a token rejection renews only the chain that owns that token; with no live CC chain, poll with the primary token. The 429 rotation guard spans several poll periods and N consecutive 429s.</li>
+<li><input type="checkbox" disabled> Live-recovery import calls <code>_live_tokens_belong_to</code>; one shared stamp+ownership helper for reconcile, authority guard, and this path.</li>
+<li><input type="checkbox" disabled> Null <code>five_hour</code>/<code>seven_day</code> or null <code>resets_at</code>: no AttributeError; clear the stale reset.</li>
+<li><input type="checkbox" disabled> Token exchange tells not-sent (DNS/connect) from reply-lost (read timeout); heal sweep does not clear a network breaker while the network is down.</li>
+<li><input type="checkbox" disabled> Background refresher reports exchanged vs skipped.</li>
+</ul>
+<h3>C. User CLIs under the service PATH (PR 3)</h3>
+<ul class="tasks">
+<li><input type="checkbox" disabled> All service-reachable user-CLI lookups (<code>codex/usage.py</code>, <code>codex/switching.py</code>, <code>codex/accounts.py</code>, <code>codex/_fsutil.py</code>, <code>dcr_settings.py</code>, <code>skill_listing.py</code>, <code>memory/merge_capture.py</code>) go through <code>findbin.find_bin</code>, with the WIP name guard folded in. Guard test bans new bare <code>shutil.which</code> for user CLIs in service modules.</li>
+<li><input type="checkbox" disabled> Codex usage failures live in their own fields; validation no longer wipes them.</li>
+</ul>
+
+<h2 id="gate">Gates and proof</h2>
+<ol>
+<li>Builders run only the unit tests for their files.</li>
+<li>Combine the three branches on one integration branch; run the full local CI pipeline once; /dcr (LARGE) and /cso beside it.</li>
+<li>Live proof: install the build, close the lid 30+ min, confirm sweep heartbeats every ~5 min of wall time and open windows on wake; Codex card shows current usage; a forced-dead CC token row self-recovers or shows "re-auth needed".</li>
+</ol>
+
+<h2 id="issues">Filed, not fixed here</h2>
+<ul><li>Why the CC chains died on 10-12 and 10-22 is not proven (network loss fits 10-22, not 10-12). The reply-lost classification above adds the evidence; an issue tracks the proof.</li>
+<li>Reconcile ordering by expiry only (<code>credential_helpers.py:575</code>) when the row token is known dead.</li></ul>
+</div>
+</body></html>

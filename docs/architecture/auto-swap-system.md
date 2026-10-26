@@ -267,7 +267,9 @@ The keeper writes its state for each account to `accounts.keeper_state`
 (JSON; see `Database.set_keeper_state`). The accounts API returns it as
 `keeper_state`, without the token fingerprint. The dashboard uses it to show
 why a window has no future reset, for example "needs re-auth",
-"retrying 3:45 PM", or "paused until 06:00".
+"retry 3:45 PM", or "paused until 6:00 AM". The keeper attaches the epoch of
+the next active start to the outside-active-hours skip, so the dashboard
+shows that time in the viewer's own zone.
 
 Legacy compatibility helpers still exist for narrowly scoped refresh and
 reconciliation paths. `_execute_swap()` must not fall back to them when no

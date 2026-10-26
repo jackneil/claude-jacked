@@ -256,6 +256,33 @@ def test_stamped_rotation_is_identified_once_per_payload():
     assert db.updates == []
 
 
+def test_stamped_rotation_after_a_transient_profile_failure_is_retried():
+    """A profile timeout on the first pass must not retire the payload: a
+    rotated single-use refresh token that is never adopted dies with the
+    next authority overwrite. The next pass identifies and adopts it."""
+    db = _db()
+    calls: list = []
+    good = _profile("carol@test.com", "org-3")
+
+    def flaky(token):
+        calls.append(token)
+        return None if len(calls) == 1 else good(token)
+
+    payload = {"_jackedAccountId": 3, **_foreign_payload()}
+    first = heal_foreign_authority(
+        db, now=100.0, profile_lookup=flaky, activate=_Activator(),
+        read_authority=lambda: payload,
+    )
+    second = heal_foreign_authority(
+        db, now=130.0, profile_lookup=flaky, activate=_Activator(),
+        read_authority=lambda: payload,
+    )
+    assert first.action == "skipped" and "profile" in first.reason
+    assert second.action == "rotation_adopted"
+    assert db.accounts[3]["cc_refresh_token"] == "live_rt_3"
+    assert len(calls) == 2
+
+
 def test_stamped_payload_with_another_accounts_tokens_goes_to_the_owner():
     """A /login to account 11 in a session writes 11's tokens under 3's
     stamp. They belong in row 11, and row 3 must stay unchanged."""
