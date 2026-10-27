@@ -1518,7 +1518,14 @@ async def fetch_usage(
                 if _retry_depth >= 1 and token_chain(account, token) == "cc":
                     from jacked.api.credential_helpers import cc_chain_dead
 
-                    if not cc_chain_dead(account):
+                    # Re-read before writing: a re-auth that landed while
+                    # this request was in flight stored a NEWER cc token,
+                    # which was never refused and must stay usable.
+                    current = db.get_account(account_id) or account
+                    if (
+                        current.get("cc_access_token") == token
+                        and not cc_chain_dead(current)
+                    ):
                         db.update_account(
                             account_id, **_breaker_updates("cc", "auth_rejected")
                         )

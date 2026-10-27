@@ -635,6 +635,41 @@ class TestCcToken401Ownership:
         assert row["cc_refresh_failure_type"] == "auth_rejected"
         assert choose_usage_token(row).chain == "primary"
 
+    def test_a_reauth_during_the_retry_request_is_never_marked_rejected(self, tmp_path):
+        """A newer cc token stored while the retry request was in flight was
+        never refused: the auth_rejected write must not touch it."""
+        from jacked.web.auth import TokenExchangeResult, choose_usage_token
+
+        db = _real_db(tmp_path)
+        client, sent = _seq_client(401, 401)
+        inner_get = client.get.side_effect
+
+        async def get_and_reauth(url, headers=None, **kw):
+            resp = await inner_get(url, headers=headers, **kw)
+            if len(sent) == 2:  # the retry frame: a dashboard re-auth lands meanwhile
+                db.update_account(1, cc_access_token="cc_at_reauthed",
+                                  cc_refresh_token="cc_rt_reauthed")
+            return resp
+
+        client.get = AsyncMock(side_effect=get_and_reauth)
+
+        async def flow(account_id, db_, mode):
+            db_.update_account(account_id, cc_access_token="cc_at_new")
+            return TokenExchangeResult(
+                success=True, access_token="cc_at_new", exchanged=True, chain="cc",
+            )
+
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.api.credential_helpers.cc_rotation_block", return_value=None), \
+             patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            asyncio.run(fetch_usage(1, db, access_token="cc_at"))
+
+        assert sent == ["cc_at", "cc_at_new"]
+        row = db.get_account(1)
+        assert row["cc_refresh_failure_type"] is None
+        assert choose_usage_token(row).token == "cc_at_reauthed"
+
     def test_primary_401_still_uses_the_primary_circuit_breaker(self, tmp_path):
         from jacked.web.auth import RefreshMode, TokenExchangeResult
 

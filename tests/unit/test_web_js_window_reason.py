@@ -95,6 +95,16 @@ class TestWindowReason:
         acct = _fresh(keeper_state={"skip_reason": "outside_active_hours", "next_attempt_at": NOW + 600})
         assert _reason(tmp_path, acct)["text"] == "paused"
 
+    def test_a_time_within_a_day_carries_no_date(self, tmp_path):
+        """A pause 7 hours away crosses midnight; the column is sized for
+        the time alone, so the date is added only beyond 24 hours."""
+        acct = _fresh(keeper_state={"skip_reason": "outside_active_hours", "paused_until": NOW + 7 * 3600})
+        text = _reason(tmp_path, acct)["text"]
+        assert text.startswith("paused until ")
+        assert len(text) <= 21, text
+        far = _fresh(keeper_state={"last_status": "rate_limited", "next_attempt_at": NOW + 3 * 86400})
+        assert len(_reason(tmp_path, far)["text"]) > 21
+
     def test_paused_without_a_time_is_just_paused(self, tmp_path):
         acct = _fresh(keeper_state={"skip_reason": "outside_active_hours"})
         assert _reason(tmp_path, acct)["text"] == "paused"

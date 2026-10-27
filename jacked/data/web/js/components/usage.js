@@ -174,11 +174,14 @@ function computeElapsedFraction7d(resetsAt) {
 /** Usage older than this reads as stale: six 5-minute poll intervals (usage_check_interval default 300s). */
 const USAGE_STALE_SECS = 30 * 60;
 
-/** Short local time ("3:45 PM"), with the date when it is not today. */
-function _keeperWhen(epochSecs) {
+/** Short local time ("3:45 PM"); the date is added only when the moment is
+ *  more than a day away (a time within the next 24 hours is unambiguous
+ *  even past midnight, and the column is sized for the short form). */
+function _keeperWhen(epochSecs, nowMs) {
     const d = new Date(epochSecs * 1000);
+    const now = (nowMs === undefined || nowMs === null) ? Date.now() : nowMs;
     const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-    if (d.toDateString() === new Date().toDateString()) return time;
+    if (Math.abs(d.getTime() - now) < 24 * 3600 * 1000) return time;
     return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + time;
 }
 
@@ -239,7 +242,7 @@ function windowReason(acct, resetsAt, nowMs) {
             // a retry deadline the keeper honors across restarts.
             const until = Number(ks.paused_until) || 0;
             return until && until * 1000 > now
-                ? reason('paused until ' + _keeperWhen(until), 'muted', false, 'paused')
+                ? reason('paused until ' + _keeperWhen(until, now), 'muted', false, 'paused')
                 : reason('paused', 'muted', false, 'paused');
         }
         case 'auto_swap_disabled': return reason('auto-swap off');
@@ -249,12 +252,12 @@ function windowReason(acct, resetsAt, nowMs) {
         if (!next) return reason('rate limited', 'muted', false, 'rate limited');
         return due
             ? reason('limit lifting', 'muted', false, 'rate limited')
-            : reason('limited until ' + _keeperWhen(next), 'muted', false, 'rate limited');
+            : reason('limited until ' + _keeperWhen(next, now), 'muted', false, 'rate limited');
     }
     if (next && ['transport', 'auth_failed', 'error', 'ping_ok_no_window'].includes(ks.last_status)) {
         return due
             ? reason('retry due', 'muted', false, 'retry due')
-            : reason('retry ' + _keeperWhen(next), 'muted', false, 'retrying');
+            : reason('retry ' + _keeperWhen(next, now), 'muted', false, 'retrying');
     }
     if (ks.last_status === 'ok' || ks.last_status === 'ping_ok_no_window') {
         return reason('window lapsed', 'muted', false, 'lapsed');
