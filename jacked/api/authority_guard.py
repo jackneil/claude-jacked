@@ -64,9 +64,9 @@ _state_lock = threading.Lock()
 # reassert rate limit or the switch lease held it off. The identified account
 # is kept, so the retry costs no network call.
 _handled: dict[str, Any] = {"digest": None, "account_id": None, "settled": True}
-# The stamped payload whose rotation jacked identified last, so a payload is
-# sent to the profile endpoint at most once.
-_stamped_handled: dict[str, Any] = {"digest": None}
+# The stamped payload whose rotation jacked identified last (settled), or
+# whose transient lookup failure is waiting out its retry cooldown.
+_stamped_handled: dict[str, Any] = {"digest": None, "retry_at": None}
 _last_reassert_at: float = 0.0
 
 
@@ -75,7 +75,7 @@ def reset_authority_guard_state() -> None:
     global _last_reassert_at
     with _state_lock:
         _handled.update({"digest": None, "account_id": None, "settled": True})
-        _stamped_handled.update({"digest": None})
+        _stamped_handled.update({"digest": None, "retry_at": None})
         _last_reassert_at = 0.0
 
 
@@ -161,9 +161,26 @@ def lookup_profile(access_token: str) -> ProfileLookup:
     return ProfileLookup(200, body if isinstance(body, dict) else None)
 
 
+# Seconds before a stamped payload whose profile lookup failed TRANSIENTLY
+# (no reply, 5xx) is identified again. Bounds the request rate while the
+# failure lasts; a terminal refusal (4xx) settles the payload instead.
+_STAMPED_LOOKUP_RETRY_SECONDS = 600.0
+
+
 def _default_profile_lookup(access_token: str) -> dict | None:
-    """Identify one access token through the OAuth profile endpoint."""
-    return lookup_profile(access_token).profile
+    """Identify one access token through the OAuth profile endpoint.
+
+    Returns the profile object on 200; an EMPTY dict when the endpoint
+    refused the token (4xx: a revoked or foreign token, a terminal verdict);
+    ``None`` when the request did not complete or the server failed (a
+    transient failure worth a later retry).
+    """
+    outcome = lookup_profile(access_token)
+    if outcome.profile:
+        return outcome.profile
+    if outcome.status_code is not None and 400 <= outcome.status_code < 500:
+        return {}
+    return None
 
 
 def _uuid_prefix(value: Any) -> str:
@@ -347,28 +364,47 @@ def _adopt_stamped_rotation(
     digest = _payload_digest(payload)
     with _state_lock:
         if _stamped_handled["digest"] == digest:
-            return HealResult(ACTION_NONE, foreign_account_id=stamp)
+            retry_at = _stamped_handled.get("retry_at")
+            if retry_at is None or retry_at > time.time():
+                return HealResult(ACTION_NONE, foreign_account_id=stamp)
 
-    def _settle() -> None:
-        # Only a settled verdict retires the payload. A transient profile
-        # failure or a failed database write (which raises past this point)
-        # leaves the digest unset, so the next observer pass retries: a
+    def _settle(retry_after: float | None = None) -> None:
+        # A settled verdict retires the payload for good. A transient profile
+        # failure parks it for a retry cooldown instead, and a failed
+        # database write (which raises past this point) leaves it unset: a
         # rotated single-use refresh token that is never adopted dies with
-        # the next authority overwrite.
+        # the next authority overwrite, so the retry matters.
         with _state_lock:
             _stamped_handled["digest"] = digest
+            _stamped_handled["retry_at"] = (
+                time.time() + retry_after if retry_after is not None else None
+            )
 
     profile = profile_lookup(access_token)
-    if not isinstance(profile, dict) or not profile:
+    if profile is None:
+        _settle(retry_after=_STAMPED_LOOKUP_RETRY_SECONDS)
         logger.info(
             "Stamped authority payload for account %d carries tokens jacked does "
-            "not hold; the profile lookup failed, so nothing was adopted yet "
-            "(payload %s); it is retried on the next pass",
+            "not hold; the profile lookup did not complete, so nothing was "
+            "adopted yet (payload %s); it is retried in %d s",
+            stamp,
+            digest[:8],
+            int(_STAMPED_LOOKUP_RETRY_SECONDS),
+        )
+        return HealResult(
+            ACTION_SKIPPED, foreign_account_id=stamp, reason="profile lookup failed"
+        )
+    if not isinstance(profile, dict) or not profile:
+        # The endpoint refused the token: a verdict, not a hiccup.
+        _settle()
+        logger.info(
+            "Stamped authority payload for account %d carries tokens the profile "
+            "endpoint refused; nothing adopted (payload %s)",
             stamp,
             digest[:8],
         )
         return HealResult(
-            ACTION_SKIPPED, foreign_account_id=stamp, reason="profile lookup failed"
+            ACTION_SKIPPED, foreign_account_id=stamp, reason="profile refused the token"
         )
     account_section = profile.get("account") or {}
     organization_section = profile.get("organization") or {}

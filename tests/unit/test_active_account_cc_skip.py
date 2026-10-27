@@ -163,6 +163,33 @@ class TestBackgroundLoopSkipsActiveCC:
     @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
     @patch("jacked.api.credential_helpers.read_active_account_id", return_value=1)
     @patch("jacked.web.auth.Database")
+    def test_session_tracker_accounts_are_live_holders(
+        self, mock_db_cls, mock_read_active, mock_refresh_cc,
+    ):
+        """A session started on account 2 keeps 2's refresh token in memory
+        after the authority moved to 1: the tracker names 2, so the loop
+        must not rotate it (2026-09-05 lesson)."""
+        from jacked.web import auth
+
+        now = int(time.time())
+        accts = [self._make_account(i, cc_expires_at=now + 120) for i in (1, 2, 3)]
+        mock_db = MagicMock()
+        mock_db.list_accounts.return_value = accts
+        mock_db.get_active_sessions.return_value = [{"session_id": "s", "account_id": 2}]
+        mock_db_cls.return_value = mock_db
+        mock_refresh_cc.return_value = True
+        live = {"_jackedAccountId": 1, "claudeAiOauth": {"accessToken": "x", "refreshToken": "y"}}
+
+        with patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"), \
+             patch("jacked.api.credential_helpers.read_live_credentials", return_value=live):
+            result = asyncio.run(auth.refresh_all_expiring_tokens())
+
+        assert [c.args[0] for c in mock_refresh_cc.call_args_list] == [3]
+        assert result["cc_refreshed"] == 1
+
+    @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
+    @patch("jacked.api.credential_helpers.read_active_account_id", return_value=1)
+    @patch("jacked.web.auth.Database")
     def test_unknown_live_holders_block_every_cc_rotation(
         self, mock_db_cls, mock_read_active, mock_refresh_cc,
     ):

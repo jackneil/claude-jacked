@@ -472,16 +472,16 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             raise click.ClickException(f"Account {account_id} disappeared after refresh")
 
     # Refresh CC token if near-expiry (independent from primary).
-    # Skip refresh if this account is currently the active Claude Code
-    # session — rotating the CC refresh token upstream would invalidate
-    # the token Claude Code's running process holds in memory/Keychain,
-    # forcing a re-login. See docs/architecture/oauth-and-credential-flows.md §7.2.
+    # Never rotate a Claude Code refresh token a running session holds:
+    # the active account's, any row the live authority or the session
+    # tracker names, and nothing at all when the active account is unknown
+    # (invariant I2 fails closed; the same gate as the background loops).
+    # See docs/architecture/oauth-and-credential-flows.md §7.2.
     if should_refresh_cc(account):
-        from jacked.api.credential_helpers import read_active_account_id
+        from jacked.api.credential_helpers import cc_rotation_block
 
-        active_id = read_active_account_id()
-
-        if active_id != account_id:
+        block = cc_rotation_block(account_id, db)
+        if block is None:
             from jacked.web.auth import refresh_cc_token
 
             try:
@@ -491,7 +491,7 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             account = db.get_account(account_id)
             if not account:
                 raise click.ClickException(f"Account {account_id} disappeared after CC refresh")
-        else:
+        elif block == "active":
             # Reconcile live creds into DB before the downstream Keychain
             # write so we don't roll back Claude Code's fresh token
             # (architecture doc §7.2 — launch.py:489 stale write gap).
@@ -506,6 +506,10 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
                 "active Claude Code session — Claude Code manages its own "
                 "token rotation).",
                 account_id,
+            )
+        else:
+            logger.info(
+                "Account %d: skipping pre-launch CC refresh (%s)", account_id, block
             )
 
     # Pre-launch CC token warnings

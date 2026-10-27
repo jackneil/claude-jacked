@@ -268,11 +268,15 @@ def test_stamped_rotation_after_a_transient_profile_failure_is_retried():
         calls.append(token)
         return None if len(calls) == 1 else good(token)
 
+    from jacked.api import authority_guard as ag
+
     payload = {"_jackedAccountId": 3, **_foreign_payload()}
     first = heal_foreign_authority(
         db, now=100.0, profile_lookup=flaky, activate=_Activator(),
         read_authority=lambda: payload,
     )
+    with ag._state_lock:
+        ag._stamped_handled["retry_at"] = 0.0  # the retry cooldown elapsed
     second = heal_foreign_authority(
         db, now=130.0, profile_lookup=flaky, activate=_Activator(),
         read_authority=lambda: payload,
@@ -281,6 +285,71 @@ def test_stamped_rotation_after_a_transient_profile_failure_is_retried():
     assert second.action == "rotation_adopted"
     assert db.accounts[3]["cc_refresh_token"] == "live_rt_3"
     assert len(calls) == 2
+
+
+def test_a_refused_token_settles_the_stamped_payload():
+    """A 4xx from the profile endpoint is a verdict (revoked or foreign
+    token): the payload is settled and never looked up again, so a dead
+    stamped authority cannot drive one request per observer pass."""
+    db = _db()
+    calls: list = []
+
+    def refused(token):
+        calls.append(token)
+        return {}  # _default_profile_lookup's terminal marker
+
+    payload = {"_jackedAccountId": 3, **_foreign_payload()}
+    for _ in range(3):
+        result = heal_foreign_authority(
+            db, now=100.0, profile_lookup=refused, activate=_Activator(),
+            read_authority=lambda: payload,
+        )
+    assert result.action in ("skipped", "none")
+    assert len(calls) == 1
+    assert db.updates == []
+
+
+def test_a_transient_lookup_failure_waits_out_a_cooldown():
+    """No reply from the profile endpoint parks the payload for the retry
+    cooldown instead of retrying on every pass."""
+    from jacked.api import authority_guard as ag
+
+    db = _db()
+    calls: list = []
+
+    def flaky(token):
+        calls.append(token)
+        return None
+
+    payload = {"_jackedAccountId": 3, **_foreign_payload()}
+    for _ in range(3):
+        heal_foreign_authority(
+            db, now=100.0, profile_lookup=flaky, activate=_Activator(),
+            read_authority=lambda: payload,
+        )
+    assert len(calls) == 1
+    with ag._state_lock:
+        ag._stamped_handled["retry_at"] = 0.0  # the cooldown elapsed
+    heal_foreign_authority(
+        db, now=100.0, profile_lookup=flaky, activate=_Activator(),
+        read_authority=lambda: payload,
+    )
+    assert len(calls) == 2
+
+
+def test_default_profile_lookup_splits_terminal_from_transient():
+    from unittest.mock import patch
+
+    from jacked.api import authority_guard as ag
+
+    with patch.object(ag, "lookup_profile", return_value=ag.ProfileLookup(401)):
+        assert ag._default_profile_lookup("t") == {}
+    with patch.object(ag, "lookup_profile", return_value=ag.ProfileLookup(503)):
+        assert ag._default_profile_lookup("t") is None
+    with patch.object(ag, "lookup_profile", return_value=ag.ProfileLookup(None)):
+        assert ag._default_profile_lookup("t") is None
+    with patch.object(ag, "lookup_profile", return_value=ag.ProfileLookup(200, {"account": {"email": "e"}})):
+        assert ag._default_profile_lookup("t") == {"account": {"email": "e"}}
 
 
 def test_stamped_payload_with_another_accounts_tokens_goes_to_the_owner():

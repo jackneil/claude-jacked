@@ -709,6 +709,25 @@ class TestPrepareAccountDir:
                         prepare_account_dir(account, db)
                         mock_asyncio.run.assert_called_once()
 
+    @pytest.mark.parametrize("block", ["active_unknown", "live_session_holds", "live_store_unreadable"])
+    def test_pre_launch_cc_refresh_fails_closed(self, tmp_path, block):
+        """The pre-launch cc refresh uses the same fail-closed gate as the
+        loops: no rotation when the active account is unknown or a running
+        session holds the row's tokens."""
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+        db.update_account(1, cc_access_token="cc", cc_refresh_token="cc-rt", cc_expires_at=1)
+        account = db.get_account(1)
+        refresh = mock.MagicMock()
+        with mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"), \
+             mock.patch("jacked.launch.should_refresh", return_value=False), \
+             mock.patch("jacked.api.credential_helpers.cc_rotation_block", return_value=block), \
+             mock.patch("jacked.web.auth.refresh_cc_token", new=refresh):
+            from jacked.launch import prepare_account_dir
+
+            prepare_account_dir(account, db)
+        refresh.assert_not_called()
+
     def test_validates_account_id(self, tmp_path):
         """Rejects account_id <= 0."""
         db = _make_db(tmp_path)

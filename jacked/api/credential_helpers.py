@@ -645,9 +645,13 @@ def live_holder_account_ids(db, live: dict | None = None) -> set[int] | None:
     Claude Code's writes for other accounts). Reads the live store once when
     ``live`` is not given.
 
+    The session tracker's accounts join the set: a session started on X
+    keeps X's refresh token in memory even after the authority moved to Y,
+    so rotating X would send that session to /login (2026-09-05).
+
     Returns ``None`` when the holders are UNKNOWN (the live store could not
-    be read, or the account list failed): a caller must treat that as "every
-    chain may be held", never as an empty set.
+    be read, the account list or the session tracker failed): a caller must
+    treat that as "every chain may be held", never as an empty set.
     """
     if live is None:
         try:
@@ -660,12 +664,16 @@ def live_holder_account_ids(db, live: dict | None = None) -> set[int] | None:
     held: set[int] = set()
     try:
         rows = db.list_accounts(include_inactive=True)
+        for row in rows:
+            if _row_holds_live_tokens(row, live):
+                held.add(int(row["id"]))
+        for session in db.get_active_sessions():
+            account_id = session.get("account_id") if isinstance(session, dict) else None
+            if isinstance(account_id, int) and not isinstance(account_id, bool):
+                held.add(account_id)
     except Exception:
-        logger.debug("live_holder_account_ids: account list failed", exc_info=True)
+        logger.debug("live_holder_account_ids: holder discovery failed", exc_info=True)
         return None
-    for row in rows:
-        if _row_holds_live_tokens(row, live):
-            held.add(int(row["id"]))
     return held
 
 
