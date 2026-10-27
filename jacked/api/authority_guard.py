@@ -171,16 +171,21 @@ def _default_profile_lookup(access_token: str) -> dict | None:
     """Identify one access token through the OAuth profile endpoint.
 
     Returns the profile object on 200; an EMPTY dict when the endpoint
-    refused the token (4xx: a revoked or foreign token, a terminal verdict);
-    ``None`` when the request did not complete or the server failed (a
-    transient failure worth a later retry).
+    refused the token (400/401/403/404: a revoked or foreign token, a
+    terminal verdict); ``None`` when the request did not complete, the
+    server failed, or the endpoint throttled it (408/429: a transient
+    failure worth a later retry).
     """
     outcome = lookup_profile(access_token)
     if outcome.profile:
         return outcome.profile
-    if outcome.status_code is not None and 400 <= outcome.status_code < 500:
+    if outcome.status_code in _PROFILE_REFUSED_STATUSES:
         return {}
     return None
+
+
+# Profile statuses that are a verdict on the token, not a hiccup.
+_PROFILE_REFUSED_STATUSES = frozenset({400, 401, 403, 404})
 
 
 def _uuid_prefix(value: Any) -> str:

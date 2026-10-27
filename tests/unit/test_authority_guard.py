@@ -346,6 +346,11 @@ def test_default_profile_lookup_splits_terminal_from_transient():
         assert ag._default_profile_lookup("t") == {}
     with patch.object(ag, "lookup_profile", return_value=ag.ProfileLookup(503)):
         assert ag._default_profile_lookup("t") is None
+    # Throttling is not a verdict on the token.
+    with patch.object(ag, "lookup_profile", return_value=ag.ProfileLookup(429)):
+        assert ag._default_profile_lookup("t") is None
+    with patch.object(ag, "lookup_profile", return_value=ag.ProfileLookup(408)):
+        assert ag._default_profile_lookup("t") is None
     with patch.object(ag, "lookup_profile", return_value=ag.ProfileLookup(None)):
         assert ag._default_profile_lookup("t") is None
     with patch.object(ag, "lookup_profile", return_value=ag.ProfileLookup(200, {"account": {"email": "e"}})):
