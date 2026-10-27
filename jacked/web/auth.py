@@ -2130,7 +2130,7 @@ async def refresh_all_expiring_tokens(
     active_id: int | None = None
     # Rows whose Claude Code tokens a running session holds (the live
     # authority's tokens, whatever its stamp says): never rotate those.
-    live_held: set[int] = set()
+    live_held: set[int] | None = None
     try:
         from jacked.api.credential_helpers import (
             live_holder_account_ids,
@@ -2145,10 +2145,13 @@ async def refresh_all_expiring_tokens(
         live_held = await asyncio.to_thread(live_holder_account_ids, db)
     except Exception:
         logger.debug("Periodic credential reconciliation failed", exc_info=True)
-    if active_id is None:
+    cc_rotation_blocked = active_id is None or live_held is None
+    if cc_rotation_blocked:
         logger.info(
-            "Token refresh: the active account is unknown; Claude Code chains "
-            "are not rotated this pass (invariant I2 fails closed)"
+            "Token refresh: %s; Claude Code chains are not rotated this pass "
+            "(invariant I2 fails closed)",
+            "the active account is unknown" if active_id is None
+            else "the live credential holders are unknown",
         )
 
     for account in accounts:
@@ -2209,7 +2212,7 @@ async def refresh_all_expiring_tokens(
         # schedule; jacked imports rotated tokens via
         # reconcile_credentials_from_live_store at line ~1044 above.
         # See docs/architecture/oauth-and-credential-flows.md §7.1.
-        if active_id is None or active_id == account_id or account_id in live_held:
+        if cc_rotation_blocked or active_id == account_id or account_id in live_held:
             continue
 
         if should_refresh_cc(account, buffer_seconds):

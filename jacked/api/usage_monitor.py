@@ -1987,17 +1987,26 @@ def _write_keeper_state(db, account_id: int, **fields) -> None:
 
 
 def _note_keeper_skip(
-    db, acct: dict, state: dict, reason: str | None, next_attempt_at=None
+    db, acct: dict, state: dict, reason: str | None, next_attempt_at=None,
+    paused_until=None,
 ) -> None:
-    """Record why the keeper did not ping an account — only on change."""
+    """Record why the keeper did not ping an account — only on change.
+
+    ``paused_until`` (the next active start) is display state kept apart
+    from ``next_attempt_at``: the latter is a retry DEADLINE that the
+    restart recovery honors, and a pause must never overwrite it.
+    """
     if state.get("skip_reason") == reason and (
-        (reason != "backoff" and next_attempt_at is None)
-        or state.get("next_attempt_at") == next_attempt_at
+        (reason != "backoff" and next_attempt_at is None and paused_until is None)
+        or (next_attempt_at is not None and state.get("next_attempt_at") == next_attempt_at)
+        or (paused_until is not None and state.get("paused_until") == paused_until)
     ):
         return
     fields: dict = {"skip_reason": reason}
     if reason == "backoff" or next_attempt_at is not None:
         fields["next_attempt_at"] = next_attempt_at
+    if reason == "outside_active_hours" or paused_until is not None:
+        fields["paused_until"] = paused_until
     if reason is not None and not state.get("last_status"):
         fields["last_status"] = "skipped"
     _write_keeper_state(db, acct["id"], **fields)
@@ -2073,6 +2082,11 @@ def _ping_window_cache_fields(result, now: float | None = None) -> dict:
         if reset and value is not None and 0.0 <= value <= 1.0:
             fields[f"{key}_resets_at"] = reset
             fields[key] = round(value * 100.0, 2)
+    # The write stamps usage_cached_at for the whole row, so the 5h window
+    # (the one the keeper opened) must be complete; a 7d-only measurement
+    # would stamp a stale 5h utilization as fresh.
+    if "five_hour" not in fields:
+        return {}
     return fields
 
 
@@ -2098,7 +2112,10 @@ class _LadderOutcome:
 # other FAILED outcome (not_sent, reply_lost, http_5xx, circuit_breaker,
 # lock_timeout, chain_changed, db_write_failed, ...) is transient.
 _ROTATION_TERMINAL_ERRORS = frozenset(
-    {"invalid_grant", "http_400", "http_401", "http_403", "account_not_found"}
+    {
+        "invalid_grant", "http_400", "http_401", "http_403", "account_not_found",
+        "no_refresh_token",
+    }
 )
 # Ceiling on a server-provided retry or 5h reset the keeper will honor; a
 # 7d reset may lie up to _KEEPER_MAX_7D_RESET_SECONDS ahead.
@@ -2209,7 +2226,10 @@ async def _keeper_auth_ladder(
                 account_id,
                 block,
             )
-            out.pending = block == "active_unknown" or block == "check_failed"
+            # The hold can end without this row's tokens changing (the
+            # authority switches away; the resolver recovers), so none of
+            # these is a verdict on the credential: retry with a backoff.
+            out.pending = True
             out.pending_reason = block
         else:
             res = await auth_mod.refresh_cc_token_result(account_id, db, force=True)
@@ -2339,6 +2359,7 @@ async def _keeper_record_success(
         "consecutive_auth_failures": 0,
         "next_attempt_at": None,
         "skip_reason": None,
+        "paused_until": None,
         "token_fp": fresh_fp,
     }
     if not window_open:
@@ -2363,25 +2384,40 @@ def _keeper_record_failure(
     fp: str | None,
     check_interval: float,
     now: float,
+    tried: set | None = None,
 ) -> None:
-    """Classify a failed sweep by its LAST attempt and persist the verdict."""
+    """Classify a failed sweep by its LAST attempt and persist the verdict.
+
+    ``tried`` is every token the sweep pinged (the ladder's rotations
+    included). A verdict is persisted against the CURRENT candidate set, and
+    only when every current candidate was tried: a token that landed during
+    the ladder (a dashboard re-auth, a reconcile) is untried and gets an
+    immediate retry instead of a latch, while a token the keeper itself
+    rotated and then saw rejected is tried and does latch (otherwise every
+    sweep would rotate once more: credential churn).
+    """
     account_id = acct["id"]
+    tried = tried or set()
     base = {
         "last_ping_at": int(now),
         "error_type": result.error_type,
         "request_id": result.request_id,
         "skip_reason": None,
+        "paused_until": None,
         "token_fp": fp,
     }
     auth_failures = int(state.get("consecutive_auth_failures") or 0)
     if result.is_auth_failure:
         auth_failures += 1
         fresh = db.get_account(account_id) or acct
-        fresh_fp = _candidate_fingerprint(*_keeper_candidates(fresh))
-        if fresh_fp != fp:
+        fresh_cc, fresh_primary = _keeper_candidates(fresh)
+        fresh_fp = _candidate_fingerprint(fresh_cc, fresh_primary)
+        base["token_fp"] = fresh_fp
+        untried = [t for t in (fresh_cc, fresh_primary) if t and t not in tried]
+        if untried:
             # A token landed while the ladder ran (a dashboard re-auth, a
-            # reconcile): the attempted set is not the current set, so no
-            # verdict is recorded against the new tokens. Retry at once.
+            # reconcile): it was never pinged, so no verdict is recorded
+            # against it. Retry at once.
             logger.info(
                 "Window keeper: account %d got new tokens during recovery — "
                 "retrying next sweep",
@@ -2570,7 +2606,9 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
     if good_token is not None:
         await _keeper_record_success(db, acct, good_token, result, check_interval, now)
         return "pinged"
-    _keeper_record_failure(db, acct, state, result, ladder, fp, check_interval, now)
+    _keeper_record_failure(
+        db, acct, state, result, ladder, fp, check_interval, now, tried=tried
+    )
     return "failed"
 
 
@@ -2611,7 +2649,7 @@ async def _run_window_keeper(db, check_interval: float) -> int:
                     acct,
                     _keeper_state_of(acct),
                     "outside_active_hours",
-                    next_attempt_at=next_start,
+                    paused_until=next_start,
                 )
                 continue
             outcome = await _keeper_process_account(db, acct, check_interval)

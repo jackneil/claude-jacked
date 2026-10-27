@@ -636,7 +636,7 @@ def _row_holds_live_tokens(row: dict, live: dict | None) -> bool:
     return bool(refresh) and refresh == row.get("cc_refresh_token")
 
 
-def live_holder_account_ids(db, live: dict | None = None) -> set[int]:
+def live_holder_account_ids(db, live: dict | None = None) -> set[int] | None:
     """Ids of the rows whose Claude Code tokens the live authority holds.
 
     A running Claude Code session refreshes from the tokens in the authority,
@@ -644,17 +644,25 @@ def live_holder_account_ids(db, live: dict | None = None) -> set[int]:
     with that session, whatever the payload's stamp says (the stamp survives
     Claude Code's writes for other accounts). Reads the live store once when
     ``live`` is not given.
+
+    Returns ``None`` when the holders are UNKNOWN (the live store could not
+    be read, or the account list failed): a caller must treat that as "every
+    chain may be held", never as an empty set.
     """
     if live is None:
-        live = read_live_credentials()
+        try:
+            live = read_live_credentials()
+        except Exception:
+            logger.debug("live_holder_account_ids: live store read failed", exc_info=True)
+            return None
     if not isinstance(live, dict):
-        return set()
+        return None
     held: set[int] = set()
     try:
         rows = db.list_accounts(include_inactive=True)
     except Exception:
         logger.debug("live_holder_account_ids: account list failed", exc_info=True)
-        return held
+        return None
     for row in rows:
         if _row_holds_live_tokens(row, live):
             held.add(int(row["id"]))
@@ -677,8 +685,10 @@ def cc_rotation_block(account_id: int, db) -> str | None:
         return "active_unknown"
     if active == account_id:
         return "active"
-    row = db.get_account(account_id)
-    if row and _row_holds_live_tokens(row, read_live_credentials()):
+    held = live_holder_account_ids(db)
+    if held is None:
+        return "live_store_unreadable"
+    if account_id in held:
         return "live_session_holds"
     return None
 

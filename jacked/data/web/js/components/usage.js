@@ -234,10 +234,14 @@ function windowReason(acct, resetsAt, nowMs) {
     switch (ks.skip_reason) {
         case 'keeper_disabled': return reason('keeper off');
         case 'no_token': return reason('no token, re-auth', 'warn', false, 'no token');
-        case 'outside_active_hours':
-            return next && !due
-                ? reason('paused until ' + _keeperWhen(next), 'muted', false, 'paused')
+        case 'outside_active_hours': {
+            // The next active start rides its own field: next_attempt_at is
+            // a retry deadline the keeper honors across restarts.
+            const until = Number(ks.paused_until) || 0;
+            return until && until * 1000 > now
+                ? reason('paused until ' + _keeperWhen(until), 'muted', false, 'paused')
                 : reason('paused', 'muted', false, 'paused');
+        }
         case 'auto_swap_disabled': return reason('auto-swap off');
         default: break;
     }

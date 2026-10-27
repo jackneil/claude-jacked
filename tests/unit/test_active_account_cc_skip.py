@@ -160,6 +160,31 @@ class TestBackgroundLoopSkipsActiveCC:
         assert [c.args[0] for c in mock_refresh_cc.call_args_list] == [3]
         assert result["cc_refreshed"] == 1
 
+    @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
+    @patch("jacked.api.credential_helpers.read_active_account_id", return_value=1)
+    @patch("jacked.web.auth.Database")
+    def test_unknown_live_holders_block_every_cc_rotation(
+        self, mock_db_cls, mock_read_active, mock_refresh_cc,
+    ):
+        """When the live store cannot be read, the holders are unknown, not
+        empty: no cc chain is rotated that pass."""
+        from jacked.web import auth
+
+        now = int(time.time())
+        accts = [self._make_account(i, cc_expires_at=now + 120) for i in (1, 2)]
+        mock_db = MagicMock()
+        mock_db.list_accounts.return_value = accts
+        mock_db_cls.return_value = mock_db
+        mock_refresh_cc.return_value = True
+
+        with patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"), \
+             patch("jacked.api.credential_helpers.read_live_credentials",
+                   side_effect=RuntimeError("keychain locked")):
+            result = asyncio.run(auth.refresh_all_expiring_tokens())
+
+        mock_refresh_cc.assert_not_called()
+        assert result["cc_refreshed"] == 0
+
 
 class TestReadActiveAccountId:
     """The shared helper used by every skip site."""
@@ -224,7 +249,7 @@ class TestWindowKeeperSkipsActiveCC:
             "jacked.web.window_keeper.ping_account",
             new_callable=AsyncMock,
             return_value=rejected,
-        ), patch("jacked.api.credential_helpers.read_live_credentials", return_value=None):
+        ), patch("jacked.api.credential_helpers.read_live_credentials", return_value={"claudeAiOauth": {"accessToken": "x"}}):
             outcome = asyncio.run(
                 usage_monitor._keeper_auth_ladder(db, acct, "cc-dead", True, {"cc-dead"})
             )

@@ -15,6 +15,7 @@ collapse into one database shared by the whole session.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -110,9 +111,7 @@ def _isolate_doctest_home(request, tmp_path_factory, monkeypatch):
         first = head.replace("\\", "/").rsplit("/", 1)[-1].lower()
         if first in supervisors:
             raise RuntimeError("doctest tripwire: real supervisor/keychain call: " + first)
-        if "jacked" in text and any(
-            f" {verb}" in text for verb in ("service", " install")
-        ):
+        if "jacked" in text and re.search(r"\b(service|install)\b", text):
             raise RuntimeError("doctest tripwire: real jacked lifecycle command")
 
     class _GuardedPopen(real_popen):

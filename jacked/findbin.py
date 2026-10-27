@@ -99,9 +99,12 @@ def _fallback_refusal(path: str) -> str | None:
     except OSError:
         return "candidate cannot be inspected"
     if stat.S_ISLNK(link_status.st_mode):
-        reason = _untrusted_reason(link_status, uid)
-        if reason:
-            return f"symlink is {reason}"
+        # A symlink's permission bits are ignored by the kernel (Linux
+        # reports 0777); who may replace it is decided by its directory,
+        # checked below. Its OWNER still matters: a link planted by another
+        # user is refused even inside a sound directory.
+        if link_status.st_uid not in (uid, 0):
+            return "symlink is not owned by the current user"
     try:
         status = os.stat(real)
     except OSError:

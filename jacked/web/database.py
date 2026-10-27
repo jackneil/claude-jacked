@@ -1451,6 +1451,7 @@ class Database:
             "consecutive_auth_failures",
             "next_attempt_at",
             "skip_reason",
+            "paused_until",
             "token_fp",
         }
     )

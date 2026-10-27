@@ -224,3 +224,48 @@ def test_refuses_a_world_writable_ancestor_directory(tmp_path, caplog):
         home.chmod(0o755)
     assert "ancestor is world-writable" in caplog.text
     assert str(exe) not in caplog.text
+
+
+@posix_only
+def test_accepts_a_linux_style_symlink_launcher(tmp_path):
+    """Linux reports mode 0777 on a symlink; those bits mean nothing (the
+    directory decides who may replace the link). A user-owned link in a
+    sound directory to a sound target is accepted."""
+    home = tmp_path / "home"
+    target = _local_bin_exe(home, "codex-real")
+    link = target.parent / "codex"
+    link.symlink_to(target)
+    real_lstat = os.lstat
+
+    def linux_lstat(path, *a, **kw):
+        st = real_lstat(path, *a, **kw)
+        if str(path) == str(link):
+            return os.stat_result((0o120777,) + tuple(st)[1:])
+        return st
+
+    with patch("jacked.findbin.shutil.which", return_value=None), \
+         patch("jacked.findbin._home_dir", return_value=str(home)), \
+         patch("jacked.findbin.os.lstat", side_effect=linux_lstat):
+        assert find_bin("codex") == str(link)
+
+
+@posix_only
+def test_refuses_a_symlink_planted_by_another_user(tmp_path, caplog):
+    home = tmp_path / "home"
+    target = _local_bin_exe(home, "codex-real")
+    link = target.parent / "codex"
+    link.symlink_to(target)
+    real_lstat = os.lstat
+
+    def foreign_lstat(path, *a, **kw):
+        st = real_lstat(path, *a, **kw)
+        if str(path) == str(link):
+            return os.stat_result(tuple(st)[:4] + (st.st_uid + 4242,) + tuple(st)[5:])
+        return st
+
+    with patch("jacked.findbin.shutil.which", return_value=None), \
+         patch("jacked.findbin._home_dir", return_value=str(home)), \
+         patch("jacked.findbin.os.lstat", side_effect=foreign_lstat), \
+         caplog.at_level("WARNING", logger="jacked.findbin"):
+        assert find_bin("codex") is None
+    assert "symlink is not owned" in caplog.text

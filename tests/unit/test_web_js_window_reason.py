@@ -84,11 +84,16 @@ class TestWindowReason:
     def test_paused_shows_the_servers_next_start_in_local_time(self, tmp_path):
         """The server attaches the epoch of the next active start; the
         client renders it in the viewer's zone (never a settings lookup)."""
-        acct = _fresh(keeper_state={"skip_reason": "outside_active_hours", "next_attempt_at": NOW + 3 * 3600})
+        acct = _fresh(keeper_state={"skip_reason": "outside_active_hours", "paused_until": NOW + 3 * 3600})
         r = _reason(tmp_path, acct)
         assert r["text"].startswith("paused until ")
         assert "06:00" not in r["text"]
         assert r["short"] == "paused"
+
+    def test_paused_ignores_a_retry_deadline(self, tmp_path):
+        """next_attempt_at is a retry deadline, never the pause time."""
+        acct = _fresh(keeper_state={"skip_reason": "outside_active_hours", "next_attempt_at": NOW + 600})
+        assert _reason(tmp_path, acct)["text"] == "paused"
 
     def test_paused_without_a_time_is_just_paused(self, tmp_path):
         acct = _fresh(keeper_state={"skip_reason": "outside_active_hours"})
@@ -127,7 +132,7 @@ class TestWindowReason:
         states = [
             {"last_status": "needs_reauth"},
             {"skip_reason": "keeper_disabled"}, {"skip_reason": "no_token"},
-            {"skip_reason": "outside_active_hours", "next_attempt_at": NOW + 3600},
+            {"skip_reason": "outside_active_hours", "paused_until": NOW + 3600},
             {"skip_reason": "auto_swap_disabled"},
             {"last_status": "rate_limited", "next_attempt_at": NOW + 600},
             {"last_status": "rate_limited"},

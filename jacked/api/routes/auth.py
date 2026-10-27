@@ -174,6 +174,7 @@ class KeeperState(BaseModel):
     consecutive_auth_failures: int = 0
     next_attempt_at: Optional[float] = None
     skip_reason: Optional[str] = None
+    paused_until: Optional[float] = None
     updated_at: Optional[int] = None
 
 
