@@ -2144,7 +2144,8 @@ async def refresh_all_expiring_tokens(
             read_active_account_id,
             reconcile_credentials_from_live_store,
         )
-        active_id = read_active_account_id()
+        # Keychain reads run off the event loop (each can take up to 2 s).
+        active_id = await asyncio.to_thread(read_active_account_id)
         if active_id is not None:
             await asyncio.to_thread(
                 reconcile_credentials_from_live_store, active_id, db

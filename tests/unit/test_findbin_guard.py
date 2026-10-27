@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import re
+import shlex
 from pathlib import Path
 
 import pytest
@@ -86,16 +87,35 @@ def _call_name(func: ast.expr) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _shell_program(command: str) -> str | None:
+    """The program a shell string runs first, skipping ``env``, ``NAME=value``
+    assignments, leading whitespace and a leading ``cd x &&``."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    while words:
+        head = words[0]
+        if head == "env" or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", head):
+            words = words[1:]
+            continue
+        if head == "cd" and "&&" in words:
+            words = words[words.index("&&") + 1:]
+            continue
+        return head
+    return None
+
+
 def _bare_cli(node: ast.expr | None) -> str | None:
     """The user CLI a literal names: ``"codex"``, ``"codex login"`` (a shell
-    string whose first word is the program), or the first element of a
-    literal argv list/tuple."""
+    string whose program is a user CLI), or the first element of a literal
+    argv list/tuple."""
     if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
         return _bare_cli(node.elts[0])
     if isinstance(node, ast.JoinedStr) and node.values:
         return _bare_cli(node.values[0])
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        head = node.value.split(" ", 1)[0]
+        head = _shell_program(node.value)
         return head if head in USER_CLIS else None
     return None
 
@@ -169,6 +189,10 @@ def test_service_reachable_code_uses_find_bin_for_user_clis():
     'import asyncio\nasyncio.create_subprocess_exec("codex", "app-server")\n',
     'import asyncio\nasyncio.create_subprocess_shell("gh pr view")\n',
     'import os\nos.system("gh auth status")\n',
+    'import subprocess\nsubprocess.run("env codex login", shell=True)\n',
+    'import subprocess\nsubprocess.run("CODEX_HOME=/x codex login", shell=True)\n',
+    'import subprocess\nsubprocess.run("cd /tmp && gh pr view", shell=True)\n',
+    'import subprocess\nsubprocess.run("  codex login", shell=True)\n',
     'import os\nos.posix_spawnp("codex", ["codex"], {})\n',
     'import os\nos.execvp("claude", ["claude"])\n',
 ])
