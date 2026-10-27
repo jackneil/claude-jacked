@@ -270,7 +270,10 @@ function renderAccountMenuItem(cls, attrs, iconKey, text, colorCls) {
  */
 function renderAccountMenu(acct) {
     const status = getAccountStatus(acct);
-    const needsAttention = status === 'invalid' || status === 'expired';
+    // The window keeper's needs_reauth verdict lights the same dot: every
+    // token it holds was rejected, and Re-auth in this menu is the fix.
+    const keeperNeedsReauth = !!(acct.keeper_state && acct.keeper_state.last_status === 'needs_reauth');
+    const needsAttention = status === 'invalid' || status === 'expired' || keeperNeedsReauth;
     const provider = acct.provider || 'claude';
     const hasCustomLabel = acct.display_name && acct.display_name !== acct.email;
     const orgLabel = accountOrgLabel(acct);
@@ -434,8 +437,8 @@ function renderAccountCard(acct, idx, total) {
     // Usage bars
     const elapsed5h = computeElapsedFraction5h(acct.cached_5h_resets_at);
     const elapsed7d = computeElapsedFraction7d(acct.cached_7d_resets_at);
-    const usage5h = renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, elapsed5h, '5h limit');
-    const usage7d = renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, elapsed7d, '7d limit');
+    const usage5h = renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, elapsed5h, '5h limit', usageBarOpts(acct, acct.cached_5h_resets_at));
+    const usage7d = renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, elapsed7d, '7d limit', usageBarOpts(acct, acct.cached_7d_resets_at));
     const cacheAgeHtml = renderCacheAge(acct.usage_cached_at, acct.id);
 
     // Priority reorder buttons

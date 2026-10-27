@@ -94,8 +94,8 @@ function orgBarsHtml(org) {
     const elapsed5h = computeElapsedFraction5h(org.cached_5h_resets_at);
     const elapsed7d = computeElapsedFraction7d(org.cached_7d_resets_at);
     let html =
-        renderUsageBar(org.cached_usage_5h, org.cached_5h_resets_at, elapsed5h, '5h', { compact: true }) +
-        renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, elapsed7d, '7d', { compact: true });
+        renderUsageBar(org.cached_usage_5h, org.cached_5h_resets_at, elapsed5h, '5h', usageBarOpts(org, org.cached_5h_resets_at, { compact: true })) +
+        renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, elapsed7d, '7d', usageBarOpts(org, org.cached_7d_resets_at, { compact: true }));
     const bm = org.usage && org.usage.binding_model;
     if (bm) {
         html += renderUsageBar(bm.utilization, bm.resets_at, null, bm.label || 'model', { compact: true });

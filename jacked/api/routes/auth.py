@@ -161,6 +161,49 @@ class AccountUsage(BaseModel):
     extra_usage: Optional[ExtraUsage] = None
 
 
+class KeeperState(BaseModel):
+    """The window keeper's last verdict for an account (dashboard reason text).
+
+    The token fingerprint the keeper stores is deliberately not exposed.
+    """
+
+    last_ping_at: Optional[int] = None
+    last_status: Optional[str] = None
+    error_type: Optional[str] = None
+    request_id: Optional[str] = None
+    consecutive_auth_failures: int = 0
+    next_attempt_at: Optional[float] = None
+    skip_reason: Optional[str] = None
+    paused_until: Optional[float] = None
+    updated_at: Optional[int] = None
+
+
+def _build_keeper_state(raw) -> Optional[KeeperState]:
+    """Parse the keeper_state column; None when absent or malformed.
+
+    >>> _build_keeper_state(None) is None
+    True
+    >>> _build_keeper_state('{"last_status": "needs_reauth", "token_fp": "ab12cd34"}').last_status
+    'needs_reauth'
+    >>> "token_fp" in _build_keeper_state('{"token_fp": "ab12cd34"}').model_dump()
+    False
+    >>> _build_keeper_state('{"consecutive_auth_failures": "x"}') is None
+    True
+    """
+    from jacked.web.database import Database
+
+    state = Database.parse_keeper_state(raw)
+    if not state:
+        return None
+    fields = {k: state.get(k) for k in KeeperState.model_fields if k in state}
+    if fields.get("consecutive_auth_failures") is None:
+        fields.pop("consecutive_auth_failures", None)
+    try:
+        return KeeperState(**fields)
+    except Exception:  # noqa: BLE001 - a malformed blob must not break the list
+        return None
+
+
 class AccountResponse(BaseModel):
     """Account data with computed fields for API responses."""
 
@@ -203,6 +246,7 @@ class AccountResponse(BaseModel):
     is_expired: bool = False
     expires_in_seconds: int = 0
     usage: Optional[AccountUsage] = None
+    keeper_state: Optional[KeeperState] = None
 
 
 class AccountPatchRequest(BaseModel):
@@ -700,6 +744,7 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
         cached_5h_resets_at=row.get("cached_5h_resets_at"),
         cached_7d_resets_at=row.get("cached_7d_resets_at"),
         usage_cached_at=row.get("usage_cached_at"),
+        keeper_state=_build_keeper_state(row.get("keeper_state")),
         last_error=row.get("last_error"),
         last_error_at=row.get("last_error_at"),
         consecutive_failures=row.get("consecutive_failures", 0),

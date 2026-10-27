@@ -202,6 +202,53 @@ class TestRunUpdate:
         assert "--host" not in restart_args
 
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.install_method.detect_install_method", return_value="pipx")
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_pipx_install_runs_the_resolved_pipx_path(
+        self, mock_popen, mock_run, mock_find, mock_method, mock_gate,
+    ):
+        """The service PATH is system-only, so a bare "pipx" argv fails with
+        FileNotFoundError when pipx lives in ~/.local/bin. The updater must
+        run the binary find_bin resolved, exactly as it does for uv."""
+        from jacked.service import updater
+        mock_find.side_effect = lambda name: {
+            "pipx": "/fake/home/.local/bin/pipx", "jacked": "/fake/jacked",
+        }.get(name)
+        mock_run.return_value = MagicMock(returncode=1)  # stop after install
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+
+        install_argv = mock_run.call_args_list[0][0][0]
+        assert install_argv[0] == "/fake/home/.local/bin/pipx"
+        assert "install" in install_argv and "claude-jacked[tray]" in install_argv
+
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
+    @patch("jacked.install_method.detect_install_method", return_value="pipx")
+    @patch("jacked.service.updater.find_bin")
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_pipx_missing_fails_loud_without_running_install(
+        self, mock_popen, mock_run, mock_find, mock_method, mock_gate,
+        tmp_path, monkeypatch,
+    ):
+        from jacked.service import updater
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "recovery.txt")
+        mock_find.side_effect = lambda name: {"jacked": "/fake/jacked"}.get(name)
+        mock_run.return_value = _ok()
+
+        with patch.object(updater, "wait_for_exit", return_value=True):
+            updater.run_update(parent_pid=12345, extras="tray")
+
+        for call in mock_run.call_args_list:
+            assert "pipx" not in call[0][0][0]
+        content = (tmp_path / "recovery.txt").read_text()
+        assert "Could not find `pipx`" in content
+
+    @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.install_method.detect_install_method", return_value="uv")
     @patch("jacked.service.updater.find_bin")
     @patch("subprocess.run")

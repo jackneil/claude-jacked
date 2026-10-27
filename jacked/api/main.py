@@ -72,12 +72,21 @@ async def _token_refresh_loop():
                 refresh_all_expiring_tokens(buffer_seconds=14400),
                 timeout=SWEEP_PASS_TIMEOUT,
             )
+            # "refreshed" counts real token exchanges only; a token inside
+            # the 4h buffer that is not yet due is "skipped".
             if result["refreshed"] > 0 or result["failed"] > 0:
                 logger.info(
-                    "Token refresh: checked=%d, refreshed=%d, failed=%d",
+                    "Token refresh: checked=%d, refreshed=%d, skipped=%d, failed=%d",
                     result["checked"],
                     result["refreshed"],
+                    result["skipped"],
                     result["failed"],
+                )
+            else:
+                logger.debug(
+                    "Token refresh: checked=%d, refreshed=0, skipped=%d, failed=0",
+                    result["checked"],
+                    result["skipped"],
                 )
         except asyncio.TimeoutError:
             # wait_for cancels the pass; an in-flight token exchange is

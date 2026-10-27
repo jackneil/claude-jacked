@@ -37,6 +37,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Mapping, Optional
 
+from jacked.findbin import find_bin
 from jacked.service.process import process_liveness
 
 from .credentials import codex_home, ensure_file_storage, extract_identity
@@ -387,7 +388,7 @@ def launch_codex(
 ) -> None:
     """Replace this process with ``codex`` running isolated on ``account_id``
     (its own ``CODEX_HOME``), so the shared root account is never touched."""
-    codex = codex_bin or shutil.which("codex")
+    codex = codex_bin or find_bin("codex")
     if not codex:
         raise CodexSwapError("the `codex` CLI is not installed or not on PATH")
     run_env = build_codex_launch_env(account_id, base, env)

@@ -39,11 +39,12 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+from jacked.findbin import find_bin
 
 try:  # POSIX advisory locking. Absent on Windows -- see ``_config_lock``.
     import fcntl
@@ -514,7 +515,7 @@ def codex_preflight(timeout: float = 10.0) -> dict:
     this runs on the /dcr hot path and on a dashboard request, and neither may
     die because a subprocess misbehaved.
     """
-    codex = shutil.which("codex")
+    codex = find_bin("codex")
     if not codex:
         return {
             "codex_installed": False,

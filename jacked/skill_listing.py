@@ -41,13 +41,14 @@ import logging
 import math
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from jacked.findbin import find_bin
 
 logger = logging.getLogger(__name__)
 
@@ -711,7 +712,7 @@ def _probe_claude_code_version() -> str | None:
         if cached is not None and now - cached[1] < VERSION_CACHE_SECONDS:
             return cached[0]
         version = None
-        exe = shutil.which("claude")
+        exe = find_bin("claude")
         if exe:
             try:
                 out = subprocess.run([exe, "--version"], capture_output=True, text=True,

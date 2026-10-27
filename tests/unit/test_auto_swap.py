@@ -748,6 +748,21 @@ class TestPickBestTargetTierStrict:
                                   current_id=99, now=now)
         assert target["id"] == 2
 
+    def test_dead_cc_chain_is_never_a_target(self):
+        """A dead Claude Code chain may still hold a live-recovered access
+        token, but its refresh token is spent: a background swap to it
+        would force a re-login when that token expires."""
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        dead = _acct(1, usage_7d=50, resets_7d=_iso(now + timedelta(hours=12)))
+        dead["cc_refresh_failure_type"] = "invalid_grant"
+        t1 = _acct(2, usage_7d=50,
+                   resets_7d=_iso(now + timedelta(hours=36)))
+        target = pick_best_target([active, dead, t1],
+                                  current_id=99, now=now)
+        assert target["id"] == 2
+
 
 class TestHas5hHeadroom:
     def test_has_room_when_below_90(self):

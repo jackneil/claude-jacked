@@ -48,7 +48,7 @@ class TestBackgroundLoopSkipsActiveCC:
             result = asyncio.run(auth.refresh_all_expiring_tokens())
 
         # Only the inactive account should have been refreshed
-        mock_refresh_cc.assert_called_once_with(2, mock_db)
+        mock_refresh_cc.assert_called_once_with(2, mock_db, buffer_seconds=14400)
         assert result["cc_refreshed"] == 1
         # Active account was checked and counted, just not CC-refreshed
         assert result["checked"] == 2
@@ -77,8 +77,11 @@ class TestBackgroundLoopSkipsActiveCC:
 
         # Must not raise NameError or any other unhandled exception.
         result = asyncio.run(auth.refresh_all_expiring_tokens())
-        # No active account detected → refresh proceeds.
-        assert result["cc_refreshed"] == 1
+        # The active account is unknown: invariant I2 fails closed, so no
+        # cc chain is rotated this pass (the loop still completes).
+        assert result["cc_refreshed"] == 0
+        assert result["checked"] == 1
+        mock_refresh_cc.assert_not_called()
 
     @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
     @patch("jacked.api.credential_helpers.read_active_account_id", return_value=None)
@@ -86,7 +89,8 @@ class TestBackgroundLoopSkipsActiveCC:
     def test_refresh_loop_survives_non_dict_live_data(
         self, mock_db_cls, mock_read_active, mock_refresh_cc,
     ):
-        """`_jackedAccountId` missing or malformed → treated as no active."""
+        """`_jackedAccountId` missing or malformed → no active account is
+        known, so no cc chain is rotated (fail closed), and the loop survives."""
         from jacked.web import auth
 
         now = int(time.time())
@@ -97,15 +101,18 @@ class TestBackgroundLoopSkipsActiveCC:
         mock_refresh_cc.return_value = True
 
         result = asyncio.run(auth.refresh_all_expiring_tokens())
-        assert result["cc_refreshed"] == 1
+        assert result["cc_refreshed"] == 0
+        mock_refresh_cc.assert_not_called()
 
     @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
     @patch("jacked.api.credential_helpers.read_active_account_id", return_value=None)
     @patch("jacked.web.auth.Database")
-    def test_no_active_account_still_refreshes_all(
+    def test_no_active_account_refreshes_no_cc_chain(
         self, mock_db_cls, mock_read_active, mock_refresh_cc,
     ):
-        """When no active-account marker is present, refresh proceeds normally."""
+        """With no resolved active account the loop cannot tell whose session
+        holds which single-use cc refresh token, so it rotates none of them
+        (invariant I2 fails closed). It still runs the primary refreshes."""
         from jacked.web import auth
 
         now = int(time.time())
@@ -122,8 +129,88 @@ class TestBackgroundLoopSkipsActiveCC:
         with patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"):
             result = asyncio.run(auth.refresh_all_expiring_tokens())
 
-        assert mock_refresh_cc.call_count == 2
-        assert result["cc_refreshed"] == 2
+        assert mock_refresh_cc.call_count == 0
+        assert result["cc_refreshed"] == 0
+        assert result["checked"] == 2
+
+    @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
+    @patch("jacked.api.credential_helpers.read_active_account_id", return_value=1)
+    @patch("jacked.web.auth.Database")
+    def test_live_held_tokens_are_never_rotated_whatever_the_stamp_says(
+        self, mock_db_cls, mock_read_active, mock_refresh_cc,
+    ):
+        """The authority carries account 2's tokens under account 1's stamp
+        (a /login to 2 in a session). Account 2 shares its cc lineage with
+        that session, so the loop must not exchange it; account 3 is free."""
+        from jacked.web import auth
+
+        now = int(time.time())
+        accts = [self._make_account(i, cc_expires_at=now + 120) for i in (1, 2, 3)]
+        accts[1]["cc_refresh_token"] = "rt-held"
+        mock_db = MagicMock()
+        mock_db.list_accounts.return_value = accts
+        mock_db_cls.return_value = mock_db
+        mock_refresh_cc.return_value = True
+        live = {"_jackedAccountId": 1, "claudeAiOauth": {"accessToken": "at-held", "refreshToken": "rt-held"}}
+
+        with patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"), \
+             patch("jacked.api.credential_helpers.read_live_credentials", return_value=live):
+            result = asyncio.run(auth.refresh_all_expiring_tokens())
+
+        assert [c.args[0] for c in mock_refresh_cc.call_args_list] == [3]
+        assert result["cc_refreshed"] == 1
+
+    @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
+    @patch("jacked.api.credential_helpers.read_active_account_id", return_value=1)
+    @patch("jacked.web.auth.Database")
+    def test_session_tracker_accounts_are_live_holders(
+        self, mock_db_cls, mock_read_active, mock_refresh_cc,
+    ):
+        """A session started on account 2 keeps 2's refresh token in memory
+        after the authority moved to 1: the tracker names 2, so the loop
+        must not rotate it (2026-09-05 lesson)."""
+        from jacked.web import auth
+
+        now = int(time.time())
+        accts = [self._make_account(i, cc_expires_at=now + 120) for i in (1, 2, 3)]
+        mock_db = MagicMock()
+        mock_db.list_accounts.return_value = accts
+        mock_db.get_active_sessions.return_value = [{"session_id": "s", "account_id": 2}]
+        mock_db_cls.return_value = mock_db
+        mock_refresh_cc.return_value = True
+        live = {"_jackedAccountId": 1, "claudeAiOauth": {"accessToken": "x", "refreshToken": "y"}}
+
+        with patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"), \
+             patch("jacked.api.credential_helpers.read_live_credentials", return_value=live):
+            result = asyncio.run(auth.refresh_all_expiring_tokens())
+
+        assert [c.args[0] for c in mock_refresh_cc.call_args_list] == [3]
+        assert result["cc_refreshed"] == 1
+
+    @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
+    @patch("jacked.api.credential_helpers.read_active_account_id", return_value=1)
+    @patch("jacked.web.auth.Database")
+    def test_unknown_live_holders_block_every_cc_rotation(
+        self, mock_db_cls, mock_read_active, mock_refresh_cc,
+    ):
+        """When the live store cannot be read, the holders are unknown, not
+        empty: no cc chain is rotated that pass."""
+        from jacked.web import auth
+
+        now = int(time.time())
+        accts = [self._make_account(i, cc_expires_at=now + 120) for i in (1, 2)]
+        mock_db = MagicMock()
+        mock_db.list_accounts.return_value = accts
+        mock_db_cls.return_value = mock_db
+        mock_refresh_cc.return_value = True
+
+        with patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"), \
+             patch("jacked.api.credential_helpers.read_live_credentials",
+                   side_effect=RuntimeError("keychain locked")):
+            result = asyncio.run(auth.refresh_all_expiring_tokens())
+
+        mock_refresh_cc.assert_not_called()
+        assert result["cc_refreshed"] == 0
 
 
 class TestReadActiveAccountId:
@@ -166,32 +253,39 @@ class TestWindowKeeperSkipsActiveCC:
 
     @patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store")
     @patch("jacked.api.credential_helpers.read_active_account_id", return_value=7)
+    @patch("jacked.web.auth.refresh_cc_token_result", new_callable=AsyncMock)
     @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
     def test_active_account_reconciles_instead_of_refreshing(
-        self, mock_refresh_cc, mock_read_active, mock_reconcile,
+        self, mock_refresh_cc, mock_refresh_result, mock_read_active, mock_reconcile,
     ):
-        """Simulate the window keeper recovery branch directly.
+        """Drive the real keeper ladder: for the active account a 401 must
+        reconcile from live creds and never touch the CC refresh token."""
+        from jacked.api import usage_monitor
+        from jacked.web.window_keeper import PingResult
 
-        When the active account's ping fails, the path must NOT call
-        refresh_cc_token — it must reconcile from live creds instead.
-        """
-        # We test the exact branch logic in isolation by replicating
-        # the call pattern from usage_monitor.py window keeper.
-        from jacked.api.credential_helpers import (
-            read_active_account_id,
-            reconcile_credentials_from_live_store,
-        )
+        acct = {
+            "id": 7,
+            "cc_access_token": "cc-dead",
+            "cc_refresh_token": "cc-rt",
+            "access_token": "pri-dead",
+        }
+        db = MagicMock()
+        db.get_account.return_value = acct
+        rejected = PingResult(ok=False, status=401, error_type="authentication_error")
+        with patch(
+            "jacked.web.window_keeper.ping_account",
+            new_callable=AsyncMock,
+            return_value=rejected,
+        ), patch("jacked.api.credential_helpers.read_live_credentials", return_value={"claudeAiOauth": {"accessToken": "x"}}):
+            outcome = asyncio.run(
+                usage_monitor._keeper_auth_ladder(db, acct, "cc-dead", True, {"cc-dead"})
+            )
 
-        acct_id = 7
-        active_id_now = read_active_account_id()
-        assert active_id_now == acct_id  # prerequisite for the skip path
-
-        # Simulate the new skip branch: reconcile, don't refresh.
-        if active_id_now == acct_id:
-            reconcile_credentials_from_live_store(acct_id, MagicMock())
-
-        mock_refresh_cc.assert_not_called()
+        assert outcome.good_token is None
+        assert outcome.last.status == 401
         mock_reconcile.assert_called_once()
+        mock_refresh_cc.assert_not_called()
+        mock_refresh_result.assert_not_called()
 
 
 class TestLaunchSkipsActiveCC:

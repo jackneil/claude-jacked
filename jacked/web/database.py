@@ -71,9 +71,12 @@ class Account(BaseModel):
     cc_expires_at: Optional[int] = None
     refresh_last_failed_at: Optional[int] = None
     refresh_failure_type: Optional[str] = None
+    cc_refresh_last_failed_at: Optional[int] = None
+    cc_refresh_failure_type: Optional[str] = None
     account_uuid: Optional[str] = None
     profile_json: Optional[str] = None
     profile_fetched_at: Optional[float] = None
+    keeper_state: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -220,9 +223,14 @@ CREATE TABLE IF NOT EXISTS accounts (
     cc_access_token TEXT,
     cc_refresh_token TEXT,
     cc_expires_at INTEGER,
+    refresh_last_failed_at INTEGER,  -- Primary-chain breaker: last failed exchange
+    refresh_failure_type TEXT,  -- Primary-chain breaker: failure type
+    cc_refresh_last_failed_at INTEGER,  -- Claude Code chain breaker: last failed exchange
+    cc_refresh_failure_type TEXT,  -- Claude Code chain breaker: failure type
     account_uuid TEXT,  -- Claude account uuid (profile account.uuid / token exchange account.uuid)
     profile_json TEXT,  -- Non-secret profile subset: {"account": {...}, "organization": {...}}
     profile_fetched_at REAL,  -- Epoch seconds of the profile fetch that wrote profile_json
+    keeper_state TEXT,  -- Window keeper state JSON (see Database.set_keeper_state)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(provider, email, organization_uuid)
@@ -433,7 +441,18 @@ CREATE INDEX IF NOT EXISTS idx_decision_log_action ON decision_log(action);
 
 
 def _default_db_path() -> str:
-    """Return default database path: ~/.claude/jacked.db"""
+    """Return default database path: ~/.claude/jacked.db
+
+    The repo-root ``conftest.py`` gives every doctest a temporary home. When
+    ``JACKED_DOCTEST_GUARD_REAL_HOME`` names the real home (the guard test
+    in tests/unit/test_doctest_isolation.py sets it), this example proves
+    that a doctest never resolves the real database.
+
+    >>> import os
+    >>> real_home = os.environ.get("JACKED_DOCTEST_GUARD_REAL_HOME")
+    >>> real_home is None or not _default_db_path().startswith(real_home)
+    True
+    """
     return str(Path.home() / ".claude" / "jacked.db")
 
 
@@ -487,6 +506,98 @@ class Database:
     @contextmanager
     def _reader(self) -> Iterator[sqlite3.Connection]:
         yield self._get_connection()
+
+    # Name of the one-time move of legacy shared breakers in the private
+    # schema_migrations table (never in settings: the settings API lists
+    # and writes every settings row).
+    CC_BREAKER_SPLIT_MARKER = "cc_breaker_split"
+
+    @staticmethod
+    def _migrate_cc_chain_breaker(conn: sqlite3.Connection) -> None:
+        """Add the Claude Code chain breaker columns and move legacy failures.
+
+        Before this migration one column pair (refresh_last_failed_at,
+        refresh_failure_type) served both refresh lineages. The old code
+        handled a dead Claude Code chain by clearing only cc_refresh_token:
+        the dead cc_access_token stayed and the shared breaker said
+        ``invalid_grant``. A row in that shape moves its failure to the cc
+        columns.
+
+        The move is gated on a marker row in the private ``schema_migrations``
+        table, not on the column add, so a
+        database that got the columns without the move still gets it. It
+        runs once per database: after it, the shared pair belongs to the
+        primary chain only, and a later primary ``invalid_grant`` on a row
+        that has a cc access token but no cc refresh token (an old seed, or
+        a file sync of a consumed token) must not be reclassified. The
+        UPDATE and the marker share the migration transaction. A moved row
+        whose cc access token has already expired loses that token too: a
+        dead chain keeps no token in service.
+
+        >>> conn = sqlite3.connect(":memory:")
+        >>> _ = conn.execute(
+        ...     "CREATE TABLE accounts (id INTEGER PRIMARY KEY, access_token TEXT, "
+        ...     "refresh_token TEXT, cc_access_token TEXT, cc_refresh_token TEXT, "
+        ...     "cc_expires_at INTEGER, refresh_last_failed_at INTEGER, "
+        ...     "refresh_failure_type TEXT)")
+        >>> _ = conn.execute(
+        ...     "INSERT INTO accounts VALUES (1, 'at', 'rt', 'dead', NULL, 1, 50, 'invalid_grant')")
+        >>> Database._migrate_cc_chain_breaker(conn)
+        >>> conn.execute(
+        ...     "SELECT refresh_failure_type, cc_refresh_failure_type, "
+        ...     "cc_refresh_last_failed_at, cc_access_token FROM accounts").fetchone()
+        (None, 'invalid_grant', 50, None)
+        >>> conn.execute(
+        ...     "SELECT name FROM schema_migrations").fetchall()
+        [('cc_breaker_split',)]
+        """
+        cursor = conn.execute("PRAGMA table_info(accounts)")
+        cols = {row[1] for row in cursor.fetchall()}
+        for col_name, col_def in [
+            ("cc_refresh_last_failed_at", "INTEGER"),
+            ("cc_refresh_failure_type", "TEXT"),
+        ]:
+            if col_name not in cols:
+                try:
+                    conn.execute(f"ALTER TABLE accounts ADD COLUMN {col_name} {col_def}")
+                except sqlite3.OperationalError:
+                    pass
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        marker = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?",
+            (Database.CC_BREAKER_SPLIT_MARKER,),
+        ).fetchone()
+        if marker:
+            return
+        expired = (
+            "cc_expires_at IS NOT NULL "
+            "AND cc_expires_at <= CAST(strftime('%s','now') AS INTEGER)"
+        )
+        conn.execute(
+            "UPDATE accounts SET "
+            f"cc_access_token = CASE WHEN {expired} THEN NULL ELSE cc_access_token END, "
+            f"cc_expires_at = CASE WHEN {expired} THEN NULL ELSE cc_expires_at END, "
+            "cc_refresh_failure_type = 'invalid_grant', "
+            "cc_refresh_last_failed_at = refresh_last_failed_at, "
+            "refresh_failure_type = NULL, "
+            "refresh_last_failed_at = NULL "
+            "WHERE refresh_failure_type = 'invalid_grant' "
+            "AND cc_refresh_token IS NULL "
+            "AND cc_access_token IS NOT NULL "
+            # An old seed copied the PRIMARY access token into the cc column
+            # with no cc refresh token: that row never had a cc chain, so its
+            # invalid_grant is a primary failure and stays where it is.
+            "AND cc_access_token IS NOT access_token "
+            "AND refresh_token IS NOT NULL "
+            "AND cc_refresh_failure_type IS NULL"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+            (Database.CC_BREAKER_SPLIT_MARKER, datetime.now(timezone.utc).isoformat()),
+        )
 
     def _init_schema(self) -> None:
         with self._writer() as conn:
@@ -703,6 +814,24 @@ class Database:
                         )
                     except sqlite3.OperationalError:
                         pass
+            # Migration: add the window keeper's per-account state (one JSON
+            # column: last ping, status, error type, skip reason, next attempt;
+            # see set_keeper_state). Same placement rule as the identity
+            # columns: AFTER the explicit-column organization rebuild, BEFORE
+            # the provider rebuild (which copies every live column).
+            cursor = conn.execute("PRAGMA table_info(accounts)")
+            acct_cols_keeper = {row[1] for row in cursor.fetchall()}
+            if "keeper_state" not in acct_cols_keeper:
+                try:
+                    conn.execute("ALTER TABLE accounts ADD COLUMN keeper_state TEXT")
+                except sqlite3.OperationalError:
+                    pass
+            # Migration (workstream B, token chains): per-chain breaker
+            # columns for the Claude Code (cc_*) refresh lineage. The
+            # refresh_* pair now belongs to the primary lineage only. Like the
+            # identity block above, this MUST stay after the explicit-column
+            # organization rebuild and before the provider rebuild.
+            self._migrate_cc_chain_breaker(conn)
             # Migration: add `provider` column + provider-scoped uniqueness.
             # Codex support: the same (email, organization_uuid) can exist under
             # both 'claude' and 'codex'. SQLite can't ALTER a UNIQUE constraint,
@@ -1119,6 +1248,8 @@ class Database:
             "organization_uuid",
             "refresh_last_failed_at",
             "refresh_failure_type",
+            "cc_refresh_last_failed_at",
+            "cc_refresh_failure_type",
             "account_uuid",
             "profile_json",
             "profile_fetched_at",
@@ -1309,6 +1440,83 @@ class Database:
             row = cursor.fetchone()
             return dict(row) if row else None
 
+    # Keys set_keeper_state accepts. A typo must fail loudly in tests, not
+    # silently grow the JSON blob the dashboard reads.
+    KEEPER_STATE_FIELDS = frozenset(
+        {
+            "last_ping_at",
+            "last_status",
+            "error_type",
+            "request_id",
+            "consecutive_auth_failures",
+            "next_attempt_at",
+            "skip_reason",
+            "paused_until",
+            "token_fp",
+        }
+    )
+
+    @staticmethod
+    def parse_keeper_state(raw: Any) -> dict:
+        """Decode a keeper_state column value; anything malformed is {}.
+
+        >>> Database.parse_keeper_state(None)
+        {}
+        >>> Database.parse_keeper_state('{"last_status": "ok"}')
+        {'last_status': 'ok'}
+        >>> Database.parse_keeper_state("not json")
+        {}
+        """
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not raw or not isinstance(raw, str):
+            return {}
+        try:
+            value = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def set_keeper_state(self, account_id: int, **fields: Any) -> dict:
+        """Merge *fields* into the account's window keeper state.
+
+        The state is one JSON object in ``accounts.keeper_state``. A field
+        passed as None is stored as null (cleared). ``updated_at`` (epoch
+        seconds) is stamped on every write. The read-merge-write runs in one
+        writer transaction. Does not touch ``accounts.updated_at``: keeper
+        bookkeeping is not an account edit. Returns the merged state ({} when
+        the account does not exist).
+
+        >>> db = Database(":memory:")
+        >>> acct = db.create_account("k@test.com", "tok", 9999999999)
+        >>> st = db.set_keeper_state(acct["id"], last_status="ok", last_ping_at=5)
+        >>> st["last_status"], st["last_ping_at"], "updated_at" in st
+        ('ok', 5, True)
+        >>> st = db.set_keeper_state(acct["id"], skip_reason="backoff")
+        >>> st["last_status"], st["skip_reason"]
+        ('ok', 'backoff')
+        >>> Database.parse_keeper_state(db.get_account(acct["id"])["keeper_state"])["skip_reason"]
+        'backoff'
+        """
+        unknown = set(fields) - self.KEEPER_STATE_FIELDS
+        if unknown:
+            raise ValueError(f"Unknown keeper_state fields: {sorted(unknown)}")
+        with self._writer() as conn:
+            row = conn.execute(
+                "SELECT keeper_state FROM accounts WHERE id = ? AND is_deleted = 0",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                return {}
+            state = self.parse_keeper_state(row[0])
+            state.update(fields)
+            state["updated_at"] = int(time.time())
+            conn.execute(
+                "UPDATE accounts SET keeper_state = ? WHERE id = ? AND is_deleted = 0",
+                (json.dumps(state, sort_keys=True), account_id),
+            )
+        return state
+
     def update_account_usage_cache(
         self,
         account_id: int,
@@ -1319,6 +1527,8 @@ class Database:
         raw: Optional[dict] = None,
         clear_five_hour: bool = False,
         clear_seven_day: bool = False,
+        clear_five_hour_reset: bool = False,
+        clear_seven_day_reset: bool = False,
     ) -> bool:
         """Update cached usage data for an account.
 
@@ -1329,6 +1539,10 @@ class Database:
         account kept showing 100% "7d" from a window that expired days ago).
         A clear_* flag takes precedence over any value passed for the same
         window: the percent and resets_at columns are nulled together.
+        clear_five_hour_reset / clear_seven_day_reset null ONLY the resets_at
+        column and keep a utilization passed for the same window: the API
+        reports a window with a reading but no reset time, and the old reset
+        time must not survive it.
 
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@t.com", "tok", 9999999999)
@@ -1340,6 +1554,13 @@ class Database:
         True
         >>> db.get_account(acct["id"])["cached_usage_5h"] is None
         True
+        >>> _ = db.update_account_usage_cache(
+        ...     acct["id"], five_hour=7.0, five_hour_resets_at="2026-10-17T00:00:00Z")
+        >>> _ = db.update_account_usage_cache(
+        ...     acct["id"], five_hour=8.0, clear_five_hour_reset=True)
+        >>> row = db.get_account(acct["id"])
+        >>> (row["cached_usage_5h"], row["cached_5h_resets_at"])
+        (8.0, None)
         """
         updates: dict[str, Any] = {"usage_cached_at": int(time.time())}
         if clear_five_hour:
@@ -1356,6 +1577,10 @@ class Database:
             updates["cached_5h_resets_at"] = five_hour_resets_at
         if not clear_seven_day and seven_day_resets_at is not None:
             updates["cached_7d_resets_at"] = seven_day_resets_at
+        if clear_five_hour_reset and not clear_five_hour:
+            updates["cached_5h_resets_at"] = None
+        if clear_seven_day_reset and not clear_seven_day:
+            updates["cached_7d_resets_at"] = None
         if raw is not None:
             raw_str = json.dumps(raw)
             if len(raw_str) <= 10240:  # 10KB guard
@@ -1426,6 +1651,51 @@ class Database:
                     updated_at = ?
                    WHERE id = ?""",
                 (now, int(time.time()), now, account_id),
+            )
+            return cursor.rowcount > 0
+
+    def mark_account_validated(self, account_id: int) -> bool:
+        """Record a successful credential validation without hiding usage failures.
+
+        Validation owns ``validation_status`` and ``last_validated_at``. It
+        never resets ``consecutive_failures``: that counter belongs to the
+        usage fetch and the token refresh, and only their own success clears
+        it (``clear_account_errors``). A validation success proves the
+        credential, not that usage is readable (a signed-in Codex auth.json
+        says nothing about whether the ``codex`` CLI can run).
+
+        ``last_error`` is cleared only when no counted failure stands behind
+        it (``consecutive_failures`` is 0), which removes the stale messages
+        validation itself and the watchdog write. The check and the write
+        are one statement, so a concurrent usage failure is never wiped.
+
+        >>> db = Database(":memory:")
+        >>> acct = db.create_account("u@t.com", "tok", 9999999999)
+        >>> _ = db.record_account_error(acct["id"], "usage failed")
+        >>> db.mark_account_validated(acct["id"])
+        True
+        >>> row = db.get_account(acct["id"])
+        >>> row["validation_status"], row["last_error"], row["consecutive_failures"]
+        ('valid', 'usage failed', 1)
+        >>> _ = db.clear_account_errors(acct["id"])
+        >>> _ = db.update_account(acct["id"], last_error="validation timed out")
+        >>> _ = db.mark_account_validated(acct["id"])
+        >>> db.get_account(acct["id"])["last_error"] is None
+        True
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            cursor = conn.execute(
+                """UPDATE accounts SET
+                    validation_status = 'valid',
+                    last_validated_at = ?,
+                    last_error = CASE WHEN COALESCE(consecutive_failures, 0) = 0
+                                      THEN NULL ELSE last_error END,
+                    last_error_at = CASE WHEN COALESCE(consecutive_failures, 0) = 0
+                                         THEN NULL ELSE last_error_at END,
+                    updated_at = ?
+                   WHERE id = ? AND is_deleted = 0""",
+                (int(time.time()), now, account_id),
             )
             return cursor.rowcount > 0
 

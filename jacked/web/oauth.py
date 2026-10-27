@@ -81,6 +81,16 @@ ORG_TYPE_MAP = {
 }
 
 
+def _clear_keeper_backoff(account_id: int) -> None:
+    """Drop the window keeper's ping backoff for an account with new tokens."""
+    try:
+        from jacked.api.usage_monitor import clear_ping_backoff
+
+        clear_ping_backoff(account_id)
+    except Exception:  # noqa: BLE001 - never fail a token store over this
+        logger.debug("Could not clear the keeper backoff", exc_info=True)
+
+
 def _stored_profile_org(row: dict) -> str | None:
     """Return the org uuid of the row's verified stored profile, or None.
 
@@ -989,6 +999,9 @@ class OAuthFlow:
                 validation_status="valid",
                 last_validated_at=int(time.time()),
                 last_error=None,
+                # A re-auth is a new primary lineage: clear its breaker.
+                refresh_failure_type=None,
+                refresh_last_failed_at=None,
                 **reauth_updates,
             )
             account = self.db.get_account(actual_target_id)
@@ -1055,6 +1068,9 @@ class OAuthFlow:
             )
 
         logger.info("Account stored: id=%d", account["id"])
+        # New tokens: the window keeper must re-ping at once, not wait out a
+        # backoff armed against the old token.
+        _clear_keeper_backoff(account["id"])
         return account
 
     def _store_cc_tokens(self, tokens: dict, profile: dict) -> dict:
@@ -1135,11 +1151,14 @@ class OAuthFlow:
             cc_refresh_token=tokens.get("refresh_token"),
             cc_expires_at=expires_at,
             validation_status="valid",
-            # A fresh interactive login is a new refresh lineage: clear the
-            # breaker a consumed token left behind, or the guard keeps
-            # refusing to import rotations and the heal sweep keeps churning.
-            refresh_failure_type=None,
-            refresh_last_failed_at=None,
+            # A fresh interactive login is a new Claude Code refresh lineage:
+            # clear the cc chain breaker a consumed token left behind, or the
+            # guard keeps refusing to import rotations, build_oauth_data keeps
+            # withholding the refresh token, and the usage chooser keeps
+            # skipping the new token. The primary breaker belongs to the
+            # primary lineage and is not touched here.
+            cc_refresh_failure_type=None,
+            cc_refresh_last_failed_at=None,
             last_error=None,
             last_error_at=None,
             last_validated_at=int(time.time()),
@@ -1151,5 +1170,6 @@ class OAuthFlow:
             )
 
         logger.info("CC tokens stored for account %d", account_id)
+        _clear_keeper_backoff(account_id)
         # Return the full account row so credential sync works
         return self.db.get_account(account_id)

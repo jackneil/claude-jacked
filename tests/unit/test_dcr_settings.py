@@ -14,7 +14,7 @@ The load-bearing behaviors:
 
 Every test that touches the config path uses tmp_path, so the real ~/.claude is
 never read or written. ``codex_preflight`` is always driven through mocked
-``shutil.which`` / ``subprocess.run`` — no test ever spawns the real codex CLI.
+``find_bin`` / ``subprocess.run`` — no test ever spawns the real codex CLI.
 """
 import json
 import os
@@ -445,7 +445,7 @@ def test_lock_path_sits_next_to_the_config(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_preflight_not_installed():
-    with patch("jacked.dcr_settings.shutil.which", return_value=None), \
+    with patch("jacked.dcr_settings.find_bin", return_value=None), \
             patch("jacked.dcr_settings.subprocess.run") as run:
         got = dcr_settings.codex_preflight()
     run.assert_not_called()
@@ -458,7 +458,7 @@ def test_preflight_not_installed():
 
 
 def test_preflight_installed_and_logged_in():
-    with patch("jacked.dcr_settings.shutil.which", return_value="/usr/bin/codex"), \
+    with patch("jacked.dcr_settings.find_bin", return_value="/usr/bin/codex"), \
             patch("jacked.dcr_settings.subprocess.run") as run:
         run.return_value = subprocess.CompletedProcess([], 0, "Logged in", "")
         got = dcr_settings.codex_preflight()
@@ -475,7 +475,7 @@ def test_preflight_installed_and_logged_in():
 
 def test_preflight_never_inherits_stdin():
     """A codex build that decided to prompt would hang the /dcr hot path."""
-    with patch("jacked.dcr_settings.shutil.which", return_value="/usr/bin/codex"), \
+    with patch("jacked.dcr_settings.find_bin", return_value="/usr/bin/codex"), \
             patch("jacked.dcr_settings.subprocess.run") as run:
         run.return_value = subprocess.CompletedProcess([], 0, "", "")
         dcr_settings.codex_preflight()
@@ -484,7 +484,7 @@ def test_preflight_never_inherits_stdin():
 
 def test_preflight_reports_the_resolved_binary_when_not_signed_in():
     """Which codex? With several on PATH, the path is the diagnosable part."""
-    with patch("jacked.dcr_settings.shutil.which", return_value="/opt/homebrew/bin/codex"), \
+    with patch("jacked.dcr_settings.find_bin", return_value="/opt/homebrew/bin/codex"), \
             patch("jacked.dcr_settings.subprocess.run") as run:
         run.return_value = subprocess.CompletedProcess([], 1, "", "")
         got = dcr_settings.codex_preflight()
@@ -492,7 +492,7 @@ def test_preflight_reports_the_resolved_binary_when_not_signed_in():
 
 
 def test_preflight_installed_but_not_logged_in():
-    with patch("jacked.dcr_settings.shutil.which", return_value="/usr/bin/codex"), \
+    with patch("jacked.dcr_settings.find_bin", return_value="/usr/bin/codex"), \
             patch("jacked.dcr_settings.subprocess.run") as run:
         run.return_value = subprocess.CompletedProcess([], 1, "", "Not logged in")
         got = dcr_settings.codex_preflight()
@@ -506,7 +506,7 @@ def test_preflight_installed_but_not_logged_in():
 
 
 def test_preflight_timeout_degrades_instead_of_raising():
-    with patch("jacked.dcr_settings.shutil.which", return_value="/usr/bin/codex"), \
+    with patch("jacked.dcr_settings.find_bin", return_value="/usr/bin/codex"), \
             patch("jacked.dcr_settings.subprocess.run",
                   side_effect=subprocess.TimeoutExpired(cmd="codex", timeout=10.0)):
         got = dcr_settings.codex_preflight()
@@ -516,7 +516,7 @@ def test_preflight_timeout_degrades_instead_of_raising():
 
 
 def test_preflight_spawn_failure_degrades_instead_of_raising():
-    with patch("jacked.dcr_settings.shutil.which", return_value="/usr/bin/codex"), \
+    with patch("jacked.dcr_settings.find_bin", return_value="/usr/bin/codex"), \
             patch("jacked.dcr_settings.subprocess.run", side_effect=OSError("boom")):
         got = dcr_settings.codex_preflight()
     assert got["codex_installed"] is True
@@ -525,7 +525,7 @@ def test_preflight_spawn_failure_degrades_instead_of_raising():
 
 
 def test_preflight_honors_the_timeout_argument():
-    with patch("jacked.dcr_settings.shutil.which", return_value="/usr/bin/codex"), \
+    with patch("jacked.dcr_settings.find_bin", return_value="/usr/bin/codex"), \
             patch("jacked.dcr_settings.subprocess.run") as run:
         run.return_value = subprocess.CompletedProcess([], 0, "", "")
         dcr_settings.codex_preflight(timeout=2.5)
@@ -839,7 +839,7 @@ def test_preflight_reports_the_codex_version():
         if argv[1:] == ["--version"]:
             return subprocess.CompletedProcess(argv, 0, "codex-cli 0.153.4\n", "")
         return subprocess.CompletedProcess(argv, 0, "Logged in", "")
-    with patch("jacked.dcr_settings.shutil.which", return_value="/usr/bin/codex"), \
+    with patch("jacked.dcr_settings.find_bin", return_value="/usr/bin/codex"), \
             patch("jacked.dcr_settings.subprocess.run", side_effect=fake_run):
         got = dcr_settings.codex_preflight()
     assert got["codex_version"] == "0.153.4"
