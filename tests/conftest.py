@@ -22,6 +22,29 @@ REAL_HOME = Path.home()
 
 
 @pytest.fixture(autouse=True)
+def _isolate_home(monkeypatch, tmp_path_factory):
+    """Give every test a temporary HOME (and USERPROFILE on Windows).
+
+    Code under test resolves the live Claude Code credentials, the Codex
+    login, and jacked's own files from the home directory. Before this
+    fixture, tests that did not mock the live store read the developer's
+    REAL ``~/.claude/.credentials.json``: on 2026-10-27 three I2 tests
+    passed on Jack's Mac only because that file existed, and failed on every
+    CI runner where it does not. A test's result must never depend on (or
+    reach) the developer's real credentials. A test that needs a home of its
+    own still sets HOME itself; ``REAL_HOME`` keeps the real path for the
+    tripwires below.
+    """
+    home = tmp_path_factory.mktemp("home")
+    (home / ".claude").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("JACKED_HOME", raising=False)
+    yield home
+
+
+@pytest.fixture(autouse=True)
 def _isolate_default_db_path(monkeypatch, tmp_path_factory):
     """Tripwire: no test may open the developer's real ~/.claude/jacked.db.
 

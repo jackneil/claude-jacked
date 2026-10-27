@@ -11,6 +11,11 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+# A live Claude Code store that holds ANOTHER account's tokens: the I2 gate
+# then knows who holds the live chain, and it is not the row under test.
+# Without it the test read the developer's real ~/.claude/.credentials.json.
+LIVE_OTHER_ACCOUNT = {"claudeAiOauth": {"accessToken": "live-other-at", "refreshToken": "live-other-rt"}}
+
 
 class TestBackgroundLoopSkipsActiveCC:
     def _make_account(self, account_id: int, cc_expires_at: int) -> dict:
@@ -23,12 +28,13 @@ class TestBackgroundLoopSkipsActiveCC:
             "cc_expires_at": cc_expires_at,
         }
 
+    @patch("jacked.api.credential_helpers.read_live_credentials", return_value=LIVE_OTHER_ACCOUNT)
     @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
     @patch("jacked.web.auth.refresh_account_token", new_callable=AsyncMock)
     @patch("jacked.api.credential_helpers.read_active_account_id", return_value=1)
     @patch("jacked.web.auth.Database")
     def test_active_account_cc_refresh_is_skipped(
-        self, mock_db_cls, mock_read_active, mock_refresh_primary, mock_refresh_cc,
+        self, mock_db_cls, mock_read_active, mock_refresh_primary, mock_refresh_cc, _mock_live,
     ):
         """Active account's CC refresh must NOT fire from the 30min loop."""
         from jacked.web import auth
@@ -342,10 +348,11 @@ class TestLaunchSkipsActiveCC:
         # Critical assertion: refresh_cc_token must not have been called.
         mock_refresh_cc.assert_not_called()
 
+    @patch("jacked.api.credential_helpers.read_live_credentials", return_value=LIVE_OTHER_ACCOUNT)
     @patch("jacked.api.credential_helpers.read_active_account_id")
     @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
     def test_refreshes_cc_when_launching_different_account(
-        self, mock_refresh_cc, mock_read_live,
+        self, mock_refresh_cc, mock_read_live, _mock_live_store,
     ):
         """If the active account is 2 and we're launching 1, CC refresh should fire."""
         from jacked import launch

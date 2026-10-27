@@ -19,9 +19,14 @@ environment. The off-PATH fallback directories are user-writable, so a
 fallback candidate is returned only when the candidate (a symlink included),
 its resolved target file, and EVERY ancestor directory of both can be changed
 by nobody but the current user or root (the same owner and write-bit rule
-that ``jacked.service.spec`` applies to the service's own interpreter,
-without its sticky-directory exemption). The service runs as that user, so executing a
-binary that only that user can replace crosses no privilege boundary.
+that ``jacked.service.spec`` applies to the service's own interpreter). A
+root-owned sticky directory such as ``/tmp`` is accepted only as a PARENT of a
+real directory (not a symlink) owned by the user or root: the sticky bit
+stops other users from swapping an entry they do not own. Components are read
+with ``lstat``, so a symlink is judged by its own owner. The candidate's own
+directory never gets the exemption, and a path with ``..`` is refused. The service runs as that
+user, so executing a binary that only that user can replace crosses no
+privilege boundary.
 
 Usage:
     from jacked.findbin import find_bin
@@ -80,6 +85,15 @@ def _untrusted_reason(status: os.stat_result, uid: int | None) -> str | None:
     return None
 
 
+def _sticky_root_dir(status: os.stat_result) -> bool:
+    """True for a root-owned directory with the sticky bit (``/tmp``)."""
+    return (
+        stat.S_ISDIR(status.st_mode)
+        and bool(status.st_mode & stat.S_ISVTX)
+        and status.st_uid == 0
+    )
+
+
 def _fallback_refusal(path: str) -> str | None:
     """Return why an off-PATH candidate is refused, or None when it is safe.
 
@@ -90,6 +104,11 @@ def _fallback_refusal(path: str) -> str | None:
     """
     if os.name != "posix":
         return None
+    # The walk below reads path components lexically; the kernel resolves
+    # "a/../b" THROUGH "a". A path with "..", "." or doubled separators
+    # would be checked as one path and executed as another.
+    if os.path.normpath(path) != path:
+        return "candidate path is not normalized"
     uid = _current_uid()
     real = os.path.realpath(path)
     # The link itself: a replaced symlink redirects the lookup even when
@@ -115,8 +134,10 @@ def _fallback_refusal(path: str) -> str | None:
     if reason:
         return f"binary is {reason}"
     # Every ancestor of the candidate and of its target (same rule as
-    # jacked.service.spec, minus its sticky-directory exemption): a
-    # writable ancestor lets someone swap a whole directory for a symlink.
+    # jacked.service.spec): a writable ancestor lets someone swap a whole
+    # directory for a symlink. A root-owned sticky parent (/tmp) is exempt
+    # only above a real directory the user or root owns (see
+    # _untrusted_ancestor).
     for label, start in (("directory", os.path.dirname(path)),
                          ("target directory", os.path.dirname(real))):
         reason = _untrusted_ancestor(start, uid)
@@ -128,22 +149,55 @@ def _fallback_refusal(path: str) -> str | None:
 def _untrusted_ancestor(directory: str, uid: int | None) -> str | None:
     """Why ``directory`` or one of its parents is not trusted, or None.
 
-    Walks from ``directory`` up to the filesystem root.
+    Walks from ``directory`` up to the filesystem root with ``lstat``, so a
+    symlink component is judged as the link it is, not as its target: a
+    link must be owned by the user or root (its mode bits mean nothing). A
+    real directory must pass the strict owner and write-bit rule, except
+    that a root-owned sticky PARENT such as ``/tmp`` is accepted, because
+    the sticky bit stops other users from renaming or removing an entry
+    they do not own. That holds only for an entry that is a real directory
+    owned by the user or root, so every entry whose REAL containing
+    directory is a sticky world- or group-writable one must be exactly
+    that: a link there is refused even when its own lstat looks sound
+    (macOS reaches ``/private/tmp`` through the root-owned ``/tmp`` link).
+    ``directory`` itself never gets the exemption.
     """
     seen: set[str] = set()
-    current = os.path.abspath(directory)
+    start = os.path.abspath(directory)
+    current = start
     while current not in seen:
         seen.add(current)
         try:
-            status = os.stat(current)
+            status = os.lstat(current)
         except OSError:
             return "cannot be inspected"
-        reason = _untrusted_reason(status, uid)
-        if reason:
-            return f"ancestor is {reason}" if current != os.path.abspath(directory) else f"is {reason}"
+        label = "is" if current == start else "ancestor is"
+        if stat.S_ISLNK(status.st_mode):
+            # Whoever owns a link can repoint it; its permission bits are
+            # ignored by the kernel.
+            if status.st_uid not in (uid, 0):
+                return f"{label} a symlink not owned by the current user"
+        else:
+            reason = _untrusted_reason(status, uid)
+            if reason and current != start and _sticky_root_dir(status):
+                reason = None  # the entry below it is held to the rule below
+            if reason:
+                return f"{label} {reason}"
         parent = os.path.dirname(current)
         if parent == current:
             break
+        try:
+            container = os.stat(os.path.realpath(parent))
+        except OSError:
+            return "cannot be inspected"
+        if _sticky_root_dir(container) and container.st_mode & 0o022:
+            owned_dir = (
+                stat.S_ISDIR(status.st_mode)
+                and not stat.S_ISLNK(status.st_mode)
+                and status.st_uid in (uid, 0)
+            )
+            if not owned_dir:
+                return f"{label} not a directory owned by the current user below a shared sticky directory"
         current = parent
     return None
 
