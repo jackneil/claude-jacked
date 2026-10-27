@@ -427,3 +427,49 @@ def _no_reconcile_ownership_network():
     ):
         yield
     clear_ownership_cache()
+
+
+@pytest.fixture
+def trusted_tmp_ancestors(tmp_path, monkeypatch):
+    """Report every directory ABOVE ``tmp_path`` as a root-owned 0755 dir.
+
+    ``jacked.findbin`` refuses an off-PATH binary when any ancestor
+    directory is writable by others. Linux CI runners put pytest's tmp_path
+    under ``/tmp`` (root-owned, sticky, world-writable), so every fake
+    install a test builds there was refused on the runners and accepted on
+    macOS, where tmp_path lives under a user-owned directory. The layout a
+    test builds starts AT tmp_path; the directories above it belong to the
+    machine, not to the test. Entries at or below tmp_path keep their real
+    status, so the trust rule is still exercised on everything the test
+    creates.
+    """
+    import os as _os
+    import stat as _stat
+
+    above = set()
+    for start in {str(tmp_path), _os.path.realpath(tmp_path)}:
+        parent = _os.path.dirname(start)
+        while True:
+            above.add(parent)
+            nxt = _os.path.dirname(parent)
+            if nxt == parent:
+                break
+            parent = nxt
+    real_stat = _os.stat
+
+    def stat_with_trusted_ancestors(path, *args, **kwargs):
+        status = real_stat(path, *args, **kwargs)
+        try:
+            key = _os.path.abspath(_os.fspath(path))
+        except TypeError:
+            return status
+        if key in above and _stat.S_ISDIR(status.st_mode):
+            fields = list(status)
+            fields[_stat.ST_MODE] = _stat.S_IFDIR | 0o755
+            fields[_stat.ST_UID] = 0
+            fields[_stat.ST_GID] = 0
+            return _os.stat_result(fields)
+        return status
+
+    monkeypatch.setattr(_os, "stat", stat_with_trusted_ancestors)
+    return tmp_path

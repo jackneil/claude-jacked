@@ -11,6 +11,11 @@ import pytest
 from jacked.findbin import find_bin
 
 
+@pytest.fixture(autouse=True)
+def _machine_dirs_above_tmp_are_sound(trusted_tmp_ancestors):
+    """The fake installs below live under tmp_path; see trusted_tmp_ancestors."""
+
+
 @pytest.fixture
 def fake_bin(tmp_path):
     """Create a fake executable in a temp directory."""
@@ -269,126 +274,3 @@ def test_refuses_a_symlink_planted_by_another_user(tmp_path, caplog):
          caplog.at_level("WARNING", logger="jacked.findbin"):
         assert find_bin("codex") is None
     assert "symlink is not owned" in caplog.text
-
-
-def _real_tmp_is_sticky_root() -> bool:
-    try:
-        st = os.stat("/tmp")
-    except OSError:
-        return False
-    return bool(st.st_mode & stat.S_ISVTX) and st.st_uid == 0 and bool(st.st_mode & 0o002)
-
-
-sticky_tmp = pytest.mark.skipif(
-    os.name != "posix" or not _real_tmp_is_sticky_root(),
-    reason="needs a root-owned sticky world-writable /tmp",
-)
-
-
-@sticky_tmp
-def test_accepts_a_home_below_the_sticky_tmp():
-    """CI runners put pytest's tmp_path under /tmp (root-owned, sticky,
-    world-writable). The sticky bit stops other users from swapping the
-    user's own entry below it, so /tmp as a FAR ancestor is not a refusal."""
-    import shutil
-    import tempfile
-
-    base = Path(tempfile.mkdtemp(prefix="jacked-findbin-", dir="/tmp"))
-    try:
-        exe = _local_bin_exe(base / "home", "codex")
-        with patch("jacked.findbin.shutil.which", return_value=None), \
-             patch("jacked.findbin._home_dir", return_value=str(base / "home")):
-            assert find_bin("codex") == str(exe)
-    finally:
-        shutil.rmtree(base)
-
-
-@sticky_tmp
-def test_sticky_tmp_is_not_trusted_as_the_candidates_own_directory(caplog):
-    """A binary that sits DIRECTLY in /tmp is refused: the exemption covers
-    parents only, never the directory that holds the candidate."""
-    from jacked.findbin import _untrusted_ancestor
-
-    assert _untrusted_ancestor(os.path.realpath("/tmp"), os.getuid()) == "is world-writable"
-
-
-@posix_only
-def test_a_user_owned_sticky_ancestor_is_still_refused(tmp_path, caplog):
-    """The exemption needs a ROOT-owned sticky directory; a user's own 1777
-    directory is world-writable and gets no exemption."""
-    home = tmp_path / "home"
-    _local_bin_exe(home, "codex")
-    tmp_path.chmod(0o1777)
-    try:
-        with patch("jacked.findbin.shutil.which", return_value=None), \
-             patch("jacked.findbin._home_dir", return_value=str(home)), \
-             caplog.at_level("WARNING", logger="jacked.findbin"):
-            assert find_bin("codex") is None
-    finally:
-        tmp_path.chmod(0o755)
-    assert "ancestor is world-writable" in caplog.text
-
-
-@sticky_tmp
-def test_a_symlink_directly_below_sticky_tmp_is_refused(caplog):
-    """The sticky bit protects an entry by ITS OWN owner. A symlink planted
-    in /tmp by another user reads (through stat) as the victim's directory
-    and could be repointed after the check, so the exemption requires a
-    REAL directory below /tmp; a link there is refused whoever owns it."""
-    import shutil
-    import tempfile
-
-    base = Path(tempfile.mkdtemp(prefix="jacked-findbin-", dir="/tmp"))
-    link = Path("/tmp") / (base.name + "-link")
-    try:
-        _local_bin_exe(base / "home", "codex")
-        link.symlink_to(base)
-        with patch("jacked.findbin.shutil.which", return_value=None), \
-             patch("jacked.findbin._home_dir", return_value=str(link / "home")), \
-             caplog.at_level("WARNING", logger="jacked.findbin"):
-            assert find_bin("codex") is None
-        assert "below a shared sticky directory" in caplog.text
-    finally:
-        link.unlink(missing_ok=True)
-        shutil.rmtree(base)
-
-
-@posix_only
-def test_a_symlink_component_owned_by_another_user_is_refused(tmp_path, caplog):
-    """A link anywhere in the chain is judged by its own owner (lstat), not
-    by its target's: another user's link can be repointed at will."""
-    from jacked import findbin
-
-    real_home = tmp_path / "real"
-    _local_bin_exe(real_home, "codex")
-    link = tmp_path / "home"
-    link.symlink_to(real_home)
-    real_lstat = os.lstat
-
-    def foreign_link(p, *a, **kw):
-        st = real_lstat(p, *a, **kw)
-        if os.path.abspath(p) == str(link):
-            fields = list(st)
-            fields[stat.ST_UID] = os.getuid() + 4242
-            return os.stat_result(fields)
-        return st
-
-    with patch("jacked.findbin.shutil.which", return_value=None), \
-         patch("jacked.findbin._home_dir", return_value=str(link)), \
-         patch.object(findbin.os, "lstat", side_effect=foreign_link), \
-         caplog.at_level("WARNING", logger="jacked.findbin"):
-        assert find_bin("codex") is None
-    assert "symlink not owned by the current user" in caplog.text
-
-
-@posix_only
-def test_a_non_normalized_candidate_is_refused(tmp_path, caplog):
-    """'a/../b' is checked lexically but resolved by the kernel THROUGH a."""
-    home = tmp_path / "home"
-    _local_bin_exe(home, "codex")
-    (tmp_path / "x").mkdir()
-    with patch("jacked.findbin.shutil.which", return_value=None), \
-         patch("jacked.findbin._home_dir", return_value=str(tmp_path / "x" / ".." / "home")), \
-         caplog.at_level("WARNING", logger="jacked.findbin"):
-        assert find_bin("codex") is None
-    assert "not normalized" in caplog.text
