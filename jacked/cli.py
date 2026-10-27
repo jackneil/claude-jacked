@@ -6149,6 +6149,9 @@ def _dcr_print_status(resolved: dict) -> None:
             console.print(f"  Status: [yellow]not usable - {reason}[/yellow]")
             console.print(
                 "[yellow]Reviews will fall back to Claude until this is fixed.[/yellow]"
+                if resolved.get("codex_logged_in") is not True
+                else "[yellow]Reviews will fall back to Claude until the Codex limit lifts "
+                "or you switch the Codex account.[/yellow]"
             )
         return
 

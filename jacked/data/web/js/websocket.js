@@ -358,8 +358,8 @@ function _usageUpdateCardDOM(card, acctData) {
             // The poll payload may lack keeper_state/provider: read the merged
             // account from state so the reset column keeps its reason.
             const merged = (window.jackedState && window.jackedState.accounts || []).find(a => a.id === acctData.id) || acctData;
-            const barOpts5h = typeof usageBarOpts === 'function' ? usageBarOpts(merged, acctData.cached_5h_resets_at) : undefined;
-            const barOpts7d = typeof usageBarOpts === 'function' ? usageBarOpts(merged, acctData.cached_7d_resets_at) : undefined;
+            const barOpts5h = typeof usageBarOpts === 'function' ? usageBarOpts(merged, acctData.cached_5h_resets_at, null, acctData.cached_usage_5h) : undefined;
+            const barOpts7d = typeof usageBarOpts === 'function' ? usageBarOpts(merged, acctData.cached_7d_resets_at, null, acctData.cached_usage_7d) : undefined;
             temp5h.insertAdjacentHTML('afterbegin', renderUsageBar(acctData.cached_usage_5h, acctData.cached_5h_resets_at, elapsed5h, '5h limit', barOpts5h));
             if (temp5h.firstElementChild) bar5h.replaceWith(temp5h.firstElementChild);
 

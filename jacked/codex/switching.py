@@ -250,7 +250,7 @@ def _refuse_stale_replay(target: dict, live: Optional[dict]) -> None:
     l_ref = _parse_refresh(live.get("last_refresh"))
     if t_ref is not None and l_ref is not None and t_ref < l_ref:
         raise CodexSwapError(
-            "refusing to replay a stale Codex snapshot — the live credential "
+            "refusing to replay a stale Codex snapshot: the live credential "
             "for this account is newer; replaying the old one would invalidate "
             "the rotated refresh token (run `codex login` to re-capture)"
         )
@@ -287,7 +287,7 @@ def swap_codex_account(
         if lock and not locked:
             raise CodexSwapError(
                 "could not acquire the Codex swap lock (another swap or usage "
-                "poll is in progress) — retry in a moment"
+                "poll is in progress). Retry in a moment."
             )
 
         # Read the live root INSIDE the lock: a concurrent usage poll boots

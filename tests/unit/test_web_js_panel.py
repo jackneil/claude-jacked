@@ -382,3 +382,20 @@ out({ enabledFresh, postedAfter, stamped, disabledAfterClick, cooledOnReopen });
     assert result["stamped"] is True
     assert result["disabledAfterClick"] is True
     assert result["cooledOnReopen"] is True, "60s cooldown must survive a popover reopen"
+
+
+def test_panel_marks_a_blocked_account_with_the_dashboard_text(tmp_path):
+    """The panel marker carries the same label and reset text as the card badge,
+    and the unreported Codex 5h window reads n/a, never a 0% bar."""
+    result = _run(tmp_path, """
+const org = {id: 2, provider: 'codex', email: 'c@x.com', usage_cached_at: Math.floor(Date.now() / 1000) - 60,
+             cached_usage_5h: null, cached_usage_7d: 45, cached_7d_resets_at: '2099-01-01T00:00:00Z',
+             usage_block: {reason: 'spend_limit', resets_at: null, read_at: Math.floor(Date.now() / 1000) - 60}};
+out({meta: orgMetaHtml(org, null), bars: orgBarsHtml(org), open: orgMetaHtml({id: 3}, null)});
+""")
+    assert 'class="block-badge"' in result["meta"]
+    assert 'title="Spend limit reached. Codex blocks new requests for this account."' in result["meta"]
+    assert "block-badge" not in result["open"]
+    five = result["bars"].split("reset-caption")[0]
+    assert ">n/a</span>" in result["bars"]
+    assert 'class="fill' not in five

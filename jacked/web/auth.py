@@ -1865,7 +1865,7 @@ def _validate_codex_account(account_id: int, db: Database) -> dict:
         account_id,
         validation_status="invalid",
         last_validated_at=int(time.time()),
-        last_error="Codex account signed out — run `codex login`",
+        last_error="Codex account signed out. Run `codex login`.",
         last_error_at=datetime.now(timezone.utc).isoformat(),
     )
     return {"valid": False, "error": "Codex signed out"}
