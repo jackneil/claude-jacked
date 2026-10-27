@@ -11,6 +11,11 @@ import pytest
 from jacked.findbin import find_bin
 
 
+@pytest.fixture(autouse=True)
+def _machine_dirs_above_tmp_are_sound(trusted_tmp_ancestors):
+    """The fake installs below live under tmp_path; see trusted_tmp_ancestors."""
+
+
 @pytest.fixture
 def fake_bin(tmp_path):
     """Create a fake executable in a temp directory."""

@@ -89,7 +89,7 @@ function _renderCodexPill(acct) {
     if (vs === 'invalid') {
         dot = 'triangle';
         text = 're-login';
-        title = 'Signed out of Codex — run `codex login`, then Add Account → Codex';
+        title = 'Signed out of Codex. Run `codex login`, then select Add Account > Codex.';
     } else if (vs === 'checking') {
         dot = 'pulse';
         text = 'checking…';

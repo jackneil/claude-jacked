@@ -1375,12 +1375,17 @@ class TestRefreshCCTokenNetworkError:
 class TestPrepareAccountDirCCRefresh:
     """Verify prepare_account_dir triggers CC refresh when CC token is near-expiry."""
 
+    @patch(
+        "jacked.api.credential_helpers.read_live_credentials",
+        return_value={"claudeAiOauth": {"accessToken": "live-other-at", "refreshToken": "live-other-rt"}},
+    )
     @patch("jacked.api.credential_helpers.read_active_account_id")
     @patch("jacked.launch.should_refresh_cc")
     @patch("jacked.launch.should_refresh")
     @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
     def test_cc_refresh_called_when_cc_near_expiry(
-        self, mock_cc_refresh, mock_should_primary, mock_should_cc, mock_active_id, tmp_path
+        self, mock_cc_refresh, mock_should_primary, mock_should_cc, mock_active_id, _mock_live,
+        tmp_path,
     ):
         """When should_refresh_cc is True AND this is not the active CC session,
         refresh_cc_token is called. read_active_account_id is mocked to a

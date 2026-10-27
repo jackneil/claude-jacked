@@ -146,10 +146,15 @@ class ExtraUsage(BaseModel):
 
 
 class AccountUsage(BaseModel):
-    """Usage statistics for an account with per-model breakdowns."""
+    """Usage statistics for an account with per-model breakdowns.
 
-    five_hour: float = 0
-    seven_day: float = 0
+    A window is None only for a Codex window that Codex does not report for
+    the account (a weekly-only plan has no 5h window). A Claude window with
+    no reading is "no active window", which is 0% used.
+    """
+
+    five_hour: Optional[float] = 0
+    seven_day: Optional[float] = 0
     five_hour_resets_at: Optional[str] = None
     seven_day_resets_at: Optional[str] = None
     per_model: Optional[dict[str, ModelUsage]] = None
@@ -204,6 +209,19 @@ def _build_keeper_state(raw) -> Optional[KeeperState]:
         return None
 
 
+class UsageBlock(BaseModel):
+    """The provider's own verdict that the account may not send requests.
+
+    reason is ``limit_reached``, ``spend_limit`` or ``blocked``; resets_at
+    is when the provider says the block lifts (None when it did not say).
+    """
+
+    reason: str
+    resets_at: Optional[str] = None
+    # usage_cached_at of the reading that carried the verdict (epoch seconds).
+    read_at: Optional[int] = None
+
+
 class AccountResponse(BaseModel):
     """Account data with computed fields for API responses."""
 
@@ -247,6 +265,7 @@ class AccountResponse(BaseModel):
     expires_in_seconds: int = 0
     usage: Optional[AccountUsage] = None
     keeper_state: Optional[KeeperState] = None
+    usage_block: Optional[UsageBlock] = None
 
 
 class AccountPatchRequest(BaseModel):
@@ -632,6 +651,8 @@ def _build_account_usage(row: dict) -> Optional[AccountUsage]:
     >>> u = _build_account_usage({"cached_usage_5h": 25.0, "cached_usage_7d": 60.0})
     >>> u.five_hour
     25.0
+    >>> _build_account_usage({"provider": "codex", "cached_usage_7d": 100.0}).five_hour is None
+    True
     """
     if row.get("cached_usage_5h") is None and row.get("cached_usage_7d") is None:
         return None
@@ -639,9 +660,17 @@ def _build_account_usage(row: dict) -> Optional[AccountUsage]:
         row.get("cached_usage_raw")
     )
     binding = per_model.get(binding_key) if (per_model and binding_key) else None
+    codex = (row.get("provider") or "claude") == "codex"
+
+    def _window(value):
+        # A Codex window with no reading is not reported, not 0% used.
+        if value is None:
+            return None if codex else 0
+        return value
+
     return AccountUsage(
-        five_hour=row.get("cached_usage_5h", 0) or 0,
-        seven_day=row.get("cached_usage_7d", 0) or 0,
+        five_hour=_window(row.get("cached_usage_5h")),
+        seven_day=_window(row.get("cached_usage_7d")),
         five_hour_resets_at=row.get("cached_5h_resets_at"),
         seven_day_resets_at=row.get("cached_7d_resets_at"),
         per_model=per_model,
@@ -768,7 +797,20 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
         is_expired=now >= row["expires_at"],
         expires_in_seconds=max(0, row["expires_at"] - now),
         usage=_build_account_usage(row),
+        usage_block=_build_usage_block(row),
     )
+
+
+def _build_usage_block(row: dict) -> Optional[UsageBlock]:
+    """The provider's usage-blocked verdict for a DB row, or None.
+
+    >>> _build_usage_block({}) is None
+    True
+    """
+    from jacked.service.menubar_summary import usage_block_of_row
+
+    block = usage_block_of_row(row)
+    return UsageBlock(**block) if block else None
 
 
 # --- Routes ---

@@ -54,14 +54,14 @@ def import_codex_account(
     ident = status.identity
     if ident is None or not ident.email:
         raise CodexImportError(
-            status.reason or "no Codex account found — run `codex login` first"
+            status.reason or "no Codex account found. Run `codex login` first."
         )
 
     auth = read_auth_json(home, env) or {}
     tokens = auth.get("tokens") or {}
     if not (tokens.get("access_token") or auth.get("OPENAI_API_KEY")):
         raise CodexImportError(
-            "Codex auth.json has no usable token — run `codex login` first"
+            "Codex auth.json has no usable token. Run `codex login` first."
         )
 
     acct = db.create_account(

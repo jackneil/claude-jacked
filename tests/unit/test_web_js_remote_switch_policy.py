@@ -194,7 +194,7 @@ def test_accounts_view_shows_one_hint_only_when_switching_is_denied(tmp_path):
 // on any of them, so a flat stub keeps this focused on the hint itself.
 for (const fn of ['renderTokenPills', 'renderUsageBar', 'renderActiveSessions',
                   'providerBadge', 'usageTextClass', 'timeAgoFromUnix',
-                  '_usageUpdateCardDOM']) {
+                  '_usageUpdateCardDOM', 'renderUsageBlockBadge']) {
     global[fn] = () => '';
 }
 global.computeElapsedFraction5h = () => 0;
@@ -315,7 +315,7 @@ def test_accounts_view_hint_follows_the_reason(tmp_path, reason, expected):
     result = _run_js(tmp_path, """
 for (const fn of ['renderTokenPills', 'renderUsageBar', 'renderActiveSessions',
                   'providerBadge', 'usageTextClass', 'timeAgoFromUnix',
-                  '_usageUpdateCardDOM']) {
+                  '_usageUpdateCardDOM', 'renderUsageBlockBadge']) {
     global[fn] = () => '';
 }
 global.computeElapsedFraction5h = () => 0;

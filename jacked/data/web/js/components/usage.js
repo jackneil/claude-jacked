@@ -45,7 +45,7 @@ function usageTextClass(colorClass) {
  * @param {string} resetTime - ISO timestamp or human-readable reset time string.
  * @param {number|null} elapsedFraction - 0-1 fraction of time elapsed in the window.
  * @param {string} label - Label like "5h limit" or "7d limit".
- * @param {{compact?: boolean, reason?: ({text: string, tone?: string, muted?: boolean}|null)}} [opts]
+ * @param {{compact?: boolean, reason?: ({text: string, tone?: string, muted?: boolean, absent?: boolean}|null)}} [opts]
  *   compact drops the fixed reset-time column
  *   (it's moved to the row's hover title) and narrows the label so the bar gets
  *   the width back — for tight surfaces like the menu-bar panel popover. The
@@ -54,6 +54,9 @@ function usageTextClass(colorClass) {
  *   window has no future reset: plain muted text in the reset column (warning
  *   tone for a re-auth). When the reading is stale, the bar and the percent
  *   are dimmed; the reason text that explains the dimming stays readable.
+ *   reason.absent marks a window the provider does not report: the bar has
+ *   no fill and the percent reads "n/a". reason.hint, when set, is the hover
+ *   text of the reset column.
  * @returns {string} HTML string.
  */
 function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
@@ -79,6 +82,15 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
         if (reason.tone === 'warn') resetTone = 'text-amber-400';
         if (reason.muted) staleDim = ' opacity-60';
     }
+    // A window the provider does not report has no reading: an empty track
+    // and "n/a", never a 0% bar that reads as free headroom.
+    const absent = !!(reason && reason.absent);
+    // Hover text: the reason's own explanation when it has one.
+    const resetTitle = hasReason && reason.hint ? reason.hint : resetDisplay;
+    const fillHtml = absent ? '' : `<div class="fill ${colorClass}" style="width: ${pct.toFixed(1)}%"></div>`;
+    const pctText = absent ? 'n/a' : Math.round(pct) + '%';
+    const pctTone = absent ? 'text-slate-500' : pctColor;
+    if (absent) markerHtml = '';
 
     if (compact) {
         // Narrow label + bar + percent, then a short reset caption so the
@@ -97,16 +109,16 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
         else if (hasReason) resetShort = reason.short || resetDisplay;
         else if (resetDisplay) resetShort = 'no window';
         const resetCaption = resetShort
-            ? `<span class="reset-caption text-[10px] ${resetTone} shrink-0 text-right tabular-nums whitespace-nowrap" title="${escapeHtml(resetDisplay)}">${escapeHtml(resetShort)}</span>`
+            ? `<span class="reset-caption text-[10px] ${resetTone} shrink-0 text-right tabular-nums whitespace-nowrap" title="${escapeHtml(resetTitle)}">${escapeHtml(resetShort)}</span>`
             : '';
         return `
-        <div class="flex items-center gap-2 mb-0.5" title="${escapeHtml(label || '')}${resetDisplay ? ' · ' + escapeHtml(resetDisplay) : ''}">
+        <div class="flex items-center gap-2 mb-0.5" title="${escapeHtml(label || '')}${resetTitle ? ' · ' + escapeHtml(resetTitle) : ''}">
             <span class="text-[10px] text-slate-400 w-10 shrink-0 truncate">${escapeHtml(label || '')}</span>
             <div class="usage-bar flex-1${staleDim}">
-                <div class="fill ${colorClass}" style="width: ${pct.toFixed(1)}%"></div>
+                ${fillHtml}
                 ${markerHtml}
             </div>
-            <span class="text-[11px] font-mono w-9 text-right tabular-nums ${pctColor}${staleDim}">${Math.round(pct)}%</span>
+            <span class="text-[11px] font-mono w-9 text-right tabular-nums ${pctTone}${staleDim}">${pctText}</span>
             ${resetCaption}
         </div>
     `;
@@ -116,11 +128,11 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
         <div class="flex items-center gap-3 mb-1">
             <span class="text-xs text-slate-400 w-14 shrink-0 truncate" title="${escapeHtml(label || '')}">${escapeHtml(label || '')}</span>
             <div class="usage-bar flex-1${staleDim}">
-                <div class="fill ${colorClass}" style="width: ${pct.toFixed(1)}%"></div>
+                ${fillHtml}
                 ${markerHtml}
             </div>
-            <span class="text-xs font-mono w-10 text-right tabular-nums ${pctColor}${staleDim}">${Math.round(pct)}%</span>
-            <span class="reset-text text-xs ${resetTone} w-32 text-right whitespace-nowrap truncate" title="${escapeHtml(resetDisplay)}">${escapeHtml(resetDisplay)}</span>
+            <span class="text-xs font-mono w-10 text-right tabular-nums ${pctTone}${staleDim}">${pctText}</span>
+            <span class="reset-text text-xs ${resetTone} w-32 text-right whitespace-nowrap truncate" title="${escapeHtml(resetTitle)}">${escapeHtml(resetDisplay)}</span>
         </div>
     `;
 }
@@ -202,12 +214,27 @@ function _keeperReadDate(epochSecs) {
  * @param {object} acct - Account payload (keeper_state, usage_cached_at, provider).
  * @param {string|null} resetsAt - ISO reset timestamp of this window.
  * @param {number} [nowMs] - Current time in ms (tests).
- * @returns {{text: string, short: string, tone: ('warn'|'muted'), muted: boolean}|null}
+ * @param {number|null} [percentage] - This window's cached reading (null = none).
+ * @returns {{text: string, short: string, tone: ('warn'|'muted'), muted: boolean, absent?: boolean, hint?: string}|null}
  *   text is the dashboard column copy; short is the compact-panel caption
- *   (at most 14 characters); muted marks a stale reading (the bar dims).
+ *   (at most 14 characters); muted marks a stale reading (the bar dims);
+ *   absent marks a Codex window that Codex does not report; hint is its
+ *   hover text.
  */
-function windowReason(acct, resetsAt, nowMs) {
+function windowReason(acct, resetsAt, nowMs, percentage) {
     if (!acct) return null;
+    // Codex reports only the windows a plan has (a weekly-only plan has no
+    // 5h window), and a window it stops reporting is cleared. No reading
+    // there means "not reported", not 0% used. A Claude window with no
+    // reading is "no active window", which is 0% used, so it keeps its bar.
+    // Only an explicit null is "no reading": a caller that passes no
+    // percentage (undefined) gets the plain reason logic.
+    if (acct.provider === 'codex' && percentage === null && Number(acct.usage_cached_at) > 0) {
+        return {
+            text: 'not reported', short: 'not reported', tone: 'muted', muted: false, absent: true,
+            hint: 'Codex does not report this limit for this account.',
+        };
+    }
     const now = (nowMs === undefined || nowMs === null) ? Date.now() : nowMs;
     const resetMs = resetsAt ? new Date(resetsAt).getTime() : NaN;
     if (Number.isFinite(resetMs) && resetMs > now) return null;
@@ -265,7 +292,45 @@ function windowReason(acct, resetsAt, nowMs) {
     return null;
 }
 
-/** renderUsageBar opts for an account window: merges the window reason. */
-function usageBarOpts(acct, resetsAt, base) {
-    return Object.assign({}, base || {}, { reason: windowReason(acct, resetsAt) });
+/** renderUsageBar opts for an account window: merges the window reason.
+ *  percentage is the window's cached reading (null when it has none). */
+function usageBarOpts(acct, resetsAt, base, percentage) {
+    return Object.assign({}, base || {}, { reason: windowReason(acct, resetsAt, undefined, percentage) });
+}
+
+/**
+ * Label and hover text for a provider-reported usage block (acct.usage_block),
+ * shared by the dashboard badge and the panel marker. The server drops a block
+ * whose reset time has passed. A reading older than the stale threshold adds
+ * when it was read, because the verdict is only as new as that reading.
+ * @param {object} acct - Account payload.
+ * @param {number} [nowMs] - Current time in ms (tests).
+ * @returns {{label: string, title: string}|null}
+ */
+function usageBlockText(acct, nowMs) {
+    const block = acct && acct.usage_block;
+    if (!block) return null;
+    const label = block.reason === 'spend_limit' ? 'Spend limit reached'
+        : block.reason === 'limit_reached' ? 'Limit reached' : 'Usage blocked';
+    const provider = acct.provider === 'codex' ? 'Codex' : 'The provider';
+    const reset = block.resets_at ? formatResetTime(block.resets_at) : '';
+    let title = label + '. ' + provider + ' blocks new requests for this account.';
+    if (/^resets\s+/i.test(reset)) title += ' The limit ' + reset + '.';
+    const now = (nowMs === undefined || nowMs === null) ? Date.now() : nowMs;
+    const readAt = Number(block.read_at) || 0;
+    if (readAt > 0 && (now / 1000 - readAt) > USAGE_STALE_SECS) {
+        title += ' Last usage read ' + _keeperReadDate(readAt) + '.';
+    }
+    return { label, title };
+}
+
+/**
+ * The card badge for a provider-reported usage block (acct.usage_block), or ''.
+ * @param {object} acct - Account payload.
+ * @returns {string} HTML string.
+ */
+function renderUsageBlockBadge(acct) {
+    const text = usageBlockText(acct);
+    if (!text) return '';
+    return `<span class="badge badge-danger" title="${escapeHtml(text.title)}">${escapeHtml(text.label)}</span>`;
 }

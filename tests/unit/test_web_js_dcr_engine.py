@@ -885,3 +885,16 @@ def test_features_tab_entry_leaves_an_in_flight_save_alone():
     assert "_dcrEngineLastPayload = null;" in block
     # And the reset runs before the fetch that feeds the render.
     assert guard < src.index("dcrEngineData = await loadDcrEngine();")
+
+
+def test_codex_usage_limit_names_how_the_fallback_ends(tmp_path):
+    """Signed in but blocked by a Codex usage limit: the user cannot "fix"
+    a limit, so the fallback line says what ends it instead."""
+    reason = "Codex usage limit reached (resets 2026-11-02 20:49 UTC)"
+    html = _render_section(
+        tmp_path,
+        _engine(engine="codex", usable=False, reason=reason, codex_logged_in=True),
+    )
+    assert reason in html
+    assert "until the Codex limit lifts or you switch the Codex account." in html
+    assert "until this is fixed" not in html
