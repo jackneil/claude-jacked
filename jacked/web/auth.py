@@ -1511,6 +1511,23 @@ async def fetch_usage(
                         logger.debug("Live credential import failed during 401 recovery",
                                      exc_info=True)
 
+                # A FRESHLY rotated cc token that the API still refuses: record
+                # it on the cc chain so the chooser stops picking that chain
+                # and the next poll does not rotate it again (one rotation per
+                # poll cycle, forever, is a credential-churn loop).
+                if _retry_depth >= 1 and token_chain(account, token) == "cc":
+                    from jacked.api.credential_helpers import cc_chain_dead
+
+                    if not cc_chain_dead(account):
+                        db.update_account(
+                            account_id, **_breaker_updates("cc", "auth_rejected")
+                        )
+                        logger.warning(
+                            "Account %d: the API refused the freshly rotated cc "
+                            "access token; recorded auth_rejected on the cc chain",
+                            account_id,
+                        )
+
                 # Refresh and live import both failed or already retried — mark invalid
                 error_msg = f"Usage fetch failed (HTTP {resp.status_code}) — token refresh failed"
                 db.update_account(

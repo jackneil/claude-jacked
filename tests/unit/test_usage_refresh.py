@@ -605,6 +605,36 @@ class TestCcToken401Ownership:
         assert sent == ["cc_at", "cc_at_new"]
         assert db.get_account(1)["cc_refresh_failure_type"] is None
 
+    def test_rotated_cc_token_refused_again_records_auth_rejected(self, tmp_path):
+        """A rotation that yields a token the API still refuses must record
+        auth_rejected on the cc chain: otherwise every poll rotates the cc
+        chain once more, forever (CSO 2026-10-26)."""
+        from jacked.web.auth import RefreshMode, TokenExchangeResult, choose_usage_token
+
+        db = _real_db(tmp_path)
+        client, sent = _seq_client(401, 401)
+        calls: list = []
+
+        async def flow(account_id, db_, mode):
+            calls.append(mode)
+            db_.update_account(account_id, cc_access_token="cc_at_new")
+            return TokenExchangeResult(
+                success=True, access_token="cc_at_new", exchanged=True, chain="cc",
+            )
+
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.api.credential_helpers.cc_rotation_block", return_value=None), \
+             patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            result = asyncio.run(fetch_usage(1, db, access_token="cc_at"))
+
+        assert result is None
+        assert calls == [RefreshMode.CC]
+        assert sent == ["cc_at", "cc_at_new"]
+        row = db.get_account(1)
+        assert row["cc_refresh_failure_type"] == "auth_rejected"
+        assert choose_usage_token(row).chain == "primary"
+
     def test_primary_401_still_uses_the_primary_circuit_breaker(self, tmp_path):
         from jacked.web.auth import RefreshMode, TokenExchangeResult
 
