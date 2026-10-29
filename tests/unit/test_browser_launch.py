@@ -564,9 +564,13 @@ def test_flatpak_profile_launch_grants_the_profile_directory(monkeypatch):
                         "com.google.Chrome"]
     assert argv[4:] == build_command(spec, URL, "profile",
                                      Path("/home/u/.claude/jacked-browser-profiles/a"))[1:]
-    # Incognito needs no directory: the export launcher is used as-is.
-    assert launch_argv(spec, URL, "incognito", None, platform="linux") == \
-        build_command(spec, URL, "incognito", None)
+    # Incognito needs no directory: the export launcher is used as-is, even
+    # when the caller passed a known account's profile directory.
+    profile = Path("/home/u/.claude/jacked-browser-profiles/a")
+    assert launch_argv(spec, URL, "incognito", profile, platform="linux") == \
+        build_command(spec, URL, "incognito", profile)
+    assert not any(arg.startswith("--filesystem") for arg in
+                   launch_argv(spec, URL, "incognito", profile, platform="linux"))
 
 
 def test_flatpak_profile_launch_without_flatpak_falls_back_and_says_so(monkeypatch, caplog):

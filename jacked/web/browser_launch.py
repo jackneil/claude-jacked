@@ -460,7 +460,7 @@ def launch_argv(
         bundle = _app_bundle_for(spec.path)
         if bundle is not None:
             return ["open", "-n", "-a", bundle, "--args", *cmd[1:]]
-    if spec.flatpak_app and profile_dir is not None:
+    if spec.flatpak_app and mode == "profile" and profile_dir is not None:
         # A Flatpak browser cannot see ~/.claude/jacked-browser-profiles unless
         # the app has home access (Flathub's Chrome and Firefox do not), so
         # the per-account profile would not persist. Grant that one directory
