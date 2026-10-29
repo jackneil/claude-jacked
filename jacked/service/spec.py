@@ -35,6 +35,9 @@ _DARWIN_ACL_TYPE_EXTENDED = 0x100
 _DARWIN_ACL_EXTENDED_ALLOW = 1
 _DARWIN_MUTATING_ACL_MASK = sum(1 << bit for bit in (2, 4, 5, 6, 8, 10, 12, 13))
 _HOST_IS_DARWIN = sys.platform == "darwin"
+# <membership.h>: mbr_uuid_to_id reports which kind of id a qualifier names.
+_DARWIN_ID_TYPE_UID = 0
+_DARWIN_ID_TYPE_GID = 1
 
 
 @lru_cache(maxsize=1)
@@ -62,7 +65,40 @@ def _darwin_acl_api():
     library.acl_get_permset_mask_np.restype = ctypes.c_int
     library.acl_free.argtypes = [ctypes.c_void_p]
     library.acl_free.restype = ctypes.c_int
+    library.acl_get_qualifier.argtypes = [ctypes.c_void_p]
+    library.acl_get_qualifier.restype = ctypes.c_void_p
+    library.mbr_uuid_to_id.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    library.mbr_uuid_to_id.restype = ctypes.c_int
     return library
+
+
+def _darwin_entry_is_trusted(library, entry) -> bool:
+    """True when an ACL entry names a principal that is already trusted.
+
+    An allow entry for the user, root, a root-equivalent group member, or a
+    trusted group grants nothing those principals could not already do, so it
+    is not a way in for anyone else. A qualifier that cannot be resolved is
+    untrusted (fail closed).
+    """
+    qualifier = library.acl_get_qualifier(entry)
+    if not qualifier:
+        return False
+    try:
+        ident = ctypes.c_uint32()
+        id_type = ctypes.c_int()
+        if library.mbr_uuid_to_id(qualifier, ctypes.byref(ident), ctypes.byref(id_type)) != 0:
+            return False
+        if id_type.value == _DARWIN_ID_TYPE_UID:
+            return ident.value in _trusted_owner_ids()
+        if id_type.value == _DARWIN_ID_TYPE_GID:
+            return ident.value in _trusted_group_ids()
+        return False
+    finally:
+        library.acl_free(qualifier)
 
 
 def _darwin_acl_allows_mutation(acl: int | None) -> bool:
@@ -90,6 +126,7 @@ def _darwin_acl_allows_mutation(acl: int | None) -> bool:
             if (
                 tag.value == _DARWIN_ACL_EXTENDED_ALLOW
                 and mask.value & _DARWIN_MUTATING_ACL_MASK
+                and not _darwin_entry_is_trusted(library, entry)
             ):
                 return True
             entry_id = -1
@@ -98,7 +135,8 @@ def _darwin_acl_allows_mutation(acl: int | None) -> bool:
 
 
 def _darwin_secure_status(path: Path, *, directory: bool) -> os.stat_result:
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    # O_NONBLOCK: a FIFO swapped into the path must not hang the open.
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     if directory:
         flags |= os.O_DIRECTORY
     try:

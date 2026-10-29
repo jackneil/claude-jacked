@@ -787,7 +787,7 @@ def _service_path_env(monkeypatch, home):
 
 @posix_only
 def test_read_rate_limits_finds_home_codex_under_the_service_path(
-    tmp_path, monkeypatch, trusted_tmp_ancestors
+    tmp_path, monkeypatch
 ):
     home = tmp_path / "home"
     shim = _install_home_codex(home)
