@@ -341,6 +341,22 @@ def _entry_links(line: str) -> list[str]:
     return _INDEX_LINK_RE.findall(line)
 
 
+def _inside_group(link: str) -> bool:
+    r"""Whether ``link`` names a file inside the group folder. Absolute, drive,
+    UNC, URL and ``..`` links do not, and are never opened: reading one could
+    reach another folder or a network share during SessionStart.
+
+    >>> [_inside_group(x) for x in ("decision/t.md", "a b/t.md")]
+    [True, True]
+    >>> [_inside_group(x) for x in ("/etc/t.md", "../t.md", "a/../../t.md",
+    ...     "\\\\host\\share\\t.md", "C:t.md", "file://h/t.md", "a\\..\\t.md")]
+    [False, False, False, False, False, False, False]
+    """
+    if link.startswith(("/", "\\")) or ":" in link:
+        return False
+    return ".." not in link.replace("\\", "/").split("/")
+
+
 def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
     """One tail-lazy pass over index.md for both recall index tiers.
 
@@ -374,6 +390,8 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
         # Reviewed only when EVERY linked note is: a title or hook that names
         # another (reviewed) note can never launder an unreviewed one, because
         # the line's own note is always among its links.
+        if not all(_inside_group(link) for link in links):
+            return False  # a link out of the group is never read, so unvetted
         for link in links:
             path = gdir / link
             cand = candidate_memo.get(path)

@@ -689,6 +689,32 @@ def test_a_rewritten_index_line_is_still_judged_by_its_link(env, shape):
     assert "Rewritten candidate" not in brief
 
 
+@pytest.mark.parametrize(
+    "outside",
+    ["/etc/outside.md", "../../outside.md", "\\\\host\\share\\outside.md", "C:/outside.md"],
+)
+def test_a_link_out_of_the_group_is_never_read(env, outside, monkeypatch):
+    """A hook link to an absolute, UNC or escaping path must not be opened
+    (on Windows a UNC read is a network access during SessionStart), and the
+    line that carries it stays out of the brief."""
+    _seed_group(env)
+    res = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="Outside linker",
+        group="myrepo", repos=["myrepo"], tags=[], body="A reviewed decision.",
+    )
+    _rewrite_index_line(
+        env, res, lambda own: f"- [Outside linker]({own}) - see [x]({outside}) now",
+    )
+    opened = []
+    real = recall._is_candidate_note
+    monkeypatch.setattr(
+        recall, "_is_candidate_note", lambda path: opened.append(str(path)) or real(path)
+    )
+    brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
+    assert "Outside linker" not in brief
+    assert not any("outside" in path for path in opened)
+
+
 def test_candidate_note_surfaces_after_promotion(env):
     """Dropping the candidate tag (librarian promotion) makes the note visible
     to recall - the exclusion is about review status, not the note itself."""
