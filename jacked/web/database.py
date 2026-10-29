@@ -17,7 +17,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from pydantic import BaseModel, computed_field
 
@@ -1991,6 +1991,92 @@ class Database:
                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
                 (key, value, now),
             )
+
+    def get_settings(self, keys: Iterable[str]) -> dict[str, Optional[str]]:
+        """Read several settings in ONE statement: one consistent snapshot.
+
+        Settings that belong together (a threshold pair, an enabled flag and
+        its scope) must be read this way. Two ``get_setting`` calls can
+        straddle another thread's commit and see half of an update.
+
+        >>> db = Database(":memory:")
+        >>> db.set_settings({"a": "1", "b": "2"})
+        >>> db.get_settings(["a", "b", "missing"])
+        {'a': '1', 'b': '2', 'missing': None}
+        """
+        keys = list(keys)
+        if not keys:
+            return {}
+        placeholders = ",".join("?" * len(keys))
+        with self._reader() as conn:
+            rows = conn.execute(
+                f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
+                keys,
+            ).fetchall()
+        found = {row["key"]: row["value"] for row in rows}
+        return {key: found.get(key) for key in keys}
+
+    def set_settings(self, values: Mapping[str, Optional[str]]) -> None:
+        """Write several settings in ONE transaction (None deletes the key).
+
+        A reader using ``get_settings`` sees all of the new values or none
+        of them, and two overlapping saves can never leave a mix of both.
+
+        >>> db = Database(":memory:")
+        >>> db.set_settings({"warning": "20", "critical": "30"})
+        >>> db.set_settings({"warning": None})
+        >>> db.get_settings(["warning", "critical"])
+        {'warning': None, 'critical': '30'}
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            for key, value in values.items():
+                if value is None:
+                    conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+                else:
+                    conn.execute(
+                        """INSERT INTO settings (key, value, updated_at)
+                           VALUES (?, ?, ?)
+                           ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                               updated_at = excluded.updated_at""",
+                        (key, value, now),
+                    )
+
+    def update_setting(
+        self, key: str, compute: Callable[[Optional[str]], Optional[str]]
+    ) -> Optional[str]:
+        """Atomic read-modify-write of one setting. Returns the new value.
+
+        ``compute`` gets the current value (None when unset) and returns the
+        value to store, or None to leave the setting as it is. BEGIN IMMEDIATE
+        takes the database write lock BEFORE the read, so no other writer
+        (another thread, another Database object, another process) can change
+        the key between the read and the write.
+
+        >>> db = Database(":memory:")
+        >>> db.update_setting("n", lambda v: str(int(v or 0) + 1))
+        '1'
+        >>> db.update_setting("n", lambda v: str(int(v or 0) + 1))
+        '2'
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+            current = row["value"] if row else None
+            new = compute(current)
+            if new is None or new == current:
+                return current
+            conn.execute(
+                """INSERT INTO settings (key, value, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                       updated_at = excluded.updated_at""",
+                (key, new, now),
+            )
+            return new
 
     @staticmethod
     def active_account_setting_key(provider: str = "claude") -> str:

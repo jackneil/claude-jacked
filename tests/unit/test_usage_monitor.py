@@ -75,6 +75,7 @@ def _make_db(settings=None, accounts=None):
 
     db = MagicMock()
     db.get_setting.side_effect = lambda key: settings.get(key)
+    db.get_settings.side_effect = lambda keys: {k: settings.get(k) for k in keys}
     db.list_accounts.return_value = accounts
     db.record_swap = MagicMock()
     db._certified_auto_swap_engine = _TestCertifiedEngine(db)
@@ -3238,7 +3239,7 @@ class TestDbWorkOffTheLoop:
             accounts=[_acct(1)],
         )
         seen: dict = {}
-        names = ["get_setting", "list_accounts", "set_keeper_state"]
+        names = ["get_settings", "list_accounts", "set_keeper_state"]
         _record_db_threads(db, names, seen)
         app = _make_app(db=db)
 

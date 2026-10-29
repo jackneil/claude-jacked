@@ -78,6 +78,20 @@ def _get_db(request: Request):
     return getattr(request.app.state, "db", None)
 
 
+SWAP_SETTING_KEYS = (
+    "auto_swap_enabled",
+    "auto_swap_5h_warning",
+    "auto_swap_5h_critical",
+    "auto_swap_7d_threshold",
+    "usage_check_interval",
+    "auto_swap_paused_until",
+    "window_keeper_enabled",
+    "window_keeper_active_start",
+    "window_keeper_active_end",
+    "window_keeper_prewake",
+)
+
+
 @router.get("/swap-settings", response_model=SwapSettings)
 def get_swap_settings(request: Request):
     """Get current auto-swap and window keeper settings."""
@@ -85,8 +99,12 @@ def get_swap_settings(request: Request):
     if db is None:
         return SwapSettings()
 
+    # One snapshot: the thresholds are validated as a set (warning below
+    # critical), so they must never mix two saves.
+    stored = db.get_settings(SWAP_SETTING_KEYS)
+
     def _g(key, default):
-        val = db.get_setting(key)
+        val = stored[key]
         return val if val is not None else default
 
     try:
@@ -115,23 +133,21 @@ async def update_swap_settings(request: Request, body: SwapSettings):
     if db is None:
         return SwapSettings()
 
-    def _write():
-        db.set_setting("auto_swap_enabled", str(body.auto_swap_enabled).lower())
-        db.set_setting("auto_swap_5h_warning", str(body.auto_swap_5h_warning))
-        db.set_setting("auto_swap_5h_critical", str(body.auto_swap_5h_critical))
-        db.set_setting("auto_swap_7d_threshold", str(body.auto_swap_7d_threshold))
-        db.set_setting("usage_check_interval", str(body.usage_check_interval))
-        db.set_setting("window_keeper_enabled", str(body.window_keeper_enabled).lower())
-        db.set_setting("window_keeper_active_start", body.window_keeper_active_start)
-        db.set_setting("window_keeper_active_end", body.window_keeper_active_end)
-        db.set_setting("window_keeper_prewake", body.window_keeper_prewake)
-        if body.auto_swap_paused_until:
-            db.set_setting("auto_swap_paused_until", body.auto_swap_paused_until)
-        else:
-            db.set_setting("auto_swap_paused_until", "")
-
-    # The writes run in a worker; the asyncio.Event below is set on the loop.
-    await asyncio.to_thread(_write)
+    # One transaction, in a worker: two overlapping saves can never persist a
+    # mix (warning from one, critical from the other). The asyncio.Event
+    # below is set on the loop.
+    await asyncio.to_thread(db.set_settings, {
+        "auto_swap_enabled": str(body.auto_swap_enabled).lower(),
+        "auto_swap_5h_warning": str(body.auto_swap_5h_warning),
+        "auto_swap_5h_critical": str(body.auto_swap_5h_critical),
+        "auto_swap_7d_threshold": str(body.auto_swap_7d_threshold),
+        "usage_check_interval": str(body.usage_check_interval),
+        "window_keeper_enabled": str(body.window_keeper_enabled).lower(),
+        "window_keeper_active_start": body.window_keeper_active_start,
+        "window_keeper_active_end": body.window_keeper_active_end,
+        "window_keeper_prewake": body.window_keeper_prewake,
+        "auto_swap_paused_until": body.auto_swap_paused_until or "",
+    })
 
     # Wake the sweep loop immediately so changes take effect now
     from jacked.api.usage_monitor import _sweep_wake

@@ -239,7 +239,7 @@ def test_use_account_runs_every_db_call_off_the_loop(tmp_path):
             "finish_auth_action",
             "mark_global_sessions_pending",
             "set_setting",
-            "get_setting",
+            "update_setting",
         } <= names
         assert all(ident != loop_thread["id"] for _, ident in db.calls), db.calls
 

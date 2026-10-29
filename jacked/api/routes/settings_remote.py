@@ -130,8 +130,12 @@ def update_remote_access(request: Request, body: RemoteAccessSettings):
         return _settings_local_only()
     db = _get_db(request)
     if db is not None:
-        db.set_setting("remote_access_enabled", "true" if body.enabled else "false")
-        db.set_setting("remote_access_scope", body.scope)
+        # One transaction: a credential gate reading in between must never
+        # see the new flag with the old scope.
+        db.set_settings({
+            "remote_access_enabled": "true" if body.enabled else "false",
+            "remote_access_scope": body.scope,
+        })
     return {**_read_state(db), "editable": True}
 
 

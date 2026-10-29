@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,9 @@ class _RecordingDB:
 
     def set_setting(self, key, value):
         self._mark(f"set_setting:{key}")
+
+    def set_settings(self, values):
+        self._mark("set_settings:" + ",".join(values))
 
     def get_project_activity_summary(self, limit=100):
         self._mark("get_project_activity_summary")
@@ -107,17 +111,13 @@ def test_update_swap_settings_writes_off_the_loop_and_wakes_on_it(monkeypatch):
     result, loop_thread = _run_on_loop(lambda: update_swap_settings(_request(db), body))
 
     assert result is body
+    # One transaction for the whole bundle (#162 review: two overlapping
+    # saves must never persist a mixed threshold pair).
     assert [name for name, _ in db.threads] == [
-        "set_setting:auto_swap_enabled",
-        "set_setting:auto_swap_5h_warning",
-        "set_setting:auto_swap_5h_critical",
-        "set_setting:auto_swap_7d_threshold",
-        "set_setting:usage_check_interval",
-        "set_setting:window_keeper_enabled",
-        "set_setting:window_keeper_active_start",
-        "set_setting:window_keeper_active_end",
-        "set_setting:window_keeper_prewake",
-        "set_setting:auto_swap_paused_until",
+        "set_settings:auto_swap_enabled,auto_swap_5h_warning,"
+        "auto_swap_5h_critical,auto_swap_7d_threshold,usage_check_interval,"
+        "window_keeper_enabled,window_keeper_active_start,"
+        "window_keeper_active_end,window_keeper_prewake,auto_swap_paused_until",
     ]
     worker_threads = {t for _, t in db.threads}
     assert len(worker_threads) == 1 and loop_thread not in worker_threads
@@ -132,7 +132,7 @@ def test_update_swap_settings_write_error_propagates_and_skips_the_wake(monkeypa
     monkeypatch.setattr(usage_monitor, "_sweep_wake", SimpleNamespace(set=lambda: woken.append(1)))
 
     class _LockedDB(_RecordingDB):
-        def set_setting(self, key, value):
+        def set_settings(self, values):
             raise sqlite3.OperationalError("database is locked")
 
     with pytest.raises(sqlite3.OperationalError, match="database is locked"):
@@ -289,3 +289,66 @@ def test_detach_connection_hands_over_this_threads_connection(tmp_path):
     db.list_settings()  # reopens
     assert db.detach_connection() is not None
     conn.close()
+
+
+# --- atomic settings primitives (#162 review) ------------------------------
+
+
+def test_update_setting_holds_the_write_lock_through_compute(tmp_path):
+    """A writer on ANOTHER Database object (another thread or process) that
+    arrives while compute() runs waits for the commit, so the read-modify-write
+    can never overwrite it with a decision made on a stale read."""
+    from jacked.web.database import Database
+
+    path = str(tmp_path / "jacked.db")
+    a, b = Database(path), Database(path)
+    a.set_setting("auto_swap_paused_until", "short")
+    in_compute = threading.Event()
+    order = []
+
+    def compute(current):
+        in_compute.set()
+        time.sleep(0.3)  # the other writer arrives now
+        order.append(("compute saw", current))
+        return "extended"
+
+    def other_writer():
+        in_compute.wait(5)
+        b.set_setting("auto_swap_paused_until", "one-day")
+        order.append(("other wrote", None))
+
+    t = threading.Thread(target=other_writer)
+    t.start()
+    a.update_setting("auto_swap_paused_until", compute)
+    t.join(10)
+    assert order == [("compute saw", "short"), ("other wrote", None)]
+    assert b.get_setting("auto_swap_paused_until") == "one-day"
+
+
+def test_a_snapshot_never_sees_half_of_a_bundle(tmp_path):
+    from jacked.web.database import Database
+
+    path = str(tmp_path / "jacked.db")
+    writer, reader = Database(path), Database(path)
+    pairs = [("20", "30"), ("80", "90")]
+    writer.set_settings({"warning": "20", "critical": "30"})
+    stop = threading.Event()
+    seen = set()
+
+    def write():
+        i = 0
+        while not stop.is_set():
+            w, c = pairs[i % 2]
+            writer.set_settings({"warning": w, "critical": c})
+            i += 1
+
+    t = threading.Thread(target=write)
+    t.start()
+    try:
+        for _ in range(300):
+            snap = reader.get_settings(["warning", "critical"])
+            seen.add((snap["warning"], snap["critical"]))
+    finally:
+        stop.set()
+        t.join(10)
+    assert seen <= set(pairs), seen

@@ -1961,20 +1961,23 @@ async def use_account(account_id: int, request: Request):
         # Only ever EXTEND an active pause — the user may have set a
         # longer explicit pause (POST /api/settings/swap-pause, up to
         # 1440 min); a manual switch must never silently shorten it.
-        # The read and the write share one thread hop.
-        existing = db.get_setting("auto_swap_paused_until") or ""
-        if existing:
-            try:
-                existing_dt = datetime.fromisoformat(
-                    existing.replace("Z", "+00:00"),
-                )
-                if existing_dt > pause_dt:
-                    pause_dt = existing_dt
-            except (ValueError, TypeError):
-                # Unparseable/naive timestamp (the sweep loop ignores
-                # these anyway) — overwrite with the 15-minute pause.
-                pass
-        db.set_setting("auto_swap_paused_until", pause_dt.isoformat())
+        # update_setting reads and writes under one database write lock, so
+        # a pause saved by another request in between is never overwritten.
+        def _longer(existing):
+            if existing:
+                try:
+                    existing_dt = datetime.fromisoformat(
+                        existing.replace("Z", "+00:00"),
+                    )
+                    if existing_dt > pause_dt:
+                        return None  # keep the longer pause
+                except (ValueError, TypeError):
+                    # Unparseable/naive timestamp (the sweep loop ignores
+                    # these anyway) — overwrite with the 15-minute pause.
+                    pass
+            return pause_dt.isoformat()
+
+        db.update_setting("auto_swap_paused_until", _longer)
 
     try:
         await asyncio.to_thread(

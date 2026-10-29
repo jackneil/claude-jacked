@@ -214,6 +214,19 @@ def _read_active_account_id() -> int | None:
     return None
 
 
+class _Snapshot:
+    """Settings read in ONE statement (Database.get_settings), with the
+    ``get_setting`` shape the _setting_* readers expect. Related settings
+    (a threshold pair, a window's start and end) read through one snapshot
+    can never mix two saves made by another thread."""
+
+    def __init__(self, db, keys) -> None:
+        self._values = db.get_settings(list(keys))
+
+    def get_setting(self, key: str):
+        return self._values[key]
+
+
 def _setting_bool(db, key: str, default: bool = False) -> bool:
     """Read a boolean setting from DB (stored as 'true'/'false' strings)."""
     val = db.get_setting(key)
@@ -976,12 +989,18 @@ async def active_account_poll_loop(app):
             def _read_tick_settings():
                 """One thread hop for the tick's settings reads (they ran back
                 to back on the loop). None when auto-swap is off or paused."""
-                auto_swap_enabled = _setting_bool(db, "auto_swap_enabled", False)
+                snap = _Snapshot(db, (
+                    "auto_swap_enabled", "auto_swap_paused_until",
+                    "auto_swap_5h_critical", "auto_swap_5h_warning",
+                    "usage_check_interval", "window_keeper_active_start",
+                    "window_keeper_active_end",
+                ))
+                auto_swap_enabled = _setting_bool(snap, "auto_swap_enabled", False)
                 if not auto_swap_enabled:
                     return None
 
                 # Check pause
-                paused_until_str = _setting_str(db, "auto_swap_paused_until", "")
+                paused_until_str = _setting_str(snap, "auto_swap_paused_until", "")
                 if paused_until_str:
                     try:
                         paused_until = datetime.fromisoformat(
@@ -997,11 +1016,11 @@ async def active_account_poll_loop(app):
                         )
 
                 return (
-                    _setting_float(db, "auto_swap_5h_critical", 90),
-                    _setting_float(db, "auto_swap_5h_warning", 80),
-                    _setting_float(db, "usage_check_interval", 300),
-                    _setting_str(db, "window_keeper_active_start", "06:00"),
-                    _setting_str(db, "window_keeper_active_end", "23:00"),
+                    _setting_float(snap, "auto_swap_5h_critical", 90),
+                    _setting_float(snap, "auto_swap_5h_warning", 80),
+                    _setting_float(snap, "usage_check_interval", 300),
+                    _setting_str(snap, "window_keeper_active_start", "06:00"),
+                    _setting_str(snap, "window_keeper_active_end", "23:00"),
                 )
 
             tick_settings = await asyncio.to_thread(_read_tick_settings)
@@ -2691,9 +2710,13 @@ async def _run_window_keeper(db, check_interval: float) -> int:
         """One thread hop for the pass's reads (they ran back to back on the
         loop) and the plain time math between them."""
         accounts = db.list_accounts(include_inactive=False)
-        wk_start = _setting_str(db, "window_keeper_active_start", "06:00")
-        wk_end = _setting_str(db, "window_keeper_active_end", "23:00")
-        wk_prewake = _setting_str(db, "window_keeper_prewake", "04:00")
+        snap = _Snapshot(db, (
+            "window_keeper_active_start", "window_keeper_active_end",
+            "window_keeper_prewake",
+        ))
+        wk_start = _setting_str(snap, "window_keeper_active_start", "06:00")
+        wk_end = _setting_str(snap, "window_keeper_active_end", "23:00")
+        wk_prewake = _setting_str(snap, "window_keeper_prewake", "04:00")
 
         # Local time intentional: users configure active hours in their local
         # timezone (e.g. "06:00" means local 6am).
@@ -2819,9 +2842,10 @@ async def full_sweep_loop(app):
                 continue
 
             def _read_sweep_settings():
+                snap = _Snapshot(db, ("window_keeper_enabled", "usage_check_interval"))
                 return (
-                    _setting_bool(db, "window_keeper_enabled", False),
-                    _setting_float(db, "usage_check_interval", 300),
+                    _setting_bool(snap, "window_keeper_enabled", False),
+                    _setting_float(snap, "usage_check_interval", 300),
                 )
 
             window_keeper_enabled, check_interval = await asyncio.to_thread(

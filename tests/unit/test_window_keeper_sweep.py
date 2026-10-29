@@ -185,10 +185,9 @@ class TestWallClockSleep:
                 raise asyncio.CancelledError
 
         db = MagicMock()
-        db.get_setting.side_effect = lambda k: {
-            "window_keeper_enabled": "false",
-            "usage_check_interval": "300",
-        }.get(k)
+        stored = {"window_keeper_enabled": "false", "usage_check_interval": "300"}
+        db.get_setting.side_effect = stored.get
+        db.get_settings.side_effect = lambda keys: {k: stored.get(k) for k in keys}
         db.list_accounts.return_value = []
         app = MagicMock()
         app.state.db = db
@@ -1089,7 +1088,7 @@ class TestKeeperDbWorkOffTheLoop:
         dead_id = _mk(db, email="dead@test.com", cc="cc-dead", primary="pri-dead")
         pings = _Pings({"cc-ok": _ok()})  # every other token answers 401
         seen: dict = {}
-        names = ["list_accounts", "get_setting", "get_account",
+        names = ["list_accounts", "get_settings", "get_account",
                  "update_account_usage_cache", "set_keeper_state"]
         _record_db_threads(db, names, seen)
         loop_tid = threading.get_ident()  # asyncio.run runs the loop here
@@ -1103,7 +1102,7 @@ class TestKeeperDbWorkOffTheLoop:
     def test_outside_hours_and_prewake_bookkeeping_off_the_loop(self, db):
         aid = _mk(db)
         seen: dict = {}
-        names = ["list_accounts", "get_setting", "set_keeper_state", "set_setting"]
+        names = ["list_accounts", "get_settings", "get_setting", "set_keeper_state", "set_setting"]
         _record_db_threads(db, names, seen)
         loop_tid = threading.get_ident()
 
