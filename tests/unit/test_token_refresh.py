@@ -590,17 +590,58 @@ class TestReconcileOwnershipProof:
         self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"))
         assert db.get_account(aid)["cc_access_token"] == "old-access"
 
-    def test_dead_lineage_imports_the_access_token_but_not_the_refresh_token(self, tmp_path):
-        """invalid_grant: the row's tokens are dead, so the working access token
-        comes in; the refresh token stays out (it is Claude Code's single-use
-        token, and exchanging it would end Claude Code's session)."""
+    def test_invalid_grant_alone_keeps_the_backward_rule(self, tmp_path):
+        """invalid_grant marks the refresh LINEAGE dead; the access token beside
+        it may be fresh (adopted by the authority guard, or recovered from the
+        live store), so an older live payload must not replace it."""
         db, aid, live = self._older_live_over_newer_row(
             tmp_path, cc_refresh_failure_type="invalid_grant")
         self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"))
         row = db.get_account(aid)
-        assert row["cc_access_token"] == "new-access"
+        assert row["cc_access_token"] == "old-access"
         assert row["cc_refresh_token"] == "old-refresh"
-        assert row["cc_refresh_failure_type"] == "invalid_grant"
+
+    def test_a_reauth_during_the_ownership_lookup_wins(self, tmp_path):
+        """The ownership lookup can take seconds. A re-authentication that
+        lands meanwhile (new tokens, verdict cleared) must not be overwritten
+        by a decision made from the row as it was before."""
+        from unittest.mock import patch
+
+        from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+
+        db, aid, live = self._older_live_over_newer_row(
+            tmp_path, cc_refresh_failure_type="auth_rejected")
+        owner = _owner_profile("owner@test.com", "org-a", "uuid-a")
+
+        def lookup_while_reauth_lands(*args, **kwargs):
+            db.update_account(aid, cc_access_token="reauth-access", cc_refresh_token="reauth-refresh",
+                              cc_expires_at=int(time.time()) + 28800, cc_refresh_failure_type=None)
+            return owner
+
+        with patch("jacked.api.credential_helpers.read_platform_credentials", return_value=live), \
+             patch("jacked.api.credential_helpers._ownership_lookup", side_effect=lookup_while_reauth_lands):
+            reconcile_credentials_from_live_store(aid, db)
+        row = db.get_account(aid)
+        assert (row["cc_access_token"], row["cc_refresh_token"]) == ("reauth-access", "reauth-refresh")
+
+    def test_the_override_acts_on_a_fresh_read_never_the_cache(self, tmp_path):
+        """A cached live payload (up to 30 s old) must not be what a dead-token
+        verdict admits: the store is read again first."""
+        from unittest.mock import patch
+
+        from jacked.api import credential_helpers as ch
+
+        db, aid, cached = self._older_live_over_newer_row(
+            tmp_path, cc_refresh_failure_type="auth_rejected")
+        ch._cache_live_credentials(aid, self._live(aid, access="stale-cached", refresh="stale-r",
+                                                   expires_s=int(time.time()) + 300))
+        fresh = self._live(aid, access="fresh-access", refresh="fresh-refresh",
+                           expires_s=int(time.time()) + 900)
+        with patch("jacked.api.credential_helpers.read_platform_credentials", return_value=fresh), \
+             patch("jacked.api.credential_helpers._ownership_lookup",
+                   return_value=_owner_profile("owner@test.com", "org-a", "uuid-a")):
+            ch.reconcile_credentials_from_live_store(aid, db)
+        assert db.get_account(aid)["cc_access_token"] == "fresh-access"
 
     @pytest.mark.parametrize("raw", ["[]", "not json", '"needs_reauth"', None])
     def test_a_malformed_keeper_state_is_no_verdict(self, raw):

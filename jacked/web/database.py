@@ -1284,6 +1284,47 @@ class Database:
             )
             return cursor.rowcount > 0
 
+    def update_account_if_unchanged(
+        self, account_id: int, expected: dict, **kwargs: Any
+    ) -> bool:
+        """Compare-and-set: update only while every ``expected`` column still
+        holds its expected value (NULL included). False when the row changed
+        or does not exist.
+
+        A caller that read the row, did slow work (a network lookup), and now
+        writes a decision based on that read uses this so a concurrent write
+        in between is never overwritten.
+
+        >>> db = Database(":memory:")
+        >>> acct = db.create_account("u@test.com", "tok", 9999999999)
+        >>> db.update_account_if_unchanged(acct["id"], {"cc_access_token": None}, cc_access_token="a")
+        True
+        >>> db.update_account_if_unchanged(acct["id"], {"cc_access_token": None}, cc_access_token="b")
+        False
+        >>> db.get_account(acct["id"])["cc_access_token"]
+        'a'
+        """
+        if not kwargs:
+            return False
+        allowed = self._ACCOUNT_UPDATE_COLS | {"updated_at"}
+        # keeper_state is written only by set_keeper_state but may be compared.
+        comparable = allowed | {"keeper_state"}
+        invalid_cols = (set(kwargs) - allowed) | (set(expected) - comparable)
+        if invalid_cols:
+            raise ValueError(f"Invalid columns for account update: {invalid_cols}")
+
+        kwargs["updated_at"] = datetime.now(timezone.utc).isoformat()
+        set_clause = ", ".join(f"{k} = ?" for k in kwargs)
+        where = "".join(f" AND {k} IS ?" for k in expected)
+        values = [*kwargs.values(), account_id, *expected.values()]
+
+        with self._writer() as conn:
+            cursor = conn.execute(
+                f"UPDATE accounts SET {set_clause} WHERE id = ? AND is_deleted = 0{where}",
+                values,
+            )
+            return cursor.rowcount > 0
+
     def set_account_label(self, account_id: int, label: Optional[str]) -> bool:
         """Set display_name for an account — the ONLY way to change labels.
 

@@ -521,18 +521,23 @@ def cc_chain_dead(account: dict) -> bool:
 def cc_token_known_dead(account: dict) -> bool:
     """True when the row's Claude Code access token is known not to work.
 
-    Two recorded verdicts count: a per-chain failure that marks the token
-    unusable (``invalid_grant``, or ``auth_rejected`` after a 401), and the
-    window keeper's ``needs_reauth``, but only when it was recorded against
-    the row's CURRENT candidate tokens (a verdict on older tokens says
-    nothing about these). Expiry order is never such evidence (#179i).
+    Two recorded verdicts count, both tied to the token the row holds now:
+    ``auth_rejected`` (the API refused this access token; every writer that
+    replaces the access token clears it), and the window keeper's
+    ``needs_reauth`` recorded against the row's CURRENT candidate tokens.
+    ``invalid_grant`` does not count: it marks the refresh LINEAGE dead, and
+    the access token beside it may be a fresh, working one (one the authority
+    guard just adopted, or one recovered from the live store). Expiry order
+    is never such evidence (#179i).
 
     >>> cc_token_known_dead({"cc_refresh_failure_type": "auth_rejected"})
     True
+    >>> cc_token_known_dead({"cc_refresh_failure_type": "invalid_grant"})
+    False
     >>> cc_token_known_dead({"cc_refresh_failure_type": None, "keeper_state": None})
     False
     """
-    if account.get("cc_refresh_failure_type") in CC_TOKEN_UNUSABLE_FAILURES:
+    if account.get("cc_refresh_failure_type") == "auth_rejected":
         return True
     from jacked.web.database import Database
 
@@ -746,6 +751,17 @@ def read_live_credentials() -> dict | None:
     return None
 
 
+# The row columns a reconcile decision depends on; the write is skipped when
+# any of them changed after the row was read.
+_RECONCILE_GUARD_COLS = (
+    "cc_access_token",
+    "cc_refresh_token",
+    "cc_expires_at",
+    "cc_refresh_failure_type",
+    "keeper_state",
+)
+
+
 def reconcile_credentials_from_live_store(account_id: int, db) -> None:
     """Read live credentials for the active account and reconcile with DB.
 
@@ -762,6 +778,7 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
     """
     # Check cache first to avoid Keychain subprocess calls
     live = _get_cached_live_credentials(account_id)
+    from_cache = bool(live)
 
     if not live:
         # Read live credentials (Keychain first, file fallback)
@@ -817,15 +834,21 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
     # the row's token is KNOWN dead: then an owned live token that merely
     # expires sooner is the one that works (#179i).
     row_expires = account.get("cc_expires_at") or 0
-    if live_expires and row_expires and not cc_token_known_dead(account):
+    if live_expires and row_expires:
         live_expires_s = int(live_expires / 1000) if live_expires > 1e12 else int(live_expires)
         if live_expires_s < row_expires:
-            logger.info(
-                "Account %d: live credentials are older than the stored ones; "
-                "not importing them",
-                account_id,
-            )
-            return
+            if not cc_token_known_dead(account):
+                logger.info(
+                    "Account %d: live credentials are older than the stored ones; "
+                    "not importing them",
+                    account_id,
+                )
+                return
+            if from_cache:
+                # The verdict is what admits this older payload, so act on a
+                # fresh read, never on one cached up to 30 s ago.
+                invalidate_live_cred_cache()
+                return reconcile_credentials_from_live_store(account_id, db)
 
     db_cc_refresh = account.get("cc_refresh_token")
 
@@ -877,7 +900,17 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
         updates["cc_refresh_last_failed_at"] = None
 
     if updates:
-        db.update_account(account_id, **updates)
+        # Compare-and-set against the row this decision was made from: the
+        # ownership lookup above can take seconds, and a re-authentication or
+        # an authority-guard adoption that landed meanwhile must win.
+        expected = {col: account.get(col) for col in _RECONCILE_GUARD_COLS}
+        if not db.update_account_if_unchanged(account_id, expected, **updates):
+            logger.info(
+                "Account %d: the row changed while reconciling; not importing "
+                "the live credentials",
+                account_id,
+            )
+            return
         logger.info(
             "Account %d: reconciled %d credential field(s) from live store",
             account_id, len(updates),
