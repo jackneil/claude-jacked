@@ -931,3 +931,18 @@ def test_the_brief_framing_names_the_candidate_quarantine():
 
     header = recall._header_section(Path("/vault/groups/g1"), "g1")
     assert "candidate" in header and "[candidate, unreviewed]" in header
+
+
+def test_a_candidate_note_titled_index_is_still_marked(env):
+    """Its file is decision/index.md: a typed note, not the group index."""
+    from jacked.memory.vault import CANDIDATE_MARK
+
+    _init_empty(env)
+    r = CliRunner().invoke(main, [
+        "memory", "add", "--type", "decision", "--title", "Index", "--group", "g1",
+        "--tags", "candidate", "--body", "Plain text. Mentions wombat only here.",
+    ])
+    assert r.exit_code == 0, r.output
+    hits = [line for p, _, line in memory.search(env.vault, "wombat")
+            if _posix(p).endswith("decision/index.md")]
+    assert hits and all(line.startswith(CANDIDATE_MARK) for line in hits)

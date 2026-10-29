@@ -1219,13 +1219,15 @@ def _mark_candidates(vault: Path, results: list) -> list:
     marked = []
     for rel, lineno, line in results:
         path = vault / rel
-        if path.name == "index.md":
+        if path.parent.name in VALID_TYPES:  # a note, whatever its slug
+            flagged = candidate(path)
+        elif path.name == "index.md" and path.parent.parent.name == "groups":
             flagged = any(
                 recall._inside_group(link) and candidate(path.parent / link)
                 for link in recall._entry_links(line)
             )
         else:
-            flagged = path.parent.name in VALID_TYPES and candidate(path)
+            flagged = False
         marked.append((rel, lineno, CANDIDATE_MARK + line if flagged else line))
     return marked
 
