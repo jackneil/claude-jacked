@@ -120,7 +120,7 @@ def parse_wait_process(text: str) -> tuple[int, str]:
     pid_text, sep, creation_id = text.partition(":")
     if (
         not sep
-        or not pid_text.isdigit()
+        or not (pid_text.isascii() and pid_text.isdigit())
         or int(pid_text) <= 0
         or not _CREATION_ID_RE.fullmatch(creation_id)
     ):

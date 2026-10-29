@@ -47,3 +47,56 @@ jobs:
 
       - name: Run tests
         run: uv run --frozen python -m pytest
+
+  supply-chain:
+    # Blocks a merge on a known advisory in any locked package (OSV) and on a
+    # workflow finding (zizmor). One Linux runner, a few minutes.
+    name: Supply chain (pip-audit + zizmor)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv, pip-audit and zizmor
+        # Hash-locked (.github/requirements/ci-uv.txt and ci-audit.txt, from
+        # their .in files), wheels only.
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r .github/requirements/ci-uv.txt
+          python -m pip install --require-hashes --only-binary=:all: -r .github/requirements/ci-audit.txt
+
+      - name: Audit every locked package (OSV)
+        # Markers are stripped so the macOS-only and Windows-only pins are
+        # audited too (pip-audit would evaluate them for this Linux runner and
+        # skip them); the step fails unless the audited set is exactly the
+        # lock's registry packages.
+        run: |
+          uv export --frozen --format requirements-txt --no-emit-project --no-hashes --no-annotate --no-header -o "$RUNNER_TEMP/export.txt"
+          sed -E 's/ *;.*$//' "$RUNNER_TEMP/export.txt" | sort -u > "$RUNNER_TEMP/locked.txt"
+          python - "$RUNNER_TEMP/locked.txt" <<'PY'
+          import re, sys
+          lock = open("uv.lock", encoding="utf-8").read()
+          locked = {f"{n}=={v}".lower() for n, v in re.findall(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"\nsource = \{ registry', lock)}
+          audited = {line.strip().lower() for line in open(sys.argv[1], encoding="utf-8") if line.strip()}
+          print(f"auditing {len(audited)} of {len(locked)} locked packages")
+          sys.exit(0 if locked and audited == locked else f"coverage mismatch: missing {sorted(locked - audited)}, extra {sorted(audited - locked)}")
+          PY
+          pip-audit -r "$RUNNER_TEMP/locked.txt" --no-deps --disable-pip --vulnerability-service osv
+
+      - name: Audit the workflows (zizmor)
+        # --strict-collection: a workflow zizmor cannot parse fails the job
+        # instead of being skipped.
+        run: zizmor --no-progress --strict-collection .github/workflows

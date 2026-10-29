@@ -150,11 +150,18 @@ def refresh_expiry_from_response(data: Any, now_ms: int) -> int | None:
     True
     >>> refresh_expiry_from_response({"refresh_token_expires_in": "1" + "0" * 309}, 1000) is None
     True
+    >>> refresh_expiry_from_response({"refresh_token_expires_in": "60"}, 1000)
+    61000
+    >>> [refresh_expiry_from_response({"refresh_token_expires_in": v}, 1000) for v in ("\u00b2", "\u0661\u0662", "9" * 5000)]
+    [None, None, None]
     """
     if not isinstance(data, dict):
         return None
     seconds = data.get("refresh_token_expires_in")
-    if isinstance(seconds, str) and seconds.isdigit():
+    # ASCII digits only, and short: str.isdigit() also accepts digits such as
+    # "\u00b2" that int() refuses, and int() refuses strings over 4300 digits.
+    # Either raise would also lose the new pair.
+    if isinstance(seconds, str) and seconds.isascii() and seconds.isdigit() and len(seconds) <= 20:
         seconds = int(seconds)
     # A non-finite or absurd value (Infinity, 1e308, 10**309) would raise on
     # the way to an int after the server already consumed the refresh token,
