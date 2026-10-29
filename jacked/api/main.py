@@ -639,6 +639,21 @@ except ImportError:
 
 # --- Static files + SPA catch-all ---
 
+# The pages use inline <script> blocks, inline on* handlers and injected
+# <style> (Tailwind Play, SweetAlert2), so script-src and style-src keep
+# 'unsafe-inline'; nothing needs eval. The policy still stops any script,
+# style, image, frame or connection from another origin, <base> hijacks and
+# plugins (tests/unit/test_web_vendor_scripts.py keeps the pages honest).
+_DOCUMENT_CSP = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+    "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"
+)
+# The update progress page is framed by the local file the tray writes
+# (update_bootstrap.html), an ancestor frame-ancestors cannot name. It only
+# reads status, so it keeps the CSP without the framing ban.
+_FRAMEABLE_PAGES = frozenset({"/update.html"})
+
 if WEB_DIR.exists():
     _css_dir = WEB_DIR / "css"
     _js_dir = WEB_DIR / "js"
@@ -652,6 +667,21 @@ if WEB_DIR.exists():
         path = request.url.path
         if path.startswith(("/js/", "/css/")):
             response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
+    @app.middleware("http")
+    async def document_security_headers(request, call_next):
+        """Every HTML page the dashboard serves runs only same-origin code and
+        cannot be framed by another site (clickjacking: a framing page could
+        trick clicks onto account, OAuth or remote-access controls)."""
+        response = await call_next(request)
+        if response.headers.get("content-type", "").startswith("text/html"):
+            framed = request.url.path in _FRAMEABLE_PAGES
+            response.headers["Content-Security-Policy"] = (
+                _DOCUMENT_CSP if framed else _DOCUMENT_CSP + "; frame-ancestors 'none'"
+            )
+            if not framed:
+                response.headers["X-Frame-Options"] = "DENY"
         return response
 
     if _css_dir.exists():
