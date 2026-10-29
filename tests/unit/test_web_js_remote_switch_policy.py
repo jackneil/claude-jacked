@@ -379,6 +379,15 @@ def test_rate_limited_switch_surfaces_the_server_message():
     assert "'warning', 8000" in block
 
 
+def test_busy_outgoing_account_is_a_warning_with_the_server_message():
+    """The 409 OUTGOING_ACCOUNT_BUSY is transient (retry in a moment), so it
+    warns with the server's message instead of reporting a failure."""
+    source = ACCOUNT_ACTIONS_JS.read_text(encoding="utf-8")
+    block = source.split("'OUTGOING_ACCOUNT_BUSY'", 1)[1][:400]
+    assert "showToast(e.message" in block
+    assert "'warning', 8000" in block
+
+
 # ---------------------------------------------------------------------------
 # Remote-access settings controls are host-only
 # ---------------------------------------------------------------------------
