@@ -534,13 +534,9 @@ def cc_token_known_dead(account: dict) -> bool:
     """
     if account.get("cc_refresh_failure_type") in CC_TOKEN_UNUSABLE_FAILURES:
         return True
-    raw = account.get("keeper_state")
-    if not raw:
-        return False
-    try:
-        state = json.loads(raw) if isinstance(raw, str) else dict(raw)
-    except (TypeError, ValueError):
-        return False
+    from jacked.web.database import Database
+
+    state = Database.parse_keeper_state(account.get("keeper_state"))
     if state.get("last_status") != "needs_reauth":
         return False
     from jacked.api.usage_monitor import _candidate_fingerprint, _keeper_candidates

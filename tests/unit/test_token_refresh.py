@@ -602,6 +602,12 @@ class TestReconcileOwnershipProof:
         assert row["cc_refresh_token"] == "old-refresh"
         assert row["cc_refresh_failure_type"] == "invalid_grant"
 
+    @pytest.mark.parametrize("raw", ["[]", "not json", '"needs_reauth"', None])
+    def test_a_malformed_keeper_state_is_no_verdict(self, raw):
+        from jacked.api.credential_helpers import cc_token_known_dead
+
+        assert cc_token_known_dead({"keeper_state": raw, "cc_access_token": "a"}) is False
+
     def test_a_dead_row_token_still_needs_the_ownership_proof(self, tmp_path):
         db, aid, live = self._older_live_over_newer_row(
             tmp_path, cc_refresh_failure_type="auth_rejected")
