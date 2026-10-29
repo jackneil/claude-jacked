@@ -1219,9 +1219,10 @@ def _mark_candidates(vault: Path, results: list) -> list:
     marked = []
     for rel, lineno, line in results:
         path = vault / rel
-        if path.parent.name in VALID_TYPES:  # a note, whatever its slug
-            flagged = candidate(path)
-        elif path.name == "index.md" and path.parent.parent.name == "groups":
+        parts = Path(rel).parts
+        if len(parts) == 4 and parts[0] == "groups" and parts[2] in VALID_TYPES:
+            flagged = candidate(path)  # groups/<g>/<type>/<slug>.md, any slug
+        elif parts[:1] == ("groups",) and len(parts) == 3 and parts[2] == "index.md":
             flagged = any(
                 recall._inside_group(link) and candidate(path.parent / link)
                 for link in recall._entry_links(line)

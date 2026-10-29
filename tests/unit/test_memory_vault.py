@@ -946,3 +946,19 @@ def test_a_candidate_note_titled_index_is_still_marked(env):
     hits = [line for p, _, line in memory.search(env.vault, "wombat")
             if _posix(p).endswith("decision/index.md")]
     assert hits and all(line.startswith(CANDIDATE_MARK) for line in hits)
+
+
+def test_a_group_named_like_a_note_type_still_marks_its_index(env):
+    """groups/decision/index.md is the index of a group called "decision",
+    not a decision note."""
+    from jacked.memory.vault import CANDIDATE_MARK
+
+    _init_empty(env)
+    r = CliRunner().invoke(main, [
+        "memory", "add", "--type", "reference", "--title", "Capybara capture",
+        "--group", "decision", "--tags", "candidate", "--body", "Body text.",
+    ])
+    assert r.exit_code == 0, r.output
+    index_hits = [line for p, _, line in memory.search(env.vault, "Capybara")
+                  if _posix(p).endswith("groups/decision/index.md")]
+    assert index_hits and all(line.startswith(CANDIDATE_MARK) for line in index_hits)
