@@ -532,7 +532,9 @@ def _triage_cwd() -> str | None:
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(path, 0o700)
     except OSError:
-        logger.debug("memory capture: no private triage dir at %s", path, exc_info=True)
+        # WARNING, so jacked-memory.log records that this pass ran in the
+        # caller's cwd (its project CLAUDE.md and settings load again).
+        logger.warning("memory capture: no private triage dir at %s; running in the caller's cwd", path, exc_info=True)
         return None
     return str(path)
 
