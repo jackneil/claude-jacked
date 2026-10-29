@@ -8,7 +8,7 @@ multiple Claude/Codex accounts with live usage tracking and auto-swap.
   uv tool install claude-jacked && jacked install
 """
 
-__version__ = "0.108.1"
+__version__ = "0.109.0"
 
 __all__ = [
     "__version__",
