@@ -1219,16 +1219,17 @@ def _mark_candidates(vault: Path, results: list) -> list:
     marked = []
     for rel, lineno, line in results:
         path = vault / rel
-        parts = Path(rel).parts
-        if len(parts) == 4 and parts[0] == "groups" and parts[2] in VALID_TYPES:
-            flagged = candidate(path)  # groups/<g>/<type>/<slug>.md, any slug
-        elif parts[:1] == ("groups",) and len(parts) == 3 and parts[2] == "index.md":
+        # Normalized, so a group argument such as "g1/../g2" cannot change
+        # the shape; and fail closed: any hit whose own file is a candidate
+        # is marked, whatever its path looks like.
+        parts = Path(os.path.normpath(rel)).parts
+        if parts[:1] == ("groups",) and len(parts) == 3 and parts[2] == "index.md":
             flagged = any(
                 recall._inside_group(link) and candidate(path.parent / link)
                 for link in recall._entry_links(line)
             )
         else:
-            flagged = False
+            flagged = candidate(path)
         marked.append((rel, lineno, CANDIDATE_MARK + line if flagged else line))
     return marked
 

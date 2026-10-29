@@ -962,3 +962,18 @@ def test_a_group_named_like_a_note_type_still_marks_its_index(env):
     index_hits = [line for p, _, line in memory.search(env.vault, "Capybara")
                   if _posix(p).endswith("groups/decision/index.md")]
     assert index_hits and all(line.startswith(CANDIDATE_MARK) for line in index_hits)
+
+
+@pytest.mark.parametrize("group", ["g1/../g2", "g2/decision/.."])
+def test_a_traversing_group_argument_cannot_hide_the_mark(env, group):
+    from jacked.memory.vault import CANDIDATE_MARK
+
+    _init_empty(env)
+    for g in ("g1", "g2"):
+        r = CliRunner().invoke(main, [
+            "memory", "add", "--type", "decision", "--title", f"Pangolin {g}",
+            "--group", g, "--tags", "candidate", "--body", "Pangolin body.",
+        ])
+        assert r.exit_code == 0, r.output
+    hits = memory.search(env.vault, "Pangolin", group=group)
+    assert hits and all(line.startswith(CANDIDATE_MARK) for _, _, line in hits)
