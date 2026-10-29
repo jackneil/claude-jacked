@@ -68,7 +68,9 @@ def test_two_prebound_sockets_both_answer_health(_isolate_home):
     s2, p2 = _bind_ephemeral_loopback()
     assert p1 != p2
 
-    config = uvicorn.Config("jacked.api.main:app", log_level="warning")
+    from jacked.api.serving import SERVER_SETTINGS
+
+    config = uvicorn.Config("jacked.api.main:app", log_level="warning", **SERVER_SETTINGS)
     server = uvicorn.Server(config)
 
     thread = threading.Thread(
