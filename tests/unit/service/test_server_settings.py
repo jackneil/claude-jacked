@@ -64,6 +64,20 @@ def test_the_settings_resolve_to_the_sans_io_protocol():
     assert config.ws_protocol_class is WebSocketsSansIOProtocol
 
 
+def test_the_sans_io_protocol_has_flow_control_and_keepalive():
+    """Without write flow control a client that stops reading never blocks
+    send_text, so the registry's send timeout (jacked/api/websocket.py)
+    never evicts it (uvicorn < 0.52.1); without keepalive nothing ends it
+    (< 0.44). pyproject's uvicorn floor must stay above both."""
+    from uvicorn.protocols.websockets.websockets_sansio_impl import (
+        WebSocketsSansIOProtocol,
+    )
+
+    assert callable(getattr(WebSocketsSansIOProtocol, "pause_writing", None))
+    assert callable(getattr(WebSocketsSansIOProtocol, "resume_writing", None))
+    assert callable(getattr(WebSocketsSansIOProtocol, "send_keepalive_ping", None))
+
+
 def test_the_settings_cannot_be_changed_at_runtime():
     with pytest.raises(TypeError):
         SERVER_SETTINGS["ws"] = "websockets"  # type: ignore[index]
