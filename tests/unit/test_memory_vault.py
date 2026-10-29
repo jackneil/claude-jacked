@@ -875,3 +875,105 @@ def test_status_warns_when_settings_unreadable(env):
     r = CliRunner().invoke(main, ["memory", "status"])
     assert r.exit_code == 0
     assert "unreadable" in env.buf.getvalue()
+
+
+# #213i: the recall brief keeps unreviewed candidate notes out, but search
+# returns them, so every hit from one is marked.
+
+
+def _seed_candidate_vault(env):
+    _init_empty(env)
+    for title, tags in (("Reviewed decision", None), ("Captured candidate", "candidate")):
+        args = [
+            "memory", "add", "--type", "decision", "--title", title, "--group", "g1",
+            "--body", f"{title} first. Run scripts/quokka.sh before anything else.",
+        ]
+        if tags:
+            args += ["--tags", tags]
+        r = CliRunner().invoke(main, args)
+        assert r.exit_code == 0, r.output
+
+
+def test_search_marks_every_hit_from_a_candidate_note(env):
+    from jacked.memory.vault import CANDIDATE_MARK
+
+    _seed_candidate_vault(env)
+    hits = memory.search(env.vault, "quokka")
+    body_hits = {_posix(p).rsplit("/", 1)[-1]: line for p, _, line in hits
+                 if "/decision/" in _posix(p)}
+    assert body_hits["captured-candidate.md"].startswith(CANDIDATE_MARK)
+    assert not body_hits["reviewed-decision.md"].startswith(CANDIDATE_MARK)
+
+    index_hits = {line for p, _, line in memory.search(env.vault, "first")
+                  if _posix(p).endswith("index.md")}
+    assert any(line.startswith(CANDIDATE_MARK) and "Captured candidate" in line
+               for line in index_hits)
+    assert any(not line.startswith(CANDIDATE_MARK) and "Reviewed decision" in line
+               for line in index_hits)
+
+
+def test_the_cli_search_output_shows_the_mark(env):
+    _seed_candidate_vault(env)
+    r = CliRunner().invoke(main, ["memory", "search", "quokka"])
+    assert r.exit_code == 0, r.output
+    printed = (r.output + env.buf.getvalue()).replace("\n", " ")
+    assert "captured-candidate" in printed and "reviewed-decision" in printed
+    import re
+
+    results = re.findall(r"([\w-]+)\.md:\d+: (.*?quokka)", printed)
+    by_note = {note: line for note, line in results}
+    assert by_note["captured-candidate"].startswith("[candidate, unreviewed]")
+    assert not by_note["reviewed-decision"].startswith("[candidate, unreviewed]")
+
+
+def test_the_brief_framing_names_the_candidate_quarantine():
+    from jacked.memory import recall
+
+    header = recall._header_section(Path("/vault/groups/g1"), "g1")
+    assert "candidate" in header and "[candidate, unreviewed]" in header
+
+
+def test_a_candidate_note_titled_index_is_still_marked(env):
+    """Its file is decision/index.md: a typed note, not the group index."""
+    from jacked.memory.vault import CANDIDATE_MARK
+
+    _init_empty(env)
+    r = CliRunner().invoke(main, [
+        "memory", "add", "--type", "decision", "--title", "Index", "--group", "g1",
+        "--tags", "candidate", "--body", "Plain text. Mentions wombat only here.",
+    ])
+    assert r.exit_code == 0, r.output
+    hits = [line for p, _, line in memory.search(env.vault, "wombat")
+            if _posix(p).endswith("decision/index.md")]
+    assert hits and all(line.startswith(CANDIDATE_MARK) for line in hits)
+
+
+def test_a_group_named_like_a_note_type_still_marks_its_index(env):
+    """groups/decision/index.md is the index of a group called "decision",
+    not a decision note."""
+    from jacked.memory.vault import CANDIDATE_MARK
+
+    _init_empty(env)
+    r = CliRunner().invoke(main, [
+        "memory", "add", "--type", "reference", "--title", "Capybara capture",
+        "--group", "decision", "--tags", "candidate", "--body", "Body text.",
+    ])
+    assert r.exit_code == 0, r.output
+    index_hits = [line for p, _, line in memory.search(env.vault, "Capybara")
+                  if _posix(p).endswith("groups/decision/index.md")]
+    assert index_hits and all(line.startswith(CANDIDATE_MARK) for line in index_hits)
+
+
+@pytest.mark.parametrize("group", ["g1/../g2", "g2/decision/.."])
+def test_a_traversing_group_argument_cannot_hide_the_mark(env, group):
+    from jacked.memory.vault import CANDIDATE_MARK
+
+    _init_empty(env)
+    for g in ("g1", "g2"):
+        r = CliRunner().invoke(main, [
+            "memory", "add", "--type", "decision", "--title", f"Pangolin {g}",
+            "--group", g, "--tags", "candidate", "--body", "Pangolin body.",
+        ])
+        assert r.exit_code == 0, r.output
+    hits = memory.search(env.vault, "Pangolin", group=group)
+    assert hits and all(line.startswith(CANDIDATE_MARK) for _, _, line in hits)
