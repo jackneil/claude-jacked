@@ -60,10 +60,13 @@ def run_tree(
         kwargs["creationflags"] = NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
+    # uv, npx and jacked write UTF-8; the locale code page (cp1252 on
+    # Windows) would mangle anything outside ASCII.
+    text = {"text": True, "encoding": "utf-8", "errors": "replace"}
     if capture:
-        kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+        kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE, **text)
     elif relay:
-        kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+        kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **text)
     else:
         kwargs.update(stdout=log_fh, stderr=log_fh)
 
@@ -97,7 +100,13 @@ def run_tree(
 def _relay_lines(stream, log_fh) -> None:
     for line in stream:
         try:
-            sys.stdout.write(line)
+            try:
+                sys.stdout.write(line)
+            except UnicodeEncodeError:
+                # A console code page that cannot show a character: show
+                # the line with a replacement, never drop it.
+                enc = getattr(sys.stdout, "encoding", None) or "ascii"
+                sys.stdout.write(line.encode(enc, "replace").decode(enc))
             sys.stdout.flush()
         except (OSError, ValueError):
             pass  # a closed terminal: the child must keep running

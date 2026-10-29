@@ -93,7 +93,9 @@ def _run(tmp_path, steps):
     proc = subprocess.run(
         ["node", str(tmp_path / "harness.js"), str(tmp_path / "page.js"),
          str(tmp_path / "steps.json")],
-        capture_output=True, text=True, timeout=30, check=False,
+        # node writes UTF-8; Windows' default code page would mangle the
+        # heading's ellipsis.
+        capture_output=True, text=True, encoding="utf-8", timeout=30, check=False,
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)

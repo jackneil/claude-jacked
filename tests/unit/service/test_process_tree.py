@@ -113,3 +113,13 @@ def test_capture_timeout_still_reports_what_was_printed():
             timeout=3, capture=True,
         )
     assert "started" in (err.value.output or "")
+
+
+def test_relay_and_capture_read_utf8_output(tmp_path):
+    """uv and npx write UTF-8: the runner decodes it as UTF-8 on every
+    platform (Windows' default code page would mangle it)."""
+    from jacked.proctree import run_tree
+
+    script = "import sys; sys.stdout.buffer.write('caf\\u00e9 \\u2026\\n'.encode('utf-8'))"
+    result = run_tree([sys.executable, "-c", script], timeout=30, capture=True)
+    assert result.stdout == "caf\u00e9 \u2026\n"

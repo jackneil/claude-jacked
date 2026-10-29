@@ -208,3 +208,6 @@ def test_launchd_never_ran_is_false_off_macos_and_on_a_probe_failure(monkeypatch
     assert _real_launchd_job_never_ran(run=lambda *a, **k: 1 / 0) is False
     monkeypatch.setattr(platform.sys, "platform", "darwin")
     assert _real_launchd_job_never_ran(run=lambda *a, **k: MagicMock(returncode=113, stdout="")) is False
+    # A platform without os.getuid (Windows) never raises.
+    monkeypatch.delattr(platform.os, "getuid", raising=False)
+    assert _real_launchd_job_never_ran(run=lambda *a, **k: MagicMock(returncode=0, stdout="")) is False

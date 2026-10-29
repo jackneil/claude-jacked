@@ -351,7 +351,12 @@ def launchd_job_never_ran(run=subprocess.run, uid: "int | None" = None) -> bool:
         return False
     import re
 
-    domain = f"gui/{os.getuid() if uid is None else uid}/{LAUNCHD_LABEL}"
+    if uid is None:
+        getuid = getattr(os, "getuid", None)  # absent on Windows
+        if getuid is None:
+            return False
+        uid = getuid()
+    domain = f"gui/{uid}/{LAUNCHD_LABEL}"
     try:
         probe = run(
             ["launchctl", "print", domain],
