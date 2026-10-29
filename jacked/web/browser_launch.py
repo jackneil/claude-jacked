@@ -162,6 +162,9 @@ class BrowserSpec:
     name: str
     path: str
     family: str  # "chromium" | "firefox"
+    # Set for a Flatpak export launcher: the app id, so a launch can grant the
+    # sandbox the profile directory (see launch_argv).
+    flatpak_app: Optional[str] = None
 
 
 def _win_candidates() -> list[tuple[str, str, str]]:
@@ -243,11 +246,15 @@ def _linux_fixed_candidates(exe: str) -> list[str]:
     return paths
 
 
-def _resolve_linux_browser(exe: str) -> Optional[str]:
-    """``exe`` on PATH, else the first trusted fixed location, else None."""
+def _resolve_linux_browser(exe: str) -> tuple[Optional[str], Optional[str]]:
+    """``(path, flatpak app id or None)`` for ``exe``, or ``(None, None)``.
+
+    PATH first, then the first trusted fixed location.
+    """
     found = shutil.which(exe)
     if found:
-        return found
+        return found, None
+    exports = {os.path.expanduser(d) for d in _FLATPAK_EXPORT_DIRS}
     for path in _linux_fixed_candidates(exe):
         if not (os.path.isfile(path) and os.access(path, os.X_OK)):
             continue
@@ -256,7 +263,18 @@ def _resolve_linux_browser(exe: str) -> Optional[str]:
             # Values-free: the name is a fixed browser name, never a path.
             logger.warning("browser launcher: refused the %s candidate: %s", exe, refusal)
             continue
-        return path
+        return path, (_FLATPAK_APP_IDS.get(exe) if os.path.dirname(path) in exports else None)
+    return None, None
+
+
+def _flatpak_binary() -> Optional[str]:
+    """The ``flatpak`` command, on PATH or at its trusted system location."""
+    found = shutil.which("flatpak")
+    if found:
+        return found
+    fixed = "/usr/bin/flatpak"
+    if os.path.isfile(fixed) and os.access(fixed, os.X_OK) and not trusted_path_refusal(fixed):
+        return fixed
     return None
 
 
@@ -288,10 +306,10 @@ def _candidates() -> list[BrowserSpec]:
     else:
         seen: set[str] = set()
         for name, exe, family in _linux_candidates():
-            resolved = _resolve_linux_browser(exe)
+            resolved, flatpak_app = _resolve_linux_browser(exe)
             if resolved and resolved not in seen:
                 seen.add(resolved)
-                found.append(BrowserSpec(name, resolved, family))
+                found.append(BrowserSpec(name, resolved, family, flatpak_app))
     return found
 
 
@@ -415,6 +433,19 @@ def launch_argv(
         bundle = _app_bundle_for(spec.path)
         if bundle is not None:
             return ["open", "-n", "-a", bundle, "--args", *cmd[1:]]
+    if spec.flatpak_app and profile_dir is not None:
+        # A Flatpak browser cannot see ~/.claude/jacked-browser-profiles unless
+        # the app has home access (Flathub's Chrome and Firefox do not), so
+        # the per-account profile would not persist. Grant that one directory
+        # for this launch. The export launcher has no way to pass this option.
+        flatpak = _flatpak_binary()
+        if flatpak:
+            return [flatpak, "run", f"--filesystem={profile_dir}:create",
+                    spec.flatpak_app, *cmd[1:]]
+        logger.warning(
+            "browser launcher: flatpak command not found; %s may not keep its profile",
+            spec.flatpak_app,
+        )
     return cmd
 
 

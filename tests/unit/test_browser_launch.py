@@ -547,7 +547,37 @@ def test_linux_finds_a_flatpak_export_by_app_id(tmp_path, monkeypatch):
     monkeypatch.setattr(bl, "_LINUX_VENDOR_PATHS", {})
     monkeypatch.setattr(bl, "_FLATPAK_EXPORT_DIRS", (str(exports),))
     monkeypatch.setattr(bl.shutil, "which", lambda name: None)
-    assert bl._candidates() == [BrowserSpec("Firefox", str(shim), "firefox")]
+    assert bl._candidates() == [BrowserSpec("Firefox", str(shim), "firefox", "org.mozilla.firefox")]
+
+
+def test_flatpak_profile_launch_grants_the_profile_directory(monkeypatch):
+    """Flathub's Chrome and Firefox have no home access, so a profile under
+    ~/.claude would not persist. The launch goes through `flatpak run` with
+    that one directory granted."""
+    spec = BrowserSpec("Chrome", "/var/lib/flatpak/exports/bin/com.google.Chrome",
+                       "chromium", "com.google.Chrome")
+    monkeypatch.setattr(bl, "_flatpak_binary", lambda: "/usr/bin/flatpak")
+    argv = launch_argv(spec, URL, "profile", Path("/home/u/.claude/jacked-browser-profiles/a"),
+                       platform="linux")
+    assert argv[:4] == ["/usr/bin/flatpak", "run",
+                        f"--filesystem={Path('/home/u/.claude/jacked-browser-profiles/a')}:create",
+                        "com.google.Chrome"]
+    assert argv[4:] == build_command(spec, URL, "profile",
+                                     Path("/home/u/.claude/jacked-browser-profiles/a"))[1:]
+    # Incognito needs no directory: the export launcher is used as-is.
+    assert launch_argv(spec, URL, "incognito", None, platform="linux") == \
+        build_command(spec, URL, "incognito", None)
+
+
+def test_flatpak_profile_launch_without_flatpak_falls_back_and_says_so(monkeypatch, caplog):
+    spec = BrowserSpec("Chrome", "/var/lib/flatpak/exports/bin/com.google.Chrome",
+                       "chromium", "com.google.Chrome")
+    monkeypatch.setattr(bl, "_flatpak_binary", lambda: None)
+    profile = Path("/home/u/p")
+    with caplog.at_level("WARNING", logger="jacked.oauth.browser"):
+        argv = launch_argv(spec, URL, "profile", profile, platform="linux")
+    assert argv == build_command(spec, URL, "profile", profile)
+    assert "may not keep its profile" in caplog.text
 
 
 @linux_layout
@@ -578,5 +608,5 @@ def test_linux_path_hit_wins_and_duplicates_collapse(monkeypatch):
     monkeypatch.setattr(bl.shutil, "which",
                         lambda name: "/usr/bin/google-chrome" if name.startswith("google-chrome") else None)
     monkeypatch.setattr(bl, "_resolve_linux_browser",
-                        lambda exe: bl.shutil.which(exe))
+                        lambda exe: (bl.shutil.which(exe), None))
     assert bl._candidates() == [BrowserSpec("Chrome", "/usr/bin/google-chrome", "chromium")]
