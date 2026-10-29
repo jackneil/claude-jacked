@@ -207,9 +207,14 @@ def _exempt_ids(tree: ast.AST) -> set[int]:
     """ids of bare string statements (docstrings, attribute docstrings) and of
     every node inside a logger call, including a call through a local alias
     such as ``log = logger.warning``."""
+    def _logs(value: ast.AST) -> bool:
+        if isinstance(value, ast.IfExp):  # logger.debug if seen else logger.warning
+            return _logs(value.body) and _logs(value.orelse)
+        return _is_logger_method(value)
+
     aliases = {
         target.id
-        for node in ast.walk(tree) if isinstance(node, ast.Assign) and _is_logger_method(node.value)
+        for node in ast.walk(tree) if isinstance(node, ast.Assign) and _logs(node.value)
         for target in node.targets if isinstance(target, ast.Name)
     }
     exempt: set[int] = set()
@@ -321,7 +326,8 @@ def test_the_scans_see_through_lexer_traps(tmp_path):
         "    log = logger.warning if bad else logger.info\n"
         "    warn = logger.warning\n"
         "    warn('internal — fine %s', 1)\n"
+        "    log('also internal — fine')\n"
         "    print('shown — hit')\n",
         encoding="utf-8",
     )
-    assert [h.split(":")[1] for h in python_offenders(py)] == ["7"]
+    assert [h.split(":")[1] for h in python_offenders(py)] == ["8"]
