@@ -607,18 +607,24 @@ async def _run_chain_flow(
                     expires_col: new_expires_at,
                     **_breaker_updates(chain, None),
                 }
-                if chain == "cc" and result.refresh_token_expires_at_ms is not None:
-                    # Claude Code's own refresh rule: take the response's
-                    # refresh-token expiry when it sends one, else keep the
-                    # previous value (so nothing is written then).
+                if chain == "cc":
+                    # Claude Code's refresh rule for its pass-through fields
+                    # (#174i): take the response's refresh-token expiry when
+                    # it sends one, else keep the previous value. The values
+                    # are bound to a refresh lineage, so they are re-bound to
+                    # the rotated token either way.
                     from jacked.credentials.oauth_extra import (
                         encode_oauth_extra,
                         parse_oauth_extra,
                     )
 
-                    extra = parse_oauth_extra((current or {}).get("cc_oauth_extra"))
-                    extra["refreshTokenExpiresAt"] = result.refresh_token_expires_at_ms
-                    updates["cc_oauth_extra"] = encode_oauth_extra(extra)
+                    previous = current or {}
+                    extra = parse_oauth_extra(
+                        previous.get("cc_oauth_extra"), previous.get("cc_refresh_token")
+                    )
+                    if result.refresh_token_expires_at_ms is not None:
+                        extra["refreshTokenExpiresAt"] = result.refresh_token_expires_at_ms
+                    updates["cc_oauth_extra"] = encode_oauth_extra(extra, result.refresh_token)
 
                 db_updated = False
                 for attempt in range(3):
@@ -794,7 +800,7 @@ async def _cc_chain_died(
             cc_access_token=live_access,
             cc_expires_at=live_exp_s,
             cc_refresh_token=None,
-            cc_oauth_extra=encode_oauth_extra(recovered_extra),
+            cc_oauth_extra=encode_oauth_extra(recovered_extra, None),
             **_breaker_updates("cc", "invalid_grant"),
         )
         logger.info(

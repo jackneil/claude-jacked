@@ -766,6 +766,8 @@ CC_IMPORT_GUARD_COLS = (
     "cc_refresh_token",
     "cc_expires_at",
     "cc_refresh_failure_type",
+    # Read to decide whether the pass-through fields changed (#174i).
+    "cc_oauth_extra",
 )
 # Added when a dead-token verdict (cc_token_known_dead) decided the import:
 # the keeper verdict and the primary token its fingerprint includes.
@@ -967,7 +969,9 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
     if not cc_chain_dead(account):
         from jacked.credentials.oauth_extra import encode_oauth_extra, oauth_extra_from
 
-        extra = encode_oauth_extra(oauth_extra_from(oauth))
+        # Bound to the refresh token the row holds after this write.
+        row_refresh = updates.get("cc_refresh_token", account.get("cc_refresh_token"))
+        extra = encode_oauth_extra(oauth_extra_from(oauth), row_refresh)
         if extra != account.get("cc_oauth_extra"):
             updates["cc_oauth_extra"] = extra
 
@@ -1078,7 +1082,11 @@ def build_oauth_data(account: dict) -> dict:
             # The fields Claude Code wrote that jacked carries through (#174i),
             # only when known: never invented. refreshTokenExpiresAt describes
             # the refresh token beside it, so it goes only with one.
-            extra = parse_oauth_extra(account.get("cc_oauth_extra"))
+            # Read for the row's own refresh token: fields captured with an
+            # earlier lineage are not this one's.
+            extra = parse_oauth_extra(
+                account.get("cc_oauth_extra"), account.get("cc_refresh_token")
+            )
             if not cc_rt:
                 extra.pop("refreshTokenExpiresAt", None)
             return {

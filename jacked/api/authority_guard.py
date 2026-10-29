@@ -370,7 +370,8 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
     if row.get("cc_refresh_failure_type") != "invalid_grant":
         from jacked.credentials.oauth_extra import encode_oauth_extra, oauth_extra_from
 
-        extra = encode_oauth_extra(oauth_extra_from(oauth))
+        row_refresh = updates.get("cc_refresh_token", row.get("cc_refresh_token"))
+        extra = encode_oauth_extra(oauth_extra_from(oauth), row_refresh)
         if extra != row.get("cc_oauth_extra"):
             updates["cc_oauth_extra"] = extra
     return updates

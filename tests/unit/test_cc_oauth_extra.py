@@ -18,6 +18,7 @@ import pytest
 
 from jacked.api.credential_helpers import build_oauth_data
 from jacked.credentials.canonical import CredentialPayload
+from jacked.credentials.oauth_extra import encode_oauth_extra, parse_oauth_extra
 from jacked.web.database import Database
 
 RT_EXPIRES = 1_900_000_000_000
@@ -44,8 +45,8 @@ def _row(**extra):
 
 
 def test_known_fields_are_written_back():
-    extra = json.dumps({"refreshTokenExpiresAt": RT_EXPIRES, "clientId": "c-1",
-                        "subscriptionTypeSource": "sign_in"})
+    extra = encode_oauth_extra({"refreshTokenExpiresAt": RT_EXPIRES, "clientId": "c-1",
+                                "subscriptionTypeSource": "sign_in"}, "cc-rt")
     oauth = build_oauth_data(_row(cc_oauth_extra=extra))
     assert oauth["refreshTokenExpiresAt"] == RT_EXPIRES
     assert oauth["clientId"] == "c-1"
@@ -59,20 +60,23 @@ def test_unknown_fields_are_absent_never_invented():
 
 
 def test_refresh_expiry_goes_only_with_a_refresh_token():
-    extra = json.dumps({"refreshTokenExpiresAt": RT_EXPIRES, "clientId": "c-1"})
+    extra = encode_oauth_extra({"refreshTokenExpiresAt": RT_EXPIRES, "clientId": "c-1"}, None)
     oauth = build_oauth_data(_row(cc_refresh_token=None, cc_oauth_extra=extra))
     assert "refreshTokenExpiresAt" not in oauth
     assert oauth["clientId"] == "c-1"
 
 
 def test_the_primary_fallback_carries_none_of_them():
-    extra = json.dumps({"refreshTokenExpiresAt": RT_EXPIRES})
+    extra = encode_oauth_extra({"refreshTokenExpiresAt": RT_EXPIRES}, "cc-rt")
     oauth = build_oauth_data(_row(cc_access_token=None, cc_oauth_extra=extra))
     assert "refreshTokenExpiresAt" not in oauth
 
 
 def test_a_stored_value_cannot_smuggle_a_token_field():
-    extra = json.dumps({"accessToken": "evil", "refreshToken": "evil", "clientId": "c"})
+    from jacked.credentials.oauth_extra import lineage_of
+
+    extra = json.dumps({"accessToken": "evil", "refreshToken": "evil", "clientId": "c",
+                        "_lineage": lineage_of("cc-rt")})
     oauth = build_oauth_data(_row(cc_oauth_extra=extra))
     assert oauth["accessToken"] == "cc-at" and oauth["refreshToken"] == "cc-rt"
 
@@ -132,7 +136,8 @@ def test_switch_reconcile_switch_keeps_refresh_token_expiry(tmp_path):
 def test_the_drift_warning_no_longer_fires_for_carried_fields(caplog):
     from jacked.credentials.transaction import _warn_on_schema_drift
 
-    stored = json.dumps({"refreshTokenExpiresAt": RT_EXPIRES, "subscriptionTypeSource": "sign_in"})
+    stored = encode_oauth_extra({"refreshTokenExpiresAt": RT_EXPIRES,
+                                 "subscriptionTypeSource": "sign_in"}, "cc-rt")
     target = build_oauth_data(_row(cc_oauth_extra=stored))
     authority = {**target, "refreshTokenExpiresAt": RT_EXPIRES - 5,
                  "subscriptionTypeSource": "sign_in"}
@@ -187,7 +192,8 @@ def test_a_cc_refresh_takes_the_response_expiry_or_keeps_the_old_one(tmp_path, s
     aid = db.create_account("owner@test.com", "primary-at", int(time.time()) + 3600)["id"]
     db.update_account(aid, cc_access_token="cc-at", cc_refresh_token="cc-rt",
                       cc_expires_at=int(time.time()) - 10,
-                      cc_oauth_extra=json.dumps({"refreshTokenExpiresAt": 123, "clientId": "c"}))
+                      cc_oauth_extra=encode_oauth_extra({"refreshTokenExpiresAt": 123, "clientId": "c"},
+                                                        "cc-rt"))
     result = TokenExchangeResult(
         success=True, access_token="cc-at-2", refresh_token="cc-rt-2", expires_in=3600,
         refresh_token_expires_at_ms=(int(time.time() * 1000) + sent * 1000) if sent else None,
@@ -195,7 +201,8 @@ def test_a_cc_refresh_takes_the_response_expiry_or_keeps_the_old_one(tmp_path, s
     _refresh(db, aid, result)
     row = db.get_account(aid)
     assert row["cc_access_token"] == "cc-at-2"
-    extra = json.loads(row["cc_oauth_extra"])
+    # Re-bound to the rotated refresh token, so they are still readable.
+    extra = parse_oauth_extra(row["cc_oauth_extra"], row["cc_refresh_token"])
     assert extra["clientId"] == "c"
     if expected == "kept":
         assert extra["refreshTokenExpiresAt"] == 123
@@ -220,7 +227,9 @@ def test_the_scoped_file_sync_carries_the_fields(tmp_path):
         "accessToken": "new", "refreshToken": "new-rt", "expiresAt": 9_999_999_999_000,
         "refreshTokenExpiresAt": RT_EXPIRES}}))
     _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
-    assert json.loads(db.get_account(aid)["cc_oauth_extra"]) == {"refreshTokenExpiresAt": RT_EXPIRES}
+    row = db.get_account(aid)
+    assert parse_oauth_extra(row["cc_oauth_extra"], row["cc_refresh_token"]) == {
+        "refreshTokenExpiresAt": RT_EXPIRES}
 
 
 # ---------------------------------------------------------------------------
@@ -248,3 +257,44 @@ def test_the_column_is_added_to_an_existing_database_without_touching_rows(tmp_p
     conn.close()
     assert "cc_oauth_extra" in cols
     assert after == before
+
+
+def test_fields_from_a_replaced_lineage_are_never_written_back(tmp_path):
+    """A writer that replaces the tokens without touching the column (an older
+    jacked after a downgrade does a fresh sign-in) leaves the old fields
+    behind; they are bound to the old refresh token, so none goes out."""
+    db = Database(str(tmp_path / "t.db"))
+    aid = db.create_account("owner@test.com", "primary-at", int(time.time()) + 3600)["id"]
+    db.update_account(aid, cc_access_token="cc-at", cc_refresh_token="old-rt",
+                      cc_expires_at=int(time.time()) + 3600,
+                      cc_oauth_extra=encode_oauth_extra(
+                          {"refreshTokenExpiresAt": RT_EXPIRES, "clientId": "custom"}, "old-rt"))
+    assert build_oauth_data(db.get_account(aid))["clientId"] == "custom"
+    # The older jacked's sign-in: new tokens, the column untouched.
+    db.update_account(aid, cc_access_token="new-at", cc_refresh_token="new-rt")
+    oauth = build_oauth_data(db.get_account(aid))
+    assert "clientId" not in oauth and "refreshTokenExpiresAt" not in oauth
+
+
+def test_the_scoped_sync_takes_fields_even_when_the_token_is_unchanged(tmp_path):
+    from jacked.launch import _sync_tokens_from_file
+
+    db = Database(str(tmp_path / "test.db"))
+    aid = db.create_account("owner@test.com", "primary-at", int(time.time()) + 3600)["id"]
+    db.update_account(aid, cc_access_token="same-at", cc_refresh_token="same-rt")
+    config_dir = tmp_path / "accounts" / str(aid)
+    config_dir.mkdir(parents=True)
+    (config_dir / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "same-at", "refreshToken": "same-rt", "expiresAt": 9_999_999_999_000,
+        "subscriptionTypeSource": "profile"}}))
+    _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+    row = db.get_account(aid)
+    assert parse_oauth_extra(row["cc_oauth_extra"], "same-rt") == {"subscriptionTypeSource": "profile"}
+    assert row["cc_access_token"] == "same-at"
+
+
+def test_an_absurd_refresh_lifetime_is_ignored_not_raised():
+    from jacked.credentials.oauth_extra import refresh_expiry_from_response
+
+    for value in (1e308, float("inf"), float("nan"), -5, "x", True):
+        assert refresh_expiry_from_response({"refresh_token_expires_in": value}, 1000) is None

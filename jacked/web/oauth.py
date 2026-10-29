@@ -128,7 +128,9 @@ def _sign_in_oauth_extra(tokens: dict) -> Optional[str]:
     if not tokens.get("refresh_token"):
         return None
     expires = refresh_expiry_from_response(tokens, int(time.time() * 1000))
-    return encode_oauth_extra({"refreshTokenExpiresAt": expires} if expires else {})
+    return encode_oauth_extra(
+        {"refreshTokenExpiresAt": expires} if expires else {}, tokens.get("refresh_token")
+    )
 
 
 def identity_hint_params(account: Optional[dict]) -> dict:
