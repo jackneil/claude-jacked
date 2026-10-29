@@ -33,7 +33,7 @@ def _process_tree_through_subprocess_run():
     tests/unit/service/test_process_tree.py."""
     import subprocess as _subprocess
 
-    def _via_run(argv, *, timeout, log_fh=None):
+    def _via_run(argv, *, timeout, log_fh=None, relay=False):
         return _subprocess.run(argv, stdout=log_fh, stderr=log_fh, check=False,
                                timeout=timeout).returncode
 
@@ -1349,6 +1349,15 @@ class TestInterruptedUpgrade:
 
         stack = TestUpgradeIsATransaction._patches()
         restart = MagicMock(side_effect=restart_effect or (lambda argv, timeout: 0 if restart_ok else 1))
+
+        def tree(argv, *, timeout, log_fh=None, relay=False):
+            # The restart after an interrupt is the call under test; every
+            # other child (the package install) runs through subprocess.run.
+            if argv[1:] == ["service", "restart"]:
+                return restart(argv, timeout)
+            import subprocess as _subprocess
+
+            return _subprocess.run(argv, check=False).returncode
         with (
             stack[0], stack[1], stack[2], stack[3],
             patch("subprocess.Popen"),
@@ -1357,7 +1366,7 @@ class TestInterruptedUpgrade:
             patch("jacked.cli._installed_package_version", return_value="0.107.1"),
             patch("jacked.service.updater.run_migrate_settings", side_effect=interrupt),
             patch("jacked.service.process.is_port_available", return_value=port_free),
-            patch("jacked.service.updater.run_process_tree", restart),
+            patch("jacked.service.updater.run_process_tree", side_effect=tree),
             contextlib.ExitStack() as extras,
         ):
             for cm in extra:

@@ -70,6 +70,9 @@
         ["rolling_back",       "Rolling back to the previous version"],
     ];
 
+    // A status record unchanged this long is stale (the updater is gone).
+    const STALE_MS = 120000;
+
     // Phases that only run when an update goes wrong.
     const OPTIONAL_PHASES = new Set(["rolling_back"]);
 
@@ -88,6 +91,7 @@
         currentVersion: null,
         overall: "in_progress",
         currentPhase: null,
+        haveRecord: false,
         error: null,
         recovery: null,
         phases: {},
@@ -221,14 +225,23 @@
         }
     }
 
-    // The update is over. The new version answering is not enough: the
-    // skill packs refresh runs after the new service is up, and its result
-    // (ok or warning) arrives after the version matches.
+    function statusAgeMs() {
+        if (!state.serverMtime) return null;
+        const t = Date.parse(state.serverMtime);
+        return Number.isNaN(t) ? null : Date.now() - t;
+    }
+
+    // The update is over when its status record says so. The new version
+    // answering is not enough: the skill packs refresh runs after the new
+    // service is up, and its result (ok or warning) arrives later. The
+    // version match decides only when there is no record, or the record
+    // stopped changing (an updater that died after the restart).
     function isFinished() {
         if (state.overall === "succeeded" || state.overall === "failed") return true;
         const targetKnown = state.targetVersion && state.targetVersion !== "next";
-        return Boolean(targetKnown && state.currentVersion === state.targetVersion &&
-            state.currentPhase !== "refreshing_packs");
+        if (!(targetKnown && state.currentVersion === state.targetVersion)) return false;
+        const age = statusAgeMs();
+        return !state.haveRecord || (age !== null && age > STALE_MS);
     }
 
     function renderBanner() {
@@ -239,13 +252,9 @@
 
         const done = state.overall !== "failed" && isFinished();
 
-        let serverAgeMs = null;
-        if (state.serverMtime) {
-            const t = Date.parse(state.serverMtime);
-            if (!Number.isNaN(t)) serverAgeMs = Date.now() - t;
-        }
+        const serverAgeMs = statusAgeMs();
         const stuck = !done && state.overall !== "failed" &&
-            serverAgeMs !== null && serverAgeMs > 120000;
+            serverAgeMs !== null && serverAgeMs > STALE_MS;
         renderHeading(done);
 
         if (done) {
@@ -302,6 +311,7 @@
             if (r.ok) {
                 const body = await r.json();
                 if (body && body.status) {
+                    state.haveRecord = true;
                     state.serviceDownSince = null;
                     state.serverMtime = body.mtime_iso || state.serverMtime;
                     if (!state.startedAt && body.status.started_at) {

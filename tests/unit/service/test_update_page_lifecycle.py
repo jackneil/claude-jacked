@@ -50,7 +50,7 @@ const context = {
   fetch: async url => {
     const s = steps[Math.min(step, steps.length - 1)];
     const body = url.includes("/api/update/status")
-      ? {status: s.status, mtime_iso: new Date().toISOString()}
+      ? {status: s.status, mtime_iso: s.mtime_iso || new Date().toISOString()}
       : {current: s.version};
     return {ok: true, json: async () => body};
   },
@@ -99,30 +99,41 @@ def _run(tmp_path, steps):
     return json.loads(proc.stdout)
 
 
-def test_the_page_waits_for_the_packs_phase_then_shows_its_warning(tmp_path):
-    base = {"from_version": "0.108.1", "to_version": "0.109.0", "method": "uv"}
-    running = dict(base, overall="in_progress", current_phase="refreshing_packs",
+BASE = {"from_version": "0.108.1", "to_version": "0.109.0", "method": "uv"}
+UPDATING = "Jacked is updating\u2026"
+
+
+def test_the_page_waits_through_the_restart_and_packs_then_shows_the_warning(tmp_path):
+    """The new service answers with the target version while the record is
+    still verifying it, then refreshing packs; only the record's own end
+    finishes the page."""
+    verifying = dict(BASE, overall="in_progress", current_phase="verifying_service",
+                     phases=_phases(("verifying_service", "in_progress")))
+    running = dict(BASE, overall="in_progress", current_phase="refreshing_packs",
                    phases=_phases(("verifying_service", "ok"), ("refreshing_packs", "in_progress")))
-    warned = dict(base, overall="succeeded", current_phase=None,
+    warned = dict(BASE, overall="succeeded", current_phase=None,
                   phases=_phases(("verifying_service", "ok"), ("refreshing_packs", "warning")))
     out = _run(tmp_path, [
-        {"status": running, "version": "0.109.0"},  # new service up, packs running
+        {"status": verifying, "version": "0.109.0"},  # new service answers early
+        {"status": running, "version": "0.109.0"},
         {"status": warned, "version": "0.109.0"},
     ])
-    assert out[0] == {"heading": "Jacked is updating…", "banner": "", "polling": True}
-    assert out[1]["heading"] == "Jacked is updated"
-    assert "The skill packs were not refreshed." in out[1]["banner"]
-    assert "jacked packs update" in out[1]["banner"]
-    assert out[1]["polling"] is False
+    for step in out[:2]:
+        assert step == {"heading": UPDATING, "banner": "", "polling": True}
+    assert out[2]["heading"] == "Jacked is updated"
+    assert "The skill packs were not refreshed." in out[2]["banner"]
+    assert "jacked packs update" in out[2]["banner"]
+    assert out[2]["polling"] is False
 
 
-def test_a_version_match_in_any_other_phase_still_finishes(tmp_path):
-    """An updater that died after the restart never marks the record
-    succeeded; the version match is the fallback signal, as before."""
-    stale = {"from_version": "0.108.1", "to_version": "0.109.0", "method": "uv",
-             "overall": "in_progress", "current_phase": "verifying_service",
-             "phases": _phases(("verifying_service", "in_progress"))}
-    out = _run(tmp_path, [{"status": stale, "version": "0.109.0"}])
+def test_a_stale_record_with_the_new_version_still_finishes(tmp_path):
+    """An updater that died after the restart never closes its record; once
+    the record stops changing, the version match finishes the page."""
+    stale = dict(BASE, overall="in_progress", current_phase="verifying_service",
+                 phases=_phases(("verifying_service", "in_progress")))
+    out = _run(tmp_path, [
+        {"status": stale, "version": "0.109.0", "mtime_iso": "2020-01-01T00:00:00Z"},
+    ])
     assert out[0]["heading"] == "Jacked is updated"
     assert out[0]["polling"] is False
 

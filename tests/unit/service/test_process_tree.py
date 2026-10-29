@@ -60,3 +60,56 @@ def test_the_exit_code_comes_back(tmp_path):
         )
     assert code == 3
     assert log.read_text().strip() == "hi"
+
+
+LEAVES_A_WORKER = (
+    "import subprocess, sys\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+    "open(sys.argv[1], 'w').write(str(child.pid))\n"
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="group cleanup after exit is POSIX")
+def test_a_worker_left_behind_by_a_clean_exit_is_stopped(tmp_path):
+    """An inner timeout (npx under `jacked packs update`) can exit the child
+    while a worker still runs; the runner stops what is left of the group."""
+    pid_file = tmp_path / "worker.pid"
+    code = run_process_tree([sys.executable, "-c", LEAVES_A_WORKER, str(pid_file)], timeout=30)
+    assert code == 0
+    worker = int(pid_file.read_text())
+    deadline = time.monotonic() + 10
+    while _alive(worker) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not _alive(worker)
+
+
+def test_relay_keeps_the_child_running_when_the_terminal_is_gone(tmp_path, monkeypatch):
+    """A closed terminal: writes to stdout raise. The child still finishes and
+    the log still gets every line."""
+    class Closed:
+        def write(self, _):
+            raise OSError(5, "Input/output error")
+
+        def flush(self):
+            raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(sys, "stdout", Closed())
+    log = tmp_path / "relay.log"
+    with open(log, "w") as fh:
+        code = run_process_tree(
+            [sys.executable, "-c", "for i in range(3): print('line', i)"],
+            timeout=30, log_fh=fh, relay=True,
+        )
+    assert code == 0
+    assert log.read_text().split() == ["line", "0", "line", "1", "line", "2"]
+
+
+def test_capture_timeout_still_reports_what_was_printed():
+    from jacked.proctree import run_tree
+
+    with pytest.raises(subprocess.TimeoutExpired) as err:
+        run_tree(
+            [sys.executable, "-c", "import sys, time; print('started', flush=True); time.sleep(60)"],
+            timeout=3, capture=True,
+        )
+    assert "started" in (err.value.output or "")

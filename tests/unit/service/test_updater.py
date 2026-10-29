@@ -21,7 +21,7 @@ def _process_tree_through_subprocess_run():
     tests/unit/service/test_process_tree.py."""
     import subprocess as _subprocess
 
-    def _via_run(argv, *, timeout, log_fh=None):
+    def _via_run(argv, *, timeout, log_fh=None, relay=False):
         return _subprocess.run(argv, stdout=log_fh, stderr=log_fh, check=False,
                                timeout=timeout).returncode
 

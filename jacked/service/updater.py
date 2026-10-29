@@ -11,7 +11,6 @@ from __future__ import annotations
 import http.client
 import json
 import logging
-import os
 import subprocess
 import sys
 import time
@@ -1190,52 +1189,19 @@ MIGRATE_TIMEOUT_SECONDS = 600
 PACK_REFRESH_TIMEOUT_SECONDS = 900
 
 
-def run_process_tree(argv: list[str], *, timeout: float, log_fh=None) -> int:
-    """Run ``argv`` in its own process group and return its exit code.
+def run_process_tree(
+    argv: list[str], *, timeout: float | None, log_fh=None, relay: bool = False
+) -> int:
+    """Run ``argv`` as a whole process tree and return its exit code.
 
-    ``subprocess.run`` kills only its direct child on a timeout, so a
-    grandchild (the npx worker under `jacked packs update`) kept writing
-    skills and lockfiles after the upgrade released its lock. Here the whole
-    group is killed and reaped on a timeout or any interrupt, then the
-    exception is raised again. The own session also keeps a closed terminal's
-    SIGHUP away from the child; the upgrade decides when to stop it.
+    A timeout or an interrupt stops the child and every worker it started
+    (jacked.proctree), so no npx or uv process keeps writing after the
+    upgrade gives up on it (#178i). Raises ``subprocess.TimeoutExpired`` and
+    ``OSError`` like ``subprocess.run``.
     """
-    kwargs: dict = {"stdout": log_fh, "stderr": log_fh}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
-    proc = subprocess.Popen(argv, **kwargs)
-    try:
-        return proc.wait(timeout=timeout)
-    except BaseException:
-        _kill_process_tree(proc)
-        raise
+    from jacked.proctree import run_tree
 
-
-def _kill_process_tree(proc) -> None:
-    if sys.platform == "win32":
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                check=False,
-                timeout=30,
-                creationflags=NO_WINDOW,
-            )
-        except (OSError, subprocess.SubprocessError):
-            proc.kill()
-    else:
-        import signal
-
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        logger.warning("Process %s did not exit after a kill", proc.pid)
+    return run_tree(argv, timeout=timeout, log_fh=log_fh, relay=relay).returncode
 
 
 def run_migrate_settings(jacked: str, log_fh=None) -> tuple[int, str | None]:

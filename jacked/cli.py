@@ -1301,22 +1301,24 @@ def _upgrade_phase(phase: str, status: str, **kwargs) -> None:
 
 def _upgrade_install_package(cmd: list[str], label: str) -> str:
     """Run the package upgrade, then re-resolve the `jacked` binary."""
-    import subprocess
     from jacked.findbin import find_bin
+    from jacked.service.updater import run_process_tree
 
     _upgrade_phase("installing_package", "begin")
     console.print(f"[dim]$ {label}[/dim]")
+    # Own process group plus relayed output: a closed terminal can neither
+    # hang up nor break the installer halfway through replacing the venv.
     with _defer_upgrade_signals():
-        result = subprocess.run(cmd)
-    if result.returncode != 0:
+        code = run_process_tree(cmd, timeout=None, relay=True)
+    if code != 0:
         _upgrade_phase(
             "installing_package", "failed",
-            error=f"upgrade command exit {result.returncode}", recovery=label,
+            error=f"upgrade command exit {code}", recovery=label,
         )
         console.print(
-            f"[red]Package upgrade failed (exit {result.returncode}). Aborting.[/red]"
+            f"[red]Package upgrade failed (exit {code}). Aborting.[/red]"
         )
-        sys.exit(result.returncode)
+        sys.exit(code)
 
     # Re-resolve jacked - the path may have changed after --force.
     jacked = find_bin("jacked")
@@ -1698,9 +1700,16 @@ def _restart_after_interrupt() -> "tuple[bool, str] | None":
 
         jacked = find_bin("jacked")
         if jacked:
-            code = run_process_tree(
-                [jacked, "service", "restart"], timeout=_INTERRUPT_RESTART_SECONDS
-            )
+            from jacked.service.updater import UPDATE_LOG
+
+            # Output goes to the update log, never to a terminal that may
+            # already be closed (an EIO there would stop the restart).
+            with open(UPDATE_LOG, "a", encoding="utf-8") as log_fh:
+                code = run_process_tree(
+                    [jacked, "service", "restart"],
+                    timeout=_INTERRUPT_RESTART_SECONDS,
+                    log_fh=log_fh,
+                )
             return code == 0, f"jacked service restart exit {code}"
         from jacked.service.platform import native_restart
 
