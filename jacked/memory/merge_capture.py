@@ -57,25 +57,20 @@ _PRUNE_DAYS = 90
 _MAIN_BRANCHES = ("main", "master")
 
 # Output contract for the distillation pass, enforced by the CLI (--json-schema).
+# The API takes this as a tool input_schema, which must have `"type": "object"`
+# at the root: a bare top-level `anyOf` (the earlier shape) is refused with
+# "400 tools.1.custom.input_schema.type: Field required", so every merge fell
+# back to the deterministic note. The skip-or-note choice is therefore made by
+# `_note_from_result`, not by the schema.
 MERGE_SCHEMA = {
-    "anyOf": [
-        {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["skip"],
-            "properties": {"skip": {"type": "boolean", "enum": [True]}},
-        },
-        {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["title", "body", "tags"],
-            "properties": {
-                "title": {"type": "string"},
-                "body": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-    ]
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "skip": {"type": "boolean"},
+        "title": {"type": "string"},
+        "body": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+    },
 }
 
 # "Merge pull request #123 from owner/branch"

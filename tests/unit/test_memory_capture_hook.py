@@ -7,6 +7,7 @@ passes even when pytest itself runs inside a Claude Code subagent). The
 `claude -p` boundary is always mocked -- a real claude binary is never invoked.
 """
 import json
+import os
 import subprocess
 from io import StringIO
 from types import SimpleNamespace
@@ -459,10 +460,29 @@ def test_call_claude_nonzero_exit_returns_distinct_cause(env):
     class _P:
         returncode = 3
         stdout = ""
+        stderr = ""
     with patch("subprocess.run", return_value=_P()):
         text, cause = capture.call_claude("prompt", "haiku")
     assert text is None
     assert cause == "claude exited 3"
+
+
+def test_call_claude_nonzero_exit_names_the_first_stderr_line(env):
+    """A failed run says WHY: the first non-empty stderr line, cut to 200 chars.
+    Without it, "claude exited 1" in jacked-memory.log cannot be diagnosed."""
+    class _P:
+        returncode = 1
+        stdout = ""
+        stderr = "\n  Error: Invalid value for --json-schema\nmore detail\n"
+    with patch("subprocess.run", return_value=_P()):
+        text, cause = capture.call_claude("prompt", "haiku")
+    assert text is None
+    assert cause == "claude exited 1: Error: Invalid value for --json-schema"
+
+    _P.stderr = "x" * 500
+    with patch("subprocess.run", return_value=_P()):
+        _text, cause = capture.call_claude("prompt", "haiku")
+    assert cause == "claude exited 1: " + "x" * 200
 
 
 def test_call_claude_gives_the_triage_session_no_tools(env):
@@ -481,6 +501,40 @@ def test_call_claude_gives_the_triage_session_no_tools(env):
         assert "--strict-mcp-config" in argv
         assert "--mcp-config" not in argv
         assert "--dangerously-skip-permissions" not in argv
+
+
+def test_call_claude_runs_no_hooks_and_saves_no_session(env):
+    """The triage session must not fire hooks: its own SessionEnd would run the
+    memory capture hook again (a second retry-queue drain, another claude -p).
+    It also writes no transcript, so recover and analytics never see it."""
+    class _P:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+    for schema in (None, capture.TRIAGE_SCHEMA):
+        with patch("subprocess.run", return_value=_P()) as run:
+            capture.call_claude("prompt", "haiku", schema=schema)
+        argv = run.call_args.args[0]
+        at = argv.index("--settings")
+        assert json.loads(argv[at + 1]) == {"disableAllHooks": True}
+        assert "--no-session-persistence" in argv
+        child_env = run.call_args.kwargs["env"]
+        assert child_env[capture.TRIAGE_ENV] == "1"
+        # The rest of the environment is inherited (auth, PATH, proxies).
+        assert child_env.get("PATH") == os.environ.get("PATH")
+
+
+def test_capture_is_a_no_op_inside_a_triage_session(env, monkeypatch):
+    """Backstop for a hook that still fires (a managed policy can force hooks):
+    a capture that runs inside a triage child returns at once, with no claude
+    call and no retry-queue drain."""
+    monkeypatch.setenv(capture.TRIAGE_ENV, "1")
+    calls = []
+    monkeypatch.setattr(capture, "call_claude", lambda *a, **k: calls.append(a) or ("{}", None))
+    monkeypatch.setattr(capture, "_drain_queue", lambda *a, **k: calls.append("drain") or (False, []))
+    capture.session_end({"transcript_path": "/nonexistent", "cwd": "/tmp", "session_id": "s"})
+    capture.pre_compact({"transcript_path": "/nonexistent", "cwd": "/tmp", "session_id": "s"})
+    assert calls == []
 
 
 def test_call_claude_returns_stdout_and_no_cause_on_success(env):
@@ -862,3 +916,17 @@ def test_capture_failure_writes_to_memory_log(env):
         assert "triage failed" in text
     finally:
         _clear()
+
+
+def test_call_claude_reads_the_api_error_from_the_json_envelope(env):
+    """With --output-format json the CLI leaves stderr empty and puts the API
+    error in the stdout envelope. The cause must carry it."""
+    class _P:
+        returncode = 1
+        stdout = json.dumps({"is_error": True, "subtype": "success",
+                             "result": "API Error: 400 tools.1.custom.input_schema.type: Field required"})
+        stderr = ""
+    with patch("subprocess.run", return_value=_P()):
+        text, cause = capture.call_claude("prompt", "haiku", schema=capture.TRIAGE_SCHEMA)
+    assert text is None
+    assert cause == "claude exited 1: API Error: 400 tools.1.custom.input_schema.type: Field required"
