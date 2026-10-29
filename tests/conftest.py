@@ -367,6 +367,12 @@ def _no_real_service_processes(request, monkeypatch):
         first = head.replace("\\", "/").rsplit("/", 1)[-1].lower()
         if first in supervisors:
             raise RuntimeError("test tried to drive a real supervisor: " + text)
+        # The Task Scheduler is also read through its COM API from PowerShell
+        # (jacked.service.supervisors._task_xml.task_query_command, #165i).
+        if first in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"} and (
+            "Schedule.Service" in text
+        ):
+            raise RuntimeError("test tried to drive a real supervisor: " + text)
         padded = f" {text} "
         after_service = " " + padded.split(" service ", 1)[1] if " service " in padded else ""
         if "jacked" in text and any(

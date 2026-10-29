@@ -19,6 +19,7 @@ from ._artifacts import (
 )
 from ._transition import SupervisorTransitionLease, TransitionBusy
 from . import render_for_spec
+from ._task_xml import query_task_xml
 
 
 def uninstall_owned_supervisor(
@@ -72,7 +73,13 @@ def _uninstall_locked(
     )
     if marker is None:
         return _refused(artifact_path, "supervisor ownership marker is invalid")
-    common = {"capture_output": True, "text": True, "timeout": 15, "check": False}
+    common = {
+        "capture_output": True,
+        "text": True,
+        "errors": "replace",
+        "timeout": 15,
+        "check": False,
+    }
     try:
         if spec.supervisor is SupervisorKind.LAUNCHD:
             action = _uninstall_launchd(
@@ -163,12 +170,14 @@ def _uninstall_systemd(spec, path, original, run, common) -> SupervisorAction:
 
 
 def _uninstall_task(spec, path, marker, run, common) -> SupervisorAction:
-    queried = run(_task_query_command(spec.service_id), **common)
-    if queried.returncode == 3:
+    queried = query_task_xml(run, spec.service_id, timeout=common["timeout"])
+    if queried.absent:
         return SupervisorAction(True, "uninstall", "Task Scheduler task was absent")
     if queried.returncode != 0:
         return _refused(path, f"Task Scheduler inspection exit {queried.returncode}")
-    registered = extract_marker(queried.stdout.encode("utf-8"), spec.supervisor)
+    registered = (
+        extract_marker(queried.xml, spec.supervisor) if queried.xml is not None else None
+    )
     if registered != marker:
         return _refused(path, "registered task identity is foreign")
     # /End returns 1 when no instance is running. Deletion is still required
@@ -180,25 +189,6 @@ def _uninstall_task(spec, path, marker, run, common) -> SupervisorAction:
     if deleted.returncode != 0:
         return _refused(path, f"Task Scheduler exit {deleted.returncode}")
     return SupervisorAction(True, "uninstall", "unregistered Task Scheduler task")
-
-
-def _task_query_command(service_id: str) -> list[str]:
-    task_name = service_id.replace("'", "''")
-    script = (
-        "$ErrorActionPreference='Stop';"
-        "$service=New-Object -ComObject 'Schedule.Service';"
-        "$service.Connect();$folder=$service.GetFolder('\\');"
-        f"try{{$task=$folder.GetTask('{task_name}')}}"
-        "catch{if($_.Exception.HResult -eq -2147024894){exit 3}else{exit 4}};"
-        "[Console]::Out.Write($task.Xml)"
-    )
-    return [
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        script,
-    ]
 
 
 def _remove_exact_artifact(
