@@ -547,6 +547,67 @@ class TestReconcileOwnershipProof:
         self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"))
         assert not self._imported(db, aid)
 
+    # #179i: expiry order is not evidence that a token works. When the row's
+    # Claude Code token is KNOWN dead, an owned live token that merely expires
+    # sooner replaces it.
+
+    def _older_live_over_newer_row(self, tmp_path, **row_fields):
+        db, aid = self._account(tmp_path)
+        db.update_account(aid, cc_expires_at=int(time.time()) + 7200, **row_fields)
+        live = self._live(aid, expires_s=int(time.time()) + 600)
+        return db, aid, live
+
+    def test_older_live_token_replaces_a_row_token_the_api_refused(self, tmp_path):
+        """A 401 on the row's cc token (auth_rejected) makes it known dead."""
+        db, aid, live = self._older_live_over_newer_row(
+            tmp_path, cc_refresh_failure_type="auth_rejected",
+            cc_refresh_last_failed_at=int(time.time()) - 60)
+        self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"))
+        row = db.get_account(aid)
+        assert row["cc_access_token"] == "new-access"
+        assert row["cc_refresh_token"] == "new-refresh"
+        assert row["cc_expires_at"] < int(time.time()) + 7200
+        # The refusal belonged to the replaced token.
+        assert row["cc_refresh_failure_type"] is None
+
+    def test_older_live_token_replaces_a_row_token_the_keeper_gave_up_on(self, tmp_path):
+        """The window keeper's needs_reauth verdict, recorded against the
+        row's CURRENT tokens, makes the cc token known dead."""
+        from jacked.api.usage_monitor import _candidate_fingerprint
+
+        db, aid, live = self._older_live_over_newer_row(tmp_path)
+        row = db.get_account(aid)
+        db.set_keeper_state(aid, last_status="needs_reauth",
+                            token_fp=_candidate_fingerprint(row["cc_access_token"], row["access_token"]))
+        self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"))
+        assert db.get_account(aid)["cc_access_token"] == "new-access"
+
+    def test_a_stale_keeper_verdict_does_not_count(self, tmp_path):
+        """A needs_reauth recorded against OTHER tokens says nothing about the
+        row's current ones: the backward rule holds."""
+        db, aid, live = self._older_live_over_newer_row(tmp_path)
+        db.set_keeper_state(aid, last_status="needs_reauth", token_fp="aaaa|bbbb")
+        self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"))
+        assert db.get_account(aid)["cc_access_token"] == "old-access"
+
+    def test_dead_lineage_imports_the_access_token_but_not_the_refresh_token(self, tmp_path):
+        """invalid_grant: the row's tokens are dead, so the working access token
+        comes in; the refresh token stays out (it is Claude Code's single-use
+        token, and exchanging it would end Claude Code's session)."""
+        db, aid, live = self._older_live_over_newer_row(
+            tmp_path, cc_refresh_failure_type="invalid_grant")
+        self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"))
+        row = db.get_account(aid)
+        assert row["cc_access_token"] == "new-access"
+        assert row["cc_refresh_token"] == "old-refresh"
+        assert row["cc_refresh_failure_type"] == "invalid_grant"
+
+    def test_a_dead_row_token_still_needs_the_ownership_proof(self, tmp_path):
+        db, aid, live = self._older_live_over_newer_row(
+            tmp_path, cc_refresh_failure_type="auth_rejected")
+        self._reconcile(db, aid, live, _owner_profile("other@test.com", "org-b", "uuid-b"))
+        assert db.get_account(aid)["cc_access_token"] == "old-access"
+
 
 # ---------------------------------------------------------------------------
 # B6: exchange outcome classification (not_sent vs reply_lost)

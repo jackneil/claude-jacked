@@ -518,6 +518,37 @@ def cc_chain_dead(account: dict) -> bool:
     return account.get("cc_refresh_failure_type") in CC_CHAIN_DEAD_FAILURES
 
 
+def cc_token_known_dead(account: dict) -> bool:
+    """True when the row's Claude Code access token is known not to work.
+
+    Two recorded verdicts count: a per-chain failure that marks the token
+    unusable (``invalid_grant``, or ``auth_rejected`` after a 401), and the
+    window keeper's ``needs_reauth``, but only when it was recorded against
+    the row's CURRENT candidate tokens (a verdict on older tokens says
+    nothing about these). Expiry order is never such evidence (#179i).
+
+    >>> cc_token_known_dead({"cc_refresh_failure_type": "auth_rejected"})
+    True
+    >>> cc_token_known_dead({"cc_refresh_failure_type": None, "keeper_state": None})
+    False
+    """
+    if account.get("cc_refresh_failure_type") in CC_TOKEN_UNUSABLE_FAILURES:
+        return True
+    raw = account.get("keeper_state")
+    if not raw:
+        return False
+    try:
+        state = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (TypeError, ValueError):
+        return False
+    if state.get("last_status") != "needs_reauth":
+        return False
+    from jacked.api.usage_monitor import _candidate_fingerprint, _keeper_candidates
+
+    current = _candidate_fingerprint(*_keeper_candidates(account))
+    return current is not None and state.get("token_fp") == current
+
+
 def is_primary_publication(account: dict, live_access) -> bool:
     """True when ``live_access`` is the row's PRIMARY access token.
 
@@ -786,9 +817,11 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
         return
 
     # Never move a row backward: a stale payload (for example the file mirror
-    # read after a failed Keychain read) must not replace newer tokens.
+    # read after a failed Keychain read) must not replace newer tokens. Unless
+    # the row's token is KNOWN dead: then an owned live token that merely
+    # expires sooner is the one that works (#179i).
     row_expires = account.get("cc_expires_at") or 0
-    if live_expires and row_expires:
+    if live_expires and row_expires and not cc_token_known_dead(account):
         live_expires_s = int(live_expires / 1000) if live_expires > 1e12 else int(live_expires)
         if live_expires_s < row_expires:
             logger.info(
