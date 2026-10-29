@@ -12,6 +12,7 @@ import os
 import subprocess
 from datetime import datetime, timedelta, timezone
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -713,6 +714,46 @@ def test_a_link_out_of_the_group_is_never_read(env, outside, monkeypatch):
     brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
     assert "Outside linker" not in brief
     assert not any("outside" in path for path in opened)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "- [Unlinked line](<{own}>) - hook",
+        "- [Unlinked line]({own} \"title\") - hook",
+        "- [Unlinked line]({own}#part) - hook",
+        "- [Unlinked line] [[{stem}]] - hook",
+    ],
+)
+def test_an_entry_line_the_gate_cannot_check_stays_out(env, shape):
+    """A markdown reader follows these links, but the gate parses none of them,
+    so it cannot tell a candidate from a reviewed note: fail closed."""
+    _seed_group(env)
+    res = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="Unlinked line",
+        group="myrepo", repos=["myrepo"], tags=["candidate"], body="Body.",
+    )
+    _rewrite_index_line(
+        env, res, lambda own: shape.format(own=own, stem=own.removesuffix(".md")),
+    )
+    brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
+    assert "Unlinked line" not in brief
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_a_fifo_in_place_of_a_note_is_never_opened(env):
+    """Opening a FIFO blocks until a writer appears, which would hang the
+    SessionStart hook. It is excluded without being read."""
+    _seed_group(env)
+    res = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="Fifo note",
+        group="myrepo", repos=["myrepo"], tags=[], body="Body.",
+    )
+    note = Path(res["abs_path"])
+    note.unlink()
+    os.mkfifo(note)
+    brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
+    assert "Fifo note" not in brief
 
 
 def test_candidate_note_surfaces_after_promotion(env):

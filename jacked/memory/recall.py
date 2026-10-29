@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -374,7 +375,8 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
     the vault) stay out of the injected brief until a librarian or human pass
     promotes them. A line whose note can't be read or parsed is KEPT: only a
     positively-identified candidate tag excludes it, so a broken note never
-    silently vanishes from recall.
+    silently vanishes from recall. A line with no link the gate can check, or
+    with a link out of the group folder, is excluded: it cannot be vetted.
 
     Returns ``(excerpt_lines, decision_lines)`` both in original (oldest-first)
     order to match the newest-at-bottom index: ``excerpt_lines`` is the last
@@ -386,7 +388,10 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
     def _reviewed(line: str) -> bool:
         links = _entry_links(line)
         if not links:
-            return True  # no parseable link -> keep (never silently drop)
+            # An entry line with no link a reader could be pointed at by
+            # this parser (a wikilink, an anchor, an angle-bracket link) is
+            # unvetted: keep it out rather than inject an unreviewed note.
+            return False
         # Reviewed only when EVERY linked note is: a title or hook that names
         # another (reviewed) note can never launder an unreviewed one, because
         # the line's own note is always among its links.
@@ -424,6 +429,14 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
 
 
 def _is_candidate_note(path: Path) -> bool:
+    """True when the note at ``path`` is tagged ``candidate``. Something that
+    exists but is not a regular file (a FIFO would block SessionStart) counts
+    as one and is never opened; a missing or unreadable note does not."""
+    try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            return True
+    except OSError:
+        return False
     try:
         meta, _body = vault_mod.read_note(path)
     except (OSError, UnicodeDecodeError):
