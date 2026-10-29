@@ -22,8 +22,12 @@ PHASES: list[dict] = [
     # After the service is back: downloading skill packs no longer keeps the
     # service down (#178i). A failure here is a "warning": the upgrade itself
     # succeeded, and `jacked packs update` retries it.
-    {"name": "refreshing_packs", "label": "Refreshing skill packs"},
+    {"name": "refreshing_packs", "label": "Refreshing skill packs", "may_warn": True},
     {"name": "rolling_back", "label": "Rolling back to the previous version"},
 ]
 
 PHASE_NAMES: list[str] = [p["name"] for p in PHASES]
+
+# Phases that can end as "warning" without failing the update. update.html
+# must explain each one in its done banner (PHASE_WARNINGS there).
+WARNING_PHASE_NAMES: list[str] = [p["name"] for p in PHASES if p.get("may_warn")]

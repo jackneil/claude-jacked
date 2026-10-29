@@ -2345,7 +2345,7 @@ def _update_status_init_shim(from_version, to_version, method, log_path):
 @click.option("--error", default=None)
 @click.option("--recovery", default=None)
 def _update_status_shim(phase, status, error, recovery):
-    """Internal: write one status transition. `status` is in_progress|ok|failed."""
+    """Internal: write one status transition. `status` is in_progress|ok|warning|failed."""
     from jacked.service import update_status as us_mod
     path = us_mod.UPDATE_STATUS_FILE
     try:

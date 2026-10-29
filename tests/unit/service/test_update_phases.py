@@ -85,3 +85,25 @@ def test_update_html_posts_state_and_breaks_out_of_frame():
     assert "postMessage" in html
     assert "_top" in html
     assert "The service is restarting. Reconnecting" in html
+
+
+def test_update_html_explains_every_warning_phase():
+    """A phase that can end as "warning" needs its own banner text and
+    recovery command in update.html, or the user sees an amber row with
+    no explanation (#178i)."""
+    import re
+    from jacked.service.update_phases import WARNING_PHASE_NAMES
+
+    html = (_web_dir() / "update.html").read_text(encoding="utf-8")
+    block = re.search(r"const PHASE_WARNINGS = \{(.*?)\};", html, re.S)
+    assert block, "update.html has no PHASE_WARNINGS map"
+    keys = set(re.findall(r"^\s*(\w+):", block.group(1), re.M))
+    assert WARNING_PHASE_NAMES, "expected at least one warning phase"
+    assert keys == set(WARNING_PHASE_NAMES)
+
+
+def test_update_html_styles_the_warning_state():
+    html = (_web_dir() / "update.html").read_text(encoding="utf-8")
+    assert "li.phase.warning" in html
+    assert ".dot.warning" in html
+    assert 'id="heading"' in html

@@ -50,7 +50,7 @@
     </style>
 </head>
 <body>
-    <h1>Jacked is updating&hellip;</h1>
+    <h1 id="heading">Jacked is updating&hellip;</h1>
     <div class="meta" id="meta">Waiting for first status update&hellip;</div>
     <ol class="phases" id="phases"></ol>
     <div id="banner" class="banner"></div>
@@ -72,6 +72,12 @@
 
     // Phases that only run when an update goes wrong.
     const OPTIONAL_PHASES = new Set(["rolling_back"]);
+
+    // A phase that ends as "warning" does not fail the update. The done
+    // banner says what did not happen and the command that does it later.
+    const PHASE_WARNINGS = {
+        refreshing_packs: ["The skill packs were not refreshed.", "jacked packs update"],
+    };
 
     const state = {
         startedAt: null,
@@ -189,6 +195,31 @@
         banner.parentNode.insertBefore(wrap, banner.nextSibling);
     }
 
+    function renderHeading(done) {
+        const heading = document.getElementById("heading");
+        if (done) heading.textContent = "Jacked is updated";
+        else if (state.overall === "failed") heading.textContent = "Jacked update failed";
+        else heading.textContent = "Jacked is updating\u2026";
+    }
+
+    function renderWarnings(banner) {
+        for (const [name, label] of PHASES) {
+            const entry = state.phases[name];
+            if (!entry || entry.status !== "warning") continue;
+            const [text, command] = PHASE_WARNINGS[name] ||
+                [label + " did not complete. See ~/.claude/jacked-update.log.", null];
+            const row = makeEl("div", "row");
+            row.appendChild(makeEl("b", null, "Warning: "));
+            row.appendChild(document.createTextNode(text));
+            if (command) {
+                row.appendChild(document.createTextNode(" To do it later, run "));
+                row.appendChild(makeEl("code", null, command));
+                row.appendChild(document.createTextNode("."));
+            }
+            banner.appendChild(row);
+        }
+    }
+
     function renderBanner() {
         const banner = document.getElementById("banner");
         clearChildren(banner);
@@ -206,11 +237,13 @@
         }
         const stuck = !done && state.overall !== "failed" &&
             serverAgeMs !== null && serverAgeMs > 120000;
+        renderHeading(done);
 
         if (done) {
             banner.classList.add("succeeded");
             const v = state.currentVersion || state.targetVersion || "";
             banner.appendChild(makeEl("div", null, "Update complete. jacked is now v" + v + "."));
+            renderWarnings(banner);
             const a = makeEl("a", "button", "Open dashboard");
             a.href = "/";
             // Break out of the bootstrap iframe so the whole tab navigates.
