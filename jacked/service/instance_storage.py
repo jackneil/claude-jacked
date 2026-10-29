@@ -367,9 +367,10 @@ def process_user_identity(pid: int) -> str:
             timeout=2,
             check=False,
         )
-        if result.returncode != 0 or not result.stdout.strip().isdigit():
+        uid_text = result.stdout.strip()
+        if result.returncode != 0 or not (uid_text.isascii() and uid_text.isdigit()):
             raise ProcessLookupError(pid)
-        return f"uid:{int(result.stdout.strip())}"
+        return f"uid:{int(uid_text)}"
     if sys.platform == "win32":
         # Opening another user's process token may be denied, which is itself
         # insufficient ownership evidence and therefore fails closed.
