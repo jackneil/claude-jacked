@@ -755,6 +755,27 @@ def read_live_credentials() -> dict | None:
     return None
 
 
+def _platform_store_holds(live: dict) -> bool:
+    """Whether ``live`` holds the tokens the platform store itself holds.
+
+    On macOS the credentials file is a mirror that Claude Code never updates,
+    so ``read_live_credentials`` returns a stale copy after a failed Keychain
+    read. A decision that admits an OLDER payload (the dead-token override)
+    must not act on that copy. Other platforms have no separate store: the
+    file is the store.
+    """
+    if sys.platform != "darwin":
+        return True
+    store = read_platform_credentials()
+    if not isinstance(store, dict):
+        return False
+    held = store.get("claudeAiOauth") or {}
+    seen = live.get("claudeAiOauth") or {}
+    return bool(held.get("accessToken")) and (
+        held.get("accessToken"), held.get("refreshToken")
+    ) == (seen.get("accessToken"), seen.get("refreshToken"))
+
+
 # The row columns every Claude Code token import decision reads. An import
 # that read the row, then did slow work (the ownership lookup), writes only
 # while these still hold what it read (Database.update_account_if_unchanged),
@@ -910,6 +931,13 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
                 return None
             if cached:
                 return _RECONCILE_RETRY_FRESH
+            if not _platform_store_holds(live):
+                logger.info(
+                    "Account %d: the older live credentials are not the "
+                    "Keychain's own copy; not importing them",
+                    account_id,
+                )
+                return None
             # The verdict decided this import, so it is guarded too.
             guard_cols = CC_IMPORT_GUARD_COLS + CC_VERDICT_GUARD_COLS
 

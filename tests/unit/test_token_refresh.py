@@ -650,6 +650,43 @@ class TestReconcileOwnershipProof:
             ch.reconcile_credentials_from_live_store(aid, db)
         assert db.get_account(aid)["cc_access_token"] == "fresh-access"
 
+    def _override_on_macos(self, tmp_path, monkeypatch, keychain):
+        """Run the dead-token override as on macOS: ``read_live_credentials``
+        returns ``live`` and the Keychain itself returns ``keychain``."""
+        import sys
+        from unittest.mock import patch
+
+        from jacked.api import credential_helpers as ch
+
+        db, aid, live = self._older_live_over_newer_row(
+            tmp_path, cc_refresh_failure_type="auth_rejected")
+        monkeypatch.setattr(sys, "platform", "darwin")
+        with patch("jacked.api.credential_helpers.read_live_credentials", return_value=live), \
+             patch("jacked.api.credential_helpers.read_platform_credentials",
+                   return_value=keychain(live)), \
+             patch("jacked.api.credential_helpers._ownership_lookup",
+                   return_value=_owner_profile("owner@test.com", "org-a", "uuid-a")):
+            ch.reconcile_credentials_from_live_store(aid, db)
+        return db.get_account(aid)
+
+    def test_on_macos_the_override_ignores_the_file_mirror(self, tmp_path, monkeypatch):
+        """The Keychain read failed, so the payload is the stale file mirror:
+        a dead-token verdict must not let it move the row backward."""
+        row = self._override_on_macos(tmp_path, monkeypatch, keychain=lambda live: None)
+        assert (row["cc_access_token"], row["cc_refresh_token"]) == ("old-access", "old-refresh")
+
+    def test_on_macos_the_override_ignores_a_mirror_the_keychain_disagrees_with(
+        self, tmp_path, monkeypatch
+    ):
+        row = self._override_on_macos(
+            tmp_path, monkeypatch,
+            keychain=lambda live: self._live(1, access="kc-access", refresh="kc-refresh"))
+        assert row["cc_access_token"] == "old-access"
+
+    def test_on_macos_the_override_imports_the_keychain_copy(self, tmp_path, monkeypatch):
+        row = self._override_on_macos(tmp_path, monkeypatch, keychain=lambda live: live)
+        assert (row["cc_access_token"], row["cc_refresh_token"]) == ("new-access", "new-refresh")
+
     def test_a_keeper_verdict_that_skipped_the_cc_token_says_nothing_about_it(self, tmp_path):
         """Under invalid_grant the keeper leaves the cc token out and records
         needs_reauth against the primary token alone: no verdict on cc."""
