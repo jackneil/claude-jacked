@@ -374,18 +374,26 @@ def test_the_guard_sees_every_call_form(tmp_path, monkeypatch):
     )
     tree = ast.parse(src)
     module = "jacked._guard_probe"
-    _modules.cache_clear(); _sync_functions.cache_clear(); _blocking_sync_functions.cache_clear()
-    _imports.cache_clear(); _aliases.cache_clear()
+    _modules.cache_clear()
+    _sync_functions.cache_clear()
+    _blocking_sync_functions.cache_clear()
+    _imports.cache_clear()
+    _aliases.cache_clear()
     real = dict(_modules())
     real[module] = tree
     monkeypatch.setattr(
         __import__(__name__, fromlist=["_modules"]), "_modules", lambda: real
     )
     try:
-        _sync_functions.cache_clear(); _blocking_sync_functions.cache_clear(); _imports.cache_clear(); _aliases.cache_clear()
+        _sync_functions.cache_clear()
+        _blocking_sync_functions.cache_clear()
+        _imports.cache_clear()
+        _aliases.cache_clear()
         probe = [v for v in _violations() if v.startswith(module)]
     finally:
-        _sync_functions.cache_clear(); _blocking_sync_functions.cache_clear(); _imports.cache_clear()
+        _sync_functions.cache_clear()
+        _blocking_sync_functions.cache_clear()
+        _imports.cache_clear()
         _aliases.cache_clear()
     assert probe == [
         f"{module}:15 nested() calls work (a local sync jacked.db query)",

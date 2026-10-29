@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="jacked:type" content="lockdown">
+  <meta name="jacked:status" content="audit-complete">
+  <meta name="jacked:branch" content="jack_20261029_deps_ruff_anthropic">
+  <meta name="jacked:date" content="2026-10-29">
+  <title>Supply-Chain Lockdown - claude-jacked</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#fafaf7; --card:#fff; --fg:#1b1b1b; --muted:#5d5d5d; --border:#d9d5cc; --ok:#19733b; --warn:#a55b0a; --danger:#b42318; --info:#2463a3; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#151515; --card:#202020; --fg:#ece9e3; --muted:#b4b0aa; --border:#383838; --ok:#69cc8c; --warn:#efad55; --danger:#f47b70; --info:#79afe8; } }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:2rem 1rem; background:var(--bg); color:var(--fg); font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:960px; margin:auto; }
+    h1 { margin:.25rem 0; font-size:2rem; }
+    h2 { margin-top:2.2rem; padding-bottom:.3rem; border-bottom:1px solid var(--border); }
+    h3 { margin-bottom:.4rem; }
+    .meta,.score,.finding,aside { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:1rem; margin:1rem 0; }
+    .meta { display:flex; flex-wrap:wrap; gap:.5rem 1.5rem; color:var(--muted); }
+    .score { display:flex; align-items:center; gap:1.5rem; }
+    .score strong { color:var(--warn); font:700 4rem/1 ui-monospace,monospace; }
+    .badge { display:inline-block; padding:.15rem .55rem; border-radius:999px; font-size:.78rem; font-weight:700; }
+    .ok { color:var(--ok); } .warn { color:var(--warn); } .danger { color:var(--danger); } .info { color:var(--info); } .muted { color:var(--muted); }
+    table { width:100%; border-collapse:collapse; background:var(--card); }
+    caption { text-align:left; font-weight:700; margin-bottom:.5rem; }
+    th,td { text-align:left; vertical-align:top; border:1px solid var(--border); padding:.55rem .7rem; }
+    code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:color-mix(in srgb,var(--card),var(--muted) 12%); padding:.1rem .3rem; border-radius:3px; }
+    ul.tasks { list-style:none; padding:0; } ul.tasks li { margin:.55rem 0; } input { margin-right:.5rem; }
+    @media print { body { background:#fff; color:#000; padding:0; } .finding,table,aside { break-inside:avoid; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Supply-Chain Lockdown - claude-jacked</h1>
+  <div class="meta">
+    <span>Date: 2026-10-29</span><span>Mode: audit (baseline)</span>
+    <span>Scope: worktree claude-jacked-m11 (branch jack_20261029_deps_ruff_anthropic, a git worktree), compared with master 92f2232</span>
+    <span>Not evaluated: AI/ML model deserialization; IDE-extension supply chain</span>
+  </div>
+
+  <h2>Score &amp; Posture</h2>
+  <div class="score"><strong>91</strong><div><b>Hardened</b> after this branch (master before it: <b>25</b>, Critical gaps).<br>Coverage: 9 of 10 applicable categories (90%). Malware is <i>unknown</i>: Socket is not installed; the manual existence and provenance checks below passed.</div></div>
+  <table>
+    <caption>Category breakdown (after this branch)</caption>
+    <tr><th>Category</th><th>Status</th><th>Notes</th></tr>
+    <tr><td>Lockfile integrity</td><td class="ok">ok</td><td>54/54 registry packages hashed (1353 sha256 entries); uv lock --check clean; CI uses uv run --frozen; cooldown 2026-10-22; no git-source deps</td></tr>
+    <tr><td>Dependency CVEs</td><td class="ok">ok</td><td>osv-scanner: no issues; pip-audit (osv + pypi): no known vulnerabilities; CI requirement files: no issues</td></tr>
+    <tr><td>Malware / typosquat</td><td class="muted">unknown</td><td>Socket missing (install: curl -fsSL https://socket.dev/install.sh | sh). All 54 lock names exist on PyPI; claude-jacked is registered; the two packages added in 90 days (pyobjc-framework-LocalAuthentication, pyobjc-framework-Security) are cleared by canonical source (ronaldoussoren/pyobjc master setup.py names) and are declared by this repo's pyproject.toml. Python only: no install scripts; CI installs --only-binary=:all:.</td></tr>
+    <tr><td>CI/Actions hardening</td><td class="ok">ok</td><td>11/11 uses: SHA-pinned with version comments; permissions: read-all on both workflows; persist-credentials: false on both checkouts; harden-runner (audit) in all 3 jobs; zizmor: no findings; actionlint clean; CI tools hash-locked</td></tr>
+    <tr><td>Secrets hygiene</td><td class="ok">ok</td><td>gitleaks: 1001 commits, no leaks; .gitignore covers .env*, *.pem, *.key, .npmrc, .pypirc, credential files; pre-commit gitleaks</td></tr>
+    <tr><td>Provenance &amp; signing</td><td class="ok">ok</td><td>PyPI Trusted Publishing (id-token scoped to the publish job), pypa/gh-action-pypi-publish v1.14.2 (PEP 740 attestations on by default), CycloneDX SBOM per release build</td></tr>
+    <tr><td>Container hardening</td><td class="muted">n/a</td><td>No Dockerfile</td></tr>
+    <tr><td>Pre-commit + Scorecard</td><td class="info">warn</td><td>Pre-commit: gitleaks, actionlint, zizmor. Scorecard on master 5.5/10: see SCSC-010..012</td></tr>
+  </table>
+
+  <h2>Ecosystem Inventory</h2>
+  <table>
+    <tr><th>Ecosystem</th><th>Evidence</th><th>Scanners</th></tr>
+    <tr><td>Python (uv)</td><td>pyproject.toml, uv.lock (54 packages)</td><td>osv-scanner, pip-audit, uv lock --check</td></tr>
+    <tr><td>GitHub Actions</td><td>tests.yml, publish.yml, dependabot.yml</td><td>zizmor 1.24.1, actionlint, OpenSSF Scorecard</td></tr>
+    <tr><td>Secrets</td><td>.gitleaks.toml, .pre-commit-config.yaml</td><td>gitleaks</td></tr>
+    <tr><td>Node, Docker</td><td>none</td><td>skipped</td></tr>
+  </table>
+  <p>Dependabot PRs in scope: #170pr (step-security/harden-runner v2.22.1 ccd8616d), #171pr (actions/download-artifact v8.0.2 9000827c), #172pr (actions/upload-artifact v7.0.2 cf430e03). Each pinned SHA matches its upstream release tag (git ref API).</p>
+
+  <h2>Findings</h2>
+
+  <div class="finding">
+    <h3><span class="badge danger">[cve][CRITICAL]</span> SCSC-001: 139 known advisories in the locked dependency set</h3>
+    <p><b>Status:</b> fixed</p>
+    <p><b>Evidence:</b> osv-scanner on master&#x27;s uv.lock: pillow 12.2.0 (up to CVSS 9.8, fix 13.0.0), anyio 4.13.0 (CVSS 9.3), certifi 2026.4.22 (CVSS 9.1), aiohttp 3.13.5 (up to 8.7), starlette 1.0.0 (up to 7.5), multidict 6.7.1 (5.3). Scorecard Vulnerabilities: 85 existing.</p>
+    <p><b>Risk:</b> An attacker could send crafted input to a vulnerable aiohttp/starlette code path (the service is an HTTP server and an HTTP client), or exploit pillow image decoding, on every install built from this lock.</p>
+    <p><b>Fix:</b> Targeted upgrade of the six packages under a cutoff moved to 2026-10-22: aiohttp 3.14.5, anyio 4.14.2, certifi 2026.10.19, multidict 7.1.0, pillow 13.0.0, starlette 1.9.0 (yarl 1.25.1 follows aiohttp). Pillow cap raised to &lt;14. Pillow 13 needs Python 3.11, and Python 3.10 reached end of life in October 2026, so requires-python is now &gt;=3.11. After: osv-scanner &#x27;No issues found&#x27;; pip-audit (osv and pypi databases) &#x27;No known vulnerabilities found&#x27;.</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge warn">[lockfile][HIGH]</span> SCSC-002: The exclude-newer cooldown was five months behind</h3>
+    <p><b>Status:</b> fixed</p>
+    <p><b>Evidence:</b> pyproject.toml [tool.uv] exclude-newer = 2026-05-13. The cooldown is meant to delay a new release by about seven days; left in place it froze every security fix out of the lock.</p>
+    <p><b>Risk:</b> An attacker could keep exploiting a fixed vulnerability for months, because the build refuses every release newer than the cutoff, including the fix.</p>
+    <p><b>Fix:</b> Cutoff moved to 2026-10-22 (seven days before the audit), with a comment that a stale cutoff is its own risk.</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge warn">[lockfile][HIGH]</span> SCSC-003: starlette had no upper version bound</h3>
+    <p><b>Status:</b> fixed</p>
+    <p><b>Evidence:</b> pyproject.toml: &quot;starlette&gt;=0.48&quot; (16 prod deps, only this one unbounded).</p>
+    <p><b>Risk:</b> An attacker who publishes a poisoned starlette 99.0 could land it in any downstream fresh resolve, whatever this repo&#x27;s lock says.</p>
+    <p><b>Fix:</b> &quot;starlette&gt;=0.48,&lt;2&quot;.</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge warn">[actions-hardening][HIGH]</span> SCSC-004: CI tool installs were not hash-pinned</h3>
+    <p><b>Status:</b> fixed</p>
+    <p><b>Evidence:</b> Scorecard Pinned-Dependencies 5/10: pipCommand not pinned by hash at tests.yml:41 (uv) and publish.yml:32-33 (pip, build, hatchling, cyclonedx-bom, twine).</p>
+    <p><b>Risk:</b> An attacker who compromises one of those PyPI projects (or a transitive dependency) could run code in the publish job, the job that holds the PyPI OIDC token.</p>
+    <p><b>Fix:</b> New .github/requirements/ci-uv.txt and ci-publish.txt (from .in files, uv pip compile --universal --generate-hashes, same cutoff); workflows install with --require-hashes --only-binary=:all:. Rehearsed locally on Python 3.11: hashed install, python -m build, twine check PASSED (wheel and sdist), cyclonedx-py SBOM 78 KB. osv-scanner on both files: no issues.</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge warn">[actions-hardening][HIGH]</span> SCSC-005: install.sh piped a remote installer to sh</h3>
+    <p><b>Status:</b> fixed</p>
+    <p><b>Evidence:</b> install.sh:13 curl -LsSf https://astral.sh/uv/install.sh | sh (Scorecard downloadThenRun not pinned).</p>
+    <p><b>Risk:</b> An attacker who controls or compromises that URL could run any code on the machine of everyone who runs the jacked installer.</p>
+    <p><b>Fix:</b> The script no longer runs another installer: it prints the official uv install command and exits, which matches the README&#x27;s &#x27;install uv first&#x27; step (the script already asked the user to re-run it after installing uv).</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge info">[lockfile][MEDIUM]</span> SCSC-006: Dependabot never updated uv.lock</h3>
+    <p><b>Status:</b> fixed</p>
+    <p><b>Evidence:</b> .github/dependabot.yml used package-ecosystem &quot;pip&quot; for a uv project; its PRs (#122pr anthropic, #177pr ruff) changed pyproject.toml only, while CI runs uv run --frozen from uv.lock.</p>
+    <p><b>Risk:</b> An attacker benefits when security updates are proposed but never reach the locked build: a merged Dependabot PR looks like a fix and changes nothing.</p>
+    <p><b>Fix:</b> package-ecosystem &quot;uv&quot; for the project (7-day cooldown kept), plus a pip entry for .github/requirements.</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge info">[lockfile][MEDIUM]</span> SCSC-007: An unused runtime dependency (anthropic)</h3>
+    <p><b>Status:</b> fixed</p>
+    <p><b>Evidence:</b> pyproject.toml declared anthropic&gt;=0.40,&lt;1; no file in the repository imports it (jacked calls the API with httpx).</p>
+    <p><b>Risk:</b> An attacker who compromises the anthropic SDK or one of its four exclusive transitive dependencies gains code execution in every jacked install, for code jacked never uses.</p>
+    <p><b>Fix:</b> Removed; the lock drops anthropic, distro, docstring-parser, jiter and sniffio. #122pr is superseded.</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge info">[precommit][MEDIUM]</span> SCSC-008: Lint was not enforced in CI</h3>
+    <p><b>Status:</b> fixed</p>
+    <p><b>Evidence:</b> tests.yml ran pytest only; a lint regression (E702 in tests/unit/api/test_db_off_loop_guard.py) reached master.</p>
+    <p><b>Risk:</b> Not an attack path by itself; it removes a guard that catches unsafe patterns before review.</p>
+    <p><b>Fix:</b> tests.yml runs uv run --frozen ruff check . before pytest; the rule set is pinned in [tool.ruff.lint] so a ruff upgrade cannot change it (ruff 0.15 and 0.17 both report 0 findings). #177pr is superseded by the pinned rules plus the &lt;0.18 cap.</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge info">[scorecard][MEDIUM]</span> SCSC-009: No security policy</h3>
+    <p><b>Status:</b> fixed</p>
+    <p><b>Evidence:</b> Scorecard Security-Policy 0: no SECURITY.md.</p>
+    <p><b>Risk:</b> An attacker benefits when a researcher has no private way to report a vulnerability and reports it in public.</p>
+    <p><b>Fix:</b> SECURITY.md added (private report route, supported versions, scope, how releases are built).</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge info">[scorecard][MEDIUM]</span> SCSC-010: Branch protection is off on master; private vulnerability reporting is off</h3>
+    <p><b>Status:</b> manual</p>
+    <p><b>Evidence:</b> Scorecard Branch-Protection 0; GET /repos/.../branches/master/protection: 404 Branch not protected; private-vulnerability-reporting: enabled=false.</p>
+    <p><b>Risk:</b> An attacker with a stolen maintainer token can force-push master without a status check.</p>
+    <p><b>Fix:</b> Repository settings (admin): see Manual Verification. Not changed by this audit.</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge info">[scorecard][MEDIUM]</span> SCSC-011: No SAST on commits</h3>
+    <p><b>Status:</b> filed</p>
+    <p><b>Evidence:</b> Scorecard SAST 0: no CodeQL or other SAST tool runs on commits.</p>
+    <p><b>Risk:</b> An attacker benefits from an injection or unsafe-deserialization pattern that a SAST pass would have flagged before merge.</p>
+    <p><b>Fix:</b> Filed as #199i (a CodeQL workflow; free on public repositories).</p>
+  </div>
+  <div class="finding">
+    <h3><span class="badge muted">[scorecard][LOW]</span> SCSC-012: Fuzzing, CII badge, single-organization contributors</h3>
+    <p><b>Status:</b> noted</p>
+    <p><b>Evidence:</b> Scorecard Fuzzing 0, CII-Best-Practices 0, Contributors 3, Code-Review 0 (single maintainer).</p>
+    <p><b>Risk:</b> Low direct risk; these lower the external trust score.</p>
+    <p><b>Fix:</b> Noted only.</p>
+  </div>
+
+  <h2>Remediation Plan</h2>
+  <ul class="tasks">
+    <li><input type="checkbox" checked disabled> SCSC-001/002/003: CVE refresh, cutoff 2026-10-22, starlette bound, Python &gt;=3.11</li>
+    <li><input type="checkbox" checked disabled> SCSC-004: hash-locked CI requirement files</li>
+    <li><input type="checkbox" checked disabled> SCSC-005: install.sh no longer runs a remote installer</li>
+    <li><input type="checkbox" checked disabled> SCSC-006: Dependabot uv ecosystem</li>
+    <li><input type="checkbox" checked disabled> SCSC-007: anthropic removed</li>
+    <li><input type="checkbox" checked disabled> SCSC-008: ruff in CI with a pinned rule set</li>
+    <li><input type="checkbox" checked disabled> SCSC-009: SECURITY.md</li>
+    <li><input type="checkbox" disabled> SCSC-011: CodeQL workflow (#199i)</li>
+  </ul>
+
+  <h2>Manual Verification</h2>
+  <ul class="tasks">
+    <li><input type="checkbox" disabled> Settings, Branches: protect master (required status checks for the three test jobs, no force-push).</li>
+    <li><input type="checkbox" disabled> Settings, Code security: enable private vulnerability reporting (SECURITY.md points reporters to it).</li>
+    <li><input type="checkbox" disabled> Settings, Actions: require actions pinned to a full-length commit SHA; workflow permissions read-only by default.</li>
+    <li><input type="checkbox" disabled> PyPI: confirm the trusted publisher for claude-jacked names this repository and the pypi environment, and that no API tokens remain.</li>
+  </ul>
+</main>
+</body>
+</html>

@@ -7,15 +7,16 @@ set -e
 echo "Installing claude-jacked..."
 echo ""
 
-# Check for uv
+# Check for uv. This script does not download and run another installer for
+# you: install uv with its official installer, then run this script again.
 if ! command -v uv &> /dev/null; then
-    echo "uv not found. Installing uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    echo "uv is not installed. jacked installs with uv."
     echo ""
-    echo "uv installed. You may need to restart your shell or run:"
-    echo "  source ~/.bashrc  (or ~/.zshrc)"
+    echo "Install uv with its official installer:"
+    echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"
+    echo "Other ways to install uv: https://docs.astral.sh/uv/getting-started/installation/"
     echo ""
-    echo "Then re-run this installer."
+    echo "Then open a new shell and run this installer again."
     exit 1
 fi
 

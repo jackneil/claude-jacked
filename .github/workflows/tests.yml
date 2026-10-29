@@ -37,8 +37,13 @@ jobs:
           python-version: "3.11"
 
       - name: Install uv
+        # Hash-locked (.github/requirements/ci-uv.txt, from ci-uv.in).
         run: |
-          python -m pip install --only-binary=:all: uv
+          python -m pip install --require-hashes --only-binary=:all: -r .github/requirements/ci-uv.txt
+
+      - name: Lint
+        # The rule set is pinned in pyproject.toml ([tool.ruff.lint]).
+        run: uv run --frozen ruff check .
 
       - name: Run tests
         run: uv run --frozen python -m pytest
