@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -240,12 +241,13 @@ def _linux_fixed_candidates(exe: str) -> list[str]:
     >>> _linux_fixed_candidates("firefox")[-2]
     '/var/lib/flatpak/exports/bin/org.mozilla.firefox'
     """
+    # Linux paths whatever the host: posixpath, never os.path (Windows CI).
     snap = _SNAP_NAMES.get(exe, exe)
-    paths = [os.path.join(directory, snap) for directory in _LINUX_FIXED_DIRS]
+    paths = [posixpath.join(directory, snap) for directory in _LINUX_FIXED_DIRS]
     paths.extend(_LINUX_VENDOR_PATHS.get(exe, ()))
     app_id = _FLATPAK_APP_IDS.get(exe)
     if app_id:
-        paths.extend(os.path.join(os.path.expanduser(d), app_id) for d in _FLATPAK_EXPORT_DIRS)
+        paths.extend(posixpath.join(os.path.expanduser(d), app_id) for d in _FLATPAK_EXPORT_DIRS)
     return paths
 
 
@@ -288,7 +290,7 @@ def _resolve_linux_browser(exe: str) -> tuple[Optional[str], Optional[str]]:
             # Values-free: the name is a fixed browser name, never a path.
             logger.warning("browser launcher: refused the %s candidate: %s", exe, refusal)
             continue
-        return path, (_FLATPAK_APP_IDS.get(exe) if os.path.dirname(path) in exports else None)
+        return path, (_FLATPAK_APP_IDS.get(exe) if posixpath.dirname(path) in exports else None)
     return None, None
 
 
