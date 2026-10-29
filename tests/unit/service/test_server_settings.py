@@ -89,12 +89,20 @@ def test_the_dashboard_socket_serves_over_sans_io(_isolate_home, monkeypatch):  
         assert getattr(server, "started", False), "uvicorn did not start"
 
         url = f"ws://127.0.0.1:{port}/api/ws"
-        seen = []
+        import logging
+
+        marker = f"sansio-probe-{port}"
+        got_ping = got_marker = False
         with ws_client.connect(url, origin=f"http://127.0.0.1:{port}", open_timeout=5) as conn:
-            while "ping" not in seen:
-                seen.append(json.loads(conn.recv(timeout=5))["type"])
-        # The app's own broadcasts (the server log feed) arrive as well.
-        assert "server_logs_changed" in seen
+            # A log line emitted AFTER the socket is open must come back as an
+            # app broadcast (the server log feed), independent of startup logs.
+            logging.getLogger("jacked.api.main").warning(marker)
+            deadline = time.monotonic() + 10
+            while not (got_ping and got_marker) and time.monotonic() < deadline:
+                frame = json.loads(conn.recv(timeout=5))
+                got_ping |= frame["type"] == "ping"
+                got_marker |= frame["type"] == "server_logs_changed" and marker in json.dumps(frame)
+        assert got_ping and got_marker
 
         from websockets.exceptions import InvalidStatus
 
