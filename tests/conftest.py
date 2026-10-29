@@ -1,10 +1,16 @@
 """Shared fixtures for jacked tests."""
 
+import os
 import re
 from pathlib import Path
 
 import pytest
 from unittest.mock import patch
+
+# Any jacked.db query that jacked code makes on an event-loop thread raises
+# in tests (jacked/web/database.py, #162): a blocking query on the service
+# loop freezes every route, whatever form the call takes.
+os.environ.setdefault("JACKED_DB_LOOP_STRICT", "1")
 
 from jacked.credentials.models import (
     CredentialIdentity,

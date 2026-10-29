@@ -11,6 +11,7 @@ WAL mode for concurrent reads, single writer lock for atomic writes.
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -22,6 +23,53 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 from pydantic import BaseModel, computed_field
 
 logger = logging.getLogger(__name__)
+
+# A query made on an event-loop thread blocks every route and background
+# loop of the service until it returns (#162). Every query is checked: the
+# first query from each call site logs a WARNING that names the site, so a
+# regression shows up in the field log instead of as a frozen dashboard.
+# The test suite sets JACKED_DB_LOOP_STRICT=1 (tests/conftest.py), which
+# raises instead when the call comes from the jacked package itself.
+_LOOP_QUERY_SITES: set[tuple[str, int]] = set()
+_THIS_FILE = __file__
+
+
+def _query_origin() -> tuple[str, int, str]:
+    """The first stack frame outside this module and contextlib (the
+    _reader/_writer context managers): who asked for the query."""
+    import contextlib
+    import sys
+
+    skip = {_THIS_FILE, contextlib.__file__}
+    frame = sys._getframe(2)
+    while frame is not None and frame.f_code.co_filename in skip:
+        frame = frame.f_back
+    if frame is None:
+        return ("?", 0, "?")
+    return (frame.f_code.co_filename, frame.f_lineno, frame.f_code.co_name)
+
+
+def _check_not_on_event_loop() -> None:
+    from asyncio import events
+
+    if events._get_running_loop() is None:
+        return
+    filename, lineno, func = _query_origin()
+    if os.environ.get("JACKED_DB_LOOP_STRICT") == "1" and (
+        f"{os.sep}jacked{os.sep}" in filename and f"{os.sep}tests{os.sep}" not in filename
+    ):
+        raise RuntimeError(
+            f"jacked.db query on the event loop thread from {filename}:{lineno} "
+            f"({func}); send it to a thread (#162)"
+        )
+    if (filename, lineno) in _LOOP_QUERY_SITES:
+        return
+    _LOOP_QUERY_SITES.add((filename, lineno))
+    logger.warning(
+        "jacked.db query on the event loop thread from %s:%d (%s); it blocks "
+        "every route and background loop until it returns",
+        filename, lineno, func,
+    )
 
 # Sessions without a heartbeat within this window are considered stale
 SESSION_STALENESS_MINUTES = 60
@@ -496,6 +544,7 @@ class Database:
 
     @contextmanager
     def _writer(self) -> Iterator[sqlite3.Connection]:
+        _check_not_on_event_loop()
         with self._write_lock:
             conn = self._get_connection()
             try:
@@ -507,6 +556,7 @@ class Database:
 
     @contextmanager
     def _reader(self) -> Iterator[sqlite3.Connection]:
+        _check_not_on_event_loop()
         yield self._get_connection()
 
     # Name of the one-time move of legacy shared breakers in the private

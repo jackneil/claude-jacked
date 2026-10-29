@@ -282,7 +282,9 @@ async def lifespan(app: FastAPI):
     try:
         from jacked.web.database import Database
 
-        app.state.db = Database()
+        # Schema setup and migrations are disk I/O: off the loop like every
+        # other query (#162). The loop thread then never opens a connection.
+        app.state.db = await asyncio.to_thread(Database)
         logger.info("Database initialized")
     except Exception as e:
         logger.warning("Database init failed: %s", e)
@@ -469,10 +471,11 @@ async def _close_loop_db_connection(app) -> None:
 
     ``Database`` connections are thread-local, and ``Database.close()``
     closes only the CALLING thread's connection. The one this shutdown must
-    close belongs to the loop thread (``Database()`` in the lifespan opened
-    it there for the schema). So detach it here, on the loop thread, and
-    close it in a worker: closing the last WAL connection checkpoints, which
-    is disk I/O. Never raises.
+    close is any one the loop thread opened (none today: the lifespan builds
+    the Database in a worker and every query runs off the loop, but a stray
+    loop-thread connection must still be closed). So detach it here, on the
+    loop thread, and close it in a worker: closing the last WAL connection
+    checkpoints, which is disk I/O. Never raises.
     """
     db = getattr(app.state, "db", None)
     if db is None:

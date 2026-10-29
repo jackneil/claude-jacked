@@ -222,6 +222,25 @@ def _local_blocking(fn: ast.AST, module: str, parents: dict) -> set[str]:
     if isinstance(owner, ast.ClassDef):
         methods = [item for item in owner.body if isinstance(item, ast.FunctionDef)]
     found: set[str] = set()
+    # Assignments in the coroutine itself: `fetch = db.get_account`,
+    # `fetch = lambda: db.get_account(1)`, `fetch = partial(db.get_account, 1)`.
+    for node in ast.walk(fn):
+        if not (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            continue
+        value = node.value
+        if isinstance(value, ast.Call) and ast.unparse(value.func).rsplit(".", 1)[-1] == "partial":
+            value = value.args[0] if value.args else value
+        if _is_db_method_ref(value) or (
+            isinstance(value, ast.Lambda) and _lambda_blocks(value, module, parents)
+        ) or (
+            isinstance(value, (ast.Name, ast.Attribute))
+            and _resolve(ast.Call(func=value, args=[], keywords=[]), module) in blocking
+        ):
+            found.add(node.targets[0].id)
     changed = True
     while changed:
         changed = False
@@ -238,6 +257,31 @@ def _local_blocking(fn: ast.AST, module: str, parents: dict) -> set[str]:
                 found.add(key)
                 changed = True
     return found
+
+
+def _is_db_method_ref(expr: ast.expr) -> bool:
+    """``db.get_account`` (not called) or ``getattr(db, "get_account")``."""
+    if isinstance(expr, ast.Attribute):
+        return expr.attr in METHODS and _is_db_receiver(expr.value)
+    return (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "getattr"
+        and len(expr.args) >= 2
+        and _is_db_receiver(expr.args[0])
+        and isinstance(expr.args[1], ast.Constant)
+        and expr.args[1].value in METHODS
+    )
+
+
+def _lambda_blocks(node: ast.Lambda, module: str, parents: dict) -> bool:
+    blocking = _blocking_sync_functions()
+    for call in ast.walk(node.body):
+        if not isinstance(call, ast.Call):
+            continue
+        if _is_db_method_ref(call.func) or _resolve(call, module) in blocking:
+            return True
+    return False
 
 
 def _call_name(call: ast.Call) -> str | None:
@@ -259,6 +303,11 @@ def _violations() -> list[str]:
                 continue
             for call in _direct_db_calls(fn, parents):
                 found.append(f"{module}:{call.lineno} {fn.name}() calls {ast.unparse(call.func)}")
+            for call in _own_calls(fn, parents):
+                if isinstance(call.func, ast.Call) and _is_db_method_ref(call.func):
+                    found.append(
+                        f"{module}:{call.lineno} {fn.name}() calls {ast.unparse(call.func)}"
+                    )
             local = _local_blocking(fn, module, parents)
             for call in _own_calls(fn, parents):
                 target = _resolve(call, module)
@@ -282,7 +331,7 @@ def test_no_coroutine_runs_a_jacked_db_query_on_the_event_loop():
     )
 
 
-def test_the_guard_sees_a_direct_and_an_indirect_call(tmp_path, monkeypatch):
+def test_the_guard_sees_every_call_form(tmp_path, monkeypatch):
     """The detector itself: one direct call, one through a sync helper, and
     the to_thread form that is allowed."""
     src = (
@@ -297,6 +346,19 @@ def test_the_guard_sees_a_direct_and_an_indirect_call(tmp_path, monkeypatch):
         "    def work():\n        return db.get_account(1)\n"
         "    await asyncio.to_thread(work)\n"
         "    return work()\n"
+        "async def via_getattr(db):\n"
+        "    return getattr(db, 'get_account')(1)\n"
+        "async def via_bound(db):\n"
+        "    fetch = db.get_account\n"
+        "    return fetch(1)\n"
+        "async def via_lambda(db):\n"
+        "    fetch = lambda: db.get_account(1)\n"
+        "    return fetch()\n"
+        "async def via_partial(db):\n"
+        "    import functools\n"
+        "    fetch = functools.partial(db.get_account, 1)\n"
+        "    await asyncio.to_thread(fetch)\n"
+        "    return fetch()\n"
         "aliased = helper\n"
         "async def via_alias(db):\n"
         "    return aliased(db)\n"
@@ -327,9 +389,65 @@ def test_the_guard_sees_a_direct_and_an_indirect_call(tmp_path, monkeypatch):
         _aliases.cache_clear()
     assert probe == [
         f"{module}:15 nested() calls work (a local sync jacked.db query)",
-        f"{module}:18 via_alias() calls {module}.helper (a sync jacked.db query)",
-        f"{module}:23 build() calls {module}.Flow (a sync jacked.db query)",
-        f"{module}:29 run() calls self._read (a local sync jacked.db query)",
+        f"{module}:17 via_getattr() calls getattr(db, 'get_account')",
+        f"{module}:20 via_bound() calls fetch (a local sync jacked.db query)",
+        f"{module}:23 via_lambda() calls fetch (a local sync jacked.db query)",
+        f"{module}:28 via_partial() calls fetch (a local sync jacked.db query)",
+        f"{module}:31 via_alias() calls {module}.helper (a sync jacked.db query)",
+        f"{module}:36 build() calls {module}.Flow (a sync jacked.db query)",
+        f"{module}:42 run() calls self._read (a local sync jacked.db query)",
         f"{module}:5 direct() calls db.get_account",
         f"{module}:7 indirect() calls {module}.helper (a sync jacked.db query)",
     ]
+
+
+# --- the runtime check (jacked/web/database.py) -----------------------------
+
+
+def test_strict_mode_raises_for_a_jacked_query_on_the_loop(tmp_path, monkeypatch):
+    """The test suite runs strict: a query that jacked code makes on an
+    event-loop thread raises, whatever form the call took (getattr, an
+    alias, another object's method) - the cases a static guard cannot see."""
+    import asyncio
+
+    import pytest
+
+    from jacked.api import usage_monitor
+    from jacked.web.database import Database
+
+    monkeypatch.setenv("JACKED_DB_LOOP_STRICT", "1")
+    db = Database(str(tmp_path / "jacked.db"))
+
+    async def on_loop():
+        return usage_monitor._setting_str(db, "anything", "default")
+
+    with pytest.raises(RuntimeError, match="event loop thread from .*usage_monitor"):
+        asyncio.run(on_loop())
+
+    async def off_loop():
+        return await asyncio.to_thread(usage_monitor._setting_str, db, "anything", "default")
+
+    assert asyncio.run(off_loop()) == "default"
+
+
+def test_outside_strict_mode_each_call_site_logs_once(tmp_path, monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    from jacked.api import usage_monitor
+    from jacked.web import database
+    from jacked.web.database import Database
+
+    monkeypatch.delenv("JACKED_DB_LOOP_STRICT", raising=False)
+    monkeypatch.setattr(database, "_LOOP_QUERY_SITES", set())
+    db = Database(str(tmp_path / "jacked.db"))
+
+    async def twice():
+        usage_monitor._setting_str(db, "a", "")
+        usage_monitor._setting_str(db, "a", "")
+
+    with caplog.at_level(logging.WARNING, logger="jacked.web.database"):
+        asyncio.run(twice())
+    lines = [r for r in caplog.records if "event loop thread" in r.getMessage()]
+    assert len(lines) == 1
+    assert "usage_monitor" in lines[0].getMessage()

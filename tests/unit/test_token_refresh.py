@@ -479,9 +479,14 @@ class TestReconcileOwnershipProof:
         spy.assert_not_called()
         assert db.get_account(aid)["cc_access_token"] == "new-access"
 
-    def test_event_loop_caller_never_blocks_on_the_lookup(self, tmp_path):
+    def test_event_loop_caller_never_blocks_on_the_lookup(self, tmp_path, monkeypatch):
         import asyncio
 
+        # This test calls reconcile ON the loop on purpose, to prove its
+        # network lookup is skipped there; the strict on-loop query check
+        # (#162) would stop it at the first DB read. No service path calls
+        # it on the loop (tests/unit/api/test_db_off_loop_guard.py).
+        monkeypatch.delenv("JACKED_DB_LOOP_STRICT", raising=False)
         db, aid = self._account(tmp_path)
 
         async def on_loop():
