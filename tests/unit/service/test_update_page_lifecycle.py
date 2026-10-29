@@ -159,6 +159,21 @@ def test_a_long_pack_refresh_by_a_live_updater_keeps_the_page_polling(tmp_path):
     assert gone[0]["heading"] == "Jacked is updated" and gone[0]["polling"] is False
 
 
+def test_liveness_is_cleared_when_the_record_disappears(tmp_path):
+    """The record was live, then the updater died and the API hid the
+    abandoned record (status null). The page must drop the old liveness and
+    finish, not stay suppressed forever."""
+    running = dict(BASE, overall="in_progress", current_phase="refreshing_packs",
+                   phases=_phases(("verifying_service", "ok"), ("refreshing_packs", "in_progress")))
+    long_ago = "2020-01-01T00:00:00Z"
+    out = _run(tmp_path, [
+        {"status": running, "version": "0.109.0", "mtime_iso": long_ago, "updater_alive": True},
+        {"status": None, "version": "0.109.0", "updater_alive": None},
+    ])
+    assert out[0]["polling"] is True
+    assert out[1]["heading"] == "Jacked is updated" and out[1]["polling"] is False
+
+
 def test_a_failed_update_says_so_in_the_heading(tmp_path):
     failed = {"from_version": "0.108.1", "to_version": "0.109.0", "method": "uv",
               "overall": "failed", "current_phase": None, "error": "uv exited 2",

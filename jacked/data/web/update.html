@@ -311,13 +311,14 @@
             const r = await fetch("/api/update/status", {cache: "no-store"});
             if (r.ok) {
                 const body = await r.json();
+                // On every answer, a null status included: a running updater
+                // keeps a long phase (the skill-pack refresh) alive however
+                // long its record stays unchanged, and only while it runs.
+                state.updaterAlive = body ? body.updater_alive : null;
                 if (body && body.status) {
                     state.haveRecord = true;
                     state.serviceDownSince = null;
                     state.serverMtime = body.mtime_iso || state.serverMtime;
-                    // A running updater keeps a long phase (the skill-pack
-                    // refresh) alive however long its record stays unchanged.
-                    state.updaterAlive = body.updater_alive;
                     if (!state.startedAt && body.status.started_at) {
                         state.startedAt = Date.parse(body.status.started_at);
                     }

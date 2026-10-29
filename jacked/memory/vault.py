@@ -227,7 +227,10 @@ def atomic_write_text(path: Path | str, text: str) -> None:
     behind vault state, vault config, the rollup recent/archive writes, and the
     settings_io writer.
     """
-    path = Path(path)
+    # Write through a symlink, the way write_text does: os.replace on the
+    # link itself would swap it for a plain file and leave its target (a
+    # shared dotfiles CLAUDE.md) unchanged.
+    path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:

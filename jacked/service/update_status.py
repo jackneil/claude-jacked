@@ -195,18 +195,43 @@ def _resolve_updater_pid(updater_pid: Optional[int]) -> Optional[int]:
     return updater_pid
 
 
+def _creation_id(pid: Optional[int]) -> Optional[str]:
+    """The process creation identity of ``pid``, or None when it cannot be read."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        from jacked.service.instance_storage import process_identity
+
+        return process_identity(pid).creation_id
+    except Exception:  # noqa: BLE001 - an unreadable identity is simply unknown
+        return None
+
+
 def updater_liveness(data: dict) -> Optional[bool]:
     """True when the recording process runs, False when it is gone, None when
-    the record names no usable pid or the probe is indeterminate."""
+    the record names no usable pid or the probe is indeterminate.
+
+    A pid alone can be reused by an unrelated process (after the updater
+    exits, or after a reboot), which would keep an abandoned record alive for
+    good. A record that carries ``updater_creation_id`` counts as alive only
+    while that same process (same creation identity) holds the pid.
+    """
     pid = data.get("updater_pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
     from jacked.service.process import process_liveness
 
     try:
-        return process_liveness(pid)
+        alive = process_liveness(pid)
     except Exception:  # noqa: BLE001 - a probe failure is indeterminate, not proof
         return None
+    recorded = data.get("updater_creation_id")
+    if alive is not True or not isinstance(recorded, str):
+        return alive  # dead, unknown, or a record written before the field
+    current = _creation_id(pid)
+    if current is None:
+        return None
+    return current == recorded
 
 
 def read_status_with_mtime(path: Path) -> tuple[Optional[dict], Optional[str]]:
@@ -281,6 +306,7 @@ def init_status(
         "recovery": None,
         "log_path": log_path,
         "updater_pid": _resolve_updater_pid(updater_pid),
+        "updater_creation_id": _creation_id(_resolve_updater_pid(updater_pid)),
     }
     if preinit:
         data["preinit"] = True
@@ -351,8 +377,10 @@ def init_or_adopt_status(
                 # An updater that cannot be probed (a Windows batch) must
                 # not leave the dead tray's pid on the record.
                 prior.pop("updater_pid", None)
+                prior.pop("updater_creation_id", None)
             else:
                 prior["updater_pid"] = claimed
+                prior["updater_creation_id"] = _creation_id(claimed)
             # A claim that cannot be written leaves the tray's dead pid on
             # the record; the update would then read as abandoned mid-run.
             # Surface it as the LockBusy the caller already handles.

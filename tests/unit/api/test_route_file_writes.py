@@ -21,10 +21,18 @@ def _raw_writes(path: Path) -> list[str]:
         func = node.func
         if isinstance(func, ast.Attribute) and func.attr in {"write_text", "write_bytes"}:
             found.append(f"{path.name}:{node.lineno} .{func.attr}()")
-        if isinstance(func, ast.Name) and func.id == "open" and len(node.args) > 1:
-            mode = node.args[1]
-            if isinstance(mode, ast.Constant) and isinstance(mode.value, str) and set(mode.value) & set("wax+"):
-                found.append(f"{path.name}:{node.lineno} open(..., {mode.value!r})")
+        is_open = (isinstance(func, ast.Name) and func.id == "open") or (
+            isinstance(func, ast.Attribute) and func.attr == "open"
+        )
+        if not is_open:
+            continue
+        # open(path, "w") puts the mode second; Path.open("w") puts it first.
+        position = 1 if isinstance(func, ast.Name) else 0
+        mode = next((kw.value for kw in node.keywords if kw.arg == "mode"), None)
+        if mode is None and len(node.args) > position:
+            mode = node.args[position]
+        if isinstance(mode, ast.Constant) and isinstance(mode.value, str) and set(mode.value) & set("wax+"):
+            found.append(f"{path.name}:{node.lineno} open(..., {mode.value!r})")
     return found
 
 
@@ -35,8 +43,12 @@ def test_route_modules_have_no_raw_file_writes():
 
 def test_the_guard_sees_a_raw_write(tmp_path):
     bad = tmp_path / "bad.py"
-    bad.write_text("from pathlib import Path\nPath('x').write_text('y')\nopen('z', 'w')\n")
-    assert len(_raw_writes(bad)) == 2
+    bad.write_text(
+        "from pathlib import Path\nPath('x').write_text('y')\nopen('z', 'w')\n"
+        "open('z', mode='a')\nPath('z').open('w')\nPath('z').open(mode='x')\n"
+        "open('r')\nPath('z').open()\n"
+    )
+    assert len(_raw_writes(bad)) == 5
 
 
 def test_concurrent_lesson_saves_never_mix_their_contents(tmp_path):
@@ -60,3 +72,25 @@ def test_concurrent_lesson_saves_never_mix_their_contents(tmp_path):
         for t in threads:
             t.join()
         assert target.read_text() in (long_text, short_text)
+
+
+def test_the_atomic_writer_writes_through_a_symlink(tmp_path):
+    """A CLAUDE.md that links to a shared dotfiles copy stays a link, and the
+    shared copy gets the new text (write_text behaved the same way)."""
+    import os
+
+    import pytest
+
+    from jacked.memory.vault import atomic_write_text
+
+    shared = tmp_path / "dotfiles" / "CLAUDE.md"
+    shared.parent.mkdir()
+    shared.write_text("old\n")
+    link = tmp_path / "CLAUDE.md"
+    try:
+        link.symlink_to(shared)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    atomic_write_text(link, "new\n")
+    assert os.path.islink(link)
+    assert shared.read_text() == "new\n" and link.read_text() == "new\n"

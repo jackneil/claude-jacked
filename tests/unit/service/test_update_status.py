@@ -828,3 +828,21 @@ def test_init_status_clobbers_a_record_whose_updater_is_proven_dead(tmp_path, mo
     with pytest.raises(us.LockBusy):  # indeterminate keeps the mtime rule
         us.init_status(path, "1.0.0", "1.4.0", "uv")
 
+
+
+def test_a_reused_pid_does_not_keep_an_update_alive(tmp_path, monkeypatch):
+    """The updater exits and an unrelated process takes its pid: same pid,
+    different creation identity, so the record is not proven alive."""
+    from jacked.service import update_status as us
+
+    p = tmp_path / "status.json"
+    us.init_status(p, from_version="a", to_version="b", method="uv")
+    data = us.read_status(p)
+    assert isinstance(data.get("updater_creation_id"), str)
+    assert us.updater_liveness(data) is True
+    monkeypatch.setattr(us, "_creation_id", lambda pid: "another-process")
+    assert us.updater_liveness(data) is False
+    monkeypatch.setattr(us, "_creation_id", lambda pid: None)
+    assert us.updater_liveness(data) is None  # cannot tell: the mtime rule applies
+    legacy = {k: v for k, v in data.items() if k != "updater_creation_id"}
+    assert us.updater_liveness(legacy) is True  # a record from before the field

@@ -306,12 +306,13 @@ def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONRes
 
 
 @router.get("/update/status")
-async def get_update_status():
+def get_update_status():
     """Return the current update-status JSON + its mtime.
 
     Used by /update.html (polled every 1s). mtime_iso is server-reported
     so the client-side stuck-detection doesn't reset on repeated stale reads.
     Returns {"status": null, "mtime_iso": null} when no update is in flight.
+    A plain def (threadpool): the liveness probe can read the process table.
     """
     data, mtime_iso = _update_status_mod.read_status_with_mtime(
         _update_status_mod.UPDATE_STATUS_FILE,
