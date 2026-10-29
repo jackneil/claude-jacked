@@ -908,6 +908,25 @@ def _upgrade_target_version() -> str | None:
     return safe or None
 
 
+# The real lookup, for tests: tests/conftest.py replaces _upgrade_target_version
+# so no test reaches PyPI, and this name lets the lookup itself be tested.
+_upgrade_target_version_impl = _upgrade_target_version
+
+
+def _status_target(previous: str, target: str | None) -> str:
+    """The update-status ``to_version``: the target only when it is NEWER than
+    the running build. The update page treats a running build that equals
+    to_version as done, so a reinstall of the current version (an extras
+    change, or the index already caught up) keeps "next".
+
+    >>> _status_target("0.107.0", "0.107.1"), _status_target("0.107.1", "0.107.1")
+    ('0.107.1', 'next')
+    >>> _status_target("0.107.0", None)
+    'next'
+    """
+    return target if target and _index_lag(previous, target) else "next"
+
+
 def _index_lag(installed: str, target: str | None) -> bool:
     """True when ``installed`` is older than the ``target`` the index named.
 
@@ -1231,7 +1250,7 @@ def _acquire_upgrade_lock(
         _us.init_or_adopt_status(
             _us.UPDATE_STATUS_FILE,
             from_version=previous_version,
-            to_version=target_version or "next",
+            to_version=_status_target(previous_version, target_version),
             method=method,
         )
     except _us.LockBusy as exc:
@@ -1992,7 +2011,7 @@ def _spawn_windows_upgrade_helper(
         # A batch cannot hold an OS lock across steps, so this is the Windows
         # equivalent of the CLI's exclusive update lock.
         'jacked _update_status_init "' + safe_previous + '" "'
-        + (safe_target or "next") + '" ' + method
+        + _status_target(safe_previous, safe_target or None) + '" ' + method
         + ' --log-path "' + str(log_path) + '"\r\n'
         'if errorlevel 2 (\r\n'
         '    echo [%date% %time%] REFUSED: another jacked updater is in progress\r\n'
@@ -2035,7 +2054,10 @@ def _spawn_windows_upgrade_helper(
         # Close the status record that _update_status_init claimed, so the
         # dashboard does not show "in progress" until the record goes stale.
         'jacked _update_status_succeed'
-        + (' --target "' + safe_target + '"' if safe_target else '')
+        + (
+            ' --target "' + safe_target + '" --previous "' + safe_previous + '"'
+            if safe_target else ''
+        )
         + '\r\n'
         '(goto) 2>nul & del "%~f0"\r\n'
         + preflight_failed_block
@@ -2211,7 +2233,8 @@ def _update_status_shim(phase, status, error, recovery):
 
 @main.command(name="_update_status_succeed", hidden=True)
 @click.option("--target", default=None, help="The version the upgrade should reach.")
-def _update_status_succeed_shim(target):
+@click.option("--previous", default=None, help="The version the upgrade started from.")
+def _update_status_succeed_shim(target, previous):
     """Internal: close the update-status record at the end of a Windows upgrade.
 
     With ``--target``, a build older than the target (the package index did
@@ -2222,7 +2245,7 @@ def _update_status_succeed_shim(target):
 
     installed = _installed_package_version()
     if _index_lag(installed, target):
-        message = _index_lag_message(installed, target, changed=True)
+        message = _index_lag_message(installed, target, changed=installed != previous)
         us_mod.mark_failed(
             us_mod.UPDATE_STATUS_FILE,
             error=f"the package index does not serve v{target} yet",
