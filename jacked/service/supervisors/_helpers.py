@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -14,9 +15,10 @@ def privately_controlled(path: Path, status: os.stat_result) -> bool:
     only for the caller's Linux user-private group. Debian and Ubuntu give
     such users umask 002, so every directory they create is group-writable,
     and that group holds only them (the same rule as
-    ``jacked.service.spec._trusted_group_ids``). On Linux the access ACL is
-    read too: with an ACL the group bits show the MASK, so a named grant to
-    another user would otherwise hide behind the private group.
+    ``jacked.service.spec._trusted_group_ids``). The ACL is read too, since
+    mode bits cannot show it: on Linux the group bits show the MASK, so a
+    named grant to another user would hide behind the private group; on
+    macOS an extended ACL entry can grant another user write on its own.
     """
     from jacked.service import spec
 
@@ -28,7 +30,13 @@ def privately_controlled(path: Path, status: os.stat_result) -> bool:
             return False
     try:
         spec._validate_linux_acl(path)
-    except ValueError:
+        if spec._HOST_IS_DARWIN:
+            opened = spec._darwin_secure_status(
+                path, directory=stat.S_ISDIR(status.st_mode)
+            )
+            if (opened.st_dev, opened.st_ino) != (status.st_dev, status.st_ino):
+                return False  # the path changed since the caller's lstat
+    except (OSError, ValueError):
         return False
     return True
 

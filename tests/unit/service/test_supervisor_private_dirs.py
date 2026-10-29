@@ -8,6 +8,8 @@ stock desktop install. CI runners use umask 022 and never saw it.
 
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,11 +36,14 @@ def no_private_group(monkeypatch):
     monkeypatch.setattr("jacked.service.spec._user_private_group_id", lambda: None)
 
 
-def _status(mode, uid_offset=0, gid_offset=0):
+def _status(mode, uid_offset=0, gid_offset=0, path=None):
+    real = path.lstat() if path is not None else None
     return SimpleNamespace(
         st_mode=stat.S_IFDIR | mode,
         st_uid=os.getuid() + uid_offset,
         st_gid=PRIVATE_GID + gid_offset,
+        st_dev=real.st_dev if real else 0,
+        st_ino=real.st_ino if real else 0,
     )
 
 
@@ -56,14 +61,14 @@ def _status(mode, uid_offset=0, gid_offset=0):
     ],
 )
 def test_privately_controlled(tmp_path, mode, uid_offset, gid_offset, expected):
-    status = _status(mode, uid_offset, gid_offset)
+    status = _status(mode, uid_offset, gid_offset, path=tmp_path)
     assert privately_controlled(tmp_path, status) is expected
 
 
 @posix_only
 @pytest.mark.usefixtures("no_private_group")
 def test_group_write_is_refused_without_a_user_private_group():
-    assert privately_controlled(Path("."), _status(0o775)) is False
+    assert privately_controlled(Path("."), _status(0o775, path=Path("."))) is False
 
 
 @posix_only
@@ -96,3 +101,16 @@ def test_an_existing_directory_writable_by_the_private_group_is_accepted(
     monkeypatch.setattr("jacked.service.spec._user_private_group_id", lambda: None)
     with pytest.raises(OSError, match="not privately controlled"):
         _ensure_safe_parent(existing)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS extended ACLs")
+def test_a_mutating_macos_acl_entry_is_not_private(tmp_path):
+    """Mode bits cannot show an extended ACL entry: a LaunchAgents folder that
+    grants everyone add_file is writable by another user."""
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir(mode=0o700)
+    assert privately_controlled(agents, agents.lstat())
+    subprocess.run(["/bin/chmod", "+a", "everyone allow add_file,delete_child", str(agents)], check=True)
+    assert not privately_controlled(agents, agents.lstat())
+    with pytest.raises(OSError, match="not privately controlled"):
+        _ensure_safe_parent(agents)
