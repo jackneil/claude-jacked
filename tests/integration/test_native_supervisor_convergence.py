@@ -131,13 +131,17 @@ class StatefulManager:
         return SimpleNamespace(returncode=0, stdout="")
 
     def _task(self, command):
-        action = command[1]
-        if action == "/Query":
+        if command[0] == "powershell.exe":
+            # The COM query (task_query_command): UTF-8 text, exit 3 when the
+            # task is absent (#165i).
+            from jacked.service.supervisors._task_xml import decode_task_xml
+
             return SimpleNamespace(
-                returncode=0 if self.registered is not None else 1,
-                # schtasks /Query output is captured as bytes (#165i).
-                stdout=self.registered or b"",
+                returncode=0 if self.registered is not None else 3,
+                stdout=decode_task_xml(self.registered).encode("utf-8")
+                if self.registered else b"",
             )
+        action = command[1]
         if action == "/Create":
             xml_path = command[command.index("/XML") + 1]
             self.registered = type(self.path)(xml_path).read_bytes()

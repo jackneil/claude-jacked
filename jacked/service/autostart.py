@@ -123,7 +123,7 @@ def _inspect_windows(path: Path, legacy: Path, run: Any) -> AutostartInspection:
     except (OSError, subprocess.SubprocessError):
         return AutostartInspection(AutostartState.UNKNOWN, "Task Scheduler unavailable")
     registered = result.returncode == 0
-    if result.returncode not in {0, 1}:
+    if not registered and not result.absent:
         return AutostartInspection(AutostartState.UNKNOWN, "Task Scheduler indeterminate")
     marker = (
         extract_marker(result.xml, SupervisorKind.TASK_SCHEDULER)

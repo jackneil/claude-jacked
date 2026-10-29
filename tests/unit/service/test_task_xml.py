@@ -81,8 +81,6 @@ def test_non_ascii_console_text_is_refused_not_guessed(raw):
     page. A non-ASCII byte there is ambiguous, so ownership fails closed."""
     with pytest.raises(UnicodeDecodeError):
         decode_task_xml(raw)
-    run = Mock(return_value=SimpleNamespace(returncode=0, stdout=raw, stderr=b""))
-    assert query_task_xml(run, "ai.hank.jacked", timeout=15).xml is None
 
 def test_decode_strips_the_bom_and_keeps_the_text():
     text = decode_task_xml(codecs.BOM_UTF16_LE + ('<?xml version="1.0" encoding="UTF-16"?>' + BODY).encode("utf-16-le"))
@@ -107,26 +105,34 @@ def test_first_line(value, expected):
 
 
 class TestQueryTaskXml:
-    def test_registered_task_comes_back_canonical_and_bytes_are_captured(self):
-        raw = codecs.BOM_UTF16_LE + ('<?xml version="1.0" encoding="UTF-16"?>' + BODY).encode("utf-16-le")
-        run = Mock(return_value=SimpleNamespace(returncode=0, stdout=raw, stderr=b""))
+    def test_reads_the_com_query_as_utf8_and_returns_canonical_bytes(self):
+        """The COM query writes UTF-8 text that still declares UTF-16; the
+        bytes come back captured (not text mode) and canonical."""
+        printed = ('<?xml version="1.0" encoding="UTF-16"?>\r\n' + BODY).encode("utf-8")
+        run = Mock(return_value=SimpleNamespace(returncode=0, stdout=printed, stderr=b""))
         result = query_task_xml(run, "ai.hank.jacked", timeout=15)
-        assert result.returncode == 0
+        assert (result.returncode, result.absent) == (0, False)
         assert result.xml == encode_task_xml(BODY)
         argv = run.call_args.args[0]
-        assert argv == ["schtasks.exe", "/Query", "/TN", "ai.hank.jacked", "/XML"]
+        assert argv[:4] == ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+        assert "GetTask('ai.hank.jacked')" in argv[4]
         kwargs = run.call_args.kwargs
         assert kwargs["capture_output"] is True and kwargs.get("text") is not True
         assert kwargs["timeout"] == 15 and kwargs["check"] is False
 
-    def test_absent_task_carries_no_xml_and_the_first_stderr_line(self):
-        run = Mock(return_value=SimpleNamespace(
-            returncode=1, stdout=b"", stderr=b"ERROR: The system cannot find the file specified.\r\n"))
+    def test_exit_3_is_an_absent_task(self):
+        run = Mock(return_value=SimpleNamespace(returncode=3, stdout=b"", stderr=b""))
         result = query_task_xml(run, "ai.hank.jacked", timeout=15)
-        assert (result.returncode, result.xml) == (1, None)
-        assert result.stderr == "ERROR: The system cannot find the file specified."
+        assert result.absent and result.xml is None
 
-    def test_undecodable_output_is_no_xml(self):
+    def test_any_other_failure_is_not_absent_and_keeps_stderr(self):
         run = Mock(return_value=SimpleNamespace(
-            returncode=0, stdout=codecs.BOM_UTF16_LE + b"<", stderr=b""))
+            returncode=4, stdout=b"", stderr=b"Exception calling Connect\r\n"))
+        result = query_task_xml(run, "ai.hank.jacked", timeout=15)
+        assert not result.absent and result.xml is None
+        assert result.stderr == "Exception calling Connect"
+
+    def test_output_that_is_not_utf8_is_no_xml(self):
+        run = Mock(return_value=SimpleNamespace(
+            returncode=0, stdout="<Task>Jos\u00e9</Task>".encode("cp1252"), stderr=b""))
         assert query_task_xml(run, "ai.hank.jacked", timeout=15).xml is None

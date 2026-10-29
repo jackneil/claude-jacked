@@ -68,7 +68,7 @@ def test_install_task_retires_known_legacy_vbs_and_runs_task(tmp_path, monkeypat
     monkeypatch.setenv("APPDATA", str(appdata))
     runner = Mock(
         side_effect=[
-            SimpleNamespace(returncode=1, stdout=""),
+            SimpleNamespace(returncode=3, stdout=""),
             SimpleNamespace(returncode=0, stdout=""),
             SimpleNamespace(returncode=0, stdout=""),
         ]
@@ -184,11 +184,11 @@ def test_ambiguous_task_create_is_deleted_before_legacy_vbs_returns(
 
     def run(command, **_kwargs):
         calls.append(command)
-        if command[1:3] == ["/Query", "/TN"] and len(calls) == 1:
-            return SimpleNamespace(returncode=1, stdout="")
+        if command[0] == "powershell.exe" and len(calls) == 1:
+            return SimpleNamespace(returncode=3, stdout="")
         if command[1] == "/Create":
             raise subprocess.TimeoutExpired("schtasks", 15)
-        if command[1] == "/Query":
+        if command[0] == "powershell.exe":
             return SimpleNamespace(returncode=0, stdout=decode_task_xml(rendered.content))
         if command[1] == "/Delete":
             assert not legacy.exists()
@@ -200,7 +200,8 @@ def test_ambiguous_task_create_is_deleted_before_legacy_vbs_returns(
     assert result.ok is False
     assert "previous Task Scheduler state restored" in result.reason
     assert legacy.exists()
-    assert [call[1] for call in calls] == ["/Query", "/Create", "/Query", "/Delete"]
+    steps = ["query" if call[0] == "powershell.exe" else call[1] for call in calls]
+    assert steps == ["query", "/Create", "query", "/Delete"]
 
 
 def test_is_known_legacy_artifact_recognises_the_pre_v2_startup_vbs(tmp_path):
@@ -251,11 +252,10 @@ _MALFORMED = (
 )
 
 
-def _utf16_query_output(content: bytes) -> bytes:
-    """Task XML the way schtasks can print it: UTF-16 LE with a BOM."""
-    import codecs
-
-    return codecs.BOM_UTF16_LE + decode_task_xml(content).encode("utf-16-le")
+def _query_output(content: bytes) -> bytes:
+    """Task XML the way the COM query writes it: UTF-8 text that still
+    declares UTF-16."""
+    return decode_task_xml(content).encode("utf-8")
 
 
 def test_rendered_task_is_utf16_with_a_matching_declaration(tmp_path):
@@ -275,9 +275,9 @@ def test_create_failure_names_the_step_and_the_schtasks_message(tmp_path):
     )
     runner = Mock(
         side_effect=[
-            SimpleNamespace(returncode=1, stdout=b"", stderr=b""),
+            SimpleNamespace(returncode=3, stdout=b"", stderr=b""),
             SimpleNamespace(returncode=1, stdout="", stderr=_MALFORMED),
-            SimpleNamespace(returncode=1, stdout=b"", stderr=b""),
+            SimpleNamespace(returncode=3, stdout=b"", stderr=b""),
         ]
     )
 
@@ -290,7 +290,7 @@ def test_create_failure_names_the_step_and_the_schtasks_message(tmp_path):
     assert "previous Task Scheduler state restored" in result.reason
 
 
-def test_a_registered_task_printed_as_utf16_is_owned_and_its_backup_restores(tmp_path):
+def test_a_registered_task_read_back_is_owned_and_its_backup_restores(tmp_path):
     """The second install reads our own task back. Its backup must be a file
     schtasks /Create accepts: canonical UTF-16, never re-encoded UTF-8."""
     from xml.etree import ElementTree
@@ -305,8 +305,8 @@ def test_a_registered_task_printed_as_utf16_is_owned_and_its_backup_restores(tmp
     restored_from = []
 
     def run(argv, **kwargs):
-        if argv[1] == "/Query":
-            return SimpleNamespace(returncode=0, stdout=_utf16_query_output(previous), stderr=b"")
+        if argv[0] == "powershell.exe":
+            return SimpleNamespace(returncode=0, stdout=_query_output(previous), stderr=b"")
         if argv[1] == "/Create" and ".transition-backup" in argv[5]:
             restored_from.append(Path(argv[5]).read_bytes())
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -334,7 +334,7 @@ def test_a_utf8_artifact_from_an_older_jacked_is_replaced(tmp_path):
     path.write_bytes(legacy)
     runner = Mock(
         side_effect=[
-            SimpleNamespace(returncode=1, stdout=b"", stderr=b""),
+            SimpleNamespace(returncode=3, stdout=b"", stderr=b""),
             SimpleNamespace(returncode=0, stdout="", stderr=""),
             SimpleNamespace(returncode=0, stdout="", stderr=""),
         ]

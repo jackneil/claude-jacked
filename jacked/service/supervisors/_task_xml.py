@@ -5,10 +5,12 @@
 writes, keeps as a backup, or compares is the same canonical bytes: UTF-16
 LE with a byte-order mark and a matching declaration.
 
-``schtasks /Query /XML`` output comes back in a form that depends on the
-console. It can be UTF-16 with or without a byte-order mark, or 8-bit text
-that still declares UTF-16. ``query_task_xml`` captures the raw bytes and
-``decode_task_xml`` accepts each form.
+A registered task is read through the Task Scheduler COM API, never
+through ``schtasks /Query /XML``: piped, schtasks writes the console code
+page, and the Windows CI round trip proved a non-ASCII launcher path
+(C:\\Users\\Jos\u00e9) comes back as 8-bit text that still declares UTF-16, which
+cannot be decoded exactly. ``query_task_xml`` runs ``task_query_command``,
+which writes the definition as UTF-8.
 """
 
 from __future__ import annotations
@@ -106,29 +108,69 @@ def first_line(value: bytes | str | None) -> str:
     return next((line.strip() for line in text.splitlines() if line.strip()), "")
 
 
+# task_query_command exit codes: the task does not exist (HRESULT
+# 0x80070002, the same in every Windows language), or any other failure.
+TASK_ABSENT_EXIT = 3
+TASK_QUERY_FAILED_EXIT = 4
+
+
 @dataclass(frozen=True)
 class TaskQuery:
     returncode: int
     xml: bytes | None  # canonical task bytes; None when absent or undecodable
     stderr: str  # first non-empty stderr line
 
+    @property
+    def absent(self) -> bool:
+        return self.returncode == TASK_ABSENT_EXIT
+
+
+def task_query_command(service_id: str) -> list[str]:
+    """PowerShell that writes one task's XML, as UTF-8, from the COM API.
+
+    Exit 0 with the definition on stdout, ``TASK_ABSENT_EXIT`` when the task
+    does not exist, ``TASK_QUERY_FAILED_EXIT`` on any other failure.
+
+    >>> command = task_query_command("ai.hank.jacked")
+    >>> command[0], "UTF8Encoding" in command[-1], "GetTask('ai.hank.jacked')" in command[-1]
+    ('powershell.exe', True, True)
+    >>> "GetTask('it''s')" in task_query_command("it's")[-1]
+    True
+    """
+    task_name = service_id.replace("'", "''")
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding $false;"
+        "$service=New-Object -ComObject 'Schedule.Service';"
+        "$service.Connect();$folder=$service.GetFolder('\\');"
+        f"try{{$task=$folder.GetTask('{task_name}')}}"
+        "catch{if($_.Exception.HResult -eq -2147024894)"
+        f"{{exit {TASK_ABSENT_EXIT}}}else{{exit {TASK_QUERY_FAILED_EXIT}}}}};"
+        "[Console]::Out.Write($task.Xml)"
+    )
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]
+
 
 def query_task_xml(run: Any, service_id: str, *, timeout: float) -> TaskQuery:
-    """Run ``schtasks /Query /TN <id> /XML`` and canonicalize the output.
+    """Read one registered task and return its canonical bytes.
 
-    The output is captured as bytes: text mode would decode it with the
-    locale code page before the encoding is known.
+    The output is captured as bytes and decoded as the UTF-8 the script
+    writes (text mode would decode it with the locale code page). Output
+    that is not valid UTF-8 gives ``xml=None``, which every ownership
+    decision treats as "not ours".
     """
     result = run(
-        ["schtasks.exe", "/Query", "/TN", service_id, "/XML"],
+        task_query_command(service_id),
         capture_output=True,
         timeout=timeout,
         check=False,
     )
     xml = None
     if result.returncode == 0 and result.stdout:
+        raw = result.stdout
         try:
-            xml = canonical_task_xml(result.stdout)
+            text = raw if isinstance(raw, str) else raw.decode("utf-8-sig")
+            xml = encode_task_xml(text)
         except UnicodeDecodeError:
             xml = None
     return TaskQuery(result.returncode, xml, first_line(getattr(result, "stderr", None)))

@@ -99,13 +99,14 @@ def _inspect_registered_task(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return SupervisorAction(False, "install", type(exc).__name__)
-    if queried.returncode == 1:
+    if queried.absent:
         return None
     if queried.returncode != 0:
         return SupervisorAction(
             False,
             "refused",
-            _step_reason("/Query", queried.returncode, queried.stderr),
+            f"Task Scheduler inspection exit {queried.returncode}"
+            + (f": {queried.stderr}" if queried.stderr else ""),
         )
     content = queried.xml
     if content is None:
@@ -324,7 +325,7 @@ def _rollback_new_task(transition: _Transition) -> bool:
         checked = query_task_xml(
             request.run, request.spec.service_id, timeout=_RUN_OPTIONS["timeout"]
         )
-        if checked.returncode in {1, 3}:
+        if checked.absent:
             return True
         registered = checked.xml
         if checked.returncode != 0 or registered is None or (

@@ -64,6 +64,9 @@ def test_rendered_task_registers_and_reads_back_as_owned(tmp_path):
         created = _schtasks("/Create", "/TN", name, "/XML", str(artifact), "/F")
         assert created.returncode == 0, created.stderr
 
+        # The read-back goes through the COM query (UTF-8): the first CI run
+        # proved schtasks /Query /XML pipes 8-bit code-page text that cannot
+        # carry this non-ASCII path exactly.
         queried = query_task_xml(subprocess.run, name, timeout=60)
         assert queried.returncode == 0, queried.stderr
         assert queried.xml is not None
@@ -81,4 +84,4 @@ def test_rendered_task_registers_and_reads_back_as_owned(tmp_path):
         _schtasks("/Delete", "/TN", name, "/F")
 
     gone = query_task_xml(subprocess.run, name, timeout=60)
-    assert gone.returncode != 0 and gone.xml is None
+    assert gone.absent and gone.xml is None, (gone.returncode, gone.stderr)

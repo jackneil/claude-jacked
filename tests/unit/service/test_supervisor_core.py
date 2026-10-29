@@ -321,30 +321,22 @@ def test_install_systemd_restores_old_generation_after_restart_failure(tmp_path)
     assert runner.call_args_list[6].args[0][-2:] == ["restart", "jacked.service"]
 
 
-@pytest.mark.parametrize("printed_as", ["utf-16-bom", "console-text"])
-def test_task_restart_recognizes_its_own_task_however_schtasks_prints_it(
-    tmp_path, printed_as
-):
-    """#165i: schtasks /Query /XML output declares UTF-16. Re-encoding it as
-    UTF-8 made the restart refuse its own task as "identity differs"."""
-    import codecs
-
+@pytest.mark.parametrize("bom", [b"", b"\xef\xbb\xbf"])
+def test_task_restart_recognizes_its_own_task_read_back_as_utf8(tmp_path, bom):
+    """#165i: the read-back XML is UTF-8 text that still declares UTF-16.
+    Re-encoding it as-is made the restart refuse its own task as
+    "identity differs"."""
     from jacked.service.supervisors._task_xml import decode_task_xml
 
     spec, environment, rendered, path = _installed_artifact(
         tmp_path, SupervisorKind.TASK_SCHEDULER
     )
-    text = decode_task_xml(rendered.content)
-    printed = (
-        codecs.BOM_UTF16_LE + text.encode("utf-16-le")
-        if printed_as == "utf-16-bom"
-        else text.encode("utf-8")
-    )
+    printed = bom + decode_task_xml(rendered.content).encode("utf-8")
     calls = []
 
     def run(argv, **kwargs):
         calls.append(argv)
-        if argv[1] == "/Query":
+        if argv[0] == "powershell.exe":
             return SimpleNamespace(returncode=0, stdout=printed, stderr=b"")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 

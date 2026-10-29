@@ -130,7 +130,7 @@ class TestDetectAutostart:
             patch("jacked.service.platform._get_windows_startup_path", return_value=vbs),
             patch(
                 "jacked.service.autostart.subprocess.run",
-                return_value=MagicMock(returncode=1, stdout=""),
+                return_value=MagicMock(returncode=3, stdout=""),
             ),
         ):
             assert detect_autostart() is True
@@ -143,7 +143,7 @@ class TestDetectAutostart:
             patch("jacked.service.platform._get_windows_startup_path", return_value=vbs),
             patch(
                 "jacked.service.autostart.subprocess.run",
-                return_value=MagicMock(returncode=1, stdout=""),
+                return_value=MagicMock(returncode=3, stdout=""),
             ),
         ):
             assert detect_autostart() is False
