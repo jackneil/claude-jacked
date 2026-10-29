@@ -75,6 +75,8 @@ def js_dash_lines(src: str) -> list[int]:
     [2]
     >>> js_dash_lines("const n = a / b; // \u2014\\nshow('a \u2014 b');")
     [2]
+    >>> js_dash_lines("const n = count++ / 2; show('\u2014');")
+    [1]
     >>> js_dash_lines("const s = 'one \\\\\\ntwo';\\nshow('\u2014');")
     [3]
     """
@@ -82,7 +84,8 @@ def js_dash_lines(src: str) -> list[int]:
     out: list[int] = []
     templates: list[int] = []  # brace depth inside each open ${ }
     state, quote, line, i, n = "code", "", 1, 0, len(src)
-    prev, word, in_class = "", "", False  # last code char, last identifier, regex [..]
+    # last code char, the one before it, last identifier, inside a regex [..]
+    prev, prev2, word, in_class = "", "", "", False
     while i < n:
         c = src[i]
         nxt = src[i + 1] if i + 1 < n else ""
@@ -101,7 +104,9 @@ def js_dash_lines(src: str) -> list[int]:
             if c == "/" and nxt == "*":
                 state, i = "block", i + 2
                 continue
-            if c == "/" and (word in _REGEX_KEYWORDS or (not word and prev in _REGEX_PRECEDERS)):
+            postfix = prev in "+-" and prev2 == prev  # `i++ / 2` divides
+            if c == "/" and (word in _REGEX_KEYWORDS
+                             or (not word and not postfix and prev in _REGEX_PRECEDERS)):
                 state, in_class = "regex", False
             elif c in "'\"":
                 state, quote = "str", c
@@ -119,7 +124,7 @@ def js_dash_lines(src: str) -> list[int]:
                 out.append(line)
             if not c.isspace():
                 word = word + c if (c.isalnum() or c in "_$") else ""
-                prev = c
+                prev2, prev = prev, c
         elif state == "line":
             if c == "\n":
                 state = "code"
@@ -203,30 +208,59 @@ def _is_logger_method(node: ast.AST) -> bool:
     return "log" in name.lower()
 
 
+def _scope_nodes(scope: ast.AST):
+    """Nodes in ``scope``'s own body, not inside a nested function or class."""
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            stack.extend(ast.iter_child_nodes(node))
+
+
 def _exempt_ids(tree: ast.AST) -> set[int]:
     """ids of bare string statements (docstrings, attribute docstrings) and of
-    every node inside a logger call, including a call through a local alias
-    such as ``log = logger.warning``."""
+    every node inside a logger call. A call through a local alias such as
+    ``log = logger.warning`` counts only inside the scope that binds it, and
+    only when every binding of that name in the scope is a logger method."""
     def _logs(value: ast.AST) -> bool:
         if isinstance(value, ast.IfExp):  # logger.debug if seen else logger.warning
             return _logs(value.body) and _logs(value.orelse)
         return _is_logger_method(value)
 
-    aliases = {
-        target.id
-        for node in ast.walk(tree) if isinstance(node, ast.Assign) and _logs(node.value)
-        for target in node.targets if isinstance(target, ast.Name)
-    }
     exempt: set[int] = set()
     for node in ast.walk(tree):
         if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
                 and isinstance(node.value.value, str)):
             exempt.add(id(node.value))
-        if isinstance(node, ast.Call) and (
-            _is_logger_method(node.func)
-            or (isinstance(node.func, ast.Name) and node.func.id in aliases)
-        ):
+        if isinstance(node, ast.Call) and _is_logger_method(node.func):
             exempt.update(id(sub) for sub in ast.walk(node))
+    for scope in ast.walk(tree):
+        if not isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        nodes = list(_scope_nodes(scope))
+        bound: dict[str, bool] = {}  # name -> every binding in this scope is a logger method
+        if not isinstance(scope, ast.Module):
+            for arg in [*scope.args.posonlyargs, *scope.args.args, *scope.args.kwonlyargs]:
+                bound[arg.arg] = False  # a parameter can be anything
+        for node in nodes:
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                targets, value = [node.target], getattr(node, "value", None)
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.With, ast.AsyncWith)):
+                targets, value = [n for n in ast.walk(node) if isinstance(n, ast.Name)
+                                  and isinstance(n.ctx, ast.Store)], None
+            else:
+                continue
+            ok = value is not None and _logs(value) and not isinstance(node, ast.AugAssign)
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    bound[target.id] = bound.get(target.id, True) and ok
+        aliases = {name for name, ok in bound.items() if ok}
+        for node in nodes:
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in aliases:
+                exempt.update(id(sub) for sub in ast.walk(node))
     return exempt
 
 
@@ -327,7 +361,13 @@ def test_the_scans_see_through_lexer_traps(tmp_path):
         "    warn = logger.warning\n"
         "    warn('internal — fine %s', 1)\n"
         "    log('also internal — fine')\n"
-        "    print('shown — hit')\n",
+        "    print('shown — hit')\n"
+        "def g():\n"
+        "    emit = logger.warning\n"
+        "    emit = print\n"
+        "    emit('reassigned — hit')\n"
+        "def h(log):\n"
+        "    log('another scope — hit')\n",
         encoding="utf-8",
     )
-    assert [h.split(":")[1] for h in python_offenders(py)] == ["8"]
+    assert [h.split(":")[1] for h in python_offenders(py)] == ["8", "12", "14"]
