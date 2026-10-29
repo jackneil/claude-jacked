@@ -247,6 +247,11 @@ def _expiry_seconds(raw: Any) -> int | None:
     return int(raw / 1000) if raw > 1e12 else int(raw)
 
 
+# _import_rotated_tokens result: the row kept changing under every attempt.
+ADOPTION_RACE_LOST = -1
+_ADOPTION_ATTEMPTS = 3
+
+
 def _import_rotated_tokens(
     db, row: dict, payload: dict, profile: dict | None = None
 ) -> int:
@@ -257,7 +262,57 @@ def _import_rotated_tokens(
     already hold one of the tokens, or the profile endpoint must prove it.
     The payload stamp plays no part here, because a stamp survives Claude
     Code's writes for other accounts.
+
+    The write is compare-and-set against the columns the decision read; when
+    the row changed meanwhile (a re-auth, a reconcile) the decision is made
+    again from the new row. Returns the number of fields written, 0 when there
+    was nothing to adopt, or ``ADOPTION_RACE_LOST`` when the row kept changing
+    (the caller must not settle the payload or overwrite the authority).
     """
+    from jacked.api.credential_helpers import CC_IMPORT_GUARD_COLS
+
+    account_id = int(row["id"])
+    for _attempt in range(_ADOPTION_ATTEMPTS):
+        updates = _adoption_updates(row, payload, profile)
+        if not updates:
+            return 0
+        expected = {col: row.get(col) for col in CC_IMPORT_GUARD_COLS}
+        if db.update_account_if_unchanged(account_id, expected, **updates):
+            logger.info(
+                "Adopted rotated Claude Code tokens for account %d from a foreign "
+                "authority write (%d field(s))",
+                account_id,
+                len(updates),
+            )
+            try:
+                from jacked.api.usage_monitor import clear_ping_backoff
+
+                clear_ping_backoff(account_id)
+            except Exception:  # noqa: BLE001 - never fail an import over this
+                logger.debug("Could not clear the keeper backoff", exc_info=True)
+            return len(updates)
+        # The ownership verdict for this payload is cached per token, so the
+        # next decision sends no second profile request.
+        fresh = db.get_account(account_id)
+        if fresh is None:
+            return 0
+        row = fresh
+        logger.info(
+            "Account %d: the row changed while adopting rotated Claude Code "
+            "tokens; deciding again",
+            account_id,
+        )
+    logger.warning(
+        "Account %d: the row kept changing during %d adoption attempts; the "
+        "rotated Claude Code tokens were not adopted yet",
+        account_id,
+        _ADOPTION_ATTEMPTS,
+    )
+    return ADOPTION_RACE_LOST
+
+
+def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | None:
+    """The fields that adopt ``payload`` into ``row``; None when refused."""
     from jacked.api.credential_helpers import (
         is_primary_publication,
         live_payload_belongs_to,
@@ -265,14 +320,14 @@ def _import_rotated_tokens(
 
     account_id = int(row["id"])
     if is_primary_publication(row, _oauth_section(payload).get("accessToken")):
-        return 0
+        return None
     if not live_payload_belongs_to(row, payload, require_stamp=False, profile=profile):
         logger.warning(
             "Account %d: rotated Claude Code tokens are not proven to belong to "
             "this account; not adopting them",
             account_id,
         )
-        return 0
+        return None
     oauth = _oauth_section(payload)
     updates: dict[str, Any] = {}
 
@@ -310,22 +365,7 @@ def _import_rotated_tokens(
         # A newer access token replaces the one the API refused.
         updates["cc_refresh_failure_type"] = None
         updates["cc_refresh_last_failed_at"] = None
-
-    if updates:
-        db.update_account(account_id, **updates)
-        logger.info(
-            "Adopted rotated Claude Code tokens for account %d from a foreign "
-            "authority write (%d field(s))",
-            account_id,
-            len(updates),
-        )
-        try:
-            from jacked.api.usage_monitor import clear_ping_backoff
-
-            clear_ping_backoff(account_id)
-        except Exception:  # noqa: BLE001 - never fail an import over this
-            logger.debug("Could not clear the keeper backoff", exc_info=True)
-    return len(updates)
+    return updates
 
 
 def _holds_payload_tokens(row: dict | None, payload: dict) -> bool:
@@ -448,6 +488,13 @@ def _adopt_stamped_rotation(
             owner_id,
         )
     adopted = _import_rotated_tokens(db, owner, payload, profile=profile)
+    if adopted == ADOPTION_RACE_LOST:
+        # Not settled: the next pass adopts the rotation once the row is quiet.
+        return HealResult(
+            ACTION_NONE,
+            foreign_account_id=owner_id,
+            reason="the row kept changing; adoption retried next pass",
+        )
     _settle()
     return HealResult(
         ACTION_ROTATION_ADOPTED if adopted else ACTION_NONE,
@@ -623,9 +670,18 @@ def _heal(
             )
 
     foreign_account_id = int(row["id"])
-    _import_rotated_tokens(
+    adopted = _import_rotated_tokens(
         db, row, payload, profile=profile if known_account_id is None else None
     )
+    if adopted == ADOPTION_RACE_LOST:
+        # Do not settle, and do not reassert over the authority: it still holds
+        # the only copy of the rotated refresh token. The next pass retries.
+        _mark_handled(digest, foreign_account_id, settled=False)
+        return HealResult(
+            ACTION_SKIPPED,
+            foreign_account_id=foreign_account_id,
+            reason="the row kept changing; adoption retried next pass",
+        )
 
     desired_id = _desired_account_id(db)
     if desired_id is None:

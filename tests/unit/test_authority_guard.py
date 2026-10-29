@@ -51,6 +51,12 @@ class FakeDatabase:
         self.updates.append((int(account_id), dict(fields)))
         return True
 
+    def update_account_if_unchanged(self, account_id: int, expected: dict, **fields) -> bool:
+        row = self.accounts.get(int(account_id))
+        if row is None or any(row.get(col) != value for col, value in expected.items()):
+            return False
+        return self.update_account(account_id, **fields)
+
     def get_setting(self, key: str):
         return self.settings.get(key)
 
@@ -845,3 +851,88 @@ def test_adoption_logs_a_values_free_info_line(caplog):
     lines = [r.getMessage() for r in caplog.records]
     assert any("Adopted rotated Claude Code tokens for account 3" in m for m in lines)
     assert not any("live_at_3" in m or "live_rt_3" in m for m in lines)
+
+
+def test_adoption_decides_again_when_the_row_changed_during_the_lookup():
+    """With no profile supplied the adoption reads the row, then runs the
+    profile lookup itself (seconds). A refresh that burned the lineage meanwhile
+    (invalid_grant recorded) must be seen: the decision is made again from the
+    new row, so the single-use refresh token is NOT imported."""
+    from unittest.mock import patch
+
+    from jacked.api.authority_guard import ProfileLookup, _import_rotated_tokens
+
+    db = _db()
+    row = db.get_account(3)
+
+    def lookup_while_the_lineage_dies(token):
+        db.accounts[3].update(cc_refresh_failure_type="invalid_grant")
+        return ProfileLookup(200, {"account": {"email": row["email"], "uuid": None},
+                                   "organization": {"uuid": row.get("organization_uuid")}})
+
+    with patch("jacked.api.credential_helpers._ownership_lookup",
+               side_effect=lookup_while_the_lineage_dies):
+        _import_rotated_tokens(db, row, _foreign_payload())
+
+    assert db.accounts[3]["cc_refresh_token"] == "db_rt_3"
+    assert db.accounts[3]["cc_refresh_failure_type"] == "invalid_grant"
+    # The working access token is still adopted.
+    assert db.accounts[3]["cc_access_token"] == "live_at_3"
+
+
+def test_adoption_without_a_race_still_adopts():
+    """Control for the race test above: the same lookup with no concurrent
+    write adopts the rotated tokens, so the race test measures the race."""
+    from unittest.mock import patch
+
+    from jacked.api.authority_guard import ProfileLookup, _import_rotated_tokens
+
+    db = _db()
+    row = db.get_account(3)
+    owner = ProfileLookup(200, {"account": {"email": row["email"], "uuid": None},
+                                "organization": {"uuid": row.get("organization_uuid")}})
+    with patch("jacked.api.credential_helpers._ownership_lookup", return_value=owner):
+        adopted = _import_rotated_tokens(db, row, _foreign_payload())
+    assert adopted > 0
+    assert db.accounts[3]["cc_access_token"] == "live_at_3"
+
+
+def test_a_busy_row_never_loses_the_rotated_tokens():
+    """When the row changes under every attempt, nothing is settled and the
+    authority (the only copy of the rotated refresh token) is not overwritten:
+    no reassert runs, and the next pass retries."""
+    from unittest.mock import patch
+
+    from jacked.api import authority_guard as ag
+
+    db = _db()
+    activate = _Activator()
+    with patch.object(ag, "_import_rotated_tokens", return_value=ag.ADOPTION_RACE_LOST):
+        result = heal_foreign_authority(
+            db, now=100.0, profile_lookup=_profile("alice@test.com", "org-1"),
+            activate=activate, read_authority=lambda: _foreign_payload(),
+        )
+    assert result.action != "reasserted"
+    assert activate.calls == []
+
+
+def test_an_unrelated_keeper_write_does_not_veto_an_adoption():
+    """keeper_state is not part of the adoption decision, so a keeper write
+    during the lookup must not stop the rotated tokens from being adopted."""
+    from unittest.mock import patch
+
+    from jacked.api.authority_guard import ProfileLookup, _import_rotated_tokens
+
+    db = _db()
+    row = db.get_account(3)
+
+    def lookup_while_keeper_writes(token):
+        db.accounts[3]["keeper_state"] = '{"last_status": "ok"}'
+        return ProfileLookup(200, {"account": {"email": row["email"], "uuid": None},
+                                   "organization": {"uuid": row.get("organization_uuid")}})
+
+    with patch("jacked.api.credential_helpers._ownership_lookup",
+               side_effect=lookup_while_keeper_writes):
+        adopted = _import_rotated_tokens(db, row, _foreign_payload())
+    assert adopted > 0
+    assert db.accounts[3]["cc_access_token"] == "live_at_3"

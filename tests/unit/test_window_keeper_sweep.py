@@ -104,8 +104,14 @@ class _Pings:
         return answer
 
 
-def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True):
-    """One keeper pass with the network edges mocked."""
+def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True, prewake=False):
+    """One keeper pass with the network edges mocked.
+
+    Both schedule inputs are pinned. ``prewake_due`` reads the real clock
+    when hours are inactive, and the default pre-wake time is 04:00: a CI
+    runner in UTC at 04:xx ran a pre-wake pass inside an "outside active
+    hours" test and failed it.
+    """
     refresh = refresh or AsyncMock(
         return_value=CCRefreshResult(CCRefreshOutcome.NO_REFRESH_TOKEN)
     )
@@ -114,6 +120,7 @@ def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True
         patch.object(um, "_KEEPER_PING_PACING_SECONDS", 0),
         patch("jacked.web.window_keeper.ping_account", new=pings),
         patch("jacked.web.window_keeper.is_active_hours", return_value=active),
+        patch("jacked.web.window_keeper.prewake_due", return_value=prewake),
         patch("jacked.web.auth.refresh_cc_token_result", refresh),
         patch("jacked.web.auth._try_refresh_primary_token", AsyncMock(return_value=None)),
         patch("jacked.web.auth.fetch_usage", fetch),

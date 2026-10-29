@@ -497,10 +497,17 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             # (architecture doc §7.2 — launch.py:489 stale write gap).
             try:
                 from jacked.api.credential_helpers import reconcile_credentials_from_live_store
-                reconcile_credentials_from_live_store(account_id, db)
+                reconciled = reconcile_credentials_from_live_store(account_id, db)
                 account = db.get_account(account_id) or account
             except Exception:
+                reconciled = True
                 logger.debug("Pre-launch reconcile failed", exc_info=True)
+            if reconciled is False:
+                # Claude Code's latest tokens for this account may not be saved
+                # yet; the launch's credential write would overwrite them.
+                raise click.ClickException(
+                    f"Account {account_id} is being updated right now. Try again."
+                )
             logger.info(
                 "Account %d: skipping pre-launch CC refresh (account is the "
                 "active Claude Code session — Claude Code manages its own "
@@ -925,6 +932,20 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                 # null so should_refresh_cc() knows the token is gone.
                 set_clauses.append("cc_refresh_token = ?")
                 params.append(refresh_token)
+
+                # A new access token is not the one the API refused: drop an
+                # auth_rejected verdict (it would mark the replacement dead).
+                # An invalid_grant verdict is about the refresh lineage and
+                # stays.
+                if "cc_refresh_failure_type" in cols:
+                    set_clauses.append(
+                        "cc_refresh_last_failed_at = CASE WHEN cc_refresh_failure_type = "
+                        "'auth_rejected' THEN NULL ELSE cc_refresh_last_failed_at END"
+                    )
+                    set_clauses.append(
+                        "cc_refresh_failure_type = CASE WHEN cc_refresh_failure_type = "
+                        "'auth_rejected' THEN NULL ELSE cc_refresh_failure_type END"
+                    )
 
                 set_clauses.extend([
                     "validation_status = 'valid'",

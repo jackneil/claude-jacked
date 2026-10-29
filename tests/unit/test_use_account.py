@@ -1545,3 +1545,19 @@ def test_local_switch_reason_is_unchanged(app, db):
 
     reasons = [p["reason"] for e, p in broadcasts if e == "auto_swap_triggered"]
     assert reasons and " from " not in reasons[0]
+
+
+def test_switch_refuses_while_the_outgoing_row_is_busy(client, app):
+    """When reconcile could not save the outgoing account's latest Claude Code
+    tokens (its row kept changing), the switch would overwrite the only copy
+    of them: it answers 409 and writes nothing."""
+    with (
+        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store",
+                   return_value=False),
+        mock.patch("jacked.api.usage_monitor._read_active_account_id", return_value=2),
+    ):
+        resp = client.post("/api/auth/accounts/1/use")
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "OUTGOING_ACCOUNT_BUSY"
+    app.state.credential_switcher.assert_not_called()

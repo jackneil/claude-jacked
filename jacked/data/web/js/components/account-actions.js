@@ -487,6 +487,10 @@ async function requestSwitch(id, email, ids) {
             // with the same long reading time as its siblings. (ApiError
             // already carries error.message/error.code from the body.)
             showToast(e.message || 'Too many account switches from this browser. Wait a minute and try again.', 'warning', 8000);
+        } else if (e.code === 'OUTGOING_ACCOUNT_BUSY') {
+            // The current account's row was being updated, so the server
+            // refused to overwrite its newest tokens. Transient: warn, retry.
+            showToast(e.message || 'The current account is being updated. Try the switch again.', 'warning', 8000);
         } else {
             // Mostly the 403 local-only refusal, which is long: give it the
             // same reading time as its siblings, and never render `undefined`.
