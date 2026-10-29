@@ -2374,6 +2374,9 @@ class Database:
                 )
                 return existing[0]
 
+            from jacked.session_tracking_store import unique_detected_at
+
+            ts = unique_detected_at(conn, session_id, ts)
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO session_accounts
                    (session_id, account_id, email, detected_at, last_activity_at,
