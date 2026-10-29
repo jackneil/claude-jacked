@@ -8,6 +8,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from jacked.service.supervisors._helpers import privately_controlled
+
 
 class TransitionBusy(RuntimeError):
     """Another process or thread is changing this native service."""
@@ -60,13 +62,11 @@ def _ensure_safe_parent(path: Path) -> None:
 
         ensure_private_windows_directory(path)
         return
-    path.mkdir(parents=True, exist_ok=True)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
     status = path.lstat()
     if not stat.S_ISDIR(status.st_mode):
         raise OSError("supervisor directory is not a directory")
-    if os.name == "posix" and (
-        status.st_uid != os.getuid() or status.st_mode & 0o022
-    ):
+    if os.name == "posix" and not privately_controlled(status):
         raise OSError("supervisor directory is not privately controlled")
 
 
