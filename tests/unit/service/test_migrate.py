@@ -221,26 +221,30 @@ class TestMigrateBakedHostToDb:
         msg = migrate_baked_host_to_db("0.0.0.0", db=_BoomDb())  # must not raise
         assert "could not migrate" in msg
 
-    def test_scope_written_before_guard_key_so_partial_write_self_heals(self):
-        """The guard key `remote_access_enabled` must be written LAST. If the
-        scope write is the one that lands but enabled fails, the guard stays
-        absent so a later boot retries cleanly instead of sticking a half-applied
-        intent (enabled set, scope missing -> silently downgraded to default)."""
+    def test_scope_and_guard_key_land_in_one_transaction(self, db):
+        """Both keys land together: a reader never sees the guard key
+        without its scope, and a failed write leaves the guard key absent so
+        a later boot retries cleanly."""
+        migrate_baked_host_to_db("0.0.0.0", db=db)
+        assert db.get_settings(["remote_access_enabled", "remote_access_scope"]) == {
+            "remote_access_enabled": "true",
+            "remote_access_scope": "all",
+        }
+
+    def test_a_failed_write_leaves_the_guard_key_absent(self):
         writes = []
 
-        class _PartialDb:
+        class _FailingDb:
             def get_setting(self, key):
                 return None  # key absent -> migration proceeds
 
-            def set_setting(self, key, value):
-                writes.append(key)
-                if key == "remote_access_enabled":
-                    raise RuntimeError("write failed after scope landed")
+            def set_settings(self, values):
+                writes.append(dict(values))
+                raise RuntimeError("write failed")
 
-        msg = migrate_baked_host_to_db("0.0.0.0", db=_PartialDb())  # must not raise
+        msg = migrate_baked_host_to_db("0.0.0.0", db=_FailingDb())  # must not raise
         assert "could not migrate" in msg
-        # scope was attempted BEFORE the guard key (so the guard never landed).
-        assert writes == ["remote_access_scope", "remote_access_enabled"]
+        assert writes == [{"remote_access_enabled": "true", "remote_access_scope": "all"}]
 
 
 class TestRemoteAccessConfigured:

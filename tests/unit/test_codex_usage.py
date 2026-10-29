@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import os
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -817,3 +818,84 @@ def test_read_rate_limits_refuses_home_codex_in_world_writable_dir(tmp_path, mon
             asyncio.run(cu.read_codex_rate_limits(home=codex_home_dir, env=dict(os.environ)))
     finally:
         shim.parent.chmod(0o755)
+
+
+# --------------------------------------------------------------------------
+# fetch_codex_usage runs its jacked.db work off the event loop (#162)
+# --------------------------------------------------------------------------
+
+def _record_db_threads(db, names, seen):
+    """Wrap each named Database method so it records the thread it ran on."""
+    for name in names:
+        real = getattr(db, name)
+
+        def _wrapped(*args, _real=real, _name=name, **kwargs):
+            seen.setdefault(_name, []).append(threading.get_ident())
+            return _real(*args, **kwargs)
+
+        setattr(db, name, _wrapped)
+
+
+def test_fetch_codex_usage_success_does_db_work_off_the_loop(db, tmp_path, monkeypatch):
+    """The identity re-check, the cache write, the plan sync and the error
+    clear all run in a worker thread; the cache write, plan sync and clear
+    share ONE hop (they ran back to back on the loop)."""
+    home = tmp_path / ".codex"
+    home.mkdir()
+    acct = db.create_account(
+        "dev@example.com", "tok", cu.time.time() + 99999,
+        provider="codex", subscription_type="plus",
+    )
+    (home / "auth.json").write_text(json.dumps(_root_auth("", "dev@example.com")))
+    seen: dict = {}
+    _record_db_threads(
+        db,
+        ["list_accounts", "update_account_usage_cache", "get_account",
+         "update_account", "clear_account_errors"],
+        seen,
+    )
+
+    async def fake_read(**kwargs):
+        return RECORDED_RESULT  # planType "pro": the plan sync writes
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+
+    async def scenario():
+        loop_tid = threading.get_ident()
+        result = await cu.fetch_codex_usage(acct["id"], db, home=home)
+        return loop_tid, result
+
+    loop_tid, result = asyncio.run(scenario())
+    assert result is not None
+    for name in ("list_accounts", "update_account_usage_cache", "get_account",
+                 "update_account", "clear_account_errors"):
+        assert seen.get(name), f"{name} was never called"
+        assert loop_tid not in seen[name], f"{name} ran on the event loop thread"
+    persist = {seen[n][-1] for n in ("update_account_usage_cache", "clear_account_errors")}
+    assert len(persist) == 1, "cache write and error clear split across thread hops"
+    assert db.get_account(acct["id"])["subscription_type"] == "pro"
+
+
+def test_fetch_codex_usage_failure_records_error_off_the_loop(db, tmp_path, monkeypatch):
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    seen: dict = {}
+    _record_db_threads(db, ["record_account_error"], seen)
+
+    async def boom(**kwargs):
+        raise cu.CodexUsageError("app-server exploded")
+
+    async def empty(**kwargs):
+        return {"rateLimits": {}}
+
+    async def scenario(reader):
+        monkeypatch.setattr(cu, "read_codex_rate_limits", reader)
+        loop_tid = threading.get_ident()
+        result = await cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex")
+        return loop_tid, result
+
+    for reader in (boom, empty):
+        loop_tid, result = asyncio.run(scenario(reader))
+        assert result is None
+    assert len(seen["record_account_error"]) == 2
+    assert loop_tid not in seen["record_account_error"]
+    assert db.get_account(acct["id"])["last_error"] == "codex app-server returned no rate limits"

@@ -7338,9 +7338,12 @@ def _persist_remote_access_from_host(host: str, *, allow_one_shot: bool = True) 
         from jacked.web.database import Database
 
         db = Database()
-        db.set_setting("remote_access_enabled", enabled)
+        # One transaction: the running service's credential gate reads the
+        # flag and its scope as one policy and must never see half of it.
+        values = {"remote_access_enabled": enabled}
         if scope is not None:
-            db.set_setting("remote_access_scope", scope)
+            values["remote_access_scope"] = scope
+        db.set_settings(values)
     except Exception as exc:
         console.print(
             f"[yellow]Could not persist the Remote access setting ({exc}); "

@@ -6,6 +6,7 @@ asyncio.run() for async tests (no pytest-asyncio dependency).
 
 import asyncio
 import logging
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -74,6 +75,7 @@ def _make_db(settings=None, accounts=None):
 
     db = MagicMock()
     db.get_setting.side_effect = lambda key: settings.get(key)
+    db.get_settings.side_effect = lambda keys: {k: settings.get(k) for k in keys}
     db.list_accounts.return_value = accounts
     db.record_swap = MagicMock()
     db._certified_auto_swap_engine = _TestCertifiedEngine(db)
@@ -3102,3 +3104,154 @@ def test_all_accounts_loop_never_resends_a_dead_cc_token(monkeypatch):
         asyncio.run(um.all_accounts_refresh_loop(app))
 
     assert calls == {1: "p-1", 2: "live-cc-2", 3: "p-3", 4: "p-4", 5: "p-5"}
+
+
+# ---------------------------------------------------------------------------
+# jacked.db work runs off the event loop (#162)
+# ---------------------------------------------------------------------------
+
+
+def _record_db_threads(db, names, seen):
+    """Wrap each named DB method so it records the thread it ran on."""
+    for name in names:
+        real = getattr(db, name)
+
+        def _wrapped(*args, _real=real, _name=name, **kwargs):
+            seen.setdefault(_name, []).append(threading.get_ident())
+            return _real(*args, **kwargs)
+
+        setattr(db, name, _wrapped)
+
+
+def _assert_off_loop(seen, names, loop_tid):
+    for name in names:
+        assert seen.get(name), f"{name} was never called"
+        assert loop_tid not in seen[name], f"{name} ran on the event loop thread"
+
+
+class TestDbWorkOffTheLoop:
+    def test_active_poll_tick_reads_and_writes_off_the_loop(self):
+        """Settings, account list, poll-interval inputs, the decision write
+        and the prune all run in worker threads."""
+        accounts = [_acct(1, usage_5h=10, usage_7d=10)]
+        db = _make_db(
+            settings={"auto_swap_enabled": "true", "usage_check_interval": "300"},
+            accounts=accounts,
+        )
+        db.get_account.side_effect = lambda account_id: accounts[0]
+        db.record_decision.return_value = None
+        seen: dict = {}
+        names = ["get_setting", "list_accounts", "get_account",
+                 "record_decision", "prune_decision_log"]
+        _record_db_threads(db, names, seen)
+        app = _make_app(db=db)
+
+        async def _run():
+            loop_tid = threading.get_ident()
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=1),
+                ),
+                patch(
+                    "jacked.api.usage_monitor._read_active_account_id",
+                    return_value=1,
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ),
+                patch(
+                    "jacked.api.credential_helpers.read_fresh_active_token",
+                    return_value="fresh_tok",
+                ),
+                # Force the periodic prune on this tick.
+                patch("jacked.api.usage_monitor.random.random", return_value=0.0),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+            return loop_tid
+
+        loop_tid = asyncio.run(_run())
+        _assert_off_loop(seen, names, loop_tid)
+
+    def test_execute_swap_recommendation_is_recorded_off_the_loop(self, monkeypatch):
+        from jacked.api import usage_monitor as um
+
+        db = MagicMock()
+        db._certified_auto_swap_engine = None
+        seen: dict = {}
+        _record_db_threads(db, ["record_swap"], seen)
+        monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
+
+        async def _run():
+            loop_tid = threading.get_ident()
+            ok = await um._execute_swap(
+                db,
+                active_acct_id=99,
+                active_acct={"id": 99, "email": "old@test"},
+                target={"id": 7, "email": "new@test"},
+                reason="r",
+                trigger="t",
+                usage_5h=20,
+                usage_7d=50,
+            )
+            return loop_tid, ok
+
+        loop_tid, ok = asyncio.run(_run())
+        assert ok is False
+        _assert_off_loop(seen, ["record_swap"], loop_tid)
+
+    def test_all_accounts_refresh_lists_accounts_off_the_loop(self):
+        from jacked.api.usage_monitor import all_accounts_refresh_loop
+
+        db = _make_db(accounts=[_acct(2)])
+        seen: dict = {}
+        _record_db_threads(db, ["list_accounts"], seen)
+        app = _make_app(db=db)
+        app.state.active_poll_account_id = 1
+
+        async def _run():
+            loop_tid = threading.get_ident()
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=1),
+                ),
+                patch(
+                    "jacked.web.auth.fetch_usage",
+                    new_callable=AsyncMock,
+                    return_value={"_cached": True},
+                ) as mock_fetch,
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await all_accounts_refresh_loop(app)
+                mock_fetch.assert_awaited_once()
+            return loop_tid
+
+        loop_tid = asyncio.run(_run())
+        _assert_off_loop(seen, ["list_accounts"], loop_tid)
+
+    def test_full_sweep_disabled_notes_keeper_off_the_loop(self):
+        db = _make_db(
+            settings={"window_keeper_enabled": "false"},
+            accounts=[_acct(1)],
+        )
+        seen: dict = {}
+        names = ["get_settings", "list_accounts", "set_keeper_state"]
+        _record_db_threads(db, names, seen)
+        app = _make_app(db=db)
+
+        async def _run():
+            loop_tid = threading.get_ident()
+            with patch(
+                "jacked.api.usage_monitor.asyncio.sleep",
+                side_effect=_sleep_canceller(max_sleeps=0),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await full_sweep_loop(app)
+            return loop_tid
+
+        loop_tid = asyncio.run(_run())
+        _assert_off_loop(seen, names, loop_tid)

@@ -9,6 +9,8 @@ fleet-wide glance. Pure summary helpers live in
 ``jacked.service.menubar_summary`` (no rumps/pyobjc here).
 """
 
+import asyncio
+
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 
@@ -37,7 +39,7 @@ async def menubar_summary(request: Request):
             content={"error": {"message": "Database unavailable", "code": "DB_UNAVAILABLE"}},
         )
 
-    rows = db.list_accounts(include_inactive=False)
+    rows = await asyncio.to_thread(db.list_accounts, include_inactive=False)
 
     # Resolve the active account via the SAME 3-layer matching the
     # active-credential route uses (stamp → token → email+org), so the pill and

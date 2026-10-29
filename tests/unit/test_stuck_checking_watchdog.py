@@ -1,7 +1,10 @@
 """Tests for stuck-checking DB methods + async wrapper.
 
-Uses a real in-memory Database so the SQL WHERE guard runs; uses
-asyncio.run() wrappers (project convention — no pytest-asyncio)."""
+Uses a real file-backed Database so the SQL WHERE guard runs; uses
+asyncio.run() wrappers (project convention — no pytest-asyncio). The file,
+not ``:memory:``: the async wrapper runs its DB work in a worker thread, and
+Database keeps one connection per thread, so an in-memory DB would be a
+different, empty database there."""
 import asyncio
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, AsyncMock
@@ -12,8 +15,8 @@ from jacked.web.database import Database
 
 
 @pytest.fixture
-def db():
-    d = Database(":memory:")
+def db(tmp_path):
+    d = Database(str(tmp_path / "jacked.db"))
     yield d
     d.close()
 

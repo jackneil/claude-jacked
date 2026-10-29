@@ -9,6 +9,7 @@ asyncio.run() (project convention, no pytest-asyncio).
 import asyncio
 import json
 import logging
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -184,10 +185,9 @@ class TestWallClockSleep:
                 raise asyncio.CancelledError
 
         db = MagicMock()
-        db.get_setting.side_effect = lambda k: {
-            "window_keeper_enabled": "false",
-            "usage_check_interval": "300",
-        }.get(k)
+        stored = {"window_keeper_enabled": "false", "usage_check_interval": "300"}
+        db.get_setting.side_effect = stored.get
+        db.get_settings.side_effect = lambda keys: {k: stored.get(k) for k in keys}
         db.list_accounts.return_value = []
         app = MagicMock()
         app.state.db = db
@@ -1054,3 +1054,61 @@ def test_null_7d_reset_alone_does_not_reping_after_success(db):
     assert db.get_account(aid)["cached_7d_resets_at"] is None
     _run_pass(db, pings)
     assert pings.calls == ["cc-tok"]
+
+
+# ---------------------------------------------------------------------------
+# The keeper pass runs its jacked.db work off the event loop (#162)
+# ---------------------------------------------------------------------------
+
+
+def _record_db_threads(db, names, seen):
+    """Wrap each named Database method so it records the thread it ran on."""
+    for name in names:
+        real = getattr(db, name)
+
+        def _wrapped(*args, _real=real, _name=name, **kwargs):
+            seen.setdefault(_name, []).append(threading.get_ident())
+            return _real(*args, **kwargs)
+
+        setattr(db, name, _wrapped)
+
+
+def _assert_off_loop(seen, names, loop_tid):
+    for name in names:
+        assert seen.get(name), f"{name} was never called"
+        assert loop_tid not in seen[name], f"{name} ran on the event loop thread"
+
+
+class TestKeeperDbWorkOffTheLoop:
+    def test_success_and_failure_paths_do_db_work_off_the_loop(self, db):
+        """A ping that opens a window (success bookkeeping) and an account
+        whose every token is rejected (ladder + failure verdict): every DB
+        read and write runs in a worker thread, and the verdicts still land."""
+        ok_id = _mk(db, email="ok@test.com", cc="cc-ok", primary="pri-ok")
+        dead_id = _mk(db, email="dead@test.com", cc="cc-dead", primary="pri-dead")
+        pings = _Pings({"cc-ok": _ok()})  # every other token answers 401
+        seen: dict = {}
+        names = ["list_accounts", "get_settings", "get_account",
+                 "update_account_usage_cache", "set_keeper_state"]
+        _record_db_threads(db, names, seen)
+        loop_tid = threading.get_ident()  # asyncio.run runs the loop here
+
+        assert _run_pass(db, pings) == 1
+
+        _assert_off_loop(seen, names, loop_tid)
+        assert _state(db, ok_id)["last_status"] == "ok"
+        assert _state(db, dead_id)["last_status"] == "needs_reauth"
+
+    def test_outside_hours_and_prewake_bookkeeping_off_the_loop(self, db):
+        aid = _mk(db)
+        seen: dict = {}
+        names = ["list_accounts", "get_settings", "get_setting", "set_keeper_state", "set_setting"]
+        _record_db_threads(db, names, seen)
+        loop_tid = threading.get_ident()
+
+        _run_pass(db, _Pings({}), active=False, prewake=False)
+        assert _state(db, aid)["skip_reason"] == "outside_active_hours"
+        _run_pass(db, _Pings({"cc-tok": _ok()}), active=False, prewake=True)
+
+        _assert_off_loop(seen, names, loop_tid)
+        assert db.get_setting(um._PREWAKE_DONE_KEY) is not None
