@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 from jacked.api.claude_identity import (
@@ -16,7 +17,6 @@ from jacked.api.claude_identity import (
     write_identity,
 )
 from jacked.api.credential_helpers import (
-    OUTGOING_ACCOUNT_BUSY_MESSAGE,
     ClaudeConfigUnwritable,
     build_oauth_data,
     reconcile_outgoing_before_activation,
@@ -225,17 +225,11 @@ def detect_claude_identity(home: Path) -> ExecutableIdentity:
     return identity
 
 
-def _unsupported(
-    operation_id: str,
-    account: dict,
-    reason: str,
-    outcome: SwitchOutcome = SwitchOutcome.UNSUPPORTED,
-) -> SwitchResult:
-    """A refusal that changed nothing (``outcome`` says why)."""
+def _unsupported(operation_id: str, account: dict, reason: str) -> SwitchResult:
     account_id = int(account["id"])
     return SwitchResult(
         operation_id=operation_id,
-        outcome=outcome,
+        outcome=SwitchOutcome.UNSUPPORTED,
         desired_default=IdentityAxis(account_id, "desired"),
         storage=IdentityAxis(None, "unchanged"),
         committed_authority=IdentityAxis(None, "unchanged"),
@@ -362,30 +356,45 @@ def activate_account(db, account: dict, context: SwitchContext, operation_id: st
     engine = _engine_for(db, resolution, home)
     if isinstance(engine, str):
         return _unsupported(operation_id, account, engine)
-    try:
-        saved = reconcile_outgoing_before_activation(db, int(account["id"]))
-    except Exception:  # noqa: BLE001 - the activation was never gated on it before
-        logger.warning("Could not save the outgoing account's live tokens", exc_info=True)
-        saved = True
-    if not saved:
-        return _unsupported(
-            operation_id, account, OUTGOING_ACCOUNT_BUSY_MESSAGE, SwitchOutcome.BUSY
+    target_id = int(account["id"])
+
+    def _payload(row: dict) -> CredentialPayload:
+        return CredentialPayload.from_mapping(
+            {"_jackedAccountId": target_id, "claudeAiOauth": build_oauth_data(row)}
         )
-    payload = CredentialPayload.from_mapping(
-        {"_jackedAccountId": int(account["id"]), "claudeAiOauth": build_oauth_data(account)}
-    )
+
     request = SwitchRequest(
         operation_id=operation_id,
-        account_id=int(account["id"]),
+        account_id=target_id,
         email=account.get("email") or "",
         organization_id=account.get("organization_uuid") or None,
-        payload=payload,
+        payload=_payload(account),
         context=context,
         interaction=InteractionMode.FOREGROUND,
         display_name=account.get("display_name") or None,
         organization_name=account.get("organization_name") or None,
     )
-    return engine.activate(request)
+
+    def preflight() -> SwitchRequest | None:
+        # Inside the switch lease: save the active account's newest live
+        # tokens before they are overwritten, then build the payload from the
+        # row as it is now (a same-account activation may just have imported
+        # a rotation). Fail closed: a refusal is retryable, a lost refresh
+        # lineage is not.
+        try:
+            if not reconcile_outgoing_before_activation(db, target_id):
+                return None
+            row = db.get_account(target_id) or account
+        except Exception:  # noqa: BLE001 - any failure refuses the overwrite
+            logger.warning(
+                "Could not save the outgoing account's live tokens; not "
+                "overwriting the credential store",
+                exc_info=True,
+            )
+            return None
+        return replace(request, payload=_payload(row), preflight=None)
+
+    return engine.activate(replace(request, preflight=preflight))
 
 
 def scoped_launch_needs_global_activation() -> bool:

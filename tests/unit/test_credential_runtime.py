@@ -571,17 +571,37 @@ def test_the_runtime_lease_covers_threads_and_processes(tmp_path: Path) -> None:
 
 # Every activation path (switch, launch, OAuth) overwrites the live store, and
 # Claude Code spends a refresh token when it rotates it: the active account's
-# newest tokens must be saved to its row first (the switch route alone did).
+# newest tokens must be saved to its row first, inside the switch lease, from
+# a fresh read of the store.
 
 
-def _activate_with_outgoing(home: Path, outgoing_id, reconcile):
+class _MutableRowDb(_RowDb):
+    def update(self, **fields):
+        self._row.update(fields)
+
+
+def _activate_with_outgoing(home: Path, outgoing_id, reconcile, db=None):
+    from jacked.credentials.repository import InMemoryCredentialSwitchRepository
+
+    db = db or _MutableRowDb(_account())
     with mock.patch(
         "jacked.api.usage_monitor._read_active_account_id", return_value=outgoing_id
     ), mock.patch(
         "jacked.api.credential_helpers.reconcile_credentials_from_live_store",
         side_effect=reconcile,
-    ) as spy:
-        return _activate_on_linux_home(home), spy
+    ) as spy, mock.patch(
+        "jacked.credentials.runtime.detect_claude_identity",
+        return_value=_identity(platform_system="linux", platform_machine="x86_64"),
+    ), mock.patch("jacked.credentials.runtime.Path.home", return_value=home), mock.patch(
+        "jacked.credentials.runtime.DatabaseCredentialSwitchRepository",
+        lambda _db: InMemoryCredentialSwitchRepository(),
+    ):
+        result = activate_account(db, _account(), SwitchContext.MANUAL, "op-linux")
+    return result, spy
+
+
+def _written(home: Path) -> str:
+    return (home / ".claude" / ".credentials.json").read_text(encoding="utf-8").replace(" ", "")
 
 
 def test_activation_saves_the_outgoing_accounts_live_tokens_first(tmp_path: Path) -> None:
@@ -589,47 +609,57 @@ def test_activation_saves_the_outgoing_accounts_live_tokens_first(tmp_path: Path
     authority = tmp_path / ".claude" / ".credentials.json"
     seen_before_write = []
 
-    def reconcile(account_id, db):
-        seen_before_write.append(authority.exists())
+    def reconcile(account_id, db, fresh=False):
+        seen_before_write.append((account_id, fresh, authority.exists()))
         return True
 
     result, spy = _activate_with_outgoing(tmp_path, 3, reconcile)
 
-    assert spy.call_count == 1 and spy.call_args.args[0] == 3
-    assert seen_before_write == [False]
+    assert seen_before_write == [(3, True, False)]  # fresh read, before the write
     assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
-    assert '"_jackedAccountId":7' in authority.read_text(encoding="utf-8").replace(" ", "")
+    assert '"_jackedAccountId":7' in _written(tmp_path)
 
 
 def test_activation_refuses_while_the_outgoing_row_is_busy(tmp_path: Path) -> None:
+    from jacked.credentials.transaction import OUTGOING_ACCOUNT_BUSY_CODE
+
     (tmp_path / ".claude").mkdir()
 
-    result, _ = _activate_with_outgoing(tmp_path, 3, lambda account_id, db: False)
+    result, _ = _activate_with_outgoing(tmp_path, 3, lambda *a, **k: False)
 
     assert result.outcome is SwitchOutcome.BUSY
+    assert result.code == OUTGOING_ACCOUNT_BUSY_CODE
     assert "being updated" in result.message
     assert not (tmp_path / ".claude" / ".credentials.json").exists()
 
 
-def test_activating_the_active_account_does_not_reconcile_it(tmp_path: Path) -> None:
+def test_a_same_account_activation_writes_the_rotation_it_just_saved(tmp_path: Path) -> None:
+    """Activating the active account (a launch of it, an OAuth re-auth) first
+    imports Claude Code's newer rotation into its row, then writes THAT, not
+    the row as the caller read it."""
     (tmp_path / ".claude").mkdir()
+    db = _MutableRowDb(_account())
 
-    result, spy = _activate_with_outgoing(tmp_path, 7, lambda account_id, db: False)
+    def reconcile(account_id, db_, fresh=False):
+        db_.update(cc_access_token="rotated-access", cc_refresh_token="rotated-refresh")
+        return True
 
-    spy.assert_not_called()
+    result, spy = _activate_with_outgoing(tmp_path, 7, reconcile, db=db)
+
+    assert spy.call_count == 1
     assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert '"refreshToken":"rotated-refresh"' in _written(tmp_path)
 
 
-def test_a_failed_outgoing_reconcile_does_not_block_the_activation(
-    tmp_path: Path, caplog
-) -> None:
+def test_a_failed_outgoing_reconcile_refuses_the_overwrite(tmp_path: Path, caplog) -> None:
     (tmp_path / ".claude").mkdir()
 
-    def reconcile(account_id, db):
-        raise RuntimeError("store unreadable")
+    def reconcile(*args, **kwargs):
+        raise RuntimeError("database is locked")
 
     with caplog.at_level("WARNING", logger="jacked.credentials.runtime"):
         result, _ = _activate_with_outgoing(tmp_path, 3, reconcile)
 
-    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert result.outcome is SwitchOutcome.BUSY
+    assert not (tmp_path / ".claude" / ".credentials.json").exists()
     assert "outgoing account" in caplog.text

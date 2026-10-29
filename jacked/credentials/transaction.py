@@ -62,9 +62,21 @@ class SwitchRequest:
     # this identity changes; a Keychain write alone is invisible to them.
     display_name: str | None = None
     organization_name: str | None = None
+    # Runs inside the switch lease, before any store write. It returns the
+    # request to carry out (its payload rebuilt from the freshest row), or
+    # None when the store must not be overwritten yet: the outgoing account's
+    # newest tokens could not be saved to its row. None refuses with BUSY.
+    preflight: Callable[[], SwitchRequest | None] | None = None
 
 
 IdentityPublisher = Callable[[SwitchRequest], None]
+
+# The code and text of a preflight refusal. The switch route maps the code
+# to its OUTGOING_ACCOUNT_BUSY answer; launch and OAuth show the text.
+OUTGOING_ACCOUNT_BUSY_CODE = "outgoing_account_busy"
+OUTGOING_ACCOUNT_BUSY_MESSAGE = (
+    "The current account is being updated. Try again in a moment."
+)
 
 # Reported whenever the identity mirror did not land. Running Claude Code
 # sessions keep their cached token until they restart, so the caller must see
@@ -226,6 +238,7 @@ def _result(
     is_committed: bool = False,
     message: str = "",
     sessions_follow: bool | None = None,
+    code: str = "",
 ) -> SwitchResult:
     observed = _enrich_identity(request, observed)
     storage_state = "committed" if is_committed else outcome.value
@@ -257,6 +270,7 @@ def _result(
         provider_verification=ProviderVerificationState.UNVERIFIED,
         observed_identity=observed,
         message=message,
+        code=code,
     )
 
 
@@ -306,6 +320,16 @@ class CredentialTransactionEngine:
                     SwitchOutcome.INTERACTIVE_OPERATION_IN_PROGRESS,
                     message="another credential operation holds the switch lease",
                 )
+            if request.preflight is not None:
+                prepared = request.preflight()
+                if prepared is None:
+                    return _result(
+                        request,
+                        SwitchOutcome.BUSY,
+                        message=OUTGOING_ACCOUNT_BUSY_MESSAGE,
+                        code=OUTGOING_ACCOUNT_BUSY_CODE,
+                    )
+                request = prepared
             return operation(request)
 
     def _activate_unfenced(self, request: SwitchRequest) -> SwitchResult:

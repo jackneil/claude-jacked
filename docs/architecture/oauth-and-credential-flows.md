@@ -672,12 +672,19 @@ row only when it can prove the owner:
   columns. That payload is the primary fallback of `build_oauth_data()`.
 
 Every activation path (a switch, a launch, an OAuth activation) goes through
-`activate_account()`. Before it writes another account into the live store,
-it calls `reconcile_outgoing_before_activation()`. This saves the active
-account's live tokens to its row, because Claude Code spends a refresh token
-when it rotates it. When the outgoing row keeps changing, the activation
-stops with `busy` and writes nothing. The switch route makes the same check
-first, so the dashboard gets the `OUTGOING_ACCOUNT_BUSY` answer.
+`activate_account()`. Inside the switch lease, before the engine writes the
+live store, it calls `reconcile_outgoing_before_activation()`. This saves the
+active account's live tokens to its row, because Claude Code spends a refresh
+token when it rotates it. The store is read fresh, not from the 30-second
+cache. The step also runs when the target is the active account. The payload
+is then built again from the row, so the activation writes the rotation that
+it just saved. When the outgoing row keeps changing, or the step fails, the
+activation stops with `busy` and code `outgoing_account_busy`, and writes
+nothing. The switch route answers that code with `OUTGOING_ACCOUNT_BUSY`
+(409).
+
+On a macOS build whose certified authority is the credentials file, the file
+is the store, and the #179i exception reads it as such.
 
 One case still loses a refresh lineage. Claude Code rotates the token, and the
 access token expires before any reconcile pass sees it (for example, the

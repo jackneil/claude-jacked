@@ -24,6 +24,7 @@ from jacked.credentials.store import MemoryCredentialStore
 from jacked.credentials.transaction import (
     CredentialTransactionEngine,
     StaticInstallKeyProvider,
+    OUTGOING_ACCOUNT_BUSY_CODE,
     SwitchRequest,
     TransactionDependencies,
 )
@@ -661,3 +662,60 @@ def test_engine_without_a_publisher_is_unchanged() -> None:
     result = engine.activate(_request(_payload(2, "target")))
     assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
     assert result.existing_session_activation is SessionActivationState.RESTART_REQUIRED
+
+
+# The preflight (activate_account's outgoing-token save) runs inside the
+# switch lease, before any store write.
+
+
+class _WatchedLease:
+    def __init__(self):
+        self.held = False
+
+    def acquire(self):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _held():
+            self.held = True
+            try:
+                yield True
+            finally:
+                self.held = False
+
+        return _held()
+
+
+def _engine_with_lease(before):
+    engine, repository, store = _engine(CapabilityMode.GLOBAL_UNCOOPERATIVE, before)
+    lease = _WatchedLease()
+    engine._deps = replace(engine._deps, switch_lease=lease)
+    return engine, store, lease
+
+
+def test_a_refusing_preflight_writes_nothing_and_says_busy() -> None:
+    engine, store, lease = _engine_with_lease(_payload(1, "before"))
+    seen = []
+
+    def preflight():
+        seen.append(lease.held)
+        return None
+
+    result = engine.activate(replace(_request(_payload(2, "target")), preflight=preflight))
+
+    assert seen == [True]
+    assert result.outcome is SwitchOutcome.BUSY
+    assert result.code == OUTGOING_ACCOUNT_BUSY_CODE
+    assert store.read().payload.identity.account_id == 1
+
+
+def test_the_preflight_request_is_the_one_written() -> None:
+    engine, store, _ = _engine_with_lease(_payload(1, "before"))
+    fresh = _request(_payload(2, "rebuilt"))
+    request = replace(_request(_payload(2, "stale")), preflight=lambda: fresh)
+
+    result = engine.activate(request)
+
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    oauth = store.read().payload.to_mapping()["claudeAiOauth"]
+    assert oauth["accessToken"] == "rebuilt"

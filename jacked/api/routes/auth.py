@@ -1858,20 +1858,24 @@ async def use_account(account_id: int, request: Request):
             headers={"Cache-Control": "no-store"},
         )
 
-    # Reconcile outgoing account's credentials before writing new ones. The
-    # engine does this too (every activation path); checking here first is
-    # what lets the dashboard get its OUTGOING_ACCOUNT_BUSY answer.
-    from jacked.api.credential_helpers import reconcile_outgoing_before_activation
+    # The outgoing account, for the history broadcast. Saving its live tokens
+    # before the overwrite happens inside activate_account, under the switch
+    # lease, on every activation path.
     from jacked.api.usage_monitor import _read_active_account_id
 
     outgoing_id = await asyncio.to_thread(_read_active_account_id)
-    reconciled = await asyncio.to_thread(
-        reconcile_outgoing_before_activation, db, account_id, outgoing_id
+
+    from jacked.credentials.models import SwitchContext, SwitchOutcome
+    from jacked.credentials.runtime import activate_account
+    from jacked.credentials.transaction import OUTGOING_ACCOUNT_BUSY_CODE
+
+    switcher = getattr(request.app.state, "credential_switcher", activate_account)
+    result = await asyncio.to_thread(
+        switcher, db, account, SwitchContext.MANUAL, operation_id
     )
-    if reconciled is False:
+    if result.code == OUTGOING_ACCOUNT_BUSY_CODE:
         # The outgoing account's row kept changing, so Claude Code's latest
-        # tokens for it may not be saved yet. Switching now would overwrite
-        # the only copy of them.
+        # tokens for it may not be saved yet. Nothing was written.
         content = {
             "error": {
                 "message": "The current account is being updated. Try the switch again.",
@@ -1889,14 +1893,6 @@ async def use_account(account_id: int, request: Request):
             content=content,
             headers={"Cache-Control": "no-store"},
         )
-
-    from jacked.credentials.models import SwitchContext, SwitchOutcome
-    from jacked.credentials.runtime import activate_account
-
-    switcher = getattr(request.app.state, "credential_switcher", activate_account)
-    result = await asyncio.to_thread(
-        switcher, db, account, SwitchContext.MANUAL, operation_id
-    )
     content = _switch_content(result, account.get("email", ""))
     http_status = _switch_http_status(result.outcome)
 

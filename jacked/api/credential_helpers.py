@@ -762,10 +762,15 @@ def _platform_store_holds(live: dict) -> bool:
     so ``read_live_credentials`` returns a stale copy after a failed Keychain
     read. A decision that admits an OLDER payload (the dead-token override)
     must not act on that copy. Other platforms have no separate store: the
-    file is the store.
+    file is the store, and so is a macOS build whose certified authority is
+    the file.
     """
     if sys.platform != "darwin":
         return True
+    from jacked.credentials.runtime import scoped_launch_needs_global_activation
+
+    if not scoped_launch_needs_global_activation():
+        return True  # this Claude build's certified authority IS the file
     store = read_platform_credentials()
     if not isinstance(store, dict):
         return False
@@ -797,7 +802,9 @@ CC_VERDICT_GUARD_COLS = ("access_token", "keeper_state")
 _IMPORT_ATTEMPTS = 3
 
 
-def reconcile_credentials_from_live_store(account_id: int, db) -> bool:
+def reconcile_credentials_from_live_store(
+    account_id: int, db, fresh: bool = False
+) -> bool:
     """Read live credentials for the active account and reconcile with DB.
 
     Before swapping away from an account, check if Claude Code rotated
@@ -816,8 +823,9 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> bool:
     invalid_grant — the live token is Claude Code's active token and
     importing+exchanging it would destroy CC's session.
     """
-    # Check cache first to avoid Keychain subprocess calls
-    live = _get_cached_live_credentials(account_id)
+    # Check cache first to avoid Keychain subprocess calls; ``fresh`` callers
+    # are about to overwrite the store and need what it holds now.
+    live = None if fresh else _get_cached_live_credentials(account_id)
     from_cache = bool(live)
 
     if not live:
@@ -1019,31 +1027,32 @@ def _clear_keeper_backoff(account_id: int) -> None:
 # Backward-compatible alias
 reconcile_outgoing_credentials = reconcile_credentials_from_live_store
 
-OUTGOING_ACCOUNT_BUSY_MESSAGE = (
-    "The current account is being updated. Try again in a moment."
-)
+def reconcile_outgoing_before_activation(db, target_id: int) -> bool:
+    """Save the active account's live tokens before the store is overwritten.
 
-
-def reconcile_outgoing_before_activation(
-    db, target_id: int, outgoing_id: int | None = None
-) -> bool:
-    """Save the active account's live tokens before another account's are
-    written over them.
-
-    Claude Code rotates refresh tokens and spends the old one, so the live
-    store can hold the only working copy of the active account's chain.
-    ``activate_account`` calls this on every path (switch, launch, OAuth).
-    Returns False when the outgoing row kept changing: the caller must not
-    overwrite the store yet. ``outgoing_id`` is the active account a caller
-    already resolved; None resolves it here.
+    Claude Code spends a refresh token when it rotates it, so the live store
+    can hold the only working copy of the active account's chain.
+    ``activate_account`` calls this inside the switch lease on every path
+    (switch, launch, OAuth), also when the target IS the active account: its
+    row then gets the rotation and the activation writes it back. The live
+    store is read fresh, never from the 30-second cache, because it is about
+    to be overwritten. Returns False when the outgoing row kept changing: the
+    caller must not overwrite the store yet. ``target_id`` is kept for the
+    log line only.
     """
-    if outgoing_id is None:
-        from jacked.api.usage_monitor import _read_active_account_id
+    from jacked.api.usage_monitor import _read_active_account_id
 
-        outgoing_id = _read_active_account_id()
-    if not outgoing_id or outgoing_id == int(target_id):
+    outgoing_id = _read_active_account_id()
+    if not outgoing_id:
         return True
-    return reconcile_credentials_from_live_store(outgoing_id, db)
+    saved = reconcile_credentials_from_live_store(outgoing_id, db, fresh=True)
+    if not saved:
+        logger.warning(
+            "Account %d: its row kept changing; not activating account %d over "
+            "its live credentials yet",
+            outgoing_id, int(target_id),
+        )
+    return saved
 
 
 def write_platform_credentials(data: dict) -> bool:
