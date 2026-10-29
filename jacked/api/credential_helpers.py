@@ -755,18 +755,23 @@ def read_live_credentials() -> dict | None:
     return None
 
 
-# The row columns a Claude Code token import depends on (its tokens, its
-# verdicts, and the primary token the keeper fingerprint includes). An import
-# that read the row, then did slow work, writes only while all of them still
-# hold what it read (Database.update_account_if_unchanged).
+# The row columns every Claude Code token import decision reads. An import
+# that read the row, then did slow work (the ownership lookup), writes only
+# while these still hold what it read (Database.update_account_if_unchanged),
+# and otherwise decides again from the new row. Columns the decision did not
+# read stay out: a keeper bookkeeping write must not veto an import, or the
+# rotated refresh token is lost when the switch overwrites the live store.
 CC_IMPORT_GUARD_COLS = (
-    "access_token",
     "cc_access_token",
     "cc_refresh_token",
     "cc_expires_at",
     "cc_refresh_failure_type",
-    "keeper_state",
 )
+# Added when a dead-token verdict (cc_token_known_dead) decided the import:
+# the keeper verdict and the primary token its fingerprint includes.
+CC_VERDICT_GUARD_COLS = ("access_token", "keeper_state")
+# Read-decide-write attempts before an import gives up on a busy row.
+_IMPORT_ATTEMPTS = 3
 
 
 def reconcile_credentials_from_live_store(account_id: int, db) -> None:
@@ -800,22 +805,65 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
     if _stamp_of(live) != account_id:
         return
 
+    if not live.get("claudeAiOauth", {}).get("accessToken"):
+        return
+
+    for attempt in range(_IMPORT_ATTEMPTS):
+        # Read the row this decision is made from (again, after a lost
+        # compare-and-set: the ownership verdict for this payload is cached
+        # per token, so a retry sends no second profile request).
+        account = db.get_account(account_id)
+        if not account:
+            return
+        decision = _reconcile_decision(account_id, account, live, from_cache and attempt == 0)
+        if decision is _RECONCILE_RETRY_FRESH:
+            # The verdict is what admits this older payload, so act on a fresh
+            # read, never on one cached up to 30 s ago.
+            invalidate_live_cred_cache()
+            return reconcile_credentials_from_live_store(account_id, db)
+        if not decision:
+            return
+        updates, guard_cols = decision
+        # Compare-and-set against the columns this decision read: a
+        # re-authentication or adoption that landed during the ownership
+        # lookup wins, and the decision is made again from the new row.
+        expected = {col: account.get(col) for col in guard_cols}
+        if db.update_account_if_unchanged(account_id, expected, **updates):
+            logger.info(
+                "Account %d: reconciled %d credential field(s) from live store",
+                account_id, len(updates),
+            )
+            _clear_keeper_backoff(account_id)
+            return
+        logger.info(
+            "Account %d: the row changed while reconciling; deciding again",
+            account_id,
+        )
+    logger.warning(
+        "Account %d: the row kept changing during %d reconcile attempts; the "
+        "live credentials were not imported",
+        account_id, _IMPORT_ATTEMPTS,
+    )
+
+
+# Sentinel: the decision needs a fresh (uncached) read of the live store.
+_RECONCILE_RETRY_FRESH = object()
+
+
+def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool):
+    """``(updates, guard columns)`` to import ``live`` into ``account``, or a
+    falsy value (nothing to import), or ``_RECONCILE_RETRY_FRESH``.
+
+    Pure apart from the ownership lookup, which is cached per token.
+    """
     oauth = live.get("claudeAiOauth", {})
     live_access = oauth.get("accessToken")
     live_refresh = oauth.get("refreshToken")
     live_expires = oauth.get("expiresAt")  # milliseconds
 
-    if not live_access:
-        return
-
-    # Read current DB state
-    account = db.get_account(account_id)
-    if not account:
-        return
-
     # jacked's own primary-fallback publication is not a Claude Code token.
     if is_primary_publication(account, live_access):
-        return
+        return None
 
     # The stamp alone does not prove ownership: Claude Code keeps jacked's
     # _jackedAccountId on its own writes (a /login to another account, or a
@@ -834,8 +882,9 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
                 else ""
             ),
         )
-        return
+        return None
 
+    guard_cols = CC_IMPORT_GUARD_COLS
     # Never move a row backward: a stale payload (for example the file mirror
     # read after a failed Keychain read) must not replace newer tokens. Unless
     # the row's token is KNOWN dead: then an owned live token that merely
@@ -850,12 +899,11 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
                     "not importing them",
                     account_id,
                 )
-                return
-            if from_cache:
-                # The verdict is what admits this older payload, so act on a
-                # fresh read, never on one cached up to 30 s ago.
-                invalidate_live_cred_cache()
-                return reconcile_credentials_from_live_store(account_id, db)
+                return None
+            if cached:
+                return _RECONCILE_RETRY_FRESH
+            # The verdict decided this import, so it is guarded too.
+            guard_cols = CC_IMPORT_GUARD_COLS + CC_VERDICT_GUARD_COLS
 
     db_cc_refresh = account.get("cc_refresh_token")
 
@@ -906,23 +954,7 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
         updates["cc_refresh_failure_type"] = None
         updates["cc_refresh_last_failed_at"] = None
 
-    if updates:
-        # Compare-and-set against the row this decision was made from: the
-        # ownership lookup above can take seconds, and a re-authentication or
-        # an authority-guard adoption that landed meanwhile must win.
-        expected = {col: account.get(col) for col in CC_IMPORT_GUARD_COLS}
-        if not db.update_account_if_unchanged(account_id, expected, **updates):
-            logger.info(
-                "Account %d: the row changed while reconciling; not importing "
-                "the live credentials",
-                account_id,
-            )
-            return
-        logger.info(
-            "Account %d: reconciled %d credential field(s) from live store",
-            account_id, len(updates),
-        )
-        _clear_keeper_backoff(account_id)
+    return (updates, guard_cols) if updates else None
 
 
 def _clear_keeper_backoff(account_id: int) -> None:

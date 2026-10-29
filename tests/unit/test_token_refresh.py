@@ -681,6 +681,29 @@ class TestReconcileOwnershipProof:
             reconcile_credentials_from_live_store(aid, db)
         assert db.get_account(aid)["cc_access_token"] == "old-access"
 
+    def test_a_keeper_bookkeeping_write_never_vetoes_a_rotation_import(self, tmp_path):
+        """keeper_state is read only on the dead-token path. On a plain
+        rotation a keeper write during the lookup must not stop the import, or
+        the rotated refresh token is lost when the switch overwrites the store."""
+        from unittest.mock import patch
+
+        from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+
+        db, aid = self._account(tmp_path)
+        live = self._live(aid)
+        owner = _owner_profile("owner@test.com", "org-a", "uuid-a")
+
+        def lookup_while_keeper_writes(*args, **kwargs):
+            db.set_keeper_state(aid, last_status="ok", last_ping_at=1)
+            db.update_account(aid, access_token="primary-refreshed")
+            return owner
+
+        with patch("jacked.api.credential_helpers.read_platform_credentials", return_value=live), \
+             patch("jacked.api.credential_helpers._ownership_lookup",
+                   side_effect=lookup_while_keeper_writes):
+            reconcile_credentials_from_live_store(aid, db)
+        assert self._imported(db, aid)
+
     @pytest.mark.parametrize("raw", ["[]", "not json", '"needs_reauth"', None])
     def test_a_malformed_keeper_state_is_no_verdict(self, raw):
         from jacked.api.credential_helpers import cc_token_known_dead
