@@ -237,6 +237,37 @@ def build_menu(
     return pystray.Menu(*items)
 
 
+def _spawn_updater_in_fresh_interpreter(parent_pid: int, port: int, target: "str | None") -> None:
+    """Run the updater spawn in a new interpreter (the code on disk).
+
+    Waits for the short-lived spawner, so a failure is reported here and the
+    tray stays up instead of stopping with no updater behind it. Raises
+    RuntimeError when the spawner fails.
+    """
+    import subprocess
+    import sys
+
+    from jacked.winproc import NO_WINDOW
+
+    argv = [
+        sys.executable, "-m", "jacked", "_tray_spawn_updater",
+        "--parent-pid", str(parent_pid), "--port", str(port),
+    ]
+    if target:
+        argv += ["--target", str(target)]
+    result = subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=60,
+        check=False,
+        creationflags=NO_WINDOW,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"fresh-interpreter updater spawn exited {result.returncode}")
+
+
 class ServiceRunner:
     """Manages the uvicorn server thread and pystray icon."""
 
@@ -1283,15 +1314,28 @@ class ServiceRunner:
                 # will handle its own init.
                 logger.info("Pre-spawn init_status didn't write: %s", _e)
 
+            target = (self._version_info or {}).get("latest")
             try:
-                from jacked.service.updater import spawn_updater_from_tray
+                try:
+                    from jacked.service.updater import spawn_updater_from_tray
 
-                spawn_updater_from_tray(
-                    parent_pid=os.getpid(),
-                    extras="tray",
-                    target_version=(self._version_info or {}).get("latest"),
-                    port=self.port,
-                )
+                    spawn_updater_from_tray(
+                        parent_pid=os.getpid(),
+                        extras="tray",
+                        target_version=target,
+                        port=self.port,
+                    )
+                except ImportError as skew:
+                    # This tray runs the OLD build while a newer one is on
+                    # disk: the new updater module imports a name the old,
+                    # already-loaded modules lack (#178i). A fresh interpreter
+                    # loads the new code consistently, so spawn from there.
+                    logger.warning(
+                        "Updater import failed in the running tray (%s); "
+                        "spawning it from a fresh interpreter",
+                        skew,
+                    )
+                    _spawn_updater_in_fresh_interpreter(os.getpid(), self.port, target)
             except Exception:
                 logger.exception("Failed to spawn updater")
                 if self._icon:

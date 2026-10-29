@@ -2360,6 +2360,24 @@ def _update_status_shim(phase, status, error, recovery):
         sys.exit(1)
 
 
+@main.command(name="_tray_spawn_updater", hidden=True)
+@click.option("--parent-pid", type=int, required=True)
+@click.option("--port", type=int, required=True)
+@click.option("--target", default=None)
+def _tray_spawn_updater_shim(parent_pid, port, target):
+    """Internal: spawn the tray updater from a fresh interpreter.
+
+    The running tray calls this when importing the updater fails because a
+    newer build is already on disk (code skew, #178i). This process loads the
+    new code end to end, spawns the detached updater, and exits.
+    """
+    from jacked.service.updater import spawn_updater_from_tray
+
+    spawn_updater_from_tray(
+        parent_pid=parent_pid, extras="tray", target_version=target, port=port
+    )
+
+
 @main.command(name="_update_status_succeed", hidden=True)
 @click.option("--target", default=None, help="The version the upgrade should reach.")
 @click.option("--previous", default=None, help="The version the upgrade started from.")
