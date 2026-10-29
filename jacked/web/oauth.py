@@ -40,6 +40,22 @@ def _activate_oauth_account(db: Database, account: dict, operation_id: str):
 
     return activate_account(db, account, SwitchContext.OAUTH, operation_id)
 
+# The loopback callback pages are static: no outside code, and no framing.
+_CALLBACK_PAGE_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'unsafe-inline'; frame-ancestors 'none'"
+    ),
+    "X-Frame-Options": "DENY",
+}
+
+
+def _callback_page(text: str) -> web.Response:
+    """An OAuth loopback callback page (``text`` is already escaped)."""
+    return web.Response(
+        text=text, content_type="text/html", headers=_CALLBACK_PAGE_HEADERS
+    )
+
+
 # ---------------------------------------------------------------------------
 # Constants — from design doc section 5
 # ---------------------------------------------------------------------------
@@ -544,9 +560,8 @@ class OAuthFlow:
             self._status = "error"
             self._error = f"{error}: {error_desc}" if error_desc else error
             self._event.set()
-            return web.Response(
+            return _callback_page(
                 text="<h1>Error</h1><p>Authentication failed. You can close this window.</p>",
-                content_type="text/html",
             )
 
         # CSRF check — state validation also prevents cross-flow purpose confusion
@@ -555,9 +570,8 @@ class OAuthFlow:
             self._status = "error"
             self._error = "Invalid state parameter (possible CSRF attack)"
             self._event.set()
-            return web.Response(
+            return _callback_page(
                 text="<h1>Error</h1><p>Security validation failed.</p>",
-                content_type="text/html",
             )
 
         if code:
@@ -583,15 +597,13 @@ class OAuthFlow:
 
         if self._status == "error":
             safe_error = html.escape(self._error or "Unknown error")
-            return web.Response(
+            return _callback_page(
                 text=f"<h1>Authorization Failed</h1><p>{safe_error}</p>"
                      "<p>Return to the jacked dashboard to try again.</p>",
-                content_type="text/html",
             )
-        return web.Response(
+        return _callback_page(
             text="<h1>Success!</h1><p>You can close this window.</p>"
                  "<script>window.close()</script>",
-            content_type="text/html",
         )
 
     @staticmethod
