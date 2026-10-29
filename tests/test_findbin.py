@@ -498,3 +498,138 @@ def test_refuses_a_mutating_macos_acl_on_any_step(tmp_path, caplog, kind):
         caplog.clear()
         flagged = "/nowhere"
         assert _lookup(home, caplog) == str(bin_dir / "codex")
+
+
+@posix_only
+def test_resolves_a_relative_link_against_its_own_directory(tmp_path, caplog):
+    """~/.local/bin/codex -> ../../pkg/codex resolves from ~/.local/bin, not
+    from /: the target directory is checked, and a 0777 target dir refuses."""
+    home = tmp_path / "home"
+    real = _executable(home / "pkg" / "codex")
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "codex").symlink_to("../../pkg/codex")
+    assert _lookup(home, caplog) == str(bin_dir / "codex")
+    real.parent.chmod(0o777)
+    try:
+        assert _lookup(home, caplog) is None
+    finally:
+        real.parent.chmod(0o755)
+    assert "a directory is world-writable" in caplog.text
+
+
+@posix_only
+def test_a_fifo_is_refused_before_anything_opens_it(tmp_path, caplog):
+    """Opening a FIFO with no writer blocks. A FIFO in the candidate's place
+    is refused from its lstat alone; the descriptor read never runs on it."""
+    import jacked.findbin as findbin
+
+    bin_dir = tmp_path / "home" / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    fifo = bin_dir / "codex"
+    os.mkfifo(fifo)
+    opened = []
+    real_secure = findbin._secure_lstat
+
+    def spy(path, kind):
+        opened.append(path)
+        return real_secure(path, kind)
+
+    with patch.object(findbin, "_secure_lstat", side_effect=spy):
+        real_path, reason = findbin._resolve_trusted(str(fifo))
+    assert real_path is None and reason == "a path component is not a regular file or directory"
+    assert str(fifo) not in opened
+
+
+@posix_only
+def test_refuses_a_link_with_an_empty_target(tmp_path, caplog):
+    import jacked.findbin as findbin
+
+    home = tmp_path / "home"
+    real = _executable(home / "pkg" / "codex")
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    link = bin_dir / "codex"
+    link.symlink_to(real)
+    real_readlink = os.readlink
+    with patch.object(findbin.os, "readlink",
+                      side_effect=lambda p: "" if str(p) == str(link) else real_readlink(p)):
+        assert _lookup(home, caplog) is None
+    assert "empty target" in caplog.text
+
+
+@posix_only
+def test_refuses_a_mount_point_planted_in_the_sticky_tmp(caplog):
+    """Inside /tmp only a plain directory on /tmp's own filesystem is pinned
+    by the sticky bit; a directory on another device (a user FUSE mount can
+    report any owner) is refused."""
+    import tempfile
+
+    import jacked.findbin as findbin
+
+    home = Path(tempfile.mkdtemp(prefix="jk-findbin-mnt-", dir="/tmp"))
+    try:
+        _executable(home / ".local" / "bin" / "codex")
+        real_secure = findbin._secure_lstat
+        real_lstat = os.lstat
+
+        def other_device(status):
+            fields = list(status)
+            fields[stat.ST_DEV] += 1
+            return os.stat_result(fields)
+
+        with patch.object(findbin, "_secure_lstat",
+                          side_effect=lambda p, k: other_device(real_secure(p, k)) if p.endswith(home.name) else real_secure(p, k)), \
+             patch.object(findbin.os, "lstat",
+                          side_effect=lambda p: other_device(real_lstat(p)) if str(p).endswith(home.name) else real_lstat(p)), \
+             patch("jacked.findbin.shutil.which", return_value=None), \
+             caplog.at_level("WARNING", logger="jacked.findbin"):
+            assert find_bin("codex", home=str(home)) is None
+        assert "mount point" in caplog.text
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(home)
+
+
+macos_only = pytest.mark.skipif(sys.platform != "darwin", reason="macOS extended ACLs and descriptor reads")
+
+
+@macos_only
+def test_macos_real_acl_for_another_principal_is_refused_and_for_the_user_is_not(tmp_path, caplog):
+    """#185i with real ACLs (chmod +a), not mocks: `everyone allow add_file` on
+    the bin directory is refused; the same grant to the user alone is fine,
+    because it gives no one else a way in."""
+    import getpass
+    import subprocess
+
+    home = tmp_path / "home"
+    exe = _executable(home / ".local" / "bin" / "codex")
+    bin_dir = exe.parent
+    me = getpass.getuser()
+    subprocess.run(["chmod", "+a", f"user:{me} allow add_file,delete_child", str(bin_dir)], check=True)
+    assert _lookup(home, caplog) == str(exe)
+    subprocess.run(["chmod", "+a", "everyone allow add_file,delete_child", str(bin_dir)], check=True)
+    try:
+        assert _lookup(home, caplog) is None
+        assert "mutating ACL" in caplog.text
+    finally:
+        subprocess.run(["chmod", "-N", str(bin_dir)], check=True)
+    subprocess.run(["chmod", "+a", "everyone allow write", str(exe)], check=True)
+    try:
+        assert _lookup(home, caplog) is None
+    finally:
+        subprocess.run(["chmod", "-N", str(exe)], check=True)
+
+
+@macos_only
+def test_macos_traverse_only_directories_are_accepted(tmp_path, caplog):
+    """A directory the user may search but not read (0311 here; a root-owned
+    0711 parent in the field) cannot be opened for a descriptor read. Its ACL
+    is read by path instead, so the install is still found."""
+    home = tmp_path / "home"
+    exe = _executable(home / ".local" / "bin" / "codex")
+    exe.parent.chmod(0o311)
+    try:
+        assert _lookup(home, caplog) == str(exe)
+    finally:
+        exe.parent.chmod(0o755)

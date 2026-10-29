@@ -110,17 +110,24 @@ def _secure_lstat(path: str, kind: str) -> os.stat_result:
     file is opened with ``O_NOFOLLOW`` and its ACL read from the descriptor
     (``jacked.service.spec._darwin_secure_status``, the rule the service spec
     applies to its own interpreter); a link's ACL is read with
-    ``acl_get_link_np``. Raises ``OSError`` or ``ValueError``.
+    ``acl_get_link_np``. A directory or file the user may traverse but not
+    read (mode 0711, 0311) cannot be opened; its ACL is then read by path
+    without following links, which needs only search permission. Raises
+    ``OSError`` or ``ValueError``.
     """
     if not _HOST_IS_DARWIN:
         return os.lstat(path)
     from jacked.service import spec
 
-    if kind == "link":
-        status = os.lstat(path)
-        spec._validate_darwin_link_acl(Path(path))
-        return status
-    return spec._darwin_secure_status(Path(path), directory=kind == "dir")
+    if kind != "link":
+        try:
+            return spec._darwin_secure_status(Path(path), directory=kind == "dir")
+        except ValueError as exc:
+            if not isinstance(exc.__cause__, PermissionError):
+                raise
+    status = os.lstat(path)
+    spec._validate_darwin_link_acl(Path(path))
+    return status
 
 
 def _shared_sticky(status: os.stat_result) -> bool:
@@ -170,8 +177,9 @@ def _resolve_trusted(path: str) -> tuple[str | None, str | None]:
     if _untrusted_reason(root, uid):
         return None, "the root directory is writable by others"
 
-    # The resolved chain so far: (directory, is a shared sticky directory).
-    chain: list[tuple[str, bool]] = [(os.sep, False)]
+    # The resolved chain so far: (directory, is a shared sticky directory,
+    # its device).
+    chain: list[tuple[str, bool, int]] = [(os.sep, False, root.st_dev)]
     pending = [part for part in path.split(os.sep) if part]
     pending.reverse()  # a stack: the next component is pending[-1]
     hops = 0
@@ -183,7 +191,7 @@ def _resolve_trusted(path: str) -> tuple[str | None, str | None]:
             if len(chain) > 1:
                 chain.pop()
             continue
-        holder, holder_shared = chain[-1]
+        holder, holder_shared, holder_dev = chain[-1]
         entry = os.path.join(holder, part)
         try:
             first = os.lstat(entry)
@@ -200,15 +208,26 @@ def _resolve_trusted(path: str) -> tuple[str | None, str | None]:
                 target = os.readlink(entry)
             except (OSError, ValueError) as exc:
                 return None, _acl_or(exc, "a symlink cannot be read")
+            if not target:
+                return None, "a symlink has an empty target"
             hops += 1
             if hops > _MAX_SYMLINK_HOPS:
                 return None, "too many symlink hops"
             if os.path.isabs(target):
-                del chain[1:]
+                del chain[1:]  # back to the root, already checked
             pending.extend(reversed([p for p in target.split(os.sep) if p]))
             continue
 
         is_dir = stat.S_ISDIR(first.st_mode)
+        # Decide everything the lstat can decide BEFORE opening the entry: an
+        # open of a FIFO swapped into the path would block.
+        if not is_dir:
+            if not stat.S_ISREG(first.st_mode):
+                return None, "a path component is not a regular file or directory"
+            if pending:
+                return None, "a path component is not a directory"
+            if holder_shared:
+                return None, "the binary sits in a shared sticky directory"
         try:
             status = _secure_lstat(entry, "dir" if is_dir else "file")
         except (OSError, ValueError) as exc:
@@ -219,17 +238,18 @@ def _resolve_trusted(path: str) -> tuple[str | None, str | None]:
         if is_dir:
             if status.st_uid not in (uid, 0):
                 return None, "a directory is not owned by the current user"
+            if holder_shared and status.st_dev != holder_dev:
+                # A mount point planted in /tmp (a user FUSE mount can report
+                # any owner): only a plain directory on /tmp's own filesystem
+                # is pinned by the sticky bit.
+                return None, "a directory in a shared sticky directory is a mount point"
             shared = _shared_sticky(status)
             reason = _untrusted_reason(status, uid)
             if reason and not shared:
                 return None, f"a directory is {reason}"
-            chain.append((entry, shared))
+            chain.append((entry, shared, status.st_dev))
             continue
 
-        if pending:
-            return None, "a path component is not a directory"
-        if holder_shared:
-            return None, "the binary sits in a shared sticky directory"
         if not stat.S_ISREG(status.st_mode):
             return None, "binary is not a regular file"
         reason = _untrusted_reason(status, uid)
@@ -240,8 +260,21 @@ def _resolve_trusted(path: str) -> tuple[str | None, str | None]:
 
 
 def _acl_or(exc: BaseException, fallback: str) -> str:
-    """``"... has a mutating ACL"`` when the macOS check said so, else ``fallback``."""
-    return "a path component has a mutating ACL" if "ACL" in str(exc) and "mutating" in str(exc) else fallback
+    """The macOS ACL verdict in ``exc`` as a refusal reason, else ``fallback``.
+
+    >>> _acl_or(ValueError("runtime_path has a mutating extended ACL"), "x")
+    'a path component has a mutating ACL'
+    >>> _acl_or(ValueError("runtime_path ACL could not be inspected"), "x")
+    "a path component's ACL cannot be inspected"
+    >>> _acl_or(OSError("boom"), "x")
+    'x'
+    """
+    text = str(exc)
+    if "ACL" in text and "mutating" in text:
+        return "a path component has a mutating ACL"
+    if "ACL" in text and "could not be inspected" in text:
+        return "a path component's ACL cannot be inspected"
+    return fallback
 
 
 def _clean_dir(directory: str | None, label: str) -> str | None:
