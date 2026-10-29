@@ -601,12 +601,44 @@ def test_linux_refuses_a_shim_in_a_world_writable_directory(tmp_path, monkeypatc
     assert str(tmp_path) not in caplog.text
 
 
-def test_linux_path_hit_wins_and_duplicates_collapse(monkeypatch):
-    """google-chrome and google-chrome-stable often name one binary: it is
-    listed once, and a PATH hit is used as-is."""
+@linux_layout
+def test_linux_path_hit_wins_and_duplicates_collapse(tmp_path, monkeypatch):
+    """A PATH hit is used before any fixed location (the real resolver runs,
+    with a shim waiting in the fixed dir), and google-chrome plus
+    google-chrome-stable naming one binary are listed once."""
+    snap_bin = tmp_path / "snap" / "bin"
+    _shim(snap_bin, "google-chrome")
     monkeypatch.setattr(bl.sys, "platform", "linux")
+    monkeypatch.setattr(bl, "_LINUX_FIXED_DIRS", (str(snap_bin),))
+    monkeypatch.setattr(bl, "_LINUX_VENDOR_PATHS", {})
+    monkeypatch.setattr(bl, "_FLATPAK_EXPORT_DIRS", ())
     monkeypatch.setattr(bl.shutil, "which",
                         lambda name: "/usr/bin/google-chrome" if name.startswith("google-chrome") else None)
-    monkeypatch.setattr(bl, "_resolve_linux_browser",
-                        lambda exe: (bl.shutil.which(exe), None))
     assert bl._candidates() == [BrowserSpec("Chrome", "/usr/bin/google-chrome", "chromium")]
+
+
+def test_flatpak_edge_gets_the_edge_private_flag():
+    edge = BrowserSpec("Edge", "/var/lib/flatpak/exports/bin/com.microsoft.Edge",
+                       "chromium", "com.microsoft.Edge")
+    assert build_command(edge, URL, "incognito", None)[1] == "--inprivate"
+
+
+@linux_layout
+def test_snap_browser_profile_lives_under_its_snap_common_dir(tmp_path, monkeypatch):
+    """Snap hides ~/.claude from a confined browser, so the profile goes to
+    ~/snap/<snap>/common/jacked-browser-profiles/<slug>, created 0700."""
+    monkeypatch.setattr(bl.Path, "home", classmethod(lambda cls: tmp_path))
+    spec = BrowserSpec("Firefox", "/snap/bin/firefox", "firefox")
+    monkeypatch.setattr(bl, "find_browser", lambda: spec)
+    monkeypatch.setattr(bl, "_detach_kwargs", lambda: {})
+    with patch.object(bl.subprocess, "Popen") as popen:
+        popen.return_value.pid = 1
+        bl.open_auth_url(URL, {"email": "j@x.com"}, FakeDb("profile"))
+    argv = popen.call_args.args[0]
+    profile = Path(argv[argv.index("-profile") + 1])
+    assert profile.parent == tmp_path / "snap" / "firefox" / "common" / "jacked-browser-profiles"
+    assert profile.is_dir() and (profile.stat().st_mode & 0o777) == 0o700
+
+
+def test_brave_snap_is_probed_under_its_snap_name():
+    assert bl._linux_fixed_candidates("brave-browser")[0] == "/snap/bin/brave"

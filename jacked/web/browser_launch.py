@@ -208,6 +208,8 @@ def _linux_candidates() -> list[tuple[str, str, str]]:
 # After a PATH miss these fixed locations are probed, each one through the
 # find_bin trust rule.
 _LINUX_FIXED_DIRS = ("/snap/bin",)
+# Snap names where they differ from the executable name.
+_SNAP_NAMES = {"brave-browser": "brave", "chromium-browser": "chromium"}
 _LINUX_VENDOR_PATHS = {
     "google-chrome": ("/opt/google/chrome/chrome",),
     "google-chrome-stable": ("/opt/google/chrome/chrome",),
@@ -238,12 +240,35 @@ def _linux_fixed_candidates(exe: str) -> list[str]:
     >>> _linux_fixed_candidates("firefox")[-2]
     '/var/lib/flatpak/exports/bin/org.mozilla.firefox'
     """
-    paths = [os.path.join(directory, exe) for directory in _LINUX_FIXED_DIRS]
+    snap = _SNAP_NAMES.get(exe, exe)
+    paths = [os.path.join(directory, snap) for directory in _LINUX_FIXED_DIRS]
     paths.extend(_LINUX_VENDOR_PATHS.get(exe, ()))
     app_id = _FLATPAK_APP_IDS.get(exe)
     if app_id:
         paths.extend(os.path.join(os.path.expanduser(d), app_id) for d in _FLATPAK_EXPORT_DIRS)
     return paths
+
+
+def snap_profile_dir(spec: "BrowserSpec", profile_dir: Path) -> Path:
+    """Where a Snap browser can keep ``profile_dir``.
+
+    Snap confinement hides dot-directories in the home directory, so a Snap
+    browser cannot use ``~/.claude/jacked-browser-profiles``. Each snap may
+    write ``~/snap/<snap>/common``; the per-account profile lives there, with
+    the same slug. Any other browser keeps ``profile_dir``.
+
+    >>> snap = BrowserSpec("Chromium", "/snap/bin/chromium", "chromium")
+    >>> p = snap_profile_dir(snap, Path("/h/.claude/jacked-browser-profiles/a"))
+    >>> p.parts[-4:]
+    ('chromium', 'common', 'jacked-browser-profiles', 'a')
+    >>> other = BrowserSpec("Chrome", "/usr/bin/google-chrome", "chromium")
+    >>> snap_profile_dir(other, Path("/x/a")) == Path("/x/a")
+    True
+    """
+    path = Path(spec.path)
+    if path.parent != Path("/snap/bin"):
+        return profile_dir
+    return Path.home() / "snap" / path.name / "common" / PROFILE_ROOT.name / profile_dir.name
 
 
 def _resolve_linux_browser(exe: str) -> tuple[Optional[str], Optional[str]]:
@@ -379,7 +404,9 @@ def build_command(
             "--new-window",
             url,
         ]
-    private_flag = "--inprivate" if "msedge" in Path(spec.path).name.lower() else "--incognito"
+    # By name, not path: a Flatpak export is named com.microsoft.Edge.
+    is_edge = spec.name == "Edge" or "msedge" in Path(spec.path).name.lower()
+    private_flag = "--inprivate" if is_edge else "--incognito"
     return [spec.path, private_flag, "--new-window", url]
 
 
@@ -499,6 +526,7 @@ def open_auth_url(url: str, account: Optional[dict], db) -> LaunchResult:
 
     try:
         if effective == "profile":
+            profile_dir = snap_profile_dir(spec, profile_dir)
             profile_dir.mkdir(parents=True, exist_ok=True)
             try:
                 profile_dir.chmod(0o700)
