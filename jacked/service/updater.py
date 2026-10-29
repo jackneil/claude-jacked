@@ -1116,7 +1116,11 @@ def run_update(
         outcome = _start_and_verify(target_version)
         if outcome == "ok":
             log(f"Updater done - new service is listening on :{port}")
-            _refresh_packs_phase(jacked, log, log_fh)
+            # Phase: refreshing_packs, now that the service is up. Never fatal.
+            _begin("refreshing_packs")
+            packs_reason = run_refresh_packs(jacked, log_fh)
+            log(f"jacked packs update: {packs_reason or 'ok'}")
+            _end("refreshing_packs", "ok" if packs_reason is None else "warning")
             if RECOVERY_FILE.exists():
                 try:
                     RECOVERY_FILE.unlink()
@@ -1226,24 +1230,6 @@ def run_refresh_packs(jacked: str, log_fh=None) -> "str | None":
     except OSError as exc:
         return f"could not start ({type(exc).__name__})"
     return None if result.returncode == 0 else f"exit {result.returncode}"
-
-
-def _refresh_packs_phase(jacked: str, log, log_fh) -> None:
-    """The refreshing_packs phase of the detached updater (never fatal)."""
-    from jacked.service import update_status as _us
-
-    try:
-        _us.begin_phase(_us.UPDATE_STATUS_FILE, "refreshing_packs")
-    except Exception:
-        logger.debug("Could not open the refreshing_packs phase", exc_info=True)
-    reason = run_refresh_packs(jacked, log_fh)
-    log(f"jacked packs update: {reason or 'ok'}")
-    try:
-        _us.end_phase(
-            _us.UPDATE_STATUS_FILE, "refreshing_packs", "ok" if reason is None else "warning"
-        )
-    except Exception:
-        logger.debug("Could not close the refreshing_packs phase", exc_info=True)
 
 
 def windows_refresh_packs_block(drift_guard: str = "") -> str:
