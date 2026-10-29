@@ -497,10 +497,17 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             # (architecture doc §7.2 — launch.py:489 stale write gap).
             try:
                 from jacked.api.credential_helpers import reconcile_credentials_from_live_store
-                reconcile_credentials_from_live_store(account_id, db)
+                reconciled = reconcile_credentials_from_live_store(account_id, db)
                 account = db.get_account(account_id) or account
             except Exception:
+                reconciled = True
                 logger.debug("Pre-launch reconcile failed", exc_info=True)
+            if reconciled is False:
+                # Claude Code's latest tokens for this account may not be saved
+                # yet; the launch's credential write would overwrite them.
+                raise click.ClickException(
+                    f"Account {account_id} is being updated right now. Try again."
+                )
             logger.info(
                 "Account %d: skipping pre-launch CC refresh (account is the "
                 "active Claude Code session — Claude Code manages its own "

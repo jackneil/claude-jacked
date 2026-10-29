@@ -774,7 +774,7 @@ CC_VERDICT_GUARD_COLS = ("access_token", "keeper_state")
 _IMPORT_ATTEMPTS = 3
 
 
-def reconcile_credentials_from_live_store(account_id: int, db) -> None:
+def reconcile_credentials_from_live_store(account_id: int, db) -> bool:
     """Read live credentials for the active account and reconcile with DB.
 
     Before swapping away from an account, check if Claude Code rotated
@@ -783,6 +783,11 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
 
     Called before an account switch moves the credential stores to another
     account.
+
+    Returns False only when the row kept changing during every attempt: an
+    owned rotation may then still be waiting in the live store, and a caller
+    about to overwrite that store (an account switch, a launch) must not.
+    Returns True in every other case, imported or not.
 
     SAFETY: Never imports cc_refresh_token when circuit breaker shows
     invalid_grant — the live token is Claude Code's active token and
@@ -799,14 +804,14 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
         _cache_live_credentials(account_id, live)
 
     if not live:
-        return
+        return True
 
     # Only reconcile if the credentials belong to the outgoing account
     if _stamp_of(live) != account_id:
-        return
+        return True
 
     if not live.get("claudeAiOauth", {}).get("accessToken"):
-        return
+        return True
 
     for attempt in range(_IMPORT_ATTEMPTS):
         # Read the row this decision is made from (again, after a lost
@@ -814,15 +819,15 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
         # per token, so a retry sends no second profile request).
         account = db.get_account(account_id)
         if not account:
-            return
-        decision = _reconcile_decision(account_id, account, live, from_cache and attempt == 0)
+            return True
+        decision = _reconcile_decision(account_id, account, live, from_cache)
         if decision is _RECONCILE_RETRY_FRESH:
             # The verdict is what admits this older payload, so act on a fresh
             # read, never on one cached up to 30 s ago.
             invalidate_live_cred_cache()
             return reconcile_credentials_from_live_store(account_id, db)
         if not decision:
-            return
+            return True
         updates, guard_cols = decision
         # Compare-and-set against the columns this decision read: a
         # re-authentication or adoption that landed during the ownership
@@ -834,7 +839,7 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
                 account_id, len(updates),
             )
             _clear_keeper_backoff(account_id)
-            return
+            return True
         logger.info(
             "Account %d: the row changed while reconciling; deciding again",
             account_id,
@@ -844,6 +849,7 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
         "live credentials were not imported",
         account_id, _IMPORT_ATTEMPTS,
     )
+    return False
 
 
 # Sentinel: the decision needs a fresh (uncached) read of the live store.

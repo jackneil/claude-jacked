@@ -704,6 +704,31 @@ class TestReconcileOwnershipProof:
             reconcile_credentials_from_live_store(aid, db)
         assert self._imported(db, aid)
 
+    def test_reconcile_reports_a_row_that_kept_changing(self, tmp_path):
+        """True for every settled outcome; False only when every attempt lost
+        the compare-and-set (a rotation may still be waiting in the store)."""
+        from unittest.mock import patch
+
+        from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+
+        db, aid = self._account(tmp_path)
+        owner = _owner_profile("owner@test.com", "org-a", "uuid-a")
+        with patch("jacked.api.credential_helpers.read_platform_credentials",
+                   return_value=self._live(aid)), \
+             patch("jacked.api.credential_helpers._ownership_lookup", return_value=owner), \
+             patch.object(type(db), "update_account_if_unchanged", return_value=False) as cas:
+            assert reconcile_credentials_from_live_store(aid, db) is False
+        assert cas.call_count == 3
+        assert not self._imported(db, aid)
+        # Same payload, a quiet row: imported, True.
+        from jacked.api.credential_helpers import invalidate_live_cred_cache
+        invalidate_live_cred_cache()
+        with patch("jacked.api.credential_helpers.read_platform_credentials",
+                   return_value=self._live(aid)), \
+             patch("jacked.api.credential_helpers._ownership_lookup", return_value=owner):
+            assert reconcile_credentials_from_live_store(aid, db) is True
+        assert self._imported(db, aid)
+
     @pytest.mark.parametrize("raw", ["[]", "not json", '"needs_reauth"', None])
     def test_a_malformed_keeper_state_is_no_verdict(self, raw):
         from jacked.api.credential_helpers import cc_token_known_dead
