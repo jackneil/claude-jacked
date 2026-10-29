@@ -896,11 +896,31 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                 # Credential files contain CC tokens — sync to cc_* columns.
                 # CAS: only write if DB value hasn't changed under us.
                 row = conn.execute(
-                    "SELECT cc_access_token FROM accounts WHERE id = ?",
+                    "SELECT cc_access_token, cc_refresh_token FROM accounts WHERE id = ?",
                     (account_id,),
                 ).fetchone()
                 old_cc_access_token = row[0] if row else None
                 if old_cc_access_token == access_token:
+                    # Same tokens, but the file may carry pass-through fields
+                    # the row lacks (a row from before #174i, or a field
+                    # Claude Code changed without rotating): take them, bound
+                    # to the row's own refresh token, CAS on the access token.
+                    if "cc_oauth_extra" in cols and refresh_token == row[1]:
+                        from jacked.credentials.oauth_extra import (
+                            encode_oauth_extra,
+                            oauth_extra_from,
+                        )
+
+                        extra = encode_oauth_extra(oauth_extra_from(oauth), refresh_token)
+                        # CAS on BOTH tokens: an invalid_grant recovery keeps
+                        # the access token but replaces the lineage.
+                        conn.execute(
+                            "UPDATE accounts SET cc_oauth_extra = ? "
+                            "WHERE id = ? AND cc_access_token IS ? "
+                            "AND cc_refresh_token IS ? AND cc_oauth_extra IS NOT ?",
+                            (extra, account_id, access_token, refresh_token, extra),
+                        )
+                        conn.commit()
                     return  # Token unchanged
 
                 # If cc_access_token is NULL in DB, skip sync. NULL means
@@ -946,6 +966,16 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                         "cc_refresh_failure_type = CASE WHEN cc_refresh_failure_type = "
                         "'auth_rejected' THEN NULL ELSE cc_refresh_failure_type END"
                     )
+
+                # Claude Code's pass-through fields (#174i) as the file holds them.
+                if "cc_oauth_extra" in cols:
+                    from jacked.credentials.oauth_extra import (
+                        encode_oauth_extra,
+                        oauth_extra_from,
+                    )
+
+                    set_clauses.append("cc_oauth_extra = ?")
+                    params.append(encode_oauth_extra(oauth_extra_from(oauth), refresh_token))
 
                 set_clauses.extend([
                     "validation_status = 'valid'",

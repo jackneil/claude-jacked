@@ -106,6 +106,33 @@ def _stored_profile_org(row: dict) -> str | None:
     return org.strip() if isinstance(org, str) and org.strip() else None
 
 
+def _sign_in_oauth_extra(tokens: dict) -> Optional[str]:
+    """The pass-through fields for a fresh Claude Code sign-in (#174i).
+
+    A sign-in starts a new refresh lineage, so nothing carries over: only a
+    ``refresh_token_expires_in`` the token response itself sent. jacked does
+    not invent Claude Code's 30-day default, and it uses the default OAuth
+    client, for which Claude Code writes no clientId.
+
+    >>> _sign_in_oauth_extra({"refresh_token": "r"}) is None
+    True
+    >>> "refreshTokenExpiresAt" in _sign_in_oauth_extra(
+    ...     {"refresh_token": "r", "refresh_token_expires_in": 60})
+    True
+    """
+    from jacked.credentials.oauth_extra import (
+        encode_oauth_extra,
+        refresh_expiry_from_response,
+    )
+
+    if not tokens.get("refresh_token"):
+        return None
+    expires = refresh_expiry_from_response(tokens, int(time.time() * 1000))
+    return encode_oauth_extra(
+        {"refreshTokenExpiresAt": expires} if expires else {}, tokens.get("refresh_token")
+    )
+
+
 def identity_hint_params(account: Optional[dict]) -> dict:
     """Extra authorize-URL params that pre-select the account being re-authed.
 
@@ -1150,6 +1177,8 @@ class OAuthFlow:
             cc_access_token=tokens["access_token"],
             cc_refresh_token=tokens.get("refresh_token"),
             cc_expires_at=expires_at,
+            # A new lineage: only what this token response says (#174i).
+            cc_oauth_extra=_sign_in_oauth_extra(tokens),
             validation_status="valid",
             # A fresh interactive login is a new Claude Code refresh lineage:
             # clear the cc chain breaker a consumed token left behind, or the

@@ -9,6 +9,44 @@ from pathlib import Path
 HEARTBEAT_THROTTLE_SECONDS = 300
 
 
+def unique_detected_at(conn: sqlite3.Connection, session_id: str, ts: str) -> str:
+    """``ts``, or one microsecond past the session's latest ``detected_at``.
+
+    ``session_accounts`` is ``UNIQUE(session_id, detected_at)`` and the insert
+    is ``INSERT OR IGNORE``. Two detections for one session in the same clock
+    tick (Windows' clock is coarse) gave the second record the first one's
+    timestamp: it was silently dropped after the first was ended, and the
+    session was left with no open record. Call inside the writer transaction.
+
+    >>> c = sqlite3.connect(":memory:")
+    >>> _ = c.execute("CREATE TABLE session_accounts (session_id TEXT, detected_at TEXT)")
+    >>> _ = c.execute("INSERT INTO session_accounts VALUES ('s', '2026-10-29T05:00:00+00:00')")
+    >>> unique_detected_at(c, "s", "2026-10-29T05:00:00+00:00")
+    '2026-10-29T05:00:00.000001+00:00'
+    >>> unique_detected_at(c, "s", "2026-10-29T06:00:00+00:00")
+    '2026-10-29T06:00:00+00:00'
+    >>> unique_detected_at(c, "other", "2026-10-29T05:00:00+00:00")
+    '2026-10-29T05:00:00+00:00'
+    """
+    from datetime import timedelta
+
+    row = conn.execute(
+        "SELECT MAX(detected_at) FROM session_accounts WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    latest = row[0] if row else None
+    if not latest:
+        return ts
+    try:
+        latest_dt = datetime.fromisoformat(latest)
+        ts_dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return ts
+    if ts_dt > latest_dt:
+        return ts
+    return (latest_dt + timedelta(microseconds=1)).isoformat()
+
+
 def match_snapshot_account(
     db_path: Path, snapshot: dict | None
 ) -> tuple[int | None, str | None]:
@@ -130,6 +168,7 @@ def record_session(
                         (ts, existing[0]),
                     )
             else:
+                ts = unique_detected_at(conn, session_id, ts)
                 base = (session_id, account_id, email, ts, ts, method, repo_path, pid)
                 if supports_evidence:
                     conn.execute(

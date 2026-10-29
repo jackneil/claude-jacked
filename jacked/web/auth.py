@@ -200,6 +200,8 @@ class TokenExchangeResult:
     chain: str | None = None
     # Values-free detail for logs (an exception class name), never a token.
     detail: str | None = None
+    # The response's refresh_token_expires_in as a ms epoch, when it sent one.
+    refresh_token_expires_at_ms: int | None = None
 
 
 class RefreshMode(str, Enum):
@@ -335,11 +337,16 @@ async def _exchange_refresh_token(
                     status_code=200,
                     detail=type(exc).__name__,
                 )
+            from jacked.credentials.oauth_extra import refresh_expiry_from_response
+
             return TokenExchangeResult(
                 success=True,
                 access_token=access_token,
                 refresh_token=data.get("refresh_token", refresh_token),
                 expires_in=data.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS),
+                refresh_token_expires_at_ms=refresh_expiry_from_response(
+                    data, int(time.time() * 1000)
+                ),
             )
 
         # Parse error type from response
@@ -600,6 +607,24 @@ async def _run_chain_flow(
                     expires_col: new_expires_at,
                     **_breaker_updates(chain, None),
                 }
+                if chain == "cc":
+                    # Claude Code's refresh rule for its pass-through fields
+                    # (#174i): take the response's refresh-token expiry when
+                    # it sends one, else keep the previous value. The values
+                    # are bound to a refresh lineage, so they are re-bound to
+                    # the rotated token either way.
+                    from jacked.credentials.oauth_extra import (
+                        encode_oauth_extra,
+                        parse_oauth_extra,
+                    )
+
+                    previous = current or {}
+                    extra = parse_oauth_extra(
+                        previous.get("cc_oauth_extra"), previous.get("cc_refresh_token")
+                    )
+                    if result.refresh_token_expires_at_ms is not None:
+                        extra["refreshTokenExpiresAt"] = result.refresh_token_expires_at_ms
+                    updates["cc_oauth_extra"] = encode_oauth_extra(extra, result.refresh_token)
 
                 db_updated = False
                 for attempt in range(3):
@@ -763,11 +788,19 @@ async def _cc_chain_died(
             int(live_expires / 1000) if live_expires and live_expires > 1e12
             else int(live_expires) if live_expires else None
         )
+        # The recovered access token carries no refresh token, so no
+        # refresh-token expiry either; the other pass-through fields stay as
+        # Claude Code holds them.
+        from jacked.credentials.oauth_extra import encode_oauth_extra, oauth_extra_from
+
+        recovered_extra = oauth_extra_from(oauth)
+        recovered_extra.pop("refreshTokenExpiresAt", None)
         db.update_account(
             account_id,
             cc_access_token=live_access,
             cc_expires_at=live_exp_s,
             cc_refresh_token=None,
+            cc_oauth_extra=encode_oauth_extra(recovered_extra, None),
             **_breaker_updates("cc", "invalid_grant"),
         )
         logger.info(
@@ -782,6 +815,7 @@ async def _cc_chain_died(
         cc_access_token=None,
         cc_refresh_token=None,
         cc_expires_at=None,
+        cc_oauth_extra=None,
         **_breaker_updates("cc", "invalid_grant"),
     )
     logger.warning(

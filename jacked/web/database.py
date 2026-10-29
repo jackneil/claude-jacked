@@ -77,6 +77,7 @@ class Account(BaseModel):
     profile_json: Optional[str] = None
     profile_fetched_at: Optional[float] = None
     keeper_state: Optional[str] = None
+    cc_oauth_extra: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -231,6 +232,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     profile_json TEXT,  -- Non-secret profile subset: {"account": {...}, "organization": {...}}
     profile_fetched_at REAL,  -- Epoch seconds of the profile fetch that wrote profile_json
     keeper_state TEXT,  -- Window keeper state JSON (see Database.set_keeper_state)
+    cc_oauth_extra TEXT,  -- claudeAiOauth pass-through fields, JSON (jacked.credentials.oauth_extra)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(provider, email, organization_uuid)
@@ -826,6 +828,16 @@ class Database:
                     conn.execute("ALTER TABLE accounts ADD COLUMN keeper_state TEXT")
                 except sqlite3.OperationalError:
                     pass
+            # Migration: the claudeAiOauth fields Claude Code writes that
+            # jacked does not model (refreshTokenExpiresAt, clientId, ...),
+            # kept so a switch writes them back (#174i). Nullable, no
+            # backfill: an existing row simply has none until the next
+            # reconcile reads them. Same placement rule as keeper_state.
+            if "cc_oauth_extra" not in acct_cols_keeper:
+                try:
+                    conn.execute("ALTER TABLE accounts ADD COLUMN cc_oauth_extra TEXT")
+                except sqlite3.OperationalError:
+                    pass
             # Migration (workstream B, token chains): per-chain breaker
             # columns for the Claude Code (cc_*) refresh lineage. The
             # refresh_* pair now belongs to the primary lineage only. Like the
@@ -1245,6 +1257,7 @@ class Database:
             "cc_access_token",
             "cc_refresh_token",
             "cc_expires_at",
+            "cc_oauth_extra",
             "organization_uuid",
             "refresh_last_failed_at",
             "refresh_failure_type",
@@ -2361,6 +2374,9 @@ class Database:
                 )
                 return existing[0]
 
+            from jacked.session_tracking_store import unique_detected_at
+
+            ts = unique_detected_at(conn, session_id, ts)
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO session_accounts
                    (session_id, account_id, email, detected_at, last_activity_at,

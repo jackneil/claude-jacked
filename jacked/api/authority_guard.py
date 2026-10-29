@@ -365,6 +365,15 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
         # A newer access token replaces the one the API refused.
         updates["cc_refresh_failure_type"] = None
         updates["cc_refresh_last_failed_at"] = None
+    # Claude Code's pass-through fields (#174i), unless the lineage they
+    # describe is the dead one jacked does not take.
+    if row.get("cc_refresh_failure_type") != "invalid_grant":
+        from jacked.credentials.oauth_extra import encode_oauth_extra, oauth_extra_from
+
+        row_refresh = updates.get("cc_refresh_token", row.get("cc_refresh_token"))
+        extra = encode_oauth_extra(oauth_extra_from(oauth), row_refresh)
+        if extra != row.get("cc_oauth_extra"):
+            updates["cc_oauth_extra"] = extra
     return updates
 
 

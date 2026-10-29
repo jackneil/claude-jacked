@@ -225,7 +225,8 @@ def _is_pid_alive(pid: int) -> bool:
     with an exception set") for exited PIDs. That error slipped past
     the `except OSError:` below because SystemError isn't an OSError.
 
-    >>> _is_pid_alive(1)  # init/launchd is always alive
+    >>> import os
+    >>> _is_pid_alive(os.getpid())  # this process, on every OS
     True
     >>> _is_pid_alive(999999999)
     False
