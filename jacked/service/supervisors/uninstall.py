@@ -17,6 +17,7 @@ from ._artifacts import (
     extract_marker,
     inspect_artifact,
 )
+from ._helpers import privately_controlled
 from ._transition import SupervisorTransitionLease, TransitionBusy
 from . import render_for_spec
 from ._task_xml import query_task_xml
@@ -208,7 +209,7 @@ def _remove_exact_artifact(
         or status.st_nlink != 1
         or (
             os.name == "posix"
-            and (status.st_uid != os.getuid() or status.st_mode & 0o022)
+            and not privately_controlled(path, status)
         )
     ):
         return _refused(path, "artifact changed during uninstall")

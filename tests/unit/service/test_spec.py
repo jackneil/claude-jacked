@@ -78,7 +78,11 @@ def test_virtualenv_runtime_accepts_supported_python_targets(tmp_path, target_na
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
-def test_virtualenv_runtime_rejects_broken_non_python_and_writable_paths(tmp_path):
+def test_virtualenv_runtime_rejects_broken_non_python_and_writable_paths(
+    tmp_path, monkeypatch
+):
+    from jacked.service import spec as spec_module
+
     venv = tmp_path / "venv"
     venv.joinpath("bin").mkdir(parents=True)
     venv.joinpath("pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
@@ -102,6 +106,9 @@ def test_virtualenv_runtime_rejects_broken_non_python_and_writable_paths(tmp_pat
     # parent's group, which is the trusted wheel group under /private/tmp.
     os.chown(venv.joinpath("bin"), -1, os.getgid())
     venv.joinpath("bin").chmod(0o775)
+    # On Linux the user's own group is often a user-private group, which is
+    # trusted by design; pin the trusted set so the group grant is untrusted.
+    monkeypatch.setattr(spec_module, "_trusted_group_ids", lambda: frozenset({0}))
     with pytest.raises(ValueError, match="untrusted writable directory"):
         _spec(runtime_path=str(broken))
 

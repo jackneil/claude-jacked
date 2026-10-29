@@ -13,7 +13,7 @@ from typing import Any
 from xml.etree import ElementTree
 
 from jacked.service.spec import SupervisorKind
-from jacked.service.supervisors._helpers import atomic_write
+from jacked.service.supervisors._helpers import atomic_write, privately_controlled
 
 
 class ArtifactDisposition(str, Enum):
@@ -55,9 +55,7 @@ def inspect_artifact(path: Path, expected: SupervisorArtifact) -> ArtifactInspec
                 ArtifactDisposition.FOREIGN,
                 "artifact is not a regular single-link file",
             )
-        if os.name == "posix" and (
-            status.st_uid != os.getuid() or status.st_mode & 0o022
-        ):
+        if os.name == "posix" and not privately_controlled(path, status):
             return ArtifactInspection(
                 ArtifactDisposition.FOREIGN,
                 "artifact is not privately controlled by the current user",

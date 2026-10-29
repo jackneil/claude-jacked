@@ -20,7 +20,7 @@ from jacked.service.supervisors._artifacts import (
     inspect_artifact,
     reconcile_artifact,
 )
-from jacked.service.supervisors._helpers import atomic_write
+from jacked.service.supervisors._helpers import atomic_write, privately_controlled
 
 
 @dataclass(frozen=True)
@@ -330,7 +330,7 @@ def _read_artifact(path: Path) -> bytes | None:
             or status.st_nlink != 1
             or (
                 os.name == "posix"
-                and (status.st_uid != os.getuid() or status.st_mode & 0o022)
+                and not privately_controlled(path, status)
             )
         ):
             return None
