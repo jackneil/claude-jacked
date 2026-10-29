@@ -854,6 +854,14 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
         f"[dim](install method: {method})[/dim]\n"
     )
 
+    # The version this upgrade should reach, read from the same PyPI JSON API
+    # the version check uses. The install resolves through the simple index,
+    # which can lag the JSON API for minutes after a release (#166i); knowing
+    # the target is how a reinstall of the old build gets reported truthfully.
+    target_version = _upgrade_target_version()
+    if target_version:
+        console.print(f"[dim]Target version: v{target_version} (PyPI)[/dim]")
+
     # Windows can't overwrite a running .exe. Spawn a detached cmd.exe that
     # waits for this process to die, then does the install + migrate + restart.
     if sys.platform == "win32":
@@ -862,6 +870,7 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
         _spawn_windows_upgrade_helper(
             cmd, label, extras, skip_service,
             previous_version=__version__, no_rollback=no_rollback,
+            target_version=target_version,
         )
         return
 
@@ -870,6 +879,87 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
     _run_upgrade_inline(
         cmd, label, extras, skip_service, PID_FILE, DEFAULT_HOST, DEFAULT_PORT,
         previous_version=__version__, no_rollback=no_rollback,
+        target_version=target_version,
+    )
+
+
+# Exit code of `jacked upgrade` when the package index did not serve the
+# target version yet (the machine is consistent; run the upgrade again later).
+EXIT_INDEX_LAG = 4
+
+
+def _upgrade_target_version() -> str | None:
+    """The newest claude-jacked on PyPI's JSON API, or None when unknown.
+
+    Best effort with a short timeout: offline, the upgrade proceeds exactly as
+    before and reports what it installed.
+    """
+    from jacked.install_method import safe_version_label
+    from jacked.version_check import get_latest_pypi_version
+
+    try:
+        latest = get_latest_pypi_version(timeout=5.0)
+    except Exception:  # noqa: BLE001 - a lookup failure never blocks an upgrade
+        return None
+    if not latest:
+        return None
+    # The label reaches a generated Windows batch: allow a version shape only.
+    safe = safe_version_label(latest, fallback="")
+    return safe or None
+
+
+# The real lookup, for tests: tests/conftest.py replaces _upgrade_target_version
+# so no test reaches PyPI, and this name lets the lookup itself be tested.
+_upgrade_target_version_impl = _upgrade_target_version
+
+
+def _status_target(previous: str, target: str | None) -> str:
+    """The update-status ``to_version``: the target only when it is NEWER than
+    the running build. The update page treats a running build that equals
+    to_version as done, so a reinstall of the current version (an extras
+    change, or the index already caught up) keeps "next".
+
+    >>> _status_target("0.107.0", "0.107.1"), _status_target("0.107.1", "0.107.1")
+    ('0.107.1', 'next')
+    >>> _status_target("0.107.0", None)
+    'next'
+    """
+    return target if target and _index_lag(previous, target) else "next"
+
+
+def _index_lag(installed: str, target: str | None) -> bool:
+    """True when ``installed`` is older than the ``target`` the index named.
+
+    >>> _index_lag("0.107.0", "0.107.1"), _index_lag("0.107.1", "0.107.1")
+    (True, False)
+    >>> _index_lag("0.108.0", "0.107.1"), _index_lag("0.107.0", None)
+    (False, False)
+    >>> _index_lag("0.109.0.dev3", "0.109.0"), _index_lag("0.109.0rc1", "0.109.0")
+    (True, True)
+    """
+    if not target or not installed:
+        return False
+    # PEP 440 ordering (pre-releases and dev builds sort before the release).
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return Version(installed) < Version(target)
+    except InvalidVersion:
+        from jacked.version_check import _parse_version_tuple
+
+        return _parse_version_tuple(installed) < _parse_version_tuple(target)
+
+
+def _index_lag_message(installed: str, target: str, changed: bool) -> str:
+    """The user-facing lag message (Simplified Technical English, no dash).
+
+    >>> _index_lag_message("0.107.0", "0.107.1", changed=False)
+    'Already on v0.107.0. The package index does not serve v0.107.1 yet. Try again in a few minutes.'
+    """
+    first = f"Upgraded to v{installed}." if changed else f"Already on v{installed}."
+    return (
+        f"{first} The package index does not serve v{target} yet. "
+        "Try again in a few minutes."
     )
 
 
@@ -1118,7 +1208,9 @@ def _finish_failed_upgrade(*, error: str, commands: list[str]) -> None:
     sys.exit(1)
 
 
-def _acquire_upgrade_lock(previous_version: str, extras: str):
+def _acquire_upgrade_lock(
+    previous_version: str, extras: str, target_version: str | None = None
+):
     """Claim the shared update lock, or refuse when one is in flight.
 
     The tray updater and this command drive the same machine. Two of them at
@@ -1158,7 +1250,7 @@ def _acquire_upgrade_lock(previous_version: str, extras: str):
         _us.init_or_adopt_status(
             _us.UPDATE_STATUS_FILE,
             from_version=previous_version,
-            to_version="next",
+            to_version=_status_target(previous_version, target_version),
             method=method,
         )
     except _us.LockBusy as exc:
@@ -1376,6 +1468,7 @@ def _run_upgrade_inline(
     cmd: list[str], label: str, extras: str, skip_service: bool,
     pid_file, host: str, port: int,
     previous_version: str = "", no_rollback: bool = False,
+    target_version: str | None = None,
 ):
     """Inline upgrade for POSIX. Running binary gets replaced safely via inode.
 
@@ -1392,8 +1485,9 @@ def _run_upgrade_inline(
         pid_file=pid_file,
         previous_version=previous_version,
         no_rollback=no_rollback,
+        target_version=target_version,
     )
-    lock = _acquire_upgrade_lock(previous_version, extras)
+    lock = _acquire_upgrade_lock(previous_version, extras, target_version)
     try:
         _run_upgrade_inline_locked(request)
     finally:
@@ -1413,6 +1507,7 @@ class _UpgradeRequest:
     pid_file: object
     previous_version: str = ""
     no_rollback: bool = False
+    target_version: str | None = None
 
 
 def _run_upgrade_inline_locked(request: "_UpgradeRequest") -> None:
@@ -1422,6 +1517,22 @@ def _run_upgrade_inline_locked(request: "_UpgradeRequest") -> None:
     # Step 1: package upgrade (uv / pipx, auto-detected).
     jacked = _upgrade_install_package(request.cmd, request.label)
     new_version = _installed_package_version()
+    lagging = _index_lag(new_version, request.target_version)
+    if lagging and new_version == request.previous_version:
+        # The index served the build that is already installed. Nothing on
+        # this machine changed and the service was never touched: say so,
+        # instead of "Upgrade complete" (#166i).
+        message = _index_lag_message(new_version, request.target_version, changed=False)
+        try:
+            _us.mark_failed(
+                _us.UPDATE_STATUS_FILE,
+                error=f"the package index does not serve v{request.target_version} yet",
+                recovery="jacked upgrade (in a few minutes)",
+            )
+        except Exception:
+            logger.debug("Could not mark the update status failed", exc_info=True)
+        console.print(f"\n[yellow]{message}[/yellow]")
+        sys.exit(EXIT_INDEX_LAG)
     plan = _RollbackPlan(
         jacked=jacked,
         previous_version=request.previous_version,
@@ -1442,6 +1553,20 @@ def _run_upgrade_inline_locked(request: "_UpgradeRequest") -> None:
         )
     # A clean upgrade retires the recovery file an earlier failure left behind.
     _clear_upgrade_recovery_file()
+    if lagging:
+        # A newer build did install and run, but not the one the index named:
+        # the machine is consistent, the upgrade is not finished.
+        message = _index_lag_message(new_version, request.target_version, changed=True)
+        try:
+            _us.mark_failed(
+                _us.UPDATE_STATUS_FILE,
+                error=f"the package index does not serve v{request.target_version} yet",
+                recovery="jacked upgrade (in a few minutes)",
+            )
+        except Exception:
+            logger.debug("Could not mark the update status failed", exc_info=True)
+        console.print(f"\n[yellow]{message}[/yellow]")
+        sys.exit(EXIT_INDEX_LAG)
     try:
         _us.mark_succeeded(_us.UPDATE_STATUS_FILE)
     except Exception:
@@ -1675,6 +1800,7 @@ def _cli_package_failed_block(
 def _spawn_windows_upgrade_helper(
     cmd: list[str], label: str, extras: str, skip_service: bool,
     previous_version: str = "", no_rollback: bool = False,
+    target_version: str | None = None,
 ):
     """Windows: spawn a detached cmd.exe helper and exit this process.
 
@@ -1721,6 +1847,9 @@ def _spawn_windows_upgrade_helper(
     # line. A version that fails the check must never reach a shell line, not
     # even inside an echo.
     safe_previous = safe_version_label(previous_version)
+    # The target reaches batch lines: the same one-time validation, and "next"
+    # (the status record's "unknown") when there is no safe target.
+    safe_target = safe_version_label(target_version or "", fallback="")
     from jacked.install_method import detect_install_method
 
     method = detect_install_method()
@@ -1881,7 +2010,8 @@ def _spawn_windows_upgrade_helper(
         # In-flight guard: the same status-record claim the tray batch makes.
         # A batch cannot hold an OS lock across steps, so this is the Windows
         # equivalent of the CLI's exclusive update lock.
-        'jacked _update_status_init "' + safe_previous + '" "next" ' + method
+        'jacked _update_status_init "' + safe_previous + '" "'
+        + _status_target(safe_previous, safe_target or None) + '" ' + method
         + ' --log-path "' + str(log_path) + '"\r\n'
         'if errorlevel 2 (\r\n'
         '    echo [%date% %time%] REFUSED: another jacked updater is in progress\r\n'
@@ -1923,7 +2053,12 @@ def _spawn_windows_upgrade_helper(
         'echo [%date% %time%] upgrade complete\r\n'
         # Close the status record that _update_status_init claimed, so the
         # dashboard does not show "in progress" until the record goes stale.
-        'jacked _update_status_succeed\r\n'
+        'jacked _update_status_succeed'
+        + (
+            ' --target "' + safe_target + '" --previous "' + safe_previous + '"'
+            if safe_target else ''
+        )
+        + '\r\n'
         '(goto) 2>nul & del "%~f0"\r\n'
         + preflight_failed_block
         + (
@@ -2097,9 +2232,27 @@ def _update_status_shim(phase, status, error, recovery):
 
 
 @main.command(name="_update_status_succeed", hidden=True)
-def _update_status_succeed_shim():
-    """Internal: mark overall=succeeded on the update-status file."""
+@click.option("--target", default=None, help="The version the upgrade should reach.")
+@click.option("--previous", default=None, help="The version the upgrade started from.")
+def _update_status_succeed_shim(target, previous):
+    """Internal: close the update-status record at the end of a Windows upgrade.
+
+    With ``--target``, a build older than the target (the package index did
+    not serve it yet, #166i) closes the record as failed with the lag message
+    and exits 4, instead of succeeded.
+    """
     from jacked.service import update_status as us_mod
+
+    installed = _installed_package_version()
+    if _index_lag(installed, target):
+        message = _index_lag_message(installed, target, changed=installed != previous)
+        us_mod.mark_failed(
+            us_mod.UPDATE_STATUS_FILE,
+            error=f"the package index does not serve v{target} yet",
+            recovery="jacked upgrade (in a few minutes)",
+        )
+        click.echo(message)
+        sys.exit(EXIT_INDEX_LAG)
     us_mod.mark_succeeded(us_mod.UPDATE_STATUS_FILE)
 
 

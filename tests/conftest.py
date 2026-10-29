@@ -76,6 +76,15 @@ def exec_attempts():
 
 
 @pytest.fixture(autouse=True)
+def _no_pypi_lookup_in_upgrade(monkeypatch):
+    """`jacked upgrade` reads its target version from PyPI; no test may reach
+    the network for it. A test that needs a target patches it explicitly."""
+    import jacked.cli
+
+    monkeypatch.setattr(jacked.cli, "_upgrade_target_version", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_home(monkeypatch, tmp_path_factory):
     """Give every test a temporary HOME (and USERPROFILE on Windows).
 

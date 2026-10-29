@@ -683,6 +683,35 @@ class TestUpgradeWindows:
         assert "jacked install --force" in batch
         assert "service restart" in batch
 
+    @patch("sys.platform", "win32")
+    @patch("jacked.install_method.detect_install_method", return_value="uv")
+    @patch("jacked.findbin.find_bin")
+    @patch("subprocess.Popen")
+    def test_windows_batch_records_and_checks_the_real_target(
+        self, mock_popen, mock_find, mock_method, tmp_path, monkeypatch,
+    ):
+        """#166i: the status record names the PyPI target, not "next", and the
+        batch's last step checks the installed build against it."""
+        import tempfile as _tempfile
+
+        from jacked.cli import main
+        mock_find.side_effect = lambda name: {"uv": r"C:\uv\uv.exe"}.get(name)
+        real_mkstemp = _tempfile.mkstemp
+        created = []
+
+        def fake_mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, dir=str(tmp_path), **{k: v for k, v in kwargs.items() if k != "dir"})
+            created.append(path)
+            return fd, path
+
+        monkeypatch.setattr(_tempfile, "mkstemp", fake_mkstemp)
+        with patch("jacked.cli._upgrade_target_version", return_value="0.109.0"):
+            CliRunner().invoke(main, ["upgrade"])
+        batch = open(created[0]).read()
+        assert '_update_status_init "' in batch and '" "0.109.0" ' in batch
+        assert 'jacked _update_status_succeed --target "0.109.0" --previous "' in batch
+        assert '"next"' not in batch
+
     # test_windows_batch_uses_pip_user_when_method_is_pip: removed in 0.41.19
     # — pip installs are refused by the pre-flight gate, not auto-upgraded.
 
@@ -1151,3 +1180,129 @@ class TestUpgradeStatusInitFailsClosed:
         assert "no space left on device" in result.output
         run.assert_not_called()
         popen.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# #166i: the package index serving an older build is reported, not "complete"
+# ---------------------------------------------------------------------------
+
+
+class TestIndexLag:
+    """The PyPI JSON API names the target; the simple index the installer
+    reads can lag it for minutes after a release."""
+
+    def _invoke(self, run_results, installed, target, version="0.107.0", tmp_path=None):
+        from jacked.cli import main
+
+        stack = TestUpgradeIsATransaction._patches()
+        with (
+            stack[0], stack[1], stack[2], stack[3],
+            patch("subprocess.Popen"),
+            patch("subprocess.run") as run,
+            patch("jacked.__version__", version),
+            patch("jacked.cli._installed_package_version", return_value=installed),
+            patch("jacked.cli._upgrade_target_version", return_value=target),
+        ):
+            run.side_effect = list(run_results)
+            result = CliRunner().invoke(main, ["upgrade"])
+        return result, run
+
+    def test_a_reinstall_of_the_same_build_says_so_and_exits_nonzero(self, tmp_path):
+        result, run = self._invoke([_ok()], installed="0.107.0", target="0.107.1")
+        assert result.exit_code == 4, result.output
+        assert "Already on v0.107.0. The package index does not serve v0.107.1 yet." in result.output
+        assert "Upgrade complete" not in result.output
+        # Nothing changed, so the service was not touched: only the install ran.
+        assert run.call_count == 1
+
+    def test_a_partial_upgrade_finishes_the_transaction_then_reports(self, tmp_path):
+        result, run = self._invoke(
+            [_ok(), _ok(), _ok(), _ok()], installed="0.107.1", target="0.107.2",
+            version="0.107.0",
+        )
+        assert result.exit_code == 4, result.output
+        assert "Upgraded to v0.107.1. The package index does not serve v0.107.2 yet." in result.output
+        assert "Upgrade complete" not in result.output
+
+    def test_reaching_the_target_is_complete(self, tmp_path):
+        result, _run = self._invoke(
+            [_ok(), _ok(), _ok(), _ok()], installed="0.107.1", target="0.107.1",
+        )
+        assert result.exit_code == 0, result.output
+        assert "Upgrade complete." in result.output
+
+    def test_an_unknown_target_keeps_the_old_behavior(self, tmp_path):
+        result, _run = self._invoke(
+            [_ok(), _ok(), _ok(), _ok()], installed="0.107.0", target=None,
+        )
+        assert result.exit_code == 0, result.output
+        assert "Upgrade complete." in result.output
+
+    def test_the_status_record_names_the_real_target(self, tmp_path):
+        import json
+
+        from jacked.service import update_status as us
+
+        self._invoke([_ok()], installed="0.107.0", target="0.107.1")
+        data = json.loads(us.UPDATE_STATUS_FILE.read_text())
+        assert data["to_version"] == "0.107.1"
+        assert data["overall"] == "failed"
+        assert "does not serve v0.107.1" in data["error"]
+
+
+def test_status_succeed_shim_reports_index_lag(tmp_path):
+    import json
+
+    from jacked.cli import main
+    from jacked.service import update_status as us
+
+    us.init_or_adopt_status(us.UPDATE_STATUS_FILE, from_version="0.107.0",
+                            to_version="0.107.1", method="uv")
+    with patch("jacked.cli._installed_package_version", return_value="0.107.0"):
+        result = CliRunner().invoke(main, ["_update_status_succeed", "--target", "0.107.1",
+                                           "--previous", "0.107.0"])
+    assert result.exit_code == 4
+    assert "Already on v0.107.0. The package index does not serve v0.107.1 yet" in result.output
+    assert json.loads(us.UPDATE_STATUS_FILE.read_text())["overall"] == "failed"
+    with patch("jacked.cli._installed_package_version", return_value="0.107.1"):
+        result = CliRunner().invoke(main, ["_update_status_succeed", "--target", "0.107.1"])
+    assert result.exit_code == 0
+    assert json.loads(us.UPDATE_STATUS_FILE.read_text())["overall"] == "succeeded"
+
+
+
+def test_a_reinstall_of_the_running_version_keeps_next_as_the_status_target(tmp_path):
+    """The update page treats a running build equal to to_version as done, so
+    a target that is not newer than the running build is not recorded."""
+    import json
+
+    from jacked.service import update_status as us
+
+    TestIndexLag()._invoke([_ok(), _ok(), _ok(), _ok()], installed="0.107.1",
+                           target="0.107.1", version="0.107.1")
+    assert json.loads(us.UPDATE_STATUS_FILE.read_text())["to_version"] == "next"
+
+
+class TestTargetLookup:
+    """The real _upgrade_target_version (the autouse stub is bypassed here)."""
+
+    def test_lookup_returns_the_pypi_version(self, monkeypatch):
+        from jacked import cli
+
+        with patch("jacked.version_check.get_latest_pypi_version", return_value="0.109.0"):
+            assert cli._upgrade_target_version_impl() == "0.109.0"
+
+    def test_lookup_failure_is_none(self):
+        from jacked import cli
+
+        with patch("jacked.version_check.get_latest_pypi_version", side_effect=OSError("offline")):
+            assert cli._upgrade_target_version_impl() is None
+        with patch("jacked.version_check.get_latest_pypi_version", return_value=None):
+            assert cli._upgrade_target_version_impl() is None
+
+    def test_an_unsafe_version_string_never_reaches_a_batch(self):
+        from jacked import cli
+
+        with patch("jacked.version_check.get_latest_pypi_version",
+                   return_value='1.0" & del C:\\x & "'):
+            assert cli._upgrade_target_version_impl() is None
