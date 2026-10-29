@@ -41,6 +41,14 @@ class _RecordingDB:
         self._note("update_account")
         return dict(self.account or {}, **fields)
 
+    def update_account_if_unchanged(self, account_id, expected, **fields):
+        self._note("update_account_if_unchanged")
+        current = self.account or {}
+        if any(current.get(k) != v for k, v in expected.items()):
+            return False
+        self.account = dict(current, **fields)
+        return True
+
     def list_accounts(self, include_inactive=False):
         self._note("list_accounts")
         return []
@@ -193,9 +201,9 @@ def test_cc_chain_cleanup_rereads_and_writes_under_the_lineage_lock(monkeypatch)
 
     assert result.error == "invalid_grant"
     assert loop_tid not in db.threads["get_account"]
-    assert db.threads["update_account"] == db.threads["get_account"]
-    assert db.lock_held["get_account"] == [True]
-    assert db.lock_held["update_account"] == [True]
+    assert db.threads["update_account_if_unchanged"] == db.threads["get_account"][:1]
+    assert db.lock_held["get_account"][0] is True
+    assert db.lock_held["update_account_if_unchanged"] == [True]
     assert not CC_LINEAGE_WRITE_LOCK.locked()
 
 
@@ -274,3 +282,82 @@ def test_complete_auth_stores_under_the_lineage_lock_off_the_loop():
     decide_tid, decide_locked = seen["decide"]
     assert store_tid != loop_tid and store_locked
     assert decide_tid == store_tid and not decide_locked
+
+
+def test_chain_death_cleanup_never_clears_a_lineage_stored_after_its_read(tmp_path, monkeypatch):
+    """#162 review: the cleanup reads the row, then writes. A re-auth or a
+    rotation by ANY writer in between (this one bypasses every lock) stored
+    a new lineage; the compare-and-set write must leave it alone."""
+    from jacked.web import auth as auth_mod
+    from jacked.web.database import Database
+
+    db = Database(str(tmp_path / "jacked.db"))
+    acct = db.create_account("cc@test.com", "pri", 9999999999)
+    db.update_account(acct["id"], cc_access_token="new-at", cc_refresh_token="new-rt",
+                      cc_expires_at=9999999999)
+    stale = dict(db.get_account(acct["id"]), cc_refresh_token="dead-rt", cc_access_token="dead-at")
+    real_get = db.get_account
+    calls = {"n": 0}
+
+    def get_account(account_id):
+        calls["n"] += 1
+        return stale if calls["n"] == 1 else real_get(account_id)
+
+    monkeypatch.setattr(db, "get_account", get_account)
+    monkeypatch.setattr(auth_mod, "_live_recovery_payload", lambda *a: None)
+
+    result = asyncio.run(auth_mod._cc_chain_died(acct["id"], db, stale, "dead-rt"))
+
+    row = real_get(acct["id"])
+    assert (row["cc_refresh_token"], row["cc_access_token"]) == ("new-rt", "new-at")
+    assert result.success and result.access_token == "new-at"
+
+
+def test_a_profile_never_lands_on_a_row_whose_identity_changed_after_the_check(tmp_path, monkeypatch):
+    """#162 review: the profile write follows an ownership check. A re-auth
+    that moved the row to another organization in between must win."""
+    from jacked.web import auth as auth_mod
+    from jacked.web.database import Database
+
+    db = Database(str(tmp_path / "jacked.db"))
+    acct = db.create_account("p@test.com", "pri", 9999999999)
+    db.update_account(acct["id"], organization_uuid="org-a", account_uuid="acc-1")
+    checked = db.get_account(acct["id"])
+    db.update_account(acct["id"], organization_uuid="org-b", organization_name="B Org")
+    monkeypatch.setattr(db, "get_account", lambda account_id: checked)
+    profile = {
+        "account": {"uuid": "acc-1", "email": "p@test.com"},
+        "organization": {"uuid": "org-a", "name": "A Org", "organization_type": "claude_max"},
+    }
+
+    assert auth_mod._update_profile_metadata(acct["id"], profile, db) is False
+
+    row = Database.get_account(db, acct["id"])
+    assert (row["organization_uuid"], row["organization_name"]) == ("org-b", "B Org")
+
+
+def test_a_rotation_never_overwrites_a_reauth_that_landed_during_the_exchange(tmp_path, monkeypatch):
+    """Pre-existing gap the #162 review surfaced: the OAuth store does not
+    take the refresh lock, so a re-auth can store a new primary lineage while
+    the old one is being exchanged. The rotation's write is a compare-and-set
+    on the exchanged refresh token, so the re-auth wins."""
+    from jacked.web import auth as auth_mod
+    from jacked.web.database import Database
+
+    db = Database(str(tmp_path / "jacked.db"))
+    acct = db.create_account("r@test.com", "old-at", 1)  # expired: due
+    db.update_account(acct["id"], refresh_token="old-rt")
+
+    async def exchange(refresh_token, timeout=30.0):
+        assert refresh_token == "old-rt"
+        db.update_account(acct["id"], access_token="reauth-at", refresh_token="reauth-rt")
+        return auth_mod.TokenExchangeResult(
+            success=True, access_token="rotated-at", refresh_token="rotated-rt", expires_in=3600,
+        )
+
+    monkeypatch.setattr(auth_mod, "_exchange_refresh_token", exchange)
+    result = asyncio.run(auth_mod._refresh_token_flow(acct["id"], db, auth_mod.RefreshMode.PRIMARY))
+
+    row = db.get_account(acct["id"])
+    assert (row["access_token"], row["refresh_token"]) == ("reauth-at", "reauth-rt")
+    assert result.success and result.access_token == "reauth-at"

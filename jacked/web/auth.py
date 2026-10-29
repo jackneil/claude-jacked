@@ -180,8 +180,25 @@ def _update_profile_metadata(account_id: int, data: dict, db) -> bool:
         updates["has_extra_usage"] = org["has_extra_usage_enabled"]
     if org.get("name"):
         updates["organization_name"] = org["name"]
-    db.update_account(account_id, **updates)
-    return True
+    # Compare-and-set on the identity the ownership check just read: a
+    # re-auth that moved this row to another organization or account in the
+    # meantime (writers run on threads) makes this a no-op, so one identity's
+    # profile can never land on another's row.
+    applied = db.update_account_if_unchanged(
+        account_id,
+        {
+            "organization_uuid": row.get("organization_uuid"),
+            "account_uuid": row.get("account_uuid"),
+        },
+        **updates,
+    )
+    if not applied:
+        logger.warning(
+            "Profile for account %d not applied: the row's identity changed "
+            "while the profile was being applied",
+            account_id,
+        )
+    return applied
 
 
 @dataclass
@@ -597,6 +614,27 @@ async def _run_chain_flow(
             timeout = 30.0 if mode in (RefreshMode.PRIMARY, RefreshMode.CC) else 15.0
             result = await _exchange_refresh_token(refresh_token, timeout=timeout)
 
+            def _write_lineage(**updates) -> bool:
+                # Every write below is about the lineage that was just
+                # exchanged. A compare-and-set on its refresh token means a
+                # re-auth that stored a NEW lineage during the exchange (the
+                # OAuth store does not take this lock) is never overwritten
+                # by the old lineage's rotation or marked with its breaker.
+                return db.update_account_if_unchanged(
+                    account_id, {refresh_col: refresh_token}, **updates
+                )
+
+            async def _newer_lineage() -> TokenExchangeResult:
+                latest = await asyncio.to_thread(db.get_account, account_id) or {}
+                logger.info(
+                    "Account %d: %s chain was re-authorized during the refresh; "
+                    "keeping the new lineage",
+                    account_id, chain,
+                )
+                return TokenExchangeResult(
+                    success=True, access_token=latest.get(access_col), chain=chain,
+                )
+
             # ----------------------------------------------------------
             # Success — single atomic DB write to this chain's columns.
             # ----------------------------------------------------------
@@ -630,7 +668,8 @@ async def _run_chain_flow(
                 db_updated = False
                 for attempt in range(3):
                     try:
-                        await asyncio.to_thread(db.update_account, account_id, **updates)
+                        if not await asyncio.to_thread(_write_lineage, **updates):
+                            return await _newer_lineage()
                         db_updated = True
                         break
                     except Exception as db_err:
@@ -675,12 +714,15 @@ async def _run_chain_flow(
                 if chain == "cc":
                     return await _cc_chain_died(account_id, db, current, refresh_token)
 
-                def _record_primary_invalid_grant() -> None:
-                    db.update_account(account_id, **_breaker_updates("primary", "invalid_grant"))
+                def _record_primary_invalid_grant() -> bool:
+                    if not _write_lineage(**_breaker_updates("primary", "invalid_grant")):
+                        return False
                     if mode == RefreshMode.PRIMARY:
                         db.record_account_error(account_id, "Refresh token consumed (will retry)")
+                    return True
 
-                await asyncio.to_thread(_record_primary_invalid_grant)
+                if not await asyncio.to_thread(_record_primary_invalid_grant):
+                    return await _newer_lineage()
                 if mode != RefreshMode.PRIMARY:
                     logger.warning(
                         "Account %d: primary refresh token is dead (invalid_grant) — "
@@ -695,9 +737,10 @@ async def _run_chain_flow(
             # Other errors — this chain's breaker only.
             # ----------------------------------------------------------
             cooldown = breaker_cooldown(result.error)
-            await asyncio.to_thread(
-                db.update_account, account_id, **_breaker_updates(chain, result.error)
-            )
+            if not await asyncio.to_thread(
+                _write_lineage, **_breaker_updates(chain, result.error)
+            ):
+                return await _newer_lineage()
             if result.error == "reply_lost":
                 logger.warning(
                     "Account %d: %s chain refresh reply lost after the request "
@@ -779,15 +822,28 @@ async def _cc_chain_died(
     def _apply() -> TokenExchangeResult:
         current = db.get_account(account_id) or {}
         current_refresh = current.get("cc_refresh_token")
-        if current_refresh and current_refresh != failed_refresh_token:
+
+        def _kept_new_lineage() -> TokenExchangeResult:
             logger.info(
                 "Account %d: the cc chain was re-authorized while the dead chain "
                 "was being cleaned up; keeping the new lineage",
                 account_id,
             )
+            latest = db.get_account(account_id) or current
             return TokenExchangeResult(
-                success=True, access_token=current.get("cc_access_token"), chain="cc",
+                success=True, access_token=latest.get("cc_access_token"), chain="cc",
             )
+
+        def _write_if_unchanged(**updates) -> bool:
+            # Compare-and-set on the refresh token read above: any writer that
+            # stored a new lineage since (a re-auth, a rotation, a live import)
+            # makes this a no-op instead of clearing its tokens.
+            return db.update_account_if_unchanged(
+                account_id, {"cc_refresh_token": current_refresh}, **updates
+            )
+
+        if current_refresh and current_refresh != failed_refresh_token:
+            return _kept_new_lineage()
 
         if oauth:
             live_access = oauth.get("accessToken")
@@ -803,14 +859,14 @@ async def _cc_chain_died(
 
             recovered_extra = oauth_extra_from(oauth)
             recovered_extra.pop("refreshTokenExpiresAt", None)
-            db.update_account(
-                account_id,
+            if not _write_if_unchanged(
                 cc_access_token=live_access,
                 cc_expires_at=live_exp_s,
                 cc_refresh_token=None,
                 cc_oauth_extra=encode_oauth_extra(recovered_extra, None),
                 **_breaker_updates("cc", "invalid_grant"),
-            )
+            ):
+                return _kept_new_lineage()
             logger.info(
                 "Account %d: invalid_grant on the cc chain — recovered cc_access_token "
                 "from live credentials (ownership proven; refresh token not imported)",
@@ -818,14 +874,14 @@ async def _cc_chain_died(
             )
             return TokenExchangeResult(success=True, access_token=live_access, chain="cc")
 
-        db.update_account(
-            account_id,
+        if not _write_if_unchanged(
             cc_access_token=None,
             cc_refresh_token=None,
             cc_expires_at=None,
             cc_oauth_extra=None,
             **_breaker_updates("cc", "invalid_grant"),
-        )
+        ):
+            return _kept_new_lineage()
         logger.warning(
             "Account %d: invalid_grant on the cc chain — clearing cc tokens "
             "(no recovery; the Claude Code chain needs re-authorization)",
@@ -1328,13 +1384,21 @@ async def _recover_rejected_cc_token(
             return result.access_token
 
     def _record_rejection() -> dict:
-        # The re-read and the write are one thread hop, under the cc
-        # lineage lock: a re-auth that stores a new cc lineage cannot land
-        # between them.
+        # Compare-and-set on the refused token: a rotation or a re-auth that
+        # stored a NEWER cc token in the meantime (any writer, any thread)
+        # makes the write a no-op, so a token that was never refused is
+        # never marked auth_rejected.
         with CC_LINEAGE_WRITE_LOCK:
             fresh = db.get_account(account_id) or account
-            if not cc_chain_dead(fresh) and fresh.get("cc_access_token") == stale_token:
-                db.update_account(account_id, **_breaker_updates("cc", "auth_rejected"))
+            if (
+                not cc_chain_dead(fresh)
+                and fresh.get("cc_access_token") == stale_token
+                and db.update_account_if_unchanged(
+                    account_id,
+                    {"cc_access_token": stale_token},
+                    **_breaker_updates("cc", "auth_rejected"),
+                )
+            ):
                 logger.warning(
                     "Account %d: the API refused the cc access token; recorded on the cc "
                     "chain, falling back to the primary token",
@@ -1587,15 +1651,20 @@ async def fetch_usage(
                         # this request was in flight stored a NEWER cc token,
                         # which was never refused and must stay usable. The
                         # cc lineage lock keeps a re-auth out of the gap.
+                        # The write is a compare-and-set on the refused
+                        # token, so a rotation by any other writer (the
+                        # window keeper's forced refresh) wins.
                         with CC_LINEAGE_WRITE_LOCK:
                             current = db.get_account(account_id) or account
                             if (
                                 current.get("cc_access_token") == token
                                 and not cc_chain_dead(current)
-                            ):
-                                db.update_account(
-                                    account_id, **_breaker_updates("cc", "auth_rejected")
+                                and db.update_account_if_unchanged(
+                                    account_id,
+                                    {"cc_access_token": token},
+                                    **_breaker_updates("cc", "auth_rejected"),
                                 )
+                            ):
                                 logger.warning(
                                     "Account %d: the API refused the freshly rotated cc "
                                     "access token; recorded auth_rejected on the cc chain",
