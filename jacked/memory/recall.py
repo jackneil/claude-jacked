@@ -311,7 +311,26 @@ def _index_excerpt_section(lines: list[str], exclude: set[str] | None = None) ->
     return "# Recent notes (index)\n" + "\n".join(kept)
 
 
-_INDEX_LINK_RE = re.compile(r"\]\(([^)]+\.md)\)")
+# A structural note link in an index line: "](<type>/<slug>.md) - ". The title
+# before it and the hook after it can both carry text of external origin, so a
+# line may hold more than one such link, and its position proves nothing.
+_INDEX_LINK_RE = re.compile(
+    r"\]\(((?:decision|convention|vision|reference|progress)/[^()\s\]\[]+\.md)\) - "
+)
+
+
+def _entry_links(line: str) -> list[str]:
+    """Every structural note link in an index line. The line's own note is
+    always one of them; the recall gate requires ALL of them to be reviewed.
+
+    >>> _entry_links("- [T](decision/t.md) - hook (updated 2026-10-29)")
+    ['decision/t.md']
+    >>> _entry_links("- [T](decision/ok.md) - x](decision/t.md) - hook")
+    ['decision/ok.md', 'decision/t.md']
+    >>> _entry_links("- [T](nope.md) x - plain text")
+    []
+    """
+    return _INDEX_LINK_RE.findall(line)
 
 
 def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
@@ -341,15 +360,21 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
     candidate_memo: dict[Path, bool] = {}
 
     def _reviewed(line: str) -> bool:
-        m = _INDEX_LINK_RE.search(line)
-        if not m:
+        links = _entry_links(line)
+        if not links:
             return True  # no parseable link -> keep (never silently drop)
-        path = gdir / m.group(1)
-        cand = candidate_memo.get(path)
-        if cand is None:
-            cand = _is_candidate_note(path)
-            candidate_memo[path] = cand
-        return not cand
+        # Reviewed only when EVERY linked note is: a title or hook that names
+        # another (reviewed) note can never launder an unreviewed one, because
+        # the line's own note is always among its links.
+        for link in links:
+            path = gdir / link
+            cand = candidate_memo.get(path)
+            if cand is None:
+                cand = _is_candidate_note(path)
+                candidate_memo[path] = cand
+            if cand:
+                return False
+        return True
 
     excerpt_rev: list[str] = []    # newest-first reviewed lines (any type), <= 20
     decisions_rev: list[str] = []  # newest-first reviewed decision lines, <= 5
@@ -357,13 +382,14 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
         # Once the excerpt is full, only decision lines can still contribute --
         # skip non-decision lines WITHOUT reading their notes, so a decision-poor
         # group never degrades back into a full-index scan.
-        if len(excerpt_rev) >= _INDEX_EXCERPT and "](decision/" not in line:
+        is_decision = any(link.startswith("decision/") for link in _entry_links(line))
+        if len(excerpt_rev) >= _INDEX_EXCERPT and not is_decision:
             continue
         if not _reviewed(line):
             continue
         if len(excerpt_rev) < _INDEX_EXCERPT:
             excerpt_rev.append(line)
-        if "](decision/" in line and len(decisions_rev) < _TOP_DECISIONS:
+        if is_decision and len(decisions_rev) < _TOP_DECISIONS:
             decisions_rev.append(line)
         if len(excerpt_rev) >= _INDEX_EXCERPT and len(decisions_rev) >= _TOP_DECISIONS:
             break
