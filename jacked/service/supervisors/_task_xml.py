@@ -23,6 +23,7 @@ from typing import Any
 TASK_XML_DECLARATION = '<?xml version="1.0" encoding="UTF-16"?>\r\n'
 
 _DECLARATION = re.compile(r"\A\s*<\?xml[^>]*\?>\s*")
+_DECLARED_ENCODING = re.compile(rb"""\A\s*<\?xml[^>]*?encoding\s*=\s*["']([^"']+)["']""")
 
 _BOMS = (
     (codecs.BOM_UTF16_LE, "utf-16-le"),
@@ -46,16 +47,29 @@ def encode_task_xml(text: str) -> bytes:
 def decode_task_xml(raw: bytes | str) -> str:
     """Decode task XML from any form schtasks or jacked produced.
 
-    Raises ``UnicodeDecodeError`` for bytes that are not valid in the
-    encoding they show (a truncated UTF-16 stream), never a guess.
+    UTF-16 (with a byte-order mark, or recognized by its NUL bytes) and
+    UTF-8 (a UTF-8 or undeclared document: the artifact older jacked
+    versions wrote) decode exactly. 8-bit text that declares UTF-16 was
+    re-encoded by a console in an unknown code page: it is accepted only
+    when it is pure ASCII, because a non-ASCII byte could stand for a
+    different character, and the Arguments path decides ownership.
+
+    Raises ``UnicodeDecodeError`` for bytes that do not decode exactly,
+    never a guess.
 
     >>> decode_task_xml("<Task/>".encode("utf-16-le"))
     '<Task/>'
     >>> decode_task_xml(b"<Task/>")
     '<Task/>'
+    >>> lying = '<?xml version="1.0" encoding="UTF-16"?><T>\u00e9</T>'.encode("utf-8")
+    >>> try:
+    ...     decode_task_xml(lying)
+    ... except UnicodeDecodeError:
+    ...     print("refused")
+    refused
     """
     if isinstance(raw, str):
-        return raw.lstrip("﻿")
+        return raw.lstrip("\ufeff")
     for bom, codec in _BOMS:
         if raw.startswith(bom):
             return raw[len(bom):].decode(codec)
@@ -63,10 +77,16 @@ def decode_task_xml(raw: bytes | str) -> str:
         return raw.decode("utf-16-le")
     if len(raw) >= 2 and raw[0] == 0:
         return raw.decode("utf-16-be")
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode(_console_encoding(), errors="replace")
+    if _declares_utf16(raw):
+        return raw.decode("ascii")
+    return raw.decode("utf-8")
+
+
+def _declares_utf16(raw: bytes) -> bool:
+    match = _DECLARED_ENCODING.match(raw)
+    return bool(match) and match.group(1).lower().replace(b"_", b"-") in {
+        b"utf-16", b"utf16", b"ucs-2", b"unicode"
+    }
 
 
 def canonical_task_xml(raw: bytes | str) -> bytes:
@@ -115,8 +135,13 @@ def query_task_xml(run: Any, service_id: str, *, timeout: float) -> TaskQuery:
 
 
 def _decode_console(raw: bytes) -> str:
+    """Best-effort text of a command's message output (never XML)."""
+    if raw[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
+        return raw.decode("utf-16", errors="replace")
+    if len(raw) >= 2 and raw[1] == 0:
+        return raw.decode("utf-16-le", errors="replace")
     try:
-        return decode_task_xml(raw)
+        return raw.decode("utf-8")
     except UnicodeDecodeError:
         return raw.decode(_console_encoding(), errors="replace")
 

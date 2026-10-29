@@ -44,8 +44,6 @@ def test_encode_replaces_an_existing_declaration_once():
     ('<?xml version="1.0" encoding="UTF-16"?>\r\n' + BODY).encode("utf-16-le"),
     # UTF-16 BE with a BOM
     codecs.BOM_UTF16_BE + BODY.encode("utf-16-be"),
-    # 8-bit console text that still says UTF-16 (the declaration lies)
-    ('<?xml version="1.0" encoding="UTF-16"?>\r\n' + BODY).encode("utf-8"),
     # the UTF-8 artifact older jacked versions wrote
     ("<?xml version='1.0' encoding='utf-8'?>\n" + BODY).encode("utf-8"),
     codecs.BOM_UTF8 + BODY.encode("utf-8"),
@@ -61,6 +59,30 @@ def test_every_query_form_becomes_the_same_canonical_bytes(raw):
         "{http://schemas.microsoft.com/windows/2004/02/mit/task}Description"))
     assert description.text == "José"
 
+
+
+def test_pure_ascii_console_text_is_exact():
+    """8-bit text that declares UTF-16 but holds only ASCII decodes exactly."""
+    body = BODY.replace("\u00e9", "e")
+    raw = ('<?xml version="1.0" encoding="UTF-16"?>\r\n' + body).encode("ascii")
+    assert canonical_task_xml(raw) == encode_task_xml(body)
+
+
+@pytest.mark.parametrize("raw", [
+    # UTF-8 bytes under a UTF-16 declaration (a console in a UTF-8 code page)
+    ('<?xml version="1.0" encoding="UTF-16"?>\r\n' + BODY).encode("utf-8"),
+    # CP850 "\u251c\u00ae" is C3 A9, the same bytes as UTF-8 "\u00e9": a
+    # different path that a UTF-8-first decode would read as ours
+    ('<?xml version="1.0" encoding="UTF-16"?>\r\n'
+     "<Task><Arguments>C:\\Users\\\u251c\u00ae\\launcher.ps1</Arguments></Task>").encode("cp850"),
+])
+def test_non_ascii_console_text_is_refused_not_guessed(raw):
+    """8-bit text that declares UTF-16 was re-encoded in an unknown code
+    page. A non-ASCII byte there is ambiguous, so ownership fails closed."""
+    with pytest.raises(UnicodeDecodeError):
+        decode_task_xml(raw)
+    run = Mock(return_value=SimpleNamespace(returncode=0, stdout=raw, stderr=b""))
+    assert query_task_xml(run, "ai.hank.jacked", timeout=15).xml is None
 
 def test_decode_strips_the_bom_and_keeps_the_text():
     text = decode_task_xml(codecs.BOM_UTF16_LE + ('<?xml version="1.0" encoding="UTF-16"?>' + BODY).encode("utf-16-le"))
