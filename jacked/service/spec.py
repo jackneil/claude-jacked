@@ -317,42 +317,81 @@ _ACL_MASK = 0x10
 _ACL_WRITE = 0x02
 
 
-def _posix_acl_grants_untrusted_write(raw: bytes) -> bool:
+_ACL_USER_OBJ = 0x01
+_ACL_GROUP_OBJ = 0x04
+_ACL_OTHER = 0x20
+_ACL_KNOWN_TAGS = frozenset(
+    {_ACL_USER_OBJ, _ACL_USER, _ACL_GROUP_OBJ, _ACL_GROUP, _ACL_MASK, _ACL_OTHER}
+)
+
+
+def _posix_acl_grants_untrusted_write(
+    raw: bytes,
+    owners: frozenset[int] | None = None,
+    groups: frozenset[int] | None = None,
+) -> bool:
     """True when a named entry of a Linux access ACL lets an untrusted user or
     group write. The mode bits cannot show this: with an ACL mask, the group
     bits are the MASK, so a grant to another user can sit behind a trusted
     owning group (#185i fixed the same gap on macOS).
 
     ``raw`` is the ``system.posix_acl_access`` value: a little-endian 4-byte
-    version, then 8-byte entries (tag u16, perm u16, id u32). A named entry's
-    effective permissions are its own AND the mask's. A malformed value is
-    untrusted.
+    version (2), then 8-byte entries (tag u16, perm u16, id u32). A named
+    entry's effective permissions are its own AND the mask's. A value the
+    kernel would not store (another version, no entries, an unknown tag, two
+    masks, or named entries with no mask) is untrusted. ``owners`` and
+    ``groups`` default to the trusted sets of this host.
 
     >>> import struct
-    >>> def acl(*entries): return struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *e) for e in entries)
+    >>> def acl(*entries, version=2): return struct.pack("<I", version) + b"".join(struct.pack("<HHI", *e) for e in entries)
     >>> base = [(0x01, 7, 0xFFFFFFFF), (0x04, 5, 0xFFFFFFFF), (0x20, 5, 0xFFFFFFFF)]
-    >>> _posix_acl_grants_untrusted_write(acl(*base))
+    >>> me = frozenset({0, 1000})
+    >>> _posix_acl_grants_untrusted_write(acl(*base), me, me)
     False
-    >>> _posix_acl_grants_untrusted_write(acl(*base, (0x02, 7, 4242), (0x10, 7, 0xFFFFFFFF)))
+    >>> _posix_acl_grants_untrusted_write(acl(*base, (0x02, 7, 4242), (0x10, 7, 0xFFFFFFFF)), me, me)
     True
-    >>> _posix_acl_grants_untrusted_write(acl(*base, (0x02, 7, 4242), (0x10, 5, 0xFFFFFFFF)))
+    >>> _posix_acl_grants_untrusted_write(acl(*base, (0x02, 7, 4242), (0x10, 5, 0xFFFFFFFF)), me, me)
     False
-    >>> _posix_acl_grants_untrusted_write(b"bad")
+    >>> _posix_acl_grants_untrusted_write(acl(*base, (0x02, 7, 1000), (0x10, 7, 0xFFFFFFFF)), me, me)
+    False
+    >>> _posix_acl_grants_untrusted_write(b"bad", me, me)
+    True
+    >>> _posix_acl_grants_untrusted_write(acl(), me, me)
+    True
+    >>> _posix_acl_grants_untrusted_write(acl(*base, version=1), me, me)
+    True
+    >>> _posix_acl_grants_untrusted_write(acl(*base, (0x40, 0, 0)), me, me)
+    True
+    >>> _posix_acl_grants_untrusted_write(acl(*base, (0x02, 5, 4242)), me, me)
+    True
+    >>> _posix_acl_grants_untrusted_write(acl(*base, (0x10, 5, 0), (0x10, 5, 0)), me, me)
     True
     """
     import struct
 
-    if len(raw) < 4 or (len(raw) - 4) % 8:
+    if len(raw) < 12 or (len(raw) - 4) % 8:
+        return True
+    if struct.unpack_from("<I", raw, 0)[0] != 2:
         return True
     entries = [struct.unpack_from("<HHI", raw, offset) for offset in range(4, len(raw), 8)]
+    tags = [tag for tag, _, _ in entries]
+    if any(tag not in _ACL_KNOWN_TAGS for tag in tags) or tags.count(_ACL_MASK) > 1:
+        return True
+    named = any(tag in (_ACL_USER, _ACL_GROUP) for tag in tags)
+    if named and _ACL_MASK not in tags:
+        return True
     mask = next((perm for tag, perm, _ in entries if tag == _ACL_MASK), 0o7)
     for tag, perm, principal in entries:
-        if not (perm & mask & _ACL_WRITE):
+        if tag not in (_ACL_USER, _ACL_GROUP) or not (perm & mask & _ACL_WRITE):
             continue
-        if tag == _ACL_USER and principal not in _trusted_owner_ids():
-            return True
-        if tag == _ACL_GROUP and principal not in _trusted_group_ids():
-            return True
+        if tag == _ACL_USER:
+            owners = _trusted_owner_ids() if owners is None else owners
+            if principal not in owners:
+                return True
+        else:
+            groups = _trusted_group_ids() if groups is None else groups
+            if principal not in groups:
+                return True
     return False
 
 

@@ -209,7 +209,7 @@ def _remove_exact_artifact(
         or status.st_nlink != 1
         or (
             os.name == "posix"
-            and not privately_controlled(status)
+            and not privately_controlled(path, status)
         )
     ):
         return _refused(path, "artifact changed during uninstall")

@@ -68,3 +68,31 @@ def test_a_read_only_named_grant_keeps_the_path_trusted(tmp_path):
     bin_dir, tool = _chain(tmp_path)
     _setfacl("-m", f"u:{OTHER_UID}:r-x", str(bin_dir))
     assert findbin._resolve_trusted(str(tool))[1] is None
+
+
+def test_a_named_grant_on_a_supervisor_directory_is_refused(tmp_path, monkeypatch):
+    """The user-private-group exception must not let an ACL grant through:
+    with a mask, the group bits read rwx for the private group."""
+    from jacked.service.supervisors._transition import _ensure_safe_parent
+
+    unit_dir = tmp_path / "systemd" / "user"
+    unit_dir.mkdir(parents=True, mode=0o700)
+    gid = unit_dir.stat().st_gid
+    monkeypatch.setattr("jacked.service.spec._user_private_group_id", lambda: gid)
+    _ensure_safe_parent(unit_dir)
+
+    _setfacl("-m", f"u:{OTHER_UID}:rwx", str(unit_dir))
+    assert unit_dir.stat().st_mode & 0o070 == 0o070  # the mask, not the group
+    with pytest.raises(OSError, match="not privately controlled"):
+        _ensure_safe_parent(unit_dir)
+
+
+def test_a_named_grant_on_a_supervisor_artifact_is_refused(tmp_path):
+    from jacked.service.supervisors._helpers import privately_controlled
+
+    artifact = tmp_path / "jacked.service"
+    artifact.write_text("[Unit]\n")
+    artifact.chmod(0o600)
+    assert privately_controlled(artifact, artifact.lstat())
+    _setfacl("-m", f"u:{OTHER_UID}:rw,m::rw", str(artifact))
+    assert not privately_controlled(artifact, artifact.lstat())

@@ -330,7 +330,7 @@ def _read_artifact(path: Path) -> bytes | None:
             or status.st_nlink != 1
             or (
                 os.name == "posix"
-                and not privately_controlled(status)
+                and not privately_controlled(path, status)
             )
         ):
             return None

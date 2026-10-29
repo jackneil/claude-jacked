@@ -8,6 +8,7 @@ stock desktop install. CI runners use umask 022 and never saw it.
 
 import os
 import stat
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -33,35 +34,36 @@ def no_private_group(monkeypatch):
     monkeypatch.setattr("jacked.service.spec._user_private_group_id", lambda: None)
 
 
-def _status(mode, uid=None, gid=PRIVATE_GID):
+def _status(mode, uid_offset=0, gid_offset=0):
     return SimpleNamespace(
         st_mode=stat.S_IFDIR | mode,
-        st_uid=os.getuid() if uid is None else uid,
-        st_gid=gid,
+        st_uid=os.getuid() + uid_offset,
+        st_gid=PRIVATE_GID + gid_offset,
     )
 
 
 @posix_only
 @pytest.mark.usefixtures("private_group")
 @pytest.mark.parametrize(
-    ("status", "expected"),
+    ("mode", "uid_offset", "gid_offset", "expected"),
     [
-        (_status(0o700), True),
-        (_status(0o755), True),
-        (_status(0o775), True),  # group write by the user's own private group
-        (_status(0o775, gid=PRIVATE_GID + 1), False),  # another group
-        (_status(0o757), False),  # anyone can write
-        (_status(0o700, uid=os.getuid() + 1), False),  # another owner
+        (0o700, 0, 0, True),
+        (0o755, 0, 0, True),
+        (0o775, 0, 0, True),  # group write by the user's own private group
+        (0o775, 0, 1, False),  # another group
+        (0o757, 0, 0, False),  # anyone can write
+        (0o700, 1, 0, False),  # another owner
     ],
 )
-def test_privately_controlled(status, expected):
-    assert privately_controlled(status) is expected
+def test_privately_controlled(tmp_path, mode, uid_offset, gid_offset, expected):
+    status = _status(mode, uid_offset, gid_offset)
+    assert privately_controlled(tmp_path, status) is expected
 
 
 @posix_only
 @pytest.mark.usefixtures("no_private_group")
 def test_group_write_is_refused_without_a_user_private_group():
-    assert privately_controlled(_status(0o775)) is False
+    assert privately_controlled(Path("."), _status(0o775)) is False
 
 
 @posix_only
@@ -70,12 +72,14 @@ def test_a_directory_created_under_umask_002_is_private(tmp_path):
     previous = os.umask(0o002)
     try:
         _ensure_safe_parent(tmp_path / "fresh" / "LaunchAgents")
-        _helpers.atomic_write(tmp_path / "unit" / "jacked.service", b"[Unit]\n")
+        _helpers.atomic_write(tmp_path / "unit" / "user" / "jacked.service", b"[Unit]\n")
     finally:
         os.umask(previous)
+    assert (tmp_path / "fresh").stat().st_mode & 0o077 == 0
     assert (tmp_path / "fresh" / "LaunchAgents").stat().st_mode & 0o077 == 0
     assert (tmp_path / "unit").stat().st_mode & 0o077 == 0
-    assert (tmp_path / "unit" / "jacked.service").stat().st_mode & 0o077 == 0
+    assert (tmp_path / "unit" / "user").stat().st_mode & 0o077 == 0
+    assert (tmp_path / "unit" / "user" / "jacked.service").stat().st_mode & 0o077 == 0
 
 
 @posix_only

@@ -55,7 +55,7 @@ def inspect_artifact(path: Path, expected: SupervisorArtifact) -> ArtifactInspec
                 ArtifactDisposition.FOREIGN,
                 "artifact is not a regular single-link file",
             )
-        if os.name == "posix" and not privately_controlled(status):
+        if os.name == "posix" and not privately_controlled(path, status):
             return ArtifactInspection(
                 ArtifactDisposition.FOREIGN,
                 "artifact is not privately controlled by the current user",

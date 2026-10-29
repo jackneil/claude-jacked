@@ -7,26 +7,53 @@ import tempfile
 from pathlib import Path
 
 
-def privately_controlled(status: os.stat_result) -> bool:
-    """True when the current user owns the path and no one else can write it.
+def privately_controlled(path: Path, status: os.stat_result) -> bool:
+    """True when the current user owns ``path`` and no one else can write it.
 
-    Group write is accepted only for the caller's Linux user-private group.
-    Debian and Ubuntu give such users umask 002, so every directory they
-    create is group-writable, and that group holds only them (the same rule
-    as ``jacked.service.spec._trusted_group_ids``).
+    ``status`` is the caller's ``lstat`` of ``path``. Group write is accepted
+    only for the caller's Linux user-private group. Debian and Ubuntu give
+    such users umask 002, so every directory they create is group-writable,
+    and that group holds only them (the same rule as
+    ``jacked.service.spec._trusted_group_ids``). On Linux the access ACL is
+    read too: with an ACL the group bits show the MASK, so a named grant to
+    another user would otherwise hide behind the private group.
     """
-    from jacked.service.spec import _user_private_group_id
+    from jacked.service import spec
 
     if status.st_uid != os.getuid() or status.st_mode & 0o002:
         return False
     if status.st_mode & 0o020:
-        private = _user_private_group_id()
-        return private is not None and status.st_gid == private
+        private = spec._user_private_group_id()
+        if private is None or status.st_gid != private:
+            return False
+    try:
+        spec._validate_linux_acl(path)
+    except ValueError:
+        return False
     return True
 
 
+def make_private_dirs(path: Path) -> None:
+    """Create ``path`` and every missing ancestor with mode 0700.
+
+    ``Path.mkdir(mode=..., parents=True)`` applies the mode to the leaf only,
+    so under umask 002 the ancestors it creates would be group-writable.
+    Directories that already exist are left as they are.
+    """
+    missing = []
+    current = path
+    while not os.path.lexists(current) and current.parent != current:
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+
+
 def atomic_write(path: Path, content: bytes) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    make_private_dirs(path.parent)
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(name)
     try:
