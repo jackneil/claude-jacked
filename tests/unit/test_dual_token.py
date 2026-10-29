@@ -1120,6 +1120,27 @@ class TestHandleCallback:
         assert "Security validation failed" in resp.text
         assert "Success!" not in resp.text
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            {"code": "valid-code", "state": "test-state"},
+            {"error": "access_denied"},
+            {"code": "valid-code", "state": "wrong-state"},
+            {"state": "test-state"},
+        ],
+    )
+    def test_every_callback_page_is_locked_down(self, tmp_path, query):
+        """Static pages: no outside code, and no other site may frame them."""
+        flow = self._make_flow(tmp_path)
+        flow._complete_auth = AsyncMock(return_value={"account_id": 1})
+
+        resp = asyncio.run(flow._handle_callback(self._make_request(query)))
+
+        csp = resp.headers["Content-Security-Policy"]
+        assert "default-src 'none'" in csp and "frame-ancestors 'none'" in csp
+        assert resp.headers["X-Frame-Options"] == "DENY"
+        assert resp.content_type == "text/html"
+
     def test_no_code_no_error_returns_error_html(self, tmp_path):
         """Callback with no code AND no error → error status, 'Authorization Failed'."""
         flow = self._make_flow(tmp_path)

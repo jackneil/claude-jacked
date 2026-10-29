@@ -1,0 +1,3 @@
+# Vendored browser scripts are pinned by SHA-256
+# (tests/unit/test_web_vendor_scripts.py): never convert their line endings.
+jacked/data/web/js/vendor/*.js -text
