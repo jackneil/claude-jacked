@@ -947,6 +947,16 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                         "'auth_rejected' THEN NULL ELSE cc_refresh_failure_type END"
                     )
 
+                # Claude Code's pass-through fields (#174i) as the file holds them.
+                if "cc_oauth_extra" in cols:
+                    from jacked.credentials.oauth_extra import (
+                        encode_oauth_extra,
+                        oauth_extra_from,
+                    )
+
+                    set_clauses.append("cc_oauth_extra = ?")
+                    params.append(encode_oauth_extra(oauth_extra_from(oauth)))
+
                 set_clauses.extend([
                     "validation_status = 'valid'",
                     "last_validated_at = ?",

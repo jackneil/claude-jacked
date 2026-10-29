@@ -960,6 +960,17 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
         updates["cc_refresh_failure_type"] = None
         updates["cc_refresh_last_failed_at"] = None
 
+    # The pass-through fields (#174i) as Claude Code holds them now; it has
+    # already applied its own keep-the-previous-value rule. Skipped when the
+    # refresh lineage is dead, because they describe a refresh token jacked
+    # does not take.
+    if not cc_chain_dead(account):
+        from jacked.credentials.oauth_extra import encode_oauth_extra, oauth_extra_from
+
+        extra = encode_oauth_extra(oauth_extra_from(oauth))
+        if extra != account.get("cc_oauth_extra"):
+            updates["cc_oauth_extra"] = extra
+
     return (updates, guard_cols) if updates else None
 
 
@@ -1062,6 +1073,14 @@ def build_oauth_data(account: dict) -> dict:
         if cc_exp is not None and cc_exp < time.time() and not cc_rt:
             pass  # Fall through — expired CC with no refresh is unusable
         else:
+            from jacked.credentials.oauth_extra import parse_oauth_extra
+
+            # The fields Claude Code wrote that jacked carries through (#174i),
+            # only when known: never invented. refreshTokenExpiresAt describes
+            # the refresh token beside it, so it goes only with one.
+            extra = parse_oauth_extra(account.get("cc_oauth_extra"))
+            if not cc_rt:
+                extra.pop("refreshTokenExpiresAt", None)
             return {
                 "accessToken": cc_at,
                 "refreshToken": cc_rt,  # may be None pre-CC-auth
@@ -1070,6 +1089,7 @@ def build_oauth_data(account: dict) -> dict:
                 "subscriptionType": account.get("subscription_type"),
                 "rateLimitTier": account.get("rate_limit_tier"),
                 "organizationUuid": account.get("organization_uuid") or None,
+                **extra,
             }
 
     # Fallback: primary tokens, but NEVER expose primary refresh_token.
