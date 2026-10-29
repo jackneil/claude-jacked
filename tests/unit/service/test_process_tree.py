@@ -134,7 +134,10 @@ def test_a_mocked_popen_never_reaches_a_group_signal(monkeypatch):
     from jacked import proctree
 
     sent = []
-    monkeypatch.setattr(proctree.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+    # raising=False: Windows has no killpg (and never signals a group).
+    monkeypatch.setattr(
+        proctree.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), raising=False
+    )
     monkeypatch.setattr(proctree.subprocess, "Popen", MagicMock())
     proctree.run_tree(["anything"], timeout=1)
     assert sent == []
