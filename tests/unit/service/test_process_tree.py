@@ -125,6 +125,7 @@ def test_relay_and_capture_read_utf8_output(tmp_path):
     assert result.stdout == "caf\u00e9 \u2026\n"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX group signals (Windows uses taskkill)")
 def test_a_mocked_popen_never_reaches_a_group_signal(monkeypatch):
     """A MagicMock pid coerces to 1, and killpg(1) is kill(-1) on Linux: it
     signals every process the user owns (it killed a CI runner). A mocked
@@ -134,10 +135,7 @@ def test_a_mocked_popen_never_reaches_a_group_signal(monkeypatch):
     from jacked import proctree
 
     sent = []
-    # raising=False: Windows has no killpg (and never signals a group).
-    monkeypatch.setattr(
-        proctree.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)), raising=False
-    )
+    monkeypatch.setattr(proctree.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
     monkeypatch.setattr(proctree.subprocess, "Popen", MagicMock())
     proctree.run_tree(["anything"], timeout=1)
     assert sent == []
