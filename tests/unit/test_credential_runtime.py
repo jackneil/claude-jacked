@@ -567,3 +567,69 @@ def test_the_runtime_lease_covers_threads_and_processes(tmp_path: Path) -> None:
             assert same_process is False
 
     assert expected.exists()
+
+
+# Every activation path (switch, launch, OAuth) overwrites the live store, and
+# Claude Code spends a refresh token when it rotates it: the active account's
+# newest tokens must be saved to its row first (the switch route alone did).
+
+
+def _activate_with_outgoing(home: Path, outgoing_id, reconcile):
+    with mock.patch(
+        "jacked.api.usage_monitor._read_active_account_id", return_value=outgoing_id
+    ), mock.patch(
+        "jacked.api.credential_helpers.reconcile_credentials_from_live_store",
+        side_effect=reconcile,
+    ) as spy:
+        return _activate_on_linux_home(home), spy
+
+
+def test_activation_saves_the_outgoing_accounts_live_tokens_first(tmp_path: Path) -> None:
+    (tmp_path / ".claude").mkdir()
+    authority = tmp_path / ".claude" / ".credentials.json"
+    seen_before_write = []
+
+    def reconcile(account_id, db):
+        seen_before_write.append(authority.exists())
+        return True
+
+    result, spy = _activate_with_outgoing(tmp_path, 3, reconcile)
+
+    assert spy.call_count == 1 and spy.call_args.args[0] == 3
+    assert seen_before_write == [False]
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert '"_jackedAccountId":7' in authority.read_text(encoding="utf-8").replace(" ", "")
+
+
+def test_activation_refuses_while_the_outgoing_row_is_busy(tmp_path: Path) -> None:
+    (tmp_path / ".claude").mkdir()
+
+    result, _ = _activate_with_outgoing(tmp_path, 3, lambda account_id, db: False)
+
+    assert result.outcome is SwitchOutcome.BUSY
+    assert "being updated" in result.message
+    assert not (tmp_path / ".claude" / ".credentials.json").exists()
+
+
+def test_activating_the_active_account_does_not_reconcile_it(tmp_path: Path) -> None:
+    (tmp_path / ".claude").mkdir()
+
+    result, spy = _activate_with_outgoing(tmp_path, 7, lambda account_id, db: False)
+
+    spy.assert_not_called()
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+
+
+def test_a_failed_outgoing_reconcile_does_not_block_the_activation(
+    tmp_path: Path, caplog
+) -> None:
+    (tmp_path / ".claude").mkdir()
+
+    def reconcile(account_id, db):
+        raise RuntimeError("store unreadable")
+
+    with caplog.at_level("WARNING", logger="jacked.credentials.runtime"):
+        result, _ = _activate_with_outgoing(tmp_path, 3, reconcile)
+
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert "outgoing account" in caplog.text

@@ -15,7 +15,12 @@ from jacked.api.claude_identity import (
     minimal_identity_block,
     write_identity,
 )
-from jacked.api.credential_helpers import ClaudeConfigUnwritable, build_oauth_data
+from jacked.api.credential_helpers import (
+    OUTGOING_ACCOUNT_BUSY_MESSAGE,
+    ClaudeConfigUnwritable,
+    build_oauth_data,
+    reconcile_outgoing_before_activation,
+)
 from jacked.findbin import find_bin
 from jacked.web.credential_repository import DatabaseCredentialSwitchRepository
 
@@ -220,11 +225,17 @@ def detect_claude_identity(home: Path) -> ExecutableIdentity:
     return identity
 
 
-def _unsupported(operation_id: str, account: dict, reason: str) -> SwitchResult:
+def _unsupported(
+    operation_id: str,
+    account: dict,
+    reason: str,
+    outcome: SwitchOutcome = SwitchOutcome.UNSUPPORTED,
+) -> SwitchResult:
+    """A refusal that changed nothing (``outcome`` says why)."""
     account_id = int(account["id"])
     return SwitchResult(
         operation_id=operation_id,
-        outcome=SwitchOutcome.UNSUPPORTED,
+        outcome=outcome,
         desired_default=IdentityAxis(account_id, "desired"),
         storage=IdentityAxis(None, "unchanged"),
         committed_authority=IdentityAxis(None, "unchanged"),
@@ -351,6 +362,15 @@ def activate_account(db, account: dict, context: SwitchContext, operation_id: st
     engine = _engine_for(db, resolution, home)
     if isinstance(engine, str):
         return _unsupported(operation_id, account, engine)
+    try:
+        saved = reconcile_outgoing_before_activation(db, int(account["id"]))
+    except Exception:  # noqa: BLE001 - the activation was never gated on it before
+        logger.warning("Could not save the outgoing account's live tokens", exc_info=True)
+        saved = True
+    if not saved:
+        return _unsupported(
+            operation_id, account, OUTGOING_ACCOUNT_BUSY_MESSAGE, SwitchOutcome.BUSY
+        )
     payload = CredentialPayload.from_mapping(
         {"_jackedAccountId": int(account["id"]), "claudeAiOauth": build_oauth_data(account)}
     )

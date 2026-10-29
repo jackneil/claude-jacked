@@ -1019,6 +1019,32 @@ def _clear_keeper_backoff(account_id: int) -> None:
 # Backward-compatible alias
 reconcile_outgoing_credentials = reconcile_credentials_from_live_store
 
+OUTGOING_ACCOUNT_BUSY_MESSAGE = (
+    "The current account is being updated. Try again in a moment."
+)
+
+
+def reconcile_outgoing_before_activation(
+    db, target_id: int, outgoing_id: int | None = None
+) -> bool:
+    """Save the active account's live tokens before another account's are
+    written over them.
+
+    Claude Code rotates refresh tokens and spends the old one, so the live
+    store can hold the only working copy of the active account's chain.
+    ``activate_account`` calls this on every path (switch, launch, OAuth).
+    Returns False when the outgoing row kept changing: the caller must not
+    overwrite the store yet. ``outgoing_id`` is the active account a caller
+    already resolved; None resolves it here.
+    """
+    if outgoing_id is None:
+        from jacked.api.usage_monitor import _read_active_account_id
+
+        outgoing_id = _read_active_account_id()
+    if not outgoing_id or outgoing_id == int(target_id):
+        return True
+    return reconcile_credentials_from_live_store(outgoing_id, db)
+
 
 def write_platform_credentials(data: dict) -> bool:
     """Write credentials to the platform's native credential store.
