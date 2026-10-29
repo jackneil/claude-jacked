@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -311,7 +312,50 @@ def _index_excerpt_section(lines: list[str], exclude: set[str] | None = None) ->
     return "# Recent notes (index)\n" + "\n".join(kept)
 
 
-_INDEX_LINK_RE = re.compile(r"\]\(([^)]+\.md)\)")
+# A note link in an index line: "](<path>.md)". The title before the line's
+# own link and the hook after it can both carry text of external origin, so a
+# line may hold more than one link, and position proves nothing. The pattern is
+# deliberately loose (any separator after the link, spaces allowed, no hook
+# needed): a line the librarian or a human rewrote must still be judged by its
+# links, never kept as "no link found". Brackets and parentheses are excluded
+# from the path so a fragment such as "](a](decision/x.md)" still yields the
+# real link.
+_INDEX_LINK_RE = re.compile(r"\]\(([^()\[\]]+\.md)\)")
+
+
+def _entry_links(line: str) -> list[str]:
+    """Every note link in an index line. The line's own note is always one of
+    them; the recall gate requires ALL of them to be reviewed, so an extra link
+    can only exclude a line, never admit one.
+
+    >>> _entry_links("- [T](decision/t.md) - hook (updated 2026-10-29)")
+    ['decision/t.md']
+    >>> _entry_links("- [T](decision/ok.md) - x](decision/t.md) - hook")
+    ['decision/ok.md', 'decision/t.md']
+    >>> _entry_links("- [T](decision/t.md)")
+    ['decision/t.md']
+    >>> _entry_links("- [T](a](decision/t.md) \u2014 hook")
+    ['decision/t.md']
+    >>> _entry_links("- plain text, no link")
+    []
+    """
+    return _INDEX_LINK_RE.findall(line)
+
+
+def _inside_group(link: str) -> bool:
+    r"""Whether ``link`` names a file inside the group folder. Absolute, drive,
+    UNC, URL and ``..`` links do not, and are never opened: reading one could
+    reach another folder or a network share during SessionStart.
+
+    >>> [_inside_group(x) for x in ("decision/t.md", "a b/t.md")]
+    [True, True]
+    >>> [_inside_group(x) for x in ("/etc/t.md", "../t.md", "a/../../t.md",
+    ...     "\\\\host\\share\\t.md", "C:t.md", "file://h/t.md", "a\\..\\t.md")]
+    [False, False, False, False, False, False, False]
+    """
+    if link.startswith(("/", "\\")) or ":" in link:
+        return False
+    return ".." not in link.replace("\\", "/").split("/")
 
 
 def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
@@ -331,7 +375,8 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
     the vault) stay out of the injected brief until a librarian or human pass
     promotes them. A line whose note can't be read or parsed is KEPT: only a
     positively-identified candidate tag excludes it, so a broken note never
-    silently vanishes from recall.
+    silently vanishes from recall. A line with no link the gate can check, or
+    with a link out of the group folder, is excluded: it cannot be vetted.
 
     Returns ``(excerpt_lines, decision_lines)`` both in original (oldest-first)
     order to match the newest-at-bottom index: ``excerpt_lines`` is the last
@@ -341,15 +386,26 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
     candidate_memo: dict[Path, bool] = {}
 
     def _reviewed(line: str) -> bool:
-        m = _INDEX_LINK_RE.search(line)
-        if not m:
-            return True  # no parseable link -> keep (never silently drop)
-        path = gdir / m.group(1)
-        cand = candidate_memo.get(path)
-        if cand is None:
-            cand = _is_candidate_note(path)
-            candidate_memo[path] = cand
-        return not cand
+        links = _entry_links(line)
+        if not links:
+            # An entry line with no link a reader could be pointed at by
+            # this parser (a wikilink, an anchor, an angle-bracket link) is
+            # unvetted: keep it out rather than inject an unreviewed note.
+            return False
+        # Reviewed only when EVERY linked note is: a title or hook that names
+        # another (reviewed) note can never launder an unreviewed one, because
+        # the line's own note is always among its links.
+        if not all(_inside_group(link) for link in links):
+            return False  # a link out of the group is never read, so unvetted
+        for link in links:
+            path = gdir / link
+            cand = candidate_memo.get(path)
+            if cand is None:
+                cand = _is_candidate_note(path)
+                candidate_memo[path] = cand
+            if cand:
+                return False
+        return True
 
     excerpt_rev: list[str] = []    # newest-first reviewed lines (any type), <= 20
     decisions_rev: list[str] = []  # newest-first reviewed decision lines, <= 5
@@ -357,13 +413,14 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
         # Once the excerpt is full, only decision lines can still contribute --
         # skip non-decision lines WITHOUT reading their notes, so a decision-poor
         # group never degrades back into a full-index scan.
-        if len(excerpt_rev) >= _INDEX_EXCERPT and "](decision/" not in line:
+        is_decision = any(link.startswith("decision/") for link in _entry_links(line))
+        if len(excerpt_rev) >= _INDEX_EXCERPT and not is_decision:
             continue
         if not _reviewed(line):
             continue
         if len(excerpt_rev) < _INDEX_EXCERPT:
             excerpt_rev.append(line)
-        if "](decision/" in line and len(decisions_rev) < _TOP_DECISIONS:
+        if is_decision and len(decisions_rev) < _TOP_DECISIONS:
             decisions_rev.append(line)
         if len(excerpt_rev) >= _INDEX_EXCERPT and len(decisions_rev) >= _TOP_DECISIONS:
             break
@@ -372,6 +429,14 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
 
 
 def _is_candidate_note(path: Path) -> bool:
+    """True when the note at ``path`` is tagged ``candidate``. Something that
+    exists but is not a regular file (a FIFO would block SessionStart) counts
+    as one and is never opened; a missing or unreadable note does not."""
+    try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            return True
+    except OSError:
+        return False
     try:
         meta, _body = vault_mod.read_note(path)
     except (OSError, UnicodeDecodeError):
