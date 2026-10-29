@@ -293,6 +293,8 @@ def webux(host: str | None, port: int, no_browser: bool, reload: bool):
     """Start the jacked web dashboard."""
     try:
         import uvicorn
+
+        from jacked.api.serving import SERVER_SETTINGS
     except ImportError:
         console.print("[red]Error:[/red] webux requires the web extra.")
         console.print("Install it with:")
@@ -325,15 +327,7 @@ def webux(host: str | None, port: int, no_browser: bool, reload: bool):
             port=port,
             reload=True,
             reload_dirs=["jacked"],
-            # Proxy-header trust is pinned, never inherited: uvicorn would
-            # otherwise read FORWARDED_ALLOW_IPS from the environment, and
-            # request.client.host is what the credential gate authorizes on.
-            # proxy_headers stays TRUE on purpose: `tailscale serve` proxies
-            # from loopback and rewrites X-Forwarded-For to the real tailnet
-            # source, so honoring a loopback proxy's forwarding is what keeps
-            # a serve viewer from inheriting loopback's permissions.
-            proxy_headers=True,
-            forwarded_allow_ips="127.0.0.1",
+            **SERVER_SETTINGS,
         )
         return
 
@@ -391,15 +385,7 @@ def webux(host: str | None, port: int, no_browser: bool, reload: bool):
         host=plan.primary_host,
         port=port,
         log_level="warning",
-        # Proxy-header trust is pinned, never inherited: uvicorn would
-        # otherwise read FORWARDED_ALLOW_IPS from the environment, and
-        # request.client.host is what the credential gate authorizes on.
-        # proxy_headers stays TRUE on purpose: `tailscale serve` proxies
-        # from loopback and rewrites X-Forwarded-For to the real tailnet
-        # source, so honoring a loopback proxy's forwarding is what keeps
-        # a serve viewer from inheriting loopback's permissions.
-        proxy_headers=True,
-        forwarded_allow_ips="127.0.0.1",
+        **SERVER_SETTINGS,
     )
     server = uvicorn.Server(config)
     server.run(sockets=socks)

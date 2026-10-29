@@ -517,20 +517,14 @@ class ServiceRunner:
                         sock.close()
                     self._control_server = None
                     raise
+        from jacked.api.serving import SERVER_SETTINGS
+
         config = uvicorn.Config(
             "jacked.api.main:app",
             host=plan.primary_host,
             port=self.port,
             log_level="warning",
-            # Proxy-header trust is pinned, never inherited: uvicorn would
-            # otherwise read FORWARDED_ALLOW_IPS from the environment, and
-            # request.client.host is what the credential gate authorizes on.
-            # proxy_headers stays TRUE on purpose: `tailscale serve` proxies
-            # from loopback and rewrites X-Forwarded-For to the real tailnet
-            # source, so honoring a loopback proxy's forwarding is what keeps
-            # a serve viewer from inheriting loopback's permissions.
-            proxy_headers=True,
-            forwarded_allow_ips="127.0.0.1",
+            **SERVER_SETTINGS,
         )
         server = uvicorn.Server(config)
         self._uvicorn_server = server

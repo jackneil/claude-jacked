@@ -30,7 +30,11 @@ dependencies = [
     # first appeared in starlette 0.48.0; the fastapi range alone permits
     # far older starlette in shared envs.
     "starlette>=0.48,<2",
-    "uvicorn[standard]>=0.20,<1",
+    # 0.35 added the websockets Sans-I/O protocol that SERVER_SETTINGS pins
+    # (jacked/api/serving.py); it needs websockets 13 or newer, which the
+    # uvicorn[standard] extra alone (websockets>=10.4) does not promise.
+    "uvicorn[standard]>=0.35,<1",
+    "websockets>=13.0,<17",
     "httpx>=0.24,<1",
     "aiohttp>=3.9,<4",
     "packaging>=23.0,<27",
@@ -68,7 +72,7 @@ all = []
 dev = [
     "pytest>=9.0.3,<10",
     "pytest-cov>=4.0,<8",
-    "websockets>=12.0,<17",
+    "websockets>=13.0,<17",
     # Tray extra — without these the entire tray test suite skips (and the
     # @patch(...pystray) tests fail before reaching their skip guard).
     "pystray>=0.19,<1",
