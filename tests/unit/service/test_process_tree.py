@@ -146,3 +146,43 @@ def test_a_mocked_popen_never_reaches_a_group_signal(monkeypatch):
     with pytest.raises(subprocess.TimeoutExpired):
         proctree.run_tree(["anything"], timeout=1)
     assert sent == []
+
+
+NESTED_PARENT = (
+    "import sys\n"
+    "from jacked.proctree import run_tree\n"
+    "grandchild = (\n"
+    "    'import os, sys, time\\n'\n"
+    "    'open(sys.argv[1], \"w\").write(str(os.getpid()))\\n'\n"
+    "    'time.sleep(60)\\n'\n"
+    ")\n"
+    "run_tree([sys.executable, '-c', grandchild, sys.argv[1]])\n"
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sessions (Windows uses taskkill /T)")
+def test_a_timeout_stops_a_tree_the_child_runs_in_its_own_session(tmp_path):
+    """The updater runs `jacked packs update`, which runs npx through
+    run_tree, in a session of its own. The outer stop reaches only the outer
+    session; the inner run_tree must stop its tree before this process exits."""
+    pid_file = tmp_path / "grandchild.pid"
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_process_tree(
+            [sys.executable, "-c", NESTED_PARENT, str(pid_file)], timeout=3
+        )
+    deadline = time.monotonic() + 5
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    grandchild = int(pid_file.read_text())
+    try:
+        # Precondition: the grandchild leads a session of its own, so the
+        # outer group signal cannot reach it (only the inner run_tree can).
+        if _alive(grandchild):
+            assert os.getsid(grandchild) == grandchild
+        deadline = time.monotonic() + 10
+        while _alive(grandchild) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not _alive(grandchild)
+    finally:
+        if _alive(grandchild):
+            os.kill(grandchild, 9)

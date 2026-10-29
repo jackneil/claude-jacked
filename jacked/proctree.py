@@ -16,6 +16,7 @@ make the child fail on a write.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import signal
@@ -30,6 +31,43 @@ logger = logging.getLogger(__name__)
 
 # How long a group gets to exit after the polite signal before SIGKILL.
 _GRACE_SECONDS = 5
+
+
+class _Terminated(BaseException):
+    """SIGTERM arrived while a tree ran (see ``_terminate_as_exception``)."""
+
+
+@contextlib.contextmanager
+def _terminate_as_exception():
+    """While a tree runs, turn SIGTERM to this process into ``_Terminated``.
+
+    A jacked process that runs a tree is often a tree member itself (the
+    updater runs ``jacked packs update``, which runs npx). Each tree gets its
+    own session, so the outer stop reaches this process but not the inner
+    tree, and Python's default SIGTERM exits without cleanup: the inner tree
+    would keep running. Only the main thread can set a handler, and a handler
+    the caller already installed (the upgrade guard) stays in charge.
+    """
+    if sys.platform == "win32" or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    try:
+        previous = signal.getsignal(signal.SIGTERM)
+    except (OSError, ValueError):
+        yield
+        return
+    if previous is not signal.SIG_DFL:
+        yield
+        return
+
+    def _raise(_signum, _frame):
+        raise _Terminated()
+
+    signal.signal(signal.SIGTERM, _raise)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def run_tree(
@@ -79,15 +117,21 @@ def run_tree(
         )
         relay_thread.start()
     try:
-        if capture:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        else:
-            proc.wait(timeout=timeout)
-            stdout = stderr = None
+        with _terminate_as_exception():
+            if capture:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            else:
+                proc.wait(timeout=timeout)
+                stdout = stderr = None
     except subprocess.TimeoutExpired:
         _stop_tree(proc, group, interrupted=False)
         stdout, stderr = _drain(proc) if capture else (None, None)
         raise subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr) from None
+    except _Terminated:
+        # Finish inside the outer stop's grace period, then exit the way the
+        # default SIGTERM action would have.
+        _stop_tree(proc, group, interrupted=False, grace=_GRACE_SECONDS / 2)
+        raise SystemExit(128 + signal.SIGTERM) from None
     except BaseException:
         _stop_tree(proc, group, interrupted=True)
         raise
@@ -151,7 +195,9 @@ def _drain(proc) -> tuple[str | None, str | None]:
         return None, None
 
 
-def _stop_tree(proc, group: int | None, *, interrupted: bool) -> None:
+def _stop_tree(
+    proc, group: int | None, *, interrupted: bool, grace: float = _GRACE_SECONDS
+) -> None:
     """Stop the child and every process in its group, then reap the child.
 
     A Ctrl-C reaches the group as SIGINT first (what the terminal would have
@@ -175,7 +221,7 @@ def _stop_tree(proc, group: int | None, *, interrupted: bool) -> None:
     else:
         _signal_group(group, signal.SIGINT if interrupted else signal.SIGTERM)
         try:
-            proc.wait(timeout=_GRACE_SECONDS)
+            proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
             pass
         _signal_group(group, signal.SIGKILL)
