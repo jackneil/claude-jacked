@@ -15,6 +15,7 @@ them: this module's whole job is spawning a real browser.
 """
 
 import doctest
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -503,3 +504,145 @@ def test_match_window(windows, pid, exe, allow, expected):
 def test_window_focus_doctests():
     results = doctest.testmod(window_focus)
     assert results.failed == 0
+
+
+# ---------------------------------------------------------------------------
+# Linux: browsers outside the service PATH (#180i)
+# ---------------------------------------------------------------------------
+
+linux_layout = pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+
+
+def _shim(directory: Path, name: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+    return path
+
+
+@linux_layout
+def test_linux_finds_a_snap_browser_off_the_service_path(tmp_path, monkeypatch):
+    """The Linux service PATH is /usr/local/bin:/usr/bin:/bin; a Snap-only
+    Chromium lives in /snap/bin and is found there."""
+    from jacked.service import environment
+
+    snap_bin = tmp_path / "snap" / "bin"
+    shim = _shim(snap_bin, "chromium")
+    monkeypatch.setattr(bl.sys, "platform", "linux")
+    monkeypatch.setenv("PATH", environment._SAFE_PATHS["linux"])
+    monkeypatch.setattr(bl, "_LINUX_FIXED_DIRS", (str(snap_bin),))
+    monkeypatch.setattr(bl, "_LINUX_VENDOR_PATHS", {})
+    monkeypatch.setattr(bl, "_FLATPAK_EXPORT_DIRS", ())
+    monkeypatch.setattr(bl.shutil, "which", lambda name: None)
+    assert bl._candidates() == [BrowserSpec("Chromium", str(shim), "chromium")]
+
+
+@linux_layout
+def test_linux_finds_a_flatpak_export_by_app_id(tmp_path, monkeypatch):
+    exports = tmp_path / "flatpak" / "exports" / "bin"
+    shim = _shim(exports, "org.mozilla.firefox")
+    monkeypatch.setattr(bl.sys, "platform", "linux")
+    monkeypatch.setattr(bl, "_LINUX_FIXED_DIRS", ())
+    monkeypatch.setattr(bl, "_LINUX_VENDOR_PATHS", {})
+    monkeypatch.setattr(bl, "_FLATPAK_EXPORT_DIRS", (str(exports),))
+    monkeypatch.setattr(bl.shutil, "which", lambda name: None)
+    assert bl._candidates() == [BrowserSpec("Firefox", str(shim), "firefox", "org.mozilla.firefox")]
+
+
+def test_flatpak_profile_launch_grants_the_profile_directory(monkeypatch):
+    """Flathub's Chrome and Firefox have no home access, so a profile under
+    ~/.claude would not persist. The launch goes through `flatpak run` with
+    that one directory granted."""
+    spec = BrowserSpec("Chrome", "/var/lib/flatpak/exports/bin/com.google.Chrome",
+                       "chromium", "com.google.Chrome")
+    monkeypatch.setattr(bl, "_flatpak_binary", lambda: "/usr/bin/flatpak")
+    argv = launch_argv(spec, URL, "profile", Path("/home/u/.claude/jacked-browser-profiles/a"),
+                       platform="linux")
+    assert argv[:4] == ["/usr/bin/flatpak", "run",
+                        f"--filesystem={Path('/home/u/.claude/jacked-browser-profiles/a')}:create",
+                        "com.google.Chrome"]
+    assert argv[4:] == build_command(spec, URL, "profile",
+                                     Path("/home/u/.claude/jacked-browser-profiles/a"))[1:]
+    # Incognito needs no directory: the export launcher is used as-is, even
+    # when the caller passed a known account's profile directory.
+    profile = Path("/home/u/.claude/jacked-browser-profiles/a")
+    assert launch_argv(spec, URL, "incognito", profile, platform="linux") == \
+        build_command(spec, URL, "incognito", profile)
+    assert not any(arg.startswith("--filesystem") for arg in
+                   launch_argv(spec, URL, "incognito", profile, platform="linux"))
+
+
+def test_flatpak_profile_launch_without_flatpak_falls_back_and_says_so(monkeypatch, caplog):
+    spec = BrowserSpec("Chrome", "/var/lib/flatpak/exports/bin/com.google.Chrome",
+                       "chromium", "com.google.Chrome")
+    monkeypatch.setattr(bl, "_flatpak_binary", lambda: None)
+    profile = Path("/home/u/p")
+    with caplog.at_level("WARNING", logger="jacked.oauth.browser"):
+        argv = launch_argv(spec, URL, "profile", profile, platform="linux")
+    assert argv == build_command(spec, URL, "profile", profile)
+    assert "may not keep its profile" in caplog.text
+
+
+@linux_layout
+def test_linux_refuses_a_shim_in_a_world_writable_directory(tmp_path, monkeypatch, caplog):
+    """The fixed locations go through the find_bin trust rule: another local
+    user must not be able to plant the browser the service launches."""
+    snap_bin = tmp_path / "snap" / "bin"
+    _shim(snap_bin, "chromium")
+    snap_bin.chmod(0o777)
+    monkeypatch.setattr(bl.sys, "platform", "linux")
+    monkeypatch.setattr(bl, "_LINUX_FIXED_DIRS", (str(snap_bin),))
+    monkeypatch.setattr(bl, "_LINUX_VENDOR_PATHS", {})
+    monkeypatch.setattr(bl, "_FLATPAK_EXPORT_DIRS", ())
+    monkeypatch.setattr(bl.shutil, "which", lambda name: None)
+    try:
+        with caplog.at_level("WARNING", logger="jacked.oauth.browser"):
+            assert bl._candidates() == []
+    finally:
+        snap_bin.chmod(0o755)
+    assert "refused the chromium candidate: a directory is world-writable" in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+@linux_layout
+def test_linux_path_hit_wins_and_duplicates_collapse(tmp_path, monkeypatch):
+    """A PATH hit is used before any fixed location (the real resolver runs,
+    with a shim waiting in the fixed dir), and google-chrome plus
+    google-chrome-stable naming one binary are listed once."""
+    snap_bin = tmp_path / "snap" / "bin"
+    _shim(snap_bin, "google-chrome")
+    monkeypatch.setattr(bl.sys, "platform", "linux")
+    monkeypatch.setattr(bl, "_LINUX_FIXED_DIRS", (str(snap_bin),))
+    monkeypatch.setattr(bl, "_LINUX_VENDOR_PATHS", {})
+    monkeypatch.setattr(bl, "_FLATPAK_EXPORT_DIRS", ())
+    monkeypatch.setattr(bl.shutil, "which",
+                        lambda name: "/usr/bin/google-chrome" if name.startswith("google-chrome") else None)
+    assert bl._candidates() == [BrowserSpec("Chrome", "/usr/bin/google-chrome", "chromium")]
+
+
+def test_flatpak_edge_gets_the_edge_private_flag():
+    edge = BrowserSpec("Edge", "/var/lib/flatpak/exports/bin/com.microsoft.Edge",
+                       "chromium", "com.microsoft.Edge")
+    assert build_command(edge, URL, "incognito", None)[1] == "--inprivate"
+
+
+@linux_layout
+def test_snap_browser_profile_lives_under_its_snap_common_dir(tmp_path, monkeypatch):
+    """Snap hides ~/.claude from a confined browser, so the profile goes to
+    ~/snap/<snap>/common/jacked-browser-profiles/<slug>, created 0700."""
+    monkeypatch.setattr(bl.Path, "home", classmethod(lambda cls: tmp_path))
+    spec = BrowserSpec("Firefox", "/snap/bin/firefox", "firefox")
+    monkeypatch.setattr(bl, "find_browser", lambda: spec)
+    monkeypatch.setattr(bl, "_detach_kwargs", lambda: {})
+    with patch.object(bl.subprocess, "Popen") as popen:
+        popen.return_value.pid = 1
+        bl.open_auth_url(URL, {"email": "j@x.com"}, FakeDb("profile"))
+    argv = popen.call_args.args[0]
+    profile = Path(argv[argv.index("-profile") + 1])
+    assert profile.parent == tmp_path / "snap" / "firefox" / "common" / "jacked-browser-profiles"
+    assert profile.is_dir() and (profile.stat().st_mode & 0o777) == 0o700
+
+
+def test_brave_snap_is_probed_under_its_snap_name():
+    assert bl._linux_fixed_candidates("brave-browser")[0] == "/snap/bin/brave"

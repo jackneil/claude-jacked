@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from jacked.findbin import trusted_path_refusal
 from jacked.web.window_focus import bring_to_front_windows as _bring_to_front_windows
 
 logger = logging.getLogger("jacked.oauth.browser")
@@ -161,6 +163,9 @@ class BrowserSpec:
     name: str
     path: str
     family: str  # "chromium" | "firefox"
+    # Set for a Flatpak export launcher: the app id, so a launch can grant the
+    # sandbox the profile directory (see launch_argv).
+    flatpak_app: Optional[str] = None
 
 
 def _win_candidates() -> list[tuple[str, str, str]]:
@@ -186,7 +191,7 @@ def _mac_candidates() -> list[tuple[str, str, str]]:
 
 
 def _linux_candidates() -> list[tuple[str, str, str]]:
-    """(name, executable, family) triples resolved through PATH."""
+    """(name, executable, family) triples: PATH first, then fixed locations."""
     return [
         ("Chrome", "google-chrome", "chromium"),
         ("Chrome", "google-chrome-stable", "chromium"),
@@ -196,6 +201,108 @@ def _linux_candidates() -> list[tuple[str, str, str]]:
         ("Chromium", "chromium-browser", "chromium"),
         ("Firefox", "firefox", "firefox"),
     ]
+
+
+# The service PATH on Linux is /usr/local/bin:/usr/bin:/bin
+# (jacked.service.environment), so a browser installed only as a Snap, a
+# Flatpak or a vendor package under /opt is invisible to shutil.which (#180i).
+# After a PATH miss these fixed locations are probed, each one through the
+# find_bin trust rule.
+_LINUX_FIXED_DIRS = ("/snap/bin",)
+# Snap names where they differ from the executable name.
+_SNAP_NAMES = {"brave-browser": "brave", "chromium-browser": "chromium"}
+_LINUX_VENDOR_PATHS = {
+    "google-chrome": ("/opt/google/chrome/chrome",),
+    "google-chrome-stable": ("/opt/google/chrome/chrome",),
+    "microsoft-edge": ("/opt/microsoft/msedge/msedge",),
+    "brave-browser": ("/opt/brave.com/brave/brave",),
+    "chromium": ("/usr/lib/chromium/chromium", "/usr/lib/chromium-browser/chromium-browser"),
+    "chromium-browser": ("/usr/lib/chromium-browser/chromium-browser", "/usr/lib/chromium/chromium"),
+    "firefox": ("/usr/lib/firefox/firefox",),
+}
+# Flatpak exports a launcher per app id; it passes its arguments through.
+_FLATPAK_APP_IDS = {
+    "google-chrome": "com.google.Chrome",
+    "google-chrome-stable": "com.google.Chrome",
+    "microsoft-edge": "com.microsoft.Edge",
+    "brave-browser": "com.brave.Browser",
+    "chromium": "org.chromium.Chromium",
+    "chromium-browser": "org.chromium.Chromium",
+    "firefox": "org.mozilla.firefox",
+}
+_FLATPAK_EXPORT_DIRS = ("/var/lib/flatpak/exports/bin", "~/.local/share/flatpak/exports/bin")
+
+
+def _linux_fixed_candidates(exe: str) -> list[str]:
+    """Absolute paths where ``exe`` may live outside the service PATH.
+
+    >>> _linux_fixed_candidates("chromium")[:2]
+    ['/snap/bin/chromium', '/usr/lib/chromium/chromium']
+    >>> _linux_fixed_candidates("firefox")[-2]
+    '/var/lib/flatpak/exports/bin/org.mozilla.firefox'
+    """
+    # Linux paths whatever the host: posixpath, never os.path (Windows CI).
+    snap = _SNAP_NAMES.get(exe, exe)
+    paths = [posixpath.join(directory, snap) for directory in _LINUX_FIXED_DIRS]
+    paths.extend(_LINUX_VENDOR_PATHS.get(exe, ()))
+    app_id = _FLATPAK_APP_IDS.get(exe)
+    if app_id:
+        paths.extend(posixpath.join(os.path.expanduser(d), app_id) for d in _FLATPAK_EXPORT_DIRS)
+    return paths
+
+
+def snap_profile_dir(spec: "BrowserSpec", profile_dir: Path) -> Path:
+    """Where a Snap browser can keep ``profile_dir``.
+
+    Snap confinement hides dot-directories in the home directory, so a Snap
+    browser cannot use ``~/.claude/jacked-browser-profiles``. Each snap may
+    write ``~/snap/<snap>/common``; the per-account profile lives there, with
+    the same slug. Any other browser keeps ``profile_dir``.
+
+    >>> snap = BrowserSpec("Chromium", "/snap/bin/chromium", "chromium")
+    >>> p = snap_profile_dir(snap, Path("/h/.claude/jacked-browser-profiles/a"))
+    >>> p.parts[-4:]
+    ('chromium', 'common', 'jacked-browser-profiles', 'a')
+    >>> other = BrowserSpec("Chrome", "/usr/bin/google-chrome", "chromium")
+    >>> snap_profile_dir(other, Path("/x/a")) == Path("/x/a")
+    True
+    """
+    path = Path(spec.path)
+    if path.parent != Path("/snap/bin"):
+        return profile_dir
+    return Path.home() / "snap" / path.name / "common" / PROFILE_ROOT.name / profile_dir.name
+
+
+def _resolve_linux_browser(exe: str) -> tuple[Optional[str], Optional[str]]:
+    """``(path, flatpak app id or None)`` for ``exe``, or ``(None, None)``.
+
+    PATH first, then the first trusted fixed location.
+    """
+    found = shutil.which(exe)
+    if found:
+        return found, None
+    exports = {os.path.expanduser(d) for d in _FLATPAK_EXPORT_DIRS}
+    for path in _linux_fixed_candidates(exe):
+        if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+            continue
+        refusal = trusted_path_refusal(path)
+        if refusal:
+            # Values-free: the name is a fixed browser name, never a path.
+            logger.warning("browser launcher: refused the %s candidate: %s", exe, refusal)
+            continue
+        return path, (_FLATPAK_APP_IDS.get(exe) if posixpath.dirname(path) in exports else None)
+    return None, None
+
+
+def _flatpak_binary() -> Optional[str]:
+    """The ``flatpak`` command, on PATH or at its trusted system location."""
+    found = shutil.which("flatpak")
+    if found:
+        return found
+    fixed = "/usr/bin/flatpak"
+    if os.path.isfile(fixed) and os.access(fixed, os.X_OK) and not trusted_path_refusal(fixed):
+        return fixed
+    return None
 
 
 def _candidates() -> list[BrowserSpec]:
@@ -224,10 +331,12 @@ def _candidates() -> list[BrowserSpec]:
                     found.append(BrowserSpec(name, str(path), family))
                     break
     else:
+        seen: set[str] = set()
         for name, exe, family in _linux_candidates():
-            resolved = shutil.which(exe)
-            if resolved:
-                found.append(BrowserSpec(name, resolved, family))
+            resolved, flatpak_app = _resolve_linux_browser(exe)
+            if resolved and resolved not in seen:
+                seen.add(resolved)
+                found.append(BrowserSpec(name, resolved, family, flatpak_app))
     return found
 
 
@@ -297,7 +406,9 @@ def build_command(
             "--new-window",
             url,
         ]
-    private_flag = "--inprivate" if "msedge" in Path(spec.path).name.lower() else "--incognito"
+    # By name, not path: a Flatpak export is named com.microsoft.Edge.
+    is_edge = spec.name == "Edge" or "msedge" in Path(spec.path).name.lower()
+    private_flag = "--inprivate" if is_edge else "--incognito"
     return [spec.path, private_flag, "--new-window", url]
 
 
@@ -351,6 +462,19 @@ def launch_argv(
         bundle = _app_bundle_for(spec.path)
         if bundle is not None:
             return ["open", "-n", "-a", bundle, "--args", *cmd[1:]]
+    if spec.flatpak_app and mode == "profile" and profile_dir is not None:
+        # A Flatpak browser cannot see ~/.claude/jacked-browser-profiles unless
+        # the app has home access (Flathub's Chrome and Firefox do not), so
+        # the per-account profile would not persist. Grant that one directory
+        # for this launch. The export launcher has no way to pass this option.
+        flatpak = _flatpak_binary()
+        if flatpak:
+            return [flatpak, "run", f"--filesystem={profile_dir}:create",
+                    spec.flatpak_app, *cmd[1:]]
+        logger.warning(
+            "browser launcher: flatpak command not found; %s may not keep its profile",
+            spec.flatpak_app,
+        )
     return cmd
 
 
@@ -404,6 +528,7 @@ def open_auth_url(url: str, account: Optional[dict], db) -> LaunchResult:
 
     try:
         if effective == "profile":
+            profile_dir = snap_profile_dir(spec, profile_dir)
             profile_dir.mkdir(parents=True, exist_ok=True)
             try:
                 profile_dir.chmod(0o700)
