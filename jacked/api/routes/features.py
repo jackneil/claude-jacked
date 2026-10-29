@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from jacked.memory.settings_io import SettingsUnreadableError
+from jacked.memory.vault import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -953,7 +954,7 @@ async def _toggle_rules(enabled: bool):
         else:
             new_content = existing + rules_text + "\n"
 
-        CLAUDE_MD.write_text(new_content, encoding="utf-8")
+        atomic_write_text(CLAUDE_MD, new_content)
 
     else:
         # Remove rules
@@ -977,7 +978,7 @@ async def _toggle_rules(enabled: bool):
         else:
             new_content = after
 
-        CLAUDE_MD.write_text(new_content, encoding="utf-8")
+        atomic_write_text(CLAUDE_MD, new_content)
 
     return {"name": "rules", "category": "knowledge", "enabled": enabled}
 

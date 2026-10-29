@@ -21,6 +21,7 @@ from jacked.api.routes.features import (
     _write_settings_json,
 )
 from jacked.memory.settings_io import SettingsUnreadableError
+from jacked.memory.vault import atomic_write_text
 
 router = APIRouter()
 
@@ -48,10 +49,7 @@ def _write_project_settings(repo_path: str, data: dict):
     """Write <repo>/.claude/settings.local.json atomically."""
     claude_dir = Path(repo_path) / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
-    path = claude_dir / "settings.local.json"
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_text(claude_dir / "settings.local.json", json.dumps(data, indent=2))
 
 
 def _validate_repo_path(repo_path: str, db=None) -> Path | None:
