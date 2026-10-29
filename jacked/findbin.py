@@ -126,7 +126,14 @@ def _secure_lstat(path: str, kind: str) -> os.stat_result:
     ``OSError`` or ``ValueError``.
     """
     if not _HOST_IS_DARWIN:
-        return os.lstat(path)
+        status = os.lstat(path)
+        if kind != "link":
+            # Linux POSIX ACLs: the same trust rule the service spec applies
+            # to its interpreter (a named grant hidden behind the mask).
+            from jacked.service import spec
+
+            spec._validate_linux_acl(Path(path))
+        return status
     from jacked.service import spec
 
     if kind != "link":
@@ -270,9 +277,12 @@ def _resolve_trusted(path: str) -> tuple[str | None, str | None]:
 
 
 def _acl_or(exc: BaseException, fallback: str) -> str:
-    """The macOS ACL verdict in ``exc`` as a refusal reason, else ``fallback``.
+    """The ACL verdict in ``exc`` (macOS or Linux) as a refusal reason, else
+    ``fallback``.
 
     >>> _acl_or(ValueError("runtime_path has a mutating extended ACL"), "x")
+    'a path component has a mutating ACL'
+    >>> _acl_or(ValueError("runtime_path has a mutating POSIX ACL"), "x")
     'a path component has a mutating ACL'
     >>> _acl_or(ValueError("runtime_path ACL could not be inspected"), "x")
     "a path component's ACL cannot be inspected"

@@ -309,6 +309,73 @@ def _writable_by_untrusted_principal(
     return False
 
 
+# Linux POSIX ACL entry tags and the write bit (linux/posix_acl_xattr.h).
+_POSIX_ACL_XATTR = "system.posix_acl_access"
+_ACL_USER = 0x02
+_ACL_GROUP = 0x08
+_ACL_MASK = 0x10
+_ACL_WRITE = 0x02
+
+
+def _posix_acl_grants_untrusted_write(raw: bytes) -> bool:
+    """True when a named entry of a Linux access ACL lets an untrusted user or
+    group write. The mode bits cannot show this: with an ACL mask, the group
+    bits are the MASK, so a grant to another user can sit behind a trusted
+    owning group (#185i fixed the same gap on macOS).
+
+    ``raw`` is the ``system.posix_acl_access`` value: a little-endian 4-byte
+    version, then 8-byte entries (tag u16, perm u16, id u32). A named entry's
+    effective permissions are its own AND the mask's. A malformed value is
+    untrusted.
+
+    >>> import struct
+    >>> def acl(*entries): return struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *e) for e in entries)
+    >>> base = [(0x01, 7, 0xFFFFFFFF), (0x04, 5, 0xFFFFFFFF), (0x20, 5, 0xFFFFFFFF)]
+    >>> _posix_acl_grants_untrusted_write(acl(*base))
+    False
+    >>> _posix_acl_grants_untrusted_write(acl(*base, (0x02, 7, 4242), (0x10, 7, 0xFFFFFFFF)))
+    True
+    >>> _posix_acl_grants_untrusted_write(acl(*base, (0x02, 7, 4242), (0x10, 5, 0xFFFFFFFF)))
+    False
+    >>> _posix_acl_grants_untrusted_write(b"bad")
+    True
+    """
+    import struct
+
+    if len(raw) < 4 or (len(raw) - 4) % 8:
+        return True
+    entries = [struct.unpack_from("<HHI", raw, offset) for offset in range(4, len(raw), 8)]
+    mask = next((perm for tag, perm, _ in entries if tag == _ACL_MASK), 0o7)
+    for tag, perm, principal in entries:
+        if not (perm & mask & _ACL_WRITE):
+            continue
+        if tag == _ACL_USER and principal not in _trusted_owner_ids():
+            return True
+        if tag == _ACL_GROUP and principal not in _trusted_group_ids():
+            return True
+    return False
+
+
+def _validate_linux_acl(path: Path) -> None:
+    """Refuse a Linux path whose access ACL lets an untrusted principal write.
+
+    No ACL (ENODATA) or a filesystem without them (ENOTSUP) passes; any other
+    read failure fails closed. Off Linux this is a no-op (macOS ACLs are read
+    by ``_darwin_secure_status``). Symlinks carry no access ACL on Linux.
+    """
+    getxattr = getattr(os, "getxattr", None)
+    if not sys.platform.startswith("linux") or getxattr is None:
+        return
+    try:
+        raw = getxattr(os.fspath(path), _POSIX_ACL_XATTR, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            return
+        raise ValueError("runtime_path ACL could not be inspected") from exc
+    if _posix_acl_grants_untrusted_write(raw):
+        raise ValueError("runtime_path has a mutating POSIX ACL")
+
+
 def _validate_posix_directory_chain(path: Path) -> None:
     """Require every directory to resist replacement by another local user."""
 
@@ -322,6 +389,7 @@ def _validate_posix_directory_chain(path: Path) -> None:
             )
         except OSError as exc:
             raise ValueError("runtime_path directory chain is incomplete") from exc
+        _validate_linux_acl(current)
         if (
             not stat.S_ISDIR(status.st_mode)
             or not _trusted_posix_owner(status.st_uid)
@@ -342,6 +410,7 @@ def _validate_posix_file(path: Path, name: str, *, executable: bool = False) -> 
         )
     except OSError as exc:
         raise ValueError(f"{name} must be a trusted regular file") from exc
+    _validate_linux_acl(path)
     if (
         not stat.S_ISREG(status.st_mode)
         or not _trusted_posix_owner(status.st_uid)
