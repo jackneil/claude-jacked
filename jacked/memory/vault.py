@@ -215,7 +215,7 @@ def _normalize_state(raw: object) -> dict:
     return out
 
 
-def atomic_write_text(path: Path | str, text: str) -> None:
+def atomic_write_text(path: Path | str, text: str, *, follow_symlinks: bool = False) -> None:
     """Atomically write ``text`` to ``path`` (writer-unique tmp + ``os.replace``).
 
     The tmp name is writer-unique (prefix keyed off the target name) because the
@@ -227,10 +227,11 @@ def atomic_write_text(path: Path | str, text: str) -> None:
     behind vault state, vault config, the rollup recent/archive writes, and the
     settings_io writer.
     """
-    # Write through a symlink, the way write_text does: os.replace on the
-    # link itself would swap it for a plain file and leave its target (a
-    # shared dotfiles CLAUDE.md) unchanged.
-    path = Path(os.path.realpath(path))
+    # A symlink at ``path`` is replaced by a plain file unless the caller
+    # opts in: following it lets a repo-shipped link (lessons.md pointing at
+    # ~/.bashrc) turn a save into a write outside the project. The user's own
+    # global CLAUDE.md, often a link to a dotfiles copy, opts in.
+    path = Path(os.path.realpath(path)) if follow_symlinks else Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:

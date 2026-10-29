@@ -954,7 +954,8 @@ async def _toggle_rules(enabled: bool):
         else:
             new_content = existing + rules_text + "\n"
 
-        atomic_write_text(CLAUDE_MD, new_content)
+        # ~/.claude/CLAUDE.md is the user's own file, often a dotfiles link.
+        atomic_write_text(CLAUDE_MD, new_content, follow_symlinks=True)
 
     else:
         # Remove rules
@@ -978,7 +979,8 @@ async def _toggle_rules(enabled: bool):
         else:
             new_content = after
 
-        atomic_write_text(CLAUDE_MD, new_content)
+        # ~/.claude/CLAUDE.md is the user's own file, often a dotfiles link.
+        atomic_write_text(CLAUDE_MD, new_content, follow_symlinks=True)
 
     return {"name": "rules", "category": "knowledge", "enabled": enabled}
 

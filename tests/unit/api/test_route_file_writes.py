@@ -74,23 +74,44 @@ def test_concurrent_lesson_saves_never_mix_their_contents(tmp_path):
         assert target.read_text() in (long_text, short_text)
 
 
-def test_the_atomic_writer_writes_through_a_symlink(tmp_path):
-    """A CLAUDE.md that links to a shared dotfiles copy stays a link, and the
-    shared copy gets the new text (write_text behaved the same way)."""
+def test_the_atomic_writer_follows_a_symlink_only_when_asked(tmp_path):
+    """Default: a link is replaced by a plain file, so a repo-shipped
+    lessons.md that links to ~/.bashrc cannot redirect a save. The user's own
+    global CLAUDE.md opts in and stays a link to its dotfiles copy."""
     import os
 
     import pytest
 
     from jacked.memory.vault import atomic_write_text
 
+    outside = tmp_path / "home" / ".bashrc"
+    outside.parent.mkdir()
+    outside.write_text("export SAFE=1\n")
+    repo_lessons = tmp_path / "repo" / "lessons.md"
+    repo_lessons.parent.mkdir()
+    try:
+        repo_lessons.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    atomic_write_text(repo_lessons, "# Lessons\n")
+    assert not os.path.islink(repo_lessons) and repo_lessons.read_text() == "# Lessons\n"
+    assert outside.read_text() == "export SAFE=1\n"
+
     shared = tmp_path / "dotfiles" / "CLAUDE.md"
     shared.parent.mkdir()
     shared.write_text("old\n")
     link = tmp_path / "CLAUDE.md"
-    try:
-        link.symlink_to(shared)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable")
-    atomic_write_text(link, "new\n")
-    assert os.path.islink(link)
-    assert shared.read_text() == "new\n" and link.read_text() == "new\n"
+    link.symlink_to(shared)
+    atomic_write_text(link, "new\n", follow_symlinks=True)
+    assert os.path.islink(link) and shared.read_text() == "new\n"
+
+
+def test_only_the_global_claude_md_follows_links():
+    """Every route write is no-follow except the ~/.claude/CLAUDE.md toggles."""
+    following = []
+    for path in sorted(ROUTES.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "atomic_write_text":
+                if any(kw.arg == "follow_symlinks" for kw in node.keywords):
+                    following.append(f"{path.name}:{ast.unparse(node.args[0])}")
+    assert following and all(hit.endswith(":CLAUDE_MD") for hit in following), following
