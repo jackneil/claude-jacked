@@ -26,6 +26,7 @@ read from Claude Code or from a token response is absent.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 PASSTHROUGH_KEYS = ("refreshTokenExpiresAt", "clientId", "subscriptionTypeSource")
@@ -40,14 +41,15 @@ def oauth_extra_from(oauth: Any) -> dict:
     {'refreshTokenExpiresAt': 1800000000000, 'clientId': 'c', 'subscriptionTypeSource': 'sign_in'}
     >>> oauth_extra_from({"refreshTokenExpiresAt": True, "clientId": 5, "other": "y"})
     {}
-    >>> oauth_extra_from(None)
-    {}
+    >>> oauth_extra_from(None), oauth_extra_from({"refreshTokenExpiresAt": float("inf")})
+    ({}, {})
     """
     if not isinstance(oauth, dict):
         return {}
     out: dict = {}
     expires = oauth.get("refreshTokenExpiresAt")
-    if isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires > 0:
+    if (isinstance(expires, (int, float)) and not isinstance(expires, bool)
+            and math.isfinite(expires) and expires > 0):
         out["refreshTokenExpiresAt"] = int(expires)
     for key in ("clientId", "subscriptionTypeSource"):
         value = oauth.get(key)
@@ -92,12 +94,17 @@ def refresh_expiry_from_response(data: Any, now_ms: int) -> int | None:
     61000
     >>> refresh_expiry_from_response({}, 1000) is None
     True
+    >>> refresh_expiry_from_response({"refresh_token_expires_in": float("inf")}, 1000) is None
+    True
     """
     if not isinstance(data, dict):
         return None
     seconds = data.get("refresh_token_expires_in")
     if isinstance(seconds, str) and seconds.isdigit():
         seconds = int(seconds)
-    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+    # A non-finite value (Infinity, 1e400) would raise in int() after the
+    # server already consumed the refresh token, losing the new pair.
+    if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds) or seconds <= 0):
         return None
     return int(now_ms + seconds * 1000)
