@@ -661,10 +661,27 @@ row only when it can prove the owner:
 - An expired token, a failed request, or a call from an event-loop thread
   proves nothing, so reconcile imports nothing. The async callers, and the
   dashboard account list, run reconcile in a worker thread.
-- Reconcile never imports a payload that expires before the tokens the row
-  already holds.
+- Reconcile does not import a payload that expires before the tokens the row
+  already holds. One exception applies: when the row's Claude Code token is
+  known dead (the API refused it, or the window keeper recorded
+  `needs_reauth` against the current tokens), an owned payload that expires
+  sooner replaces it (#179i). This exception acts only on a fresh read. On
+  macOS it also acts only when the Keychain itself holds the payload, because
+  the credentials file is a mirror that Claude Code does not update.
 - Reconcile never imports the row's own primary access token into the `cc`
   columns. That payload is the primary fallback of `build_oauth_data()`.
+
+Every activation path (a switch, a launch, an OAuth activation) goes through
+`activate_account()`. Inside the switch lease, before the engine writes the
+live store, it calls `reconcile_outgoing_before_activation()`. This saves the
+active account's live tokens to its row, because Claude Code spends a refresh
+token when it rotates it. The store is read fresh, not from the 30-second
+cache. The step also runs when the target is the active account. The payload
+is then built again from the row, so the activation writes the rotation that
+it just saved. When the outgoing row keeps changing, or the step fails, the
+activation stops with `busy` and code `outgoing_account_busy`, and writes
+nothing. The switch route answers that code with `OUTGOING_ACCOUNT_BUSY`
+(409).
 
 One case still loses a refresh lineage. Claude Code rotates the token, and the
 access token expires before any reconcile pass sees it (for example, the

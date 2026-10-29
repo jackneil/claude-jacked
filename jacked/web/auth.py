@@ -465,6 +465,7 @@ def _live_recovery_payload(account_id: int, account: dict) -> Optional[dict]:
     None and logs a values-free reason.
     """
     from jacked.api.credential_helpers import (
+        expiry_seconds,
         is_primary_publication,
         live_payload_belongs_to,
         read_live_credentials,
@@ -478,11 +479,9 @@ def _live_recovery_payload(account_id: int, account: dict) -> Optional[dict]:
         return None
     if is_primary_publication(account, oauth.get("accessToken")):
         return None
-    live_expires = oauth.get("expiresAt")
-    if isinstance(live_expires, (int, float)) and live_expires:
-        expires_s = live_expires / 1000 if live_expires > 1e12 else live_expires
-        if expires_s <= time.time():
-            return None
+    expires_s = expiry_seconds(oauth.get("expiresAt"))
+    if expires_s is not None and expires_s <= time.time():
+        return None
     if not live_payload_belongs_to(account, live):
         logger.warning(
             "Account %d: invalid_grant live recovery refused; the live "
@@ -852,11 +851,9 @@ async def _cc_chain_died(
 
         if oauth:
             live_access = oauth.get("accessToken")
-            live_expires = oauth.get("expiresAt")
-            live_exp_s = (
-                int(live_expires / 1000) if live_expires and live_expires > 1e12
-                else int(live_expires) if live_expires else None
-            )
+            from jacked.api.credential_helpers import expiry_seconds
+
+            live_exp_s = expiry_seconds(oauth.get("expiresAt"))
             # The recovered access token carries no refresh token, so no
             # refresh-token expiry either; the other pass-through fields stay as
             # Claude Code holds them.

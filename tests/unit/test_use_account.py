@@ -1548,19 +1548,21 @@ def test_local_switch_reason_is_unchanged(app, db):
 
 
 def test_switch_refuses_while_the_outgoing_row_is_busy(client, app):
-    """When reconcile could not save the outgoing account's latest Claude Code
-    tokens (its row kept changing), the switch would overwrite the only copy
-    of them: it answers 409 and writes nothing."""
-    with (
-        mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store",
-                   return_value=False),
-        mock.patch("jacked.api.usage_monitor._read_active_account_id", return_value=2),
-    ):
+    """The engine could not save the outgoing account's latest Claude Code
+    tokens (its row kept changing) and wrote nothing: the route answers the
+    dashboard's 409 OUTGOING_ACCOUNT_BUSY."""
+    from dataclasses import replace
+
+    from jacked.credentials.transaction import OUTGOING_ACCOUNT_BUSY_CODE
+
+    app.state.credential_switcher.return_value = replace(
+        _switch_result(SwitchOutcome.BUSY), code=OUTGOING_ACCOUNT_BUSY_CODE
+    )
+    with mock.patch("jacked.api.usage_monitor._read_active_account_id", return_value=2):
         resp = client.post("/api/auth/accounts/1/use")
 
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "OUTGOING_ACCOUNT_BUSY"
-    app.state.credential_switcher.assert_not_called()
 
 
 def test_use_account_arms_the_cooldown_before_the_pointer_write(client, db):

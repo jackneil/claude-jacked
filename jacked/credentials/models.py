@@ -180,6 +180,9 @@ class SwitchResult:
     provider_verification: ProviderVerificationState
     observed_identity: CredentialIdentity = CredentialIdentity()
     message: str = ""
+    # A stable machine-readable reason, when ``outcome`` alone is not enough
+    # (transaction.OUTGOING_ACCOUNT_BUSY_CODE).
+    code: str = ""
 
 
 @dataclass(frozen=True)

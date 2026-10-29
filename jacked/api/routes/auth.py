@@ -1858,44 +1858,41 @@ async def use_account(account_id: int, request: Request):
             headers={"Cache-Control": "no-store"},
         )
 
-    # Reconcile outgoing account's credentials before writing new ones.
-    from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+    # The outgoing account, for the history broadcast. Saving its live tokens
+    # before the overwrite happens inside activate_account, under the switch
+    # lease, on every activation path.
     from jacked.api.usage_monitor import _read_active_account_id
 
     outgoing_id = await asyncio.to_thread(_read_active_account_id)
-    if outgoing_id and outgoing_id != account_id:
-        reconciled = await asyncio.to_thread(
-            reconcile_credentials_from_live_store, outgoing_id, db
-        )
-        if reconciled is False:
-            # The outgoing account's row kept changing, so Claude Code's latest
-            # tokens for it may not be saved yet. Switching now would overwrite
-            # the only copy of them.
-            content = {
-                "error": {
-                    "message": "The current account is being updated. Try the switch again.",
-                    "code": "OUTGOING_ACCOUNT_BUSY",
-                    "operation_id": operation_id,
-                }
-            }
-            await asyncio.to_thread(
-                db.finish_auth_action,
-                action_id,
-                {**content, "_http_status": status.HTTP_409_CONFLICT},
-            )
-            return JSONResponse(
-                status_code=status.HTTP_409_CONFLICT,
-                content=content,
-                headers={"Cache-Control": "no-store"},
-            )
 
     from jacked.credentials.models import SwitchContext, SwitchOutcome
     from jacked.credentials.runtime import activate_account
+    from jacked.credentials.transaction import OUTGOING_ACCOUNT_BUSY_CODE
 
     switcher = getattr(request.app.state, "credential_switcher", activate_account)
     result = await asyncio.to_thread(
         switcher, db, account, SwitchContext.MANUAL, operation_id
     )
+    if result.code == OUTGOING_ACCOUNT_BUSY_CODE:
+        # The outgoing account's row kept changing, so Claude Code's latest
+        # tokens for it may not be saved yet. Nothing was written.
+        content = {
+            "error": {
+                "message": "The current account is being updated. Try the switch again.",
+                "code": "OUTGOING_ACCOUNT_BUSY",
+                "operation_id": operation_id,
+            }
+        }
+        await asyncio.to_thread(
+            db.finish_auth_action,
+            action_id,
+            {**content, "_http_status": status.HTTP_409_CONFLICT},
+        )
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=content,
+            headers={"Cache-Control": "no-store"},
+        )
     content = _switch_content(result, account.get("email", ""))
     http_status = _switch_http_status(result.outcome)
 

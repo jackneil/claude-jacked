@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 from jacked.api.claude_identity import (
@@ -15,7 +16,11 @@ from jacked.api.claude_identity import (
     minimal_identity_block,
     write_identity,
 )
-from jacked.api.credential_helpers import ClaudeConfigUnwritable, build_oauth_data
+from jacked.api.credential_helpers import (
+    ClaudeConfigUnwritable,
+    build_oauth_data,
+    reconcile_outgoing_before_activation,
+)
 from jacked.findbin import find_bin
 from jacked.web.credential_repository import DatabaseCredentialSwitchRepository
 
@@ -351,21 +356,48 @@ def activate_account(db, account: dict, context: SwitchContext, operation_id: st
     engine = _engine_for(db, resolution, home)
     if isinstance(engine, str):
         return _unsupported(operation_id, account, engine)
-    payload = CredentialPayload.from_mapping(
-        {"_jackedAccountId": int(account["id"]), "claudeAiOauth": build_oauth_data(account)}
-    )
+    target_id = int(account["id"])
+
+    def _payload(row: dict) -> CredentialPayload:
+        return CredentialPayload.from_mapping(
+            {"_jackedAccountId": target_id, "claudeAiOauth": build_oauth_data(row)}
+        )
+
     request = SwitchRequest(
         operation_id=operation_id,
-        account_id=int(account["id"]),
+        account_id=target_id,
         email=account.get("email") or "",
         organization_id=account.get("organization_uuid") or None,
-        payload=payload,
+        payload=_payload(account),
         context=context,
         interaction=InteractionMode.FOREGROUND,
         display_name=account.get("display_name") or None,
         organization_name=account.get("organization_name") or None,
     )
-    return engine.activate(request)
+
+    def preflight() -> SwitchRequest | None:
+        # Inside the switch lease: save the active account's newest live
+        # tokens before they are overwritten, then build the payload from the
+        # row as it is now (a same-account activation may just have imported
+        # a rotation). Fail closed: a refusal is retryable, a lost refresh
+        # lineage is not.
+        try:
+            if not reconcile_outgoing_before_activation(db, target_id):
+                return None
+            row = db.get_account(target_id)
+            if row is None:
+                logger.warning("Account %d was removed during activation", target_id)
+                return None
+        except Exception:  # noqa: BLE001 - any failure refuses the overwrite
+            logger.warning(
+                "Could not save the outgoing account's live tokens; not "
+                "overwriting the credential store",
+                exc_info=True,
+            )
+            return None
+        return replace(request, payload=_payload(row), preflight=None)
+
+    return engine.activate(replace(request, preflight=preflight))
 
 
 def scoped_launch_needs_global_activation() -> bool:
