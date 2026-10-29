@@ -51,6 +51,12 @@ class FakeDatabase:
         self.updates.append((int(account_id), dict(fields)))
         return True
 
+    def update_account_if_unchanged(self, account_id: int, expected: dict, **fields) -> bool:
+        row = self.accounts.get(int(account_id))
+        if row is None or any(row.get(col) != value for col, value in expected.items()):
+            return False
+        return self.update_account(account_id, **fields)
+
     def get_setting(self, key: str):
         return self.settings.get(key)
 
@@ -845,3 +851,47 @@ def test_adoption_logs_a_values_free_info_line(caplog):
     lines = [r.getMessage() for r in caplog.records]
     assert any("Adopted rotated Claude Code tokens for account 3" in m for m in lines)
     assert not any("live_at_3" in m or "live_rt_3" in m for m in lines)
+
+
+def test_adoption_never_overwrites_a_row_that_changed_during_the_lookup():
+    """With no profile supplied (the retry of an identified payload), the
+    adoption reads the row, then runs the profile lookup itself, which can
+    take seconds. A re-authentication that stored newer tokens meanwhile must
+    win over the decision made from the row read before it."""
+    from unittest.mock import patch
+
+    from jacked.api.authority_guard import _import_rotated_tokens
+    from jacked.api.authority_guard import ProfileLookup
+
+    db = _db()
+    row = db.get_account(3)
+
+    def lookup_while_reauth_lands(token):
+        db.accounts[3].update(cc_access_token="reauth-at", cc_refresh_token="reauth-rt")
+        return ProfileLookup(200, {"account": {"email": row["email"], "uuid": None},
+                                   "organization": {"uuid": row.get("organization_uuid")}})
+
+    with patch("jacked.api.credential_helpers._ownership_lookup",
+               side_effect=lookup_while_reauth_lands):
+        adopted = _import_rotated_tokens(db, row, _foreign_payload())
+
+    assert adopted == 0
+    assert db.accounts[3]["cc_access_token"] == "reauth-at"
+    assert db.accounts[3]["cc_refresh_token"] == "reauth-rt"
+
+
+def test_adoption_without_a_race_still_adopts():
+    """Control for the race test above: the same lookup with no concurrent
+    write adopts the rotated tokens, so the race test measures the race."""
+    from unittest.mock import patch
+
+    from jacked.api.authority_guard import ProfileLookup, _import_rotated_tokens
+
+    db = _db()
+    row = db.get_account(3)
+    owner = ProfileLookup(200, {"account": {"email": row["email"], "uuid": None},
+                                "organization": {"uuid": row.get("organization_uuid")}})
+    with patch("jacked.api.credential_helpers._ownership_lookup", return_value=owner):
+        adopted = _import_rotated_tokens(db, row, _foreign_payload())
+    assert adopted > 0
+    assert db.accounts[3]["cc_access_token"] == "live_at_3"

@@ -259,6 +259,7 @@ def _import_rotated_tokens(
     Code's writes for other accounts.
     """
     from jacked.api.credential_helpers import (
+        CC_IMPORT_GUARD_COLS,
         is_primary_publication,
         live_payload_belongs_to,
     )
@@ -312,7 +313,17 @@ def _import_rotated_tokens(
         updates["cc_refresh_last_failed_at"] = None
 
     if updates:
-        db.update_account(account_id, **updates)
+        # Compare-and-set against the row this decision was made from: the
+        # ownership lookup above can take seconds, and a re-authentication or
+        # reconcile that stored newer tokens meanwhile must win.
+        expected = {col: row.get(col) for col in CC_IMPORT_GUARD_COLS}
+        if not db.update_account_if_unchanged(account_id, expected, **updates):
+            logger.info(
+                "Account %d: the row changed while adopting rotated Claude Code "
+                "tokens; not adopting them",
+                account_id,
+            )
+            return 0
         logger.info(
             "Adopted rotated Claude Code tokens for account %d from a foreign "
             "authority write (%d field(s))",

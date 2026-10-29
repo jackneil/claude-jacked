@@ -926,6 +926,20 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                 set_clauses.append("cc_refresh_token = ?")
                 params.append(refresh_token)
 
+                # A new access token is not the one the API refused: drop an
+                # auth_rejected verdict (it would mark the replacement dead).
+                # An invalid_grant verdict is about the refresh lineage and
+                # stays.
+                if "cc_refresh_failure_type" in cols:
+                    set_clauses.append(
+                        "cc_refresh_last_failed_at = CASE WHEN cc_refresh_failure_type = "
+                        "'auth_rejected' THEN NULL ELSE cc_refresh_last_failed_at END"
+                    )
+                    set_clauses.append(
+                        "cc_refresh_failure_type = CASE WHEN cc_refresh_failure_type = "
+                        "'auth_rejected' THEN NULL ELSE cc_refresh_failure_type END"
+                    )
+
                 set_clauses.extend([
                     "validation_status = 'valid'",
                     "last_validated_at = ?",

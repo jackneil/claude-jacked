@@ -546,8 +546,12 @@ def cc_token_known_dead(account: dict) -> bool:
         return False
     from jacked.api.usage_monitor import _candidate_fingerprint, _keeper_candidates
 
-    current = _candidate_fingerprint(*_keeper_candidates(account))
-    return current is not None and state.get("token_fp") == current
+    cc, primary = _keeper_candidates(account)
+    if not cc:
+        # The keeper did not try the cc token (its chain carries a verdict),
+        # so a needs_reauth says nothing about it.
+        return False
+    return state.get("token_fp") == _candidate_fingerprint(cc, primary)
 
 
 def is_primary_publication(account: dict, live_access) -> bool:
@@ -751,9 +755,12 @@ def read_live_credentials() -> dict | None:
     return None
 
 
-# The row columns a reconcile decision depends on; the write is skipped when
-# any of them changed after the row was read.
-_RECONCILE_GUARD_COLS = (
+# The row columns a Claude Code token import depends on (its tokens, its
+# verdicts, and the primary token the keeper fingerprint includes). An import
+# that read the row, then did slow work, writes only while all of them still
+# hold what it read (Database.update_account_if_unchanged).
+CC_IMPORT_GUARD_COLS = (
+    "access_token",
     "cc_access_token",
     "cc_refresh_token",
     "cc_expires_at",
@@ -903,7 +910,7 @@ def reconcile_credentials_from_live_store(account_id: int, db) -> None:
         # Compare-and-set against the row this decision was made from: the
         # ownership lookup above can take seconds, and a re-authentication or
         # an authority-guard adoption that landed meanwhile must win.
-        expected = {col: account.get(col) for col in _RECONCILE_GUARD_COLS}
+        expected = {col: account.get(col) for col in CC_IMPORT_GUARD_COLS}
         if not db.update_account_if_unchanged(account_id, expected, **updates):
             logger.info(
                 "Account %d: the row changed while reconciling; not importing "

@@ -307,6 +307,26 @@ class TestSyncTokensCAS:
         assert acct["access_token"] == original["access_token"]
         assert acct["refresh_token"] == original["refresh_token"]
 
+    @pytest.mark.parametrize("verdict, kept", [("auth_rejected", None), ("invalid_grant", "invalid_grant")])
+    def test_a_synced_replacement_drops_only_the_access_verdict(self, tmp_path, verdict, kept):
+        """auth_rejected was about the replaced access token, so it goes; an
+        invalid_grant is about the refresh lineage and stays."""
+        db = _make_db(tmp_path)
+        db.update_account(1, cc_access_token="old_cc_at", cc_refresh_failure_type=verdict,
+                          cc_refresh_last_failed_at=123)
+        config_dir = tmp_path / "accounts" / "1"
+        config_dir.mkdir(parents=True)
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "new_cc_at", "refreshToken": "new_cc_rt",
+                              "expiresAt": 9999999999000}
+        }))
+        from jacked.launch import _sync_tokens_from_file
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        acct = db.get_account(1)
+        assert acct["cc_access_token"] == "new_cc_at"
+        assert acct["cc_refresh_failure_type"] == kept
+        assert (acct["cc_refresh_last_failed_at"] is None) == (kept is None)
+
     def test_cas_sql_rejects_stale_write(self, tmp_path):
         """CAS WHERE clause rejects update when old value doesn't match DB."""
         db = _make_db(tmp_path)

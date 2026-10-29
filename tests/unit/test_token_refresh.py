@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import json
+
 import pytest
 
 from jacked.web.database import Database
@@ -642,6 +644,42 @@ class TestReconcileOwnershipProof:
                    return_value=_owner_profile("owner@test.com", "org-a", "uuid-a")):
             ch.reconcile_credentials_from_live_store(aid, db)
         assert db.get_account(aid)["cc_access_token"] == "fresh-access"
+
+    def test_a_keeper_verdict_that_skipped_the_cc_token_says_nothing_about_it(self, tmp_path):
+        """Under invalid_grant the keeper leaves the cc token out and records
+        needs_reauth against the primary token alone: no verdict on cc."""
+        from jacked.api.credential_helpers import cc_token_known_dead
+        from jacked.api.usage_monitor import _candidate_fingerprint
+
+        row = {"cc_access_token": "recovered", "access_token": "primary",
+               "cc_refresh_failure_type": "invalid_grant",
+               "keeper_state": json.dumps({"last_status": "needs_reauth",
+                                           "token_fp": _candidate_fingerprint(None, "primary")})}
+        assert cc_token_known_dead(row) is False
+
+    def test_a_primary_reauth_during_the_lookup_also_stops_the_write(self, tmp_path):
+        """The keeper fingerprint includes the primary token, so a primary-only
+        re-auth that lands during the lookup changes the verdict's meaning."""
+        from unittest.mock import patch
+
+        from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+        from jacked.api.usage_monitor import _candidate_fingerprint
+
+        db, aid, live = self._older_live_over_newer_row(tmp_path)
+        row = db.get_account(aid)
+        db.set_keeper_state(aid, last_status="needs_reauth",
+                            token_fp=_candidate_fingerprint(row["cc_access_token"], row["access_token"]))
+        owner = _owner_profile("owner@test.com", "org-a", "uuid-a")
+
+        def lookup_while_primary_reauth_lands(*args, **kwargs):
+            db.update_account(aid, access_token="new-primary")
+            return owner
+
+        with patch("jacked.api.credential_helpers.read_platform_credentials", return_value=live), \
+             patch("jacked.api.credential_helpers._ownership_lookup",
+                   side_effect=lookup_while_primary_reauth_lands):
+            reconcile_credentials_from_live_store(aid, db)
+        assert db.get_account(aid)["cc_access_token"] == "old-access"
 
     @pytest.mark.parametrize("raw", ["[]", "not json", '"needs_reauth"', None])
     def test_a_malformed_keeper_state_is_no_verdict(self, raw):
