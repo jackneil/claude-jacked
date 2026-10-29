@@ -139,14 +139,14 @@ def migrate_baked_host_to_db(host: str, db=None) -> str:
             msg = f"remote access setting already present; baked host {host} left alone"
             logger.info(msg)
             return msg
-        # Write scope FIRST, then the guard key `remote_access_enabled` LAST.
-        # If the second write fails mid-migration, `remote_access_enabled` stays
-        # absent, so the guard above lets a later boot retry the whole migration
-        # cleanly instead of the intent sticking half-applied (enabled set, scope
-        # missing) and being permanently downgraded to the default scope.
+        # One transaction: the scope and the guard key `remote_access_enabled`
+        # land together or not at all. A failed write leaves the guard key
+        # absent, so a later boot retries the whole migration instead of the
+        # intent sticking half-applied (enabled set, scope missing).
+        values = {"remote_access_enabled": enabled}
         if scope is not None:
-            db.set_setting("remote_access_scope", scope)
-        db.set_setting("remote_access_enabled", enabled)
+            values["remote_access_scope"] = scope
+        db.set_settings(values)
     except Exception as exc:  # sqlite errors, unreadable DB path ...
         msg = f"could not migrate baked host {host}: {exc}"
         logger.warning(msg)

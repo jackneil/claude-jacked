@@ -33,6 +33,23 @@ def _clear_active_flows():
     oauth_mod.reset_locks()
 
 
+_DB_DIR: list = []
+
+
+@pytest.fixture(autouse=True)
+def _db_dir(tmp_path):
+    _DB_DIR[:] = [tmp_path]
+    yield
+    _DB_DIR.clear()
+
+
+def _new_db() -> Database:
+    """A file-backed Database, not ``:memory:``: start() reads the re-auth
+    target row in a worker thread, and Database keeps one connection per
+    thread, so an in-memory DB would be a different, empty database there."""
+    return Database(str(_DB_DIR[0] / f"jacked-{len(list(_DB_DIR[0].glob('*.db')))}.db"))
+
+
 async def _drain_background_tasks():
     """Cancel the tasks start() spawned, including their 30s cleanup sleep."""
     current = asyncio.current_task()
@@ -56,7 +73,7 @@ def run_async(body):
 
 
 def _make_db(email="jack@example.com", org_uuid="org-abc", org_name="Acme Inc"):
-    db = Database(":memory:")
+    db = _new_db()
     account = db.create_account(
         email=email,
         access_token="sk-ant-old",
@@ -143,7 +160,7 @@ def test_reauth_start_and_status_report_who_is_being_authorized():
 def test_a_flow_with_no_target_sends_no_hints():
     """Add Account has no identity yet; a stale hint would pre-fill the wrong
     email and force the user to clear it."""
-    db = Database(":memory:")
+    db = _new_db()
 
     async def _body():
         flow = OAuthFlow(db, purpose="primary", manual=True)
@@ -174,7 +191,7 @@ def test_a_personal_account_sends_only_the_login_hint():
 
 def test_a_missing_target_account_does_not_break_the_flow():
     """The account could be deleted between the click and the start."""
-    db = Database(":memory:")
+    db = _new_db()
 
     async def _body():
         flow = OAuthFlow(db, purpose="primary", target_account_id=999, manual=True)
@@ -219,11 +236,13 @@ def _pending_browser_flow(db, target_account_id=None):
     """A browser-mode flow parked where start() would leave it.
 
     start() is skipped deliberately: it binds a real socket in 45100-45199 and
-    spawns a background task. reopen_browser only reads _auth_url and _status.
+    spawns a background task. reopen_browser reads _auth_url, _status and the
+    target row, which start() loads.
     """
     flow = OAuthFlow(
         db, purpose="primary", target_account_id=target_account_id, manual=False
     )
+    flow._target_account = flow._load_target_account()
     flow._auth_url = "https://claude.com/cai/oauth/authorize?state=abc"
     flow._status = "pending"
     return flow

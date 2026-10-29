@@ -57,7 +57,7 @@ def test_windows_task_plus_legacy_vbs_is_duplicate(tmp_path):
 def test_windows_staged_definition_is_not_enabled(tmp_path):
     task = tmp_path / "task.xml"
     task.write_text("<Task />", encoding="utf-8")
-    run = Mock(return_value=SimpleNamespace(returncode=1, stdout=""))
+    run = Mock(return_value=SimpleNamespace(returncode=3, stdout=""))
     with patch("jacked.service.autostart.extract_marker", return_value=_OWNED_MARKER):
         result = inspect_autostart(
             platform="win32",
@@ -72,7 +72,7 @@ def test_windows_staged_definition_is_not_enabled(tmp_path):
 def test_windows_staged_foreign_definition_is_foreign(tmp_path):
     task = tmp_path / "task.xml"
     task.write_text("<Task />", encoding="utf-8")
-    run = Mock(return_value=SimpleNamespace(returncode=1, stdout=""))
+    run = Mock(return_value=SimpleNamespace(returncode=3, stdout=""))
     with patch("jacked.service.autostart.extract_marker", return_value=None):
         result = inspect_autostart(
             platform="win32",
@@ -115,3 +115,26 @@ def test_linux_unit_requires_manager_enabled_state(tmp_path):
         )
     assert disabled.state is AutostartState.OWNED_DISABLED
     assert enabled.state is AutostartState.OWNED_ENABLED
+
+
+def test_windows_owned_task_read_back_as_utf8_is_enabled(tmp_path):
+    """#165i: the read-back XML still declares UTF-16 while its bytes are
+    UTF-8. A plain re-encode used to make our own task read as unowned."""
+    from jacked.service.spec import SupervisorKind
+    from jacked.service.supervisors._task_xml import decode_task_xml
+    from tests.unit.service.supervisor_test_support import installed_artifact
+
+    _, _, rendered, _ = installed_artifact(tmp_path, SupervisorKind.TASK_SCHEDULER)
+    # The COM query writes the definition as UTF-8 text (declaration and all).
+    printed = decode_task_xml(rendered.content).encode("utf-8")
+    run = Mock(return_value=SimpleNamespace(returncode=0, stdout=printed, stderr=b""))
+
+    result = inspect_autostart(
+        platform="win32",
+        run=run,
+        task_path=tmp_path / "task.xml",
+        legacy_vbs_path=tmp_path / "missing.vbs",
+    )
+
+    assert result.state is AutostartState.OWNED_ENABLED
+    assert run.call_args.kwargs.get("text") is not True  # bytes, decoded by us

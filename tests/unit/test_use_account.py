@@ -1561,3 +1561,31 @@ def test_switch_refuses_while_the_outgoing_row_is_busy(client, app):
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "OUTGOING_ACCOUNT_BUSY"
     app.state.credential_switcher.assert_not_called()
+
+
+def test_use_account_arms_the_cooldown_before_the_pointer_write(client, db):
+    """The pointer write runs in a worker thread; the auto-swap sweep can run
+    on the loop meanwhile, so the cooldown must already be armed (#162)."""
+    order = []
+    real_set = db.set_setting
+
+    def recording_set(key, value):
+        if key == "active_account_id":
+            order.append("pointer")
+        return real_set(key, value)
+
+    with (
+        mock.patch("jacked.api.credential_helpers.sync_credential_to_all_stores"),
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
+        ),
+        mock.patch(
+            "jacked.api.usage_monitor.note_external_swap",
+            side_effect=lambda: order.append("cooldown"),
+        ),
+        mock.patch.object(db, "set_setting", side_effect=recording_set),
+    ):
+        resp = client.post("/api/auth/accounts/1/use")
+
+    assert resp.status_code == 200
+    assert order == ["cooldown", "pointer"]

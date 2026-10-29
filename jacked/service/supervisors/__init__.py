@@ -23,6 +23,7 @@ from jacked.service.supervisors._artifacts import (
     reconcile_artifact,
 )
 from jacked.service.supervisors._helpers import systemd_quote, windows_quote
+from jacked.service.supervisors._task_xml import encode_task_xml, query_task_xml
 from jacked.service.supervisors._transition import (
     SupervisorTransitionLease,
     TransitionBusy,
@@ -131,7 +132,8 @@ def render_task_scheduler(
         + spec.generation
     )
     root = _task_scheduler_tree(spec, marker, environment, arguments)
-    content = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+    # schtasks /Create /XML reads the file as UTF-16 (#165i).
+    content = encode_task_xml(ElementTree.tostring(root, encoding="unicode"))
     return SupervisorArtifact(
         kind=spec.supervisor,
         name=spec.service_id,
@@ -234,7 +236,13 @@ def restart_owned_supervisor(
 
 
 def _restart_owned_locked(spec, path, expected, run, uid) -> SupervisorAction:
-    common = {"capture_output": True, "text": True, "timeout": 15, "check": False}
+    common = {
+        "capture_output": True,
+        "text": True,
+        "errors": "replace",
+        "timeout": 15,
+        "check": False,
+    }
     inspection = inspect_artifact(path, expected)
     if inspection.disposition is not ArtifactDisposition.MATCHING:
         return SupervisorAction(
@@ -289,12 +297,11 @@ def _restart_command(spec, path, expected, run, common, uid):
     if spec.supervisor is SupervisorKind.TASK_SCHEDULER:
         from jacked.service.supervisors.task_scheduler import task_action
 
-        checked = run(
-            ["schtasks.exe", "/Query", "/TN", spec.service_id, "/XML"], **common
-        )
-        registered = checked.stdout.encode("utf-8")
+        checked = query_task_xml(run, spec.service_id, timeout=common["timeout"])
+        registered = checked.xml
         if (
             checked.returncode != 0
+            or registered is None
             or extract_marker(registered, spec.supervisor) != expected.marker
             or task_action(registered) != task_action(expected.content)
         ):

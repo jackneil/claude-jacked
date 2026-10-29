@@ -360,7 +360,9 @@ async def fetch_codex_usage(
         # home): nothing to re-verify, proceed.
         auth = read_auth_json(lock_base, env)
         if auth is not None:
-            live_id = find_codex_account_id(db, extract_identity(auth))
+            live_id = await asyncio.to_thread(
+                find_codex_account_id, db, extract_identity(auth)
+            )
             if live_id != account_id:
                 logger.info(
                     "Codex usage poll skipped for %s — root now holds account %s",
@@ -376,7 +378,7 @@ async def fetch_codex_usage(
                 "Codex usage fetch failed for account %s: %s", account_id, exc
             )
             try:
-                db.record_account_error(account_id, str(exc))
+                await asyncio.to_thread(db.record_account_error, account_id, str(exc))
             except Exception:  # pragma: no cover - bookkeeping must not mask failure
                 logger.debug("record_account_error failed", exc_info=True)
             return None
@@ -393,7 +395,8 @@ async def fetch_codex_usage(
             # account legitimately has no plan windows — record it without
             # incrementing consecutive_failures, or it would be starved out of
             # auto-swap fallback (get_fallback_account excludes failures >= 3).
-            db.record_account_error(
+            await asyncio.to_thread(
+                db.record_account_error,
                 account_id,
                 "codex app-server returned no rate limits",
                 increment_failures=False,
@@ -409,43 +412,49 @@ async def fetch_codex_usage(
     # usedPercent preserves the last known value instead of destroying it.
     clear_five = norm["windows_complete"] and not five["reported"]
     clear_seven = norm["windows_complete"] and not seven["reported"]
-    db.update_account_usage_cache(
-        account_id,
-        five_hour=five["utilization"],
-        seven_day=seven["utilization"],
-        # A resets_at only travels WITH its percent — a window that carries a
-        # resetsAt but no usedPercent must not pair a fresh reset time with
-        # the preserved stale percent.
-        five_hour_resets_at=(
-            five["resets_at"] if five["utilization"] is not None else None
-        ),
-        seven_day_resets_at=(
-            seven["resets_at"] if seven["utilization"] is not None else None
-        ),
-        clear_five_hour=clear_five,
-        clear_seven_day=clear_seven,
-        raw=result,
-    )
-    # The rate-limits read carries the CURRENT ChatGPT plan — keep the stored
-    # subscription in sync so an upgrade/downgrade (Plus <-> Pro) shows up on
-    # the dashboard without re-adding the account. (At add time the plan comes
-    # from the id_token claim and was never refreshed before this.)
-    plan = norm.get("plan_type")
-    if plan:
+
+    def _persist() -> None:
+        # One thread hop for the cache write, the plan sync and the error
+        # clear: they ran back to back on the loop before, keep them together.
+        db.update_account_usage_cache(
+            account_id,
+            five_hour=five["utilization"],
+            seven_day=seven["utilization"],
+            # A resets_at only travels WITH its percent — a window that carries a
+            # resetsAt but no usedPercent must not pair a fresh reset time with
+            # the preserved stale percent.
+            five_hour_resets_at=(
+                five["resets_at"] if five["utilization"] is not None else None
+            ),
+            seven_day_resets_at=(
+                seven["resets_at"] if seven["utilization"] is not None else None
+            ),
+            clear_five_hour=clear_five,
+            clear_seven_day=clear_seven,
+            raw=result,
+        )
+        # The rate-limits read carries the CURRENT ChatGPT plan — keep the stored
+        # subscription in sync so an upgrade/downgrade (Plus <-> Pro) shows up on
+        # the dashboard without re-adding the account. (At add time the plan comes
+        # from the id_token claim and was never refreshed before this.)
+        plan = norm.get("plan_type")
+        if plan:
+            try:
+                acct = db.get_account(account_id)
+                if acct and acct.get("subscription_type") != plan:
+                    db.update_account(account_id, subscription_type=plan)
+                    logger.info(
+                        "Codex account %s plan changed: %s -> %s",
+                        account_id, acct.get("subscription_type"), plan,
+                    )
+            except Exception:  # pragma: no cover - bookkeeping must not mask usage
+                logger.debug("codex plan sync failed", exc_info=True)
         try:
-            acct = db.get_account(account_id)
-            if acct and acct.get("subscription_type") != plan:
-                db.update_account(account_id, subscription_type=plan)
-                logger.info(
-                    "Codex account %s plan changed: %s -> %s",
-                    account_id, acct.get("subscription_type"), plan,
-                )
-        except Exception:  # pragma: no cover - bookkeeping must not mask usage
-            logger.debug("codex plan sync failed", exc_info=True)
-    try:
-        db.clear_account_errors(account_id)
-    except Exception:  # pragma: no cover
-        logger.debug("clear_account_errors failed", exc_info=True)
+            db.clear_account_errors(account_id)
+        except Exception:  # pragma: no cover
+            logger.debug("clear_account_errors failed", exc_info=True)
+
+    await asyncio.to_thread(_persist)
     if state is not None:
         state["last_fetched_at"] = time.time()
     # The one line the on-call reads: carry the window values AND any clear on

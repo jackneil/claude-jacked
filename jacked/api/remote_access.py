@@ -67,8 +67,8 @@ def read_enabled_scope(db) -> tuple[bool, str]:
     >>> class _DB:
     ...     def __init__(self, **kv):
     ...         self._kv = kv
-    ...     def get_setting(self, key):
-    ...         return self._kv.get(key)
+    ...     def get_settings(self, keys):
+    ...         return {key: self._kv.get(key) for key in keys}
     >>> read_enabled_scope(_DB())
     (False, 'tailscale')
     >>> read_enabled_scope(_DB(remote_access_enabled='true', remote_access_scope='all'))
@@ -81,7 +81,7 @@ def read_enabled_scope(db) -> tuple[bool, str]:
     A settings DB that cannot be read denies rather than raises:
 
     >>> class _BrokenDB:
-    ...     def get_setting(self, key):
+    ...     def get_settings(self, keys):
     ...         raise RuntimeError('database is locked')
     >>> read_enabled_scope(_BrokenDB())
     (False, 'tailscale')
@@ -89,8 +89,11 @@ def read_enabled_scope(db) -> tuple[bool, str]:
     if db is None:
         return False, DEFAULT_SCOPE
     try:
-        enabled = db.get_setting("remote_access_enabled") == "true"
-        stored_scope = db.get_setting("remote_access_scope")
+        # One snapshot: the flag and its scope are one policy. Two reads
+        # could straddle a save and pair the new flag with the old scope.
+        values = db.get_settings(["remote_access_enabled", "remote_access_scope"])
+        enabled = values["remote_access_enabled"] == "true"
+        stored_scope = values["remote_access_scope"]
     except Exception as exc:  # locked/corrupt sqlite, unreadable path ...
         # Fail closed, and do NOT propagate: this read now runs on /use,
         # /credential-operations/* and the polled /active-credential, so a

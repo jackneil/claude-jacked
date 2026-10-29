@@ -41,6 +41,9 @@ class _FakeDB:
     def get_setting(self, key):
         return self._settings.get(key)
 
+    def get_settings(self, keys):
+        return {key: self._settings.get(key) for key in keys}
+
 
 # ---------------------------------------------------------------------------
 # read_enabled_scope
@@ -206,6 +209,9 @@ def test_remote_access_doctests_run():
 
 class _BrokenDB:
     def get_setting(self, key):
+        raise sqlite3.OperationalError("database is locked")
+
+    def get_settings(self, keys):
         raise sqlite3.OperationalError("database is locked")
 
 

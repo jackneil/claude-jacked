@@ -85,7 +85,7 @@ def _validate_repo_path(repo_path: str, db=None) -> Path | None:
 
 
 @router.get("/claude-settings/project-permissions")
-async def get_project_permissions(repo_path: str, request: Request):
+def get_project_permissions(repo_path: str, request: Request):
     """Read project-level Claude Code permissions."""
     db = getattr(request.app.state, "db", None)
     resolved = _validate_repo_path(repo_path, db=db)
@@ -121,7 +121,7 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
             content={"error": {"message": f"Invalid mode: {body.defaultMode}"}},
         )
     db = getattr(request.app.state, "db", None)
-    resolved = _validate_repo_path(body.repo_path, db=db)
+    resolved = await asyncio.to_thread(_validate_repo_path, body.repo_path, db=db)
     if not resolved:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -258,7 +258,7 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
 
     if body.scope == "project":
         db = getattr(request.app.state, "db", None)
-        resolved = _validate_repo_path(body.repo_path, db=db)
+        resolved = await asyncio.to_thread(_validate_repo_path, body.repo_path, db=db)
         if not resolved:
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

@@ -8,6 +8,7 @@ from jacked.service.supervisors import (
     render_task_scheduler,
 )
 from jacked.service.supervisors.uninstall import uninstall_owned_supervisor
+from jacked.service.supervisors._task_xml import decode_task_xml
 from tests.unit.service.supervisor_test_support import (
     installed_artifact as _installed_artifact,
 )
@@ -186,7 +187,7 @@ def test_uninstall_task_stops_and_deletes_exact_registered_definition(tmp_path):
     )
     runner = Mock(
         side_effect=[
-            SimpleNamespace(returncode=0, stdout=rendered.content.decode()),
+            SimpleNamespace(returncode=0, stdout=decode_task_xml(rendered.content)),
             SimpleNamespace(returncode=1, stdout=""),
             SimpleNamespace(returncode=0, stdout=""),
         ]
@@ -224,7 +225,7 @@ def test_uninstall_task_refuses_foreign_registered_definition(tmp_path):
         },
     )
     runner = Mock(
-        return_value=SimpleNamespace(returncode=0, stdout=foreign.content.decode())
+        return_value=SimpleNamespace(returncode=0, stdout=decode_task_xml(foreign.content))
     )
 
     result = uninstall_owned_supervisor(spec, path, environment=environment, run=runner)

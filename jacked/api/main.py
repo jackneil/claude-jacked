@@ -177,7 +177,9 @@ async def _profile_backfill_once(app):
         logger.error(
             "Profile backfill exceeded %ds and was cancelled", SWEEP_PASS_TIMEOUT
         )
-        web_auth.log_identity_coverage(db, counts, timed_out=True)
+        await asyncio.to_thread(
+            web_auth.log_identity_coverage, db, counts, timed_out=True
+        )
     except Exception as e:
         logger.warning("Profile backfill error: %s", type(e).__name__)
 
@@ -280,7 +282,9 @@ async def lifespan(app: FastAPI):
     try:
         from jacked.web.database import Database
 
-        app.state.db = Database()
+        # Schema setup and migrations are disk I/O: off the loop like every
+        # other query (#162). The loop thread then never opens a connection.
+        app.state.db = await asyncio.to_thread(Database)
         logger.info("Database initialized")
     except Exception as e:
         logger.warning("Database init failed: %s", e)
@@ -459,12 +463,30 @@ async def lifespan(app: FastAPI):
         logging.getLogger().removeHandler(_file_handler)
         _file_handler.close()
 
+    await _close_loop_db_connection(app)
+
+
+async def _close_loop_db_connection(app) -> None:
+    """Close the jacked.db connection that the event-loop thread holds.
+
+    ``Database`` connections are thread-local, and ``Database.close()``
+    closes only the CALLING thread's connection. The one this shutdown must
+    close is any one the loop thread opened (none today: the lifespan builds
+    the Database in a worker and every query runs off the loop, but a stray
+    loop-thread connection must still be closed). So detach it here, on the
+    loop thread, and close it in a worker: closing the last WAL connection
+    checkpoints, which is disk I/O. Never raises.
+    """
     db = getattr(app.state, "db", None)
-    if db is not None:
-        try:
-            db.close()
-        except Exception:
-            pass
+    if db is None:
+        return
+    conn = db.detach_connection()
+    if conn is None:
+        return
+    try:
+        await asyncio.to_thread(conn.close)
+    except Exception:
+        pass
 
 
 app = FastAPI(

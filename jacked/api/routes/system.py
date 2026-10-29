@@ -338,7 +338,7 @@ async def get_install_summary():
 
 
 @router.post("/project/guardrails-init")
-async def project_guardrails_init(body: ProjectInitRequest, request: Request):
+def project_guardrails_init(body: ProjectInitRequest, request: Request):
     """Create JACKED_GUARDRAILS.md in a project from templates."""
     error = _validate_project_path(body.repo_path, request)
     if error:
@@ -351,7 +351,7 @@ async def project_guardrails_init(body: ProjectInitRequest, request: Request):
 
 
 @router.post("/project/lint-hook-init")
-async def project_lint_hook_init(body: ProjectInitRequest, request: Request):
+def project_lint_hook_init(body: ProjectInitRequest, request: Request):
     """Install a pre-push lint hook in a project's .git/hooks/."""
     error = _validate_project_path(body.repo_path, request)
     if error:
@@ -372,7 +372,7 @@ class EnvUpdateRequest(BaseModel):
 
 
 @router.get("/project/env")
-async def get_project_env(repo_path: str, request: Request):
+def get_project_env(repo_path: str, request: Request):
     """Get the configured Python env for a project.
 
     >>> # GET /api/project/env?repo_path=/some/repo
@@ -410,7 +410,7 @@ async def get_project_env(repo_path: str, request: Request):
 
 
 @router.put("/project/env")
-async def update_project_env(body: EnvUpdateRequest, request: Request):
+def update_project_env(body: EnvUpdateRequest, request: Request):
     """Manually set the Python env path for a project.
 
     >>> # PUT /api/project/env  {"repo_path": "...", "env_path": "..."}
@@ -446,7 +446,7 @@ async def update_project_env(body: EnvUpdateRequest, request: Request):
 
 
 @router.post("/project/env/detect")
-async def detect_project_env(body: ProjectInitRequest, request: Request):
+def detect_project_env(body: ProjectInitRequest, request: Request):
     """Auto-detect and store the Python env for a project.
 
     >>> # POST /api/project/env/detect  {"repo_path": "..."}
@@ -504,7 +504,7 @@ class LessonsUpdateRequest(BaseModel):
 
 
 @router.get("/project/lessons")
-async def get_project_lessons(repo_path: str, request: Request):
+def get_project_lessons(repo_path: str, request: Request):
     """Read and parse lessons.md for a project."""
     from pathlib import Path
     import re
@@ -543,7 +543,7 @@ async def get_project_lessons(repo_path: str, request: Request):
 
 
 @router.put("/project/lessons")
-async def update_project_lessons(body: LessonsUpdateRequest, request: Request):
+def update_project_lessons(body: LessonsUpdateRequest, request: Request):
     """Write updated lessons back to lessons.md."""
     from pathlib import Path
 
@@ -607,7 +607,7 @@ async def update_project_lessons(body: LessonsUpdateRequest, request: Request):
 
 
 @router.get("/installations", response_model=list[InstallationResponse])
-async def list_installations(request: Request):
+def list_installations(request: Request):
     """List repos where jacked is installed."""
     import json
 
@@ -636,7 +636,7 @@ async def list_installations(request: Request):
 
 
 @router.get("/installations/overview", response_model=InstallationsOverview)
-async def installations_overview(request: Request):
+def installations_overview(request: Request):
     """Global install state + per-project activity summary."""
     from pathlib import Path
 
@@ -851,7 +851,7 @@ async def system_upgrade(request: Request):
 
 
 @router.get("/logs/hooks")
-async def list_hook_logs(
+def list_hook_logs(
     request: Request,
     limit: int = 200,
     offset: int = 0,
@@ -875,7 +875,7 @@ async def list_hook_logs(
 
 
 @router.get("/logs/version-checks")
-async def list_version_check_logs(
+def list_version_check_logs(
     request: Request,
     limit: int = 100,
     offset: int = 0,
@@ -898,7 +898,7 @@ async def list_version_check_logs(
 
 
 @router.get("/settings", response_model=list[SettingResponse])
-async def get_settings(request: Request):
+def get_settings(request: Request):
     """All settings as key/value pairs.
 
     Filters out legacy gatekeeper.* rows — the feature was retired in 0.70.0
@@ -954,7 +954,7 @@ _PROTECTED_SETTING_KEYS = {
 
 
 @router.put("/settings/{key}")
-async def update_setting(key: str, body: SettingUpdateRequest, request: Request):
+def update_setting(key: str, body: SettingUpdateRequest, request: Request):
     """Update a setting."""
     import json
 
@@ -984,7 +984,7 @@ async def update_setting(key: str, body: SettingUpdateRequest, request: Request)
 
 
 @router.delete("/settings/{key}")
-async def delete_setting(key: str, request: Request):
+def delete_setting(key: str, request: Request):
     """Delete a setting by key."""
     if key in _PROTECTED_SETTING_KEYS:
         return JSONResponse(

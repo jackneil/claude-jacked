@@ -17,11 +17,13 @@
         li.phase.ok { background: #064e3b; }
         li.phase.in_progress { background: #1e3a8a; }
         li.phase.failed { background: #7f1d1d; }
+        li.phase.warning { background: #78350f; }
         li.phase.pending { opacity: 0.55; }
         .dot { width: 0.7em; height: 0.7em; border-radius: 50%; display: inline-block; }
         .dot.ok { background: #10b981; }
         .dot.in_progress { background: #3b82f6; animation: pulse 1s infinite; }
         .dot.failed { background: #ef4444; }
+        .dot.warning { background: #f59e0b; }
         .dot.pending { background: #6b7280; }
         @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.3 } }
         .banner { padding: 1em; border-radius: 6px; margin: 1.5em 0;
@@ -48,7 +50,7 @@
     </style>
 </head>
 <body>
-    <h1>Jacked is updating&hellip;</h1>
+    <h1 id="heading">Jacked is updating&hellip;</h1>
     <div class="meta" id="meta">Waiting for first status update&hellip;</div>
     <ol class="phases" id="phases"></ol>
     <div id="banner" class="banner"></div>
@@ -64,11 +66,21 @@
         ["waiting_port_free",  "Waiting for port to free"],
         ["starting_service",   "Starting new service"],
         ["verifying_service",  "Verifying new service"],
+        ["refreshing_packs",   "Refreshing skill packs"],
         ["rolling_back",       "Rolling back to the previous version"],
     ];
 
+    // A status record unchanged this long is stale (the updater is gone).
+    const STALE_MS = 120000;
+
     // Phases that only run when an update goes wrong.
     const OPTIONAL_PHASES = new Set(["rolling_back"]);
+
+    // A phase that ends as "warning" does not fail the update. The done
+    // banner says what did not happen and the command that does it later.
+    const PHASE_WARNINGS = {
+        refreshing_packs: ["The skill packs were not refreshed.", "jacked packs update"],
+    };
 
     const state = {
         startedAt: null,
@@ -78,6 +90,8 @@
         method: null,
         currentVersion: null,
         overall: "in_progress",
+        currentPhase: null,
+        haveRecord: false,
         error: null,
         recovery: null,
         phases: {},
@@ -186,28 +200,68 @@
         banner.parentNode.insertBefore(wrap, banner.nextSibling);
     }
 
+    function renderHeading(done) {
+        const heading = document.getElementById("heading");
+        if (done) heading.textContent = "Jacked is updated";
+        else if (state.overall === "failed") heading.textContent = "Jacked update failed";
+        else heading.textContent = "Jacked is updating\u2026";
+    }
+
+    function renderWarnings(banner) {
+        for (const [name, label] of PHASES) {
+            const entry = state.phases[name];
+            if (!entry || entry.status !== "warning") continue;
+            const [text, command] = PHASE_WARNINGS[name] ||
+                [label + " did not complete. See ~/.claude/jacked-update.log.", null];
+            const row = makeEl("div", "row");
+            row.appendChild(makeEl("b", null, "Warning: "));
+            row.appendChild(document.createTextNode(text));
+            if (command) {
+                row.appendChild(document.createTextNode(" To do it later, run "));
+                row.appendChild(makeEl("code", null, command));
+                row.appendChild(document.createTextNode("."));
+            }
+            banner.appendChild(row);
+        }
+    }
+
+    function statusAgeMs() {
+        if (!state.serverMtime) return null;
+        const t = Date.parse(state.serverMtime);
+        return Number.isNaN(t) ? null : Date.now() - t;
+    }
+
+    // The update is over when its status record says so. The new version
+    // answering is not enough: the skill packs refresh runs after the new
+    // service is up, and its result (ok or warning) arrives later. The
+    // version match decides only when there is no record, or the record
+    // stopped changing (an updater that died after the restart).
+    function isFinished() {
+        if (state.overall === "succeeded" || state.overall === "failed") return true;
+        const targetKnown = state.targetVersion && state.targetVersion !== "next";
+        if (!(targetKnown && state.currentVersion === state.targetVersion)) return false;
+        const age = statusAgeMs();
+        return !state.haveRecord || (age !== null && age > STALE_MS);
+    }
+
     function renderBanner() {
         const banner = document.getElementById("banner");
         clearChildren(banner);
         banner.style.display = "none";
         banner.className = "banner";
 
-        const targetKnown = state.targetVersion && state.targetVersion !== "next";
-        const done = state.overall === "succeeded" ||
-            (targetKnown && state.currentVersion === state.targetVersion);
+        const done = state.overall !== "failed" && isFinished();
 
-        let serverAgeMs = null;
-        if (state.serverMtime) {
-            const t = Date.parse(state.serverMtime);
-            if (!Number.isNaN(t)) serverAgeMs = Date.now() - t;
-        }
+        const serverAgeMs = statusAgeMs();
         const stuck = !done && state.overall !== "failed" &&
-            serverAgeMs !== null && serverAgeMs > 120000;
+            serverAgeMs !== null && serverAgeMs > STALE_MS;
+        renderHeading(done);
 
         if (done) {
             banner.classList.add("succeeded");
             const v = state.currentVersion || state.targetVersion || "";
             banner.appendChild(makeEl("div", null, "Update complete. jacked is now v" + v + "."));
+            renderWarnings(banner);
             const a = makeEl("a", "button", "Open dashboard");
             a.href = "/";
             // Break out of the bootstrap iframe so the whole tab navigates.
@@ -257,6 +311,7 @@
             if (r.ok) {
                 const body = await r.json();
                 if (body && body.status) {
+                    state.haveRecord = true;
                     state.serviceDownSince = null;
                     state.serverMtime = body.mtime_iso || state.serverMtime;
                     if (!state.startedAt && body.status.started_at) {
@@ -266,6 +321,7 @@
                     state.fromVersion = body.status.from_version || state.fromVersion;
                     state.method = body.status.method || state.method;
                     state.overall = body.status.overall || state.overall;
+                    state.currentPhase = body.status.current_phase || null;
                     state.error = body.status.error;
                     state.recovery = body.status.recovery;
                     state.phases = {};
@@ -306,11 +362,7 @@
                 {jackedUpdateOverall: state.overall, jackedCurrentVersion: state.currentVersion},
                 "*");
         } catch (_) {}
-        const targetKnown = state.targetVersion && state.targetVersion !== "next";
-        const terminal = state.overall === "succeeded" ||
-            state.overall === "failed" ||
-            (targetKnown && state.currentVersion === state.targetVersion);
-        if (terminal && pollHandle !== null) {
+        if (isFinished() && pollHandle !== null) {
             clearInterval(pollHandle);
             pollHandle = null;
         }

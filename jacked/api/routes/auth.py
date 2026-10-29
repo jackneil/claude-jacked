@@ -836,7 +836,7 @@ async def start_add_account(
         from jacked.codex.accounts import CodexImportError, add_codex_account
 
         try:
-            acct = add_codex_account(db, run_login=False)
+            acct = await asyncio.to_thread(add_codex_account, db, run_login=False)
         except CodexImportError as exc:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -854,10 +854,11 @@ async def start_add_account(
             "plan": acct.get("subscription_type"),
         }
 
+    allow_activation = await asyncio.to_thread(_credential_mutation_allowed, request)
     flow = OAuthFlow(
         db,
         manual=_manual_oauth(request, remote),
-        allow_credential_activation=_credential_mutation_allowed(request),
+        allow_credential_activation=allow_activation,
     )
     result = await flow.start()
 
@@ -884,7 +885,15 @@ async def start_reauth(account_id: int, request: Request, remote: bool = False):
     if db is None:
         return _db_unavailable()
 
-    account = db.get_account(account_id)
+    def _load():
+        # One thread hop for the account read and the activation decision,
+        # which ran back to back on the loop before.
+        account = db.get_account(account_id)
+        if not account or (account.get("provider") or "claude") == "codex":
+            return account, False
+        return account, _credential_mutation_allowed(request)
+
+    account, allow_activation = await asyncio.to_thread(_load)
     if not account:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -908,7 +917,7 @@ async def start_reauth(account_id: int, request: Request, remote: bool = False):
         purpose="primary",
         target_account_id=account_id,
         manual=_manual_oauth(request, remote),
-        allow_credential_activation=_credential_mutation_allowed(request),
+        allow_credential_activation=allow_activation,
     )
     result = await flow.start()
 
@@ -988,16 +997,19 @@ async def list_accounts(request: Request, include_inactive: bool = False):
     if db is None:
         return _db_unavailable()
 
-    rows = db.list_accounts(include_inactive=include_inactive)
     # _account_to_response can reconcile the active account, which reads the
-    # Keychain and may call the profile endpoint. Keep both off the loop.
+    # Keychain and may call the profile endpoint. Keep the list read and the
+    # conversion off the loop, in one thread hop.
     return await asyncio.to_thread(
-        lambda: [_account_to_response(row, db=db) for row in rows]
+        lambda: [
+            _account_to_response(row, db=db)
+            for row in db.list_accounts(include_inactive=include_inactive)
+        ]
     )
 
 
 @router.patch("/accounts/{account_id}")
-async def update_account(account_id: int, body: AccountPatchRequest, request: Request):
+def update_account(account_id: int, body: AccountPatchRequest, request: Request):
     """Update display_name and/or is_active for an account."""
     db = _get_db(request)
     if db is None:
@@ -1043,7 +1055,7 @@ async def update_account(account_id: int, body: AccountPatchRequest, request: Re
 
 
 @router.delete("/accounts/{account_id}")
-async def delete_account(account_id: int, request: Request):
+def delete_account(account_id: int, request: Request):
     """Soft-delete an account. Cannot delete primary while others exist."""
     db = _get_db(request)
     if db is None:
@@ -1096,7 +1108,7 @@ async def delete_account(account_id: int, request: Request):
 
 
 @router.post("/accounts/reorder")
-async def reorder_accounts(body: ReorderRequest, request: Request):
+def reorder_accounts(body: ReorderRequest, request: Request):
     """Reorder account priorities. Index position becomes priority value."""
     db = _get_db(request)
     if db is None:
@@ -1127,7 +1139,7 @@ async def refresh_token(account_id: int, request: Request):
     if db is None:
         return _db_unavailable()
 
-    account = db.get_account(account_id)
+    account = await asyncio.to_thread(db.get_account, account_id)
     if not account:
         return _not_found(f"No account with id={account_id}")
 
@@ -1156,7 +1168,7 @@ async def refresh_token(account_id: int, request: Request):
         return RefreshResponse(success=True)
 
     # Re-read account to get the error that was recorded
-    updated = db.get_account(account_id)
+    updated = await asyncio.to_thread(db.get_account, account_id)
     error_msg = (
         updated.get("last_error", "Token refresh failed")
         if updated
@@ -1174,7 +1186,7 @@ async def refresh_usage(account_id: int, request: Request):
     if db is None:
         return _db_unavailable()
 
-    account = db.get_account(account_id)
+    account = await asyncio.to_thread(db.get_account, account_id)
     if not account:
         return _not_found(f"No account with id={account_id}")
 
@@ -1200,7 +1212,8 @@ async def refresh_usage(account_id: int, request: Request):
         # Mirror the bulk route's timeout handling: record the error and
         # reset validation_status in the same call so the row doesn't sit
         # at 'checking' waiting for the watchdog's next 60s tick.
-        db.update_account(
+        await asyncio.to_thread(
+            db.update_account,
             account_id,
             validation_status="unknown",
             last_error=(f"Usage fetch timed out after {int(_SINGLE_USAGE_TIMEOUT)}s"),
@@ -1235,7 +1248,7 @@ async def refresh_usage(account_id: int, request: Request):
         )
 
     # Re-read to get updated cache values
-    updated = db.get_account(account_id)
+    updated = await asyncio.to_thread(db.get_account, account_id)
     return UsageRefreshResponse(
         success=True,
         account_id=account_id,
@@ -1291,7 +1304,7 @@ async def refresh_all_usage(
     # the requester gets its data in the HTTP response.
     since_last = time.time() - _last_bulk_completed_at
     if _last_bulk_completed_at and since_last < _BULK_PASS_MIN_INTERVAL:
-        accounts = db.list_accounts(include_inactive=False)
+        accounts = await asyncio.to_thread(db.list_accounts, include_inactive=False)
         results = [
             {
                 "account_id": acct["id"],
@@ -1357,7 +1370,9 @@ async def refresh_all_usage(
         my_task = asyncio.current_task()
         _bulk_refresh_task = my_task
         try:
-            accounts = db.list_accounts(include_inactive=False)
+            accounts = await asyncio.to_thread(
+                db.list_accounts, include_inactive=False
+            )
             ws_registry = getattr(request.app.state, "ws_registry", None)
             total = len(accounts)
 
@@ -1437,7 +1452,8 @@ async def refresh_all_usage(
                         # Reset validation_status in the same call that records
                         # the error so the row doesn't sit at 'checking' waiting
                         # for the watchdog's next 60s tick (PM3 fix).
-                        db.update_account(
+                        await asyncio.to_thread(
+                            db.update_account,
                             acct["id"],
                             validation_status="unknown",
                             last_error=timeout_error,
@@ -1457,6 +1473,30 @@ async def refresh_all_usage(
                     )
                     if is_backed_off:
                         usage_data = None
+
+                    fetch_failed = not is_cached and usage_data is None
+
+                    def _final_reads():
+                        # Both account re-reads in one thread hop, as they ran
+                        # back to back on the loop before. They run before the
+                        # completion count below, so that count and its
+                        # broadcast still have no await between them.
+                        error_row = (
+                            db.get_account(acct["id"]) if fetch_failed else None
+                        )
+                        payload = None
+                        if ws_registry:
+                            updated_row = db.get_account(acct["id"])
+                            payload = (
+                                _account_to_response(updated_row).model_dump()
+                                if updated_row
+                                else None
+                            )
+                        return error_row, payload
+
+                    updated_acct, acct_payload = await asyncio.to_thread(
+                        _final_reads
+                    )
 
                     if usage_data is not None:
                         five_hour = usage_data.get("five_hour", {})
@@ -1478,7 +1518,6 @@ async def refresh_all_usage(
                             "cached_usage_7d": acct.get("cached_usage_7d"),
                         }
                     else:
-                        updated_acct = db.get_account(acct["id"])
                         row = {
                             "account_id": acct["id"],
                             "email": acct["email"],
@@ -1490,16 +1529,8 @@ async def refresh_all_usage(
 
                     completed["n"] += 1
                     # Notify frontend: done or failed (include account data for immediate UI update)
-                    progress_status = (
-                        "failed" if (not is_cached and usage_data is None) else "done"
-                    )
+                    progress_status = "failed" if fetch_failed else "done"
                     if ws_registry:
-                        updated_row = db.get_account(acct["id"])
-                        acct_payload = (
-                            _account_to_response(updated_row).model_dump()
-                            if updated_row
-                            else None
-                        )
                         await ws_registry.broadcast(
                             "usage_refresh_progress",
                             {
@@ -1565,7 +1596,7 @@ async def validate_token(account_id: int, request: Request):
     if db is None:
         return _db_unavailable()
 
-    account = db.get_account(account_id)
+    account = await asyncio.to_thread(db.get_account, account_id)
     if not account:
         return _not_found(f"No account with id={account_id}")
 
@@ -1601,7 +1632,15 @@ async def start_cc_auth(account_id: int, request: Request, remote: bool = False)
     if db is None:
         return _db_unavailable()
 
-    account = db.get_account(account_id)
+    def _load():
+        # One thread hop for the account read and the activation decision,
+        # which ran back to back on the loop before.
+        account = db.get_account(account_id)
+        if not account or (account.get("provider") or "claude") == "codex":
+            return account, False
+        return account, _credential_mutation_allowed(request)
+
+    account, allow_activation = await asyncio.to_thread(_load)
     if not account:
         return _not_found(f"No account with id={account_id}")
 
@@ -1627,7 +1666,7 @@ async def start_cc_auth(account_id: int, request: Request, remote: bool = False)
         purpose="claude_code",
         target_account_id=account_id,
         manual=_manual_oauth(request, remote),
-        allow_credential_activation=_credential_mutation_allowed(request),
+        allow_credential_activation=allow_activation,
     )
     result = await flow.start()
     return result
@@ -1646,8 +1685,8 @@ async def use_account(account_id: int, request: Request):
     Rejects disabled accounts, accounts with invalid validation status,
     and accounts without CC tokens (which would be un-refreshable).
     """
-    allowed, reason, client_host = _credential_mutation_decision(
-        request, audit="switch"
+    allowed, reason, client_host = await asyncio.to_thread(
+        _credential_mutation_decision, request, audit="switch"
     )
     if not allowed:
         return JSONResponse(
@@ -1695,7 +1734,7 @@ async def use_account(account_id: int, request: Request):
     if db is None:
         return _db_unavailable()
 
-    account = db.get_account(account_id)
+    account = await asyncio.to_thread(db.get_account, account_id)
     if not account:
         return _not_found(f"No account with id={account_id}")
 
@@ -1773,8 +1812,8 @@ async def use_account(account_id: int, request: Request):
             },
         )
 
-    action_id, operation_id, action_state, stored_result = _claim_switch_action(
-        db, request, account_id
+    action_id, operation_id, action_state, stored_result = await asyncio.to_thread(
+        _claim_switch_action, db, request, account_id
     )
     if action_state == "complete" and stored_result is not None:
         stored_result = dict(stored_result)
@@ -1839,8 +1878,10 @@ async def use_account(account_id: int, request: Request):
                     "operation_id": operation_id,
                 }
             }
-            db.finish_auth_action(
-                action_id, {**content, "_http_status": status.HTTP_409_CONFLICT}
+            await asyncio.to_thread(
+                db.finish_auth_action,
+                action_id,
+                {**content, "_http_status": status.HTTP_409_CONFLICT},
             )
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1857,22 +1898,12 @@ async def use_account(account_id: int, request: Request):
     )
     content = _switch_content(result, account.get("email", ""))
     http_status = _switch_http_status(result.outcome)
-    db.finish_auth_action(action_id, {**content, "_http_status": http_status})
 
     truthful_target = result.outcome in {
         SwitchOutcome.COMMITTED,
         SwitchOutcome.COMMITTED_DEGRADED,
         SwitchOutcome.OBSERVED_TARGET_UNFENCED,
     }
-    if truthful_target:
-        db.mark_global_sessions_pending()
-
-    if not truthful_target:
-        return JSONResponse(
-            status_code=http_status,
-            content=content,
-            headers={"Cache-Control": "no-store"},
-        )
 
     # Give the manual choice residency: without this, the auto-swap loop
     # can silently revert a user-chosen account within ~2-5 minutes.
@@ -1884,36 +1915,74 @@ async def use_account(account_id: int, request: Request):
     # engine reports observed_target_unfenced for every switch, because no
     # shipped Claude build can be fenced. That outcome still names the account
     # the authority now holds, so the DB pointer and the pause must follow it.
-    try:
-        db.set_setting("active_account_id", str(account_id))
-    except Exception:
-        logger.exception(
-            "Failed to record the active account pointer after a manual switch "
-            "(account=%d)",
-            account_id,
+    def _record_switch():
+        # One thread hop for the writes that ran back to back on the loop:
+        # the action result, the pending-session mark and the DB pointer.
+        db.finish_auth_action(action_id, {**content, "_http_status": http_status})
+        if not truthful_target:
+            return
+        db.mark_global_sessions_pending()
+
+        try:
+            db.set_setting("active_account_id", str(account_id))
+        except Exception:
+            logger.exception(
+                "Failed to record the active account pointer after a manual "
+                "switch (account=%d)",
+                account_id,
+            )
+
+    if truthful_target:
+        # Arm the cooldown BEFORE the thread hop: while the pointer write
+        # runs in a worker, the auto-swap sweep can run on the loop, and it
+        # must already see the manual switch. The monitor state it touches
+        # belongs to the loop, so this stays here.
+        try:
+            from jacked.api import usage_monitor  # local import: avoids cycle
+
+            usage_monitor.note_external_swap()
+        except Exception:
+            logger.exception(
+                "Failed to arm the auto-swap cooldown after a manual switch "
+                "(account=%d)",
+                account_id,
+            )
+
+    await asyncio.to_thread(_record_switch)
+
+    if not truthful_target:
+        return JSONResponse(
+            status_code=http_status,
+            content=content,
+            headers={"Cache-Control": "no-store"},
         )
 
-    try:
-        from jacked.api import usage_monitor  # local import: avoids cycle
-
-        usage_monitor.note_external_swap()
-        pause_dt = datetime.now(timezone.utc) + timedelta(minutes=15)
+    def _extend_pause(pause_dt):
         # Only ever EXTEND an active pause — the user may have set a
         # longer explicit pause (POST /api/settings/swap-pause, up to
         # 1440 min); a manual switch must never silently shorten it.
-        existing = db.get_setting("auto_swap_paused_until") or ""
-        if existing:
-            try:
-                existing_dt = datetime.fromisoformat(
-                    existing.replace("Z", "+00:00"),
-                )
-                if existing_dt > pause_dt:
-                    pause_dt = existing_dt
-            except (ValueError, TypeError):
-                # Unparseable/naive timestamp (the sweep loop ignores
-                # these anyway) — overwrite with the 15-minute pause.
-                pass
-        db.set_setting("auto_swap_paused_until", pause_dt.isoformat())
+        # update_setting reads and writes under one database write lock, so
+        # a pause saved by another request in between is never overwritten.
+        def _longer(existing):
+            if existing:
+                try:
+                    existing_dt = datetime.fromisoformat(
+                        existing.replace("Z", "+00:00"),
+                    )
+                    if existing_dt > pause_dt:
+                        return None  # keep the longer pause
+                except (ValueError, TypeError):
+                    # Unparseable/naive timestamp (the sweep loop ignores
+                    # these anyway) — overwrite with the 15-minute pause.
+                    pass
+            return pause_dt.isoformat()
+
+        db.update_setting("auto_swap_paused_until", _longer)
+
+    try:
+        await asyncio.to_thread(
+            _extend_pause, datetime.now(timezone.utc) + timedelta(minutes=15)
+        )
     except Exception:
         logger.exception(
             "Failed to arm auto-swap pause after manual switch "
@@ -1924,7 +1993,11 @@ async def use_account(account_id: int, request: Request):
     try:
         from jacked.web.auto_swap import format_account_label
 
-        prev_acct = db.get_account(outgoing_id) if outgoing_id else None
+        prev_acct = (
+            await asyncio.to_thread(db.get_account, outgoing_id)
+            if outgoing_id
+            else None
+        )
         reason = f"user switched to {format_account_label(account)}"
         # Attribute a remote switch so Swap History can tell it apart from one
         # made at the machine. (This route writes no swap_log row itself; the
@@ -1956,7 +2029,7 @@ async def use_account(account_id: int, request: Request):
 
 
 @router.get("/credential-operations/{identifier}")
-async def get_credential_operation(identifier: str, request: Request):
+def get_credential_operation(identifier: str, request: Request):
     """Return secret-free status for a credential action/operation.
 
     Same scope gate as the switch itself: loopback always, a remote client
@@ -2051,7 +2124,9 @@ async def get_active_credential(request: Request):
     # remote dashboard on an unresolved/conflicting path would silently
     # re-enable a button the server will reject. Not audited: this route is
     # polled, so one INFO line per poll would be noise, not a trail.
-    allow_activation, activation_reason, _host = _credential_mutation_decision(request)
+    allow_activation, activation_reason, _host = await asyncio.to_thread(
+        _credential_mutation_decision, request
+    )
     activation = {
         "allow_credential_activation": allow_activation,
         "credential_activation_reason": activation_reason,
@@ -2072,7 +2147,11 @@ async def get_active_credential(request: Request):
             **activation,
         )
     identity = observation.identity
-    account = db.get_account(identity.account_id) if identity.account_id else None
+    account = (
+        await asyncio.to_thread(db.get_account, identity.account_id)
+        if identity.account_id
+        else None
+    )
     if not account or account.get("is_deleted"):
         return ActiveCredentialResponse(
             state=ResolverState.UNUSABLE.value,
@@ -2100,7 +2179,7 @@ async def get_active_credential(request: Request):
 
 
 @router.get("/session-account")
-async def get_session_account(request: Request, session_id: str = ""):
+def get_session_account(request: Request, session_id: str = ""):
     """Get account records for a specific session."""
     db = _get_db(request)
     if db is None or not session_id:
@@ -2111,7 +2190,7 @@ async def get_session_account(request: Request, session_id: str = ""):
 
 
 @router.get("/accounts/{account_id}/sessions")
-async def get_account_sessions(request: Request, account_id: int, limit: int = 50):
+def get_account_sessions(request: Request, account_id: int, limit: int = 50):
     """Get recent sessions that used a given account."""
     db = _get_db(request)
     if db is None:
@@ -2120,7 +2199,7 @@ async def get_account_sessions(request: Request, account_id: int, limit: int = 5
 
 
 @router.get("/active-sessions")
-async def get_active_sessions(request: Request, staleness: int = 60):
+def get_active_sessions(request: Request, staleness: int = 60):
     """Compatibility view of recent session observations grouped by account.
 
     The grouping is historical/configuration evidence, not proof of which
@@ -2165,7 +2244,7 @@ async def get_active_sessions(request: Request, staleness: int = 60):
 
 
 @router.get("/session-states")
-async def get_session_states(request: Request, staleness: int = 60):
+def get_session_states(request: Request, staleness: int = 60):
     """Return evidence-qualified configuration state for recent sessions."""
     db = _get_db(request)
     if db is None:
@@ -2243,7 +2322,7 @@ async def get_session_states(request: Request, staleness: int = 60):
 
 
 @router.get("/display-name-audit")
-async def get_display_name_audit(request: Request, limit: int = 50):
+def get_display_name_audit(request: Request, limit: int = 50):
     """Return recent display_name change audit log entries."""
     db = _get_db(request)
     if db is None:

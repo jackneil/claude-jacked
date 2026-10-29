@@ -11,17 +11,65 @@ WAL mode for concurrent reads, single writer lock for atomic writes.
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from pydantic import BaseModel, computed_field
 
 logger = logging.getLogger(__name__)
+
+# A query made on an event-loop thread blocks every route and background
+# loop of the service until it returns (#162). Every query is checked: the
+# first query from each call site logs a WARNING that names the site, so a
+# regression shows up in the field log instead of as a frozen dashboard.
+# The test suite sets JACKED_DB_LOOP_STRICT=1 (tests/conftest.py), which
+# raises instead when the call comes from the jacked package itself.
+_LOOP_QUERY_SITES: set[tuple[str, int]] = set()
+_THIS_FILE = __file__
+
+
+def _query_origin() -> tuple[str, int, str]:
+    """The first stack frame outside this module and contextlib (the
+    _reader/_writer context managers): who asked for the query."""
+    import contextlib
+    import sys
+
+    skip = {_THIS_FILE, contextlib.__file__}
+    frame = sys._getframe(2)
+    while frame is not None and frame.f_code.co_filename in skip:
+        frame = frame.f_back
+    if frame is None:
+        return ("?", 0, "?")
+    return (frame.f_code.co_filename, frame.f_lineno, frame.f_code.co_name)
+
+
+def _check_not_on_event_loop() -> None:
+    from asyncio import events
+
+    if events._get_running_loop() is None:
+        return
+    filename, lineno, func = _query_origin()
+    if os.environ.get("JACKED_DB_LOOP_STRICT") == "1" and (
+        f"{os.sep}jacked{os.sep}" in filename and f"{os.sep}tests{os.sep}" not in filename
+    ):
+        raise RuntimeError(
+            f"jacked.db query on the event loop thread from {filename}:{lineno} "
+            f"({func}); send it to a thread (#162)"
+        )
+    if (filename, lineno) in _LOOP_QUERY_SITES:
+        return
+    _LOOP_QUERY_SITES.add((filename, lineno))
+    logger.warning(
+        "jacked.db query on the event loop thread from %s:%d (%s); it blocks "
+        "every route and background loop until it returns",
+        filename, lineno, func,
+    )
 
 # Sessions without a heartbeat within this window are considered stale
 SESSION_STALENESS_MINUTES = 60
@@ -496,6 +544,7 @@ class Database:
 
     @contextmanager
     def _writer(self) -> Iterator[sqlite3.Connection]:
+        _check_not_on_event_loop()
         with self._write_lock:
             conn = self._get_connection()
             try:
@@ -507,6 +556,7 @@ class Database:
 
     @contextmanager
     def _reader(self) -> Iterator[sqlite3.Connection]:
+        _check_not_on_event_loop()
         yield self._get_connection()
 
     # Name of the one-time move of legacy shared breakers in the private
@@ -982,6 +1032,20 @@ class Database:
         if hasattr(self._local, "connection") and self._local.connection:
             self._local.connection.close()
             self._local.connection = None
+
+    def detach_connection(self) -> sqlite3.Connection | None:
+        """Take the calling thread's connection away without closing it.
+
+        Connections are thread-local, so ``close()`` closes only the calling
+        thread's one. A caller that must close the connection of THIS thread
+        somewhere else (the service shutdown closes the event-loop thread's
+        connection in a worker, because the final WAL checkpoint is disk
+        I/O) detaches it here. Connections use ``check_same_thread=False``.
+        The next query on this thread opens a new connection.
+        """
+        conn = getattr(self._local, "connection", None)
+        self._local.connection = None
+        return conn
 
     # ==================================================================
     # Account CRUD
@@ -1653,33 +1717,38 @@ class Database:
         account_id: int,
         error_message: str,
         increment_failures: bool = True,
+        expected: Optional[Mapping[str, Any]] = None,
     ) -> bool:
         """Record an error for an account.
+
+        ``expected`` makes it a compare-and-set (as in
+        ``update_account_if_unchanged``): the error is recorded only while
+        every listed column still holds its value, so a failure of one token
+        is never written onto a row that a re-auth has moved on from.
 
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@t.com", "tok", 9999999999)
         >>> db.record_account_error(acct["id"], "test error")
         True
+        >>> db.record_account_error(acct["id"], "stale", expected={"access_token": "other"})
+        False
         """
+        expected = dict(expected or {})
+        comparable = self._ACCOUNT_UPDATE_COLS | {"updated_at", "keeper_state"}
+        invalid = set(expected) - comparable
+        if invalid:
+            raise ValueError(f"Invalid columns for account update: {invalid}")
         now = datetime.now(timezone.utc).isoformat()
+        failures = ", consecutive_failures = consecutive_failures + 1" if increment_failures else ""
+        where = "".join(f" AND {k} IS ?" for k in expected)
         with self._writer() as conn:
-            if increment_failures:
-                cursor = conn.execute(
-                    """UPDATE accounts SET
-                        last_error = ?, last_error_at = ?,
-                        consecutive_failures = consecutive_failures + 1,
-                        updated_at = ?
-                       WHERE id = ?""",
-                    (error_message, now, now, account_id),
-                )
-            else:
-                cursor = conn.execute(
-                    """UPDATE accounts SET
-                        last_error = ?, last_error_at = ?,
-                        updated_at = ?
-                       WHERE id = ?""",
-                    (error_message, now, now, account_id),
-                )
+            cursor = conn.execute(
+                f"""UPDATE accounts SET
+                    last_error = ?, last_error_at = ?{failures},
+                    updated_at = ?
+                   WHERE id = ?{where}""",
+                (error_message, now, now, account_id, *expected.values()),
+            )
             return cursor.rowcount > 0
 
     def clear_account_errors(self, account_id: int) -> bool:
@@ -1977,6 +2046,92 @@ class Database:
                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
                 (key, value, now),
             )
+
+    def get_settings(self, keys: Iterable[str]) -> dict[str, Optional[str]]:
+        """Read several settings in ONE statement: one consistent snapshot.
+
+        Settings that belong together (a threshold pair, an enabled flag and
+        its scope) must be read this way. Two ``get_setting`` calls can
+        straddle another thread's commit and see half of an update.
+
+        >>> db = Database(":memory:")
+        >>> db.set_settings({"a": "1", "b": "2"})
+        >>> db.get_settings(["a", "b", "missing"])
+        {'a': '1', 'b': '2', 'missing': None}
+        """
+        keys = list(keys)
+        if not keys:
+            return {}
+        placeholders = ",".join("?" * len(keys))
+        with self._reader() as conn:
+            rows = conn.execute(
+                f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
+                keys,
+            ).fetchall()
+        found = {row["key"]: row["value"] for row in rows}
+        return {key: found.get(key) for key in keys}
+
+    def set_settings(self, values: Mapping[str, Optional[str]]) -> None:
+        """Write several settings in ONE transaction (None deletes the key).
+
+        A reader using ``get_settings`` sees all of the new values or none
+        of them, and two overlapping saves can never leave a mix of both.
+
+        >>> db = Database(":memory:")
+        >>> db.set_settings({"warning": "20", "critical": "30"})
+        >>> db.set_settings({"warning": None})
+        >>> db.get_settings(["warning", "critical"])
+        {'warning': None, 'critical': '30'}
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            for key, value in values.items():
+                if value is None:
+                    conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+                else:
+                    conn.execute(
+                        """INSERT INTO settings (key, value, updated_at)
+                           VALUES (?, ?, ?)
+                           ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                               updated_at = excluded.updated_at""",
+                        (key, value, now),
+                    )
+
+    def update_setting(
+        self, key: str, compute: Callable[[Optional[str]], Optional[str]]
+    ) -> Optional[str]:
+        """Atomic read-modify-write of one setting. Returns the new value.
+
+        ``compute`` gets the current value (None when unset) and returns the
+        value to store, or None to leave the setting as it is. BEGIN IMMEDIATE
+        takes the database write lock BEFORE the read, so no other writer
+        (another thread, another Database object, another process) can change
+        the key between the read and the write.
+
+        >>> db = Database(":memory:")
+        >>> db.update_setting("n", lambda v: str(int(v or 0) + 1))
+        '1'
+        >>> db.update_setting("n", lambda v: str(int(v or 0) + 1))
+        '2'
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._writer() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+            current = row["value"] if row else None
+            new = compute(current)
+            if new is None or new == current:
+                return current
+            conn.execute(
+                """INSERT INTO settings (key, value, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                       updated_at = excluded.updated_at""",
+                (key, new, now),
+            )
+            return new
 
     @staticmethod
     def active_account_setting_key(provider: str = "claude") -> str:
