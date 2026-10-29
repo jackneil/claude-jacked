@@ -15,6 +15,7 @@ them: this module's whole job is spawning a real browser.
 """
 
 import doctest
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -503,3 +504,79 @@ def test_match_window(windows, pid, exe, allow, expected):
 def test_window_focus_doctests():
     results = doctest.testmod(window_focus)
     assert results.failed == 0
+
+
+# ---------------------------------------------------------------------------
+# Linux: browsers outside the service PATH (#180i)
+# ---------------------------------------------------------------------------
+
+linux_layout = pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+
+
+def _shim(directory: Path, name: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+    return path
+
+
+@linux_layout
+def test_linux_finds_a_snap_browser_off_the_service_path(tmp_path, monkeypatch):
+    """The Linux service PATH is /usr/local/bin:/usr/bin:/bin; a Snap-only
+    Chromium lives in /snap/bin and is found there."""
+    from jacked.service import environment
+
+    snap_bin = tmp_path / "snap" / "bin"
+    shim = _shim(snap_bin, "chromium")
+    monkeypatch.setattr(bl.sys, "platform", "linux")
+    monkeypatch.setenv("PATH", environment._SAFE_PATHS["linux"])
+    monkeypatch.setattr(bl, "_LINUX_FIXED_DIRS", (str(snap_bin),))
+    monkeypatch.setattr(bl, "_LINUX_VENDOR_PATHS", {})
+    monkeypatch.setattr(bl, "_FLATPAK_EXPORT_DIRS", ())
+    monkeypatch.setattr(bl.shutil, "which", lambda name: None)
+    assert bl._candidates() == [BrowserSpec("Chromium", str(shim), "chromium")]
+
+
+@linux_layout
+def test_linux_finds_a_flatpak_export_by_app_id(tmp_path, monkeypatch):
+    exports = tmp_path / "flatpak" / "exports" / "bin"
+    shim = _shim(exports, "org.mozilla.firefox")
+    monkeypatch.setattr(bl.sys, "platform", "linux")
+    monkeypatch.setattr(bl, "_LINUX_FIXED_DIRS", ())
+    monkeypatch.setattr(bl, "_LINUX_VENDOR_PATHS", {})
+    monkeypatch.setattr(bl, "_FLATPAK_EXPORT_DIRS", (str(exports),))
+    monkeypatch.setattr(bl.shutil, "which", lambda name: None)
+    assert bl._candidates() == [BrowserSpec("Firefox", str(shim), "firefox")]
+
+
+@linux_layout
+def test_linux_refuses_a_shim_in_a_world_writable_directory(tmp_path, monkeypatch, caplog):
+    """The fixed locations go through the find_bin trust rule: another local
+    user must not be able to plant the browser the service launches."""
+    snap_bin = tmp_path / "snap" / "bin"
+    _shim(snap_bin, "chromium")
+    snap_bin.chmod(0o777)
+    monkeypatch.setattr(bl.sys, "platform", "linux")
+    monkeypatch.setattr(bl, "_LINUX_FIXED_DIRS", (str(snap_bin),))
+    monkeypatch.setattr(bl, "_LINUX_VENDOR_PATHS", {})
+    monkeypatch.setattr(bl, "_FLATPAK_EXPORT_DIRS", ())
+    monkeypatch.setattr(bl.shutil, "which", lambda name: None)
+    try:
+        with caplog.at_level("WARNING", logger="jacked.oauth.browser"):
+            assert bl._candidates() == []
+    finally:
+        snap_bin.chmod(0o755)
+    assert "refused the chromium candidate: a directory is world-writable" in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+def test_linux_path_hit_wins_and_duplicates_collapse(monkeypatch):
+    """google-chrome and google-chrome-stable often name one binary: it is
+    listed once, and a PATH hit is used as-is."""
+    monkeypatch.setattr(bl.sys, "platform", "linux")
+    monkeypatch.setattr(bl.shutil, "which",
+                        lambda name: "/usr/bin/google-chrome" if name.startswith("google-chrome") else None)
+    monkeypatch.setattr(bl, "_resolve_linux_browser",
+                        lambda exe: bl.shutil.which(exe))
+    assert bl._candidates() == [BrowserSpec("Chrome", "/usr/bin/google-chrome", "chromium")]

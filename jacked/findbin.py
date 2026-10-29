@@ -99,6 +99,16 @@ def _fallback_refusal(path: str) -> str | None:
     return reason
 
 
+def trusted_path_refusal(path: str) -> str | None:
+    """Why the absolute file ``path`` must not be executed, or None.
+
+    The off-PATH fallback rule (``_resolve_trusted``) for callers that probe
+    their own fixed locations, such as the Linux browser launcher's Snap and
+    Flatpak paths. The reason never contains a path. Windows: always None.
+    """
+    return _fallback_refusal(path)
+
+
 _MAX_SYMLINK_HOPS = 40  # Linux's ELOOP limit
 _HOST_IS_DARWIN = sys.platform == "darwin"
 

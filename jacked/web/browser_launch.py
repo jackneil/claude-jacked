@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from jacked.findbin import trusted_path_refusal
 from jacked.web.window_focus import bring_to_front_windows as _bring_to_front_windows
 
 logger = logging.getLogger("jacked.oauth.browser")
@@ -186,7 +187,7 @@ def _mac_candidates() -> list[tuple[str, str, str]]:
 
 
 def _linux_candidates() -> list[tuple[str, str, str]]:
-    """(name, executable, family) triples resolved through PATH."""
+    """(name, executable, family) triples: PATH first, then fixed locations."""
     return [
         ("Chrome", "google-chrome", "chromium"),
         ("Chrome", "google-chrome-stable", "chromium"),
@@ -196,6 +197,67 @@ def _linux_candidates() -> list[tuple[str, str, str]]:
         ("Chromium", "chromium-browser", "chromium"),
         ("Firefox", "firefox", "firefox"),
     ]
+
+
+# The service PATH on Linux is /usr/local/bin:/usr/bin:/bin
+# (jacked.service.environment), so a browser installed only as a Snap, a
+# Flatpak or a vendor package under /opt is invisible to shutil.which (#180i).
+# After a PATH miss these fixed locations are probed, each one through the
+# find_bin trust rule.
+_LINUX_FIXED_DIRS = ("/snap/bin",)
+_LINUX_VENDOR_PATHS = {
+    "google-chrome": ("/opt/google/chrome/chrome",),
+    "google-chrome-stable": ("/opt/google/chrome/chrome",),
+    "microsoft-edge": ("/opt/microsoft/msedge/msedge",),
+    "brave-browser": ("/opt/brave.com/brave/brave",),
+    "chromium": ("/usr/lib/chromium/chromium", "/usr/lib/chromium-browser/chromium-browser"),
+    "chromium-browser": ("/usr/lib/chromium-browser/chromium-browser", "/usr/lib/chromium/chromium"),
+    "firefox": ("/usr/lib/firefox/firefox",),
+}
+# Flatpak exports a launcher per app id; it passes its arguments through.
+_FLATPAK_APP_IDS = {
+    "google-chrome": "com.google.Chrome",
+    "google-chrome-stable": "com.google.Chrome",
+    "microsoft-edge": "com.microsoft.Edge",
+    "brave-browser": "com.brave.Browser",
+    "chromium": "org.chromium.Chromium",
+    "chromium-browser": "org.chromium.Chromium",
+    "firefox": "org.mozilla.firefox",
+}
+_FLATPAK_EXPORT_DIRS = ("/var/lib/flatpak/exports/bin", "~/.local/share/flatpak/exports/bin")
+
+
+def _linux_fixed_candidates(exe: str) -> list[str]:
+    """Absolute paths where ``exe`` may live outside the service PATH.
+
+    >>> _linux_fixed_candidates("chromium")[:2]
+    ['/snap/bin/chromium', '/usr/lib/chromium/chromium']
+    >>> _linux_fixed_candidates("firefox")[-2]
+    '/var/lib/flatpak/exports/bin/org.mozilla.firefox'
+    """
+    paths = [os.path.join(directory, exe) for directory in _LINUX_FIXED_DIRS]
+    paths.extend(_LINUX_VENDOR_PATHS.get(exe, ()))
+    app_id = _FLATPAK_APP_IDS.get(exe)
+    if app_id:
+        paths.extend(os.path.join(os.path.expanduser(d), app_id) for d in _FLATPAK_EXPORT_DIRS)
+    return paths
+
+
+def _resolve_linux_browser(exe: str) -> Optional[str]:
+    """``exe`` on PATH, else the first trusted fixed location, else None."""
+    found = shutil.which(exe)
+    if found:
+        return found
+    for path in _linux_fixed_candidates(exe):
+        if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+            continue
+        refusal = trusted_path_refusal(path)
+        if refusal:
+            # Values-free: the name is a fixed browser name, never a path.
+            logger.warning("browser launcher: refused the %s candidate: %s", exe, refusal)
+            continue
+        return path
+    return None
 
 
 def _candidates() -> list[BrowserSpec]:
@@ -224,9 +286,11 @@ def _candidates() -> list[BrowserSpec]:
                     found.append(BrowserSpec(name, str(path), family))
                     break
     else:
+        seen: set[str] = set()
         for name, exe, family in _linux_candidates():
-            resolved = shutil.which(exe)
-            if resolved:
+            resolved = _resolve_linux_browser(exe)
+            if resolved and resolved not in seen:
+                seen.add(resolved)
                 found.append(BrowserSpec(name, resolved, family))
     return found
 
