@@ -1301,21 +1301,24 @@ def _upgrade_phase(phase: str, status: str, **kwargs) -> None:
 
 def _upgrade_install_package(cmd: list[str], label: str) -> str:
     """Run the package upgrade, then re-resolve the `jacked` binary."""
-    import subprocess
     from jacked.findbin import find_bin
+    from jacked.service.updater import run_process_tree
 
     _upgrade_phase("installing_package", "begin")
     console.print(f"[dim]$ {label}[/dim]")
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
+    # Own process group plus relayed output: a closed terminal can neither
+    # hang up nor break the installer halfway through replacing the venv.
+    with _defer_upgrade_signals():
+        code = run_process_tree(cmd, timeout=None, relay=True)
+    if code != 0:
         _upgrade_phase(
             "installing_package", "failed",
-            error=f"upgrade command exit {result.returncode}", recovery=label,
+            error=f"upgrade command exit {code}", recovery=label,
         )
         console.print(
-            f"[red]Package upgrade failed (exit {result.returncode}). Aborting.[/red]"
+            f"[red]Package upgrade failed (exit {code}). Aborting.[/red]"
         )
-        sys.exit(result.returncode)
+        sys.exit(code)
 
     # Re-resolve jacked - the path may have changed after --force.
     jacked = find_bin("jacked")
@@ -1418,27 +1421,47 @@ def _upgrade_migrate_settings(
     upgrade finish. That shipped a build whose settings never migrated and
     still said "Upgrade complete", so it is a transaction failure now.
     """
-    import subprocess
+    from jacked.service.updater import run_migrate_settings
 
     _upgrade_phase("migrating_settings", "begin")
-    console.print(f"\n[dim]$ {plan.jacked} install --force[/dim]")
-    code = subprocess.run([plan.jacked, "install", "--force"]).returncode
+    # Skill packs are refreshed after the restart (_upgrade_refresh_packs):
+    # their download was the slow part of this step and kept the service down.
+    console.print(f"\n[dim]$ {plan.jacked} install --force --no-packs[/dim]")
+    with _defer_upgrade_signals():
+        code, error = run_migrate_settings(plan.jacked)
     if code == 0:
         _upgrade_phase("migrating_settings", "ok")
         return
     _upgrade_phase(
         "migrating_settings", "failed",
-        error=f"jacked install exit {code}",
+        error=error,
         recovery="jacked install --force",
     )
     _upgrade_rollback_and_exit(
-        plan=replace(plan, reason=f"the settings migration failed (exit {code})"),
+        plan=replace(plan, reason=f"the settings migration failed ({error})"),
         new_version=new_version,
         detail=(
             "settings.json may be in a partial state. Backups are at "
             "~/.claude/settings.json.bak-*"
         ),
         no_rollback=no_rollback,
+    )
+
+
+def _upgrade_refresh_packs(jacked: str) -> None:
+    """Refresh skill packs once the new build runs; a failure only warns."""
+    from jacked.service.updater import run_refresh_packs
+
+    _upgrade_phase("refreshing_packs", "begin")
+    console.print(f"\n[dim]$ {jacked} packs update[/dim]")
+    reason = run_refresh_packs(jacked)
+    if reason is None:
+        _upgrade_phase("refreshing_packs", "ok")
+        return
+    _upgrade_phase("refreshing_packs", "warning")
+    console.print(
+        f"[yellow]Skill packs were not refreshed ({reason}).[/yellow] "
+        f"Run `{jacked} packs update` later."
     )
 
 
@@ -1488,12 +1511,211 @@ def _run_upgrade_inline(
         target_version=target_version,
     )
     lock = _acquire_upgrade_lock(previous_version, extras, target_version)
+    previous_handlers = _install_upgrade_signal_handlers()
     try:
         _run_upgrade_inline_locked(request)
+    except SystemExit:
+        # Every planned exit (a rollback, a refusal, the index-lag report)
+        # already recorded its own status and recovery text.
+        raise
+    except BaseException as exc:  # Ctrl-C, a signal, a crash
+        # A second Ctrl-C or signal must not abort the repair halfway.
+        _ignore_upgrade_signals(previous_handlers)
+        code = _upgrade_interrupted(exc, request)
+        raise SystemExit(code) from exc
     finally:
         # Held for the whole transaction, released on success, on a rollback
         # (which exits through SystemExit) and on any unexpected raise.
         _release_upgrade_lock(lock)
+        _restore_signal_handlers(previous_handlers)
+
+
+class _UpgradeInterrupted(BaseException):
+    """Raised by the SIGHUP/SIGTERM handler installed for the transaction."""
+
+
+# What a person runs after an interrupted upgrade: re-run the settings
+# migration on whatever is installed now, then restart the service on it.
+_INTERRUPTED_RECOVERY = "jacked install --force && jacked service restart"
+
+# How long the post-interrupt `jacked service restart` may take (a supervisor
+# start plus its readiness wait).
+_INTERRUPT_RESTART_SECONDS = 120
+
+
+# While a step that writes the install runs (the package install, the
+# settings migration), a SIGHUP/SIGTERM is held until the child exits.
+# subprocess.run kills its child when any exception other than Ctrl-C
+# interrupts it, so raising at once would cut `uv tool install` off halfway.
+_UPGRADE_SIGNALS = {"defer": 0, "pending": None}
+
+
+def _install_upgrade_signal_handlers() -> dict:
+    """Turn SIGHUP (a closed terminal) and SIGTERM into _UpgradeInterrupted for
+    the length of the transaction, so the interrupt guard runs. Returns the
+    previous handlers; a platform or thread without them returns {}."""
+    import signal
+
+    def _raise(signum, _frame):
+        name = signal.Signals(signum).name
+        if _UPGRADE_SIGNALS["defer"]:
+            _UPGRADE_SIGNALS["pending"] = _UPGRADE_SIGNALS["pending"] or name
+            return
+        raise _UpgradeInterrupted(name)
+
+    previous = {}
+    for name in ("SIGHUP", "SIGTERM"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            previous[sig] = signal.signal(sig, _raise)
+        except (ValueError, OSError):  # not the main thread, or not allowed
+            continue
+    return previous
+
+
+@contextlib.contextmanager
+def _defer_upgrade_signals():
+    """Hold a SIGHUP/SIGTERM until the child process in this block exits, then
+    raise it. The child is never killed halfway through a write."""
+    _UPGRADE_SIGNALS["defer"] += 1
+    try:
+        yield
+    finally:
+        _UPGRADE_SIGNALS["defer"] -= 1
+    pending = _UPGRADE_SIGNALS["pending"]
+    if pending and not _UPGRADE_SIGNALS["defer"]:
+        _UPGRADE_SIGNALS["pending"] = None
+        raise _UpgradeInterrupted(pending)
+
+
+def _ignore_upgrade_signals(previous: dict) -> None:
+    """Ignore Ctrl-C, SIGHUP and SIGTERM while an interrupted upgrade repairs
+    itself. Records the original Ctrl-C handler in ``previous`` so
+    _restore_signal_handlers puts every handler back."""
+    import signal
+
+    for name in ("SIGINT", "SIGHUP", "SIGTERM"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            original = signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            continue
+        previous.setdefault(sig, original)
+
+
+def _restore_signal_handlers(previous: dict) -> None:
+    import signal
+
+    _UPGRADE_SIGNALS["pending"] = None
+
+    for sig, handler in previous.items():
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            continue
+
+
+def _upgrade_interrupted(exc: BaseException, request: "_UpgradeRequest") -> int:
+    """The final guard for an upgrade that stopped outside its planned exits.
+
+    Before this, a Ctrl-C, a closed terminal (SIGHUP) or a crash between two
+    phases left the status record "in_progress" forever, wrote no recovery
+    file, and (when it hit the restart) left no service running (#178i). Now:
+    the status closes as failed with the phase it stopped in, the recovery file
+    names the repair, and a service that is down is started again (unless the
+    caller asked to leave the service alone). Returns the exit code.
+    """
+    from jacked.service import update_status as _us
+
+    if isinstance(exc, KeyboardInterrupt):
+        kind, code = "Ctrl-C", 130
+    elif isinstance(exc, _UpgradeInterrupted):
+        kind, code = str(exc.args[0]) if exc.args else "a signal", 143
+    else:
+        kind, code = type(exc).__name__, 1
+    status = None
+    try:
+        status = _us.read_status(_us.UPDATE_STATUS_FILE)
+    except Exception:
+        logger.debug("Could not read the update status", exc_info=True)
+    phase = (status or {}).get("current_phase") or "an early step"
+    reason = f"the upgrade was interrupted ({kind}) during {phase}"
+    if not status or status.get("overall") in (None, "in_progress"):
+        try:
+            _us.mark_failed(_us.UPDATE_STATUS_FILE, error=reason, recovery=_INTERRUPTED_RECOVERY)
+        except Exception:
+            logger.debug("Could not mark the update status failed", exc_info=True)
+    logger.error("Upgrade interrupted: %s", reason, exc_info=not isinstance(
+        exc, (KeyboardInterrupt, _UpgradeInterrupted)))
+    # The terminal may be gone (SIGHUP): every line below is best effort and
+    # the service restart comes before any of them.
+    restarted = None if request.skip_service else _restart_after_interrupt()
+    _quiet(_write_upgrade_recovery, reason, ["jacked install --force", "jacked service restart"])
+    _quiet(console.print, f"\n[red]The upgrade stopped: {reason}.[/red]")
+    if restarted is not None:
+        ok, why = restarted
+        _quiet(
+            console.print,
+            "[green]The service was down and is started again.[/green]"
+            if ok else f"[yellow]The service is down and did not start ({why}).[/yellow]",
+        )
+    _quiet(console.print, f"Recovery: [cyan]{_INTERRUPTED_RECOVERY}[/cyan]")
+    return code
+
+
+def _quiet(fn, *args) -> None:
+    """Call ``fn``; an output error (a closed terminal) is logged, not raised."""
+    try:
+        fn(*args)
+    except (OSError, ValueError):
+        logger.debug("Output after an interrupted upgrade failed", exc_info=True)
+
+
+def _restart_after_interrupt() -> "tuple[bool, str] | None":
+    """Start the service again when an interrupted upgrade left it down.
+
+    None when the service is still up. The restart runs through the jacked
+    CLI that is installed NOW, in a fresh interpreter: this process may still
+    hold the old build, whose service contract refuses the artifact the new
+    build already wrote. Without an installed CLI, the in-process restart is
+    the fallback.
+    """
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+
+    try:
+        from jacked.service.process import is_port_available
+
+        if not is_port_available(DEFAULT_HOST, DEFAULT_PORT):
+            return None
+    except Exception:
+        logger.debug("Could not check whether the service is down", exc_info=True)
+        return None
+    try:
+        from jacked.findbin import find_bin
+        from jacked.service.updater import run_process_tree
+
+        jacked = find_bin("jacked")
+        if jacked:
+            from jacked.service.updater import UPDATE_LOG
+
+            # Output goes to the update log, never to a terminal that may
+            # already be closed (an EIO there would stop the restart).
+            with open(UPDATE_LOG, "a", encoding="utf-8") as log_fh:
+                code = run_process_tree(
+                    [jacked, "service", "restart"],
+                    timeout=_INTERRUPT_RESTART_SECONDS,
+                    log_fh=log_fh,
+                )
+            return code == 0, f"jacked service restart exit {code}"
+        from jacked.service.platform import native_restart
+
+        return native_restart()
+    except Exception as restart_exc:  # noqa: BLE001
+        return False, type(restart_exc).__name__
 
 
 @dataclass(frozen=True)
@@ -1551,6 +1773,7 @@ def _run_upgrade_inline_locked(request: "_UpgradeRequest") -> None:
         _upgrade_restart_or_rollback(
             plan, new_version, request.no_rollback, request.pid_file
         )
+    _upgrade_refresh_packs(jacked)
     # A clean upgrade retires the recovery file an earlier failure left behind.
     _clear_upgrade_recovery_file()
     if lagging:
@@ -1840,6 +2063,7 @@ def _spawn_windows_upgrade_helper(
         package_retry_block,
         release_install_line,
         wait_for_parent_block,
+        windows_refresh_packs_block,
     )
 
     my_pid = os.getpid()
@@ -2042,11 +2266,12 @@ def _spawn_windows_upgrade_helper(
         'jacked service preflight --timeout 120 2>&1\r\n'
         'if errorlevel 1 goto preflight_failed\r\n'
         'if not "%ERRORLEVEL%"=="0" goto preflight_failed\r\n'
-        'echo [%date% %time%] running jacked install --force\r\n'
-        'jacked install --force 2>&1\r\n'
+        'echo [%date% %time%] running jacked install --force --no-packs\r\n'
+        'jacked install --force --no-packs 2>&1\r\n'
         'if errorlevel 1 goto migrate_failed\r\n'
         'if not "%ERRORLEVEL%"=="0" goto migrate_failed\r\n'
-        + restart_line +
+        + restart_line
+        + windows_refresh_packs_block() +
         # A clean upgrade retires the breadcrumb an earlier failure left
         # behind, so nothing warns about a failure already repaired.
         'if exist ' + _WIN_FAILED_FILE + ' del ' + _WIN_FAILED_FILE + '\r\n'
@@ -2216,7 +2441,7 @@ def _update_status_init_shim(from_version, to_version, method, log_path):
 @click.option("--error", default=None)
 @click.option("--recovery", default=None)
 def _update_status_shim(phase, status, error, recovery):
-    """Internal: write one status transition. `status` is in_progress|ok|failed."""
+    """Internal: write one status transition. `status` is in_progress|ok|warning|failed."""
     from jacked.service import update_status as us_mod
     path = us_mod.UPDATE_STATUS_FILE
     try:
@@ -2229,6 +2454,24 @@ def _update_status_shim(phase, status, error, recovery):
         # on phase-name drift between the batch and update_phases.PHASES.
         click.echo(f"[update-status] {exc}", err=True)
         sys.exit(1)
+
+
+@main.command(name="_tray_spawn_updater", hidden=True)
+@click.option("--parent-pid", type=int, required=True)
+@click.option("--port", type=int, required=True)
+@click.option("--target", default=None)
+def _tray_spawn_updater_shim(parent_pid, port, target):
+    """Internal: spawn the tray updater from a fresh interpreter.
+
+    The running tray calls this when importing the updater fails because a
+    newer build is already on disk (code skew, #178i). This process loads the
+    new code end to end, spawns the detached updater, and exits.
+    """
+    from jacked.service.updater import spawn_updater_from_tray
+
+    spawn_updater_from_tray(
+        parent_pid=parent_pid, extras="tray", target_version=target, port=port
+    )
 
 
 @main.command(name="_update_status_succeed", hidden=True)
@@ -4867,8 +5110,13 @@ def _run_packs_phase(
     include_codex: bool,
     as_json: bool,
     no_packs: bool = False,
+    only: list[str] | None = None,
 ) -> dict:
     """Install/refresh the effectively-enabled skill packs as part of `jacked install`.
+
+    `jacked packs update` runs this same phase (``only`` narrows it to one
+    pack), so a refresh after an upgrade also installs a pack the new version
+    turns on and still reports a shadowed skill (#178i).
 
     Effectively-enabled = every registry pack marked ``default: true`` that the
     user has not explicitly disabled, plus any pack explicitly enabled (via a
@@ -4909,6 +5157,8 @@ def _run_packs_phase(
             )
 
     targets = _packs.effective_enabled_pack_names(home, registry)
+    if only is not None:
+        targets = [name for name in targets if name in only]
     results: dict = {}
     if not targets:
         return results
@@ -5396,6 +5646,7 @@ def doctor():
     from jacked import __version__
     from jacked.install_method import detect_install_method
     from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+    from jacked.service.platform import launchd_job_never_ran
     from jacked.service.process import (
         is_port_available, is_process_alive, read_pid,
     )
@@ -5442,7 +5693,11 @@ def doctor():
             f"[bold]Service:[/bold] [yellow]NOT RUNNING[/yellow] "
             f"(port {DEFAULT_PORT} free)"
         )
-        console.print("  Recovery: [cyan]jacked service start[/cyan]")
+        if launchd_job_never_ran():
+            console.print(
+                "  [yellow]The launchd job is loaded but never ran.[/yellow]"
+            )
+        console.print(f"  Recovery: [cyan]{_service_start_command()}[/cyan]")
         if pid_info and not pid_alive:
             console.print(
                 f"  [dim]Stale PID file at {PID_FILE} "
@@ -5489,7 +5744,7 @@ def doctor():
                 console.print(f"  Find the owner: [cyan]{_port_owner_hint()}[/cyan]")
                 console.print(
                     "  Recovery: stop that process, then "
-                    "[cyan]jacked service start[/cyan]"
+                    f"[cyan]{_service_start_command()}[/cyan]"
                 )
             else:
                 console.print(
@@ -6013,22 +6268,25 @@ def packs_disable(name: str):
 @packs_group.command(name="update")
 @click.argument("name", required=False)
 def packs_update(name: str | None):
-    """Refresh the skills of enabled packs from their upstream repos.
+    """Install or refresh the skills of enabled packs from their upstream repos.
 
     Scoped to packs that are effectively enabled (default-on packs you didn't
     disable, plus any you explicitly enabled) -- all of them, or a single NAME.
     Disabled packs are left alone; enable a pack first to install its skills.
+    Runs the same step as `jacked install`: a pack with a missing or shadowed
+    skill is installed (the collision guard names the shadow), a pack that is
+    fully present is refreshed. Exits 1 when a pack fails or npx is missing.
     """
     from jacked import packs as _packs
 
     home = _jacked_home()
-    registry = _packs.load_registry(_get_data_root())
+    data_root = _get_data_root()
+    registry = _packs.load_registry(data_root)
     effective = _packs.effective_enabled_pack_names(home, registry)
-    include_codex = _detect_codex_for_packs()
 
+    only = None
     if name:
-        pack = registry.get(name)
-        if pack is None:
+        if registry.get(name) is None:
             _packs_unknown_name(name, registry)
         if name not in effective:
             console.print(
@@ -6036,27 +6294,20 @@ def packs_update(name: str | None):
                 f"Run `jacked packs enable {name}` first.[/yellow]"
             )
             raise SystemExit(1)
-        targets = [pack]
-    else:
-        # Explicit-enabled-but-deregistered packs can't be updated (unknown to
-        # this build); warn rather than silently skip.
-        for unknown_name in [
-            n for n in _packs.enabled_pack_names(home) if n not in registry
-        ]:
-            console.print(
-                f"[yellow][!][/yellow] Pack '{unknown_name}' is enabled but "
-                "unknown to this jacked version; its skills were left untouched."
-            )
-        targets = [registry[n] for n in effective]
-        if not targets:
-            console.print("No skill packs are enabled. Nothing to update.")
-            return
+        only = [name]
+    elif not effective:
+        console.print("No skill packs are enabled. Nothing to update.")
+        return
 
-    res = _packs.update_packs(targets, home, include_codex=include_codex)
-    if res.ok:
-        console.print(f"[green][OK][/green] {_rich_escape(res.message)}")
-    else:
-        console.print(f"[red][FAIL][/red] {_rich_escape(res.message)}")
+    if _packs.find_npx() is None:
+        console.print(
+            "[red][FAIL][/red] Skill packs need Node.js/npx (install Node 18+)."
+        )
+        raise SystemExit(1)
+    results = _run_packs_phase(
+        home, data_root, [], _detect_codex_for_packs(), as_json=False, only=only
+    )
+    if any(not result["ok"] for result in results.values()):
         raise SystemExit(1)
 
 
@@ -7508,6 +7759,25 @@ def _rearm_native_owner(port: int) -> bool:
     return _ensure_autostart_and_running(port, label="Service")
 
 
+def _service_start_command() -> str:
+    """The command that brings the service up the right way on this machine.
+
+    With autostart enabled, `jacked service start` runs the service in the
+    foreground (it is also the supervisor's entry point) and never returns,
+    which reads as "stuck" (#178i); `jacked service restart` hands the start to
+    the supervisor instead. Without autostart, `service start` is the command.
+    """
+    try:
+        from jacked.service.autostart import AutostartState
+        from jacked.service.platform import inspect_autostart
+
+        if inspect_autostart().state is AutostartState.OWNED_ENABLED:
+            return "jacked service restart"
+    except Exception:
+        logger.debug("Autostart state unreadable", exc_info=True)
+    return "jacked service start"
+
+
 @service.command(name="status")
 def service_status():
     """Show evidence-qualified service state and discovered endpoint."""
@@ -7526,6 +7796,16 @@ def service_status():
     else:
         detail = f" ({autostart.reason})" if autostart.reason else ""
         autostart_label = f"[yellow]{autostart.state.value}{detail}[/yellow]"
+    if autostart.state is AutostartState.OWNED_ENABLED:
+        from jacked.service.platform import launchd_job_never_ran
+
+        if launchd_job_never_ran():
+            # Loaded with RunAtLoad but never spawned (#178i): "enabled" alone
+            # read as fine while nothing was going to start the service.
+            autostart_label += (
+                " [yellow](the launchd job is loaded but never ran; "
+                "run `jacked service restart`)[/yellow]"
+            )
     if endpoint.source == "manifest":
         from jacked.service.ipc import ControlAction, send_native_control
 

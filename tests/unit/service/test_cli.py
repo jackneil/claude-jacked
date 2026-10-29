@@ -2174,3 +2174,23 @@ class TestStartupExposureWarning:
 
         assert result.exit_code == 0, result.output
         assert seen == [plan]
+
+
+def test_status_flags_a_launchd_job_that_never_ran(tmp_path, monkeypatch):
+    """#178i: "Autostart: enabled" while launchd had the job loaded with
+    runs = 0 read as fine; nothing was going to start the service."""
+    from types import SimpleNamespace
+
+    from jacked.cli import main
+    from jacked.service.autostart import AutostartState
+
+    monkeypatch.setattr(
+        "jacked.service.platform.inspect_autostart",
+        lambda: SimpleNamespace(state=AutostartState.OWNED_ENABLED, reason=""),
+    )
+    monkeypatch.setattr("jacked.service.platform.launchd_job_never_ran", lambda: True)
+    with patch("jacked.service.PID_FILE", tmp_path / "nope.pid"):
+        result = CliRunner().invoke(main, ["service", "status"])
+    text = " ".join(result.output.split())  # Rich wraps at the console width
+    assert "loaded but never ran" in text
+    assert "jacked service restart" in text

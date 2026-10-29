@@ -315,6 +315,28 @@ def quiet_lifespan(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _process_tree_through_subprocess_run(request):
+    """jacked.service.updater.run_process_tree spawns with Popen. Tests
+    script the upgrade's child processes through a mocked subprocess.run (and
+    often mock Popen too, whose pid coerces to 1), so route it there: every
+    child stays visible to the scripted run, and the call-order assertions
+    keep meaning what they say (#178i). Tests of the real process-tree logic
+    import run_process_tree / run_tree directly, or opt out with
+    ``@pytest.mark.real_process_tree``."""
+    if request.node.get_closest_marker("real_process_tree"):
+        yield
+        return
+    import subprocess as _subprocess
+
+    def _via_run(argv, *, timeout, log_fh=None, relay=False):
+        return _subprocess.run(argv, stdout=log_fh, stderr=log_fh, check=False,
+                               timeout=timeout).returncode
+
+    with patch("jacked.service.updater.run_process_tree", side_effect=_via_run):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _no_real_service_processes(request, monkeypatch):
     """Tripwire: a test must never start the real jacked service or drive a
     real supervisor.
@@ -350,6 +372,12 @@ def _no_real_service_processes(request, monkeypatch):
         head = str(args[0]) if isinstance(args, (list, tuple)) and args else text.split(" ", 1)[0]
         first = head.replace("\\", "/").rsplit("/", 1)[-1].lower()
         if first in supervisors:
+            raise RuntimeError("test tried to drive a real supervisor: " + text)
+        # The Task Scheduler is also read through its COM API from PowerShell
+        # (jacked.service.supervisors._task_xml.task_query_command, #165i).
+        if first in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"} and (
+            "Schedule.Service" in text
+        ):
             raise RuntimeError("test tried to drive a real supervisor: " + text)
         padded = f" {text} "
         after_service = " " + padded.split(" service ", 1)[1] if " service " in padded else ""

@@ -1834,3 +1834,69 @@ class TestTrayProxyHeaderTrustIsPinned:
         kwargs = mock_uvicorn.Config.call_args.kwargs
         assert kwargs["proxy_headers"] is True
         assert kwargs["forwarded_allow_ips"] == "127.0.0.1"
+
+
+class TestUpdateClickSurvivesCodeSkew:
+    """#178i: a tray still running the old build imported the NEW updater
+    module (already on disk), which needs a name the old loaded modules lack;
+    "Failed to spawn updater" followed. The spawn now runs in a fresh
+    interpreter when the in-process import fails."""
+
+    def _runner(self):
+        _skip_if_no_tray()
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+        return runner
+
+    def test_an_import_failure_spawns_from_a_fresh_interpreter_then_stops(self):
+        import sys as _sys
+
+        runner = self._runner()
+        ok = MagicMock(returncode=0)
+        with patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")), \
+             patch("jacked.service.updater.spawn_updater_from_tray",
+                   side_effect=ImportError("cannot import name 'is_port_listening'")), \
+             patch("subprocess.run", return_value=ok) as run, \
+             patch.object(runner, "_on_stop") as stop:
+            runner._on_update_click()
+        argv = run.call_args.args[0]
+        assert argv[:5] == [_sys.executable, "-I", "-m", "jacked", "_tray_spawn_updater"]
+        assert "--target" in argv and "0.42.0" in argv
+        stop.assert_called_once()
+
+    def test_a_failing_fresh_spawn_keeps_the_tray_running(self):
+        runner = self._runner()
+        with patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")), \
+             patch("jacked.service.updater.spawn_updater_from_tray", side_effect=ImportError("skew")), \
+             patch("subprocess.run", return_value=MagicMock(returncode=1)), \
+             patch.object(runner, "_on_stop") as stop:
+            runner._on_update_click()
+        stop.assert_not_called()
+
+
+def test_a_failing_fresh_spawn_names_its_cause():
+    from jacked.service.tray import _spawn_updater_in_fresh_interpreter
+
+    failed = MagicMock(returncode=1, stderr=(
+        "Traceback (most recent call last):\n  File \"x\", line 1\n"
+        "ModuleNotFoundError: No module named 'pystray'\n"))
+    with patch("subprocess.run", return_value=failed), pytest.raises(RuntimeError) as err:
+        _spawn_updater_in_fresh_interpreter(42, 8321, None)
+    assert str(err.value) == (
+        "fresh-interpreter updater spawn exited 1: "
+        "ModuleNotFoundError: No module named 'pystray'"
+    )
+
+def test_the_hidden_spawn_command_calls_the_updater():
+    from click.testing import CliRunner
+
+    from jacked.cli import main
+
+    with patch("jacked.service.updater.spawn_updater_from_tray") as spawn:
+        result = CliRunner().invoke(main, ["_tray_spawn_updater", "--parent-pid", "42",
+                                           "--port", "8321", "--target", "0.42.0"])
+    assert result.exit_code == 0, result.output
+    spawn.assert_called_once_with(parent_pid=42, extras="tray", target_version="0.42.0", port=8321)

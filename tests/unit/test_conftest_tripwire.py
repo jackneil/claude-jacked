@@ -77,3 +77,24 @@ def test_run_refuses_supervisor_paths_containing_spaces():
     with pytest.raises(RuntimeError, match="real supervisor"):
         subprocess.run([r"C:\\Program Files\\Windows\\System32\\schtasks.exe", "/Query"])
 
+
+
+def test_run_refuses_the_task_scheduler_com_query():
+    """The Task Scheduler is read through PowerShell's COM API (#165i); a
+    test must not reach the real one that way either."""
+    from jacked.service.supervisors._task_xml import task_query_command
+
+    with pytest.raises(RuntimeError, match="real supervisor"):
+        subprocess.run(task_query_command("ai.hank.jacked"))
+
+
+def test_run_allows_unrelated_powershell():
+    """Only the COM task query is refused; other PowerShell stays usable.
+    Off Windows the binary is missing, which is an OSError, not the guard."""
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", "exit 0"],
+            capture_output=True, timeout=60, check=False,
+        )
+    except OSError:
+        pass
