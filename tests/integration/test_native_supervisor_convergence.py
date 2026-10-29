@@ -135,7 +135,8 @@ class StatefulManager:
         if action == "/Query":
             return SimpleNamespace(
                 returncode=0 if self.registered is not None else 1,
-                stdout=self.registered.decode() if self.registered else "",
+                # schtasks /Query output is captured as bytes (#165i).
+                stdout=self.registered or b"",
             )
         if action == "/Create":
             xml_path = command[command.index("/XML") + 1]

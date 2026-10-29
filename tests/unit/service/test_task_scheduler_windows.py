@@ -12,7 +12,11 @@ import uuid
 
 import pytest
 
-pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Task Scheduler is Windows only")
+pytestmark = [
+    pytest.mark.skipif(sys.platform != "win32", reason="Task Scheduler is Windows only"),
+    # Runs the real schtasks.exe on purpose, against a throwaway task name.
+    pytest.mark.real_process,
+]
 
 
 def _schtasks(*args):
@@ -34,7 +38,9 @@ def test_rendered_task_registers_and_reads_back_as_owned(tmp_path):
     from jacked.service.supervisors.task_scheduler import task_action
 
     name = f"jacked-test-{uuid.uuid4().hex[:12]}"
-    launcher = tmp_path / "launcher.ps1"
+    # A non-ASCII path (a user name such as "Jos\u00e9") must survive the
+    # read-back exactly: the Arguments comparison decides ownership.
+    launcher = tmp_path / "launcher-Jos\u00e9.ps1"
     launcher.write_text("exit 0\n", encoding="utf-8")
     spec = ServiceSpec(
         service_id=name,
@@ -64,6 +70,7 @@ def test_rendered_task_registers_and_reads_back_as_owned(tmp_path):
         marker = extract_marker(queried.xml, SupervisorKind.TASK_SCHEDULER)
         assert marker == rendered.marker
         assert task_action(queried.xml) == task_action(rendered.content)
+        assert "Jos\u00e9" in task_action(queried.xml)[1]
 
         # The installer keeps the read-back bytes as its rollback backup.
         backup = tmp_path / "backup.xml"
