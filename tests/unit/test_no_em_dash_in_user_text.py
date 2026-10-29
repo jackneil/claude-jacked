@@ -36,6 +36,12 @@ _HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 _CSS_COMMENT = re.compile(r"/\*.*?\*/", re.S)
 _SCRIPT = re.compile(r"(<script\b[^>]*>)(.*?)(</script>)", re.S | re.I)
 _STYLE = re.compile(r"(<style\b[^>]*>)(.*?)(</style>)", re.S | re.I)
+# A line that calls the browser console: its text is a developer log.
+_CONSOLE_CALL = re.compile(r"\bconsole\.(log|debug|info|warn|error|trace)\s*\(")
+# After one of these characters (or at the start of the file), or after one
+# of these keywords, a "/" opens a regex literal; after a value it divides.
+_REGEX_PRECEDERS = set("(,=:[!&|?{};+-*%<>~^") | {""}
+_REGEX_KEYWORDS = ("return", "typeof", "case", "do", "else", "in", "of", "void", "yield")
 
 
 def _literal_dashes(src: str) -> str:
@@ -56,7 +62,8 @@ def js_dash_lines(src: str) -> list[int]:
     """Line numbers of em-dashes outside JS comments.
 
     A small lexer: it tracks strings, template literals (with ``${}``
-    nesting) and comments, so ``https://`` inside a string is not a comment.
+    nesting), regex literals and comments, so ``https://`` inside a string is
+    not a comment and ``/[/*]/`` is not the start of one.
 
     >>> js_dash_lines("const a = 'x \u2014 y'; // ok \u2014 here")
     [1]
@@ -64,16 +71,29 @@ def js_dash_lines(src: str) -> list[int]:
     [2]
     >>> js_dash_lines(r"const e = '\\u2014';")
     [1]
+    >>> js_dash_lines("const r = /[/*]/g;\\nshow('a \u2014 b');")
+    [2]
+    >>> js_dash_lines("const n = a / b; // \u2014\\nshow('a \u2014 b');")
+    [2]
+    >>> js_dash_lines("const s = 'one \\\\\\ntwo';\\nshow('\u2014');")
+    [3]
     """
     src = _literal_dashes(src)
     out: list[int] = []
     templates: list[int] = []  # brace depth inside each open ${ }
     state, quote, line, i, n = "code", "", 1, 0, len(src)
+    prev, word, in_class = "", "", False  # last code char, last identifier, regex [..]
     while i < n:
         c = src[i]
         nxt = src[i + 1] if i + 1 < n else ""
         if c == "\n":
             line += 1
+        if state in ("str", "tpl", "regex") and c == "\\":
+            # An escape: skip the next character, and count it if it is a
+            # newline (a line continuation inside a string).
+            line += nxt == "\n"
+            i += 2
+            continue
         if state == "code":
             if c == "/" and nxt == "/":
                 state, i = "line", i + 2
@@ -81,7 +101,9 @@ def js_dash_lines(src: str) -> list[int]:
             if c == "/" and nxt == "*":
                 state, i = "block", i + 2
                 continue
-            if c in "'\"":
+            if c == "/" and (word in _REGEX_KEYWORDS or (not word and prev in _REGEX_PRECEDERS)):
+                state, in_class = "regex", False
+            elif c in "'\"":
                 state, quote = "str", c
             elif c == "`":
                 state = "tpl"
@@ -95,6 +117,9 @@ def js_dash_lines(src: str) -> list[int]:
                     templates[-1] -= 1
             elif c == EM_DASH:
                 out.append(line)
+            if not c.isspace():
+                word = word + c if (c.isalnum() or c in "_$") else ""
+                prev = c
         elif state == "line":
             if c == "\n":
                 state = "code"
@@ -102,23 +127,24 @@ def js_dash_lines(src: str) -> list[int]:
             if c == "*" and nxt == "/":
                 state, i = "code", i + 2
                 continue
+        elif state == "regex":
+            if c == "[":
+                in_class = True
+            elif c == "]":
+                in_class = False
+            elif (c == "/" and not in_class) or c == "\n":
+                state, prev, word = "code", "x", "x"  # a regex ends like a value
         elif state == "str":
-            if c == "\\":
-                i += 2
-                continue
             if c == quote or c == "\n":
-                state = "code"
+                state, prev, word = "code", "x", "x"
             elif c == EM_DASH:
                 out.append(line)
         else:  # template literal
-            if c == "\\":
-                i += 2
-                continue
             if c == "`":
-                state = "code"
+                state, prev, word = "code", "x", "x"
             elif c == "$" and nxt == "{":
                 templates.append(0)
-                state, i = "code", i + 2
+                state, prev, word, i = "code", "{", "", i + 2
                 continue
             elif c == EM_DASH:
                 out.append(line)
@@ -158,32 +184,44 @@ def web_offenders(root: Path = WEB) -> list[str]:
             continue
         src = path.read_text(encoding="utf-8")
         lines = src.splitlines()
-        if path.suffix == ".js":
-            # An HTML comment inside a JS template string never renders.
-            hits = js_dash_lines(_HTML_COMMENT.sub(lambda m: _blank(m.group(0)), src))
-        else:
-            hits = html_dash_lines(src)
+        # No HTML-comment stripping inside JS: a string set through textContent
+        # shows "<!-- ... -->" as visible text.
+        hits = js_dash_lines(src) if path.suffix == ".js" else html_dash_lines(src)
         for no in sorted(set(hits)):
-            if "console." in lines[no - 1]:
+            if _CONSOLE_CALL.search(lines[no - 1]):
                 continue
             found.append(f"{path.relative_to(root).as_posix()}:{no}: {lines[no - 1].strip()[:100]}")
     return found
 
 
+def _is_logger_method(node: ast.AST) -> bool:
+    """``logger.warning`` / ``self._log.info``: a log method on a logger-named owner."""
+    if not (isinstance(node, ast.Attribute) and node.attr in _LOG_METHODS):
+        return False
+    owner = node.value
+    name = getattr(owner, "id", None) or getattr(owner, "attr", None) or ""
+    return "log" in name.lower()
+
+
 def _exempt_ids(tree: ast.AST) -> set[int]:
     """ids of bare string statements (docstrings, attribute docstrings) and of
-    every node inside a logger call."""
+    every node inside a logger call, including a call through a local alias
+    such as ``log = logger.warning``."""
+    aliases = {
+        target.id
+        for node in ast.walk(tree) if isinstance(node, ast.Assign) and _is_logger_method(node.value)
+        for target in node.targets if isinstance(target, ast.Name)
+    }
     exempt: set[int] = set()
     for node in ast.walk(tree):
         if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
                 and isinstance(node.value.value, str)):
             exempt.add(id(node.value))
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                and node.func.attr in _LOG_METHODS:
-            owner = node.func.value
-            name = getattr(owner, "id", None) or getattr(owner, "attr", None) or ""
-            if "log" in name.lower():
-                exempt.update(id(sub) for sub in ast.walk(node))
+        if isinstance(node, ast.Call) and (
+            _is_logger_method(node.func)
+            or (isinstance(node.func, ast.Name) and node.func.id in aliases)
+        ):
+            exempt.update(id(sub) for sub in ast.walk(node))
     return exempt
 
 
@@ -251,3 +289,39 @@ def test_the_scans_catch_a_planted_dash(tmp_path):
     )
     hits = python_offenders(py)
     assert [h.split(":")[1] for h in hits] == ["7", "8"]
+
+
+def test_the_scans_see_through_lexer_traps(tmp_path):
+    """The traps the /dcr review found (#183i): a regex literal that looks
+    like a comment opener, a string continued with backslash-newline, an HTML
+    comment shown through textContent, copy that mentions "console", and an
+    exempt message logged through a local logger alias."""
+    web = tmp_path / "web"
+    web.mkdir()
+    (web / "traps.js").write_text(
+        "const r = /[/*]/;\n"                          # 1 regex, not a comment
+        "showToast('Saved — done');\n"            # 2 hit
+        "const s = 'one \\\n"                          # 3 continued string
+        "two';\n"                                       # 4
+        "console.log('debug — fine');\n"          # 5 exempt
+        "showToast('Again — hit');\n"             # 6 hit
+        "label.textContent = '<!-- Saved — ok -->';\n"   # 7 hit (shown as text)
+        "showToast('Open the console. Saved — ok');\n",  # 8 hit
+        encoding="utf-8",
+    )
+    hits = web_offenders(web)
+    assert [h.split(":")[1] for h in hits] == ["2", "6", "7", "8"]
+
+    py = tmp_path / "pkg"
+    py.mkdir()
+    (py / "alias.py").write_text(
+        "import logging\n"
+        "logger = logging.getLogger(__name__)\n"
+        "def f(bad):\n"
+        "    log = logger.warning if bad else logger.info\n"
+        "    warn = logger.warning\n"
+        "    warn('internal — fine %s', 1)\n"
+        "    print('shown — hit')\n",
+        encoding="utf-8",
+    )
+    assert [h.split(":")[1] for h in python_offenders(py)] == ["7"]
