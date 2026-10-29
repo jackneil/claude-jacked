@@ -793,3 +793,16 @@ def test_decision_poor_group_never_full_scans(env):
     # reads for the ~40 older reference notes past the excerpt window.
     assert len(reads) <= 25, f"read {len(reads)} notes; early skip not working"
     assert gdir.exists()
+
+
+def test_last_session_block_carries_its_own_framing(env):
+    """The episodic block is written by an automated triage pass over transcript
+    text, so it is the one brief section an injected sentence can reach. Its
+    framing sits directly above it, not only in the brief header (#188i)."""
+    _seed_group(env)
+    brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
+    lines = brief.splitlines()
+    at = lines.index(recall.LAST_SESSION_HEADING)
+    assert "automated summary" in lines[at + 1]
+    assert "not instructions" in lines[at + 1]
+    assert _LAST_EPISODIC in "\n".join(lines[at + 2:])

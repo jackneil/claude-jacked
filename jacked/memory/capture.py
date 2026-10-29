@@ -57,6 +57,36 @@ _TRIAGE_TIMEOUT = 120
 # from stored metadata and dropped from the queue.
 _MAX_ATTEMPTS = 3
 
+# Flags that isolate the triage session. `--tools ""` disables the built-in
+# tool set; `--strict-mcp-config` with no `--mcp-config` loads no MCP server;
+# `--disallowedTools "mcp__*"` is the documented belt for MCP tools, which
+# `--tools` does not cover (the child's init message already lists no MCP
+# server, checked live); `disableAllHooks` stops every hook from settings and
+# plugins (without it the
+# child's own SessionEnd re-runs this capture hook, which drains the retry queue
+# a second time); `--no-session-persistence` writes no transcript. User settings
+# still load, so auth from `env` / `apiKeyHelper` keeps working. Structured
+# output still works. Checked live on Claude Code 2.1.312 (2026-10-28).
+_ISOLATION_ARGS = (
+    "--tools", "",
+    "--strict-mcp-config",
+    "--disallowedTools", "mcp__*",
+    "--settings", json.dumps({"disableAllHooks": True}),
+    "--no-session-persistence",
+)
+
+# Set in the triage child's environment. A capture hook that still runs inside
+# that child (a managed policy can force hooks on) sees it and does nothing.
+TRIAGE_ENV = "JACKED_MEMORY_TRIAGE"
+
+# The triage child runs here, not in the session's repo, so the repo's
+# CLAUDE.md and project settings do not load into a summarizing pass (#189i).
+# One fixed directory, so Claude Code keeps one project entry for it.
+_TRIAGE_DIR_NAME = "jacked-memory-triage"
+
+# How much of the child's first stderr line a failure cause keeps.
+_STDERR_CAUSE_CHARS = 200
+
 _GIT_TIMEOUT = 15
 
 _ALLOWED_SEMANTIC_TYPES = ("decision", "convention", "vision", "reference")
@@ -174,6 +204,8 @@ def _capture(payload: dict, kind: str) -> None:
     if not vault_mod.is_initialized(vault):
         return
     if _is_subagent():
+        return
+    if os.environ.get(TRIAGE_ENV):
         return
 
     model = state.get("triage_model") or vault_mod.DEFAULT_TRIAGE_MODEL
@@ -460,7 +492,12 @@ def call_claude(
     ARG_MAX as an argv).
     """
     claude_bin = find_bin("claude") or "claude"
-    argv = [claude_bin, "-p", "--model", model]
+    # NO TOOLS, NO MCP. The prompt is a transcript, and DATA_FRAMING alone does
+    # not hold: a pre-compaction excerpt ends in "continue the task" text, and a
+    # tool-enabled triage session obeyed it (it killed a running gate and
+    # started its own in the user's worktree, 2026-10-12). Triage only writes
+    # JSON, so it gets nothing it could act with.
+    argv = [claude_bin, "-p", "--model", model, *_ISOLATION_ARGS]
     if schema is not None:
         argv += ["--output-format", "json", "--json-schema", json.dumps(schema)]
     try:
@@ -470,14 +507,87 @@ def call_claude(
             capture_output=True,
             text=True,
             timeout=_TRIAGE_TIMEOUT,
+            env={**os.environ, TRIAGE_ENV: "1"},
+            cwd=_triage_cwd(),
         )
     except subprocess.TimeoutExpired:
         return None, f"claude timed out after {_TRIAGE_TIMEOUT}s"
     except (OSError, subprocess.SubprocessError) as e:
         return None, f"claude binary not found or failed to launch: {e}"
     if proc.returncode != 0:
-        return None, f"claude exited {proc.returncode}"
+        detail = _first_line(getattr(proc, "stderr", None)) or _envelope_error(proc.stdout)
+        cause = f"claude exited {proc.returncode}"
+        return None, f"{cause}: {detail}" if detail else cause
     return proc.stdout, None
+
+
+def _triage_cwd() -> str | None:
+    """The private working directory for the triage child (mode 0700).
+
+    Returns None (inherit the caller's cwd) when it cannot be made, so a
+    read-only home never blocks capture.
+    """
+    path = vault_mod.jacked_home() / ".claude" / _TRIAGE_DIR_NAME
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
+    except OSError:
+        # WARNING, so jacked-memory.log records that this pass ran in the
+        # caller's cwd (its project CLAUDE.md and settings load again).
+        logger.warning("memory capture: no private triage dir at %s; running in the caller's cwd", path, exc_info=True)
+        return None
+    return str(path)
+
+
+def _envelope_error(stdout: str | None) -> str:
+    """The error text of a ``--output-format json`` envelope, else ''.
+
+    With JSON output the CLI reports a failure on stdout and leaves stderr
+    empty: an API error puts its message in ``result``; a terminal failure
+    (``error_during_execution``, ``error_max_structured_output_retries``) puts
+    a list of messages in ``errors``.
+
+    >>> _envelope_error('{"is_error": true, "result": "API Error: 400 bad schema"}')
+    'API Error: 400 bad schema'
+    >>> _envelope_error('{"is_error": true, "errors": ["", "builder failed"]}')
+    'builder failed'
+    >>> _envelope_error('{"is_error": false, "result": "fine"}')
+    ''
+    >>> _envelope_error("not json")
+    ''
+    """
+    try:
+        obj = json.loads(stdout or "")
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(obj, dict) or obj.get("is_error") is not True:
+        return ""
+    result = obj.get("result")
+    if isinstance(result, str) and result.strip():
+        return _first_line(result)
+    for err in obj.get("errors") or []:
+        line = _first_line(err) if isinstance(err, str) else ""
+        if line:
+            return line
+    return ""
+
+
+def _first_line(text: str | None) -> str:
+    """First non-empty line of ``text``, stripped and cut to 200 characters.
+
+    >>> _first_line("\\n  Error: bad flag\\nmore")
+    'Error: bad flag'
+    >>> _first_line("\\x1b[31mred\\x1b[0m")
+    '[31mred[0m'
+    >>> _first_line(None)
+    ''
+    """
+    for line in (text or "").splitlines():
+        # one_line strips control characters: the cause is echoed to terminals.
+        line = vault_mod.one_line(line)
+        if line:
+            return line[:_STDERR_CAUSE_CHARS]
+    return ""
 
 
 def parse_triage(raw: str | None) -> dict | None:

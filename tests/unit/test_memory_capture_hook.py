@@ -7,8 +7,10 @@ passes even when pytest itself runs inside a Claude Code subagent). The
 `claude -p` boundary is always mocked -- a real claude binary is never invoked.
 """
 import json
+import os
 import subprocess
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
@@ -459,10 +461,85 @@ def test_call_claude_nonzero_exit_returns_distinct_cause(env):
     class _P:
         returncode = 3
         stdout = ""
+        stderr = ""
     with patch("subprocess.run", return_value=_P()):
         text, cause = capture.call_claude("prompt", "haiku")
     assert text is None
     assert cause == "claude exited 3"
+
+
+def test_call_claude_nonzero_exit_names_the_first_stderr_line(env):
+    """A failed run says WHY: the first non-empty stderr line, cut to 200 chars.
+    Without it, "claude exited 1" in jacked-memory.log cannot be diagnosed."""
+    class _P:
+        returncode = 1
+        stdout = ""
+        stderr = "\n  Error: Invalid value for --json-schema\nmore detail\n"
+    with patch("subprocess.run", return_value=_P()):
+        text, cause = capture.call_claude("prompt", "haiku")
+    assert text is None
+    assert cause == "claude exited 1: Error: Invalid value for --json-schema"
+
+    _P.stderr = "x" * 500
+    with patch("subprocess.run", return_value=_P()):
+        _text, cause = capture.call_claude("prompt", "haiku")
+    assert cause == "claude exited 1: " + "x" * 200
+
+
+def test_call_claude_gives_the_triage_session_no_tools(env):
+    """The transcript is untrusted text. The triage session must have no tool
+    and no MCP server, with and without a schema, so that an instruction in the
+    transcript cannot run a command."""
+    class _P:
+        returncode = 0
+        stdout = "{}"
+    for schema in (None, capture.TRIAGE_SCHEMA):
+        with patch("subprocess.run", return_value=_P()) as run:
+            capture.call_claude("prompt", "haiku", schema=schema)
+        argv = run.call_args.args[0]
+        at = argv.index("--tools")
+        assert argv[at + 1] == ""
+        assert "--strict-mcp-config" in argv
+        assert argv[argv.index("--disallowedTools") + 1] == "mcp__*"
+        assert "--mcp-config" not in argv
+        assert "--dangerously-skip-permissions" not in argv
+
+
+def test_call_claude_runs_no_hooks_and_saves_no_session(env):
+    """The triage session must not fire hooks: its own SessionEnd would run the
+    memory capture hook again (a second retry-queue drain, another claude -p).
+    It also writes no transcript, so recover and analytics never see it."""
+    class _P:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+    for schema in (None, capture.TRIAGE_SCHEMA):
+        with patch("subprocess.run", return_value=_P()) as run:
+            capture.call_claude("prompt", "haiku", schema=schema)
+        argv = run.call_args.args[0]
+        at = argv.index("--settings")
+        assert json.loads(argv[at + 1]) == {"disableAllHooks": True}
+        assert "--no-session-persistence" in argv
+        child_env = run.call_args.kwargs["env"]
+        assert child_env[capture.TRIAGE_ENV] == "1"
+        # The rest of the environment is inherited (auth, PATH, proxies).
+        assert child_env.get("PATH") == os.environ.get("PATH")
+
+
+def test_capture_is_a_no_op_inside_a_triage_session(env, monkeypatch):
+    """Backstop for a hook that still fires (a managed policy can force hooks):
+    a capture that runs inside a triage child returns at once, with no claude
+    call and no retry-queue drain."""
+    # An enabled vault, so the only thing that can stop the capture is the
+    # triage marker (a disabled vault returns earlier and proves nothing).
+    _init_enabled_vault(env)
+    monkeypatch.setenv(capture.TRIAGE_ENV, "1")
+    calls = []
+    monkeypatch.setattr(capture, "call_claude", lambda *a, **k: calls.append(a) or ("{}", None))
+    monkeypatch.setattr(capture, "_drain_queue", lambda *a, **k: calls.append("drain") or (False, []))
+    capture.session_end({"transcript_path": "/nonexistent", "cwd": "/tmp", "session_id": "s"})
+    capture.pre_compact({"transcript_path": "/nonexistent", "cwd": "/tmp", "session_id": "s"})
+    assert calls == []
 
 
 def test_call_claude_returns_stdout_and_no_cause_on_success(env):
@@ -844,3 +921,61 @@ def test_capture_failure_writes_to_memory_log(env):
         assert "triage failed" in text
     finally:
         _clear()
+
+
+def test_call_claude_reads_the_api_error_from_the_json_envelope(env):
+    """With --output-format json the CLI leaves stderr empty and puts the API
+    error in the stdout envelope. The cause must carry it."""
+    class _P:
+        returncode = 1
+        stdout = json.dumps({"is_error": True, "subtype": "success",
+                             "result": "API Error: 400 tools.1.custom.input_schema.type: Field required"})
+        stderr = ""
+    with patch("subprocess.run", return_value=_P()):
+        text, cause = capture.call_claude("prompt", "haiku", schema=capture.TRIAGE_SCHEMA)
+    assert text is None
+    assert cause == "claude exited 1: API Error: 400 tools.1.custom.input_schema.type: Field required"
+
+
+@pytest.mark.parametrize("subtype", ["error_during_execution", "error_max_structured_output_retries"])
+def test_call_claude_reads_terminal_errors_from_the_envelope(env, subtype):
+    """Terminal CLI failures carry the message in ``errors`` (a list), not in
+    ``result``. The cause names the first one."""
+    class _P:
+        returncode = 1
+        stdout = json.dumps({"is_error": True, "subtype": subtype,
+                             "errors": ["", "queryParams builder failed: bad input"]})
+        stderr = ""
+    with patch("subprocess.run", return_value=_P()):
+        _text, cause = capture.call_claude("prompt", "haiku", schema=capture.TRIAGE_SCHEMA)
+    assert cause == "claude exited 1: queryParams builder failed: bad input"
+
+
+def test_call_claude_runs_the_child_in_a_private_directory(env):
+    """The child must not run in the session's repo: that would load the
+    repo's CLAUDE.md and project settings into a summarizing pass (#189i)."""
+    class _P:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+    with patch("subprocess.run", return_value=_P()) as run:
+        capture.call_claude("prompt", "haiku")
+    cwd = Path(run.call_args.kwargs["cwd"])
+    assert cwd == env.home / ".claude" / "jacked-memory-triage"
+    assert cwd.is_dir()
+    if os.name != "nt":
+        assert (cwd.stat().st_mode & 0o777) == 0o700
+
+
+def test_call_claude_still_runs_when_the_private_directory_cannot_be_made(env, monkeypatch):
+    class _P:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+    def _boom(*a, **k):
+        raise PermissionError("read-only home")
+    monkeypatch.setattr(Path, "mkdir", _boom)
+    with patch("subprocess.run", return_value=_P()) as run:
+        text, cause = capture.call_claude("prompt", "haiku")
+    assert (text, cause) == ("{}", None)
+    assert run.call_args.kwargs["cwd"] is None
