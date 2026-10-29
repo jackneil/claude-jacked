@@ -5,6 +5,23 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+from jacked.service.platform import launchd_job_never_ran as _real_launchd_job_never_ran
+
+
+@pytest.fixture(autouse=True)
+def _no_real_supervisor_probes():
+    """doctor's NOT RUNNING path asks launchctl whether the job ever ran and
+    asks the supervisor for the autostart state. On a CI runner the port is
+    free, so both reach the real-supervisor tripwire; on a developer machine
+    the live service holds the port and hides that. Tests that care about
+    either answer patch it again inside the test."""
+    from jacked.service.autostart import AutostartInspection, AutostartState
+
+    with patch("jacked.service.platform.launchd_job_never_ran", return_value=False), \
+         patch("jacked.service.platform.inspect_autostart",
+               return_value=AutostartInspection(AutostartState.ABSENT)):
+        yield
+
 
 def test_doctor_reports_version_and_method():
     from jacked.cli import main
@@ -181,13 +198,13 @@ def test_launchd_never_ran_reads_only_the_top_level_fields(monkeypatch, stdout, 
 
     monkeypatch.setattr(platform.sys, "platform", "darwin")
     probe = MagicMock(returncode=0, stdout=stdout)
-    assert platform.launchd_job_never_ran(run=lambda *a, **k: probe, uid=501) is expected
+    assert _real_launchd_job_never_ran(run=lambda *a, **k: probe, uid=501) is expected
 
 
 def test_launchd_never_ran_is_false_off_macos_and_on_a_probe_failure(monkeypatch):
     from jacked.service import platform
 
     monkeypatch.setattr(platform.sys, "platform", "linux")
-    assert platform.launchd_job_never_ran(run=lambda *a, **k: 1 / 0) is False
+    assert _real_launchd_job_never_ran(run=lambda *a, **k: 1 / 0) is False
     monkeypatch.setattr(platform.sys, "platform", "darwin")
-    assert platform.launchd_job_never_ran(run=lambda *a, **k: MagicMock(returncode=113, stdout="")) is False
+    assert _real_launchd_job_never_ran(run=lambda *a, **k: MagicMock(returncode=113, stdout="")) is False

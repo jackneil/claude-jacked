@@ -361,5 +361,5 @@ def launchd_job_never_ran(run=subprocess.run, uid: "int | None" = None) -> bool:
         return False
     if probe.returncode != 0:
         return False
-    fields = dict(re.findall(r"^\t(state|runs) = (.+)$", probe.stdout or "", re.M))
+    fields = dict(re.findall(r"^\t(state|runs) = (.+)$", probe.stdout or "", re.MULTILINE))
     return fields.get("runs", "").strip() == "0" and fields.get("state", "").strip() != "running"

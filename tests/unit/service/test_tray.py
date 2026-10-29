@@ -1877,6 +1877,19 @@ class TestUpdateClickSurvivesCodeSkew:
         stop.assert_not_called()
 
 
+def test_a_failing_fresh_spawn_names_its_cause():
+    from jacked.service.tray import _spawn_updater_in_fresh_interpreter
+
+    failed = MagicMock(returncode=1, stderr=(
+        "Traceback (most recent call last):\n  File \"x\", line 1\n"
+        "ModuleNotFoundError: No module named 'pystray'\n"))
+    with patch("subprocess.run", return_value=failed), pytest.raises(RuntimeError) as err:
+        _spawn_updater_in_fresh_interpreter(42, 8321, None)
+    assert str(err.value) == (
+        "fresh-interpreter updater spawn exited 1: "
+        "ModuleNotFoundError: No module named 'pystray'"
+    )
+
 def test_the_hidden_spawn_command_calls_the_updater():
     from click.testing import CliRunner
 

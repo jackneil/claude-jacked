@@ -407,6 +407,75 @@ def test_packs_update_no_enabled_says_so_and_exits_zero(env):
     assert "No skill packs are enabled" in env.buf.getvalue()
 
 
+def test_packs_update_installs_an_enabled_pack_with_missing_skills(env):
+    """After an upgrade, `packs update` is the refresh step (#178i). A pack the
+    new version turns on, with no skills on disk yet, must be INSTALLED; the
+    batched update only refreshes skills already present."""
+    calls = _fake_packs(env.monkeypatch, enabled_before=["marketing"], installed_before=[])
+    r = CliRunner().invoke(main, ["packs", "update"])
+    assert r.exit_code == 0, env.buf.getvalue()
+    assert [c.pack.name for c in calls.install_pack] == ["marketing"]
+    assert calls.update_packs == []
+
+
+def test_packs_update_refreshes_a_fully_present_pack(env):
+    calls = _fake_packs(env.monkeypatch, enabled_before=["marketing"])
+    r = CliRunner().invoke(main, ["packs", "update"])
+    assert r.exit_code == 0, env.buf.getvalue()
+    assert [p.name for p in calls.update_packs[0].packs] == ["marketing"]
+    assert calls.install_pack == []
+
+
+def test_packs_update_routes_a_shadowed_pack_to_the_collision_guard(env):
+    """A skill dir the user already owns must be named, never a silent
+    "up to date" from the refresh path."""
+    skills = REGISTRY["marketing"].skills
+    calls = _fake_packs(
+        env.monkeypatch,
+        enabled_before=["marketing"],
+        installed_before=[],
+        foreign_before=list(skills),
+        install_result=packs_mod.PackOpResult(
+            ok=True, installed=[], skipped=list(skills), message="kept yours"
+        ),
+    )
+    r = CliRunner().invoke(main, ["packs", "update"])
+    assert r.exit_code == 0
+    assert [c.pack.name for c in calls.install_pack] == ["marketing"]
+    assert "untouched (a skill dir you already own)" in env.buf.getvalue()
+
+
+def test_packs_update_fails_loud_without_npx(env):
+    calls = _fake_packs(env.monkeypatch, enabled_before=["marketing"], npx=None)
+    r = CliRunner().invoke(main, ["packs", "update"])
+    assert r.exit_code == 1
+    assert "Node.js/npx" in env.buf.getvalue()
+    assert calls.install_pack == [] and calls.update_packs == []
+
+
+def test_packs_update_exits_1_when_a_pack_fails(env):
+    _fake_packs(
+        env.monkeypatch,
+        enabled_before=["marketing"],
+        installed_before=[],
+        install_result=packs_mod.PackOpResult(ok=False, message="npx skills add failed."),
+    )
+    r = CliRunner().invoke(main, ["packs", "update"])
+    assert r.exit_code == 1
+    assert "[FAIL]" in env.buf.getvalue()
+
+
+def test_packs_update_name_scopes_to_that_pack(env):
+    names = [n for n in REGISTRY if n != "marketing"]
+    if not names:
+        pytest.skip("registry has one pack")
+    other = names[0]
+    calls = _fake_packs(env.monkeypatch, enabled_before=["marketing", other])
+    r = CliRunner().invoke(main, ["packs", "update", "marketing"])
+    assert r.exit_code == 0, env.buf.getvalue()
+    assert [p.name for p in calls.update_packs[0].packs] == ["marketing"]
+
+
 def test_packs_update_unknown_name_lists_valid(env):
     _fake_packs(env.monkeypatch, enabled_before=["marketing"])
     r = CliRunner().invoke(main, ["packs", "update", "bogus"])

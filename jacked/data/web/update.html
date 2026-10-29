@@ -87,6 +87,7 @@
         method: null,
         currentVersion: null,
         overall: "in_progress",
+        currentPhase: null,
         error: null,
         recovery: null,
         phases: {},
@@ -220,15 +221,23 @@
         }
     }
 
+    // The update is over. The new version answering is not enough: the
+    // skill packs refresh runs after the new service is up, and its result
+    // (ok or warning) arrives after the version matches.
+    function isFinished() {
+        if (state.overall === "succeeded" || state.overall === "failed") return true;
+        const targetKnown = state.targetVersion && state.targetVersion !== "next";
+        return Boolean(targetKnown && state.currentVersion === state.targetVersion &&
+            state.currentPhase !== "refreshing_packs");
+    }
+
     function renderBanner() {
         const banner = document.getElementById("banner");
         clearChildren(banner);
         banner.style.display = "none";
         banner.className = "banner";
 
-        const targetKnown = state.targetVersion && state.targetVersion !== "next";
-        const done = state.overall === "succeeded" ||
-            (targetKnown && state.currentVersion === state.targetVersion);
+        const done = state.overall !== "failed" && isFinished();
 
         let serverAgeMs = null;
         if (state.serverMtime) {
@@ -302,6 +311,7 @@
                     state.fromVersion = body.status.from_version || state.fromVersion;
                     state.method = body.status.method || state.method;
                     state.overall = body.status.overall || state.overall;
+                    state.currentPhase = body.status.current_phase || null;
                     state.error = body.status.error;
                     state.recovery = body.status.recovery;
                     state.phases = {};
@@ -342,11 +352,7 @@
                 {jackedUpdateOverall: state.overall, jackedCurrentVersion: state.currentVersion},
                 "*");
         } catch (_) {}
-        const targetKnown = state.targetVersion && state.targetVersion !== "next";
-        const terminal = state.overall === "succeeded" ||
-            state.overall === "failed" ||
-            (targetKnown && state.currentVersion === state.targetVersion);
-        if (terminal && pollHandle !== null) {
+        if (isFinished() && pollHandle !== null) {
             clearInterval(pollHandle);
             pollHandle = null;
         }

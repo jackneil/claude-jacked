@@ -12,6 +12,23 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _process_tree_through_subprocess_run():
+    """run_process_tree spawns with Popen; these tests script the upgrade's
+    child processes through a mocked subprocess.run. Route it there so the
+    call-order assertions keep covering every child (#178i). The helper's own
+    process-group behavior is tested with real processes in
+    tests/unit/service/test_process_tree.py."""
+    import subprocess as _subprocess
+
+    def _via_run(argv, *, timeout, log_fh=None):
+        return _subprocess.run(argv, stdout=log_fh, stderr=log_fh, check=False,
+                               timeout=timeout).returncode
+
+    with patch("jacked.service.updater.run_process_tree", side_effect=_via_run):
+        yield
+
+
 def _ok(stdout: str = "") -> MagicMock:
     """Successful subprocess result with real text streams.
 
@@ -2241,7 +2258,7 @@ class TestSkillPacksRefreshAfterTheService:
         assert code != 0 and "timed out" in error
 
     def test_a_failed_pack_refresh_is_a_warning_not_a_failure(self, tmp_path, monkeypatch):
-        run, popen, status, recovery = TestUpdaterRollback()._run_update(
+        _run, _popen, status, _recovery = TestUpdaterRollback()._run_update(
             monkeypatch, tmp_path,
             run_results=_healthy_runs() + [_fail(1)],
             listen_results=_comes_up_after(1),

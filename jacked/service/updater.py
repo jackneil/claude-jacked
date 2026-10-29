@@ -11,6 +11,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -1189,47 +1190,89 @@ MIGRATE_TIMEOUT_SECONDS = 600
 PACK_REFRESH_TIMEOUT_SECONDS = 900
 
 
-def run_migrate_settings(jacked: str, log_fh=None) -> "tuple[int, str | None]":
+def run_process_tree(argv: list[str], *, timeout: float, log_fh=None) -> int:
+    """Run ``argv`` in its own process group and return its exit code.
+
+    ``subprocess.run`` kills only its direct child on a timeout, so a
+    grandchild (the npx worker under `jacked packs update`) kept writing
+    skills and lockfiles after the upgrade released its lock. Here the whole
+    group is killed and reaped on a timeout or any interrupt, then the
+    exception is raised again. The own session also keeps a closed terminal's
+    SIGHUP away from the child; the upgrade decides when to stop it.
+    """
+    kwargs: dict = {"stdout": log_fh, "stderr": log_fh}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(argv, **kwargs)
+    try:
+        return proc.wait(timeout=timeout)
+    except BaseException:
+        _kill_process_tree(proc)
+        raise
+
+
+def _kill_process_tree(proc) -> None:
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+                timeout=30,
+                creationflags=NO_WINDOW,
+            )
+        except (OSError, subprocess.SubprocessError):
+            proc.kill()
+    else:
+        import signal
+
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        logger.warning("Process %s did not exit after a kill", proc.pid)
+
+
+def run_migrate_settings(jacked: str, log_fh=None) -> tuple[int, str | None]:
     """Run the settings migration with a timeout. Returns (code, error text).
 
     A timeout or a launch failure is a non-zero code with a values-free
     reason, so every caller takes its own failure (rollback) path.
     """
     try:
-        result = subprocess.run(
+        code = run_process_tree(
             [jacked, "install", "--force", "--no-packs"],
-            stdout=log_fh,
-            stderr=log_fh,
-            check=False,
             timeout=MIGRATE_TIMEOUT_SECONDS,
-            creationflags=NO_WINDOW,
+            log_fh=log_fh,
         )
     except subprocess.TimeoutExpired:
         return 124, f"jacked install timed out after {MIGRATE_TIMEOUT_SECONDS}s"
     except OSError as exc:
         return 127, f"jacked install could not start ({type(exc).__name__})"
-    if result.returncode != 0:
-        return result.returncode, f"jacked install exit {result.returncode}"
+    if code != 0:
+        return code, f"jacked install exit {code}"
     return 0, None
 
 
-def run_refresh_packs(jacked: str, log_fh=None) -> "str | None":
+def run_refresh_packs(jacked: str, log_fh=None) -> str | None:
     """Run `jacked packs update` after the service is back. None when it
     worked, else a values-free reason. Never raises."""
     try:
-        result = subprocess.run(
+        code = run_process_tree(
             [jacked, "packs", "update"],
-            stdout=log_fh,
-            stderr=log_fh,
-            check=False,
             timeout=PACK_REFRESH_TIMEOUT_SECONDS,
-            creationflags=NO_WINDOW,
+            log_fh=log_fh,
         )
     except subprocess.TimeoutExpired:
         return f"timed out after {PACK_REFRESH_TIMEOUT_SECONDS}s"
     except OSError as exc:
         return f"could not start ({type(exc).__name__})"
-    return None if result.returncode == 0 else f"exit {result.returncode}"
+    return None if code == 0 else f"exit {code}"
 
 
 def windows_refresh_packs_block(drift_guard: str = "") -> str:

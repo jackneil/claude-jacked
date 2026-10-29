@@ -92,12 +92,13 @@ def test_update_html_explains_every_warning_phase():
     recovery command in update.html, or the user sees an amber row with
     no explanation (#178i)."""
     import re
+
     from jacked.service.update_phases import WARNING_PHASE_NAMES
 
     html = (_web_dir() / "update.html").read_text(encoding="utf-8")
-    block = re.search(r"const PHASE_WARNINGS = \{(.*?)\};", html, re.S)
+    block = re.search(r"const PHASE_WARNINGS = \{(.*?)\};", html, re.DOTALL)
     assert block, "update.html has no PHASE_WARNINGS map"
-    keys = set(re.findall(r"^\s*(\w+):", block.group(1), re.M))
+    keys = set(re.findall(r"^\s*(\w+):", block.group(1), re.MULTILINE))
     assert WARNING_PHASE_NAMES, "expected at least one warning phase"
     assert keys == set(WARNING_PHASE_NAMES)
 

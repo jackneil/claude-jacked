@@ -1516,14 +1516,16 @@ def _run_upgrade_inline(
         # Every planned exit (a rollback, a refusal, the index-lag report)
         # already recorded its own status and recovery text.
         raise
-    except BaseException as exc:  # noqa: BLE001 - Ctrl-C, a signal, a crash
+    except BaseException as exc:  # Ctrl-C, a signal, a crash
+        # A second Ctrl-C or signal must not abort the repair halfway.
+        _ignore_upgrade_signals(previous_handlers)
         code = _upgrade_interrupted(exc, request)
         raise SystemExit(code) from exc
     finally:
-        _restore_signal_handlers(previous_handlers)
         # Held for the whole transaction, released on success, on a rollback
         # (which exits through SystemExit) and on any unexpected raise.
         _release_upgrade_lock(lock)
+        _restore_signal_handlers(previous_handlers)
 
 
 class _UpgradeInterrupted(BaseException):
@@ -1533,6 +1535,10 @@ class _UpgradeInterrupted(BaseException):
 # What a person runs after an interrupted upgrade: re-run the settings
 # migration on whatever is installed now, then restart the service on it.
 _INTERRUPTED_RECOVERY = "jacked install --force && jacked service restart"
+
+# How long the post-interrupt `jacked service restart` may take (a supervisor
+# start plus its readiness wait).
+_INTERRUPT_RESTART_SECONDS = 120
 
 
 # While a step that writes the install runs (the package install, the
@@ -1582,6 +1588,23 @@ def _defer_upgrade_signals():
         raise _UpgradeInterrupted(pending)
 
 
+def _ignore_upgrade_signals(previous: dict) -> None:
+    """Ignore Ctrl-C, SIGHUP and SIGTERM while an interrupted upgrade repairs
+    itself. Records the original Ctrl-C handler in ``previous`` so
+    _restore_signal_handlers puts every handler back."""
+    import signal
+
+    for name in ("SIGINT", "SIGHUP", "SIGTERM"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            original = signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            continue
+        previous.setdefault(sig, original)
+
+
 def _restore_signal_handlers(previous: dict) -> None:
     import signal
 
@@ -1604,7 +1627,6 @@ def _upgrade_interrupted(exc: BaseException, request: "_UpgradeRequest") -> int:
     names the repair, and a service that is down is started again (unless the
     caller asked to leave the service alone). Returns the exit code.
     """
-    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
     from jacked.service import update_status as _us
 
     if isinstance(exc, KeyboardInterrupt):
@@ -1625,31 +1647,66 @@ def _upgrade_interrupted(exc: BaseException, request: "_UpgradeRequest") -> int:
             _us.mark_failed(_us.UPDATE_STATUS_FILE, error=reason, recovery=_INTERRUPTED_RECOVERY)
         except Exception:
             logger.debug("Could not mark the update status failed", exc_info=True)
-    _write_upgrade_recovery(reason, ["jacked install --force", "jacked service restart"])
     logger.error("Upgrade interrupted: %s", reason, exc_info=not isinstance(
         exc, (KeyboardInterrupt, _UpgradeInterrupted)))
-    console.print(f"\n[red]The upgrade stopped: {reason}.[/red]")
-
-    if not request.skip_service:
-        try:
-            from jacked.service.process import is_port_available
-
-            down = is_port_available(DEFAULT_HOST, DEFAULT_PORT)
-        except Exception:
-            down = False
-        if down:
-            try:
-                from jacked.service.platform import native_restart
-
-                ok, why = native_restart()
-            except Exception as restart_exc:  # noqa: BLE001
-                ok, why = False, type(restart_exc).__name__
-            console.print(
-                "[green]The service was down and is started again.[/green]"
-                if ok else f"[yellow]The service is down and did not start ({why}).[/yellow]"
-            )
-    console.print(f"Recovery: [cyan]{_INTERRUPTED_RECOVERY}[/cyan]")
+    # The terminal may be gone (SIGHUP): every line below is best effort and
+    # the service restart comes before any of them.
+    restarted = None if request.skip_service else _restart_after_interrupt()
+    _quiet(_write_upgrade_recovery, reason, ["jacked install --force", "jacked service restart"])
+    _quiet(console.print, f"\n[red]The upgrade stopped: {reason}.[/red]")
+    if restarted is not None:
+        ok, why = restarted
+        _quiet(
+            console.print,
+            "[green]The service was down and is started again.[/green]"
+            if ok else f"[yellow]The service is down and did not start ({why}).[/yellow]",
+        )
+    _quiet(console.print, f"Recovery: [cyan]{_INTERRUPTED_RECOVERY}[/cyan]")
     return code
+
+
+def _quiet(fn, *args) -> None:
+    """Call ``fn``; an output error (a closed terminal) is logged, not raised."""
+    try:
+        fn(*args)
+    except (OSError, ValueError):
+        logger.debug("Output after an interrupted upgrade failed", exc_info=True)
+
+
+def _restart_after_interrupt() -> "tuple[bool, str] | None":
+    """Start the service again when an interrupted upgrade left it down.
+
+    None when the service is still up. The restart runs through the jacked
+    CLI that is installed NOW, in a fresh interpreter: this process may still
+    hold the old build, whose service contract refuses the artifact the new
+    build already wrote. Without an installed CLI, the in-process restart is
+    the fallback.
+    """
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+
+    try:
+        from jacked.service.process import is_port_available
+
+        if not is_port_available(DEFAULT_HOST, DEFAULT_PORT):
+            return None
+    except Exception:
+        logger.debug("Could not check whether the service is down", exc_info=True)
+        return None
+    try:
+        from jacked.findbin import find_bin
+        from jacked.service.updater import run_process_tree
+
+        jacked = find_bin("jacked")
+        if jacked:
+            code = run_process_tree(
+                [jacked, "service", "restart"], timeout=_INTERRUPT_RESTART_SECONDS
+            )
+            return code == 0, f"jacked service restart exit {code}"
+        from jacked.service.platform import native_restart
+
+        return native_restart()
+    except Exception as restart_exc:  # noqa: BLE001
+        return False, type(restart_exc).__name__
 
 
 @dataclass(frozen=True)
@@ -5044,8 +5101,13 @@ def _run_packs_phase(
     include_codex: bool,
     as_json: bool,
     no_packs: bool = False,
+    only: list[str] | None = None,
 ) -> dict:
     """Install/refresh the effectively-enabled skill packs as part of `jacked install`.
+
+    `jacked packs update` runs this same phase (``only`` narrows it to one
+    pack), so a refresh after an upgrade also installs a pack the new version
+    turns on and still reports a shadowed skill (#178i).
 
     Effectively-enabled = every registry pack marked ``default: true`` that the
     user has not explicitly disabled, plus any pack explicitly enabled (via a
@@ -5086,6 +5148,8 @@ def _run_packs_phase(
             )
 
     targets = _packs.effective_enabled_pack_names(home, registry)
+    if only is not None:
+        targets = [name for name in targets if name in only]
     results: dict = {}
     if not targets:
         return results
@@ -6195,22 +6259,25 @@ def packs_disable(name: str):
 @packs_group.command(name="update")
 @click.argument("name", required=False)
 def packs_update(name: str | None):
-    """Refresh the skills of enabled packs from their upstream repos.
+    """Install or refresh the skills of enabled packs from their upstream repos.
 
     Scoped to packs that are effectively enabled (default-on packs you didn't
     disable, plus any you explicitly enabled) -- all of them, or a single NAME.
     Disabled packs are left alone; enable a pack first to install its skills.
+    Runs the same step as `jacked install`: a pack with a missing or shadowed
+    skill is installed (the collision guard names the shadow), a pack that is
+    fully present is refreshed. Exits 1 when a pack fails or npx is missing.
     """
     from jacked import packs as _packs
 
     home = _jacked_home()
-    registry = _packs.load_registry(_get_data_root())
+    data_root = _get_data_root()
+    registry = _packs.load_registry(data_root)
     effective = _packs.effective_enabled_pack_names(home, registry)
-    include_codex = _detect_codex_for_packs()
 
+    only = None
     if name:
-        pack = registry.get(name)
-        if pack is None:
+        if registry.get(name) is None:
             _packs_unknown_name(name, registry)
         if name not in effective:
             console.print(
@@ -6218,27 +6285,20 @@ def packs_update(name: str | None):
                 f"Run `jacked packs enable {name}` first.[/yellow]"
             )
             raise SystemExit(1)
-        targets = [pack]
-    else:
-        # Explicit-enabled-but-deregistered packs can't be updated (unknown to
-        # this build); warn rather than silently skip.
-        for unknown_name in [
-            n for n in _packs.enabled_pack_names(home) if n not in registry
-        ]:
-            console.print(
-                f"[yellow][!][/yellow] Pack '{unknown_name}' is enabled but "
-                "unknown to this jacked version; its skills were left untouched."
-            )
-        targets = [registry[n] for n in effective]
-        if not targets:
-            console.print("No skill packs are enabled. Nothing to update.")
-            return
+        only = [name]
+    elif not effective:
+        console.print("No skill packs are enabled. Nothing to update.")
+        return
 
-    res = _packs.update_packs(targets, home, include_codex=include_codex)
-    if res.ok:
-        console.print(f"[green][OK][/green] {_rich_escape(res.message)}")
-    else:
-        console.print(f"[red][FAIL][/red] {_rich_escape(res.message)}")
+    if _packs.find_npx() is None:
+        console.print(
+            "[red][FAIL][/red] Skill packs need Node.js/npx (install Node 18+)."
+        )
+        raise SystemExit(1)
+    results = _run_packs_phase(
+        home, data_root, [], _detect_codex_for_packs(), as_json=False, only=only
+    )
+    if any(not result["ok"] for result in results.values()):
         raise SystemExit(1)
 
 

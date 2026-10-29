@@ -259,13 +259,21 @@ def _spawn_updater_in_fresh_interpreter(parent_pid: int, port: int, target: "str
         argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
         timeout=60,
         check=False,
         creationflags=NO_WINDOW,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"fresh-interpreter updater spawn exited {result.returncode}")
+        # The last stderr line names the cause (an exception type and its
+        # message); the full traceback is not kept.
+        lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+        cause = f": {lines[-1]}" if lines else ""
+        raise RuntimeError(
+            f"fresh-interpreter updater spawn exited {result.returncode}{cause}"
+        )
 
 
 class ServiceRunner:
