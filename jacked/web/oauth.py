@@ -1098,7 +1098,7 @@ class OAuthFlow:
         )
         if not cc_email:
             raise RuntimeError(
-                "Cannot verify CC token identity — no email in token response or profile"
+                "Cannot verify CC token identity. No email in token response or profile."
             )
         if cc_email.lower() != target["email"].lower():
             raise ValueError(
@@ -1112,8 +1112,8 @@ class OAuthFlow:
         if target_org:  # non-empty sentinel = real org
             if not cc_org:
                 raise ValueError(
-                    "CC auth missing org — cannot verify against org-scoped account "
-                    f"(target org: {target_org})"
+                    "CC auth is missing an org, so jacked cannot verify it against an org-scoped account "
+                    f"(target org: {target_org})."
                 )
             if cc_org != target_org:
                 raise ValueError(
@@ -1166,7 +1166,7 @@ class OAuthFlow:
         )
         if not updated:
             raise RuntimeError(
-                f"CC token update failed: account {account_id} — 0 rows affected"
+                f"CC token update failed: account {account_id}, 0 rows affected."
             )
 
         logger.info("CC tokens stored for account %d", account_id)

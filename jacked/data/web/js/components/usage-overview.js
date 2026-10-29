@@ -66,7 +66,7 @@ function _renderHealthBanner(overview) {
 
 function _renderFlags(flags) {
     if (!flags || flags.length === 0) {
-        return '<div class="text-sm text-slate-500 mb-4 p-3 bg-slate-800/30 rounded-lg">No anomalies detected &mdash; usage looks healthy.</div>';
+        return '<div class="text-sm text-slate-500 mb-4 p-3 bg-slate-800/30 rounded-lg">No anomalies detected. Usage looks healthy.</div>';
     }
 
     const flagHtml = flags.map(f => {

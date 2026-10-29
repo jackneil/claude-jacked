@@ -130,7 +130,7 @@ def can_auto_upgrade() -> tuple[bool, str]:
     except Exception:
         return (
             False,
-            "Could not detect install method — auto-update disabled. "
+            "Could not detect install method. Auto-update is disabled. "
             "Try: `uv tool install \"claude-jacked[tray]\" --force`.",
         )
     if method in ("uv", "pipx"):
@@ -138,12 +138,12 @@ def can_auto_upgrade() -> tuple[bool, str]:
     if method == "editable":
         return (
             False,
-            "This is an editable (dev-clone) install — auto-update disabled. "
+            "This is an editable (dev-clone) install. Auto-update is disabled. "
             "Upgrade manually from the repo: `cd <repo> && git pull && uv sync`.",
         )
     return (
         False,
-        "pip install detected — auto-update disabled (uv is the supported "
+        "pip install detected. Auto-update is disabled (uv is the supported "
         "install method). Migrate with: "
         "`uv tool install \"claude-jacked[tray]\"`.",
     )

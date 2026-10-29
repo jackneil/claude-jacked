@@ -1168,7 +1168,7 @@ def run_update(
             try:
                 from jacked.service.platform import native_restart
 
-                log("Final guard: no restart attempted by upgrade flow — kickstart")
+                log("Final guard: no restart attempted by upgrade flow. Kickstart.")
                 ok, reason = native_restart()
                 log(
                     f"Final guard: native_restart {'OK' if ok else 'FAILED'} ({reason})"

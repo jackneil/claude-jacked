@@ -39,7 +39,7 @@ def _fail(returncode: int = 1, stdout: str = "", stderr: str = "") -> MagicMock:
 class TestUpgradeRefusal:
     @patch(
         "jacked.install_method.can_auto_upgrade",
-        return_value=(False, "This is an editable (dev-clone) install — auto-update disabled. Upgrade manually from the repo: `cd <repo> && git pull && uv sync`."),
+        return_value=(False, "This is an editable (dev-clone) install. Auto-update is disabled. Upgrade manually from the repo: `cd <repo> && git pull && uv sync`."),
     )
     @patch("subprocess.Popen")
     @patch("subprocess.run")
@@ -54,7 +54,7 @@ class TestUpgradeRefusal:
 
     @patch(
         "jacked.install_method.can_auto_upgrade",
-        return_value=(False, "pip install detected — auto-update disabled. Migrate with: `uv tool install \"claude-jacked[tray]\"`."),
+        return_value=(False, "pip install detected. Auto-update is disabled. Migrate with: `uv tool install \"claude-jacked[tray]\"`."),
     )
     @patch("subprocess.Popen")
     @patch("subprocess.run")

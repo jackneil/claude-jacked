@@ -46,7 +46,7 @@ function _installSummaryHasChanges(summary) {
 function _installSummaryTitle(summary) {
     const to = summary.to_version || '';
     if (summary.from_version == null) {
-        return `Installed — ${to}`;
+        return `Installed: ${to}`;
     }
     return `Updated ${summary.from_version} → ${to}`;
 }

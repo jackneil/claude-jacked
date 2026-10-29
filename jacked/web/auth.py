@@ -1536,7 +1536,7 @@ async def fetch_usage(
                         )
 
                 # Refresh and live import both failed or already retried — mark invalid
-                error_msg = f"Usage fetch failed (HTTP {resp.status_code}) — token refresh failed"
+                error_msg = f"Usage fetch failed (HTTP {resp.status_code}). Token refresh failed."
                 db.update_account(
                     account_id,
                     validation_status="invalid",
@@ -1610,8 +1610,8 @@ async def fetch_usage(
                 state["last_fetched_at"] = time.time()
                 db.record_account_error(
                     account_id,
-                    f"Usage fetch rate limited (429) — backing off {backoff_seconds}s "
-                    f"(consecutive: {n})",
+                    f"Usage fetch rate limited (429). Backing off {backoff_seconds}s "
+                    f"(consecutive: {n}).",
                     increment_failures=False,
                 )
                 logger.warning(
@@ -1950,7 +1950,7 @@ async def validate_account(account_id: int, db: Database) -> dict:
                     last_error="Rate limited during validation",
                     last_error_at=datetime.now(timezone.utc).isoformat(),
                 )
-                return {"valid": False, "error": "Rate limited — try again later"}
+                return {"valid": False, "error": "Rate limited. Try again later."}
 
             db.update_account(
                 account_id,
@@ -2002,7 +2002,7 @@ async def reset_stale_checking_accounts(
         else:
             age = threshold_seconds  # NULL updated_at
 
-        reason = f"validation timed out after {age}s — reset by watchdog"
+        reason = f"validation timed out after {age}s. Reset by watchdog."
         rows_reset = db.reset_stuck_checking(
             acct["id"], threshold_seconds=threshold_seconds, reason=reason,
         )

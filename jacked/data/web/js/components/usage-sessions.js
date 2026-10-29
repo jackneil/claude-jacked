@@ -30,7 +30,7 @@ async function renderUsageSessions(container) {
         const cacheColor = s.cache_hit_ratio >= 90 ? 'text-teal-400' : s.cache_hit_ratio >= 70 ? 'text-yellow-400' : 'text-red-400';
         const flagCount = s.flag_count || 0;
         const dot = flagCount > 0 ? (s.has_critical ? '&#x1F534;' : '&#x1F7E1;') : '&#x1F7E2;';
-        const duration = s.duration_minutes ? Math.round(s.duration_minutes) + 'min' : '&mdash;';
+        const duration = s.duration_minutes ? Math.round(s.duration_minutes) + 'min' : '-';
 
         return '<div class="grid grid-cols-[auto_2fr_1fr_1fr_1fr_1fr_1fr] gap-2 py-2 px-3 border-t border-slate-700/30 items-center text-xs cursor-pointer hover:bg-slate-800/50" onclick="this.nextElementSibling?.classList.toggle(\'hidden\')">'
             + '<span>' + dot + '</span>'

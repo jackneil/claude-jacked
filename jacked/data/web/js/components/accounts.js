@@ -592,7 +592,7 @@ function renderAccounts(accounts) {
             ${typeof renderSessionControls === 'function' ? renderSessionControls() : ''}
             ${typeof renderSessionLookupResult === 'function' ? renderSessionLookupResult() : ''}
             ${typeof renderUnknownSessions === 'function' ? renderUnknownSessions() : ''}
-            <!-- Responsive card grid — see .accounts-grid in style.css.
+            <!-- Responsive card grid: see .accounts-grid in style.css.
                  Reflows to 2 columns only when each card can be a comfortable
                  width; the wrapper's max-width caps the flow at 2. -->
             <div id="accounts-list" class="accounts-grid">

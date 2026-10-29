@@ -553,7 +553,7 @@ def render_digest(digest: Digest, budget_chars: int = DEFAULT_BUDGET_CHARS) -> s
         head.append(f"**Branch:** {digest.git_branch}")
     sections.append(("", "\n".join(head)))
     if digest.incomplete_last_turn:
-        sections.append(("", "> WARNING: the last turn may be incomplete — work was in progress when the session ended. Verify before building on it."))
+        sections.append(("", "> WARNING: the last turn may be incomplete. Work was in progress when the session ended. Verify it before building on it."))
     # In-flight intent: the crashed agent's final reasoning (why the next step
     # was next). Skip when it merely duplicates the last assistant message
     # (the text-fallback case) — compare with any trailing cap-ellipsis removed.

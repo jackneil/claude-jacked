@@ -54,7 +54,7 @@ def format_account_label(account: dict) -> str:
         # e.g. "Jack" for user1@example.com. Don't show these.
         email_prefix = email.split("@")[0].split(".")[0].lower()
         if display_name.lower() != email_prefix and display_name.lower() != "user":
-            label_prefix = f"{display_name} \u2014 "
+            label_prefix = f"{display_name} - "
 
     return f"{label_prefix}{email}{org_suffix}"
 

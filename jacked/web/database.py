@@ -193,7 +193,7 @@ SCHEMA_SQL = """
 -- Account Management Tables
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    provider TEXT NOT NULL DEFAULT 'claude',  -- 'claude' | 'codex' — the account's CLI provider
+    provider TEXT NOT NULL DEFAULT 'claude',  -- 'claude' | 'codex': the account's CLI provider
     email TEXT NOT NULL,
     organization_uuid TEXT DEFAULT '',  -- Sentinel: "" = personal/legacy, non-empty = real org UUID
     organization_name TEXT,
@@ -1140,8 +1140,8 @@ class Database:
             rows = cursor.fetchall()
             if len(rows) > 1:
                 raise ValueError(
-                    f"Ambiguous: {len(rows)} accounts for {email} — "
-                    "specify by ID, org, or provider"
+                    f"Ambiguous: {len(rows)} accounts for {email}. "
+                    "Specify by ID, org, or provider."
                 )
             return dict(rows[0]) if rows else None
 

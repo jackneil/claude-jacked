@@ -750,7 +750,7 @@ class ServiceRunner:
         portion stays fresh without manual refresh.
         """
         if self._started_at is None:
-            return "Started: —"
+            return "Started: -"
         local = time.localtime(self._started_at)
         clock = time.strftime("%H:%M:%S", local)
         elapsed = max(0, int(time.time() - self._started_at))

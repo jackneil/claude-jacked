@@ -83,4 +83,4 @@ def test_update_html_posts_state_and_breaks_out_of_frame():
     html = (_web_dir() / "update.html").read_text(encoding="utf-8")
     assert "postMessage" in html
     assert "_top" in html
-    assert "Service restarting" in html
+    assert "The service is restarting. Reconnecting" in html

@@ -231,7 +231,7 @@ def install_hook(
         language = detect_language(repo)
 
     if not language:
-        return {"installed": False, "reason": "could not detect language — specify with --language"}
+        return {"installed": False, "reason": "could not detect language. Specify it with --language."}
 
     # Find the template
     template_name = f"pre-push-{language}.sh"

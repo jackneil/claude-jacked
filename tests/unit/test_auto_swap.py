@@ -334,13 +334,13 @@ class TestFormatAccountLabel:
     def test_custom_label_prepended(self):
         """User-set display_name that differs from default is prepended."""
         acct = {"email": "user1@example.com", "organization_name": "Acme", "display_name": "Acme Team"}
-        assert format_account_label(acct) == "Acme Team — user1@example.com (Acme)"
+        assert format_account_label(acct) == "Acme Team - user1@example.com (Acme)"
 
     def test_default_display_name_not_shown(self):
         """Default display_name (just first name) is NOT prepended."""
         acct = {"email": "user1@example.com", "organization_name": "Acme", "display_name": "User1"}
         result = format_account_label(acct)
-        assert not result.startswith("User1 —")
+        assert not result.startswith("User1 -")
         assert result == "user1@example.com (Acme)"
 
     def test_no_org_name(self):

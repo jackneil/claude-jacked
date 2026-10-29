@@ -318,14 +318,14 @@ def uninstall_autostart() -> str:
             )
             plist_path.unlink()
             return f"Removed launchd agent: {plist_path}"
-        return "No launchd agent found — nothing to remove."
+        return "No launchd agent found. Nothing to remove."
 
     elif sys.platform == "win32":
         vbs_path = _get_windows_startup_path()
         if vbs_path.exists():
             vbs_path.unlink()
             return f"Removed startup script: {vbs_path}"
-        return "No startup script found — nothing to remove."
+        return "No startup script found. Nothing to remove."
 
     else:
         return "Auto-start not supported on this platform."

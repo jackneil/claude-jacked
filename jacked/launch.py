@@ -455,7 +455,7 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     # path; this guards any other caller).
     if (account.get("provider") or "claude") == "codex":
         raise click.ClickException(
-            f"Account {account_id} is a Codex account — use `jacked codex launch {account_id}`."
+            f"Account {account_id} is a Codex account. Use `jacked codex launch {account_id}`."
         )
 
     # Refresh primary token if near-expiry (refresh_account_token is async)
@@ -573,7 +573,7 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     # Refuse symlinks (is_symlink uses lstat — catches broken symlinks too)
     if cred_path.is_symlink():
         raise click.ClickException(
-            f"Credential path is a symlink — refusing to write: {cred_path}"
+            f"Credential path is a symlink. Refusing to write: {cred_path}"
         )
 
     # Read existing file to preserve other keys (Claude Code may have added data)

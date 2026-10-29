@@ -1730,7 +1730,7 @@ async function renderClaudeCodeTab(container) {
                     <svg class="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
                     <span class="text-sm font-semibold text-white">Claude Code Configuration</span>
                 </div>
-                <p class="text-xs text-slate-400">Settings below control <span class="text-blue-300">Claude Code</span> behavior directly — not jacked features. Changes are written to <code class="text-slate-300">~/.claude/settings.json</code>. Restart Claude Code after making changes.</p>
+                <p class="text-xs text-slate-400">Settings below control <span class="text-blue-300">Claude Code</span> behavior directly, not jacked features. Changes are written to <code class="text-slate-300">~/.claude/settings.json</code>. Restart Claude Code after making changes.</p>
             </div>
         `;
 
@@ -1812,7 +1812,7 @@ async function renderClaudeCodeTab(container) {
                     <div id="cdp-mcp-help" class="hidden mt-3 p-2 bg-slate-800/50 rounded border border-slate-700/30">
                         <p class="text-xs text-slate-400 mb-1 font-semibold">Setup instructions:</p>
                         <ol class="text-xs text-slate-500 list-decimal ml-4 space-y-1">
-                            <li>Install Chrome 144 or newer — check at <code class="text-slate-300">chrome://version</code></li>
+                            <li>Install Chrome 144 or newer. Check the version at <code class="text-slate-300">chrome://version</code></li>
                             <li>Enable remote debugging at <code class="text-slate-300">chrome://inspect/#remote-debugging</code></li>
                             <li>Restart Claude Code after enabling</li>
                         </ol>
@@ -1831,7 +1831,7 @@ async function renderClaudeCodeTab(container) {
                     </svg>
                 </div>
                 <div id="raw-editor-content" class="hidden mt-3">
-                    <p class="text-xs text-slate-500 mb-2">Direct JSON editor for <code class="text-slate-300">~/.claude/settings.json</code>. Be careful — invalid JSON will break Claude Code.</p>
+                    <p class="text-xs text-slate-500 mb-2">Direct JSON editor for <code class="text-slate-300">~/.claude/settings.json</code>. Be careful: invalid JSON will break Claude Code.</p>
                     <textarea id="raw-settings-textarea"
                         class="w-full bg-slate-900 border border-slate-600 rounded px-3 py-2 text-sm text-slate-200 font-mono leading-relaxed focus:outline-none focus:border-blue-500 resize-y"
                         rows="18" spellcheck="false"></textarea>

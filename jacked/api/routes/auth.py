@@ -1134,7 +1134,7 @@ async def refresh_token(account_id: int, request: Request):
     if not account.get("refresh_token"):
         return RefreshResponse(
             success=True,
-            error="API key account — no refresh needed (valid for ~1 year)",
+            error="This is an API key account. It needs no refresh (valid for ~1 year).",
         )
 
     try:
@@ -1149,7 +1149,7 @@ async def refresh_token(account_id: int, request: Request):
             _TOKEN_REFRESH_TIMEOUT,
         )
         return _gateway_timeout(
-            "Token refresh timed out — server may be recovering a wedged refresh",
+            "Token refresh timed out. The server may be recovering a wedged refresh.",
             "REFRESH_TIMEOUT",
         )
     if success:
@@ -1207,7 +1207,7 @@ async def refresh_usage(account_id: int, request: Request):
             last_error_at=datetime.now(timezone.utc).isoformat(),
         )
         return _gateway_timeout(
-            "Usage fetch timed out — server may be recovering a wedged refresh",
+            "Usage fetch timed out. The server may be recovering a wedged refresh.",
             "REFRESH_TIMEOUT",
         )
 
@@ -1225,7 +1225,7 @@ async def refresh_usage(account_id: int, request: Request):
     if usage_data is None:
         is_codex = (account.get("provider") or "claude") == "codex"
         msg = (
-            "Failed to read Codex usage — is `codex` installed and signed in?"
+            "Failed to read Codex usage. Make sure `codex` is installed and signed in."
             if is_codex
             else "Failed to fetch usage from Anthropic API"
         )
@@ -1581,7 +1581,7 @@ async def validate_token(account_id: int, request: Request):
             _VALIDATE_TIMEOUT,
         )
         return _gateway_timeout(
-            "Validation timed out — server may be recovering a wedged refresh",
+            "Validation timed out. The server may be recovering a wedged refresh.",
             "VALIDATE_TIMEOUT",
         )
     return ValidateResponse(
@@ -1709,7 +1709,7 @@ async def use_account(account_id: int, request: Request):
             status_code=status.HTTP_400_BAD_REQUEST,
             content={
                 "error": {
-                    "message": "Account is disabled — enable it first",
+                    "message": "Account is disabled. Enable it first.",
                     "code": "ACCOUNT_DISABLED",
                 }
             },
@@ -1720,7 +1720,7 @@ async def use_account(account_id: int, request: Request):
             status_code=status.HTTP_400_BAD_REQUEST,
             content={
                 "error": {
-                    "message": "Account has invalid credentials — re-auth first",
+                    "message": "Account has invalid credentials. Re-auth first.",
                     "code": "ACCOUNT_INVALID",
                 }
             },
@@ -1753,7 +1753,7 @@ async def use_account(account_id: int, request: Request):
                 "restart_required": result.restart_required,
                 "message": (
                     "Switched the active Codex account. Restart Codex (or the "
-                    "Codex app/IDE) to pick it up — it caches auth at startup."
+                    "Codex app/IDE) to pick it up. Codex caches auth at startup."
                 ),
             },
         )
@@ -1764,9 +1764,9 @@ async def use_account(account_id: int, request: Request):
             content={
                 "error": {
                     "message": (
-                        "Account has no CC tokens — authorize Claude Code "
-                        "tokens first (credentials without a refresh token "
-                        "would expire in ~8 hours with no way to renew)"
+                        "Account has no CC tokens. Authorize Claude Code "
+                        "tokens first. Credentials without a refresh token "
+                        "expire in ~8 hours and cannot renew."
                     ),
                     "code": "CC_TOKEN_MISSING",
                 }

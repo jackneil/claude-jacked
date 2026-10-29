@@ -1014,7 +1014,7 @@ class TestCCIdentityValidation:
         tokens = {"access_token": "cc_at", "refresh_token": "cc_rt", "expires_in": 3600}
         profile = {}
 
-        with pytest.raises(RuntimeError, match="no email in token response or profile"):
+        with pytest.raises(RuntimeError, match="No email in token response or profile"):
             flow._store_cc_tokens(tokens, profile)
 
 

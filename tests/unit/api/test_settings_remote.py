@@ -32,6 +32,13 @@ def _reset_module_state(monkeypatch):
     set_restart_handler(None)
     set_active_plan(None)
     yield
+    # A test may leave its restart thread sleeping (the ~1.5 s flush). Wait for
+    # it while this test's handler and patches are still in place: if it woke
+    # after teardown it would find no handler and call the real os.execv.
+    for thread in threading.enumerate():
+        if thread.name == "jacked-remote-access-restart":
+            thread.join(timeout=10)
+            assert not thread.is_alive(), "remote-access restart thread did not finish"
     sr._restart_lock = threading.Lock()
     set_restart_handler(None)
     set_active_plan(None)

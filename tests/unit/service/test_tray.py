@@ -698,7 +698,7 @@ class TestStartedTimestamp:
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         assert runner._started_at is None
-        assert runner._started_text() == "Started: —"
+        assert runner._started_text() == "Started: -"
 
     def test_started_text_seconds_resolution(self):
         _skip_if_no_tray()

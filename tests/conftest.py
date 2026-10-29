@@ -21,6 +21,60 @@ from jacked.credentials.models import (
 REAL_HOME = Path.home()
 
 
+# --------------------------------------------------------------------------- #
+# Tripwire: nothing may replace the pytest process.
+#
+# A background thread that outlives its test (the remote-access restart thread
+# sleeps ~1.5 s, then calls os.execv when no restart handler is registered) can
+# exec AFTER monkeypatch has restored the real os.execv. The exec'd command then
+# exits on its own, often 0, so a CI job reported "pass" with the suite stopped
+# at 8% and no summary line (claude-jacked #190pr, macOS run 40802422355). The
+# guard is installed for the whole session, between tests too; a test that
+# patches os.execv itself still sees its own patch. An attempt raises OSError
+# (so the caller's own failure path runs) and fails the session at the end.
+# --------------------------------------------------------------------------- #
+
+EXEC_NAMES = ("execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe")
+_EXEC_ATTEMPTS: list[str] = []
+
+
+def _exec_guard(name):
+    def _refuse(*args, **kwargs):
+        import errno
+        import threading
+
+        _EXEC_ATTEMPTS.append(f"os.{name} from thread {threading.current_thread().name!r}")
+        raise OSError(errno.EPERM, f"test tripwire: os.{name} would replace the pytest process")
+
+    _refuse.__name__ = f"guarded_{name}"
+    return _refuse
+
+
+def pytest_configure(config):
+    import os
+
+    for name in EXEC_NAMES:
+        if hasattr(os, name):
+            setattr(os, name, _exec_guard(name))
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if _EXEC_ATTEMPTS:
+        session.config.get_terminal_writer().line(
+            "\nTRIPWIRE: something tried to replace the pytest process: "
+            + "; ".join(_EXEC_ATTEMPTS),
+            red=True,
+        )
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+@pytest.fixture
+def exec_attempts():
+    """The session's recorded exec attempts (a test that triggers one on
+    purpose removes its own entries so the session stays green)."""
+    return _EXEC_ATTEMPTS
+
+
 @pytest.fixture(autouse=True)
 def _isolate_home(monkeypatch, tmp_path_factory):
     """Give every test a temporary HOME (and USERPROFILE on Windows).

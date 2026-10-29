@@ -139,7 +139,7 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     content={
                         "error": {
-                            "message": f"Pattern '{pat}' in {list_name} list is dangerously broad — it would auto-approve everything"
+                            "message": f"Pattern '{pat}' in {list_name} list is dangerously broad. It would auto-approve everything."
                         }
                     },
                 )
@@ -152,8 +152,8 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
                         content={
                             "error": {
                                 "message": (
-                                    f"Pattern '{pat}' in {list_name} list is too broad — "
-                                    "path must have at least 3 directory segments"
+                                    f"Pattern '{pat}' in {list_name} list is too broad. "
+                                    "The path must have at least 3 directory segments."
                                 )
                             }
                         },
@@ -233,7 +233,7 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {
-                    "message": f"Pattern '{pattern}' is dangerously broad — it would auto-approve everything"
+                    "message": f"Pattern '{pattern}' is dangerously broad. It would auto-approve everything."
                 }
             },
         )
@@ -249,8 +249,8 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
                 content={
                     "error": {
                         "message": (
-                            f"Pattern '{pattern}' is too broad — "
-                            "path must have at least 3 directory segments"
+                            f"Pattern '{pattern}' is too broad. "
+                            "The path must have at least 3 directory segments."
                         )
                     }
                 },

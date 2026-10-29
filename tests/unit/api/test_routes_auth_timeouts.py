@@ -60,7 +60,7 @@ def test_refresh_usage_timeout_returns_504_and_resets_status(monkeypatch):
     assert body["error"]["code"] == "REFRESH_TIMEOUT"
     assert (
         body["error"]["message"]
-        == "Usage fetch timed out — server may be recovering a wedged refresh"
+        == "Usage fetch timed out. The server may be recovering a wedged refresh."
     )
 
     call = db.update_account.call_args
