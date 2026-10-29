@@ -911,16 +911,14 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                             oauth_extra_from,
                         )
 
+                        extra = encode_oauth_extra(oauth_extra_from(oauth), refresh_token)
+                        # CAS on BOTH tokens: an invalid_grant recovery keeps
+                        # the access token but replaces the lineage.
                         conn.execute(
                             "UPDATE accounts SET cc_oauth_extra = ? "
                             "WHERE id = ? AND cc_access_token IS ? "
-                            "AND cc_oauth_extra IS NOT ?",
-                            (
-                                encode_oauth_extra(oauth_extra_from(oauth), refresh_token),
-                                account_id,
-                                access_token,
-                                encode_oauth_extra(oauth_extra_from(oauth), refresh_token),
-                            ),
+                            "AND cc_refresh_token IS ? AND cc_oauth_extra IS NOT ?",
+                            (extra, account_id, access_token, refresh_token, extra),
                         )
                         conn.commit()
                     return  # Token unchanged

@@ -296,5 +296,23 @@ def test_the_scoped_sync_takes_fields_even_when_the_token_is_unchanged(tmp_path)
 def test_an_absurd_refresh_lifetime_is_ignored_not_raised():
     from jacked.credentials.oauth_extra import refresh_expiry_from_response
 
-    for value in (1e308, float("inf"), float("nan"), -5, "x", True):
+    for value in (1e308, 10**309, "1" + "0" * 309, float("inf"), float("nan"), -5, "x", True):
         assert refresh_expiry_from_response({"refresh_token_expires_in": value}, 1000) is None
+
+
+def test_the_scoped_sync_leaves_a_row_whose_lineage_moved_on(tmp_path):
+    """Same access token but another refresh token in the row (an invalid_grant
+    recovery keeps the access token and replaces the lineage): the file's
+    fields describe the old lineage and are not written."""
+    from jacked.launch import _sync_tokens_from_file
+
+    db = Database(str(tmp_path / "test.db"))
+    aid = db.create_account("owner@test.com", "primary-at", int(time.time()) + 3600)["id"]
+    db.update_account(aid, cc_access_token="same-at", cc_refresh_token=None)
+    config_dir = tmp_path / "accounts" / str(aid)
+    config_dir.mkdir(parents=True)
+    (config_dir / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+        "accessToken": "same-at", "refreshToken": "old-rt", "expiresAt": 9_999_999_999_000,
+        "refreshTokenExpiresAt": RT_EXPIRES}}))
+    _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+    assert db.get_account(aid)["cc_oauth_extra"] is None

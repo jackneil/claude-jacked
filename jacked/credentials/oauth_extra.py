@@ -45,6 +45,22 @@ _MAX_EPOCH_MS = 253_402_300_799_000
 _LINEAGE_KEY = "_lineage"
 
 
+def _positive_number(value: Any) -> float | None:
+    """``value`` as a positive finite float, else None. An int too large for a
+    float (10**309) is None, never an OverflowError.
+
+    >>> _positive_number(5), _positive_number(10**309), _positive_number(True)
+    (5.0, None, None)
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
 def lineage_of(refresh_token: str | None) -> str:
     """A short, one-way fingerprint of the refresh lineage (never the token).
 
@@ -70,9 +86,8 @@ def oauth_extra_from(oauth: Any) -> dict:
     if not isinstance(oauth, dict):
         return {}
     out: dict = {}
-    expires = oauth.get("refreshTokenExpiresAt")
-    if (isinstance(expires, (int, float)) and not isinstance(expires, bool)
-            and math.isfinite(expires) and 0 < expires <= _MAX_EPOCH_MS):
+    expires = _positive_number(oauth.get("refreshTokenExpiresAt"))
+    if expires is not None and expires <= _MAX_EPOCH_MS:
         out["refreshTokenExpiresAt"] = int(expires)
     for key in ("clientId", "subscriptionTypeSource"):
         value = oauth.get(key)
@@ -131,19 +146,21 @@ def refresh_expiry_from_response(data: Any, now_ms: int) -> int | None:
     True
     >>> refresh_expiry_from_response({"refresh_token_expires_in": 1e308}, 1000) is None
     True
+    >>> refresh_expiry_from_response({"refresh_token_expires_in": 10**309}, 1000) is None
+    True
+    >>> refresh_expiry_from_response({"refresh_token_expires_in": "1" + "0" * 309}, 1000) is None
+    True
     """
     if not isinstance(data, dict):
         return None
     seconds = data.get("refresh_token_expires_in")
     if isinstance(seconds, str) and seconds.isdigit():
         seconds = int(seconds)
-    # A non-finite or absurd value (Infinity, 1e308) would raise on the way to
-    # an int after the server already consumed the refresh token, losing the
-    # new pair; such a value says nothing usable, so it is ignored.
-    if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
-            or not math.isfinite(seconds) or seconds <= 0):
+    # A non-finite or absurd value (Infinity, 1e308, 10**309) would raise on
+    # the way to an int after the server already consumed the refresh token,
+    # losing the new pair; such a value says nothing usable, so it is ignored.
+    seconds = _positive_number(seconds)
+    if seconds is None or seconds > _MAX_EPOCH_MS:
         return None
     expires = now_ms + seconds * 1000
-    if not math.isfinite(expires) or expires > _MAX_EPOCH_MS:
-        return None
-    return int(expires)
+    return int(expires) if expires <= _MAX_EPOCH_MS else None
