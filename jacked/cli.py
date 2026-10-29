@@ -1418,27 +1418,46 @@ def _upgrade_migrate_settings(
     upgrade finish. That shipped a build whose settings never migrated and
     still said "Upgrade complete", so it is a transaction failure now.
     """
-    import subprocess
+    from jacked.service.updater import run_migrate_settings
 
     _upgrade_phase("migrating_settings", "begin")
-    console.print(f"\n[dim]$ {plan.jacked} install --force[/dim]")
-    code = subprocess.run([plan.jacked, "install", "--force"]).returncode
+    # Skill packs are refreshed after the restart (_upgrade_refresh_packs):
+    # their download was the slow part of this step and kept the service down.
+    console.print(f"\n[dim]$ {plan.jacked} install --force --no-packs[/dim]")
+    code, error = run_migrate_settings(plan.jacked)
     if code == 0:
         _upgrade_phase("migrating_settings", "ok")
         return
     _upgrade_phase(
         "migrating_settings", "failed",
-        error=f"jacked install exit {code}",
+        error=error,
         recovery="jacked install --force",
     )
     _upgrade_rollback_and_exit(
-        plan=replace(plan, reason=f"the settings migration failed (exit {code})"),
+        plan=replace(plan, reason=f"the settings migration failed ({error})"),
         new_version=new_version,
         detail=(
             "settings.json may be in a partial state. Backups are at "
             "~/.claude/settings.json.bak-*"
         ),
         no_rollback=no_rollback,
+    )
+
+
+def _upgrade_refresh_packs(jacked: str) -> None:
+    """Refresh skill packs once the new build runs; a failure only warns."""
+    from jacked.service.updater import run_refresh_packs
+
+    _upgrade_phase("refreshing_packs", "begin")
+    console.print(f"\n[dim]$ {jacked} packs update[/dim]")
+    reason = run_refresh_packs(jacked)
+    if reason is None:
+        _upgrade_phase("refreshing_packs", "ok")
+        return
+    _upgrade_phase("refreshing_packs", "warning")
+    console.print(
+        f"[yellow]Skill packs were not refreshed ({reason}).[/yellow] "
+        f"Run `{jacked} packs update` later."
     )
 
 
@@ -1488,12 +1507,119 @@ def _run_upgrade_inline(
         target_version=target_version,
     )
     lock = _acquire_upgrade_lock(previous_version, extras, target_version)
+    previous_handlers = _install_upgrade_signal_handlers()
     try:
         _run_upgrade_inline_locked(request)
+    except SystemExit:
+        # Every planned exit (a rollback, a refusal, the index-lag report)
+        # already recorded its own status and recovery text.
+        raise
+    except BaseException as exc:  # noqa: BLE001 - Ctrl-C, a signal, a crash
+        code = _upgrade_interrupted(exc, request)
+        raise SystemExit(code) from exc
     finally:
+        _restore_signal_handlers(previous_handlers)
         # Held for the whole transaction, released on success, on a rollback
         # (which exits through SystemExit) and on any unexpected raise.
         _release_upgrade_lock(lock)
+
+
+class _UpgradeInterrupted(BaseException):
+    """Raised by the SIGHUP/SIGTERM handler installed for the transaction."""
+
+
+# What a person runs after an interrupted upgrade: re-run the settings
+# migration on whatever is installed now, then restart the service on it.
+_INTERRUPTED_RECOVERY = "jacked install --force && jacked service restart"
+
+
+def _install_upgrade_signal_handlers() -> dict:
+    """Turn SIGHUP (a closed terminal) and SIGTERM into _UpgradeInterrupted for
+    the length of the transaction, so the interrupt guard runs. Returns the
+    previous handlers; a platform or thread without them returns {}."""
+    import signal
+
+    def _raise(signum, _frame):
+        raise _UpgradeInterrupted(signal.Signals(signum).name)
+
+    previous = {}
+    for name in ("SIGHUP", "SIGTERM"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            previous[sig] = signal.signal(sig, _raise)
+        except (ValueError, OSError):  # not the main thread, or not allowed
+            continue
+    return previous
+
+
+def _restore_signal_handlers(previous: dict) -> None:
+    import signal
+
+    for sig, handler in previous.items():
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            continue
+
+
+def _upgrade_interrupted(exc: BaseException, request: "_UpgradeRequest") -> int:
+    """The final guard for an upgrade that stopped outside its planned exits.
+
+    Before this, a Ctrl-C, a closed terminal (SIGHUP) or a crash between two
+    phases left the status record "in_progress" forever, wrote no recovery
+    file, and (when it hit the restart) left no service running (#178i). Now:
+    the status closes as failed with the phase it stopped in, the recovery file
+    names the repair, and a service that is down is started again (unless the
+    caller asked to leave the service alone). Returns the exit code.
+    """
+    from jacked.service import DEFAULT_HOST, DEFAULT_PORT
+    from jacked.service import update_status as _us
+
+    if isinstance(exc, KeyboardInterrupt):
+        kind, code = "Ctrl-C", 130
+    elif isinstance(exc, _UpgradeInterrupted):
+        kind, code = str(exc.args[0]) if exc.args else "a signal", 143
+    else:
+        kind, code = type(exc).__name__, 1
+    status = None
+    try:
+        status = _us.read_status(_us.UPDATE_STATUS_FILE)
+    except Exception:
+        logger.debug("Could not read the update status", exc_info=True)
+    phase = (status or {}).get("current_phase") or "an early step"
+    reason = f"the upgrade was interrupted ({kind}) during {phase}"
+    if not status or status.get("overall") in (None, "in_progress"):
+        try:
+            _us.mark_failed(_us.UPDATE_STATUS_FILE, error=reason, recovery=_INTERRUPTED_RECOVERY)
+        except Exception:
+            logger.debug("Could not mark the update status failed", exc_info=True)
+    _write_upgrade_recovery(reason, ["jacked install --force", "jacked service restart"])
+    logger.error("Upgrade interrupted: %s", reason, exc_info=not isinstance(
+        exc, (KeyboardInterrupt, _UpgradeInterrupted)))
+    console.print(f"\n[red]The upgrade stopped: {reason}.[/red]")
+
+    if not request.skip_service:
+        try:
+            from jacked.service.process import is_port_available
+
+            down = is_port_available(DEFAULT_HOST, DEFAULT_PORT)
+        except Exception:
+            down = False
+        if down:
+            try:
+                from jacked.service.platform import native_restart
+
+                ok, why = native_restart()
+            except Exception as restart_exc:  # noqa: BLE001
+                ok, why = False, type(restart_exc).__name__
+            console.print(
+                "[green]The service was down and is started again.[/green]"
+                if ok else f"[yellow]The service is down and did not start ({why}).[/yellow]"
+            )
+    console.print(f"Recovery: [cyan]{_INTERRUPTED_RECOVERY}[/cyan]")
+    return code
 
 
 @dataclass(frozen=True)
@@ -1551,6 +1677,7 @@ def _run_upgrade_inline_locked(request: "_UpgradeRequest") -> None:
         _upgrade_restart_or_rollback(
             plan, new_version, request.no_rollback, request.pid_file
         )
+    _upgrade_refresh_packs(jacked)
     # A clean upgrade retires the recovery file an earlier failure left behind.
     _clear_upgrade_recovery_file()
     if lagging:
@@ -1840,6 +1967,7 @@ def _spawn_windows_upgrade_helper(
         package_retry_block,
         release_install_line,
         wait_for_parent_block,
+        windows_refresh_packs_block,
     )
 
     my_pid = os.getpid()
@@ -2042,11 +2170,12 @@ def _spawn_windows_upgrade_helper(
         'jacked service preflight --timeout 120 2>&1\r\n'
         'if errorlevel 1 goto preflight_failed\r\n'
         'if not "%ERRORLEVEL%"=="0" goto preflight_failed\r\n'
-        'echo [%date% %time%] running jacked install --force\r\n'
-        'jacked install --force 2>&1\r\n'
+        'echo [%date% %time%] running jacked install --force --no-packs\r\n'
+        'jacked install --force --no-packs 2>&1\r\n'
         'if errorlevel 1 goto migrate_failed\r\n'
         'if not "%ERRORLEVEL%"=="0" goto migrate_failed\r\n'
-        + restart_line +
+        + restart_line
+        + windows_refresh_packs_block() +
         # A clean upgrade retires the breadcrumb an earlier failure left
         # behind, so nothing warns about a failure already repaired.
         'if exist ' + _WIN_FAILED_FILE + ' del ' + _WIN_FAILED_FILE + '\r\n'

@@ -90,9 +90,10 @@ class TestUpgradeCommand:
         result = runner.invoke(main, ["upgrade"])
 
         assert result.exit_code == 0
-        # Four blocking calls: package install, preflight (the transaction
-        # gate), settings migration, v2 restart.
-        assert mock_run.call_count == 4
+        # Five blocking calls: package install, preflight (the transaction
+        # gate), settings migration, v2 restart, then the skill-pack refresh.
+        assert mock_run.call_count == 5
+        assert mock_run.call_args_list[4][0][0] == ["/fake/jacked", "packs", "update"]
         uv_args = mock_run.call_args_list[0][0][0]
         assert "/fake/uv" in uv_args
         assert "claude-jacked[tray]" in uv_args
@@ -255,9 +256,10 @@ class TestUpgradeCommand:
         assert "upgrade complete" in result.output.lower()
         assert "quit the old tray" in result.output.lower()
         assert "service start" in result.output.lower()
-        # Package install, preflight, settings migration. No restart: the
-        # legacy tray cannot be authenticated, so nothing is signalled.
-        assert mock_run.call_count == 3
+        # Package install, preflight, settings migration, skill-pack refresh.
+        # No restart: the legacy tray cannot be authenticated, so nothing is
+        # signalled.
+        assert mock_run.call_count == 4
         assert mock_run.call_args_list[1][0][0] == [
             "/fake/jacked", "service", "preflight"
         ]
@@ -287,10 +289,11 @@ class TestUpgradeCommand:
         result = runner.invoke(main, ["upgrade", "--skip-service"])
 
         assert result.exit_code == 0
-        # Package install, preflight, settings migration. The service is
-        # untouched, and no detached Popen is spawned either. Preflight still
-        # runs: it changes no process, and it is the whole point of the gate.
-        assert mock_run.call_count == 3
+        # Package install, preflight, settings migration, skill-pack refresh.
+        # The service is untouched, and no detached Popen is spawned either.
+        # Preflight still runs: it changes no process, and it is the whole
+        # point of the gate.
+        assert mock_run.call_count == 4
         assert mock_run.call_args_list[1][0][0] == [
             "/fake/jacked", "service", "preflight"
         ]
@@ -1217,7 +1220,7 @@ class TestIndexLag:
 
     def test_a_partial_upgrade_finishes_the_transaction_then_reports(self, tmp_path):
         result, run = self._invoke(
-            [_ok(), _ok(), _ok(), _ok()], installed="0.107.1", target="0.107.2",
+            [_ok(), _ok(), _ok(), _ok(), _ok()], installed="0.107.1", target="0.107.2",
             version="0.107.0",
         )
         assert result.exit_code == 4, result.output
@@ -1226,14 +1229,14 @@ class TestIndexLag:
 
     def test_reaching_the_target_is_complete(self, tmp_path):
         result, _run = self._invoke(
-            [_ok(), _ok(), _ok(), _ok()], installed="0.107.1", target="0.107.1",
+            [_ok(), _ok(), _ok(), _ok(), _ok()], installed="0.107.1", target="0.107.1",
         )
         assert result.exit_code == 0, result.output
         assert "Upgrade complete." in result.output
 
     def test_an_unknown_target_keeps_the_old_behavior(self, tmp_path):
         result, _run = self._invoke(
-            [_ok(), _ok(), _ok(), _ok()], installed="0.107.0", target=None,
+            [_ok(), _ok(), _ok(), _ok(), _ok()], installed="0.107.0", target=None,
         )
         assert result.exit_code == 0, result.output
         assert "Upgrade complete." in result.output
@@ -1278,7 +1281,7 @@ def test_a_reinstall_of_the_running_version_keeps_next_as_the_status_target(tmp_
 
     from jacked.service import update_status as us
 
-    TestIndexLag()._invoke([_ok(), _ok(), _ok(), _ok()], installed="0.107.1",
+    TestIndexLag()._invoke([_ok(), _ok(), _ok(), _ok(), _ok()], installed="0.107.1",
                            target="0.107.1", version="0.107.1")
     assert json.loads(us.UPDATE_STATUS_FILE.read_text())["to_version"] == "next"
 
@@ -1306,3 +1309,81 @@ class TestTargetLookup:
         with patch("jacked.version_check.get_latest_pypi_version",
                    return_value='1.0" & del C:\\x & "'):
             assert cli._upgrade_target_version_impl() is None
+
+
+# ---------------------------------------------------------------------------
+# #178i: an interrupted upgrade never leaves the status stuck or the service down
+# ---------------------------------------------------------------------------
+
+
+class TestInterruptedUpgrade:
+    def _invoke(self, interrupt, port_free=True, restart_ok=True, args=()):
+        """Run `jacked upgrade` where the settings migration step raises
+        ``interrupt`` (a Ctrl-C, a signal, a crash)."""
+        from jacked.cli import main
+
+        stack = TestUpgradeIsATransaction._patches()
+        native = MagicMock(return_value=(restart_ok, "kickstarted"))
+        with (
+            stack[0], stack[1], stack[2], stack[3],
+            patch("subprocess.Popen"),
+            patch("subprocess.run") as run,
+            patch("jacked.__version__", "0.107.0"),
+            patch("jacked.cli._installed_package_version", return_value="0.107.1"),
+            patch("jacked.service.updater.run_migrate_settings", side_effect=interrupt),
+            patch("jacked.service.process.is_port_available", return_value=port_free),
+            patch("jacked.service.platform.native_restart", native),
+        ):
+            run.side_effect = [_ok(), _ok("[OK] Service contract OK")]
+            result = CliRunner().invoke(main, ["upgrade", *args])
+        return result, native
+
+    @pytest.mark.parametrize("interrupt, code, kind", [
+        (KeyboardInterrupt(), 130, "Ctrl-C"),
+        (None, 143, "SIGTERM"),
+        (RuntimeError("boom"), 1, "RuntimeError"),
+    ])
+    def test_the_status_closes_and_the_recovery_is_written(self, tmp_path, interrupt, code, kind):
+        import json
+
+        from jacked.cli import _UpgradeInterrupted
+        from jacked.service import update_status as us
+        from jacked.service.updater import RECOVERY_FILE
+
+        result, native = self._invoke(interrupt or _UpgradeInterrupted("SIGTERM"))
+        assert result.exit_code == code, result.output
+        data = json.loads(us.UPDATE_STATUS_FILE.read_text())
+        assert data["overall"] == "failed"
+        assert f"interrupted ({kind}) during migrating_settings" in data["error"]
+        assert data["recovery"] == "jacked install --force && jacked service restart"
+        assert "jacked install --force" in RECOVERY_FILE.read_text()
+
+    def test_a_service_that_is_down_is_started_again(self):
+        result, native = self._invoke(KeyboardInterrupt(), port_free=True)
+        native.assert_called_once()
+        assert "started again" in result.output
+
+    def test_a_running_service_is_left_alone(self):
+        result, native = self._invoke(KeyboardInterrupt(), port_free=False)
+        native.assert_not_called()
+
+    def test_skip_service_never_starts_the_service(self):
+        result, native = self._invoke(KeyboardInterrupt(), port_free=True, args=("--skip-service",))
+        native.assert_not_called()
+
+    def test_a_real_sigterm_reaches_the_guard(self, tmp_path):
+        """The handler is installed for the transaction: an actual SIGTERM to
+        this process during the migration becomes the guarded interrupt."""
+        import os
+        import signal
+
+        def send_sigterm(*args, **kwargs):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return (0, None)
+
+        if not hasattr(signal, "SIGTERM") or os.name != "posix":
+            pytest.skip("POSIX signals")
+        before = signal.getsignal(signal.SIGTERM)
+        result, _native = self._invoke(send_sigterm)
+        assert result.exit_code == 143, result.output
+        assert signal.getsignal(signal.SIGTERM) == before  # restored afterwards

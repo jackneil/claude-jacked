@@ -19,6 +19,10 @@ PHASES: list[dict] = [
     {"name": "waiting_port_free", "label": "Waiting for port to free"},
     {"name": "starting_service", "label": "Starting new service"},
     {"name": "verifying_service", "label": "Verifying new service"},
+    # After the service is back: downloading skill packs no longer keeps the
+    # service down (#178i). A failure here is a "warning": the upgrade itself
+    # succeeded, and `jacked packs update` retries it.
+    {"name": "refreshing_packs", "label": "Refreshing skill packs"},
     {"name": "rolling_back", "label": "Rolling back to the previous version"},
 ]
 

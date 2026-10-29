@@ -175,8 +175,10 @@ class TestRunUpdate:
             updater.run_update(parent_pid=12345, extras="tray")
 
         assert mock_wait.called
-        # uv install -> service preflight -> jacked install --force.
-        assert mock_run.call_count == 3
+        # uv install -> service preflight -> jacked install --force --no-packs
+        # -> (service up) -> jacked packs update.
+        assert mock_run.call_count == 4
+        assert mock_run.call_args_list[3][0][0] == ["/fake/jacked", "packs", "update"]
         uv_args = mock_run.call_args_list[0][0][0]
         assert "/fake/uv" in uv_args
         assert "tool" in uv_args and "install" in uv_args
@@ -741,6 +743,7 @@ class TestUpdaterRollback:
                 _ok(),
                 _ok("[OK] Service contract OK"),
                 _ok(),
+                _ok(),  # jacked packs update, after the service is up
             ],
             listen_results=_comes_up_after(1),
             version_answer="0.100.0",
@@ -841,8 +844,14 @@ class TestVerifyRejectsTheWrongBuild:
 
 
 def _healthy_runs():
-    """uv install, a passing preflight, jacked install --force."""
+    """uv install, a passing preflight, jacked install --force --no-packs."""
     return [_ok(), _ok("[OK] Service contract OK"), _ok()]
+
+
+def _successful_runs():
+    """A whole successful update: the healthy steps, then the skill-pack
+    refresh that runs once the new service is up (#178i)."""
+    return _healthy_runs() + [_ok()]
 
 
 class TestWaitingPortFreeIdentifiesTheListener:
@@ -877,7 +886,7 @@ class TestWaitingPortFreeIdentifiesTheListener:
         ):
             _run, popen, status, recovery = self._run_update(
                 monkeypatch, tmp_path,
-                run_results=_healthy_runs(),
+                run_results=_successful_runs(),
                 # The port never reads free: `jacked install` already activated
                 # a service on it, and /api/health fingerprints it as ours.
                 listen_results=True,
@@ -975,7 +984,7 @@ class TestVerifyingServiceUsesAConnectProbe:
 
         _run, popen, status, recovery = self._run_update(
             monkeypatch, tmp_path,
-            run_results=_healthy_runs(),
+            run_results=_successful_runs(),
             listen_results=_comes_up_after(1),
             version_answer="0.100.0",
         )
@@ -1008,7 +1017,7 @@ class TestVerifyingServiceUsesAConnectProbe:
     ):
         _run, _popen, status, _recovery = self._run_update(
             monkeypatch, tmp_path,
-            run_results=_healthy_runs(),
+            run_results=_successful_runs(),
             listen_results=_comes_up_after(1),
             version_answer="0.100.0",
         )
@@ -1028,7 +1037,7 @@ class TestVerifyingServiceUsesAConnectProbe:
         """
         _run, _popen, status, recovery = self._run_update(
             monkeypatch, tmp_path,
-            run_results=_healthy_runs(),
+            run_results=_successful_runs(),
             listen_results=_comes_up_after(1),
             version_answer=TimeoutError("read timed out"),
             health_answer=JACKED_HEALTH,
@@ -1064,7 +1073,7 @@ class TestVerifyingServiceUsesAConnectProbe:
 
         self._run_update(
             monkeypatch, tmp_path,
-            run_results=_healthy_runs(),
+            run_results=_successful_runs(),
             listen_results=_comes_up_after(1),
             version_answer=TimeoutError("read timed out"),
             health_answer=JACKED_HEALTH,
@@ -1116,7 +1125,7 @@ class TestVerifyingServiceUsesAConnectProbe:
     ):
         _run, _popen, status, recovery = self._run_update(
             monkeypatch, tmp_path,
-            run_results=_healthy_runs(),
+            run_results=_successful_runs(),
             listen_results=_comes_up_after(1),
             version_answer=None,      # /api/version refuses the connection
             health_answer=JACKED_HEALTH,   # but /api/health still identifies it
@@ -2202,3 +2211,43 @@ class TestClassifyJackedListener:
         opener.open.side_effect = TimeoutError()
         with patch("urllib.request.build_opener", return_value=opener):
             assert updater._identify_jacked_listener(8321, 2.0)[0] is False
+
+
+
+class TestSkillPacksRefreshAfterTheService:
+    """#178i: the settings migration no longer downloads skill packs while the
+    machine has no service, and a pack failure never fails the upgrade."""
+
+    def test_the_migration_skips_packs_and_has_a_timeout(self, monkeypatch):
+        import subprocess as sp
+
+        from jacked.service import updater
+
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"], seen["timeout"] = argv, kwargs.get("timeout")
+            return _ok()
+
+        monkeypatch.setattr(updater.subprocess, "run", fake_run)
+        assert updater.run_migrate_settings("/fake/jacked") == (0, None)
+        assert seen["argv"] == ["/fake/jacked", "install", "--force", "--no-packs"]
+        assert seen["timeout"] == updater.MIGRATE_TIMEOUT_SECONDS
+
+        def hang(argv, **kwargs):
+            raise sp.TimeoutExpired(argv, kwargs.get("timeout"))
+
+        monkeypatch.setattr(updater.subprocess, "run", hang)
+        code, error = updater.run_migrate_settings("/fake/jacked")
+        assert code != 0 and "timed out" in error
+
+    def test_a_failed_pack_refresh_is_a_warning_not_a_failure(self, tmp_path, monkeypatch):
+        run, popen, status, recovery = TestUpdaterRollback()._run_update(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs() + [_fail(1)],
+            listen_results=_comes_up_after(1),
+            version_answer="0.100.0",
+        )
+        assert status["overall"] == "succeeded"
+        packs = [p for p in status["phases"] if p["name"] == "refreshing_packs"]
+        assert packs and packs[-1]["status"] == "warning"

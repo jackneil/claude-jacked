@@ -19,6 +19,7 @@ def test_phases_in_expected_order():
         "waiting_port_free",
         "starting_service",
         "verifying_service",
+        "refreshing_packs",
         "rolling_back",
     ]
 

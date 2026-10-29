@@ -154,7 +154,7 @@ class TestNoLogfileRedirection:
     @pytest.mark.parametrize("which", sorted(BATCH_BUILDERS))
     def test_work_steps_are_present_and_unredirected(self, which):
         body = BATCH_BUILDERS[which]()["body"]
-        assert "jacked install --force 2>&1" in body
+        assert "jacked install --force --no-packs 2>&1" in body
         assert '"tool" "install"' in body
         upgrade_lines = [ln for ln in body.splitlines() if '"tool" "install"' in ln]
         assert upgrade_lines and all(
@@ -242,7 +242,7 @@ class TestPreflightGateAndRollback:
         # Only the FIRST occurrence matters: the rollback tail can mention
         # neither before the gate.
         gate = body.index("jacked service preflight --timeout 120 2>&1")
-        migrate = body.index("jacked install --force 2>&1")
+        migrate = body.index("jacked install --force --no-packs 2>&1")
         assert gate < migrate
 
     @pytest.mark.parametrize("which", ["tray", "cli"])
@@ -475,7 +475,7 @@ class TestEveryUpgradeStepIsChecked:
     def test_the_settings_migration_is_checked(self, which):
         lines = [ln for ln in self._success_path(which).split("\r\n") if ln]
         migrate = [
-            i for i, ln in enumerate(lines) if ln == "jacked install --force 2>&1"
+            i for i, ln in enumerate(lines) if ln == "jacked install --force --no-packs 2>&1"
         ]
         assert migrate, "the settings migration step is missing"
         nxt = lines[migrate[0] + 1]
@@ -488,7 +488,7 @@ class TestEveryUpgradeStepIsChecked:
     def test_the_settings_migration_failure_label_rolls_back(self, which):
         body = BATCH_BUILDERS[which]()["body"]
         lines = [ln for ln in self._success_path(which).split("\r\n") if ln]
-        migrate = lines.index("jacked install --force 2>&1")
+        migrate = lines.index("jacked install --force --no-packs 2>&1")
         label = lines[migrate + 1].rsplit(" ", 1)[1]
         assert ":" + label + "\r\n" in body, f"missing :{label} label"
         block = body.split(":" + label + "\r\n", 1)[1]

@@ -1079,23 +1079,19 @@ def run_update(
             return
         _end("preflight", "ok")
 
-        # Phase: migrating_settings
+        # Phase: migrating_settings. Skill packs are refreshed AFTER the new
+        # service is up (refreshing_packs): their download was the slow part
+        # of this step (61 s seen) and kept the machine without a service.
         _begin("migrating_settings")
-        log(f"Running: {jacked} install --force")
-        migrate_result = subprocess.run(
-            [jacked, "install", "--force"],
-            stdout=log_fh,
-            stderr=log_fh,
-            check=False,
-            creationflags=NO_WINDOW,
-        )
-        log(f"jacked install returncode: {migrate_result.returncode}")
+        log(f"Running: {jacked} install --force --no-packs")
+        migrate_code, migrate_error = run_migrate_settings(jacked, log_fh)
+        log(f"jacked install result: {migrate_error or 'exit 0'}")
 
-        if migrate_result.returncode != 0:
+        if migrate_code != 0:
             _end(
                 "migrating_settings",
                 "failed",
-                error=f"jacked install exit {migrate_result.returncode}",
+                error=migrate_error,
                 recovery="jacked install --force",
             )
             log(
@@ -1109,7 +1105,7 @@ def run_update(
             restored_ready = _start_and_verify(_current_version) == "ok"
             _fail_and_recover(
                 f"v{_target} could not migrate settings "
-                f"(jacked install exit {migrate_result.returncode}); "
+                f"({migrate_error}); "
                 "backups are at ~/.claude/settings.json.bak-*",
                 rollback.ok and restored_ready,
                 rollback.step or (None if restored_ready else ROLLBACK_STEP_RESTART),
@@ -1120,6 +1116,7 @@ def run_update(
         outcome = _start_and_verify(target_version)
         if outcome == "ok":
             log(f"Updater done - new service is listening on :{port}")
+            _refresh_packs_phase(jacked, log, log_fh)
             if RECOVERY_FILE.exists():
                 try:
                     RECOVERY_FILE.unlink()
@@ -1177,6 +1174,101 @@ def run_update(
                 logger.exception("Final-guard native_restart raised")
         _release_update_lock(_update_lock)
         log_fh.close()
+
+
+# `jacked install --force --no-packs`: settings migration only, a few seconds
+# normally. 600 s is ten times the slowest full install observed (61 s, with
+# pack downloads), so only a hung install reaches it; the timeout then fails
+# the step and the upgrade rolls back instead of waiting forever (#178i).
+MIGRATE_TIMEOUT_SECONDS = 600
+# `jacked packs update` clones from GitHub; generous, and never fatal.
+PACK_REFRESH_TIMEOUT_SECONDS = 900
+
+
+def run_migrate_settings(jacked: str, log_fh=None) -> "tuple[int, str | None]":
+    """Run the settings migration with a timeout. Returns (code, error text).
+
+    A timeout or a launch failure is a non-zero code with a values-free
+    reason, so every caller takes its own failure (rollback) path.
+    """
+    try:
+        result = subprocess.run(
+            [jacked, "install", "--force", "--no-packs"],
+            stdout=log_fh,
+            stderr=log_fh,
+            check=False,
+            timeout=MIGRATE_TIMEOUT_SECONDS,
+            creationflags=NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, f"jacked install timed out after {MIGRATE_TIMEOUT_SECONDS}s"
+    except OSError as exc:
+        return 127, f"jacked install could not start ({type(exc).__name__})"
+    if result.returncode != 0:
+        return result.returncode, f"jacked install exit {result.returncode}"
+    return 0, None
+
+
+def run_refresh_packs(jacked: str, log_fh=None) -> "str | None":
+    """Run `jacked packs update` after the service is back. None when it
+    worked, else a values-free reason. Never raises."""
+    try:
+        result = subprocess.run(
+            [jacked, "packs", "update"],
+            stdout=log_fh,
+            stderr=log_fh,
+            check=False,
+            timeout=PACK_REFRESH_TIMEOUT_SECONDS,
+            creationflags=NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        return f"timed out after {PACK_REFRESH_TIMEOUT_SECONDS}s"
+    except OSError as exc:
+        return f"could not start ({type(exc).__name__})"
+    return None if result.returncode == 0 else f"exit {result.returncode}"
+
+
+def _refresh_packs_phase(jacked: str, log, log_fh) -> None:
+    """The refreshing_packs phase of the detached updater (never fatal)."""
+    from jacked.service import update_status as _us
+
+    try:
+        _us.begin_phase(_us.UPDATE_STATUS_FILE, "refreshing_packs")
+    except Exception:
+        logger.debug("Could not open the refreshing_packs phase", exc_info=True)
+    reason = run_refresh_packs(jacked, log_fh)
+    log(f"jacked packs update: {reason or 'ok'}")
+    try:
+        _us.end_phase(
+            _us.UPDATE_STATUS_FILE, "refreshing_packs", "ok" if reason is None else "warning"
+        )
+    except Exception:
+        logger.debug("Could not close the refreshing_packs phase", exc_info=True)
+
+
+def windows_refresh_packs_block(drift_guard: str = "") -> str:
+    """Batch lines for the refreshing_packs phase (Windows helpers).
+
+    Runs after the service is verified. A failure is a warning, never a
+    rollback. Flat labels, no nested blocks (cmd.exe parsing).
+
+    >>> block = windows_refresh_packs_block()
+    >>> "jacked packs update 2>&1" in block and ":packsdone" in block
+    True
+    """
+    return (
+        "jacked _update_status refreshing_packs in_progress\r\n"
+        + drift_guard
+        + "jacked packs update 2>&1\r\n"
+        + 'if "%ERRORLEVEL%"=="0" goto packsok\r\n'
+        + "jacked _update_status refreshing_packs warning\r\n"
+        + "echo [%date% %time%] skill packs not refreshed; run: jacked packs update\r\n"
+        + "goto packsdone\r\n"
+        + ":packsok\r\n"
+        + "jacked _update_status refreshing_packs ok\r\n"
+        + ":packsdone\r\n"
+        + drift_guard
+    )
 
 
 def _find_updater_python() -> str | None:
@@ -1679,7 +1771,7 @@ def _spawn_windows_tray_updater(
         # Phase: migrating_settings
         "jacked _update_status migrating_settings in_progress\r\n"
         + DRIFT_GUARD
-        + "jacked install --force 2>&1\r\n"
+        + "jacked install --force --no-packs 2>&1\r\n"
         + goto_on_failure("migrate_failed")
         + "jacked _update_status migrating_settings ok\r\n"
         + DRIFT_GUARD
@@ -1730,6 +1822,7 @@ def _spawn_windows_tray_updater(
         ")\r\n"
         "jacked _update_status verifying_service ok\r\n"
         + DRIFT_GUARD
+        + windows_refresh_packs_block(DRIFT_GUARD)
         + "jacked _update_status_succeed\r\n"
         # A clean update retires the breadcrumb an earlier failure left behind,
         # so the next tray boot never warns about a repaired failure.

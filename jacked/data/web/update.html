@@ -17,11 +17,13 @@
         li.phase.ok { background: #064e3b; }
         li.phase.in_progress { background: #1e3a8a; }
         li.phase.failed { background: #7f1d1d; }
+        li.phase.warning { background: #78350f; }
         li.phase.pending { opacity: 0.55; }
         .dot { width: 0.7em; height: 0.7em; border-radius: 50%; display: inline-block; }
         .dot.ok { background: #10b981; }
         .dot.in_progress { background: #3b82f6; animation: pulse 1s infinite; }
         .dot.failed { background: #ef4444; }
+        .dot.warning { background: #f59e0b; }
         .dot.pending { background: #6b7280; }
         @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.3 } }
         .banner { padding: 1em; border-radius: 6px; margin: 1.5em 0;
@@ -64,6 +66,7 @@
         ["waiting_port_free",  "Waiting for port to free"],
         ["starting_service",   "Starting new service"],
         ["verifying_service",  "Verifying new service"],
+        ["refreshing_packs",   "Refreshing skill packs"],
         ["rolling_back",       "Rolling back to the previous version"],
     ];
 
