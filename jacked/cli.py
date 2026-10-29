@@ -915,12 +915,20 @@ def _index_lag(installed: str, target: str | None) -> bool:
     (True, False)
     >>> _index_lag("0.108.0", "0.107.1"), _index_lag("0.107.0", None)
     (False, False)
+    >>> _index_lag("0.109.0.dev3", "0.109.0"), _index_lag("0.109.0rc1", "0.109.0")
+    (True, True)
     """
     if not target or not installed:
         return False
-    from jacked.version_check import _parse_version_tuple
+    # PEP 440 ordering (pre-releases and dev builds sort before the release).
+    from packaging.version import InvalidVersion, Version
 
-    return _parse_version_tuple(installed) < _parse_version_tuple(target)
+    try:
+        return Version(installed) < Version(target)
+    except InvalidVersion:
+        from jacked.version_check import _parse_version_tuple
+
+        return _parse_version_tuple(installed) < _parse_version_tuple(target)
 
 
 def _index_lag_message(installed: str, target: str, changed: bool) -> str:
