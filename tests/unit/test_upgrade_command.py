@@ -710,7 +710,13 @@ class TestUpgradeWindows:
             return fd, path
 
         monkeypatch.setattr(_tempfile, "mkstemp", fake_mkstemp)
-        with patch("jacked.cli._upgrade_target_version", return_value="0.109.0"):
+        # Pin the running version below the target, as the other target
+        # tests do: on the release that ships 0.109.0 the real __version__
+        # equals the target and upgrade takes the "already current" path.
+        with (
+            patch("jacked.__version__", "0.108.0"),
+            patch("jacked.cli._upgrade_target_version", return_value="0.109.0"),
+        ):
             CliRunner().invoke(main, ["upgrade"])
         batch = open(created[0]).read()
         assert '_update_status_init "' in batch and '" "0.109.0" ' in batch
