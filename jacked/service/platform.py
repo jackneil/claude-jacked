@@ -329,3 +329,37 @@ def uninstall_autostart() -> str:
 
     else:
         return "Auto-start not supported on this platform."
+
+
+def launchd_job_never_ran(run=subprocess.run, uid: "int | None" = None) -> bool:
+    """True when the launchd job is loaded but launchd never spawned it.
+
+    Seen 2026-10-22 after an interrupted upgrade: `launchctl print` showed
+    ``state = not running`` and ``runs = 0`` for a job loaded with RunAtLoad,
+    while `jacked service status` said "Autostart: enabled" and nothing was
+    going to start it (#178i). Only the job's top-level fields count (one tab
+    deep; nested dictionaries carry their own ``state``). Never raises; any
+    other platform or a probe failure is False.
+
+    >>> class _R:
+    ...     returncode = 0
+    ...     stdout = "gui/501/x = {\\n\\tstate = not running\\n\\truns = 0\\n\\t\\tstate = active\\n}"
+    >>> launchd_job_never_ran(run=lambda *a, **k: _R(), uid=501) if sys.platform == "darwin" else True
+    True
+    """
+    if sys.platform != "darwin":
+        return False
+    import re
+
+    domain = f"gui/{os.getuid() if uid is None else uid}/{LAUNCHD_LABEL}"
+    try:
+        probe = run(
+            ["launchctl", "print", domain],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if probe.returncode != 0:
+        return False
+    fields = dict(re.findall(r"^\t(state|runs) = (.+)$", probe.stdout or "", re.M))
+    return fields.get("runs", "").strip() == "0" and fields.get("state", "").strip() != "running"

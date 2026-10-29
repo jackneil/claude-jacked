@@ -5543,6 +5543,7 @@ def doctor():
     from jacked import __version__
     from jacked.install_method import detect_install_method
     from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
+    from jacked.service.platform import launchd_job_never_ran
     from jacked.service.process import (
         is_port_available, is_process_alive, read_pid,
     )
@@ -5589,7 +5590,11 @@ def doctor():
             f"[bold]Service:[/bold] [yellow]NOT RUNNING[/yellow] "
             f"(port {DEFAULT_PORT} free)"
         )
-        console.print("  Recovery: [cyan]jacked service start[/cyan]")
+        if launchd_job_never_ran():
+            console.print(
+                "  [yellow]The launchd job is loaded but never ran.[/yellow]"
+            )
+        console.print(f"  Recovery: [cyan]{_service_start_command()}[/cyan]")
         if pid_info and not pid_alive:
             console.print(
                 f"  [dim]Stale PID file at {PID_FILE} "
@@ -5636,7 +5641,7 @@ def doctor():
                 console.print(f"  Find the owner: [cyan]{_port_owner_hint()}[/cyan]")
                 console.print(
                     "  Recovery: stop that process, then "
-                    "[cyan]jacked service start[/cyan]"
+                    f"[cyan]{_service_start_command()}[/cyan]"
                 )
             else:
                 console.print(
@@ -7652,6 +7657,25 @@ def _rearm_native_owner(port: int) -> bool:
     return _ensure_autostart_and_running(port, label="Service")
 
 
+def _service_start_command() -> str:
+    """The command that brings the service up the right way on this machine.
+
+    With autostart enabled, `jacked service start` runs the service in the
+    foreground (it is also the supervisor's entry point) and never returns,
+    which reads as "stuck" (#178i); `jacked service restart` hands the start to
+    the supervisor instead. Without autostart, `service start` is the command.
+    """
+    try:
+        from jacked.service.autostart import AutostartState
+        from jacked.service.platform import inspect_autostart
+
+        if inspect_autostart().state is AutostartState.OWNED_ENABLED:
+            return "jacked service restart"
+    except Exception:
+        logger.debug("Autostart state unreadable", exc_info=True)
+    return "jacked service start"
+
+
 @service.command(name="status")
 def service_status():
     """Show evidence-qualified service state and discovered endpoint."""
@@ -7670,6 +7694,16 @@ def service_status():
     else:
         detail = f" ({autostart.reason})" if autostart.reason else ""
         autostart_label = f"[yellow]{autostart.state.value}{detail}[/yellow]"
+    if autostart.state is AutostartState.OWNED_ENABLED:
+        from jacked.service.platform import launchd_job_never_ran
+
+        if launchd_job_never_ran():
+            # Loaded with RunAtLoad but never spawned (#178i): "enabled" alone
+            # read as fine while nothing was going to start the service.
+            autostart_label += (
+                " [yellow](the launchd job is loaded but never ran; "
+                "run `jacked service restart`)[/yellow]"
+            )
     if endpoint.source == "manifest":
         from jacked.service.ipc import ControlAction, send_native_control
 
