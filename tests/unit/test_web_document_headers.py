@@ -38,3 +38,11 @@ def test_the_update_page_stays_frameable_by_the_local_bootstrap(client):
 def test_non_html_responses_carry_no_document_policy(client):
     assert "content-security-policy" not in client.get("/api/health").headers
     assert "content-security-policy" not in client.get("/js/app.js").headers
+
+
+def test_the_cdn_backed_api_doc_pages_are_not_served(client):
+    for path in ("/docs", "/redoc"):
+        response = client.get(path)
+        assert "swagger" not in response.text.lower() and "redoc" not in response.text.lower()
+        assert "cdn.jsdelivr.net" not in response.text
+    assert client.get("/openapi.json").json()["info"]["title"] == "jacked dashboard"

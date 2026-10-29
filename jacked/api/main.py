@@ -494,6 +494,11 @@ app = FastAPI(
     description="Local web dashboard for Claude Code account management and analytics.",
     version=__version__,
     lifespan=lifespan,
+    # FastAPI's /docs and /redoc pages load Swagger UI and ReDoc from a CDN,
+    # which would run third-party code on the dashboard origin (and the
+    # document CSP refuses it). Nothing uses them; /openapi.json stays.
+    docs_url=None,
+    redoc_url=None,
 )
 
 _cors_origins = build_allowed_origins(
