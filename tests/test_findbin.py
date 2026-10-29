@@ -578,8 +578,10 @@ def test_refuses_a_mount_point_planted_in_the_sticky_tmp(caplog):
             fields[stat.ST_DEV] += 1
             return os.stat_result(fields)
 
+        # Both reads of the planted directory report the other device once
+        # (on Linux _secure_lstat IS os.lstat, so it must not bump twice).
         with patch.object(findbin, "_secure_lstat",
-                          side_effect=lambda p, k: other_device(real_secure(p, k)) if p.endswith(home.name) else real_secure(p, k)), \
+                          side_effect=lambda p, k: other_device(real_lstat(p)) if p.endswith(home.name) else real_secure(p, k)), \
              patch.object(findbin.os, "lstat",
                           side_effect=lambda p: other_device(real_lstat(p)) if str(p).endswith(home.name) else real_lstat(p)), \
              patch("jacked.findbin.shutil.which", return_value=None), \
