@@ -219,14 +219,41 @@ def test_init_or_adopt_over_stale_in_progress_initializes(tmp_path):
 
 
 def test_read_stale_in_progress_returns_none(tmp_path):
+    """An old record whose updater is gone (or unknown) is a zombie."""
     from jacked.service.update_status import (
-        init_status, read_status, STALE_IN_PROGRESS_SECONDS,
+        NO_UPDATER_PID, init_status, read_status, STALE_IN_PROGRESS_SECONDS,
     )
     p = tmp_path / "status.json"
-    init_status(p, from_version="a", to_version="b", method="uv")
+    init_status(p, from_version="a", to_version="b", method="uv", updater_pid=NO_UPDATER_PID)
     old = time.time() - STALE_IN_PROGRESS_SECONDS - 10
     os.utime(p, (old, old))
     assert read_status(p) is None
+
+
+def test_an_old_record_of_a_live_updater_stays_visible(tmp_path):
+    """The skill-pack refresh may run 15 minutes without writing its record.
+    While the updater runs, age alone must not hide the update (the page
+    would report it finished and stop polling)."""
+    from jacked.service.update_status import (
+        abandoned_status, init_status, read_status, STALE_IN_PROGRESS_SECONDS,
+    )
+    p = tmp_path / "status.json"
+    init_status(p, from_version="a", to_version="b", method="uv")  # this live process
+    old = time.time() - STALE_IN_PROGRESS_SECONDS - 600
+    os.utime(p, (old, old))
+    assert read_status(p) is not None
+    assert abandoned_status(p) is None
+
+
+def test_the_api_reports_whether_the_updater_runs(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from jacked.api.main import app as _app
+    from jacked.service import update_status as us_mod
+
+    p = tmp_path / "status.json"
+    us_mod.init_status(p, from_version="a", to_version="b", method="uv")
+    monkeypatch.setattr(us_mod, "UPDATE_STATUS_FILE", p)
+    assert TestClient(_app).get("/api/update/status").json()["updater_alive"] is True
 
 
 def test_read_fresh_in_progress_returns_data(tmp_path):
@@ -246,7 +273,7 @@ def test_api_endpoint_returns_null_when_no_status_file(tmp_path, monkeypatch):
     client = TestClient(_app)
     r = client.get("/api/update/status")
     assert r.status_code == 200
-    assert r.json() == {"status": None, "mtime_iso": None}
+    assert r.json() == {"status": None, "mtime_iso": None, "updater_alive": None}
 
 
 def test_api_endpoint_returns_status_content_with_mtime(tmp_path, monkeypatch):
@@ -801,3 +828,21 @@ def test_init_status_clobbers_a_record_whose_updater_is_proven_dead(tmp_path, mo
     with pytest.raises(us.LockBusy):  # indeterminate keeps the mtime rule
         us.init_status(path, "1.0.0", "1.4.0", "uv")
 
+
+
+def test_a_reused_pid_does_not_keep_an_update_alive(tmp_path, monkeypatch):
+    """The updater exits and an unrelated process takes its pid: same pid,
+    different creation identity, so the record is not proven alive."""
+    from jacked.service import update_status as us
+
+    p = tmp_path / "status.json"
+    us.init_status(p, from_version="a", to_version="b", method="uv")
+    data = us.read_status(p)
+    assert isinstance(data.get("updater_creation_id"), str)
+    assert us.updater_liveness(data) is True
+    monkeypatch.setattr(us, "_creation_id", lambda pid: "another-process")
+    assert us.updater_liveness(data) is False
+    monkeypatch.setattr(us, "_creation_id", lambda pid: None)
+    assert us.updater_liveness(data) is None  # cannot tell: the mtime rule applies
+    legacy = {k: v for k, v in data.items() if k != "updater_creation_id"}
+    assert us.updater_liveness(legacy) is True  # a record from before the field

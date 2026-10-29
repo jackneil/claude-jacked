@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from jacked.findbin import find_bin
 from jacked.install_summary import DEFAULT_LAST_INSTALL_PATH as _LAST_INSTALL_PATH
+from jacked.memory.vault import atomic_write_text
 from jacked.service import update_status as _update_status_mod
 
 logger = logging.getLogger(__name__)
@@ -305,17 +306,22 @@ def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONRes
 
 
 @router.get("/update/status")
-async def get_update_status():
+def get_update_status():
     """Return the current update-status JSON + its mtime.
 
     Used by /update.html (polled every 1s). mtime_iso is server-reported
     so the client-side stuck-detection doesn't reset on repeated stale reads.
     Returns {"status": null, "mtime_iso": null} when no update is in flight.
+    A plain def (threadpool): the liveness probe can read the process table.
     """
     data, mtime_iso = _update_status_mod.read_status_with_mtime(
         _update_status_mod.UPDATE_STATUS_FILE,
     )
-    return {"status": data, "mtime_iso": mtime_iso}
+    # True / False / None (no pid, or the probe could not tell). The page
+    # treats an unchanged record as abandoned only when this is not True,
+    # the same rule update_status.in_progress_is_stale applies.
+    alive = _update_status_mod.updater_liveness(data) if data else None
+    return {"status": data, "mtime_iso": mtime_iso, "updater_alive": alive}
 
 
 @router.get("/install/summary")
@@ -591,7 +597,9 @@ def update_project_lessons(body: LessonsUpdateRequest, request: Request):
     content = "\n".join(header_lines + lesson_lines) + "\n"
 
     try:
-        lessons_path.write_text(content, encoding="utf-8")
+        # Two tabs can save at once (this handler runs in the threadpool):
+        # a whole-file replace keeps either version intact, never a mix.
+        atomic_write_text(lessons_path, content)
     except Exception:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

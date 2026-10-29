@@ -91,6 +91,7 @@
         currentVersion: null,
         overall: "in_progress",
         currentPhase: null,
+        updaterAlive: null,
         haveRecord: false,
         error: null,
         recovery: null,
@@ -241,7 +242,7 @@
         const targetKnown = state.targetVersion && state.targetVersion !== "next";
         if (!(targetKnown && state.currentVersion === state.targetVersion)) return false;
         const age = statusAgeMs();
-        return !state.haveRecord || (age !== null && age > STALE_MS);
+        return !state.haveRecord || (age !== null && age > STALE_MS && state.updaterAlive !== true);
     }
 
     function renderBanner() {
@@ -254,7 +255,7 @@
 
         const serverAgeMs = statusAgeMs();
         const stuck = !done && state.overall !== "failed" &&
-            serverAgeMs !== null && serverAgeMs > STALE_MS;
+            serverAgeMs !== null && serverAgeMs > STALE_MS && state.updaterAlive !== true;
         renderHeading(done);
 
         if (done) {
@@ -310,6 +311,10 @@
             const r = await fetch("/api/update/status", {cache: "no-store"});
             if (r.ok) {
                 const body = await r.json();
+                // On every answer, a null status included: a running updater
+                // keeps a long phase (the skill-pack refresh) alive however
+                // long its record stays unchanged, and only while it runs.
+                state.updaterAlive = body ? body.updater_alive : null;
                 if (body && body.status) {
                     state.haveRecord = true;
                     state.serviceDownSince = null;

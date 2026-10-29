@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -127,15 +128,24 @@ def read_status(path: Path) -> Optional[dict]:
     elif overall == "in_progress":
         # An aborted updater leaves in_progress forever; without this the
         # dashboard would show a zombie "updating..." banner indefinitely.
-        # init_status already treats a file of this age as abandoned — mirror
-        # that so the read side and the write side agree on staleness.
+        # The same rule as abandoned_status: old AND not proven alive, so a
+        # long phase (a 15-minute pack refresh) stays visible while it runs.
         try:
-            age = time.time() - path.stat().st_mtime
-            if age > STALE_IN_PROGRESS_SECONDS:
+            if in_progress_is_stale(path, data):
                 return None
         except OSError:
             return None
     return data
+
+
+def in_progress_is_stale(path: Path, data: dict) -> bool:
+    """True when an ``in_progress`` record is older than the stale window AND
+    its updater is not proven alive. One phase can run longer than the window
+    without writing (the skill-pack refresh may take 15 minutes), so age alone
+    must never end an update whose updater still runs. Raises OSError when the
+    file cannot be read."""
+    age = time.time() - path.stat().st_mtime
+    return age > STALE_IN_PROGRESS_SECONDS and updater_liveness(data) is not True
 
 
 def abandoned_status(path: Path) -> Optional[dict]:
@@ -169,16 +179,12 @@ def abandoned_status(path: Path) -> Optional[dict]:
     if data is None or data.get("overall") != "in_progress":
         return None
     try:
-        age = time.time() - path.stat().st_mtime
+        stale = in_progress_is_stale(path, data)
     except OSError:
         return None
-    if age <= STALE_IN_PROGRESS_SECONDS:
-        return None
     # A proven-live updater is never abandoned. Proven-dead or indeterminate
-    # (no pid, probe failed) falls back to the mtime rule above.
-    if _updater_liveness(data) is True:
-        return None
-    return data
+    # (no pid, probe failed) falls back to the mtime rule.
+    return data if stale else None
 
 
 def _resolve_updater_pid(updater_pid: Optional[int]) -> Optional[int]:
@@ -190,18 +196,79 @@ def _resolve_updater_pid(updater_pid: Optional[int]) -> Optional[int]:
     return updater_pid
 
 
-def _updater_liveness(data: dict) -> Optional[bool]:
+def _creation_id(pid: Optional[int]) -> Optional[str]:
+    """A marker of when ``pid`` started, or None when it cannot be read.
+
+    Read in-process on every platform, never through a subprocess: this runs
+    on every status write and every status poll. Linux and Windows use
+    ``process_identity`` (/proc, the Windows API); macOS reads the start time
+    with ``proc_pidinfo`` instead of the ``ps`` that ``process_identity``
+    runs there.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        if sys.platform == "darwin":
+            return _darwin_start_marker(pid)
+        from jacked.service.instance_storage import process_identity
+
+        return process_identity(pid).creation_id
+    except Exception:  # noqa: BLE001 - an unreadable identity is simply unknown
+        return None
+
+
+def _darwin_start_marker(pid: int) -> Optional[str]:
+    """``proc_pidinfo(PROC_PIDTBSDINFO)``: the struct proc_bsdinfo start time
+    (sys/proc_info.h), in-process."""
+    import ctypes
+    import ctypes.util
+
+    class _BsdInfo(ctypes.Structure):
+        _fields_ = [
+            *[(name, ctypes.c_uint32) for name in (
+                "flags", "status", "xstatus", "pid", "ppid", "uid", "gid",
+                "ruid", "rgid", "svuid", "svgid", "rfu_1")],
+            ("comm", ctypes.c_char * 16),
+            ("name", ctypes.c_char * 32),
+            *[(name, ctypes.c_uint32) for name in ("nfiles", "pgid", "pjobc", "tdev", "tpgid")],
+            ("nice", ctypes.c_int32),
+            ("start_tvsec", ctypes.c_uint64),
+            ("start_tvusec", ctypes.c_uint64),
+        ]
+
+    libproc = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib")
+    info = _BsdInfo()
+    size = libproc.proc_pidinfo(pid, 3, ctypes.c_uint64(0), ctypes.byref(info), ctypes.sizeof(info))
+    if size != ctypes.sizeof(info) or info.pid != pid:
+        return None
+    return f"darwin-start:{info.start_tvsec}.{info.start_tvusec:06d}"
+
+
+def updater_liveness(data: dict) -> Optional[bool]:
     """True when the recording process runs, False when it is gone, None when
-    the record names no usable pid or the probe is indeterminate."""
+    the record names no usable pid or the probe is indeterminate.
+
+    A pid alone can be reused by an unrelated process (after the updater
+    exits, or after a reboot), which would keep an abandoned record alive for
+    good. A record that carries ``updater_creation_id`` counts as alive only
+    while that same process (same creation identity) holds the pid.
+    """
     pid = data.get("updater_pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
     from jacked.service.process import process_liveness
 
     try:
-        return process_liveness(pid)
+        alive = process_liveness(pid)
     except Exception:  # noqa: BLE001 - a probe failure is indeterminate, not proof
         return None
+    recorded = data.get("updater_creation_id")
+    if alive is not True or not isinstance(recorded, str):
+        return alive  # dead, unknown, or a record written before the field
+    current = _creation_id(pid)
+    if current is None:
+        return None
+    return current == recorded
 
 
 def read_status_with_mtime(path: Path) -> tuple[Optional[dict], Optional[str]]:
@@ -256,7 +323,7 @@ def init_status(
         # tray's pre-init is exempt: the tray that wrote it is expected to be
         # gone by the time the updater arrives, and adoption consumes it.
         if age <= STALE_IN_PROGRESS_SECONDS and (
-            prior.get("preinit") is True or _updater_liveness(prior) is not False
+            prior.get("preinit") is True or updater_liveness(prior) is not False
         ):
             raise LockBusy(
                 "Another updater is in-flight (started "
@@ -276,6 +343,7 @@ def init_status(
         "recovery": None,
         "log_path": log_path,
         "updater_pid": _resolve_updater_pid(updater_pid),
+        "updater_creation_id": _creation_id(_resolve_updater_pid(updater_pid)),
     }
     if preinit:
         data["preinit"] = True
@@ -346,8 +414,10 @@ def init_or_adopt_status(
                 # An updater that cannot be probed (a Windows batch) must
                 # not leave the dead tray's pid on the record.
                 prior.pop("updater_pid", None)
+                prior.pop("updater_creation_id", None)
             else:
                 prior["updater_pid"] = claimed
+                prior["updater_creation_id"] = _creation_id(claimed)
             # A claim that cannot be written leaves the tray's dead pid on
             # the record; the update would then read as abandoned mid-run.
             # Surface it as the LockBusy the caller already handles.
