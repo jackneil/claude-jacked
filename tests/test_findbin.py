@@ -11,11 +11,6 @@ import pytest
 from jacked.findbin import find_bin
 
 
-@pytest.fixture(autouse=True)
-def _machine_dirs_above_tmp_are_sound(trusted_tmp_ancestors):
-    """The fake installs below live under tmp_path; see trusted_tmp_ancestors."""
-
-
 @pytest.fixture
 def fake_bin(tmp_path):
     """Create a fake executable in a temp directory."""
@@ -227,7 +222,7 @@ def test_refuses_a_world_writable_ancestor_directory(tmp_path, caplog):
             assert find_bin("codex") is None
     finally:
         home.chmod(0o755)
-    assert "ancestor is world-writable" in caplog.text
+    assert "a directory is world-writable" in caplog.text
     assert str(exe) not in caplog.text
 
 
@@ -274,3 +269,232 @@ def test_refuses_a_symlink_planted_by_another_user(tmp_path, caplog):
          caplog.at_level("WARNING", logger="jacked.findbin"):
         assert find_bin("codex") is None
     assert "symlink is not owned" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Hop-aware resolution (#186i, #185i): every directory, every symlink and the
+# final file on the way are checked, intermediate hops included.
+# ---------------------------------------------------------------------------
+
+def _executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+    return path
+
+
+def _lookup(home, caplog, name="codex", **env):
+    with patch("jacked.findbin.shutil.which", return_value=None), \
+         patch.dict(os.environ, env), \
+         caplog.at_level("WARNING", logger="jacked.findbin"):
+        return find_bin(name, home=str(home))
+
+
+@posix_only
+def test_refuses_a_hop_through_a_world_writable_directory(tmp_path, caplog):
+    """~/.local/bin/codex -> /shared/codex -> ~/pkg/codex: the first link's
+    directory and the final target are sound, but the MIDDLE link sits in a
+    world-writable directory where another user could repoint it. The old two
+    walks never looked at /shared."""
+    home = tmp_path / "home"
+    real = _executable(home / "pkg" / "codex")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "codex").symlink_to(real)
+    shared.chmod(0o777)
+    (home / ".local" / "bin").mkdir(parents=True)
+    (home / ".local" / "bin" / "codex").symlink_to(shared / "codex")
+    try:
+        assert _lookup(home, caplog) is None
+    finally:
+        shared.chmod(0o755)
+    assert "a directory is world-writable" in caplog.text
+    assert str(tmp_path) not in caplog.text
+    # Once the middle directory is sound the same chain is accepted.
+    assert _lookup(home, caplog) == str(home / ".local" / "bin" / "codex")
+
+
+@posix_only
+def test_refuses_a_user_link_to_a_world_writable_bin(tmp_path, caplog):
+    """~/.local/bin is the user's own symlink, but it points at a 0o777
+    directory that holds the candidate."""
+    home = tmp_path / "home"
+    shared_bin = tmp_path / "shared-bin"
+    _executable(shared_bin / "codex")
+    (home / ".local").mkdir(parents=True)
+    (home / ".local" / "bin").symlink_to(shared_bin)
+    shared_bin.chmod(0o777)
+    try:
+        assert _lookup(home, caplog) is None
+    finally:
+        shared_bin.chmod(0o755)
+    assert "world-writable" in caplog.text
+
+
+@posix_only
+def test_refuses_a_link_to_a_world_writable_parent_of_bin(tmp_path, caplog):
+    """~/.local is a link to a 0o777 directory with a real bin/ below it:
+    another user could replace bin/ there."""
+    home = tmp_path / "home"
+    shared = tmp_path / "shared-local"
+    _executable(shared / "bin" / "codex")
+    home.mkdir()
+    (home / ".local").symlink_to(shared)
+    shared.chmod(0o777)
+    try:
+        assert _lookup(home, caplog) is None
+    finally:
+        shared.chmod(0o755)
+    assert "a directory is world-writable" in caplog.text
+
+
+@posix_only
+def test_accepts_a_home_under_the_sticky_tmp():
+    """Containers set HOME under /tmp. /tmp is root-owned, sticky and
+    world-writable: others may not rename or delete the user's own real
+    directory there, so a home below it keeps the fallback."""
+    import tempfile
+
+    home = Path(tempfile.mkdtemp(prefix="jk-findbin-home-", dir="/tmp"))
+    try:
+        exe = _executable(home / ".local" / "bin" / "codex")
+        with patch("jacked.findbin.shutil.which", return_value=None):
+            assert find_bin("codex", home=str(home)) == str(exe)
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(home)
+
+
+@posix_only
+def test_refuses_a_link_planted_directly_in_tmp(caplog):
+    """A symlink (or file) directly in the shared /tmp is refused whoever owns
+    it: the directory that holds the binary gets the strict rule."""
+    import tempfile
+
+    work = Path(tempfile.mkdtemp(prefix="jk-findbin-", dir=os.path.expanduser("~")
+                                 if os.access(os.path.expanduser("~"), os.W_OK) else None))
+    real = _executable(work / "pkg" / "codex")
+    link = Path(tempfile.mktemp(prefix="jk-findbin-link-", dir="/tmp"))
+    link.symlink_to(real)
+    try:
+        bin_dir = os.path.dirname(str(link))
+        with patch("jacked.findbin.shutil.which", return_value=None), \
+             patch.dict(os.environ, {"UV_TOOL_BIN_DIR": bin_dir}), \
+             caplog.at_level("WARNING", logger="jacked.findbin"):
+            assert find_bin(link.name, home="/nonexistent") is None
+        assert "shared sticky directory" in caplog.text
+        # Planted by another user: refused just the same.
+        caplog.clear()
+        with patch("jacked.findbin.shutil.which", return_value=None), \
+             patch("jacked.findbin._current_uid", return_value=os.getuid() + 4242), \
+             patch.dict(os.environ, {"UV_TOOL_BIN_DIR": bin_dir}), \
+             caplog.at_level("WARNING", logger="jacked.findbin"):
+            assert find_bin(link.name, home="/nonexistent") is None
+        assert "refused" in caplog.text
+    finally:
+        link.unlink()
+        import shutil as _shutil
+        _shutil.rmtree(work)
+
+
+@posix_only
+def test_refuses_a_candidate_directly_in_tmp_via_uv_tool_bin_dir(caplog):
+    """UV_TOOL_BIN_DIR=/tmp (on macOS /tmp is itself a link to /private/tmp):
+    a binary directly in the shared directory is refused."""
+    import tempfile
+
+    fd, name = tempfile.mkstemp(prefix="jk-findbin-exe-", dir="/tmp")
+    os.close(fd)
+    os.chmod(name, 0o755)
+    try:
+        with patch("jacked.findbin.shutil.which", return_value=None), \
+             patch.dict(os.environ, {"UV_TOOL_BIN_DIR": "/tmp"}), \
+             caplog.at_level("WARNING", logger="jacked.findbin"):
+            assert find_bin(os.path.basename(name), home="/nonexistent") is None
+        assert "shared sticky directory" in caplog.text
+    finally:
+        os.unlink(name)
+
+
+@posix_only
+def test_refuses_a_home_with_dot_dot(tmp_path, caplog):
+    home = tmp_path / "home"
+    _executable(home / ".local" / "bin" / "codex")
+    dotted = f"{tmp_path}/other/../home"
+    (tmp_path / "other").mkdir()
+    with patch("jacked.findbin.shutil.which", return_value=None), \
+         caplog.at_level("WARNING", logger="jacked.findbin"):
+        assert find_bin("codex", home=dotted) is None
+    assert "not an absolute path without '..'" in caplog.text
+
+
+@posix_only
+def test_refuses_a_symlink_loop(tmp_path, caplog):
+    home = tmp_path / "home"
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "a").symlink_to(bin_dir / "b")
+    (bin_dir / "b").symlink_to(bin_dir / "a")
+    (bin_dir / "codex").symlink_to(bin_dir / "a")
+    with patch("jacked.findbin.os.path.isfile", return_value=True), \
+         patch("jacked.findbin.os.access", return_value=True):
+        assert _lookup(home, caplog) is None
+    assert "too many symlink hops" in caplog.text
+
+
+@posix_only
+def test_refuses_a_component_swapped_between_its_two_reads(tmp_path, caplog):
+    """Each step is read with lstat and again through a descriptor; if the
+    two disagree (a swap in between), the candidate is refused."""
+    import jacked.findbin as findbin
+
+    home = tmp_path / "home"
+    exe = _executable(home / ".local" / "bin" / "codex")
+    real_secure = findbin._secure_lstat
+
+    def swapped(path, kind):
+        status = real_secure(path, kind)
+        if path == str(exe):
+            fields = list(status)
+            fields[stat.ST_INO] += 1
+            return os.stat_result(fields)
+        return status
+
+    with patch.object(findbin, "_secure_lstat", side_effect=swapped):
+        assert _lookup(home, caplog) is None
+    assert "changed while it was being checked" in caplog.text
+
+
+@posix_only
+@pytest.mark.parametrize("kind", ["dir", "file", "link"])
+def test_refuses_a_mutating_macos_acl_on_any_step(tmp_path, caplog, kind):
+    """#185i: on macOS every step goes through the service spec's ACL check
+    (an O_NOFOLLOW descriptor and acl_get_fd_np, acl_get_link_np for links),
+    so an `everyone allow add_file` entry on a 0755 directory is refused."""
+    import jacked.findbin as findbin
+    from jacked.service import spec
+
+    home = tmp_path / "home"
+    real = _executable(home / "pkg" / "codex")
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "codex").symlink_to(real)
+    flagged = {"dir": str(bin_dir), "file": str(real), "link": str(bin_dir / "codex")}[kind]
+
+    def secure_status(path, *, directory):
+        if str(path) == flagged:
+            raise ValueError("runtime_path has a mutating extended ACL")
+        return os.lstat(path)
+
+    def link_acl(path):
+        if str(path) == flagged:
+            raise ValueError("runtime_path symlink has a mutating extended ACL")
+
+    with patch.object(findbin, "_HOST_IS_DARWIN", True), \
+         patch.object(spec, "_darwin_secure_status", side_effect=secure_status), \
+         patch.object(spec, "_validate_darwin_link_acl", side_effect=link_acl):
+        assert _lookup(home, caplog) is None
+        assert "mutating ACL" in caplog.text
+        caplog.clear()
+        flagged = "/nowhere"
+        assert _lookup(home, caplog) == str(bin_dir / "codex")
