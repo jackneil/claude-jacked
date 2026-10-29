@@ -54,7 +54,7 @@
     <div id="banner" class="banner"></div>
 
     <script>
-    // PHASES mirrors jacked/service/update_phases.py — enforced by
+    // PHASES mirrors jacked/service/update_phases.py, enforced by
     // tests/unit/service/test_update_phases.py::test_update_html_embeds_all_phase_names.
     const PHASES = [
         ["waiting_for_parent", "Waiting for old tray to exit"],
@@ -116,7 +116,7 @@
         // instead of a frozen elapsed-time reading. 2s grace absorbs a single
         // missed poll so it doesn't flap on every transient blip.
         if (state.serviceDownSince && Date.now() - state.serviceDownSince > 2000) {
-            meta.textContent = "Service restarting \u2014 reconnecting\u2026";
+            meta.textContent = "The service is restarting. Reconnecting\u2026";
             return;
         }
         if (!state.startedAt) {
@@ -207,7 +207,7 @@
         if (done) {
             banner.classList.add("succeeded");
             const v = state.currentVersion || state.targetVersion || "";
-            banner.appendChild(makeEl("div", null, "Update complete \u2014 jacked is now v" + v + "."));
+            banner.appendChild(makeEl("div", null, "Update complete. jacked is now v" + v + "."));
             const a = makeEl("a", "button", "Open dashboard");
             a.href = "/";
             // Break out of the bootstrap iframe so the whole tab navigates.
@@ -299,7 +299,7 @@
     async function tick() {
         await Promise.all([pollStatus(), pollVersion()]);
         render();
-        // Surface state to a hosting bootstrap frame (harmless standalone —
+        // Surface state to a hosting bootstrap frame (harmless standalone:
         // parent === window). The bootstrap reveals its success note on this.
         try {
             window.parent.postMessage(

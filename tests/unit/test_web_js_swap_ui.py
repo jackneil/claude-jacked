@@ -21,7 +21,7 @@ ACCOUNT_ACTIONS_JS = WEB_JS / "components" / "account-actions.js"
 WEBSOCKET_JS = WEB_JS / "websocket.js"
 UTILS_JS = WEB_JS / "utils.js"
 
-EM_DASH = "—"
+PLACEHOLDER = "-"  # an empty value; never an em-dash
 
 pytestmark = pytest.mark.skipif(
     shutil.which("node") is None, reason="node not installed"
@@ -173,8 +173,8 @@ out({
         assert result["r1"] == "4m 32s"
         assert result["r2"] == "1h 2m"
         assert result["r3"] == "59s"
-        assert result["r4"] == EM_DASH
-        assert result["r5"] == EM_DASH
+        assert result["r4"] == PLACEHOLDER
+        assert result["r5"] == PLACEHOLDER
         assert result["r6"] == "0s"
         assert result["r7"] == "15m 0s"
 
@@ -207,7 +207,7 @@ out({ html });
         assert 'text-slate-400 whitespace-nowrap tabular-nums">1h 2m' in html
         assert 'text-slate-400 whitespace-nowrap tabular-nums">20m 0s' in html
         # Null residency renders an em-dash placeholder
-        assert f'text-slate-400 whitespace-nowrap tabular-nums">{EM_DASH}' in html
+        assert f'text-slate-400 whitespace-nowrap tabular-nums">{PLACEHOLDER}' in html
         # New header columns
         assert ">Status</th>" in html
         assert ">Residency</th>" in html
@@ -285,7 +285,7 @@ class TestDrainAdvisorBanner:
         assert "Account a@x.com (Acme) expires in 2h" in result["text"]
         assert "~13% capacity" in result["text"]
         assert "won't be drained at current pace" in result["text"]
-        assert "route work there now" in result["text"]
+        assert "Route work there now." in result["text"]
         assert result["shownFor"] == "3"
         # Amber/info styling, distinct from the red stall banner
         assert "bg-amber-900/95" in result["amber"]

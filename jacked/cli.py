@@ -195,7 +195,7 @@ def _maybe_prompt_first_run(ctx) -> None:
     console.print(
         Panel(
             msg,
-            title="[bold white on red]  ⚠  ONE MORE STEP — RUN `jacked install`  ⚠  [/]",
+            title="[bold white on red]  ⚠  ONE MORE STEP: RUN `jacked install`  ⚠  [/]",
             border_style="bold red",
             expand=False,
         )
@@ -206,7 +206,7 @@ def _maybe_prompt_first_run(ctx) -> None:
             if sub is None:
                 ctx.exit(0)
     except (click.Abort, EOFError, KeyboardInterrupt):
-        console.print("[dim]No problem — run `jacked install` whenever you're ready.[/dim]")
+        console.print("[dim]No problem. Run `jacked install` when you are ready.[/dim]")
 
 
 @main.command()
@@ -787,7 +787,7 @@ def check_version():
 @click.option(
     "--skip-service",
     is_flag=True,
-    help="Don't touch the running service — just upgrade the package + migrate settings.",
+    help="Do not touch the running service. Only upgrade the package and migrate settings.",
 )
 @click.option(
     "--no-rollback",
@@ -3832,7 +3832,7 @@ def _install_chrome_devtools_mcp(force: bool = False) -> None:
     if already_installed and force:
         rm = _run_claude_mcp("remove", "chrome-devtools", "-s", "user")
         if rm is None or rm.returncode != 0:
-            console.print("[yellow][WARN][/yellow] Could not remove existing Chrome DevTools MCP — attempting overwrite")
+            console.print("[yellow][WARN][/yellow] Could not remove the existing Chrome DevTools MCP. Attempting overwrite.")
 
     add = _run_claude_mcp(
         "add", "-s", "user", "chrome-devtools", "--",
@@ -4516,7 +4516,7 @@ def _run_install(
                 f"[yellow][AUDIT] Found {len(warns)} dangerous permission wildcard(s):[/yellow]"
             )
             for pat, _, prefix, reason in warns:
-                console.print(f"  [red][WARN][/red] {pat} — {reason}")
+                console.print(f"  [red][WARN][/red] {pat}: {reason}")
             console.print(
                 "[dim]Run 'jacked permissions audit' for full details, "
                 "or 'jacked permissions audit --fix' to prune them interactively.[/dim]"
@@ -5007,7 +5007,7 @@ def _setup_tray_autostart() -> None:
         return
     if _is_headless():
         console.print(
-            "[dim][-][/dim] Headless environment (no display) — skipping tray icon. "
+            "[dim][-][/dim] Headless environment (no display). Skipping the tray icon. "
             "Run `jacked service start` to run the service without a tray."
         )
         return
@@ -5056,8 +5056,8 @@ def _warn_required_plugins_missing() -> None:
     for plugin, desc in missing:
         name = plugin.split("@")[0]
         console.print(
-            f"[yellow]! Required plugin missing:[/yellow] {name} — {desc} "
-            "(enable via /plugins)"
+            f"[yellow]! Required plugin missing:[/yellow] {name} ({desc}). "
+            "Enable it via /plugins."
         )
 
 
@@ -5075,7 +5075,7 @@ def _install_required_plugins(force: bool = False) -> None:
 
     if not find_bin("claude"):
         console.print(
-            "[yellow][WARN][/yellow] `claude` CLI not found — skipping plugin "
+            "[yellow][WARN][/yellow] `claude` CLI not found. Skipping plugin "
             "install. Enable required plugins via /plugins."
         )
         return
@@ -5089,16 +5089,16 @@ def _install_required_plugins(force: bool = False) -> None:
         result = _run_claude_plugin("install", plugin, "-s", "user")
         if result is None:
             console.print(
-                f"[yellow][WARN][/yellow] Could not install {name} — enable via /plugins"
+                f"[yellow][WARN][/yellow] Could not install {name}. Enable it via /plugins."
             )
         elif result.returncode == 0:
-            console.print(f"[green][OK][/green] Plugin installed: {name} — {desc}")
+            console.print(f"[green][OK][/green] Plugin installed: {name} ({desc})")
         else:
             tail = (result.stderr or result.stdout or "").strip().splitlines()
             msg = tail[-1] if tail else "unknown error"
             console.print(
                 f"[yellow][WARN][/yellow] Plugin install failed for {name}: {msg} "
-                "— enable via /plugins"
+                "(enable it via /plugins)"
             )
 
 
@@ -5150,13 +5150,13 @@ def _recommend_external_tools():
             console.print("  Enable these in Claude Code settings or via /plugins:")
             for plugin, desc in required:
                 name = plugin.split("@")[0]
-                console.print(f"    {name:30s} — {desc}")
+                console.print(f"    {name:30s} - {desc}")
 
         if optional:
             console.print("\n  Optional plugins:")
             for plugin, desc in optional:
                 name = plugin.split("@")[0]
-                console.print(f"    {name:30s} — {desc}")
+                console.print(f"    {name:30s} - {desc}")
 
     # ---------------------------------------------------------------
     # External CLI tools
@@ -5327,7 +5327,7 @@ def doctor():
                     )
                 console.print(
                     "  Something is serving the dashboard, but it is not the "
-                    "managed service — so there is no tray icon."
+                    "managed service, so there is no tray icon."
                 )
                 console.print(
                     "  Most likely a foreground [cyan]jacked webux[/cyan] "
@@ -5351,8 +5351,8 @@ def doctor():
             )
             if pid_alive:
                 console.print(
-                    f"  PID {pid_info['pid']} is alive but HTTP probe failed — "
-                    f"service may have crashed mid-init."
+                    f"  PID {pid_info['pid']} is alive but the HTTP probe failed. "
+                    f"The service may have crashed mid-init."
                 )
             else:
                 console.print(
@@ -7667,7 +7667,7 @@ def _classify_permission(pattern: str) -> tuple[str, str, str]:
         return "OK", prefix, "scoped (low risk)"
     if prefix in LOW_RISK_PREFIXES:
         return "OK", prefix, "read-only (low risk)"
-    return "INFO", prefix, "unrecognized wildcard — review manually"
+    return "INFO", prefix, "unrecognized wildcard (review manually)"
 
 
 def _scan_permission_rules() -> list[tuple[str, str, str, str]]:
@@ -7820,17 +7820,17 @@ def permissions_audit(fix, yes):
 
     for pat, level, prefix, reason in results:
         if level == "WARN":
-            console.print(f"  [red][WARN][/red] {pat} — {reason}")
+            console.print(f"  [red][WARN][/red] {pat}: {reason}")
             console.print(
                 f"         A blanket wildcard auto-approves ANY {prefix} invocation, "
                 "including inline code execution.\n"
             )
             warn_count += 1
         elif level == "INFO":
-            console.print(f"  [yellow][INFO][/yellow] {pat} — {reason}")
+            console.print(f"  [yellow][INFO][/yellow] {pat}: {reason}")
             info_count += 1
         else:
-            console.print(f"  [green][OK][/green] {pat} — {reason}")
+            console.print(f"  [green][OK][/green] {pat}: {reason}")
             ok_count += 1
 
     console.print(f"\n{warn_count} warnings, {info_count} info, {ok_count} OK")
@@ -7848,7 +7848,7 @@ def permissions_audit(fix, yes):
         warn_patterns = {pat for pat, level, _, _ in results if level == "WARN"}
         if not warn_patterns:
             console.print(
-                "\n[green]Nothing to fix — no dangerous wildcards found.[/green]"
+                "\n[green]Nothing to fix. No dangerous wildcards found.[/green]"
             )
         else:
             console.print("")  # spacer
@@ -7888,7 +7888,7 @@ def permissions_audit(fix, yes):
                 total, per_file = _prune_dangerous_permissions(to_remove)
                 if total == 0:
                     console.print(
-                        "\n[yellow]Selected patterns not found in any settings file — nothing to remove.[/yellow]"
+                        "\n[yellow]Selected patterns not found in any settings file. Nothing to remove.[/yellow]"
                     )
                 else:
                     console.print(
@@ -8205,7 +8205,7 @@ def codex_add_cmd(make_active, no_login):
     )
     if make_active:
         console.print(
-            "It's now the active Codex account — restart Codex to pick it up."
+            "It is now the active Codex account. Restart Codex to pick it up."
         )
     else:
         console.print(
@@ -8261,7 +8261,7 @@ def codex_use_cmd(account_id):
         db.close()
     console.print(
         f"Active Codex account → [bold]{account_id}[/bold]. "
-        "Restart Codex (CLI/app/IDE) to pick it up — it caches auth at startup."
+        "Restart Codex (CLI/app/IDE) to pick it up. Codex caches auth at startup."
     )
 
 

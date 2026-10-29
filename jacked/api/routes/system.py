@@ -809,14 +809,14 @@ async def _do_upgrade(ws_registry) -> None:
 
             uv_bin = find_bin("uv")
             if not uv_bin:
-                raise RuntimeError("uv not found on PATH \u2014 cannot upgrade")
+                raise RuntimeError("uv not found on PATH. Cannot upgrade.")
             await _upgrade_broadcast(ws_registry, "upgrade_progress",
                                      {"step": "upgrade", "message": "Upgrading claude-jacked\u2026"})
             await _upgrade_run_cmd([uv_bin, "tool", "upgrade", "claude-jacked"])
 
             jacked_bin = find_bin("jacked")
             if not jacked_bin:
-                raise RuntimeError("jacked not found on PATH \u2014 cannot reinstall")
+                raise RuntimeError("jacked not found on PATH. Cannot reinstall.")
             await _upgrade_broadcast(ws_registry, "upgrade_progress",
                                      {"step": "reinstall", "message": "Reinstalling files\u2026"})
             await _upgrade_run_cmd([jacked_bin, "install", "--force"])

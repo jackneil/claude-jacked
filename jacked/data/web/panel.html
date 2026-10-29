@@ -143,14 +143,14 @@
         border-color: rgba(45, 212, 191, 0.22);
     }
 
-    /* Provider identity (Claude vs Codex) — shared glyph from js/util/provider.js.
+    /* Provider identity (Claude vs Codex): shared glyph from js/util/provider.js.
        The brand-colored badge before the email/org-name is the only cue; a
        colored edge stripe on the card would repeat it as decoration. */
     .provider-glyph {
         display: inline-flex; align-items: center; justify-content: center;
         width: 12px; height: 12px; flex: 0 0 auto;
     }
-    /* Provider badge (glyph + CODEX/CLAUDE label) — makes the account's provider
+    /* Provider badge (glyph + CODEX/CLAUDE label): makes the account's provider
        unmistakable at a glance, not just a hover-only glyph. */
     .provider-badge {
         display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto;
@@ -163,7 +163,7 @@
         font-size: 9px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
     }
 
-    /* Identity line — shared by the single-account head, multi-org header, and
+    /* Identity line: shared by the single-account head, multi-org header, and
        per-org rows so columns line up across every account type. */
     .acct-head, .login-header, .org-row-head {
         display: flex;
@@ -217,7 +217,7 @@
         font-size: 10px; color: var(--txt-dim);
         font-variant-numeric: tabular-nums; flex: none;
     }
-    /* "next 4m" countdown on the active account — a touch brighter than the
+    /* "next 4m" countdown on the active account, a touch brighter than the
        "ago" age, with a dot separator so the two read as: updated · next. */
     .next-refresh {
         font-size: 10px; color: var(--txt-muted);
@@ -235,7 +235,7 @@
 
     .org-bars { display: flex; flex-direction: column; gap: 2px; }
 
-    /* ---- Usage bar — copied verbatim from css/style.css so the bars render
+    /* ---- Usage bar: copied verbatim from css/style.css so the bars render
          identically here without pulling the whole dashboard stylesheet. ---- */
     .usage-bar {
         position: relative;
@@ -265,7 +265,7 @@
         z-index: 2;
         pointer-events: none;
     }
-    /* America 250 theme — mirrors css/style.css so the panel bars restyle in
+    /* America 250 theme: mirrors css/style.css so the panel bars restyle in
        lockstep with the dashboard (green=blue, yellow=white, red=red). The white
        warning bar would swallow the white marker, so darken it + add a ring. */
     html.theme-america250 .usage-bar .fill.green  { background: linear-gradient(90deg, #1d4ed8, #3b82f6); }

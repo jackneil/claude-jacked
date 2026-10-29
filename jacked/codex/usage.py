@@ -114,7 +114,7 @@ def _classify_windows(primary, secondary) -> dict:
             _warned_shapes.add(key)
             log(
                 "codex rate-limit window has no usable windowDurationMins "
-                "(got %r) — using positional %s mapping; the app-server "
+                "(got %r); using positional %s mapping. The app-server "
                 "payload shape may have changed or the codex client is old",
                 dur, positional_slot,
             )

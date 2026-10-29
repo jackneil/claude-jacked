@@ -171,7 +171,7 @@ function _srvInsertDisconnectMarker() {
     if (!output) return;
     const marker = document.createElement('div');
     marker.className = 'text-center text-slate-600 text-[10px] py-1 border-t border-b border-slate-800 my-1';
-    marker.textContent = '\u2014 connection interrupted \u2014';
+    marker.textContent = 'Connection interrupted.';
     output.appendChild(marker);
 }
 

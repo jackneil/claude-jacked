@@ -139,7 +139,7 @@ function renderAutoSwapPanel() {
                                 <div class="flex items-center justify-between">
                                     <div class="flex items-center gap-2">
                                         <span class="text-slate-400 text-sm">Pause Auto-Swap</span>
-                                        ${isPaused ? `<span class="text-xs px-2 py-0.5 bg-amber-600/20 text-amber-400 border border-amber-600/30 rounded">Paused — ${escapeHtml(pauseLabel)} left</span>` : ''}
+                                        ${isPaused ? `<span class="text-xs px-2 py-0.5 bg-amber-600/20 text-amber-400 border border-amber-600/30 rounded">Paused: ${escapeHtml(pauseLabel)} left</span>` : ''}
                                     </div>
                                     <div class="flex items-center gap-1.5">
                                         ${isPaused
@@ -242,7 +242,7 @@ function renderAutoSwapPanel() {
  * @returns {string} formatted label like "jack@test.com (Acme)"
  */
 function formatAccountLabel(entry, prefix) {
-    const email = entry[prefix + '_email'] || '\u2014';
+    const email = entry[prefix + '_email'] || '-';
     const orgName = entry[prefix + '_org_name'] || '';
     const displayName = (entry[prefix + '_display_name'] || '').trim();
 
@@ -259,7 +259,7 @@ function formatAccountLabel(entry, prefix) {
     if (displayName) {
         const emailPrefix = email.split('@')[0].split('.')[0].toLowerCase();
         if (displayName.toLowerCase() !== emailPrefix && displayName.toLowerCase() !== 'user') {
-            labelPrefix = displayName + ' \u2014 ';
+            labelPrefix = displayName + ' - ';
         }
     }
 
@@ -275,7 +275,7 @@ function formatAccountLabel(entry, prefix) {
 const RESIDENCY_WARN_SECONDS = 900;
 
 function formatResidency(seconds) {
-    if (seconds == null || !isFinite(seconds) || seconds < 0) return '\u2014';
+    if (seconds == null || !isFinite(seconds) || seconds < 0) return '-';
     const s = Math.floor(seconds);
     const h = Math.floor(s / 3600);
     const m = Math.floor((s % 3600) / 60);
@@ -304,10 +304,10 @@ function renderSwapLogTable(entries) {
     const rows = entries.map(e => {
         const ts = e.timestamp
             ? escapeHtml(new Date(e.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))
-            : '\u2014';
+            : '-';
         const from = escapeHtml(formatAccountLabel(e, 'from'));
         const to = escapeHtml(formatAccountLabel(e, 'to'));
-        const reason = escapeHtml(e.reason || '\u2014');
+        const reason = escapeHtml(e.reason || '-');
         const statusBadge = renderSwapStatusBadge(e.status);
         const res = e.residency_seconds;
         const residencyCls = (res != null && res < RESIDENCY_WARN_SECONDS) ? 'text-red-400' : 'text-slate-400';
@@ -351,7 +351,7 @@ function renderDecisionLogTable(entries) {
     const rows = entries.map(function(e) {
         const ts = e.timestamp
             ? escapeHtml(new Date(e.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }))
-            : '\u2014';
+            : '-';
 
         const action = e.action || 'unknown';
         let actionBadge = '';
@@ -363,12 +363,12 @@ function renderDecisionLogTable(entries) {
             actionBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-slate-700/50 text-slate-400">check</span>';
         }
 
-        const reason = escapeHtml(e.reason || '\u2014');
+        const reason = escapeHtml(e.reason || '-');
         const hasDetail = e.detail && typeof e.detail === 'object';
         const detailId = 'decision-detail-' + e.id;
         const accountLabel = hasDetail && e.detail.active
-            ? escapeHtml(e.detail.active.label || e.detail.active.email || '\u2014')
-            : '\u2014';
+            ? escapeHtml(e.detail.active.label || e.detail.active.email || '-')
+            : '-';
 
         let detailHtml = '';
         if (hasDetail) {
@@ -408,11 +408,11 @@ const TIER_LABELS = {
 };
 
 const TIER_TOOLTIPS = {
-    0: 'Tier 0: 7d window expires in under 24 hours. Drain to 100% — capacity not used will be lost.',
+    0: 'Tier 0: 7d window expires in under 24 hours. Drain to 100%. Capacity that is not used is lost.',
     1: 'Tier 1: 7d window expires in 24-48 hours. Drive to 90% (10% buffer for last-day work).',
     2: 'Tier 2: 7d window expires in 2-4 days. Stay slightly ahead of the white bar (week-elapsed line).',
-    3: 'Tier 3: 7d window expires in 4-7 days. Don\'t exceed the white bar — save capacity for later.',
-    4: 'No 7d data, or window already expired — excluded from selection.',
+    3: 'Tier 3: 7d window expires in 4-7 days. Do not go past the white bar. Save capacity for later.',
+    4: 'No 7d data, or the window already expired. Excluded from selection.',
 };
 
 function buildDecisionDetailHtml(d, detailId) {
@@ -447,11 +447,11 @@ function buildDecisionDetailHtml(d, detailId) {
         d.candidates.forEach(function(c) {
             const isBest = c.is_best === true;
             const rowCls = isBest ? 'text-teal-300' : 'text-slate-400';
-            const tierLabel = TIER_LABELS[c.tier] != null ? TIER_LABELS[c.tier] : '\u2014';
-            const fivehStr = c['5h'] != null ? Number(c['5h']).toFixed(1) + '%' : '\u2014';
-            const sevendStr = c['7d'] != null ? Number(c['7d']).toFixed(1) + '%' : '\u2014';
-            const targetStr = c.target_7d != null ? Number(c.target_7d).toFixed(1) + '%' : '\u2014';
-            let deficitStr = '\u2014';
+            const tierLabel = TIER_LABELS[c.tier] != null ? TIER_LABELS[c.tier] : '-';
+            const fivehStr = c['5h'] != null ? Number(c['5h']).toFixed(1) + '%' : '-';
+            const sevendStr = c['7d'] != null ? Number(c['7d']).toFixed(1) + '%' : '-';
+            const targetStr = c.target_7d != null ? Number(c.target_7d).toFixed(1) + '%' : '-';
+            let deficitStr = '-';
             if (c.deficit != null) {
                 const deficit = Number(c.deficit);
                 deficitStr = (deficit >= 0 ? '+' : '') + deficit.toFixed(1) + '%';
@@ -657,8 +657,8 @@ function showDrainAdvisorBanner(data) {
     const label = data.label || data.email || `account ${data.account_id}`;
     const stranding = data.stranding != null ? Math.round(Number(data.stranding)) : '?';
     text.textContent = `Account ${label} expires ${_formatTimeUntil(data.resets_at)} ` +
-        `with ~${stranding}% capacity that won't be drained at current pace — ` +
-        `route work there now`;
+        `with ~${stranding}% capacity that won't be drained at current pace. ` +
+        `Route work there now.`;
     const close = document.createElement('button');
     close.className = 'text-amber-400 hover:text-white text-lg leading-none ml-auto';
     close.textContent = '×';
@@ -689,7 +689,7 @@ function showSameTierAdvisory(data) {
     const acct = data.best_account_id != null ? data.best_account_id : '?';
     showToast(
         `Same-tier advisory: account ${acct} (${tier}) is ${deficit} behind its ` +
-        `tier target — staying on the active account by design`,
+        `tier target. Staying on the active account by design.`,
         'info', 8000
     );
 }

@@ -98,8 +98,8 @@ async function _confirmAddAccount() {
     return Swal.fire({
         title: 'Add account',
         html: `Which provider?<br><br>
-               <b>Claude</b> — opens browser tabs to authorize (usage + Claude Code tokens).<br><br>
-               <b>Codex</b> — imports your signed-in OpenAI Codex account
+               <b>Claude</b>: opens browser tabs to authorize (usage + Claude Code tokens).<br><br>
+               <b>Codex</b>: imports your signed-in OpenAI Codex account
                (run <code>codex login</code> in a terminal first if you're not signed in).`,
         showDenyButton: true,
         showCancelButton: true,
@@ -166,7 +166,7 @@ function initPillHandlers() {
                 const result = await _confirmReauth(email);
                 if (!result.isConfirmed) return;
                 if (window.jackedState._accountActionInFlight) {
-                    showToast('Another action started — please try again', 'warning', 2000);
+                    showToast('Another action started. Try again.', 'warning', 2000);
                     return;
                 }
                 startReauthFlow(id, email);
@@ -174,14 +174,14 @@ function initPillHandlers() {
                 const result = await _confirmCcAuth(email);
                 if (!result.isConfirmed) return;
                 if (window.jackedState._accountActionInFlight) {
-                    showToast('Another action started — please try again', 'warning', 2000);
+                    showToast('Another action started. Try again.', 'warning', 2000);
                     return;
                 }
                 startCcAuthFlow(id, email);
             }
         } catch (err) {
             console.error('Auth confirmation error:', err);
-            showToast('Something went wrong — please try again', 'error');
+            showToast('Something went wrong. Try again.', 'error');
         }
     });
 }
@@ -582,7 +582,7 @@ function bindAccountEvents() {
                 const result = await _confirmAddAccount();
                 if (!result.isConfirmed && !result.isDenied) return;  // cancelled
                 if (window.jackedState._accountActionInFlight) {
-                    showToast('Another action started — please try again', 'warning', 2000);
+                    showToast('Another action started. Try again.', 'warning', 2000);
                     return;
                 }
                 if (result.isDenied) {
@@ -592,7 +592,7 @@ function bindAccountEvents() {
                 }
             } catch (err) {
                 console.error('Add account confirmation error:', err);
-                showToast('Something went wrong — please try again', 'error');
+                showToast('Something went wrong. Try again.', 'error');
             }
         });
     });
@@ -615,13 +615,13 @@ function bindAccountEvents() {
                 const result = await _confirmReauth(email);
                 if (!result.isConfirmed) return;
                 if (window.jackedState._accountActionInFlight) {
-                    showToast('Another action started — please try again', 'warning', 2000);
+                    showToast('Another action started. Try again.', 'warning', 2000);
                     return;
                 }
                 startReauthFlow(id, email);
             } catch (err) {
                 console.error('Reauth confirmation error:', err);
-                showToast('Something went wrong — please try again', 'error');
+                showToast('Something went wrong. Try again.', 'error');
             }
         });
     });
@@ -975,7 +975,7 @@ async function _triggerUsageRefresh(options) {
 // ---------------------------------------------------------------------------
 async function _triggerSingleUsageRefresh(accountId) {
     if (window.jackedState._usageRefreshInProgress) {
-        showToast('Bulk refresh in progress — please wait', 'warning', 2000);
+        showToast('A bulk refresh is in progress. Wait for it to finish.', 'warning', 2000);
         return;
     }
     const startedAt = _singleRefreshInFlight.get(accountId);

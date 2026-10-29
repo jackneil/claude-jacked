@@ -180,7 +180,7 @@ class TestValidateAccountClearsLastError:
         a = db.create_account("a@t.com", "tok", 9999999999)
         db.update_account(
             a["id"], validation_status="unknown",
-            last_error="validation timed out — reset by watchdog",
+            last_error="validation timed out. Reset by watchdog.",
             last_error_at=datetime.now(timezone.utc).isoformat(),
         )
 

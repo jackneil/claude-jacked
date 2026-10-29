@@ -26,10 +26,10 @@ function _buildTooltip(current, latest, outdated, ahead, checkedAt, nextCheckAt)
         lines.push(`Update available: v${current} \u2192 v${latest}`);
         lines.push('uv tool upgrade claude-jacked');
     } else if (ahead && latest) {
-        lines.push(`v${current} — ahead of PyPI (v${latest})`);
+        lines.push(`v${current} - ahead of PyPI (v${latest})`);
         lines.push('Running unreleased build');
     } else if (latest) {
-        lines.push(`v${current} \u2014 latest`);
+        lines.push(`v${current} - latest`);
     } else {
         lines.push('Could not reach PyPI');
     }

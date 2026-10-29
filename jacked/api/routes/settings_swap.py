@@ -68,7 +68,7 @@ class SwapSettings(BaseModel):
         if start_h * 60 + start_m >= end_h * 60 + end_m:
             raise ValueError(
                 f"active_start ({self.window_keeper_active_start}) must be before "
-                f"active_end ({self.window_keeper_active_end}) — midnight-crossing ranges not supported"
+                f"active_end ({self.window_keeper_active_end}). Ranges that cross midnight are not supported."
             )
         return self
 

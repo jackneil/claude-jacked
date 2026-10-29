@@ -235,7 +235,7 @@ def get_usage_overview(request: Request, days: int = Query(default=1, ge=1, le=3
     """Overview: today's totals, cache health, project breakdown, active flags."""
     db = _get_analytics_db(request)
     if db is None:
-        return JSONResponse({"error": "Analytics not ready — scan in progress"}, status_code=503)
+        return JSONResponse({"error": "Analytics are not ready. A scan is in progress."}, status_code=503)
 
     overview = db.get_overview(days=days)
     flags = db.get_active_flags()

@@ -5,7 +5,7 @@
     <title>Jacked Update</title>
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
     <style>
-        /* Served from file:// so it cannot race the dying service — the live
+        /* Served from file:// so it cannot race the dying service; the live
            progress UI lives in the iframe below and self-heals across the
            update's service downtime. Palette mirrors update.html. */
         body { font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -71,7 +71,7 @@
     const RECOVERY_AFTER_MS = 5 * 60 * 1000;
 
     iframe.addEventListener("load", function () {
-        // Only a real load past a set src counts — the blank initial frame
+        // Only a real load past a set src counts; the blank initial frame
         // fires load too and must not reveal an empty iframe.
         if (!iframe.getAttribute("src")) return;
         iframeShown = true;
@@ -93,7 +93,7 @@
         statusEl.style.display = "";
         if (up === false) {
             statusEl.textContent =
-                "Service is restarting — this page will reconnect automatically…";
+                "The service is restarting. This page will reconnect automatically…";
             statusEl.className = "status restarting";
         } else {
             statusEl.textContent = "Connecting to the update service…";
