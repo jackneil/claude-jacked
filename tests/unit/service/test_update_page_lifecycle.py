@@ -50,7 +50,8 @@ const context = {
   fetch: async url => {
     const s = steps[Math.min(step, steps.length - 1)];
     const body = url.includes("/api/update/status")
-      ? {status: s.status, mtime_iso: s.mtime_iso || new Date().toISOString()}
+      ? {status: s.status, mtime_iso: s.mtime_iso || new Date().toISOString(),
+         updater_alive: s.updater_alive === undefined ? null : s.updater_alive}
       : {current: s.version};
     return {ok: true, json: async () => body};
   },
@@ -138,6 +139,24 @@ def test_a_stale_record_with_the_new_version_still_finishes(tmp_path):
     ])
     assert out[0]["heading"] == "Jacked is updated"
     assert out[0]["polling"] is False
+
+
+def test_a_long_pack_refresh_by_a_live_updater_keeps_the_page_polling(tmp_path):
+    """The pack refresh may run 15 minutes without touching its record. While
+    the server reports the updater alive, an old record is not abandoned:
+    the page must not report the update finished and stop polling."""
+    running = dict(BASE, overall="in_progress", current_phase="refreshing_packs",
+                   phases=_phases(("verifying_service", "ok"), ("refreshing_packs", "in_progress")))
+    long_ago = "2020-01-01T00:00:00Z"
+    out = _run(tmp_path, [
+        {"status": running, "version": "0.109.0", "mtime_iso": long_ago, "updater_alive": True},
+    ])
+    assert out[0] == {"heading": UPDATING, "banner": "", "polling": True}
+
+    gone = _run(tmp_path, [
+        {"status": running, "version": "0.109.0", "mtime_iso": long_ago, "updater_alive": False},
+    ])
+    assert gone[0]["heading"] == "Jacked is updated" and gone[0]["polling"] is False
 
 
 def test_a_failed_update_says_so_in_the_heading(tmp_path):

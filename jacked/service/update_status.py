@@ -127,15 +127,24 @@ def read_status(path: Path) -> Optional[dict]:
     elif overall == "in_progress":
         # An aborted updater leaves in_progress forever; without this the
         # dashboard would show a zombie "updating..." banner indefinitely.
-        # init_status already treats a file of this age as abandoned — mirror
-        # that so the read side and the write side agree on staleness.
+        # The same rule as abandoned_status: old AND not proven alive, so a
+        # long phase (a 15-minute pack refresh) stays visible while it runs.
         try:
-            age = time.time() - path.stat().st_mtime
-            if age > STALE_IN_PROGRESS_SECONDS:
+            if in_progress_is_stale(path, data):
                 return None
         except OSError:
             return None
     return data
+
+
+def in_progress_is_stale(path: Path, data: dict) -> bool:
+    """True when an ``in_progress`` record is older than the stale window AND
+    its updater is not proven alive. One phase can run longer than the window
+    without writing (the skill-pack refresh may take 15 minutes), so age alone
+    must never end an update whose updater still runs. Raises OSError when the
+    file cannot be read."""
+    age = time.time() - path.stat().st_mtime
+    return age > STALE_IN_PROGRESS_SECONDS and updater_liveness(data) is not True
 
 
 def abandoned_status(path: Path) -> Optional[dict]:
@@ -169,16 +178,12 @@ def abandoned_status(path: Path) -> Optional[dict]:
     if data is None or data.get("overall") != "in_progress":
         return None
     try:
-        age = time.time() - path.stat().st_mtime
+        stale = in_progress_is_stale(path, data)
     except OSError:
         return None
-    if age <= STALE_IN_PROGRESS_SECONDS:
-        return None
     # A proven-live updater is never abandoned. Proven-dead or indeterminate
-    # (no pid, probe failed) falls back to the mtime rule above.
-    if _updater_liveness(data) is True:
-        return None
-    return data
+    # (no pid, probe failed) falls back to the mtime rule.
+    return data if stale else None
 
 
 def _resolve_updater_pid(updater_pid: Optional[int]) -> Optional[int]:
@@ -190,7 +195,7 @@ def _resolve_updater_pid(updater_pid: Optional[int]) -> Optional[int]:
     return updater_pid
 
 
-def _updater_liveness(data: dict) -> Optional[bool]:
+def updater_liveness(data: dict) -> Optional[bool]:
     """True when the recording process runs, False when it is gone, None when
     the record names no usable pid or the probe is indeterminate."""
     pid = data.get("updater_pid")
@@ -256,7 +261,7 @@ def init_status(
         # tray's pre-init is exempt: the tray that wrote it is expected to be
         # gone by the time the updater arrives, and adoption consumes it.
         if age <= STALE_IN_PROGRESS_SECONDS and (
-            prior.get("preinit") is True or _updater_liveness(prior) is not False
+            prior.get("preinit") is True or updater_liveness(prior) is not False
         ):
             raise LockBusy(
                 "Another updater is in-flight (started "
