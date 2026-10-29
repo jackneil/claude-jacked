@@ -1377,8 +1377,11 @@ class TestInterruptedUpgrade:
         import os
         import signal
 
+        finished = []
+
         def send_sigterm(*args, **kwargs):
             os.kill(os.getpid(), signal.SIGTERM)
+            finished.append(True)  # the migration ran to its end
             return (0, None)
 
         if not hasattr(signal, "SIGTERM") or os.name != "posix":
@@ -1386,4 +1389,61 @@ class TestInterruptedUpgrade:
         before = signal.getsignal(signal.SIGTERM)
         result, _native = self._invoke(send_sigterm)
         assert result.exit_code == 143, result.output
+        assert finished == [True]  # held until the child step returned
         assert signal.getsignal(signal.SIGTERM) == before  # restored afterwards
+
+    def test_a_sigterm_during_the_package_install_waits_for_it(self, tmp_path):
+        """subprocess.run kills its child when an exception interrupts it, so a
+        signal during `uv tool install` is held until the install exits. The
+        guard then closes the status in the install phase."""
+        import json
+        import os
+        import signal
+
+        from jacked.cli import main
+        from jacked.service import update_status as us
+
+        if not hasattr(signal, "SIGTERM") or os.name != "posix":
+            pytest.skip("POSIX signals")
+        finished = []
+
+        def install(*args, **kwargs):
+            os.kill(os.getpid(), signal.SIGTERM)
+            finished.append(True)
+            return _ok()
+
+        stack = TestUpgradeIsATransaction._patches()
+        with (
+            stack[0], stack[1], stack[2], stack[3],
+            patch("subprocess.Popen"),
+            patch("subprocess.run", side_effect=install) as run,
+            patch("jacked.__version__", "0.107.0"),
+            patch("jacked.service.process.is_port_available", return_value=False),
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
+        assert result.exit_code == 143, result.output
+        assert finished == [True]
+        assert run.call_count == 1  # no step ran after the held signal
+        data = json.loads(us.UPDATE_STATUS_FILE.read_text())
+        assert "interrupted (SIGTERM) during installing_package" in data["error"]
+
+
+class TestDeferUpgradeSignals:
+    def test_a_held_signal_raises_when_the_outer_block_ends(self):
+        from jacked.cli import (
+            _UPGRADE_SIGNALS, _UpgradeInterrupted, _defer_upgrade_signals,
+        )
+
+        with pytest.raises(_UpgradeInterrupted, match="SIGHUP"):
+            with _defer_upgrade_signals():
+                with _defer_upgrade_signals():
+                    _UPGRADE_SIGNALS["pending"] = "SIGHUP"
+                assert _UPGRADE_SIGNALS["pending"] == "SIGHUP"  # still held
+        assert _UPGRADE_SIGNALS == {"defer": 0, "pending": None}
+
+    def test_no_signal_means_no_raise(self):
+        from jacked.cli import _UPGRADE_SIGNALS, _defer_upgrade_signals
+
+        with _defer_upgrade_signals():
+            pass
+        assert _UPGRADE_SIGNALS == {"defer": 0, "pending": None}

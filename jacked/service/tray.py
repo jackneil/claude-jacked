@@ -250,7 +250,7 @@ def _spawn_updater_in_fresh_interpreter(parent_pid: int, port: int, target: "str
     from jacked.winproc import NO_WINDOW
 
     argv = [
-        sys.executable, "-m", "jacked", "_tray_spawn_updater",
+        sys.executable, "-I", "-m", "jacked", "_tray_spawn_updater",
         "--parent-pid", str(parent_pid), "--port", str(port),
     ]
     if target:

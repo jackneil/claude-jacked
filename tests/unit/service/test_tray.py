@@ -1863,7 +1863,7 @@ class TestUpdateClickSurvivesCodeSkew:
              patch.object(runner, "_on_stop") as stop:
             runner._on_update_click()
         argv = run.call_args.args[0]
-        assert argv[:4] == [_sys.executable, "-m", "jacked", "_tray_spawn_updater"]
+        assert argv[:5] == [_sys.executable, "-I", "-m", "jacked", "_tray_spawn_updater"]
         assert "--target" in argv and "0.42.0" in argv
         stop.assert_called_once()
 

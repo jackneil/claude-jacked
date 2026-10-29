@@ -1415,8 +1415,7 @@ class TestSpawnFromTrayWindows:
             updater.spawn_updater_from_tray(parent_pid=12345, extras="tray")
 
         args = mock_popen.call_args[0][0]
-        assert "-m" in args
-        assert "jacked.service.updater" in args
+        assert args[1:4] == ["-I", "-m", "jacked.service.updater"]
 
 
 class TestMainEntrypoint:

@@ -1306,7 +1306,8 @@ def _upgrade_install_package(cmd: list[str], label: str) -> str:
 
     _upgrade_phase("installing_package", "begin")
     console.print(f"[dim]$ {label}[/dim]")
-    result = subprocess.run(cmd)
+    with _defer_upgrade_signals():
+        result = subprocess.run(cmd)
     if result.returncode != 0:
         _upgrade_phase(
             "installing_package", "failed",
@@ -1424,7 +1425,8 @@ def _upgrade_migrate_settings(
     # Skill packs are refreshed after the restart (_upgrade_refresh_packs):
     # their download was the slow part of this step and kept the service down.
     console.print(f"\n[dim]$ {plan.jacked} install --force --no-packs[/dim]")
-    code, error = run_migrate_settings(plan.jacked)
+    with _defer_upgrade_signals():
+        code, error = run_migrate_settings(plan.jacked)
     if code == 0:
         _upgrade_phase("migrating_settings", "ok")
         return
@@ -1533,6 +1535,13 @@ class _UpgradeInterrupted(BaseException):
 _INTERRUPTED_RECOVERY = "jacked install --force && jacked service restart"
 
 
+# While a step that writes the install runs (the package install, the
+# settings migration), a SIGHUP/SIGTERM is held until the child exits.
+# subprocess.run kills its child when any exception other than Ctrl-C
+# interrupts it, so raising at once would cut `uv tool install` off halfway.
+_UPGRADE_SIGNALS = {"defer": 0, "pending": None}
+
+
 def _install_upgrade_signal_handlers() -> dict:
     """Turn SIGHUP (a closed terminal) and SIGTERM into _UpgradeInterrupted for
     the length of the transaction, so the interrupt guard runs. Returns the
@@ -1540,7 +1549,11 @@ def _install_upgrade_signal_handlers() -> dict:
     import signal
 
     def _raise(signum, _frame):
-        raise _UpgradeInterrupted(signal.Signals(signum).name)
+        name = signal.Signals(signum).name
+        if _UPGRADE_SIGNALS["defer"]:
+            _UPGRADE_SIGNALS["pending"] = _UPGRADE_SIGNALS["pending"] or name
+            return
+        raise _UpgradeInterrupted(name)
 
     previous = {}
     for name in ("SIGHUP", "SIGTERM"):
@@ -1554,8 +1567,25 @@ def _install_upgrade_signal_handlers() -> dict:
     return previous
 
 
+@contextlib.contextmanager
+def _defer_upgrade_signals():
+    """Hold a SIGHUP/SIGTERM until the child process in this block exits, then
+    raise it. The child is never killed halfway through a write."""
+    _UPGRADE_SIGNALS["defer"] += 1
+    try:
+        yield
+    finally:
+        _UPGRADE_SIGNALS["defer"] -= 1
+    pending = _UPGRADE_SIGNALS["pending"]
+    if pending and not _UPGRADE_SIGNALS["defer"]:
+        _UPGRADE_SIGNALS["pending"] = None
+        raise _UpgradeInterrupted(pending)
+
+
 def _restore_signal_handlers(previous: dict) -> None:
     import signal
+
+    _UPGRADE_SIGNALS["pending"] = None
 
     for sig, handler in previous.items():
         try:

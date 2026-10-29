@@ -1316,6 +1316,9 @@ def spawn_updater_from_tray(
     _spawn_detached(
         [
             py,
+            # Isolated: the tray's working directory, PYTHONPATH and the user
+            # site never shadow the installed package (same as the service).
+            "-I",
             "-m",
             "jacked.service.updater",
             str(parent_pid),
