@@ -1191,7 +1191,43 @@ def search(
             if len(results) >= limit:
                 break
 
-    return results[:limit]
+    return _mark_candidates(vault, results[:limit])
+
+
+CANDIDATE_MARK = "[candidate, unreviewed] "
+
+
+def _mark_candidates(vault: Path, results: list) -> list:
+    """Mark the hits that come from an unreviewed ``candidate`` note.
+
+    The recall brief keeps candidates out (``recall._reviewed_tail``), because
+    auto-captures can carry text of external origin. Search still returns
+    them, so a reader must see which hits are unreviewed: a line of a
+    candidate note, or an index line that links one, starts with
+    ``CANDIDATE_MARK``. The recall gate's own helpers decide what a
+    candidate is.
+    """
+    from jacked.memory import recall
+
+    memo: dict[Path, bool] = {}
+
+    def candidate(path: Path) -> bool:
+        if path not in memo:
+            memo[path] = recall._is_candidate_note(path)
+        return memo[path]
+
+    marked = []
+    for rel, lineno, line in results:
+        path = vault / rel
+        if path.name == "index.md":
+            flagged = any(
+                recall._inside_group(link) and candidate(path.parent / link)
+                for link in recall._entry_links(line)
+            )
+        else:
+            flagged = path.parent.name in VALID_TYPES and candidate(path)
+        marked.append((rel, lineno, CANDIDATE_MARK + line if flagged else line))
+    return marked
 
 
 # --------------------------------------------------------------------------- #
