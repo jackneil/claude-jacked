@@ -627,10 +627,15 @@ class TestCCInvalidGrantHandling:
 
     @patch("jacked.web.auth.httpx.AsyncClient")
     @patch("jacked.api.credential_helpers.read_platform_credentials", return_value=None)
-    def test_invalid_grant_clears_refresh_preserves_access(
+    def test_invalid_grant_without_recovery_kills_the_whole_cc_chain(
         self, mock_read_creds, mock_client_cls, tmp_path
     ):
-        """invalid_grant clears cc_refresh_token when no live recovery available."""
+        """invalid_grant with no live recovery leaves NO cc token in service.
+
+        The dead cc_access_token used to stay in the row, so the usage poller
+        resent it every cycle and each 401/429 renewed the primary chain
+        (account 1, 2026-10-22..26, ~140 renewals a day).
+        """
         db = _make_db(tmp_path)
         expires = int(time.time()) - 100
         db.update_account(
@@ -656,9 +661,16 @@ class TestCCInvalidGrantHandling:
 
         assert result is False
         acct = db.get_account(1)
-        assert acct["cc_access_token"] == "old_cc_at"      # preserved
-        assert acct["cc_refresh_token"] is None              # cleared
-        assert acct["cc_expires_at"] == expires               # preserved
+        assert acct["cc_access_token"] is None
+        assert acct["cc_refresh_token"] is None
+        assert acct["cc_expires_at"] is None
+        assert acct["cc_refresh_failure_type"] == "invalid_grant"
+        assert acct["cc_refresh_last_failed_at"] is not None
+        # The primary chain is untouched.
+        assert acct["access_token"] == "alice_primary_at"
+        assert acct["refresh_token"] == "alice_primary_rt"
+        assert acct["refresh_failure_type"] is None
+        assert acct["refresh_last_failed_at"] is None
 
     @patch("jacked.web.auth.httpx.AsyncClient")
     def test_invalid_grant_does_not_mark_account_invalid(
@@ -952,8 +964,10 @@ class TestCCIdentityValidation:
         db = _make_db(tmp_path)
         db.update_account(
             1,
-            refresh_failure_type="invalid_grant",
-            refresh_last_failed_at=int(time.time()),
+            cc_refresh_failure_type="invalid_grant",
+            cc_refresh_last_failed_at=int(time.time()),
+            refresh_failure_type="http_5xx",
+            refresh_last_failed_at=123,
             last_error="Token invalid (HTTP 401), refresh failed",
             last_error_at=int(time.time()),
             validation_status="invalid",
@@ -966,8 +980,11 @@ class TestCCIdentityValidation:
 
         assert result["cc_refresh_token"] == "cc_rt"
         assert result["validation_status"] == "valid"
-        assert result["refresh_failure_type"] is None
-        assert result["refresh_last_failed_at"] is None
+        assert result["cc_refresh_failure_type"] is None
+        assert result["cc_refresh_last_failed_at"] is None
+        # The primary chain's breaker belongs to the primary lineage.
+        assert result["refresh_failure_type"] == "http_5xx"
+        assert result["refresh_last_failed_at"] == 123
         assert result["last_error"] is None
         assert result["last_error_at"] is None
 
@@ -1358,12 +1375,17 @@ class TestRefreshCCTokenNetworkError:
 class TestPrepareAccountDirCCRefresh:
     """Verify prepare_account_dir triggers CC refresh when CC token is near-expiry."""
 
+    @patch(
+        "jacked.api.credential_helpers.read_live_credentials",
+        return_value={"claudeAiOauth": {"accessToken": "live-other-at", "refreshToken": "live-other-rt"}},
+    )
     @patch("jacked.api.credential_helpers.read_active_account_id")
     @patch("jacked.launch.should_refresh_cc")
     @patch("jacked.launch.should_refresh")
     @patch("jacked.web.auth.refresh_cc_token", new_callable=AsyncMock)
     def test_cc_refresh_called_when_cc_near_expiry(
-        self, mock_cc_refresh, mock_should_primary, mock_should_cc, mock_active_id, tmp_path
+        self, mock_cc_refresh, mock_should_primary, mock_should_cc, mock_active_id, _mock_live,
+        tmp_path,
     ):
         """When should_refresh_cc is True AND this is not the active CC session,
         refresh_cc_token is called. read_active_account_id is mocked to a
@@ -1545,3 +1567,417 @@ class TestUpdateAccountReturnChecks:
         assert "Validation status update failed" in caplog.text
         # Account should still be returned (non-fatal)
         assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# Workstream B: chain-aware refresh flow, dead chains, live-recovery ownership
+# ---------------------------------------------------------------------------
+
+
+def _token_client(status, body):
+    """Mock the token endpoint POST."""
+    resp = MagicMock()
+    resp.status_code = status
+    resp.json.return_value = body
+    client = AsyncMock()
+    client.post.return_value = resp
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    return client
+
+
+@pytest.fixture
+def _fresh_auth_locks():
+    from jacked.web import auth
+
+    auth.reset_locks()
+    yield
+    auth.reset_locks()
+
+
+@pytest.mark.usefixtures("_fresh_auth_locks")
+class TestChainAwareFlow:
+    def test_cc_429_primary_invalid_grant_leaves_cc_untouched(self, tmp_path, caplog):
+        """CC_OR_PRIMARY_429 with no cc refresh token runs on the primary
+        chain. A primary invalid_grant records the PRIMARY failure, logs
+        chain=primary, and never claims to clear the cc refresh token."""
+        import logging
+
+        from jacked.web.auth import RefreshMode, _refresh_token_flow
+
+        db = _make_db(tmp_path)
+        cc_exp = int(time.time()) + 3600
+        db.update_account(1, cc_access_token="cc_at", cc_refresh_token=None,
+                          cc_expires_at=cc_exp)
+        client = _token_client(400, {"error": "invalid_grant"})
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             caplog.at_level(logging.INFO, logger="jacked.auth"):
+            result = asyncio.run(_refresh_token_flow(1, db, RefreshMode.CC_OR_PRIMARY_429))
+
+        assert result.success is False
+        assert result.error == "invalid_grant"
+        assert result.chain == "primary"
+        acct = db.get_account(1)
+        assert acct["refresh_failure_type"] == "invalid_grant"
+        assert acct["refresh_last_failed_at"] is not None
+        assert acct["cc_access_token"] == "cc_at"
+        assert acct["cc_expires_at"] == cc_exp
+        assert acct["cc_refresh_failure_type"] is None
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("chain=primary" in m for m in messages)
+        assert not any("clearing cc" in m for m in messages)
+
+    def test_cc_429_with_cc_chain_success_writes_cc_columns_and_logs_chain(
+        self, tmp_path, caplog,
+    ):
+        import logging
+
+        from jacked.web.auth import RefreshMode, _refresh_token_flow
+
+        db = _make_db(tmp_path)
+        db.update_account(1, cc_access_token="cc_at", cc_refresh_token="cc_rt",
+                          cc_expires_at=int(time.time()) + 3600)
+        client = _token_client(200, {"access_token": "cc_at2",
+                                     "refresh_token": "cc_rt2", "expires_in": 3600})
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             caplog.at_level(logging.INFO, logger="jacked.auth"):
+            result = asyncio.run(_refresh_token_flow(1, db, RefreshMode.CC_OR_PRIMARY_429))
+
+        assert result.success and result.exchanged and result.chain == "cc"
+        acct = db.get_account(1)
+        assert acct["cc_refresh_token"] == "cc_rt2"
+        assert acct["refresh_token"] == "alice_primary_rt"
+        assert any("cc chain token refreshed (caller cc_429)" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_early_return_hands_back_the_primary_token_when_chain_is_primary(
+        self, tmp_path,
+    ):
+        """'Already refreshed by another path' must return the token of the
+        chain in use, not cc_access_token."""
+        from jacked.web import auth
+        from jacked.web.auth import RefreshMode
+
+        db = _make_db(tmp_path)
+        db.update_account(1, cc_access_token="cc_at", cc_refresh_token=None)
+        real_get = db.get_account
+        reads = {"n": 0}
+
+        def get_account(account_id):
+            reads["n"] += 1
+            row = real_get(account_id)
+            if reads["n"] >= 2:  # the locked re-read sees a rotated primary
+                row["refresh_token"] = "rotated_rt"
+                row["access_token"] = "rotated_at"
+            return row
+
+        db.get_account = get_account
+        client = _token_client(200, {})
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            result = asyncio.run(
+                auth._refresh_token_flow(1, db, RefreshMode.CC_OR_PRIMARY_429))
+
+        assert result.success is True
+        assert result.access_token == "rotated_at"
+        assert result.chain == "primary"
+        assert result.exchanged is False
+        client.post.assert_not_called()
+
+    def test_primary_success_does_not_clear_the_cc_breaker(self, tmp_path):
+        from jacked.web.auth import RefreshMode, _refresh_token_flow
+
+        db = _make_db(tmp_path)
+        db.update_account(1, expires_at=0, cc_refresh_failure_type="invalid_grant",
+                          cc_refresh_last_failed_at=111,
+                          refresh_failure_type="http_500", refresh_last_failed_at=5)
+        client = _token_client(200, {"access_token": "p2", "refresh_token": "prt2",
+                                     "expires_in": 3600})
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.web.auth.fetch_profile", AsyncMock(return_value=None)):
+            result = asyncio.run(_refresh_token_flow(1, db, RefreshMode.PRIMARY))
+
+        assert result.success and result.exchanged
+        acct = db.get_account(1)
+        assert acct["refresh_failure_type"] is None
+        assert acct["refresh_last_failed_at"] is None
+        assert acct["cc_refresh_failure_type"] == "invalid_grant"
+        assert acct["cc_refresh_last_failed_at"] == 111
+
+    def test_cc_network_failure_records_only_the_cc_breaker(self, tmp_path):
+        import httpx
+
+        from jacked.web.auth import RefreshMode, _refresh_token_flow
+
+        db = _make_db(tmp_path)
+        db.update_account(1, cc_access_token="cc_at", cc_refresh_token="cc_rt")
+        client = AsyncMock()
+        client.post.side_effect = httpx.ReadTimeout("slow")
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
+            result = asyncio.run(_refresh_token_flow(1, db, RefreshMode.CC))
+
+        assert result.error == "reply_lost"
+        acct = db.get_account(1)
+        assert acct["cc_refresh_failure_type"] == "reply_lost"
+        assert acct["refresh_failure_type"] is None
+        assert acct["cc_refresh_token"] == "cc_rt"
+
+
+class TestCcChainMigration:
+    MARKER = Database.CC_BREAKER_SPLIT_MARKER
+
+    def _legacy_db(self, tmp_path, *, drop_columns=True):
+        """A database from before the per-chain breaker split.
+
+        ``drop_columns=False`` is the state of a machine that got the
+        columns without the move (the 2026-10-26 doctest incident).
+        """
+        path = tmp_path / "legacy.db"
+        db = Database(str(path))
+        for email, at, rt in (("a@test.com", "pat", "prt"),
+                              ("b@test.com", "pat2", "prt2"),
+                              ("c@test.com", "pat3", "prt3"),
+                              ("d@test.com", "pat4", "prt4")):
+            db.create_account(email=email, access_token=at, refresh_token=rt,
+                              expires_at=int(time.time()) + 3600, scopes=None)
+        conn = sqlite3.connect(str(path))
+        conn.execute("DROP TABLE IF EXISTS schema_migrations")
+        if drop_columns:
+            conn.execute("ALTER TABLE accounts DROP COLUMN cc_refresh_failure_type")
+            conn.execute("ALTER TABLE accounts DROP COLUMN cc_refresh_last_failed_at")
+        # Account 1: legacy dead cc chain, expired dead cc token.
+        conn.execute(
+            "UPDATE accounts SET refresh_failure_type='invalid_grant', "
+            "refresh_last_failed_at=777, cc_access_token='dead_cc', "
+            "cc_refresh_token=NULL, cc_expires_at=1 WHERE id=1")
+        # Account 2: shared network failure, cc chain alive: not moved.
+        conn.execute(
+            "UPDATE accounts SET refresh_failure_type='network_error', "
+            "refresh_last_failed_at=888, cc_access_token='cc2', "
+            "cc_refresh_token='ccrt2' WHERE id=2")
+        # Account 3: cc chain never authorized, PRIMARY died: not moved.
+        conn.execute(
+            "UPDATE accounts SET refresh_failure_type='invalid_grant', "
+            "refresh_last_failed_at=999, cc_access_token=NULL, "
+            "cc_refresh_token=NULL WHERE id=3")
+        # Account 4: the old seed copied the PRIMARY token into the cc
+        # column (no cc refresh token); its invalid_grant is a primary
+        # death: not moved.
+        conn.execute(
+            "UPDATE accounts SET refresh_failure_type='invalid_grant', "
+            "refresh_last_failed_at=1111, cc_access_token='pat4', "
+            "cc_refresh_token=NULL, cc_expires_at=NULL WHERE id=4")
+        conn.commit()
+        conn.close()
+        return path
+
+    def _assert_moved(self, db):
+        a = db.get_account(1)
+        assert a["cc_refresh_failure_type"] == "invalid_grant"
+        assert a["cc_refresh_last_failed_at"] == 777
+        assert a["refresh_failure_type"] is None
+        assert a["refresh_last_failed_at"] is None
+        assert a["cc_access_token"] is None  # expired dead token leaves service
+        assert a["cc_expires_at"] is None
+        b = db.get_account(2)
+        assert b["refresh_failure_type"] == "network_error"
+        assert b["cc_refresh_failure_type"] is None
+        c = db.get_account(3)
+        assert c["refresh_failure_type"] == "invalid_grant"
+        assert c["refresh_last_failed_at"] == 999
+        assert c["cc_refresh_failure_type"] is None
+        d = db.get_account(4)
+        assert d["refresh_failure_type"] == "invalid_grant"
+        assert d["refresh_last_failed_at"] == 1111
+        assert d["cc_refresh_failure_type"] is None
+        assert d["cc_access_token"] == "pat4"
+        conn = sqlite3.connect(db.db_path)
+        assert conn.execute(
+            "SELECT name FROM schema_migrations WHERE name = ?", (self.MARKER,)
+        ).fetchone() == (self.MARKER,)
+        conn.close()
+        # The marker is private: the settings table never carries it.
+        assert db.get_setting(self.MARKER) is None
+
+    def test_legacy_shared_invalid_grant_moves_to_the_cc_columns(self, tmp_path):
+        self._assert_moved(Database(str(self._legacy_db(tmp_path))))
+
+    def test_move_runs_when_the_columns_exist_but_the_move_never_ran(self, tmp_path):
+        path = self._legacy_db(tmp_path, drop_columns=False)
+        self._assert_moved(Database(str(path)))
+
+    def test_a_later_primary_death_is_never_reclassified(self, tmp_path):
+        """After the move, the shared pair means the primary chain. A row with
+        a cc access token but no cc refresh token (an old seed, or a file sync
+        of a consumed token) that takes a real primary invalid_grant keeps it
+        on the primary breaker on every later migration pass."""
+        path = self._legacy_db(tmp_path)
+        db = Database(str(path))
+        db.update_account(2, cc_refresh_token=None,
+                          refresh_failure_type="invalid_grant",
+                          refresh_last_failed_at=1234)
+
+        for _ in range(3):
+            again = Database(str(path))
+        b = again.get_account(2)
+        assert b["refresh_failure_type"] == "invalid_grant"
+        assert b["refresh_last_failed_at"] == 1234
+        assert b["cc_refresh_failure_type"] is None
+        assert b["cc_access_token"] == "cc2"
+        assert again.get_account(1)["cc_refresh_last_failed_at"] == 777
+
+
+@pytest.mark.usefixtures("_fresh_auth_locks")
+class TestLiveRecoveryOwnership:
+    def _db_with_cc(self, tmp_path):
+        db = _make_db(tmp_path)
+        db.update_account(1, cc_access_token="old_cc_at", cc_refresh_token="old_cc_rt",
+                          cc_expires_at=int(time.time()) - 100)
+        return db
+
+    def test_stamped_payload_with_another_accounts_tokens_is_not_imported(
+        self, tmp_path,
+    ):
+        """A live payload stamped for account 1 whose tokens belong to
+        account 5 (log 2026-10-17 13:14:55) must not land in row 1."""
+        from jacked.api.authority_guard import ProfileLookup
+
+        db = self._db_with_cc(tmp_path)
+        live = {
+            "_jackedAccountId": 1,
+            "claudeAiOauth": {
+                "accessToken": "acct5_live_at",
+                "refreshToken": "acct5_live_rt",
+                "expiresAt": (int(time.time()) + 3600) * 1000,
+            },
+        }
+        foreign = ProfileLookup(200, {"account": {"email": "someone5@test.com"},
+                                      "organization": {"uuid": None}})
+        client = _token_client(400, {"error": "invalid_grant"})
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.api.credential_helpers.read_platform_credentials",
+                   return_value=live), \
+             patch("jacked.api.credential_helpers._ownership_lookup",
+                   return_value=foreign):
+            ok = asyncio.run(refresh_cc_token(1, db))
+
+        assert ok is False
+        acct = db.get_account(1)
+        assert acct["cc_access_token"] != "acct5_live_at"
+        assert acct["cc_access_token"] is None
+        assert acct["cc_refresh_failure_type"] == "invalid_grant"
+
+    def test_proven_live_token_is_kept_for_the_dead_chain(self, tmp_path):
+        from jacked.api.authority_guard import ProfileLookup
+
+        db = self._db_with_cc(tmp_path)
+        live_exp = int(time.time()) + 3600
+        live = {
+            "_jackedAccountId": 1,
+            "claudeAiOauth": {"accessToken": "own_live_at",
+                              "refreshToken": "own_live_rt",
+                              "expiresAt": live_exp * 1000},
+        }
+        mine = ProfileLookup(200, {"account": {"email": "alice@test.com"},
+                                   "organization": {"uuid": None}})
+        client = _token_client(400, {"error": "invalid_grant"})
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.api.credential_helpers.read_platform_credentials",
+                   return_value=live), \
+             patch("jacked.api.credential_helpers._ownership_lookup",
+                   return_value=mine):
+            ok = asyncio.run(refresh_cc_token(1, db))
+
+        assert ok is True
+        acct = db.get_account(1)
+        assert acct["cc_access_token"] == "own_live_at"
+        assert acct["cc_expires_at"] == live_exp
+        # The spent refresh token leaves; the live one is never imported.
+        assert acct["cc_refresh_token"] is None
+        assert acct["cc_refresh_failure_type"] == "invalid_grant"
+        # build_oauth_data hands no refresh token for the dead chain.
+        assert build_oauth_data(acct)["refreshToken"] is None
+
+
+class TestBuildOauthDataDeadChain:
+    def _row(self, **cc):
+        row = {
+            "access_token": "primary_at", "refresh_token": "primary_rt",
+            "expires_at": int(time.time()) + 3600, "scopes": None,
+            "subscription_type": "max", "rate_limit_tier": "t1",
+        }
+        row.update(cc)
+        return row
+
+    def test_dead_chain_with_expired_token_falls_back_to_primary(self):
+        result = build_oauth_data(self._row(
+            cc_access_token="dead_at", cc_refresh_token="spent_rt",
+            cc_expires_at=int(time.time()) - 10,
+            cc_refresh_failure_type="invalid_grant"))
+        assert result["accessToken"] == "primary_at"
+        assert result["refreshToken"] is None
+        assert "spent_rt" not in str(result)
+
+    def test_dead_chain_never_publishes_its_refresh_token(self):
+        result = build_oauth_data(self._row(
+            cc_access_token="live_at", cc_refresh_token="spent_rt",
+            cc_expires_at=int(time.time()) + 600,
+            cc_refresh_failure_type="invalid_grant"))
+        assert result["accessToken"] == "live_at"
+        assert result["refreshToken"] is None
+
+    def test_primary_chain_failure_does_not_affect_cc_publication(self):
+        result = build_oauth_data(self._row(
+            cc_access_token="cc_at", cc_refresh_token="cc_rt",
+            cc_expires_at=int(time.time()) + 600,
+            refresh_failure_type="invalid_grant"))
+        assert result["refreshToken"] == "cc_rt"
+
+
+class TestDeadChainCleanupRace:
+    def test_reauth_during_live_recovery_keeps_the_new_lineage(self, tmp_path):
+        """invalid_grant on the cc chain reads the live store off the lock's
+        turn; an OAuth re-auth that stores a NEW cc pair meanwhile must not
+        be wiped by the cleanup of the OLD lineage."""
+        import asyncio
+        from unittest.mock import patch
+
+        from jacked.web import auth
+
+        db = Database(str(tmp_path / "race.db"))
+        acct = db.create_account("r@test.com", "pat", int(time.time()) + 3600, refresh_token="prt")
+        aid = acct["id"]
+        db.update_account(aid, cc_access_token="cc_old", cc_refresh_token="cc_rt_old",
+                          cc_expires_at=int(time.time()) + 3600)
+        row = db.get_account(aid)
+
+        def _reauth_lands(account_id, account):
+            db.update_account(account_id, cc_access_token="cc_new", cc_refresh_token="cc_rt_new",
+                              cc_expires_at=int(time.time()) + 7200)
+            return None  # the live store holds another account
+
+        with patch("jacked.web.auth._live_recovery_payload", side_effect=_reauth_lands):
+            result = asyncio.run(auth._cc_chain_died(aid, db, row, "cc_rt_old"))
+
+        assert result.success and result.access_token == "cc_new"
+        after = db.get_account(aid)
+        assert after["cc_refresh_token"] == "cc_rt_new"
+        assert after["cc_refresh_failure_type"] is None
+
+    def test_no_reauth_clears_the_dead_lineage(self, tmp_path):
+        import asyncio
+        from unittest.mock import patch
+
+        from jacked.web import auth
+
+        db = Database(str(tmp_path / "dead.db"))
+        acct = db.create_account("s@test.com", "pat", int(time.time()) + 3600, refresh_token="prt")
+        aid = acct["id"]
+        db.update_account(aid, cc_access_token="cc_old", cc_refresh_token="cc_rt_old")
+        with patch("jacked.web.auth._live_recovery_payload", return_value=None):
+            result = asyncio.run(auth._cc_chain_died(aid, db, db.get_account(aid), "cc_rt_old"))
+        assert not result.success and result.error == "invalid_grant"
+        after = db.get_account(aid)
+        assert after["cc_access_token"] is None and after["cc_refresh_token"] is None
+        assert after["cc_refresh_failure_type"] == "invalid_grant"

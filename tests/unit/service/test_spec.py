@@ -98,6 +98,9 @@ def test_virtualenv_runtime_rejects_broken_non_python_and_writable_paths(tmp_pat
     broken.unlink()
 
     broken.symlink_to(Path(sys.executable))
+    # Pin the user's own group: on macOS a new directory inherits its
+    # parent's group, which is the trusted wheel group under /private/tmp.
+    os.chown(venv.joinpath("bin"), -1, os.getgid())
     venv.joinpath("bin").chmod(0o775)
     with pytest.raises(ValueError, match="untrusted writable directory"):
         _spec(runtime_path=str(broken))
@@ -169,6 +172,10 @@ def test_virtualenv_runtime_rejects_mutating_darwin_acls(
 def _group_writable_venv(tmp_path, mode=0o770):
     venv = tmp_path / "venv"
     venv.joinpath("bin").mkdir(parents=True)
+    # BSD-style systems (macOS) give a new directory its PARENT's group, and
+    # /private/tmp is group wheel (gid 0, trusted): pin the user's own group
+    # so the group-trust tests mean the same thing under any tmp layout.
+    os.chown(venv.joinpath("bin"), -1, os.getgid())
     venv.joinpath("bin").chmod(mode)
     venv.joinpath("pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
     target = tmp_path / "python3.99"

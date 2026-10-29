@@ -27,11 +27,11 @@ from __future__ import annotations
 import json
 import logging
 import re
-import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from jacked.findbin import find_bin
 from jacked.memory import capture
 from jacked.memory import vault as vault_mod
 
@@ -254,11 +254,12 @@ def _fetch_pr(repo: Path, pr_number: str | None) -> tuple[str | None, str | None
     """PR (title, body, body_trimmed) via ``gh`` when available; failure tolerated."""
     if not pr_number:
         return None, None, False
-    if not shutil.which("gh"):
+    gh = find_bin("gh")
+    if not gh:
         return None, None, False
     try:
         proc = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--json", "title,body"],
+            [gh, "pr", "view", str(pr_number), "--json", "title,body"],
             cwd=str(repo), capture_output=True, text=True,
             timeout=_GH_TIMEOUT, stdin=subprocess.DEVNULL,
         )

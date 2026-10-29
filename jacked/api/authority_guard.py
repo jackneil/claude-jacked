@@ -42,6 +42,9 @@ ACTION_ADOPTED = "adopted"
 ACTION_REASSERTED = "reasserted"
 ACTION_UNKNOWN_ACCOUNT = "unknown_account"
 ACTION_SKIPPED = "skipped"
+# A stamped payload whose tokens jacked did not hold: a running Claude Code
+# session rotated its lineage. The tokens went into the proven owner's row.
+ACTION_ROTATION_ADOPTED = "rotation_adopted"
 
 
 @dataclass(frozen=True)
@@ -61,14 +64,18 @@ _state_lock = threading.Lock()
 # reassert rate limit or the switch lease held it off. The identified account
 # is kept, so the retry costs no network call.
 _handled: dict[str, Any] = {"digest": None, "account_id": None, "settled": True}
+# The stamped payload whose rotation jacked identified last (settled), or
+# whose transient lookup failure is waiting out its retry cooldown.
+_stamped_handled: dict[str, Any] = {"digest": None, "retry_at": None}
 _last_reassert_at: float = 0.0
 
 
 def reset_authority_guard_state() -> None:
-    """Forget the handled payload digest and the reassert rate limit."""
+    """Forget the handled payload digests and the reassert rate limit."""
     global _last_reassert_at
     with _state_lock:
         _handled.update({"digest": None, "account_id": None, "settled": True})
+        _stamped_handled.update({"digest": None, "retry_at": None})
         _last_reassert_at = 0.0
 
 
@@ -154,9 +161,31 @@ def lookup_profile(access_token: str) -> ProfileLookup:
     return ProfileLookup(200, body if isinstance(body, dict) else None)
 
 
+# Seconds before a stamped payload whose profile lookup failed TRANSIENTLY
+# (no reply, 5xx) is identified again. Bounds the request rate while the
+# failure lasts; a terminal refusal (4xx) settles the payload instead.
+_STAMPED_LOOKUP_RETRY_SECONDS = 600.0
+
+
 def _default_profile_lookup(access_token: str) -> dict | None:
-    """Identify one access token through the OAuth profile endpoint."""
-    return lookup_profile(access_token).profile
+    """Identify one access token through the OAuth profile endpoint.
+
+    Returns the profile object on 200; an EMPTY dict when the endpoint
+    refused the token (400/401/403/404: a revoked or foreign token, a
+    terminal verdict); ``None`` when the request did not complete, the
+    server failed, or the endpoint throttled it (408/429: a transient
+    failure worth a later retry).
+    """
+    outcome = lookup_profile(access_token)
+    if outcome.profile:
+        return outcome.profile
+    if outcome.status_code in _PROFILE_REFUSED_STATUSES:
+        return {}
+    return None
+
+
+# Profile statuses that are a verdict on the token, not a hiccup.
+_PROFILE_REFUSED_STATUSES = frozenset({400, 401, 403, 404})
 
 
 def _uuid_prefix(value: Any) -> str:
@@ -218,9 +247,32 @@ def _expiry_seconds(raw: Any) -> int | None:
     return int(raw / 1000) if raw > 1e12 else int(raw)
 
 
-def _import_rotated_tokens(db, row: dict, payload: dict) -> int:
-    """Adopt the rotated Claude Code tokens into one account row."""
+def _import_rotated_tokens(
+    db, row: dict, payload: dict, profile: dict | None = None
+) -> int:
+    """Adopt the rotated Claude Code tokens into one account row.
+
+    The shared ownership rule (``live_payload_belongs_to``) gates the
+    import: the identifying ``profile`` must name the row, or the row must
+    already hold one of the tokens, or the profile endpoint must prove it.
+    The payload stamp plays no part here, because a stamp survives Claude
+    Code's writes for other accounts.
+    """
+    from jacked.api.credential_helpers import (
+        is_primary_publication,
+        live_payload_belongs_to,
+    )
+
     account_id = int(row["id"])
+    if is_primary_publication(row, _oauth_section(payload).get("accessToken")):
+        return 0
+    if not live_payload_belongs_to(row, payload, require_stamp=False, profile=profile):
+        logger.warning(
+            "Account %d: rotated Claude Code tokens are not proven to belong to "
+            "this account; not adopting them",
+            account_id,
+        )
+        return 0
     oauth = _oauth_section(payload)
     updates: dict[str, Any] = {}
 
@@ -237,7 +289,9 @@ def _import_rotated_tokens(db, row: dict, payload: dict) -> int:
         # The invalid_grant breaker means jacked and Claude Code are already
         # competing for one single-use refresh token. Importing it here would
         # let jacked exchange the token Claude Code still needs.
-        if row.get("refresh_failure_type") == "invalid_grant":
+        # The Claude Code chain breaker guards this import; the primary
+        # chain's breaker says nothing about this lineage.
+        if row.get("cc_refresh_failure_type") == "invalid_grant":
             logger.debug(
                 "Account %d: skipping cc_refresh_token import (invalid_grant active)",
                 account_id,
@@ -245,19 +299,161 @@ def _import_rotated_tokens(db, row: dict, payload: dict) -> int:
         elif refresh_token != row.get("cc_refresh_token"):
             updates["cc_refresh_token"] = refresh_token
             # A live rotation proves the lineage is healthy, so clear the same
-            # breaker fields a successful refresh clears.
-            if row.get("refresh_failure_type") or row.get("refresh_last_failed_at"):
-                updates["refresh_failure_type"] = None
-                updates["refresh_last_failed_at"] = None
+            # breaker fields a successful cc refresh clears.
+            if row.get("cc_refresh_failure_type") or row.get("cc_refresh_last_failed_at"):
+                updates["cc_refresh_failure_type"] = None
+                updates["cc_refresh_last_failed_at"] = None
+    if (
+        "cc_access_token" in updates
+        and row.get("cc_refresh_failure_type") == "auth_rejected"
+    ):
+        # A newer access token replaces the one the API refused.
+        updates["cc_refresh_failure_type"] = None
+        updates["cc_refresh_last_failed_at"] = None
 
     if updates:
         db.update_account(account_id, **updates)
         logger.info(
             "Adopted rotated Claude Code tokens for account %d from a foreign "
-            "authority write",
+            "authority write (%d field(s))",
             account_id,
+            len(updates),
         )
+        try:
+            from jacked.api.usage_monitor import clear_ping_backoff
+
+            clear_ping_backoff(account_id)
+        except Exception:  # noqa: BLE001 - never fail an import over this
+            logger.debug("Could not clear the keeper backoff", exc_info=True)
     return len(updates)
+
+
+def _holds_payload_tokens(row: dict | None, payload: dict) -> bool:
+    """True when ``row`` already holds the payload's access and refresh tokens."""
+    if not row:
+        return False
+    oauth = _oauth_section(payload)
+    access_token = oauth.get("accessToken")
+    refresh_token = oauth.get("refreshToken")
+    if access_token and access_token == row.get("access_token"):
+        # jacked's own primary-fallback publication (build_oauth_data). It
+        # belongs to the primary lineage and must never enter the cc_* columns.
+        return True
+    if not access_token or access_token != row.get("cc_access_token"):
+        return False
+    return not refresh_token or refresh_token == row.get("cc_refresh_token")
+
+
+def _adopt_stamped_rotation(
+    db, payload: dict, stamp: int, profile_lookup: Callable[[str], dict | None]
+) -> HealResult:
+    """Keep jacked's copy of a lineage in sync after a stamped rotation.
+
+    Claude Code keeps the top-level ``_jackedAccountId`` when it rewrites the
+    authority, so a session refresh, or a ``/login`` to another account,
+    leaves a STAMPED payload with tokens jacked does not hold. This path is
+    the one that adopts those rotations. It never writes the authority.
+
+    The stamped row holding the tokens is the common case and costs no
+    network call. Otherwise the payload is identified once through the
+    profile endpoint, the matching row is proven with the shared ownership
+    rule, and the tokens go into THAT row, which may differ from the stamp.
+    """
+    stamped_row = db.get_account(stamp)
+    if _holds_payload_tokens(stamped_row, payload):
+        return HealResult(ACTION_NONE, foreign_account_id=stamp)
+    access_token = _oauth_section(payload).get("accessToken")
+    if not isinstance(access_token, str) or not access_token:
+        return HealResult(ACTION_NONE, foreign_account_id=stamp)
+
+    digest = _payload_digest(payload)
+    with _state_lock:
+        if _stamped_handled["digest"] == digest:
+            retry_at = _stamped_handled.get("retry_at")
+            if retry_at is None or retry_at > time.time():
+                return HealResult(ACTION_NONE, foreign_account_id=stamp)
+
+    def _settle(retry_after: float | None = None) -> None:
+        # A settled verdict retires the payload for good. A transient profile
+        # failure parks it for a retry cooldown instead, and a failed
+        # database write (which raises past this point) leaves it unset: a
+        # rotated single-use refresh token that is never adopted dies with
+        # the next authority overwrite, so the retry matters.
+        with _state_lock:
+            _stamped_handled["digest"] = digest
+            _stamped_handled["retry_at"] = (
+                time.time() + retry_after if retry_after is not None else None
+            )
+
+    profile = profile_lookup(access_token)
+    if profile is None:
+        _settle(retry_after=_STAMPED_LOOKUP_RETRY_SECONDS)
+        logger.info(
+            "Stamped authority payload for account %d carries tokens jacked does "
+            "not hold; the profile lookup did not complete, so nothing was "
+            "adopted yet (payload %s); it is retried in %d s",
+            stamp,
+            digest[:8],
+            int(_STAMPED_LOOKUP_RETRY_SECONDS),
+        )
+        return HealResult(
+            ACTION_SKIPPED, foreign_account_id=stamp, reason="profile lookup failed"
+        )
+    if not isinstance(profile, dict) or not profile:
+        # The endpoint refused the token: a verdict, not a hiccup.
+        _settle()
+        logger.info(
+            "Stamped authority payload for account %d carries tokens the profile "
+            "endpoint refused; nothing adopted (payload %s)",
+            stamp,
+            digest[:8],
+        )
+        return HealResult(
+            ACTION_SKIPPED, foreign_account_id=stamp, reason="profile refused the token"
+        )
+    account_section = profile.get("account") or {}
+    organization_section = profile.get("organization") or {}
+    email = account_section.get("email") if isinstance(account_section, dict) else None
+    organization_uuid = (
+        organization_section.get("uuid")
+        if isinstance(organization_section, dict)
+        else None
+    )
+    if not isinstance(email, str) or not email:
+        _settle()
+        return HealResult(
+            ACTION_SKIPPED, foreign_account_id=stamp, reason="profile carries no email"
+        )
+    owner = _match_account(db, email, organization_uuid)
+    if owner is None:
+        _settle()
+        logger.warning(
+            "Stamped authority payload for account %d holds tokens of an account "
+            "that is not a known jacked account (organization %s, payload %s); "
+            "nothing was adopted",
+            stamp,
+            _uuid_prefix(organization_uuid),
+            digest[:8],
+        )
+        return HealResult(
+            ACTION_UNKNOWN_ACCOUNT, foreign_account_id=stamp, reason="unknown account"
+        )
+    owner_id = int(owner["id"])
+    if owner_id != stamp:
+        logger.warning(
+            "The credential authority carries account %d's tokens under account "
+            "%d's stamp; adopting them into account %d only",
+            owner_id,
+            stamp,
+            owner_id,
+        )
+    adopted = _import_rotated_tokens(db, owner, payload, profile=profile)
+    _settle()
+    return HealResult(
+        ACTION_ROTATION_ADOPTED if adopted else ACTION_NONE,
+        foreign_account_id=owner_id,
+        reason="" if adopted else "nothing new to adopt",
+    )
 
 
 def _desired_account_id(db) -> int | None:
@@ -362,10 +558,12 @@ def _heal(
 
     stamp = _stamped_account_id(payload)
     if stamp is not None:
-        # A stamped payload is a jacked write. jacked itself may have chosen
-        # another account (a scoped launch, for example), and the credential
-        # repository already tracks that choice.
-        return HealResult(ACTION_NONE, foreign_account_id=stamp)
+        # A stamped payload is treated as a jacked write for reassert
+        # purposes: jacked itself may have chosen another account (a scoped
+        # launch, for example), and the credential repository already tracks
+        # that choice. The stamp survives Claude Code's own rotations, so
+        # adopt any rotated tokens before anything overwrites the authority.
+        return _adopt_stamped_rotation(db, payload, stamp, profile_lookup)
 
     digest = _payload_digest(payload)
     with _state_lock:
@@ -425,7 +623,9 @@ def _heal(
             )
 
     foreign_account_id = int(row["id"])
-    _import_rotated_tokens(db, row, payload)
+    _import_rotated_tokens(
+        db, row, payload, profile=profile if known_account_id is None else None
+    )
 
     desired_id = _desired_account_id(db)
     if desired_id is None:

@@ -146,10 +146,15 @@ class ExtraUsage(BaseModel):
 
 
 class AccountUsage(BaseModel):
-    """Usage statistics for an account with per-model breakdowns."""
+    """Usage statistics for an account with per-model breakdowns.
 
-    five_hour: float = 0
-    seven_day: float = 0
+    A window is None only for a Codex window that Codex does not report for
+    the account (a weekly-only plan has no 5h window). A Claude window with
+    no reading is "no active window", which is 0% used.
+    """
+
+    five_hour: Optional[float] = 0
+    seven_day: Optional[float] = 0
     five_hour_resets_at: Optional[str] = None
     seven_day_resets_at: Optional[str] = None
     per_model: Optional[dict[str, ModelUsage]] = None
@@ -159,6 +164,62 @@ class AccountUsage(BaseModel):
     # reports no per-model cap. Selection lives in menubar_summary.binding_model.
     binding_model: Optional[ModelUsage] = None
     extra_usage: Optional[ExtraUsage] = None
+
+
+class KeeperState(BaseModel):
+    """The window keeper's last verdict for an account (dashboard reason text).
+
+    The token fingerprint the keeper stores is deliberately not exposed.
+    """
+
+    last_ping_at: Optional[int] = None
+    last_status: Optional[str] = None
+    error_type: Optional[str] = None
+    request_id: Optional[str] = None
+    consecutive_auth_failures: int = 0
+    next_attempt_at: Optional[float] = None
+    skip_reason: Optional[str] = None
+    paused_until: Optional[float] = None
+    updated_at: Optional[int] = None
+
+
+def _build_keeper_state(raw) -> Optional[KeeperState]:
+    """Parse the keeper_state column; None when absent or malformed.
+
+    >>> _build_keeper_state(None) is None
+    True
+    >>> _build_keeper_state('{"last_status": "needs_reauth", "token_fp": "ab12cd34"}').last_status
+    'needs_reauth'
+    >>> "token_fp" in _build_keeper_state('{"token_fp": "ab12cd34"}').model_dump()
+    False
+    >>> _build_keeper_state('{"consecutive_auth_failures": "x"}') is None
+    True
+    """
+    from jacked.web.database import Database
+
+    state = Database.parse_keeper_state(raw)
+    if not state:
+        return None
+    fields = {k: state.get(k) for k in KeeperState.model_fields if k in state}
+    if fields.get("consecutive_auth_failures") is None:
+        fields.pop("consecutive_auth_failures", None)
+    try:
+        return KeeperState(**fields)
+    except Exception:  # noqa: BLE001 - a malformed blob must not break the list
+        return None
+
+
+class UsageBlock(BaseModel):
+    """The provider's own verdict that the account may not send requests.
+
+    reason is ``limit_reached``, ``spend_limit`` or ``blocked``; resets_at
+    is when the provider says the block lifts (None when it did not say).
+    """
+
+    reason: str
+    resets_at: Optional[str] = None
+    # usage_cached_at of the reading that carried the verdict (epoch seconds).
+    read_at: Optional[int] = None
 
 
 class AccountResponse(BaseModel):
@@ -203,6 +264,8 @@ class AccountResponse(BaseModel):
     is_expired: bool = False
     expires_in_seconds: int = 0
     usage: Optional[AccountUsage] = None
+    keeper_state: Optional[KeeperState] = None
+    usage_block: Optional[UsageBlock] = None
 
 
 class AccountPatchRequest(BaseModel):
@@ -588,6 +651,8 @@ def _build_account_usage(row: dict) -> Optional[AccountUsage]:
     >>> u = _build_account_usage({"cached_usage_5h": 25.0, "cached_usage_7d": 60.0})
     >>> u.five_hour
     25.0
+    >>> _build_account_usage({"provider": "codex", "cached_usage_7d": 100.0}).five_hour is None
+    True
     """
     if row.get("cached_usage_5h") is None and row.get("cached_usage_7d") is None:
         return None
@@ -595,9 +660,17 @@ def _build_account_usage(row: dict) -> Optional[AccountUsage]:
         row.get("cached_usage_raw")
     )
     binding = per_model.get(binding_key) if (per_model and binding_key) else None
+    codex = (row.get("provider") or "claude") == "codex"
+
+    def _window(value):
+        # A Codex window with no reading is not reported, not 0% used.
+        if value is None:
+            return None if codex else 0
+        return value
+
     return AccountUsage(
-        five_hour=row.get("cached_usage_5h", 0) or 0,
-        seven_day=row.get("cached_usage_7d", 0) or 0,
+        five_hour=_window(row.get("cached_usage_5h")),
+        seven_day=_window(row.get("cached_usage_7d")),
         five_hour_resets_at=row.get("cached_5h_resets_at"),
         seven_day_resets_at=row.get("cached_7d_resets_at"),
         per_model=per_model,
@@ -700,6 +773,7 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
         cached_5h_resets_at=row.get("cached_5h_resets_at"),
         cached_7d_resets_at=row.get("cached_7d_resets_at"),
         usage_cached_at=row.get("usage_cached_at"),
+        keeper_state=_build_keeper_state(row.get("keeper_state")),
         last_error=row.get("last_error"),
         last_error_at=row.get("last_error_at"),
         consecutive_failures=row.get("consecutive_failures", 0),
@@ -723,7 +797,20 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
         is_expired=now >= row["expires_at"],
         expires_in_seconds=max(0, row["expires_at"] - now),
         usage=_build_account_usage(row),
+        usage_block=_build_usage_block(row),
     )
+
+
+def _build_usage_block(row: dict) -> Optional[UsageBlock]:
+    """The provider's usage-blocked verdict for a DB row, or None.
+
+    >>> _build_usage_block({}) is None
+    True
+    """
+    from jacked.service.menubar_summary import usage_block_of_row
+
+    block = usage_block_of_row(row)
+    return UsageBlock(**block) if block else None
 
 
 # --- Routes ---
@@ -902,7 +989,11 @@ async def list_accounts(request: Request, include_inactive: bool = False):
         return _db_unavailable()
 
     rows = db.list_accounts(include_inactive=include_inactive)
-    return [_account_to_response(row, db=db) for row in rows]
+    # _account_to_response can reconcile the active account, which reads the
+    # Keychain and may call the profile endpoint. Keep both off the loop.
+    return await asyncio.to_thread(
+        lambda: [_account_to_response(row, db=db) for row in rows]
+    )
 
 
 @router.patch("/accounts/{account_id}")

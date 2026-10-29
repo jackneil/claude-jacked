@@ -71,7 +71,7 @@ def parse_jsonl_file(filepath: Path) -> ParsedTranscript:
         json.JSONDecodeError: If file has invalid JSON
 
     Examples:
-        >>> # transcript = parse_jsonl_file(Path('session.jsonl'))  # doctest: +SKIP
+        # transcript = parse_jsonl_file(Path('session.jsonl'))
     """
     if not filepath.exists():
         raise FileNotFoundError(f"Session file not found: {filepath}")
@@ -397,7 +397,7 @@ def find_session_files(projects_dir: Path, repo_pattern: Optional[str] = None) -
         Tuples of (session_path, repo_path)
 
     Examples:
-        >>> # for path, repo in find_session_files(Path('~/.claude/projects')):  # doctest: +SKIP
+        # for path, repo in find_session_files(Path('~/.claude/projects')):
         >>> #     print(f'{path.name} in {repo}')
     """
     if not projects_dir.exists():
@@ -434,11 +434,12 @@ def _decode_repo_path(encoded: str) -> str:
         encoded: The encoded directory name (e.g., C--Github-repo-name)
 
     Returns:
-        Decoded path (e.g., C:/Github/repo-name)
+        Decoded path (e.g., C:/Github/repo/name). The encoding is lossy: a
+        hyphen inside a directory name decodes as a path separator.
 
     Examples:
         >>> _decode_repo_path('C--Github-repo-name')
-        'C:/Github/repo-name'
+        'C:/Github/repo/name'
         >>> _decode_repo_path('F--act-envision')
         'F:/act/envision'
     """
@@ -541,7 +542,7 @@ def find_subagent_files(session_path: Path) -> list[Path]:
         List of paths to subagent JSONL files
 
     Examples:
-        >>> # files = find_subagent_files(Path('session.jsonl'))  # doctest: +SKIP
+        # files = find_subagent_files(Path('session.jsonl'))
     """
     # Session dir is {session-id}/ next to {session-id}.jsonl
     session_dir = session_path.parent / session_path.stem
@@ -566,7 +567,7 @@ def extract_agent_summary(agent_file: Path) -> Optional[AgentSummary]:
         AgentSummary or None if no usable summary found
 
     Examples:
-        >>> # summary = extract_agent_summary(Path('agent-abc.jsonl'))  # doctest: +SKIP
+        # summary = extract_agent_summary(Path('agent-abc.jsonl'))
     """
     # Extract agent_id from filename: agent-a4e75d5.jsonl -> a4e75d5
     agent_id = agent_file.stem.replace("agent-", "")
@@ -645,7 +646,7 @@ def extract_summary_labels(session_path: Path) -> list[SummaryLabel]:
         List of SummaryLabel objects
 
     Examples:
-        >>> # labels = extract_summary_labels(Path('session.jsonl'))  # doctest: +SKIP
+        # labels = extract_summary_labels(Path('session.jsonl'))
     """
     labels = []
 
@@ -694,7 +695,7 @@ def extract_session_slug(session_path: Path) -> Optional[str]:
         The slug string or None if not found
 
     Examples:
-        >>> # slug = extract_session_slug(Path('session.jsonl'))  # doctest: +SKIP
+        # slug = extract_session_slug(Path('session.jsonl'))
     """
     try:
         with open(session_path, "r", encoding="utf-8") as f:
@@ -726,7 +727,7 @@ def find_plan_file(slug: str, plans_dir: Optional[Path] = None) -> Optional[Plan
         PlanFile or None if not found or invalid
 
     Examples:
-        >>> # plan = find_plan_file("hidden-finding-goose")  # doctest: +SKIP
+        # plan = find_plan_file("hidden-finding-goose")
     """
     if plans_dir is None:
         plans_dir = Path.home() / ".claude" / "plans"
@@ -787,7 +788,7 @@ def parse_jsonl_file_enriched(filepath: Path) -> EnrichedTranscript:
         EnrichedTranscript with all extracted data
 
     Examples:
-        >>> # transcript = parse_jsonl_file_enriched(Path('session.jsonl'))  # doctest: +SKIP
+        # transcript = parse_jsonl_file_enriched(Path('session.jsonl'))
     """
     # Parse base transcript
     base = parse_jsonl_file(filepath)

@@ -94,8 +94,8 @@ function orgBarsHtml(org) {
     const elapsed5h = computeElapsedFraction5h(org.cached_5h_resets_at);
     const elapsed7d = computeElapsedFraction7d(org.cached_7d_resets_at);
     let html =
-        renderUsageBar(org.cached_usage_5h, org.cached_5h_resets_at, elapsed5h, '5h', { compact: true }) +
-        renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, elapsed7d, '7d', { compact: true });
+        renderUsageBar(org.cached_usage_5h, org.cached_5h_resets_at, elapsed5h, '5h', usageBarOpts(org, org.cached_5h_resets_at, { compact: true }, org.cached_usage_5h)) +
+        renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, elapsed7d, '7d', usageBarOpts(org, org.cached_7d_resets_at, { compact: true }, org.cached_usage_7d));
     const bm = org.usage && org.usage.binding_model;
     if (bm) {
         html += renderUsageBar(bm.utilization, bm.resets_at, null, bm.label || 'model', { compact: true });
@@ -111,6 +111,13 @@ function orgMetaHtml(org, nextRefreshAt) {
     const activeHtml = org.isActive
         ? '<span class="active-badge" title="Active in Claude Code">active</span>'
         : '';
+    // The provider's own "usage blocked" verdict (a spend limit can block
+    // below 100%, so the bars alone do not show it). Same text as the
+    // dashboard badge; the short label fits the panel row.
+    const block = typeof usageBlockText === 'function' ? usageBlockText(org) : null;
+    const blockHtml = block
+        ? `<span class="block-badge" title="${escapeHtml(block.title)}">blocked</span>`
+        : '';
     const age = freshnessLabel(org);
     const ageHtml = age
         ? `<span class="acct-age" title="Usage updated ${escapeHtml(age)} ago">${escapeHtml(age)}</span>`
@@ -121,7 +128,7 @@ function orgMetaHtml(org, nextRefreshAt) {
             `<span class="next-refresh" data-next-at="${nextRefreshAt}"` +
             ` title="Next automatic usage refresh">${escapeHtml(formatCountdown(nextRefreshAt))}</span>`;
     }
-    return `${planHtml}${activeHtml}<span class="meta-spacer"></span>${ageHtml}${nextHtml}`;
+    return `${planHtml}${activeHtml}${blockHtml}<span class="meta-spacer"></span>${ageHtml}${nextHtml}`;
 }
 
 /** Single-org login → one compact identity line (email-primary) + bars. */
@@ -300,7 +307,7 @@ function startRefreshCooldown(btn, secs) {
             btn.title = 'Refresh all accounts now';
             return;
         }
-        btn.title = 'Refreshed — wait ' + rem + 's';
+        btn.title = 'Refreshed. Wait ' + rem + 's.';
         rem -= 1;
         setTimeout(tick, 1000);
     };

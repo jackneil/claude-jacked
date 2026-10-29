@@ -1402,7 +1402,9 @@ function _renderDcrEngineSection(data) {
                         <span class="text-xs text-amber-400">${escapeHtml((data && data.reason) || 'Codex is not available.')}</span>
                         <a href="#" id="dcr-engine-recheck" class="text-xs text-blue-400 hover:text-blue-300 transition-colors">Check again</a>
                     </div>
-                    <div class="text-xs text-slate-500 mt-1">Reviews fall back to Claude until this is fixed.</div>
+                    <div class="text-xs text-slate-500 mt-1">${data && data.codex_logged_in === true
+                        ? 'Reviews fall back to Claude until the Codex limit lifts or you switch the Codex account.'
+                        : 'Reviews fall back to Claude until this is fixed.'}</div>
                 </div>
             `;
     }

@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable, Mapping, Optional
+
+from jacked.findbin import find_bin
 
 from .credentials import (
     codex_home,
@@ -53,14 +54,14 @@ def import_codex_account(
     ident = status.identity
     if ident is None or not ident.email:
         raise CodexImportError(
-            status.reason or "no Codex account found — run `codex login` first"
+            status.reason or "no Codex account found. Run `codex login` first."
         )
 
     auth = read_auth_json(home, env) or {}
     tokens = auth.get("tokens") or {}
     if not (tokens.get("access_token") or auth.get("OPENAI_API_KEY")):
         raise CodexImportError(
-            "Codex auth.json has no usable token — run `codex login` first"
+            "Codex auth.json has no usable token. Run `codex login` first."
         )
 
     acct = db.create_account(
@@ -105,7 +106,7 @@ def import_codex_account(
 
 def _run_codex_login(home: Path, env: Optional[Mapping[str, str]]) -> None:
     """Drive the interactive ``codex login`` browser OAuth flow."""
-    codex = shutil.which("codex")
+    codex = find_bin("codex")
     if not codex:
         raise CodexImportError("the `codex` CLI is not installed or not on PATH")
     run_env = dict(env if env is not None else os.environ)

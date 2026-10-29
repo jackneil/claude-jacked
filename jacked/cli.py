@@ -3762,13 +3762,17 @@ CHROME_DEVTOOLS_MODES: dict[str, list[str]] = {
 def _run_claude_mcp(
     *args: str, timeout: int = 10
 ) -> "subprocess.CompletedProcess[str] | None":
-    """Run a ``claude mcp`` subcommand, returning the result or None on error."""
-    import shutil
+    """Run a ``claude mcp`` subcommand, returning the result or None on error.
+
+    The dashboard calls this from the service, whose PATH is system-only, so
+    the binary is resolved with ``find_bin`` (``~/.local/bin/claude``).
+    """
     import subprocess
 
+    from jacked.findbin import find_bin
     from jacked.winproc import NO_WINDOW
 
-    claude_bin = shutil.which("claude")
+    claude_bin = find_bin("claude")
     if not claude_bin:
         return None
 
@@ -3790,14 +3794,16 @@ def _run_claude_plugin(
     """Run a ``claude plugin`` subcommand, returning the result or None on error.
 
     stdin is closed (DEVNULL) so an unexpected confirmation prompt can never
-    hang ``jacked install``.
+    hang ``jacked install``. The updater runs ``jacked install --force`` under
+    the service's system-only PATH, so the binary is resolved with
+    ``find_bin``.
     """
-    import shutil
     import subprocess
 
+    from jacked.findbin import find_bin
     from jacked.winproc import NO_WINDOW
 
-    claude_bin = shutil.which("claude")
+    claude_bin = find_bin("claude")
     if not claude_bin:
         return None
 
@@ -5065,9 +5071,9 @@ def _install_required_plugins(force: bool = False) -> None:
     A plugin the user explicitly disabled (key present but false) is left alone
     unless ``force`` is set.
     """
-    import shutil
+    from jacked.findbin import find_bin
 
-    if not shutil.which("claude"):
+    if not find_bin("claude"):
         console.print(
             "[yellow][WARN][/yellow] `claude` CLI not found — skipping plugin "
             "install. Enable required plugins via /plugins."
@@ -5155,7 +5161,7 @@ def _recommend_external_tools():
     # ---------------------------------------------------------------
     # External CLI tools
     # ---------------------------------------------------------------
-    ab = shutil.which("agent-browser")
+    ab = shutil.which("agent-browser")  # findbin: allow doctor runs in the user's own shell PATH
     if ab:
         ab_path = Path(ab).resolve()
         has_dogfood = False
@@ -5192,7 +5198,7 @@ def _recommend_external_tools():
 
     # Firecrawl CLI — web search & scraping used by jacked skills. We use the
     # CLI, not the (buggy) firecrawl MCP plugin.
-    if not shutil.which("firecrawl"):
+    if not shutil.which("firecrawl"):  # findbin: allow doctor runs in the user's own shell PATH
         tools.append(
             "  npm install -g firecrawl-cli                           "
             "# Web search & scraping (then: firecrawl login)"
@@ -6143,6 +6149,9 @@ def _dcr_print_status(resolved: dict) -> None:
             console.print(f"  Status: [yellow]not usable - {reason}[/yellow]")
             console.print(
                 "[yellow]Reviews will fall back to Claude until this is fixed.[/yellow]"
+                if resolved.get("codex_logged_in") is not True
+                else "[yellow]Reviews will fall back to Claude until the Codex limit lifts "
+                "or you switch the Codex account.[/yellow]"
             )
         return
 

@@ -21,7 +21,9 @@ from jacked.cli import (
 
 class TestRunClaudeMcp:
     def test_returns_none_when_claude_not_found(self):
-        with mock.patch("shutil.which", return_value=None):
+        # find_bin, not shutil.which: the fallback would find a real
+        # ~/.local/bin/claude on a developer machine.
+        with mock.patch("jacked.findbin.find_bin", return_value=None):
             assert _run_claude_mcp("get", "chrome-devtools") is None
 
     def test_returns_completed_process_on_success(self):

@@ -13,12 +13,12 @@ All API interactions follow design doc section 4 header matrix.
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import httpx
 
@@ -58,12 +58,22 @@ _USAGE_RATE_LIMIT_CEILING = 180
 # this caps ANY client loop at 3 fetches/min/account worst case.
 _USAGE_MANUAL_FLOOR_SECONDS = 20
 
-# Minimum seconds between 429-triggered token rotations per account.
-# Rotating refresh tokens to dodge per-token rate limits at high frequency
-# churns the shared CC token store and masks real rate-limiting — the same
-# incident rotated CC tokens 243 times in 4.5h. Outside this window a 429
-# goes straight to the escalating-backoff branch.
-_USAGE_429_ROTATION_INTERVAL = 600
+# A 429 backs off; it does not rotate a token. Rotating refresh tokens to
+# dodge per-token rate limits churns the shared CC token store and masks real
+# rate-limiting (one incident rotated CC tokens 243 times in 4.5h; another
+# renewed the primary chain ~140 times a day, once per poll cycle, because the
+# old 600s guard equaled the 600s poll period and never throttled). A
+# rotation is allowed only after _USAGE_429_ROTATION_MIN_CONSECUTIVE
+# consecutive 429s on the SAME token, and at most once per guard interval:
+# _USAGE_429_ROTATION_POLL_PERIODS poll periods, read at call time from the
+# usage_check_interval setting (floored at the 600s all-accounts poll).
+_USAGE_POLL_PERIOD_FLOOR = 600
+_USAGE_429_ROTATION_POLL_PERIODS = 3
+_USAGE_429_ROTATION_MIN_CONSECUTIVE = 3
+# The guard interval at the default settings (3 x 600s).
+_USAGE_429_ROTATION_INTERVAL = _USAGE_429_ROTATION_POLL_PERIODS * _USAGE_POLL_PERIOD_FLOOR
+# Upper bound on an honored Retry-After header (a guard against absurd values).
+_USAGE_RETRY_AFTER_MAX_SECONDS = 6 * 3600
 
 # Adaptive polling intervals by urgency tier. The floor is the 180s rate-limit
 # ceiling above — polling faster than the ceiling just returns cached data while
@@ -180,8 +190,16 @@ class TokenExchangeResult:
     access_token: str | None = None
     refresh_token: str | None = None
     expires_in: int | None = None
-    error: str | None = None       # "invalid_grant", "http_429", "network_error", etc.
+    error: str | None = None       # "invalid_grant", "http_429", "not_sent", "reply_lost", ...
     status_code: int | None = None
+    # True only when THIS call completed a token exchange and stored it. The
+    # "already refreshed by another path" return and a live recovery leave it
+    # False, so callers can count real exchanges.
+    exchanged: bool = False
+    # The refresh lineage the flow used: "cc" or "primary".
+    chain: str | None = None
+    # Values-free detail for logs (an exception class name), never a token.
+    detail: str | None = None
 
 
 class RefreshMode(str, Enum):
@@ -196,10 +214,80 @@ class RefreshMode(str, Enum):
 CIRCUIT_BREAKER_COOLDOWNS: dict[str, int] = {
     "invalid_grant": 600,
     "network_error": 60,
+    # The request never left this machine (DNS, connect, pool timeout).
+    "not_sent": 60,
+    # The request was sent but the reply was lost (read/write timeout, a
+    # dropped connection). The server may have rotated the refresh token, so
+    # the chain is suspect and waits longer before the next attempt.
+    "reply_lost": 900,
     "http_429": 120,
     "http_5xx": 120,
 }
 _DEFAULT_CB_COOLDOWN = 300
+
+
+def breaker_cooldown(failure_type: str | None) -> int:
+    """Cooldown seconds for a breaker failure type.
+
+    An exchange records a 5xx as ``http_<status>`` (``http_502``), so the
+    ``http_5xx`` entry is matched by status class here, not by exact key.
+
+    >>> breaker_cooldown("invalid_grant")
+    600
+    >>> breaker_cooldown("http_503") == CIRCUIT_BREAKER_COOLDOWNS["http_5xx"]
+    True
+    >>> breaker_cooldown("http_418") == _DEFAULT_CB_COOLDOWN
+    True
+    """
+    if isinstance(failure_type, str) and re.fullmatch(r"http_5\d\d", failure_type):
+        return CIRCUIT_BREAKER_COOLDOWNS["http_5xx"]
+    return CIRCUIT_BREAKER_COOLDOWNS.get(failure_type, _DEFAULT_CB_COOLDOWN)
+
+# Breaker failure types that describe the network, not the credential.
+NETWORK_FAILURE_TYPES = frozenset({"network_error", "not_sent", "reply_lost"})
+
+# httpx errors raised before the request reached the server.
+_NOT_SENT_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ProxyError,
+    httpx.UnsupportedProtocol,
+    httpx.LocalProtocolError,
+)
+# httpx errors raised after the request was (possibly) written.
+_REPLY_LOST_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+    httpx.CloseError,
+    httpx.TimeoutException,
+)
+
+
+def classify_exchange_exception(exc: BaseException) -> str:
+    """Map an exchange exception to a breaker failure type.
+
+    ``not_sent`` means the server never saw the request, so the refresh
+    token is intact. ``reply_lost`` means the server may have consumed it.
+    Anything else is ``network_error``.
+
+    >>> classify_exchange_exception(httpx.ConnectError("dns"))
+    'not_sent'
+    >>> classify_exchange_exception(httpx.ReadTimeout("slow"))
+    'reply_lost'
+    >>> classify_exchange_exception(httpx.RemoteProtocolError("eof"))
+    'reply_lost'
+    >>> classify_exchange_exception(RuntimeError("other"))
+    'network_error'
+    """
+    if isinstance(exc, _NOT_SENT_ERRORS):
+        return "not_sent"
+    if isinstance(exc, _REPLY_LOST_ERRORS):
+        return "reply_lost"
+    return "network_error"
 
 
 async def _exchange_refresh_token(
@@ -226,12 +314,30 @@ async def _exchange_refresh_token(
                     "anthropic-beta": OAUTH_BETA_HEADER,
                 },
             )
+    except Exception as exc:
+        return TokenExchangeResult(
+            success=False,
+            error=classify_exchange_exception(exc),
+            detail=type(exc).__name__,
+        )
 
+    try:
         if resp.status_code == 200:
-            data = resp.json()
+            try:
+                data = resp.json()
+                access_token = data["access_token"]
+            except Exception as exc:
+                # The server answered 200, so it consumed the refresh token,
+                # but the new pair is unreadable: the reply is lost.
+                return TokenExchangeResult(
+                    success=False,
+                    error="reply_lost",
+                    status_code=200,
+                    detail=type(exc).__name__,
+                )
             return TokenExchangeResult(
                 success=True,
-                access_token=data["access_token"],
+                access_token=access_token,
                 refresh_token=data.get("refresh_token", refresh_token),
                 expires_in=data.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS),
             )
@@ -250,11 +356,116 @@ async def _exchange_refresh_token(
             status_code=resp.status_code,
         )
 
-    except Exception:
+    except Exception as exc:
         return TokenExchangeResult(
             success=False,
             error="network_error",
+            detail=type(exc).__name__,
         )
+
+
+Chain = Literal["cc", "primary"]
+
+# Breaker columns per chain. The primary pair predates the split and keeps
+# its name; the Claude Code (cc) chain has its own pair (database migration
+# "workstream B, token chains").
+_CHAIN_BREAKER_COLUMNS: dict[str, tuple[str, str]] = {
+    "primary": ("refresh_failure_type", "refresh_last_failed_at"),
+    "cc": ("cc_refresh_failure_type", "cc_refresh_last_failed_at"),
+}
+
+
+def _chain_token_columns(chain: Chain) -> tuple[str, str, str]:
+    """Return the (access, refresh, expires) column names of ``chain``.
+
+    >>> _chain_token_columns("cc")
+    ('cc_access_token', 'cc_refresh_token', 'cc_expires_at')
+    >>> _chain_token_columns("primary")
+    ('access_token', 'refresh_token', 'expires_at')
+    """
+    if chain == "cc":
+        return ("cc_access_token", "cc_refresh_token", "cc_expires_at")
+    return ("access_token", "refresh_token", "expires_at")
+
+
+def _breaker_updates(chain: Chain, failure_type: str | None) -> dict:
+    """Return the update that records (or clears) one chain's breaker.
+
+    >>> _breaker_updates("cc", None)
+    {'cc_refresh_failure_type': None, 'cc_refresh_last_failed_at': None}
+    >>> sorted(_breaker_updates("primary", "invalid_grant"))
+    ['refresh_failure_type', 'refresh_last_failed_at']
+    """
+    type_col, at_col = _CHAIN_BREAKER_COLUMNS[chain]
+    return {
+        type_col: failure_type,
+        at_col: int(time.time()) if failure_type is not None else None,
+    }
+
+
+def _resolve_chain(mode: RefreshMode, account: dict) -> Chain:
+    """Decide which refresh lineage ``mode`` exchanges for ``account``.
+
+    CC_OR_PRIMARY_429 uses the Claude Code chain while it has a refresh
+    token and no recorded invalid_grant, else the primary chain.
+
+    >>> _resolve_chain(RefreshMode.CC_OR_PRIMARY_429, {"cc_refresh_token": "r"})
+    'cc'
+    >>> _resolve_chain(RefreshMode.CC_OR_PRIMARY_429, {"cc_refresh_token": None})
+    'primary'
+    >>> _resolve_chain(RefreshMode.CC_OR_PRIMARY_429,
+    ...                {"cc_refresh_token": "r", "cc_refresh_failure_type": "invalid_grant"})
+    'primary'
+    >>> _resolve_chain(RefreshMode.PRIMARY_CIRCUIT_BREAKER, {"cc_refresh_token": "r"})
+    'primary'
+    """
+    if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
+        return "primary"
+    if mode == RefreshMode.CC:
+        return "cc"
+    if account.get("cc_refresh_token") and (
+        account.get("cc_refresh_failure_type") != "invalid_grant"
+    ):
+        return "cc"
+    return "primary"
+
+
+def _live_recovery_payload(account_id: int, account: dict) -> Optional[dict]:
+    """Read the live Claude Code tokens for an invalid_grant recovery.
+
+    Runs in a worker thread: it reads the credential stores and may send
+    one profile request. It returns the ``claudeAiOauth`` section only when
+    the shared stamp-and-ownership rule proves the tokens belong to
+    ``account`` and the access token has not expired. Otherwise it returns
+    None and logs a values-free reason.
+    """
+    from jacked.api.credential_helpers import (
+        is_primary_publication,
+        live_payload_belongs_to,
+        read_live_credentials,
+    )
+
+    live = read_live_credentials()
+    if not isinstance(live, dict):
+        return None
+    oauth = live.get("claudeAiOauth")
+    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+        return None
+    if is_primary_publication(account, oauth.get("accessToken")):
+        return None
+    live_expires = oauth.get("expiresAt")
+    if isinstance(live_expires, (int, float)) and live_expires:
+        expires_s = live_expires / 1000 if live_expires > 1e12 else live_expires
+        if expires_s <= time.time():
+            return None
+    if not live_payload_belongs_to(account, live):
+        logger.warning(
+            "Account %d: invalid_grant live recovery refused; the live "
+            "credentials are not proven to belong to this account",
+            account_id,
+        )
+        return None
+    return oauth
 
 
 async def _refresh_token_flow(
@@ -265,57 +476,57 @@ async def _refresh_token_flow(
     """Unified token refresh orchestrator — replaces per-caller refresh logic.
 
     Handles token resolution, locking, circuit breaker, exchange, DB write
-    with retry, credential store sync, and error recovery. Each RefreshMode
-    encodes caller-specific behavior (which token, which lock, timeouts,
-    error handling).
+    with retry, and error recovery. Each RefreshMode encodes caller-specific
+    behavior (which token, timeouts, error handling).
+
+    The flow resolves ONE chain (``cc`` or ``primary``) under the lock and
+    uses it for every column it reads or writes, for the invalid_grant
+    branch, for the log text, and for the token it returns. A failure on
+    one chain never touches the other chain's tokens or breaker.
+
+    Credential refresh is DB-only. It never writes Claude's live stores.
     """
-    # ------------------------------------------------------------------
-    # 1. Read account from DB
-    # ------------------------------------------------------------------
     account = db.get_account(account_id)
     if not account:
         return TokenExchangeResult(success=False, error="account_not_found")
 
-    # ------------------------------------------------------------------
-    # 2. Resolve which refresh token to use
-    # ------------------------------------------------------------------
-    if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
-        refresh_token = account.get("refresh_token")
-    elif mode == RefreshMode.CC:
-        refresh_token = account.get("cc_refresh_token")
-    elif mode == RefreshMode.CC_OR_PRIMARY_429:
-        refresh_token = account.get("cc_refresh_token") or account.get("refresh_token")
-    else:
-        refresh_token = None
+    # At most two passes: the first chain is resolved before the lock to
+    # choose the lock. When the locked re-read resolves a different chain (a
+    # concurrent cc invalid_grant cleared the cc refresh token), the flow
+    # releases that lock and runs once more under the correct one.
+    for _attempt in range(2):
+        tentative = _resolve_chain(mode, account)
+        result = await _run_chain_flow(account_id, db, mode, tentative, account)
+        if result.error != "chain_changed":
+            return result
+        account = db.get_account(account_id)
+        if not account:
+            return TokenExchangeResult(success=False, error="account_not_found")
+    logger.warning(
+        "Account %d: %s refresh chain kept changing under the lock; aborting",
+        account_id, mode.value,
+    )
+    return TokenExchangeResult(success=False, error="chain_changed")
 
+
+async def _run_chain_flow(
+    account_id: int,
+    db: Database,
+    mode: RefreshMode,
+    chain: Chain,
+    account: dict,
+) -> TokenExchangeResult:
+    """Run one refresh of ``chain`` under that chain's lock (see above)."""
+    access_col, refresh_col, expires_col = _chain_token_columns(chain)
+    refresh_token = account.get(refresh_col)
     if not refresh_token:
-        return TokenExchangeResult(success=False, error="no_refresh_token")
+        return TokenExchangeResult(success=False, error="no_refresh_token", chain=chain)
 
-    # Track whether CC_OR_PRIMARY_429 is using CC or primary token
-    # (determines which DB columns to update on success)
-    used_cc = mode == RefreshMode.CC_OR_PRIMARY_429 and bool(account.get("cc_refresh_token"))
-
-    # ------------------------------------------------------------------
-    # 3. Determine which lock to acquire
     # Lock rule: all callers sharing a token set share the same lock.
-    # CC_OR_PRIMARY_429 falls back to primary when cc_refresh_token is
-    # absent — in that case, use the primary lock to prevent races with
-    # PRIMARY/PRIMARY_CIRCUIT_BREAKER callers.
-    # ------------------------------------------------------------------
-    if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
-        lock = _get_refresh_lock(account_id)
-    elif mode == RefreshMode.CC_OR_PRIMARY_429 and not used_cc:
-        # Falling back to primary token — use primary lock
-        lock = _get_refresh_lock(account_id)
-    else:
-        # CC and CC_OR_PRIMARY_429 (with CC token) use the CC lock
-        lock = _get_cc_refresh_lock(account_id)
+    lock = _get_cc_refresh_lock(account_id) if chain == "cc" else _get_refresh_lock(account_id)
 
-    # ------------------------------------------------------------------
-    # 4. Acquire lock (bounded) and execute under it
-    # The lock is non-reentrant: an unbounded acquire behind a wedged
-    # holder would suspend this caller forever, so fail fast instead.
-    # ------------------------------------------------------------------
+    # Acquire lock (bounded). The lock is non-reentrant: an unbounded
+    # acquire behind a wedged holder would suspend this caller forever.
     try:
         await asyncio.wait_for(lock.acquire(), timeout=_REFRESH_LOCK_ACQUIRE_TIMEOUT)
     except asyncio.TimeoutError:
@@ -324,116 +535,72 @@ async def _refresh_token_flow(
             "possible wedged holder; aborting this refresh attempt",
             account_id, mode.value, int(_REFRESH_LOCK_ACQUIRE_TIMEOUT),
         )
-        return TokenExchangeResult(success=False, error="lock_timeout")
+        return TokenExchangeResult(success=False, error="lock_timeout", chain=chain)
 
     exchanged = False
 
     async def _locked_section() -> TokenExchangeResult:
         # Critical section under the per-account lock — runs as a SHIELDED
-        # task (created in step 5 below) and therefore owns the lock
-        # release: the awaiting caller may be cancelled out from under it
-        # by any of the asyncio.wait_for wrappers on the refresh paths.
-        nonlocal exchanged, used_cc
+        # task (created below) and therefore owns the lock release: the
+        # awaiting caller may be cancelled out from under it by any of the
+        # asyncio.wait_for wrappers on the refresh paths.
+        nonlocal exchanged
         try:
-            # 4a. Re-read account under lock
-            account = db.get_account(account_id)
-            if not account:
+            current = db.get_account(account_id)
+            if not current:
                 return TokenExchangeResult(success=False, error="account_not_found")
 
-            # Recompute used_cc under lock — another coroutine may have cleared
-            # cc_refresh_token between our pre-lock read and lock acquisition.
-            if mode == RefreshMode.CC_OR_PRIMARY_429:
-                used_cc = bool(account.get("cc_refresh_token"))
+            # The chain is resolved ONCE, here, under the lock.
+            if _resolve_chain(mode, current) != chain:
+                return TokenExchangeResult(success=False, error="chain_changed")
 
-            # 4c. Check circuit breaker (PRIMARY_CIRCUIT_BREAKER only)
+            # Circuit breaker (PRIMARY_CIRCUIT_BREAKER only, primary chain).
             if mode == RefreshMode.PRIMARY_CIRCUIT_BREAKER:
-                last_failed = account.get("refresh_last_failed_at")
-                failure_type = account.get("refresh_failure_type")
+                last_failed = current.get("refresh_last_failed_at")
+                failure_type = current.get("refresh_failure_type")
                 if last_failed is not None:
-                    cooldown = CIRCUIT_BREAKER_COOLDOWNS.get(failure_type, _DEFAULT_CB_COOLDOWN)
+                    cooldown = breaker_cooldown(failure_type)
                     remaining = cooldown - (time.time() - last_failed)
                     if remaining > 0:
                         logger.info(
                             "Account %d: circuit breaker active (%s, %ds remaining)",
                             account_id, failure_type, int(remaining),
                         )
-                        return TokenExchangeResult(success=False, error="circuit_breaker")
-                    else:
-                        logger.info(
-                            "Account %d: circuit breaker cooldown expired, re-attempting refresh",
-                            account_id,
+                        return TokenExchangeResult(
+                            success=False, error="circuit_breaker", chain=chain,
                         )
+                    logger.info(
+                        "Account %d: circuit breaker cooldown expired, re-attempting refresh",
+                        account_id,
+                    )
 
-            # 4d. Re-read refresh token under lock — detect if another coroutine refreshed
-            if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
-                current_refresh = account.get("refresh_token")
-            elif mode == RefreshMode.CC:
-                current_refresh = account.get("cc_refresh_token")
-            else:
-                current_refresh = account.get("cc_refresh_token") or account.get("refresh_token")
-
+            # Another path rotated this chain while we waited for the lock:
+            # hand back THIS chain's current access token.
+            current_refresh = current.get(refresh_col)
             if current_refresh and current_refresh != refresh_token:
-                logger.info("Account %d: token already refreshed by another path", account_id)
-                # Return the new access token
-                if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
-                    return TokenExchangeResult(
-                        success=True, access_token=account.get("access_token"),
-                    )
-                else:
-                    return TokenExchangeResult(
-                        success=True, access_token=account.get("cc_access_token"),
-                    )
+                logger.info(
+                    "Account %d: %s chain token already refreshed by another path",
+                    account_id, chain,
+                )
+                return TokenExchangeResult(
+                    success=True, access_token=current.get(access_col), chain=chain,
+                )
 
-            # 4e. Determine timeout
-            if mode in (RefreshMode.PRIMARY, RefreshMode.CC):
-                timeout = 30.0
-            else:
-                timeout = 15.0
-
-            # 4f. Exchange refresh token
+            timeout = 30.0 if mode in (RefreshMode.PRIMARY, RefreshMode.CC) else 15.0
             result = await _exchange_refresh_token(refresh_token, timeout=timeout)
 
-            # ------------------------------------------------------------------
-            # 4g. On success — single atomic DB write
-            # ------------------------------------------------------------------
+            # ----------------------------------------------------------
+            # Success — single atomic DB write to this chain's columns.
+            # ----------------------------------------------------------
             if result.success:
                 new_expires_at = int(time.time()) + result.expires_in
+                updates = {
+                    access_col: result.access_token,
+                    refresh_col: result.refresh_token,
+                    expires_col: new_expires_at,
+                    **_breaker_updates(chain, None),
+                }
 
-                if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
-                    updates = {
-                        "access_token": result.access_token,
-                        "refresh_token": result.refresh_token,
-                        "expires_at": new_expires_at,
-                        "refresh_last_failed_at": None,
-                        "refresh_failure_type": None,
-                    }
-                elif mode == RefreshMode.CC:
-                    updates = {
-                        "cc_access_token": result.access_token,
-                        "cc_refresh_token": result.refresh_token,
-                        "cc_expires_at": new_expires_at,
-                        "refresh_last_failed_at": None,
-                        "refresh_failure_type": None,
-                    }
-                elif mode == RefreshMode.CC_OR_PRIMARY_429:
-                    if used_cc:
-                        updates = {
-                            "cc_access_token": result.access_token,
-                            "cc_refresh_token": result.refresh_token,
-                            "cc_expires_at": new_expires_at,
-                            "refresh_last_failed_at": None,
-                            "refresh_failure_type": None,
-                        }
-                    else:
-                        updates = {
-                            "access_token": result.access_token,
-                            "refresh_token": result.refresh_token,
-                            "expires_at": new_expires_at,
-                            "refresh_last_failed_at": None,
-                            "refresh_failure_type": None,
-                        }
-
-                # DB retry 3x with exponential backoff
                 db_updated = False
                 for attempt in range(3):
                     try:
@@ -453,128 +620,75 @@ async def _refresh_token_flow(
                         "Token refresh succeeded but DB update FAILED for account %d after 3 attempts.",
                         account_id,
                     )
-                    return TokenExchangeResult(success=False, error="db_write_failed")
+                    return TokenExchangeResult(
+                        success=False, error="db_write_failed", chain=chain,
+                    )
 
-                logger.info("Account %d: %s token refreshed", account_id, mode.value)
-
-                # Credential refresh is DB-only. A 429 or maintenance path must
-                # never mutate Claude's live stores: doing so races Claude Code's
-                # own refresh-token lifecycle and can silently rebind sessions.
-                # Store activation is reserved for the explicit transaction
-                # engine used by local foreground account actions.
-
-                # 4h. Success — returning releases the lock via the finally;
-                # the PRIMARY post-refresh profile fetch happens in step 6,
-                # in the caller, after the shielded task completes.
+                logger.info(
+                    "Account %d: %s chain token refreshed (caller %s)",
+                    account_id, chain, mode.value,
+                )
+                # Credential refresh is DB-only. A 429 or maintenance path
+                # must never mutate Claude's live stores: doing so races
+                # Claude Code's own refresh-token lifecycle and can silently
+                # rebind sessions.
                 exchanged = True
                 return TokenExchangeResult(
                     success=True,
                     access_token=result.access_token,
                     refresh_token=result.refresh_token,
                     expires_in=result.expires_in,
+                    exchanged=True,
+                    chain=chain,
                 )
 
-            # ------------------------------------------------------------------
-            # 4j. On invalid_grant
-            # ------------------------------------------------------------------
-            elif result.error == "invalid_grant":
-                if mode in (RefreshMode.CC, RefreshMode.CC_OR_PRIMARY_429):
-                    # Attempt live credential recovery (access token ONLY, NOT refresh token)
-                    try:
-                        from jacked.api.credential_helpers import read_platform_credentials
-                        live = read_platform_credentials()
-                        if not live:
-                            cred_path = Path.home() / ".claude" / ".credentials.json"
-                            if cred_path.exists() and not cred_path.is_symlink():
-                                try:
-                                    live = json.loads(cred_path.read_text(encoding="utf-8"))
-                                except (json.JSONDecodeError, OSError):
-                                    live = None
-
-                        if live and live.get("_jackedAccountId") == account_id:
-                            oauth = live.get("claudeAiOauth", {})
-                            live_access = oauth.get("accessToken")
-                            live_expires = oauth.get("expiresAt")
-                            if live_access:
-                                live_exp_s = (
-                                    int(live_expires / 1000) if live_expires and live_expires > 1e12
-                                    else int(live_expires) if live_expires else None
-                                )
-                                recovery_updates: dict = {"cc_access_token": live_access}
-                                if live_exp_s:
-                                    recovery_updates["cc_expires_at"] = live_exp_s
-                                # SAFETY: Never import cc_refresh_token during invalid_grant
-                                recovery_updates["refresh_last_failed_at"] = int(time.time())
-                                recovery_updates["refresh_failure_type"] = "invalid_grant"
-                                db.update_account(account_id, **recovery_updates)
-                                logger.info(
-                                    "Account %d: invalid_grant — recovered cc_access_token from live credentials",
-                                    account_id,
-                                )
-                                return TokenExchangeResult(success=True, access_token=live_access)
-                    except Exception:
-                        pass  # Fall through to no-recovery path
-
-                    # No recovery — clear cc_refresh_token + set circuit breaker
-                    db.update_account(
-                        account_id,
-                        cc_refresh_token=None,
-                        refresh_last_failed_at=int(time.time()),
-                        refresh_failure_type="invalid_grant",
-                    )
-                    logger.warning(
-                        "Account %d: invalid_grant — clearing cc_refresh_token (no recovery)",
-                        account_id,
-                    )
-
-                elif mode == RefreshMode.PRIMARY_CIRCUIT_BREAKER:
-                    db.update_account(
-                        account_id,
-                        refresh_last_failed_at=int(time.time()),
-                        refresh_failure_type="invalid_grant",
-                    )
-                    logger.warning(
-                        "Account %d: primary refresh token is dead (invalid_grant) — cooldown %ds",
-                        account_id, CIRCUIT_BREAKER_COOLDOWNS["invalid_grant"],
-                    )
-
-                elif mode == RefreshMode.PRIMARY:
-                    db.update_account(
-                        account_id,
-                        refresh_last_failed_at=int(time.time()),
-                        refresh_failure_type="invalid_grant",
-                    )
+            # ----------------------------------------------------------
+            # invalid_grant — the chain's refresh lineage is dead.
+            # ----------------------------------------------------------
+            if result.error == "invalid_grant":
+                if chain == "cc":
+                    return await _cc_chain_died(account_id, db, current, refresh_token)
+                db.update_account(account_id, **_breaker_updates("primary", "invalid_grant"))
+                if mode == RefreshMode.PRIMARY:
                     db.record_account_error(account_id, "Refresh token consumed (will retry)")
-
-                return TokenExchangeResult(success=False, error="invalid_grant")
-
-            # ------------------------------------------------------------------
-            # 4k. On other errors — set circuit breaker cooldown
-            # ------------------------------------------------------------------
-            else:
-                cooldown = CIRCUIT_BREAKER_COOLDOWNS.get(result.error, _DEFAULT_CB_COOLDOWN)
-                db.update_account(
-                    account_id,
-                    refresh_last_failed_at=int(time.time()),
-                    refresh_failure_type=result.error,
+                else:
+                    logger.warning(
+                        "Account %d: primary refresh token is dead (invalid_grant) — "
+                        "cooldown %ds (chain=primary, caller %s)",
+                        account_id, CIRCUIT_BREAKER_COOLDOWNS["invalid_grant"], mode.value,
+                    )
+                return TokenExchangeResult(
+                    success=False, error="invalid_grant", chain=chain,
                 )
+
+            # ----------------------------------------------------------
+            # Other errors — this chain's breaker only.
+            # ----------------------------------------------------------
+            cooldown = breaker_cooldown(result.error)
+            db.update_account(account_id, **_breaker_updates(chain, result.error))
+            if result.error == "reply_lost":
                 logger.warning(
-                    "Account %d: refresh failed (%s) — cooldown %ds",
-                    account_id, result.error, cooldown,
+                    "Account %d: %s chain refresh reply lost after the request "
+                    "was sent (%s); the refresh token may be consumed, chain "
+                    "marked suspect — cooldown %ds",
+                    account_id, chain, result.detail or "unknown", cooldown,
                 )
-                return result
+            else:
+                logger.warning(
+                    "Account %d: refresh failed (%s) — cooldown %ds (chain=%s)",
+                    account_id, result.error, cooldown, chain,
+                )
+            result.chain = chain
+            return result
         finally:
             lock.release()
 
-    # ------------------------------------------------------------------
-    # 5. Run the locked section as a SHIELDED task. Anthropic ROTATES
-    # refresh tokens: a cancellation (route/sweep/heal/poll-loop
-    # asyncio.wait_for timeouts) landing after the exchange POST has been
+    # Run the locked section as a SHIELDED task. Anthropic ROTATES refresh
+    # tokens: a cancellation landing after the exchange POST has been
     # consumed upstream but before the rotated pair is persisted would
     # orphan the account behind a permanent invalid_grant. shield() lets
     # the task finish the exchange, DB write, and lock release in the
     # background while the caller observes its timeout.
-    # ------------------------------------------------------------------
     flow_task = asyncio.create_task(_locked_section())
     # Strong reference: the event loop holds only weak refs to tasks, and
     # a cancelled caller drops its own reference at the shield.
@@ -591,13 +705,10 @@ async def _refresh_token_flow(
             )
         raise
 
-    # ------------------------------------------------------------------
-    # 6. Post-refresh profile fetch — deliberately OUTSIDE the lock.
+    # Post-refresh profile fetch — deliberately OUTSIDE the lock.
     # fetch_profile's 401 path re-enters _refresh_token_flow on the same
     # primary lock; running it while holding the lock self-deadlocks.
-    # Only a real successful exchange gets here (the 4d already-refreshed
-    # fast path and every failure path leave `exchanged` False).
-    # ------------------------------------------------------------------
+    # Only a real successful exchange gets here.
     if mode == RefreshMode.PRIMARY and exchanged:
         try:
             await fetch_profile(account_id, db, access_token=flow_result.access_token)
@@ -608,6 +719,77 @@ async def _refresh_token_flow(
             )
     return flow_result
 
+
+async def _cc_chain_died(
+    account_id: int, db: Database, account: dict, failed_refresh_token: str,
+) -> TokenExchangeResult:
+    """Handle invalid_grant on the Claude Code chain (lock held by caller).
+
+    The chain is dead either way. Its refresh token is spent, so it leaves
+    the row, and the cc breaker records invalid_grant. When the live store
+    holds an unexpired access token that the shared ownership rule proves
+    belongs to this account, that token is kept for the rest of its life.
+    Otherwise the dead access token and its expiry leave the row too, so no
+    consumer keeps sending a dead token. The live refresh token is never
+    imported here: it is Claude Code's, and exchanging it would destroy the
+    session that holds it.
+    """
+    try:
+        oauth = await asyncio.to_thread(_live_recovery_payload, account_id, account)
+    except Exception:
+        logger.debug("Account %d: live recovery read failed", account_id, exc_info=True)
+        oauth = None
+
+    # The live read ran off the lock's event-loop turn: an OAuth re-auth
+    # (OAuthFlow._store_cc_tokens does not take the chain lock) may have
+    # stored a NEW cc lineage meanwhile. The invalid_grant was about the
+    # token that failed, so a row that no longer holds it is left alone.
+    current = db.get_account(account_id) or {}
+    current_refresh = current.get("cc_refresh_token")
+    if current_refresh and current_refresh != failed_refresh_token:
+        logger.info(
+            "Account %d: the cc chain was re-authorized while the dead chain "
+            "was being cleaned up; keeping the new lineage",
+            account_id,
+        )
+        return TokenExchangeResult(
+            success=True, access_token=current.get("cc_access_token"), chain="cc",
+        )
+
+    if oauth:
+        live_access = oauth.get("accessToken")
+        live_expires = oauth.get("expiresAt")
+        live_exp_s = (
+            int(live_expires / 1000) if live_expires and live_expires > 1e12
+            else int(live_expires) if live_expires else None
+        )
+        db.update_account(
+            account_id,
+            cc_access_token=live_access,
+            cc_expires_at=live_exp_s,
+            cc_refresh_token=None,
+            **_breaker_updates("cc", "invalid_grant"),
+        )
+        logger.info(
+            "Account %d: invalid_grant on the cc chain — recovered cc_access_token "
+            "from live credentials (ownership proven; refresh token not imported)",
+            account_id,
+        )
+        return TokenExchangeResult(success=True, access_token=live_access, chain="cc")
+
+    db.update_account(
+        account_id,
+        cc_access_token=None,
+        cc_refresh_token=None,
+        cc_expires_at=None,
+        **_breaker_updates("cc", "invalid_grant"),
+    )
+    logger.warning(
+        "Account %d: invalid_grant on the cc chain — clearing cc tokens "
+        "(no recovery; the Claude Code chain needs re-authorization)",
+        account_id,
+    )
+    return TokenExchangeResult(success=False, error="invalid_grant", chain="cc")
 
 
 def _get_usage_state(account_id: int) -> dict:
@@ -620,13 +802,87 @@ def _get_usage_state(account_id: int) -> dict:
             "interval": _TIER_INTERVALS["idle"],
             "consecutive_429s": 0,
             "last_429_rotation_at": 0.0,
+            "last_429_token_fp": None,
         }
     state = _account_usage_state[account_id]
     if "consecutive_429s" not in state:
         state["consecutive_429s"] = 0
     if "last_429_rotation_at" not in state:
         state["last_429_rotation_at"] = 0.0
+    if "last_429_token_fp" not in state:
+        state["last_429_token_fp"] = None
     return state
+
+
+def _token_fingerprint(token: Optional[str]) -> Optional[str]:
+    """Return a short, non-reversible fingerprint of a token for state keys.
+
+    >>> _token_fingerprint(None) is None
+    True
+    >>> len(_token_fingerprint("abc"))
+    16
+    """
+    if not token:
+        return None
+    import hashlib
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def _usage_429_rotation_interval(db) -> float:
+    """Return the 429 rotation guard interval, read from settings at call time.
+
+    The guard spans _USAGE_429_ROTATION_POLL_PERIODS poll periods. The poll
+    period is the ``usage_check_interval`` setting, floored at the 600s
+    all-accounts poll, so the guard always spans several real poll cycles.
+
+    >>> _usage_429_rotation_interval(None)
+    1800.0
+    """
+    period = 300.0
+    try:
+        raw = db.get_setting("usage_check_interval") if db is not None else None
+        if isinstance(raw, (str, int, float)) and not isinstance(raw, bool):
+            period = float(raw)
+    except Exception:
+        logger.debug("usage_check_interval read failed", exc_info=True)
+    return float(_USAGE_429_ROTATION_POLL_PERIODS * max(period, _USAGE_POLL_PERIOD_FLOOR))
+
+
+def usage_cache_updates(data: dict) -> dict:
+    """Map a usage API response to ``update_account_usage_cache`` arguments.
+
+    A window key that is missing keeps the old cache. A window that is null
+    (no active window) clears that window. A window object with a null
+    ``resets_at`` keeps its utilization and clears the stale reset time.
+
+    >>> usage_cache_updates({"five_hour": None, "seven_day": {"utilization": 3}})
+    {'clear_five_hour': True, 'seven_day': 3, 'clear_seven_day_reset': True}
+    >>> usage_cache_updates({"five_hour": {"utilization": 9, "resets_at": "R"}})
+    {'five_hour': 9, 'five_hour_resets_at': 'R'}
+    >>> usage_cache_updates({})
+    {}
+    """
+    updates: dict = {}
+    for key, short in (("five_hour", "five_hour"), ("seven_day", "seven_day")):
+        if key not in data:
+            continue
+        window = data.get(key)
+        if not isinstance(window, dict):
+            updates[f"clear_{short}"] = True
+            continue
+        utilization = window.get("utilization")
+        resets_at = window.get("resets_at")
+        if utilization is None and resets_at is None:
+            updates[f"clear_{short}"] = True
+            continue
+        if utilization is not None:
+            updates[short] = utilization
+        if resets_at is None:
+            updates[f"clear_{short}_reset"] = True
+        else:
+            updates[f"{short}_resets_at"] = resets_at
+    return updates
 
 
 
@@ -669,8 +925,11 @@ def compute_urgency_tier(
 
 
 
-def should_refresh(account: dict) -> bool:
+def should_refresh(account: dict, buffer_seconds: int | None = None) -> bool:
     """Check if an account's token needs refreshing.
+
+    ``buffer_seconds`` widens the window (the background loop passes its
+    own buffer so a token it selected is exchanged, not skipped).
 
     Rules:
     - API key accounts (refresh_token is None) cannot be refreshed
@@ -692,10 +951,11 @@ def should_refresh(account: dict) -> bool:
         return False
     if not account.get("refresh_token"):
         return False
-    return account["expires_at"] < time.time() + REFRESH_BUFFER_SECONDS
+    buffer = REFRESH_BUFFER_SECONDS if buffer_seconds is None else buffer_seconds
+    return account["expires_at"] < time.time() + buffer
 
 
-def should_refresh_cc(account: dict) -> bool:
+def should_refresh_cc(account: dict, buffer_seconds: int | None = None) -> bool:
     """Check if CC (Claude Code) tokens need refresh.
 
     Returns False if cc_refresh_token is NULL — can't refresh without one.
@@ -718,41 +978,223 @@ def should_refresh_cc(account: dict) -> bool:
     cc_expires_at = account.get("cc_expires_at")
     if not cc_expires_at:
         return True
-    return cc_expires_at < time.time() + REFRESH_BUFFER_SECONDS
+    buffer = REFRESH_BUFFER_SECONDS if buffer_seconds is None else buffer_seconds
+    return cc_expires_at < time.time() + buffer
 
 
-async def refresh_cc_token(account_id: int, db: Database) -> bool:
-    """Refresh CC token pair independently. Updates cc_* columns only."""
+class CCRefreshOutcome(str, Enum):
+    """What ``refresh_cc_token_result`` actually did."""
+
+    ROTATED = "rotated"  # this call exchanged the CC refresh token
+    PEER_ROTATED = "peer_rotated"  # another path already holds a newer token
+    SKIPPED_NOT_DUE = "skipped_not_due"  # clock gate: token not near expiry
+    NO_REFRESH_TOKEN = "no_refresh_token"  # nothing to exchange
+    LOCK_HELD = "lock_held"  # another CC refresh is in flight
+    FAILED = "failed"  # exchange failed, or the account is gone
+
+
+@dataclass(frozen=True)
+class CCRefreshResult:
+    """Explicit result of a CC refresh attempt. ``access_token`` is the
+    token now stored for the CC chain after ROTATED / PEER_ROTATED."""
+
+    outcome: CCRefreshOutcome
+    access_token: Optional[str] = None
+    error: Optional[str] = None
+
+    @property
+    def new_token(self) -> bool:
+        return self.outcome in (CCRefreshOutcome.ROTATED, CCRefreshOutcome.PEER_ROTATED)
+
+
+async def refresh_cc_token_result(
+    account_id: int, db: Database, *, force: bool = False,
+    buffer_seconds: int | None = None,
+) -> CCRefreshResult:
+    """Refresh the CC token pair and say exactly what happened.
+
+    ``force=True`` bypasses only the ``should_refresh_cc`` clock gate (a
+    401 on an unexpired token must still rotate). The no-refresh-token and
+    lock-held guards always apply.
+    """
     account = db.get_account(account_id)
     if not account:
-        return False
-    if not should_refresh_cc(account):
-        return True
-    if not account.get("cc_refresh_token"):
-        return True
+        return CCRefreshResult(CCRefreshOutcome.FAILED, error="account_not_found")
+    if (account.get("provider") or "claude") == "codex" or not account.get("cc_refresh_token"):
+        return CCRefreshResult(CCRefreshOutcome.NO_REFRESH_TOKEN)
+    if not force and not should_refresh_cc(account, buffer_seconds):
+        return CCRefreshResult(CCRefreshOutcome.SKIPPED_NOT_DUE)
 
     lock = _get_cc_refresh_lock(account_id)
     if lock.locked():
-        return True  # Another refresh in progress
+        return CCRefreshResult(CCRefreshOutcome.LOCK_HELD)
 
     result = await _refresh_token_flow(account_id, db, RefreshMode.CC)
-    return result.success
+    if not result.success:
+        return CCRefreshResult(CCRefreshOutcome.FAILED, error=result.error)
+    # Only a real exchange returns the rotated refresh token; the
+    # already-refreshed and live-recovery paths return an access token only.
+    outcome = (
+        CCRefreshOutcome.ROTATED if result.refresh_token else CCRefreshOutcome.PEER_ROTATED
+    )
+    return CCRefreshResult(outcome, access_token=result.access_token)
 
 
-async def refresh_account_token(account_id: int, db: Database) -> bool:
-    """Refresh an account's primary token if needed."""
+async def refresh_cc_token(
+    account_id: int, db: Database, *, buffer_seconds: int | None = None,
+) -> bool:
+    """Refresh CC token pair independently. Updates cc_* columns only.
+
+    Bool wrapper over ``refresh_cc_token_result`` for existing callers:
+    True unless the attempt FAILED (not-due, no-refresh-token and
+    lock-held keep their historical True).
+    """
+    result = await refresh_cc_token_result(account_id, db, buffer_seconds=buffer_seconds)
+    return result.outcome is not CCRefreshOutcome.FAILED
+
+
+@dataclass(frozen=True)
+class TokenChoice:
+    """The access token a usage consumer should send, and its lineage."""
+
+    token: str
+    chain: Literal["cc", "primary"]
+
+
+def cc_token_usable(account: dict, now: float | None = None) -> bool:
+    """True when the row's Claude Code access token may be sent.
+
+    The token must be present, its chain must have no recorded dead
+    lineage or API rejection, and it must not have expired.
+
+    >>> cc_token_usable({"cc_access_token": "c", "cc_expires_at": 9999999999})
+    True
+    >>> cc_token_usable({"cc_access_token": "c", "cc_expires_at": 1})
+    False
+    >>> cc_token_usable({"cc_access_token": "c", "cc_refresh_failure_type": "invalid_grant"})
+    False
+    >>> cc_token_usable({"cc_access_token": "c", "cc_refresh_failure_type": "auth_rejected"})
+    False
+    >>> cc_token_usable({"cc_access_token": "c", "cc_refresh_failure_type": "reply_lost"})
+    True
+    """
+    from jacked.api.credential_helpers import CC_TOKEN_UNUSABLE_FAILURES
+
+    if not account.get("cc_access_token"):
+        return False
+    if account.get("cc_refresh_failure_type") in CC_TOKEN_UNUSABLE_FAILURES:
+        return False
+    cc_expires_at = account.get("cc_expires_at")
+    if cc_expires_at and cc_expires_at <= (time.time() if now is None else now):
+        return False
+    return True
+
+
+def choose_usage_token(account: dict) -> Optional[TokenChoice]:
+    """Pick the token a usage consumer sends for one Claude account.
+
+    Every consumer that picks a token for a Claude account goes through
+    this ONE helper. It prefers a usable Claude Code token
+    (``cc_token_usable``), then the primary access token, else None. A dead
+    Claude Code chain therefore never stays in service: the consumer falls
+    back to the primary token instead of resending a token the API refuses.
+    Codex rows have no Anthropic token and return None.
+
+    >>> choose_usage_token({"cc_access_token": "c", "cc_expires_at": 9999999999,
+    ...                     "access_token": "p"})
+    TokenChoice(token='c', chain='cc')
+    >>> choose_usage_token({"cc_access_token": "c", "access_token": "p",
+    ...                     "cc_refresh_failure_type": "invalid_grant"})
+    TokenChoice(token='p', chain='primary')
+    >>> choose_usage_token({"access_token": ""}) is None
+    True
+    >>> choose_usage_token({"provider": "codex", "access_token": "x"}) is None
+    True
+    """
+    if (account.get("provider") or "claude") == "codex":
+        return None
+    if cc_token_usable(account):
+        return TokenChoice(account["cc_access_token"], "cc")
+    if account.get("access_token"):
+        return TokenChoice(account["access_token"], "primary")
+    return None
+
+
+def token_chain(account: dict, token: Optional[str]) -> Optional[str]:
+    """Name the lineage that owns ``token`` in ``account``.
+
+    Returns "cc" or "primary" for a token the row holds, "primary" for
+    None (fetch_usage then sends the primary token), and None for a token
+    the row does not hold (for example a live-store token).
+
+    >>> row = {"access_token": "p", "cc_access_token": "c"}
+    >>> token_chain(row, "c"), token_chain(row, "p"), token_chain(row, None)
+    ('cc', 'primary', 'primary')
+    >>> token_chain(row, "z") is None
+    True
+    """
+    if token is None or token == account.get("access_token"):
+        return "primary"
+    if token == account.get("cc_access_token"):
+        return "cc"
+    return None
+
+
+async def _cc_rotation_allowed(account_id: int, db: Database) -> bool:
+    """True when jacked may exchange this row's Claude Code refresh token.
+
+    Invariant I2, fail closed: the rotation is refused when the active
+    account is unknown, when this row IS the active account, or when the
+    live authority holds this row's tokens (a running session shares that
+    single-use lineage). Any error refuses. Runs the store reads off the
+    event loop and logs one values-free line per refusal.
+    """
+    try:
+        from jacked.api.credential_helpers import cc_rotation_block
+
+        block = await asyncio.to_thread(cc_rotation_block, account_id, db)
+    except Exception:
+        logger.debug("cc rotation check failed for account %d", account_id, exc_info=True)
+        block = "check_failed"
+    if block is not None:
+        logger.info(
+            "Account %d: not rotating the Claude Code refresh token (%s)",
+            account_id, block,
+        )
+        return False
+    return True
+
+
+class RefreshOutcome(str, Enum):
+    """What one primary refresh attempt actually did."""
+
+    EXCHANGED = "exchanged"
+    SKIPPED_NOT_DUE = "skipped_not_due"
+    FAILED = "failed"
+
+
+async def refresh_account_token_result(
+    account_id: int, db: Database, *, buffer_seconds: int | None = None,
+) -> RefreshOutcome:
+    """Refresh an account's primary token if needed, and say what happened.
+
+    EXCHANGED means a token exchange completed and was stored. SKIPPED_NOT_DUE
+    means no exchange was needed: the token is outside the refresh window,
+    the account has no primary refresh token, or another path had already
+    rotated it. FAILED means an exchange was due and did not succeed.
+    """
     account = db.get_account(account_id)
     if not account:
-        return False
-    if not should_refresh(account):
-        return True
+        return RefreshOutcome.FAILED
+    if not should_refresh(account, buffer_seconds):
+        return RefreshOutcome.SKIPPED_NOT_DUE
     if not account.get("refresh_token"):
-        return True
+        return RefreshOutcome.SKIPPED_NOT_DUE
 
     result = await _refresh_token_flow(account_id, db, RefreshMode.PRIMARY)
 
     if result.success:
-        return True
+        return RefreshOutcome.EXCHANGED if result.exchanged else RefreshOutcome.SKIPPED_NOT_DUE
 
     # Caller-specific error policy: 401/403 marks invalid only after 2 consecutive failures
     if result.status_code in (401, 403):
@@ -765,22 +1207,89 @@ async def refresh_account_token(account_id: int, db: Database) -> bool:
                 last_error=f"Token revoked (HTTP {result.status_code})",
                 last_error_at=datetime.now(timezone.utc).isoformat(),
             )
-        return False
+        return RefreshOutcome.FAILED
 
-    if result.error == "network_error":
+    if result.error in NETWORK_FAILURE_TYPES:
         db.record_account_error(
             account_id, "Network error during token refresh",
             increment_failures=False)
 
-    return False
+    return RefreshOutcome.FAILED
+
+
+async def refresh_account_token(account_id: int, db: Database) -> bool:
+    """Refresh an account's primary token if needed.
+
+    Returns False only when a due exchange failed. Use
+    ``refresh_account_token_result`` to tell an exchange from a skip.
+    """
+    outcome = await refresh_account_token_result(account_id, db)
+    return outcome is not RefreshOutcome.FAILED
 
 
 async def _try_refresh_on_429(
-    account_id: int, db: Database, state: dict,
+    account_id: int, db: Database, state: dict, stale_token: Optional[str] = None,
 ) -> str | None:
-    """Attempt to get a fresh access token to clear a per-token rate limit."""
-    result = await _refresh_token_flow(account_id, db, RefreshMode.CC_OR_PRIMARY_429)
-    return result.access_token if result.success else None
+    """Rotate the lineage that owns ``stale_token`` to clear a per-token limit.
+
+    The Claude Code chain rotates only for a non-active account whose chain
+    is alive; the active account's cc refresh token belongs to the running
+    Claude Code sessions (invariant I2). Every other case rotates the
+    primary chain through the circuit breaker.
+    """
+    account = db.get_account(account_id) or {}
+    if token_chain(account, stale_token) == "cc" and await _cc_rotation_allowed(account_id, db):
+        result = await _refresh_token_flow(account_id, db, RefreshMode.CC_OR_PRIMARY_429)
+    else:
+        result = await _refresh_token_flow(account_id, db, RefreshMode.PRIMARY_CIRCUIT_BREAKER)
+    if not result.success or not result.access_token or result.access_token == stale_token:
+        return None
+    return result.access_token
+
+
+async def _recover_rejected_cc_token(
+    account_id: int, db, account: dict, stale_token: str,
+) -> str | None:
+    """Recover from a 401/403 on the row's Claude Code access token.
+
+    The recovery stays on the lineage that owns the failing token, or falls
+    through to the primary token. It never takes the primary circuit-breaker
+    path, which used to renew the primary chain once per poll cycle.
+
+    1. An account whose cc chain jacked may rotate (``_cc_rotation_allowed``)
+       rotates that chain.
+    2. Otherwise the cc chain records ``auth_rejected`` (unless it already
+       records a dead lineage), so ``choose_usage_token`` stops picking the
+       refused token, and the primary access token is returned. A primary
+       token inside its refresh window is renewed first (a due renewal).
+    """
+    from jacked.api.credential_helpers import cc_chain_dead
+
+    if (
+        account.get("cc_refresh_token")
+        and not cc_chain_dead(account)
+        and await _cc_rotation_allowed(account_id, db)
+    ):
+        result = await _refresh_token_flow(account_id, db, RefreshMode.CC)
+        if result.success and result.access_token and result.access_token != stale_token:
+            return result.access_token
+
+    fresh = db.get_account(account_id) or account
+    if not cc_chain_dead(fresh) and fresh.get("cc_access_token") == stale_token:
+        db.update_account(account_id, **_breaker_updates("cc", "auth_rejected"))
+        logger.warning(
+            "Account %d: the API refused the cc access token; recorded on the cc "
+            "chain, falling back to the primary token",
+            account_id,
+        )
+
+    if should_refresh(fresh):
+        await refresh_account_token_result(account_id, db)
+        fresh = db.get_account(account_id) or fresh
+    primary = fresh.get("access_token")
+    if primary and primary != stale_token and not should_refresh(fresh):
+        return primary
+    return None
 
 
 async def _try_refresh_primary_token(
@@ -788,7 +1297,26 @@ async def _try_refresh_primary_token(
     db,
     stale_token: str | None = None,
 ) -> str | None:
-    """Refresh the primary access token on 401. Returns new token or None."""
+    """Recover from a 401/403 on ``stale_token``. Returns a new token or None.
+
+    Only the lineage that owns the failing token is touched:
+
+    - the row's cc access token: ``_recover_rejected_cc_token``;
+    - a token the row does not hold (a live-store token): the primary
+      access token when it is current, else a primary renewal;
+    - the primary access token (or None): a primary renewal through the
+      circuit breaker.
+    """
+    account = db.get_account(account_id)
+    if not account:
+        return None
+    owner = token_chain(account, stale_token)
+    if owner == "cc":
+        return await _recover_rejected_cc_token(account_id, db, account, stale_token)
+    if owner is None:
+        primary = account.get("access_token")
+        if primary and not should_refresh(account):
+            return primary
     result = await _refresh_token_flow(account_id, db, RefreshMode.PRIMARY_CIRCUIT_BREAKER)
     return result.access_token if result.success else None
 
@@ -799,6 +1327,7 @@ async def fetch_usage(
     access_token: Optional[str] = None,
     manual: bool = False,
     _retry_depth: int = 0,
+    post_ping: bool = False,
 ) -> Optional[dict]:
     """Fetch usage data from the Anthropic Usage API (design doc section 4f).
 
@@ -807,6 +1336,14 @@ async def fetch_usage(
     upstream API; manual=True gets the shorter _USAGE_MANUAL_FLOOR_SECONDS
     floor instead of a full bypass.  Only the single bounded 401/429 retry
     (_retry_depth > 0) skips pacing, and it never resets pacing state.
+
+    post_ping=True is the window keeper's read-back right after a
+    successful ping: it skips the ceiling but keeps the manual floor,
+    measured against this process's own last attempt only (the keeper has
+    just stamped usage_cached_at from the ping's reset header, so the DB
+    stamp says nothing about the last upstream usage call). The 429
+    backoff still applies, and pacing state is stamped exactly as for any
+    other attempt.
 
     Updates the account's cached usage fields in the database.
 
@@ -832,7 +1369,16 @@ async def fetch_usage(
     # token — let it through WITHOUT touching last_fetched_at (the old
     # "reset to 0 before retry" un-paced the account and turned every
     # 429 into a license for the next client request to fetch again).
-    if _retry_depth == 0:
+    if _retry_depth == 0 and post_ping:
+        elapsed = now - state["last_fetched_at"]
+        if elapsed < _USAGE_MANUAL_FLOOR_SECONDS:
+            logger.debug(
+                f"Post-ping usage floor for account {account_id}: "
+                f"{int(elapsed)}s < {_USAGE_MANUAL_FLOOR_SECONDS}s, "
+                f"returning cached"
+            )
+            return {"_cached": True}
+    elif _retry_depth == 0:
         # Pace against BOTH the in-memory stamp and the DB's usage_cached_at.
         # The in-memory dict dies with the process, so without the DB check
         # every restart un-paced all accounts and the startup prime fetch
@@ -897,20 +1443,13 @@ async def fetch_usage(
 
             if resp.status_code == 200:
                 data = resp.json()
-                five_hour = data.get("five_hour", {})
-                seven_day = data.get("seven_day", {})
-
                 db.update_account_usage_cache(
-                    account_id,
-                    five_hour=five_hour.get("utilization"),
-                    seven_day=seven_day.get("utilization"),
-                    five_hour_resets_at=five_hour.get("resets_at"),
-                    seven_day_resets_at=seven_day.get("resets_at"),
-                    raw=data,
+                    account_id, raw=data, **usage_cache_updates(data),
                 )
 
                 state["last_fetched_at"] = time.time()
                 state["consecutive_429s"] = 0
+                state["last_429_token_fp"] = None
 
                 # clear_account_errors marks valid, clears last_error, consecutive_failures
                 db.clear_account_errors(account_id)
@@ -952,10 +1491,15 @@ async def fetch_usage(
                     # Refresh failed — try live credential import for active account
                     try:
                         from jacked.api.credential_helpers import reconcile_credentials_from_live_store
-                        reconcile_credentials_from_live_store(account_id, db)
+                        await asyncio.to_thread(
+                            reconcile_credentials_from_live_store, account_id, db
+                        )
                         refreshed_acct = db.get_account(account_id)
                         if refreshed_acct:
-                            live_token = refreshed_acct.get("access_token")
+                            # Reconcile writes the cc_* columns, so pick the
+                            # token through the shared chooser.
+                            choice = choose_usage_token(refreshed_acct)
+                            live_token = choice.token if choice else None
                             if live_token and live_token != token:
                                 result = await fetch_usage(
                                     account_id, db, access_token=live_token,
@@ -966,6 +1510,30 @@ async def fetch_usage(
                     except Exception:
                         logger.debug("Live credential import failed during 401 recovery",
                                      exc_info=True)
+
+                # A FRESHLY rotated cc token that the API still refuses: record
+                # it on the cc chain so the chooser stops picking that chain
+                # and the next poll does not rotate it again (one rotation per
+                # poll cycle, forever, is a credential-churn loop).
+                if _retry_depth >= 1 and token_chain(account, token) == "cc":
+                    from jacked.api.credential_helpers import cc_chain_dead
+
+                    # Re-read before writing: a re-auth that landed while
+                    # this request was in flight stored a NEWER cc token,
+                    # which was never refused and must stay usable.
+                    current = db.get_account(account_id) or account
+                    if (
+                        current.get("cc_access_token") == token
+                        and not cc_chain_dead(current)
+                    ):
+                        db.update_account(
+                            account_id, **_breaker_updates("cc", "auth_rejected")
+                        )
+                        logger.warning(
+                            "Account %d: the API refused the freshly rotated cc "
+                            "access token; recorded auth_rejected on the cc chain",
+                            account_id,
+                        )
 
                 # Refresh and live import both failed or already retried — mark invalid
                 error_msg = f"Usage fetch failed (HTTP {resp.status_code}) — token refresh failed"
@@ -982,26 +1550,41 @@ async def fetch_usage(
                 return None
 
             if resp.status_code == 429:
-                # Try to clear the per-token rate limit by getting a fresh
-                # token. Only attempt on first try (_retry_depth=0) to
-                # prevent recursion, and at most once per
-                # _USAGE_429_ROTATION_INTERVAL per account — rotating
-                # refresh tokens to dodge per-token rate limits at high
-                # frequency churns the shared CC token store and masks
-                # real rate-limiting (243 rotations in one 4.5h incident).
-                # Otherwise skip straight to the backoff branch below.
+                # A 429 backs off; it does not rotate. Count consecutive
+                # 429s per token: a new token starts a new count.
+                fp = _token_fingerprint(token)
+                if state.get("last_429_token_fp") != fp:
+                    state["consecutive_429s"] = 0
+                    state["last_429_token_fp"] = fp
+                state["consecutive_429s"] = state.get("consecutive_429s", 0) + 1
+                n = state["consecutive_429s"]
+
+                # One rotation of the lineage that owns this token is allowed
+                # only after N consecutive 429s on the same token, at most
+                # once per guard interval, and never from a retry frame.
                 rotation_due = (
                     time.time() - state.get("last_429_rotation_at", 0.0)
-                    > _USAGE_429_ROTATION_INTERVAL
+                    > _usage_429_rotation_interval(db)
                 )
-                if _retry_depth == 0 and rotation_due:
+                if (
+                    _retry_depth == 0
+                    and n >= _USAGE_429_ROTATION_MIN_CONSECUTIVE
+                    and rotation_due
+                ):
                     # Stamp at attempt time (success or not): a failed
                     # rotation still hit the token endpoint.
                     state["last_429_rotation_at"] = time.time()
-                    fresh_token = await _try_refresh_on_429(account_id, db, state)
+                    fresh_token = await _try_refresh_on_429(
+                        account_id, db, state, stale_token=token,
+                    )
                     if fresh_token:
                         state["consecutive_429s"] = 0
-                        logger.info("Account %d: retrying usage fetch with fresh token", account_id)
+                        state["last_429_token_fp"] = None
+                        logger.info(
+                            "Account %d: retrying usage fetch with fresh token "
+                            "after %d consecutive 429s",
+                            account_id, n,
+                        )
                         # The retry rides _retry_depth=1 through the pacing
                         # check; re-stamp last_fetched_at afterwards
                         # (success or not) so a 429 retry can never
@@ -1012,13 +1595,15 @@ async def fetch_usage(
                         state["last_fetched_at"] = time.time()
                         return result
 
-                # No refresh available — escalating backoff
-                state["consecutive_429s"] = state.get("consecutive_429s", 0) + 1
-                n = state["consecutive_429s"]
+                # Escalating backoff. A Retry-After header is honored when it
+                # asks for longer than the escalation step.
                 base_backoff = min(_USAGE_RATE_LIMIT_CEILING * (2 ** (n - 1)), 900)
-                retry_after = resp.headers.get("retry-after", str(base_backoff))
+                retry_after = resp.headers.get("retry-after")
                 try:
-                    backoff_seconds = min(max(int(retry_after), base_backoff), 900)
+                    backoff_seconds = min(
+                        max(int(retry_after), base_backoff),
+                        _USAGE_RETRY_AFTER_MAX_SECONDS,
+                    ) if retry_after is not None else base_backoff
                 except (ValueError, TypeError):
                     backoff_seconds = base_backoff
                 state["backoff_until"] = time.time() + backoff_seconds
@@ -1271,20 +1856,16 @@ def _validate_codex_account(account_id: int, db: Database) -> dict:
         logger.debug("codex validation read failed for %s", account_id, exc_info=True)
         signed_in = True  # never false-invalidate on a transient read error
     if signed_in:
-        db.update_account(
-            account_id,
-            validation_status="valid",
-            last_validated_at=int(time.time()),
-            consecutive_failures=0,
-            last_error=None,
-            last_error_at=None,
-        )
+        # A signed-in auth.json says nothing about whether usage is readable:
+        # the usage fetch's error and failure counter stay until a successful
+        # fetch clears them (fetch_codex_usage -> clear_account_errors).
+        db.mark_account_validated(account_id)
         return {"valid": True, "error": None}
     db.update_account(
         account_id,
         validation_status="invalid",
         last_validated_at=int(time.time()),
-        last_error="Codex account signed out — run `codex login`",
+        last_error="Codex account signed out. Run `codex login`.",
         last_error_at=datetime.now(timezone.utc).isoformat(),
     )
     return {"valid": False, "error": "Codex signed out"}
@@ -1326,14 +1907,10 @@ async def validate_account(account_id: int, db: Database) -> dict:
             )
 
             if resp.status_code == 200:
-                db.update_account(
-                    account_id,
-                    validation_status="valid",
-                    last_validated_at=int(time.time()),
-                    consecutive_failures=0,
-                    last_error=None,
-                    last_error_at=None,
-                )
+                # A profile 200 proves the token, not that usage is readable:
+                # the usage path's error and failure counter stay until a
+                # successful usage fetch clears them (clear_account_errors).
+                db.mark_account_validated(account_id)
                 _update_profile_metadata(account_id, resp.json(), db)
                 return {"valid": True, "error": None}
 
@@ -1350,14 +1927,8 @@ async def validate_account(account_id: int, db: Database) -> dict:
                         },
                     )
                     if retry_resp.status_code == 200:
-                        db.update_account(
-                            account_id,
-                            validation_status="valid",
-                            last_validated_at=int(time.time()),
-                            consecutive_failures=0,
-                            last_error=None,
-                            last_error_at=None,
-                        )
+                        # Same rule as the first-try 200 above.
+                        db.mark_account_validated(account_id)
                         _update_profile_metadata(account_id, retry_resp.json(), db)
                         return {"valid": True, "error": None}
 
@@ -1513,7 +2084,9 @@ def reset_locks() -> None:
     _inflight_refresh_tasks.clear()
 
 
-async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
+async def refresh_all_expiring_tokens(
+    buffer_seconds: int = 14400, db: Optional[Database] = None,
+) -> dict:
     """Refresh all account tokens expiring within buffer_seconds.
 
     Called by background task to proactively keep tokens fresh.
@@ -1522,17 +2095,32 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
 
     Args:
         buffer_seconds: Refresh tokens expiring within this many seconds (default 4 hours)
+        db: The database to use. None opens the default database; give an
+            explicit one in tests and examples.
 
     Returns:
         dict with counts: {"checked": N, "refreshed": N, "skipped": N, "failed": N,
                            "cc_refreshed": N, "cc_failed": N}
+        "refreshed" counts real exchanges only; a token inside the buffer that
+        is not yet inside its refresh window counts as "skipped".
+
+    The example uses an in-memory database and stubs the active-account
+    read, so it touches no real database and no credential store even when
+    it runs outside pytest.
 
     >>> import asyncio
-    >>> result = asyncio.get_event_loop().run_until_complete(refresh_all_expiring_tokens())
-    >>> all(k in result for k in ['checked', 'failed', 'refreshed', 'skipped', 'cc_refreshed', 'cc_failed'])
-    True
+    >>> from unittest.mock import patch
+    >>> with patch("jacked.api.credential_helpers.read_active_account_id",
+    ...            return_value=None):
+    ...     counts = asyncio.run(
+    ...         refresh_all_expiring_tokens(db=Database(":memory:")))
+    >>> sorted(counts)
+    ['cc_failed', 'cc_refreshed', 'checked', 'failed', 'refreshed', 'skipped']
+    >>> counts["checked"]
+    0
     """
-    db = Database()
+    if db is None:
+        db = Database()
     now = int(time.time())
     result = {
         "checked": 0, "refreshed": 0, "skipped": 0, "failed": 0,
@@ -1547,16 +2135,32 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
     # NameError here would crash the entire refresh pipeline — see
     # architecture doc §7.1).
     active_id: int | None = None
+    # Rows whose Claude Code tokens a running session holds (the live
+    # authority's tokens, whatever its stamp says): never rotate those.
+    live_held: set[int] | None = None
     try:
         from jacked.api.credential_helpers import (
+            live_holder_account_ids,
             read_active_account_id,
             reconcile_credentials_from_live_store,
         )
-        active_id = read_active_account_id()
+        # Keychain reads run off the event loop (each can take up to 2 s).
+        active_id = await asyncio.to_thread(read_active_account_id)
         if active_id is not None:
-            reconcile_credentials_from_live_store(active_id, db)
+            await asyncio.to_thread(
+                reconcile_credentials_from_live_store, active_id, db
+            )
+        live_held = await asyncio.to_thread(live_holder_account_ids, db)
     except Exception:
         logger.debug("Periodic credential reconciliation failed", exc_info=True)
+    cc_rotation_blocked = active_id is None or live_held is None
+    if cc_rotation_blocked:
+        logger.info(
+            "Token refresh: %s; Claude Code chains are not rotated this pass "
+            "(invariant I2 fails closed)",
+            "the active account is unknown" if active_id is None
+            else "the live credential holders are unknown",
+        )
 
     for account in accounts:
         result["checked"] += 1
@@ -1577,22 +2181,30 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
                 # _refresh_token_flow acquires the same non-reentrant lock
                 # internally and would self-deadlock the loop.
                 try:
-                    success = await asyncio.wait_for(
-                        refresh_account_token(account_id, db), timeout=60,
+                    outcome = await asyncio.wait_for(
+                        refresh_account_token_result(
+                            account_id, db, buffer_seconds=buffer_seconds,
+                        ),
+                        timeout=60,
                     )
                 except asyncio.TimeoutError:
                     logger.error(
                         "Account %d: refresh timed out after 60s — counting as failed",
                         account_id,
                     )
-                    success = False
+                    outcome = RefreshOutcome.FAILED
                 except Exception:
                     logger.exception(
                         "Account %d: refresh raised unexpectedly", account_id,
                     )
-                    success = False
-                if success:
+                    outcome = RefreshOutcome.FAILED
+                # Count only real exchanges as refreshed: a token inside the
+                # buffer but outside the refresh window is a skip, not a
+                # refresh.
+                if outcome is RefreshOutcome.EXCHANGED:
                     result["refreshed"] += 1
+                elif outcome is RefreshOutcome.SKIPPED_NOT_DUE:
+                    result["skipped"] += 1
                 else:
                     result["failed"] += 1
         else:
@@ -1608,11 +2220,13 @@ async def refresh_all_expiring_tokens(buffer_seconds: int = 14400) -> dict:
         # schedule; jacked imports rotated tokens via
         # reconcile_credentials_from_live_store at line ~1044 above.
         # See docs/architecture/oauth-and-credential-flows.md §7.1.
-        if active_id == account_id:
+        if cc_rotation_blocked or active_id == account_id or account_id in live_held:
             continue
 
-        if should_refresh_cc(account):
-            cc_success = await refresh_cc_token(account_id, db)
+        if should_refresh_cc(account, buffer_seconds):
+            cc_success = await refresh_cc_token(
+                account_id, db, buffer_seconds=buffer_seconds,
+            )
             if cc_success:
                 result["cc_refreshed"] += 1
             else:
@@ -1630,10 +2244,16 @@ async def heal_invalid_accounts() -> dict:
     - Otherwise → validate via profile fetch (works for API key accounts too)
     - Mark healed (valid) or confirmed-invalid
 
-    Returns dict with counts: {"checked": N, "healed": N, "confirmed_invalid": N}
+    A network breaker in its cooldown, or an unreachable token endpoint
+    host, defers the account to a later pass (counted as ``deferred``).
+
+    Returns dict with counts: {"checked": N, "healed": N, "confirmed_invalid": N,
+    "deferred": N}
     """
     db = Database()
-    result = {"checked": 0, "healed": 0, "confirmed_invalid": 0}
+    result = {"checked": 0, "healed": 0, "confirmed_invalid": 0, "deferred": 0}
+    # Probed once per pass, and only when a forced renewal is about to run.
+    network_up: Optional[bool] = None
 
     accounts = db.list_accounts(include_inactive=True)
     for account in accounts:
@@ -1654,6 +2274,32 @@ async def heal_invalid_accounts() -> dict:
         # here (it's non-reentrant — holding it would self-deadlock).
         healed = False
         if account.get("refresh_token"):
+            # A network breaker describes the network, not the credential.
+            # While its cooldown runs, or while the network is unreachable,
+            # a forced renewal can only fail again, and a reply lost on the
+            # way back can consume the refresh token. Leave the breaker and
+            # the account for a later pass.
+            failure_type = account.get("refresh_failure_type")
+            last_failed = account.get("refresh_last_failed_at")
+            if failure_type in NETWORK_FAILURE_TYPES and last_failed is not None:
+                cooldown = breaker_cooldown(failure_type)
+                remaining = cooldown - (time.time() - last_failed)
+                if remaining > 0:
+                    logger.info(
+                        "Account %d: heal waits for the %s breaker (%ds remaining)",
+                        account_id, failure_type, int(remaining),
+                    )
+                    result["deferred"] += 1
+                    continue
+            if network_up is None:
+                network_up = await _network_reachable()
+            if not network_up:
+                logger.info(
+                    "Account %d: heal deferred; the token endpoint host is unreachable",
+                    account_id,
+                )
+                result["deferred"] += 1
+                continue
             lock = _get_refresh_lock(account_id)
             if not lock.locked():
                 # Clear circuit breaker state before recovery attempt
@@ -1675,13 +2321,9 @@ async def heal_invalid_accounts() -> dict:
             # Try reconciling from live credentials before validate
             try:
                 from jacked.api.credential_helpers import reconcile_credentials_from_live_store
-                reconcile_credentials_from_live_store(account_id, db)
-            except ImportError:
-                try:
-                    from jacked.api.credential_helpers import reconcile_outgoing_credentials
-                    reconcile_outgoing_credentials(account_id, db)
-                except (ImportError, Exception):
-                    pass
+                await asyncio.to_thread(
+                    reconcile_credentials_from_live_store, account_id, db
+                )
             except Exception:
                 logger.debug("Credential reconciliation failed for account %d", account_id)
 
@@ -1704,7 +2346,11 @@ async def heal_invalid_accounts() -> dict:
                               validation_status="valid",
                               last_validated_at=int(time.time()))
             # Check if CC tokens need re-auth after primary heals
-            if not account.get("cc_refresh_token") and account.get("cc_access_token"):
+            from jacked.api.credential_helpers import cc_chain_dead
+
+            if cc_chain_dead(account) or (
+                not account.get("cc_refresh_token") and account.get("cc_access_token")
+            ):
                 logger.info(
                     "Account %d healed but CC token needs re-authorization",
                     account_id,
@@ -1714,9 +2360,30 @@ async def heal_invalid_accounts() -> dict:
 
     if result["checked"] > 0:
         logger.info(
-            "Heal sweep: checked=%d, healed=%d, confirmed_invalid=%d",
+            "Heal sweep: checked=%d, healed=%d, confirmed_invalid=%d, deferred=%d",
             result["checked"],
             result["healed"],
             result["confirmed_invalid"],
+            result["deferred"],
         )
     return result
+
+
+_NETWORK_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+async def _network_reachable() -> bool:
+    """Return True when the token endpoint host answers a cheap HEAD request.
+
+    Any HTTP status counts as reachable: the probe tests the network path,
+    not the endpoint. A DNS failure, a refused connection or a timeout
+    counts as unreachable. The probe sends no credential.
+    """
+    url = httpx.URL(TOKEN_URL)
+    try:
+        async with httpx.AsyncClient(timeout=_NETWORK_PROBE_TIMEOUT_SECONDS) as client:
+            await client.head(f"{url.scheme}://{url.host}/")
+        return True
+    except Exception as exc:
+        logger.debug("Network probe failed (%s)", type(exc).__name__)
+        return False

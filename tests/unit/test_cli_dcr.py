@@ -369,3 +369,17 @@ def test_engine_human_output_shows_the_reason_when_usable_but_adjusted(isolated_
     assert "codex CLI 0.151.0 installed" in result.output
     assert "needs Codex CLI 0.153.0 or newer" in result.output
     assert "codex update" in result.output
+
+
+def test_engine_human_output_names_the_limit_when_codex_is_blocked(isolated_home):
+    """Signed in but blocked: the fallback ends when the limit lifts, not when
+    the user "fixes" something."""
+    dcr_settings.write_config(isolated_home, {**dcr_settings.DEFAULTS, "engine": "codex"})
+    block = {"reason": "limit_reached", "resets_at": "2026-11-02T20:49:24+00:00"}
+    with patch("jacked.dcr_settings.codex_preflight", return_value=READY), \
+            patch("jacked.dcr_settings.codex_usage_block", return_value=block):
+        result = _invoke(["dcr", "engine"])
+    assert result.exit_code == 0
+    assert "Codex usage limit reached (resets 2026-11-02 20:49 UTC)" in result.output
+    assert "until the Codex limit lifts" in result.output
+    assert "until this is fixed" not in result.output

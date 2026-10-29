@@ -707,3 +707,113 @@ def test_fetch_codex_usage_plan_unchanged_no_write(db, tmp_path, monkeypatch):
     monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
     asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
     assert db.get_account(acct["id"])["subscription_type"] == "pro"
+
+
+# --------------------------------------------------------------------------
+# Usage-failure visibility: validation must not wipe the usage fetch's error
+# --------------------------------------------------------------------------
+
+def test_failed_fetch_survives_validation_until_a_fetch_succeeds(db, tmp_path, monkeypatch):
+    """A signed-in auth.json proves the credential, not that usage is
+    readable. Validation used to reset last_error and consecutive_failures,
+    so the dashboard showed a 7-week-old cache as current (counter at 6 after
+    thousands of failures). Only a successful fetch may clear them."""
+    from jacked.codex.switching import codex_slot_auth_path
+    from jacked.web.auth import validate_account
+
+    base = tmp_path / ".codex"
+    monkeypatch.setenv("CODEX_HOME", str(base))
+    acct = db.create_account("dev@example.com", "codex-managed", 9999999999,
+                             provider="codex", organization_uuid="acct-xyz")
+    slot = codex_slot_auth_path(acct["id"], base)
+    slot.parent.mkdir(parents=True, exist_ok=True)
+    slot.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "t"}}))
+
+    async def boom(**kwargs):
+        raise cu.CodexUsageError("the `codex` CLI is not installed or not on PATH")
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", boom)
+    for _ in range(2):
+        assert asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=base)) is None
+
+    assert asyncio.run(validate_account(acct["id"], db)) == {"valid": True, "error": None}
+    row = db.get_account(acct["id"])
+    assert row["validation_status"] == "valid"
+    assert row["last_validated_at"]
+    assert row["last_error"] == "the `codex` CLI is not installed or not on PATH"
+    assert row["last_error_at"] is not None
+    assert row["consecutive_failures"] == 2
+
+    async def ok(**kwargs):
+        return RECORDED_RESULT
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", ok)
+    assert asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=base)) is not None
+    row = db.get_account(acct["id"])
+    assert row["last_error"] is None
+    assert row["last_error_at"] is None
+    assert row["consecutive_failures"] == 0
+
+
+# --------------------------------------------------------------------------
+# Under the service PATH: codex in ~/.local/bin is found and run
+# --------------------------------------------------------------------------
+
+_DARWIN_SERVICE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX shim + permission bits")
+
+
+def _install_home_codex(home):
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    return write_python_shim(local_bin, "codex", _FAKE_CODEX)
+
+
+def _service_path_env(monkeypatch, home):
+    import shutil
+
+    from jacked import findbin
+    from jacked.service.environment import _SAFE_PATHS
+
+    assert _SAFE_PATHS["darwin"] == _DARWIN_SERVICE_PATH  # pin the service PATH
+    if shutil.which("codex", path=_DARWIN_SERVICE_PATH):
+        pytest.skip("a real codex sits on the system PATH; fallback not exercised")
+    monkeypatch.setenv("PATH", _DARWIN_SERVICE_PATH)
+    monkeypatch.delenv("UV_TOOL_BIN_DIR", raising=False)
+    monkeypatch.delenv("XDG_BIN_HOME", raising=False)
+    monkeypatch.setattr(findbin, "_home_dir", lambda: str(home))
+
+
+@posix_only
+def test_read_rate_limits_finds_home_codex_under_the_service_path(
+    tmp_path, monkeypatch, trusted_tmp_ancestors
+):
+    home = tmp_path / "home"
+    shim = _install_home_codex(home)
+    _service_path_env(monkeypatch, home)
+    codex_home_dir = tmp_path / ".codex"
+    codex_home_dir.mkdir()
+
+    from jacked.findbin import find_bin
+
+    assert find_bin("codex") == str(shim)
+    result = asyncio.run(cu.read_codex_rate_limits(home=codex_home_dir, env=dict(os.environ)))
+    norm = cu.normalize_rate_limits(result)
+    assert norm["five_hour"]["utilization"] == 7
+    assert norm["seven_day"]["utilization"] == 33
+
+
+@posix_only
+def test_read_rate_limits_refuses_home_codex_in_world_writable_dir(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    shim = _install_home_codex(home)
+    _service_path_env(monkeypatch, home)
+    codex_home_dir = tmp_path / ".codex"
+    codex_home_dir.mkdir()
+    shim.parent.chmod(0o777)
+    try:
+        with pytest.raises(cu.CodexUsageError, match="not installed or not on PATH"):
+            asyncio.run(cu.read_codex_rate_limits(home=codex_home_dir, env=dict(os.environ)))
+    finally:
+        shim.parent.chmod(0o755)

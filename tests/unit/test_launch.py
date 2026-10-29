@@ -709,6 +709,25 @@ class TestPrepareAccountDir:
                         prepare_account_dir(account, db)
                         mock_asyncio.run.assert_called_once()
 
+    @pytest.mark.parametrize("block", ["active_unknown", "live_session_holds", "live_store_unreadable"])
+    def test_pre_launch_cc_refresh_fails_closed(self, tmp_path, block):
+        """The pre-launch cc refresh uses the same fail-closed gate as the
+        loops: no rotation when the active account is unknown or a running
+        session holds the row's tokens."""
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+        db.update_account(1, cc_access_token="cc", cc_refresh_token="cc-rt", cc_expires_at=1)
+        account = db.get_account(1)
+        refresh = mock.MagicMock()
+        with mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"), \
+             mock.patch("jacked.launch.should_refresh", return_value=False), \
+             mock.patch("jacked.api.credential_helpers.cc_rotation_block", return_value=block), \
+             mock.patch("jacked.web.auth.refresh_cc_token", new=refresh):
+            from jacked.launch import prepare_account_dir
+
+            prepare_account_dir(account, db)
+        refresh.assert_not_called()
+
     def test_validates_account_id(self, tmp_path):
         """Rejects account_id <= 0."""
         db = _make_db(tmp_path)
@@ -1227,13 +1246,16 @@ class TestLaunchClaude:
         mock_proc.wait.return_value = 0
         mock_proc.poll.return_value = 0
 
-        with mock.patch("jacked.launch.subprocess.Popen", return_value=mock_proc) as mock_popen:
+        # The spawn uses the binary find_bin resolved (the standalone install
+        # in ~/.local/bin is off a minimal PATH), not the bare name.
+        with mock.patch("jacked.launch.subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             mock.patch("jacked.launch.find_bin", return_value="/home/u/.local/bin/claude"):
             with pytest.raises(SystemExit):
                 launch_claude(config_dir, ("--resume", "abc123"))
 
         mock_popen.assert_called_once()
         args = mock_popen.call_args
-        assert args[0][0] == ["claude", "--resume", "abc123"]
+        assert args[0][0] == ["/home/u/.local/bin/claude", "--resume", "abc123"]
         env = args[1]["env"]
         assert env["CLAUDE_CONFIG_DIR"] == str(config_dir)
         assert env["JACKED_CREDENTIAL_SCOPE"] == "unknown"
@@ -1320,7 +1342,9 @@ class TestLaunchClaude:
         mock_proc.wait.return_value = 0
         mock_proc.poll.return_value = 0  # exits immediately
 
-        with mock.patch("jacked.launch.subprocess.Popen", return_value=mock_proc) as mock_popen:
+        # find_bin finds nothing: the bare name is kept so PATH still decides.
+        with mock.patch("jacked.launch.subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             mock.patch("jacked.launch.find_bin", return_value=None):
             with pytest.raises(SystemExit):
                 launch_claude(config_dir, ("--resume", "abc"), db_path=str(tmp_path / "test.db"))
 

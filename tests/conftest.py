@@ -22,6 +22,29 @@ REAL_HOME = Path.home()
 
 
 @pytest.fixture(autouse=True)
+def _isolate_home(monkeypatch, tmp_path_factory):
+    """Give every test a temporary HOME (and USERPROFILE on Windows).
+
+    Code under test resolves the live Claude Code credentials, the Codex
+    login, and jacked's own files from the home directory. Before this
+    fixture, tests that did not mock the live store read the developer's
+    REAL ``~/.claude/.credentials.json``: on 2026-10-27 three I2 tests
+    passed on Jack's Mac only because that file existed, and failed on every
+    CI runner where it does not. A test's result must never depend on (or
+    reach) the developer's real credentials. A test that needs a home of its
+    own still sets HOME itself; ``REAL_HOME`` keeps the real path for the
+    tripwires below.
+    """
+    home = tmp_path_factory.mktemp("home")
+    (home / ".claude").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("JACKED_HOME", raising=False)
+    yield home
+
+
+@pytest.fixture(autouse=True)
 def _isolate_default_db_path(monkeypatch, tmp_path_factory):
     """Tripwire: no test may open the developer's real ~/.claude/jacked.db.
 
@@ -383,3 +406,70 @@ def _block_profile_browser_launch():
     """
     with patch("jacked.web.browser_launch.find_browser", return_value=None):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_reconcile_ownership_network():
+    """Reconcile's ownership check must never reach the real profile endpoint.
+
+    The default answer is "request did not complete", so reconcile imports
+    nothing it cannot prove. A test that needs a proven owner patches
+    ``jacked.api.credential_helpers._ownership_lookup`` itself.
+    """
+    from jacked.api.authority_guard import ProfileLookup
+
+    from jacked.api.credential_helpers import clear_ownership_cache
+
+    clear_ownership_cache()
+    with patch(
+        "jacked.api.credential_helpers._ownership_lookup",
+        return_value=ProfileLookup(None),
+    ):
+        yield
+    clear_ownership_cache()
+
+
+@pytest.fixture
+def trusted_tmp_ancestors(tmp_path, monkeypatch):
+    """Report every directory ABOVE ``tmp_path`` as a root-owned 0755 dir.
+
+    ``jacked.findbin`` refuses an off-PATH binary when any ancestor
+    directory is writable by others. Linux CI runners put pytest's tmp_path
+    under ``/tmp`` (root-owned, sticky, world-writable), so every fake
+    install a test builds there was refused on the runners and accepted on
+    macOS, where tmp_path lives under a user-owned directory. The layout a
+    test builds starts AT tmp_path; the directories above it belong to the
+    machine, not to the test. Entries at or below tmp_path keep their real
+    status, so the trust rule is still exercised on everything the test
+    creates.
+    """
+    import os as _os
+    import stat as _stat
+
+    above = set()
+    for start in {str(tmp_path), _os.path.realpath(tmp_path)}:
+        parent = _os.path.dirname(start)
+        while True:
+            above.add(parent)
+            nxt = _os.path.dirname(parent)
+            if nxt == parent:
+                break
+            parent = nxt
+    real_stat = _os.stat
+
+    def stat_with_trusted_ancestors(path, *args, **kwargs):
+        status = real_stat(path, *args, **kwargs)
+        try:
+            key = _os.path.abspath(_os.fspath(path))
+        except TypeError:
+            return status
+        if key in above and _stat.S_ISDIR(status.st_mode):
+            fields = list(status)
+            fields[_stat.ST_MODE] = _stat.S_IFDIR | 0o755
+            fields[_stat.ST_UID] = 0
+            fields[_stat.ST_GID] = 0
+            return _os.stat_result(fields)
+        return status
+
+    monkeypatch.setattr(_os, "stat", stat_with_trusted_ancestors)
+    return tmp_path

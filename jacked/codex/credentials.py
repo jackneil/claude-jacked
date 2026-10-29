@@ -294,12 +294,12 @@ def detect_codex_account(
 
     if not present:
         if mode == "file":
-            reason = "no ~/.codex/auth.json — run `codex login` first"
+            reason = "no ~/.codex/auth.json. Run `codex login` first."
         else:  # auto, no file -> creds may be in the keyring
             reason = (
                 "no readable ~/.codex/auth.json (under 'auto' the credential "
-                "may be in the OS keyring) — run `codex login`, or set "
-                'cli_auth_credentials_store = "file"'
+                "may be in the OS keyring). Run `codex login`, or set "
+                'cli_auth_credentials_store = "file".'
             )
         return CodexCredentialStatus(
             present=False,

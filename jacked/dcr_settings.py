@@ -39,11 +39,12 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+from jacked.findbin import find_bin
 
 try:  # POSIX advisory locking. Absent on Windows -- see ``_config_lock``.
     import fcntl
@@ -514,7 +515,7 @@ def codex_preflight(timeout: float = 10.0) -> dict:
     this runs on the /dcr hot path and on a dashboard request, and neither may
     die because a subprocess misbehaved.
     """
-    codex = shutil.which("codex")
+    codex = find_bin("codex")
     if not codex:
         return {
             "codex_installed": False,
@@ -565,6 +566,77 @@ def codex_preflight(timeout: float = 10.0) -> dict:
         "codex_version": version,
         "reason": "Codex CLI is not signed in. Run: codex login",
     }
+
+
+def codex_usage_block(home: Path | str, env=None) -> "dict | None":
+    """Codex's own "usage blocked" verdict for the signed-in Codex account.
+
+    Reads the verdict the dashboard poller cached in ``<home>/.claude/jacked.db``
+    (opened read-only) for the account in ``$CODEX_HOME/auth.json``. Returns
+    ``{"reason", "resets_at"}`` (see ``menubar_summary.usage_block``) or None
+    when the account is not blocked, the block has lifted, or anything needed
+    is missing. Never raises: a /dcr run must not die on a usage lookup.
+
+    A signed-in but blocked account makes every ``codex exec`` reviewer fail,
+    so the engine check reports it as not usable instead.
+
+    >>> codex_usage_block("/nonexistent-jacked-home") is None
+    True
+    """
+    import sqlite3
+
+    db_path = Path(home) / ".claude" / "jacked.db"
+    if not db_path.is_file():
+        return None
+    try:
+        from jacked.codex.credentials import extract_identity, read_auth_json
+        from jacked.service.menubar_summary import usage_block_of_row
+
+        auth = read_auth_json(env=env)
+        if not auth:
+            return None
+        identity = extract_identity(auth)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            # The row set and order the usage poller resolves the live
+            # account from (Database.list_accounts: enabled, not deleted).
+            rows = conn.execute(
+                "SELECT organization_uuid, email, cached_usage_raw, usage_cached_at "
+                "FROM accounts WHERE provider = 'codex' AND is_deleted = 0 "
+                "AND is_active = 1 ORDER BY COALESCE(priority, 0) ASC, created_at ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 -- never raise on the /dcr hot path
+        return None
+    # The same match find_codex_account_id uses: the first org match, else
+    # the LAST email match.
+    org = identity.account_id
+    email = (identity.email or "").lower()
+    match = next((r for r in rows if org and (r[0] or "") == org), None)
+    if match is None and email:
+        match = next((r for r in reversed(rows) if (r[1] or "").lower() == email), None)
+    if match is None:
+        return None
+    return usage_block_of_row({"cached_usage_raw": match[2], "usage_cached_at": match[3]})
+
+
+def _block_reason(block: dict) -> str:
+    """A human reason for a Codex usage block (shown by the /dcr engine check).
+
+    >>> _block_reason({"reason": "limit_reached", "resets_at": "2026-11-02T20:49:24+00:00"})
+    'Codex usage limit reached (resets 2026-11-02 20:49 UTC)'
+    >>> _block_reason({"reason": "spend_limit", "resets_at": None})
+    'Codex spend limit reached'
+    """
+    what = {
+        "limit_reached": "Codex usage limit reached",
+        "spend_limit": "Codex spend limit reached",
+    }.get(block.get("reason"), "Codex usage is blocked")
+    resets = block.get("resets_at")
+    if resets:
+        what += f" (resets {resets[:10]} {resets[11:16]} UTC)"
+    return what
 
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
@@ -637,7 +709,9 @@ def resolve(home: Path | str, *, preflight: bool = True) -> dict:
 
     Engine "claude" is always usable and runs no subprocess (the preflight fields
     stay null). Engine "codex" is usable only when the codex CLI is installed AND
-    signed in; ``reason`` then also carries the preflight explanation. With
+    signed in AND Codex has not blocked the account's usage (the verdict the
+    dashboard cached, see ``codex_usage_block``); ``reason`` then also carries
+    the preflight or block explanation. With
     ``preflight=False`` no check runs, so the preflight fields stay null and the
     config is reported as usable: callers that pass it want the stored config,
     not a live capability check.
@@ -684,6 +758,11 @@ def resolve(home: Path | str, *, preflight: bool = True) -> dict:
         resolved["usable"] = bool(check["codex_installed"] and check["codex_logged_in"])
         if check["reason"]:
             reasons.append(check["reason"])
+        if resolved["usable"]:
+            block = codex_usage_block(home)
+            if block:
+                resolved["usable"] = False
+                reasons.append(_block_reason(block))
         if resolved["usable"]:
             too_old = model_supported_by(resolved["model"], resolved["codex_version"])
             if too_old:

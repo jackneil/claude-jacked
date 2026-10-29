@@ -157,7 +157,7 @@ def test_boundary_exactly_71_and_90():
 
 
 def test_menubar_title_formats_and_rounds():
-    assert menubar_title(None) == "—"
+    assert menubar_title(None) == "-"
     assert menubar_title({"five_hour": 96.0, "seven_day": 78.0, "color": "red"}) == "96%·78%"
     assert menubar_title({"five_hour": 40.4, "seven_day": 30.6, "color": "green"}) == "40%·31%"
 
@@ -308,3 +308,37 @@ def test_endpoint_degraded_when_db_unavailable():
     client = TestClient(app, raise_server_exceptions=False)
     resp = client.get("/api/menubar-summary")
     assert resp.status_code == 503
+
+
+def test_endpoint_worst_codex_keeps_unreported_window_null(db):
+    """A blocked weekly-only Codex account: no 5h number, red, blocked."""
+    import json
+    import time
+
+    from jacked.api.main import app
+
+    raw = {"ordinaryUsageAllowed": False,
+           "rateLimits": {"rateLimitReachedType": "rate_limit_reached"},
+           "rateLimitUpsell": {"reset_at": int(time.time()) + 86400}}
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO accounts
+               (id, provider, email, access_token, expires_at, is_active, is_deleted,
+                validation_status, cached_usage_5h, cached_usage_7d, usage_cached_at,
+                cached_usage_raw)
+               VALUES (9, 'codex', 'cx@x.com', 'at9', 1900000000, 1, 0, 'valid',
+                       NULL, 100, ?, ?)""",
+            (int(time.time()), json.dumps(raw)),
+        )
+    app.state.db = db
+    try:
+        with _patch_active(1):
+            resp = TestClient(app, raise_server_exceptions=False).get("/api/menubar-summary")
+        worst = resp.json()["worst"]
+        assert worst["email"] == "cx@x.com"
+        assert worst["five_hour"] is None
+        assert worst["blocked"] is True
+        assert worst["color"] == "red"
+        assert menubar_title(worst) == "-·100%"
+    finally:
+        app.state.db = None

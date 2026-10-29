@@ -18,7 +18,7 @@
         } catch (e) {}
     })();
 </script>
-<title>jacked — usage</title>
+<title>jacked usage</title>
 <!-- Empty data-URI icon: the panel is a chromeless popover/panel with no
      favicon; this stops the browser's automatic /favicon.ico request (a 404). -->
 <link rel="icon" href="data:,">
@@ -55,6 +55,8 @@
     .text-slate-300 { color: #cbd5e1; }
     .text-slate-400 { color: #94a3b8; }
     .text-slate-500 { color: #64748b; }
+    .text-amber-400 { color: #fbbf24; }
+    .opacity-60 { opacity: 0.6; }
     .text-red-400 { color: #f87171; }
     .text-yellow-400 { color: #facc15; }
 </style>
@@ -142,9 +144,8 @@
     }
 
     /* Provider identity (Claude vs Codex) — shared glyph from js/util/provider.js.
-       The brand-colored glyph before the email/org-name is the primary cue; a
-       subtle left-edge bar on single-org cards adds an at-a-glance "backdrop"
-       (pseudo-element, no layout shift; .acct is position:relative). */
+       The brand-colored badge before the email/org-name is the only cue; a
+       colored edge stripe on the card would repeat it as decoration. */
     .provider-glyph {
         display: inline-flex; align-items: center; justify-content: center;
         width: 12px; height: 12px; flex: 0 0 auto;
@@ -161,12 +162,6 @@
     .provider-label {
         font-size: 9px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
     }
-    .acct.provider-claude::before, .acct.provider-codex::before {
-        content: ""; position: absolute; left: 0; top: 7px; bottom: 7px;
-        width: 2px; border-radius: 2px;
-    }
-    .acct.provider-claude::before { background: rgba(167, 139, 250, 0.7); }
-    .acct.provider-codex::before { background: rgba(96, 165, 250, 0.7); }
 
     /* Identity line — shared by the single-account head, multi-org header, and
        per-org rows so columns line up across every account type. */
@@ -209,6 +204,12 @@
         font-size: 9px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
         color: #0b1f1c; background: var(--accent);
         border-radius: 4px; padding: 1px 5px; flex: none;
+    }
+    /* Provider-reported usage block: plan-badge shape, warning text. */
+    .block-badge {
+        font-size: 10px; font-weight: 600; color: #f87171;
+        background: rgba(248, 113, 113, 0.12);
+        border-radius: 4px; padding: 0 5px; flex: none; white-space: nowrap;
     }
     /* Pushes the freshness age to the right edge so all ages align in a column. */
     .meta-spacer { flex: 1 1 0; }

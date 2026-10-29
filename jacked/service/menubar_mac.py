@@ -366,7 +366,7 @@ if RUMPS_AVAILABLE:
 
         def _refresh_pill(self, _timer):
             """Poll the summary; set the active account's % as text and tint the
-            arm icon by its color. Degrade to a gray arm + em-dash if down."""
+            arm icon by its color. Degrade to a gray arm + hyphen if down."""
             from jacked.service.menubar_summary import menubar_title
 
             upd = self._update_available()
@@ -380,7 +380,7 @@ if RUMPS_AVAILABLE:
                     (active or {}).get("provider") or "claude",
                 )
             except Exception:
-                self.title = " —"  # degraded — server unreachable
+                self.title = " -"  # degraded — server unreachable
                 self._set_icon("gray", upd)
 
             # Keep the Auto-swap checkmark honest.
@@ -769,7 +769,7 @@ if RUMPS_AVAILABLE:
             timer.stop()
             self._refresh_version_menu()
             if getattr(r, "_version_check_in_progress", False):
-                self._mac_notify("Still checking PyPI — try again in a moment.")
+                self._mac_notify("Still checking PyPI. Try again in a moment.")
             elif getattr(r, "_last_check_failed", False):
                 self._mac_notify(
                     "Couldn't reach PyPI.",
@@ -781,7 +781,7 @@ if RUMPS_AVAILABLE:
                     latest = info.get("latest", "?")
                     self._mac_notify(
                         f"Update available: v{latest}",
-                        subtitle=f"You're on v{__version__} — click the version line to install it.",
+                        subtitle=f"You're on v{__version__}. Click the version line to install it.",
                     )
                 else:
                     self._mac_notify(f"You're up to date (v{__version__}).")

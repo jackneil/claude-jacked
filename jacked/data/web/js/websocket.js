@@ -355,11 +355,16 @@ function _usageUpdateCardDOM(card, acctData) {
         const bar7d = usageContainer.children[1];
         if (bar5h && bar7d) {
             const temp5h = document.createElement('div');
-            temp5h.insertAdjacentHTML('afterbegin', renderUsageBar(acctData.cached_usage_5h, acctData.cached_5h_resets_at, elapsed5h, '5h limit'));
+            // The poll payload may lack keeper_state/provider: read the merged
+            // account from state so the reset column keeps its reason.
+            const merged = (window.jackedState && window.jackedState.accounts || []).find(a => a.id === acctData.id) || acctData;
+            const barOpts5h = typeof usageBarOpts === 'function' ? usageBarOpts(merged, acctData.cached_5h_resets_at, null, acctData.cached_usage_5h) : undefined;
+            const barOpts7d = typeof usageBarOpts === 'function' ? usageBarOpts(merged, acctData.cached_7d_resets_at, null, acctData.cached_usage_7d) : undefined;
+            temp5h.insertAdjacentHTML('afterbegin', renderUsageBar(acctData.cached_usage_5h, acctData.cached_5h_resets_at, elapsed5h, '5h limit', barOpts5h));
             if (temp5h.firstElementChild) bar5h.replaceWith(temp5h.firstElementChild);
 
             const temp7d = document.createElement('div');
-            temp7d.insertAdjacentHTML('afterbegin', renderUsageBar(acctData.cached_usage_7d, acctData.cached_7d_resets_at, elapsed7d, '7d limit'));
+            temp7d.insertAdjacentHTML('afterbegin', renderUsageBar(acctData.cached_usage_7d, acctData.cached_7d_resets_at, elapsed7d, '7d limit', barOpts7d));
             if (temp7d.firstElementChild) bar7d.replaceWith(temp7d.firstElementChild);
         }
 

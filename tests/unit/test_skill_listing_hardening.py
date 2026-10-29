@@ -442,7 +442,7 @@ def test_version_probe_is_cached_and_bounded(monkeypatch):
         calls.append(kw)
         return Done()
 
-    monkeypatch.setattr(sl.shutil, "which", lambda name: "/bin/claude")
+    monkeypatch.setattr(sl, "find_bin", lambda name: "/bin/claude")
     monkeypatch.setattr(sl.subprocess, "run", fake_run)
     monkeypatch.setattr(sl, "_VERSION_CACHE", {})
     probe = sl._probe_claude_code_version
@@ -457,7 +457,7 @@ def test_version_probe_survives_undecodable_output(monkeypatch):
     def fake_run(argv, **kw):
         raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")
 
-    monkeypatch.setattr(sl.shutil, "which", lambda name: "/bin/claude")
+    monkeypatch.setattr(sl, "find_bin", lambda name: "/bin/claude")
     monkeypatch.setattr(sl.subprocess, "run", fake_run)
     monkeypatch.setattr(sl, "_VERSION_CACHE", {})
     assert sl._probe_claude_code_version() is None

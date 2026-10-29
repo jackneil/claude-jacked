@@ -56,6 +56,8 @@ global.renderUsageBar = () => '<div data-stub="bar"></div>';
 global.renderActiveSessions = () => '<div data-stub="sessions"></div>';
 global.computeElapsedFraction5h = () => 0;
 global.computeElapsedFraction7d = () => 0;
+global.usageBarOpts = () => undefined;
+global.renderUsageBlockBadge = () => '';
 global.timeAgoFromUnix = () => '1m ago';
 global.usageTextClass = () => 'text-green-400';
 const out = (o) => process.stdout.write('\n' + JSON.stringify(o) + '\n');
@@ -157,6 +159,20 @@ class TestKebabButton:
         # expired, non-refreshable token
         assert dot in _actions(
             tmp_path, validation_status="valid", is_expired=True, has_refresh_token=False,
+        )
+
+    def test_attention_dot_for_keeper_needs_reauth(self, tmp_path):
+        """The keeper saw every token rejected: the dot points at Re-auth,
+        which stays in the menu and enabled."""
+        dot = '<span class="account-menu-dot"'
+        html = _actions(
+            tmp_path, validation_status="valid",
+            keeper_state={"last_status": "needs_reauth"},
+        )
+        assert dot in html
+        assert "btn-reauth" in _menu_panel(html)
+        assert dot not in _actions(
+            tmp_path, validation_status="valid", keeper_state={"last_status": "ok"},
         )
 
     def test_use_account_stays_on_the_card_face(self, tmp_path):
@@ -947,3 +963,18 @@ class TestStyles:
             assert "border-color" not in body, (
                 f"provider brand color must not paint a card border: {selector.strip()}"
             )
+
+
+class TestUsageBlockBadgeWiring:
+    def test_card_header_carries_the_usage_block_badge(self, tmp_path):
+        # The harness stubs the badge helper; this pins that the card header
+        # calls it with the account and places its HTML.
+        html = _run_render(
+            tmp_path,
+            "renderUsageBlockBadge = (a) => a.usage_block ? '<span data-stub=\\'block\\'></span>' : '';\n"
+            "out({ html: renderAccountCard({id: 2, email: 'c@x.com', provider: 'codex', "
+            "is_active: true, validation_status: 'valid', priority: 0, "
+            "usage_block: {reason: 'limit_reached'}}, 0, 1) });",
+        )["html"]
+        assert "data-stub='block'" in html
+        assert html.index("data-stub='block'") < html.index("data-usage-container")
