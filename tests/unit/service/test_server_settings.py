@@ -73,9 +73,40 @@ def test_the_sans_io_protocol_has_flow_control_and_keepalive():
         WebSocketsSansIOProtocol,
     )
 
-    assert callable(getattr(WebSocketsSansIOProtocol, "pause_writing", None))
-    assert callable(getattr(WebSocketsSansIOProtocol, "resume_writing", None))
-    assert callable(getattr(WebSocketsSansIOProtocol, "send_keepalive_ping", None))
+    import asyncio
+
+    # asyncio.BaseProtocol defines both as no-ops, so being callable proves
+    # nothing (uvicorn 0.46 passed that): the protocol must override them.
+    for name in ("pause_writing", "resume_writing"):
+        assert getattr(WebSocketsSansIOProtocol, name) is not getattr(asyncio.BaseProtocol, name), name
+    assert "send_keepalive_ping" in vars(WebSocketsSansIOProtocol)
+
+
+def test_a_paused_transport_blocks_sends_until_it_resumes():
+    """The behavior the registry's send timeout depends on."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from uvicorn.protocols.websockets.websockets_sansio_impl import (
+        WebSocketsSansIOProtocol,
+    )
+
+    async def scenario():
+        config = uvicorn.Config("jacked.api.main:app", **SERVER_SETTINGS)
+        config.load()
+        protocol = WebSocketsSansIOProtocol(
+            config=config, server_state=MagicMock(connections=set(), tasks=set()),
+            app_state={},
+        )
+        protocol.pause_writing()
+        waiter = asyncio.ensure_future(protocol.writable.wait())
+        await asyncio.sleep(0.05)
+        paused_blocks = not waiter.done()
+        protocol.resume_writing()
+        await asyncio.wait_for(waiter, 1)
+        return paused_blocks
+
+    assert asyncio.run(scenario())
 
 
 def test_the_settings_cannot_be_changed_at_runtime():
