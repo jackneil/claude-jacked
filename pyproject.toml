@@ -35,7 +35,6 @@ dependencies = [
     "httpx>=0.24,<1",
     "aiohttp>=3.9,<4",
     "packaging>=23.0,<27",
-    "anthropic>=0.40,<1",
     # Tray icon is ON by default — pystray/Pillow are core so a bare
     # `uv tool install claude-jacked` lights up the tray with no extra needed.
     # Opt out of the icon at runtime with `jacked install --no-tray`. Headless
@@ -76,10 +75,11 @@ dev = [
     "pystray>=0.19,<1",
     "Pillow>=9.0,<13",
     # Pinned ruff so the pre-push hook uses ONE deterministic version from
-    # .venv instead of whatever stray conda env sorts first on PATH.
-    # <0.16: ruff 0.16 broadens the default rule set (~1,250 new findings on
-    # this tree). Raise the cap only together with that migration.
-    "ruff>=0.6,<0.16",
+    # .venv instead of whatever stray conda env sorts first on PATH. The rule
+    # set is pinned in [tool.ruff.lint] below, so a ruff release that widens
+    # its DEFAULT rules (0.16 did: ~1,600 new findings on this tree) changes
+    # nothing here.
+    "ruff>=0.6,<0.18",
 ]
 
 [project.scripts]
@@ -107,5 +107,11 @@ markers = [
 # Defends against smash-and-grab attacks (axios 1.14.1, Shai-Hulud, etc.) — gives
 # the community time to flag a poisoned release before it lands in our build.
 # Bump as part of intentional dep refreshes (≥ 7 days ago is the minimum standard).
+[tool.ruff.lint]
+# Ruff's default rule set before 0.16, pinned so a ruff upgrade never
+# changes what the pre-push hook enforces. Widening it is a deliberate
+# change with its own cleanup.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.uv]
 exclude-newer = "2026-05-13T00:00:00Z"
