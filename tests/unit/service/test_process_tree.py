@@ -123,3 +123,25 @@ def test_relay_and_capture_read_utf8_output(tmp_path):
     script = "import sys; sys.stdout.buffer.write('caf\\u00e9 \\u2026\\n'.encode('utf-8'))"
     result = run_tree([sys.executable, "-c", script], timeout=30, capture=True)
     assert result.stdout == "caf\u00e9 \u2026\n"
+
+
+def test_a_mocked_popen_never_reaches_a_group_signal(monkeypatch):
+    """A MagicMock pid coerces to 1, and killpg(1) is kill(-1) on Linux: it
+    signals every process the user owns (it killed a CI runner). A mocked
+    Popen must never reach os.killpg at all."""
+    from unittest.mock import MagicMock
+
+    from jacked import proctree
+
+    sent = []
+    monkeypatch.setattr(proctree.os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+    monkeypatch.setattr(proctree.subprocess, "Popen", MagicMock())
+    proctree.run_tree(["anything"], timeout=1)
+    assert sent == []
+
+    fake = MagicMock()
+    fake.return_value.wait.side_effect = subprocess.TimeoutExpired("x", 1)
+    monkeypatch.setattr(proctree.subprocess, "Popen", fake)
+    with pytest.raises(subprocess.TimeoutExpired):
+        proctree.run_tree(["anything"], timeout=1)
+    assert sent == []

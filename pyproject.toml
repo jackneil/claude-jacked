@@ -101,6 +101,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 markers = [
     "real_process: the test deliberately executes a sandboxed stub process (opts out of the real-service tripwire in tests/conftest.py)",
+    "real_process_tree: the test needs the real jacked.service.updater.run_process_tree (opts out of the subprocess.run seam in tests/conftest.py)",
 ]
 
 # Supply-chain hardening: uv resolves only versions uploaded before this date.

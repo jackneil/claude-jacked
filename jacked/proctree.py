@@ -71,6 +71,7 @@ def run_tree(
         kwargs.update(stdout=log_fh, stderr=log_fh)
 
     proc = subprocess.Popen(argv, **kwargs)
+    group = _own_group(proc)
     relay_thread = None
     if relay:
         relay_thread = threading.Thread(
@@ -84,17 +85,42 @@ def run_tree(
             proc.wait(timeout=timeout)
             stdout = stderr = None
     except subprocess.TimeoutExpired:
-        _stop_tree(proc, interrupted=False)
+        _stop_tree(proc, group, interrupted=False)
         stdout, stderr = _drain(proc) if capture else (None, None)
         raise subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr) from None
     except BaseException:
-        _stop_tree(proc, interrupted=True)
+        _stop_tree(proc, group, interrupted=True)
         raise
     finally:
         if relay_thread is not None:
             relay_thread.join(timeout=_GRACE_SECONDS)
-    _reap_leftovers(proc)
+    _reap_leftovers(group)
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def _own_group(proc) -> int | None:
+    """The child's process group id, or None when it is not provably a
+    group of its own.
+
+    Read right after Popen returns: the child has already called setsid
+    (Popen waits for the exec), so a real child leads a group whose id is its
+    pid. Anything else (a mocked Popen, whose pid coerces to 1, or a child
+    that shares our group) gets None, and no group signal is ever sent.
+    This matters: killpg(1) is kill(-1) on Linux, which signals every
+    process the user owns.
+    """
+    if sys.platform == "win32":
+        return None
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return None
+    try:
+        group = os.getpgid(pid)
+    except OSError:
+        return None
+    if group != pid or group == os.getpgrp():
+        return None
+    return group
 
 
 def _relay_lines(stream, log_fh) -> None:
@@ -125,7 +151,7 @@ def _drain(proc) -> tuple[str | None, str | None]:
         return None, None
 
 
-def _stop_tree(proc, *, interrupted: bool) -> None:
+def _stop_tree(proc, group: int | None, *, interrupted: bool) -> None:
     """Stop the child and every process in its group, then reap the child.
 
     A Ctrl-C reaches the group as SIGINT first (what the terminal would have
@@ -144,27 +170,32 @@ def _stop_tree(proc, *, interrupted: bool) -> None:
             )
         except (OSError, subprocess.SubprocessError):
             proc.kill()
+    elif group is None:
+        proc.kill()  # no verified group: stop only the child
     else:
-        _signal_group(proc.pid, signal.SIGINT if interrupted else signal.SIGTERM)
+        _signal_group(group, signal.SIGINT if interrupted else signal.SIGTERM)
         try:
             proc.wait(timeout=_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             pass
-        _signal_group(proc.pid, signal.SIGKILL)
+        _signal_group(group, signal.SIGKILL)
     try:
         proc.wait(timeout=_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         logger.warning("Process %s did not exit after SIGKILL", proc.pid)
 
 
-def _reap_leftovers(proc) -> None:
+def _reap_leftovers(group: int | None) -> None:
     """POSIX: stop group members still alive after the child exited (a worker
     the child started and did not wait for, or one an inner timeout left)."""
-    if sys.platform != "win32":
-        _signal_group(proc.pid, signal.SIGKILL)
+    if group is not None:
+        _signal_group(group, signal.SIGKILL)
 
 
 def _signal_group(pgid: int, sig: int) -> None:
+    # Last line of defense: never a broadcast (0 or 1) and never our own group.
+    if pgid <= 1 or pgid == os.getpgrp():
+        return
     try:
         os.killpg(pgid, sig)
     except (ProcessLookupError, PermissionError):
