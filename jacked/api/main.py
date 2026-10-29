@@ -177,7 +177,9 @@ async def _profile_backfill_once(app):
         logger.error(
             "Profile backfill exceeded %ds and was cancelled", SWEEP_PASS_TIMEOUT
         )
-        web_auth.log_identity_coverage(db, counts, timed_out=True)
+        await asyncio.to_thread(
+            web_auth.log_identity_coverage, db, counts, timed_out=True
+        )
     except Exception as e:
         logger.warning("Profile backfill error: %s", type(e).__name__)
 
@@ -459,12 +461,29 @@ async def lifespan(app: FastAPI):
         logging.getLogger().removeHandler(_file_handler)
         _file_handler.close()
 
+    await _close_loop_db_connection(app)
+
+
+async def _close_loop_db_connection(app) -> None:
+    """Close the jacked.db connection that the event-loop thread holds.
+
+    ``Database`` connections are thread-local, and ``Database.close()``
+    closes only the CALLING thread's connection. The one this shutdown must
+    close belongs to the loop thread (``Database()`` in the lifespan opened
+    it there for the schema). So detach it here, on the loop thread, and
+    close it in a worker: closing the last WAL connection checkpoints, which
+    is disk I/O. Never raises.
+    """
     db = getattr(app.state, "db", None)
-    if db is not None:
-        try:
-            db.close()
-        except Exception:
-            pass
+    if db is None:
+        return
+    conn = db.detach_connection()
+    if conn is None:
+        return
+    try:
+        await asyncio.to_thread(conn.close)
+    except Exception:
+        pass
 
 
 app = FastAPI(

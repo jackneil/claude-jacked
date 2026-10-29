@@ -8,6 +8,7 @@ endpoint: the DB write is cheap and reversible, the restart is the disruptive
 part the client stages behind its own confirm + overlay.
 """
 
+import asyncio
 import logging
 import os
 import threading
@@ -108,7 +109,7 @@ def _read_state(db) -> dict:
 
 
 @router.get("/remote-access")
-async def get_remote_access(request: Request):
+def get_remote_access(request: Request):
     """Current remote-access setting plus the live effective bind state.
 
     Readable from anywhere the dashboard is reachable: a remote viewer may see
@@ -120,7 +121,7 @@ async def get_remote_access(request: Request):
 
 
 @router.put("/remote-access")
-async def update_remote_access(request: Request, body: RemoteAccessSettings):
+def update_remote_access(request: Request, body: RemoteAccessSettings):
     """Persist the remote-access setting. Does NOT restart — the client calls
     POST /remote-access/restart to apply, so save and apply stay distinct.
 
@@ -174,7 +175,9 @@ async def restart_remote_access(request: Request):
         # not reconnect (loopback-only re-bind) and shows a terminal message
         # instead of health-polling forever. Read from the DB so the payload
         # reflects what was actually persisted by the preceding PUT.
-        enabled, scope = _read_enabled_scope(_get_db(request))
+        enabled, scope = await asyncio.to_thread(
+            _read_enabled_scope, _get_db(request)
+        )
         ws_registry = getattr(request.app.state, "ws_registry", None)
         await _restart_broadcast(
             ws_registry,

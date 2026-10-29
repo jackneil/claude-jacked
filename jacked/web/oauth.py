@@ -20,6 +20,7 @@ import html
 import json
 import logging
 import secrets
+import threading
 import time
 from typing import Optional
 from urllib.parse import parse_qs, urlencode
@@ -71,6 +72,12 @@ FLOW_RETENTION_SECONDS = 300
 # API is network-trusted (no per-request auth) — bound the attempts per flow.
 MAX_SUBMIT_ATTEMPTS = 10
 DEFAULT_TOKEN_TTL_SECONDS = 28800  # 8 hours — default token lifetime from Anthropic
+# Serializes the read-check-write steps on a row's Claude Code lineage. They
+# run in worker threads (#162), so they no longer get the event loop's
+# one-turn atomicity: an OAuth store of a new cc lineage and the token
+# module's re-read-then-clear of a dead one take this lock, so neither can
+# land between the other's check and write.
+CC_LINEAGE_WRITE_LOCK = threading.Lock()
 
 # organization_type → subscription_type mapping (design doc section 4e)
 ORG_TYPE_MAP = {
@@ -264,16 +271,9 @@ class OAuthFlow:
         self._target_account_id = target_account_id
         # Re-auth flows know whose account they are for. That identity drives
         # the login_hint/orgUUID params and the per-account browser profile.
+        # start() loads the row in a worker thread: the constructor runs on
+        # the event loop (it creates asyncio objects), so it reads no DB.
         self._target_account: Optional[dict] = None
-        if target_account_id:
-            try:
-                self._target_account = db.get_account(target_account_id)
-            except Exception as e:
-                logger.debug(
-                    "Could not load re-auth target account %s: %s",
-                    target_account_id, e,
-                )
-                self._target_account = None
         self._browser_mode: Optional[str] = None
         self._browser_name: Optional[str] = None
         # Manual mode (remote dashboards): no local callback server, no local
@@ -355,6 +355,19 @@ class OAuthFlow:
             result["cc_flow_id"] = self._cc_flow_id
         return result
 
+    def _load_target_account(self) -> Optional[dict]:
+        """Read the re-auth target row, or None when it cannot be read."""
+        if not self._target_account_id:
+            return None
+        try:
+            return self.db.get_account(self._target_account_id)
+        except Exception as e:
+            logger.debug(
+                "Could not load re-auth target account %s: %s",
+                self._target_account_id, e,
+            )
+            return None
+
     async def start(self) -> dict:
         """Start the OAuth flow.
 
@@ -365,6 +378,8 @@ class OAuthFlow:
 
         Returns dict with flow_id, auth_url, and mode for the frontend.
         """
+        if self._target_account_id and self._target_account is None:
+            self._target_account = await asyncio.to_thread(self._load_target_account)
         self._verifier, challenge = generate_pkce()
         self._state = secrets.token_urlsafe(32)
 
@@ -427,8 +442,8 @@ class OAuthFlow:
             try:
                 from jacked.web.browser_launch import open_auth_url
 
-                launched = open_auth_url(
-                    self._auth_url, self._target_account, self.db
+                launched = await asyncio.to_thread(
+                    open_auth_url, self._auth_url, self._target_account, self.db
                 )
                 self._browser_mode = launched.mode
                 self._browser_name = launched.browser
@@ -477,8 +492,8 @@ class OAuthFlow:
         try:
             from jacked.web.browser_launch import open_auth_url
 
-            launched = open_auth_url(
-                self._auth_url, self._target_account, self.db
+            launched = await asyncio.to_thread(
+                open_auth_url, self._auth_url, self._target_account, self.db
             )
         except Exception as e:
             logger.warning("Could not re-open the OAuth browser: %s", e)
@@ -709,13 +724,21 @@ class OAuthFlow:
                 usage = {}
 
             # Step 5: Store in database (branches on purpose)
-            account = self._store_account(tokens, profile, usage)
+            def _store_and_decide() -> tuple[dict, bool]:
+                # The store and the activation decision are one thread hop,
+                # off the event loop. The cc lineage lock keeps the token
+                # module's dead-chain cleanup out of the store's
+                # read-check-write.
+                with CC_LINEAGE_WRITE_LOCK:
+                    account = self._store_account(tokens, profile, usage)
 
-            # Decide activation ONCE. An account becomes active only when there
-            # is no valid active account yet, or it already IS the active one
-            # (re-auth). Adding a background account must not steal the active
-            # selection from the account the user is currently on.
-            activate = self._should_become_active(account)
+                # Decide activation ONCE. An account becomes active only when there
+                # is no valid active account yet, or it already IS the active one
+                # (re-auth). Adding a background account must not steal the active
+                # selection from the account the user is currently on.
+                return account, self._should_become_active(account)
+
+            account, activate = await asyncio.to_thread(_store_and_decide)
 
             # Step 6: Write credentials to the live stores ONLY when this account
             # is (becoming) active. Otherwise adding an account would clobber the

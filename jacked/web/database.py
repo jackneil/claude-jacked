@@ -983,6 +983,20 @@ class Database:
             self._local.connection.close()
             self._local.connection = None
 
+    def detach_connection(self) -> sqlite3.Connection | None:
+        """Take the calling thread's connection away without closing it.
+
+        Connections are thread-local, so ``close()`` closes only the calling
+        thread's one. A caller that must close the connection of THIS thread
+        somewhere else (the service shutdown closes the event-loop thread's
+        connection in a worker, because the final WAL checkpoint is disk
+        I/O) detaches it here. Connections use ``check_same_thread=False``.
+        The next query on this thread opens a new connection.
+        """
+        conn = getattr(self._local, "connection", None)
+        self._local.connection = None
+        return conn
+
     # ==================================================================
     # Account CRUD
     # ==================================================================

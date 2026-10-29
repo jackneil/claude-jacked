@@ -1,5 +1,6 @@
 """API routes for auto-swap and window keeper settings."""
 
+import asyncio
 import logging
 import re as _re
 from typing import Optional
@@ -78,7 +79,7 @@ def _get_db(request: Request):
 
 
 @router.get("/swap-settings", response_model=SwapSettings)
-async def get_swap_settings(request: Request):
+def get_swap_settings(request: Request):
     """Get current auto-swap and window keeper settings."""
     db = _get_db(request)
     if db is None:
@@ -114,19 +115,23 @@ async def update_swap_settings(request: Request, body: SwapSettings):
     if db is None:
         return SwapSettings()
 
-    db.set_setting("auto_swap_enabled", str(body.auto_swap_enabled).lower())
-    db.set_setting("auto_swap_5h_warning", str(body.auto_swap_5h_warning))
-    db.set_setting("auto_swap_5h_critical", str(body.auto_swap_5h_critical))
-    db.set_setting("auto_swap_7d_threshold", str(body.auto_swap_7d_threshold))
-    db.set_setting("usage_check_interval", str(body.usage_check_interval))
-    db.set_setting("window_keeper_enabled", str(body.window_keeper_enabled).lower())
-    db.set_setting("window_keeper_active_start", body.window_keeper_active_start)
-    db.set_setting("window_keeper_active_end", body.window_keeper_active_end)
-    db.set_setting("window_keeper_prewake", body.window_keeper_prewake)
-    if body.auto_swap_paused_until:
-        db.set_setting("auto_swap_paused_until", body.auto_swap_paused_until)
-    else:
-        db.set_setting("auto_swap_paused_until", "")
+    def _write():
+        db.set_setting("auto_swap_enabled", str(body.auto_swap_enabled).lower())
+        db.set_setting("auto_swap_5h_warning", str(body.auto_swap_5h_warning))
+        db.set_setting("auto_swap_5h_critical", str(body.auto_swap_5h_critical))
+        db.set_setting("auto_swap_7d_threshold", str(body.auto_swap_7d_threshold))
+        db.set_setting("usage_check_interval", str(body.usage_check_interval))
+        db.set_setting("window_keeper_enabled", str(body.window_keeper_enabled).lower())
+        db.set_setting("window_keeper_active_start", body.window_keeper_active_start)
+        db.set_setting("window_keeper_active_end", body.window_keeper_active_end)
+        db.set_setting("window_keeper_prewake", body.window_keeper_prewake)
+        if body.auto_swap_paused_until:
+            db.set_setting("auto_swap_paused_until", body.auto_swap_paused_until)
+        else:
+            db.set_setting("auto_swap_paused_until", "")
+
+    # The writes run in a worker; the asyncio.Event below is set on the loop.
+    await asyncio.to_thread(_write)
 
     # Wake the sweep loop immediately so changes take effect now
     from jacked.api.usage_monitor import _sweep_wake
@@ -136,7 +141,7 @@ async def update_swap_settings(request: Request, body: SwapSettings):
 
 
 @router.post("/swap-pause")
-async def pause_auto_swap(request: Request, minutes: int = Query(default=60, ge=1, le=1440)):
+def pause_auto_swap(request: Request, minutes: int = Query(default=60, ge=1, le=1440)):
     """Pause auto-swap for the specified number of minutes."""
     db = _get_db(request)
     if db is None:
@@ -148,7 +153,7 @@ async def pause_auto_swap(request: Request, minutes: int = Query(default=60, ge=
 
 
 @router.post("/swap-resume")
-async def resume_auto_swap(request: Request):
+def resume_auto_swap(request: Request):
     """Resume auto-swap immediately (clear the pause)."""
     db = _get_db(request)
     if db is None:
@@ -158,7 +163,7 @@ async def resume_auto_swap(request: Request):
 
 
 @router.get("/swap-log")
-async def get_swap_log(request: Request, limit: int = Query(default=50, ge=1, le=500)):
+def get_swap_log(request: Request, limit: int = Query(default=50, ge=1, le=500)):
     """Get recent swap events (with status/residency) plus trailing-24h committed count."""
     db = _get_db(request)
     if db is None:
@@ -170,7 +175,7 @@ async def get_swap_log(request: Request, limit: int = Query(default=50, ge=1, le
 
 
 @router.get("/decision-log")
-async def get_decision_log(
+def get_decision_log(
     request: Request,
     limit: int = Query(default=100, ge=1, le=1000),
     action: list[str] = Query(default=[]),

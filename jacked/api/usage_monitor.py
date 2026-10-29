@@ -406,17 +406,37 @@ def _trigger_for_reason(reason: str | None) -> str:
 # -----------------------------------------------------------------------
 
 
+def _poll_interval_inputs(active_id: int | None, db) -> tuple | None:
+    """The DB reads behind ``_compute_poll_interval``: (account row,
+    critical_5h). Sync, so the poll loop runs it off the event loop. None
+    when there is nothing to read or a read fails (the interval falls back).
+    """
+    if active_id is None or db is None:
+        return None
+    try:
+        return (
+            db.get_account(active_id),
+            _setting_float(db, "auto_swap_5h_critical", 90),
+        )
+    except Exception:
+        return None
+
+
 def _compute_poll_interval(
     active_id: int | None,
-    db,
+    inputs: tuple | None,
     burn_rates: dict,
 ) -> tuple[float, str]:
     """Compute the adaptive poll interval and urgency tier.
 
+    ``inputs`` is what ``_poll_interval_inputs`` read from the DB. This part
+    stays on the event loop: it writes the per-account usage state that the
+    fetch coroutines share.
+
     Returns (interval_seconds, tier_name). Falls back to (60, "unknown")
     on any error.
     """
-    if active_id is None or db is None:
+    if active_id is None or inputs is None:
         return 60.0, "unknown"
     try:
         from jacked.web.auth import (
@@ -425,14 +445,14 @@ def _compute_poll_interval(
             _TIER_INTERVALS,
         )
 
-        acct = db.get_account(active_id)
+        acct, critical_5h = inputs
         br = burn_rates.get(active_id)
         state = _get_usage_state(active_id)
         tier, base = compute_urgency_tier(
             usage_5h=acct.get("cached_usage_5h") if acct else None,
             usage_7d=acct.get("cached_usage_7d") if acct else None,
             burn_rate_5h=br.rate_5h_per_min if br else 0.0,
-            critical_5h=_setting_float(db, "auto_swap_5h_critical", 90),
+            critical_5h=critical_5h,
         )
         # Override: force idle if stuck in 429 cycle — stale data makes
         # urgency tiers unreliable, and polling faster is pointless.
@@ -606,7 +626,7 @@ async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> lis
     if fetched:
         logger.debug("Candidate usage: refreshed %d stale accounts", fetched)
 
-    return db.list_accounts(include_inactive=False)
+    return await asyncio.to_thread(db.list_accounts, include_inactive=False)
 
 
 async def _drain_advisor_tick(
@@ -810,7 +830,8 @@ async def _execute_swap(
     # not safe for a background mutation.
     transaction_engine = transaction_engine or _certified_auto_swap_engine(db)
     if transaction_engine is None:
-        db.record_swap(
+        await asyncio.to_thread(
+            db.record_swap,
             from_account_id=active_acct_id,
             to_account_id=target["id"],
             reason=reason,
@@ -855,7 +876,7 @@ async def _execute_swap(
     }
     if credential_ok:
         try:
-            db.mark_global_sessions_pending()
+            await asyncio.to_thread(db.mark_global_sessions_pending)
         except Exception:
             logger.exception("Failed to mark global sessions pending after auto-swap")
 
@@ -952,33 +973,48 @@ async def active_account_poll_loop(app):
                 continue
 
             # -- Settings ------------------------------------------------
-            auto_swap_enabled = _setting_bool(db, "auto_swap_enabled", False)
-            if not auto_swap_enabled:
+            def _read_tick_settings():
+                """One thread hop for the tick's settings reads (they ran back
+                to back on the loop). None when auto-swap is off or paused."""
+                auto_swap_enabled = _setting_bool(db, "auto_swap_enabled", False)
+                if not auto_swap_enabled:
+                    return None
+
+                # Check pause
+                paused_until_str = _setting_str(db, "auto_swap_paused_until", "")
+                if paused_until_str:
+                    try:
+                        paused_until = datetime.fromisoformat(
+                            paused_until_str.replace("Z", "+00:00"),
+                        )
+                        if paused_until > datetime.now(timezone.utc):
+                            logger.info("Auto-swap paused until %s", paused_until_str)
+                            return None
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            "Ignoring unparseable pause timestamp: %r",
+                            paused_until_str,
+                        )
+
+                return (
+                    _setting_float(db, "auto_swap_5h_critical", 90),
+                    _setting_float(db, "auto_swap_5h_warning", 80),
+                    _setting_float(db, "usage_check_interval", 300),
+                    _setting_str(db, "window_keeper_active_start", "06:00"),
+                    _setting_str(db, "window_keeper_active_end", "23:00"),
+                )
+
+            tick_settings = await asyncio.to_thread(_read_tick_settings)
+            if tick_settings is None:
                 await asyncio.sleep(60)
                 continue
-
-            # Check pause
-            paused_until_str = _setting_str(db, "auto_swap_paused_until", "")
-            if paused_until_str:
-                try:
-                    paused_until = datetime.fromisoformat(
-                        paused_until_str.replace("Z", "+00:00"),
-                    )
-                    if paused_until > datetime.now(timezone.utc):
-                        logger.info("Auto-swap paused until %s", paused_until_str)
-                        await asyncio.sleep(60)
-                        continue
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Ignoring unparseable pause timestamp: %r",
-                        paused_until_str,
-                    )
-
-            critical_5h = _setting_float(db, "auto_swap_5h_critical", 90)
-            warning_5h = _setting_float(db, "auto_swap_5h_warning", 80)
-            check_interval = _setting_float(db, "usage_check_interval", 300)
-            active_start = _setting_str(db, "window_keeper_active_start", "06:00")
-            active_end = _setting_str(db, "window_keeper_active_end", "23:00")
+            (
+                critical_5h,
+                warning_5h,
+                check_interval,
+                active_start,
+                active_end,
+            ) = tick_settings
 
             _decision_action = "stay"
             _decision_trigger = "tick"
@@ -1022,7 +1058,9 @@ async def active_account_poll_loop(app):
                 from jacked.web.auth import fetch_usage as _prime_fetch
 
                 logger.info("Auto-swap: priming usage data for all accounts")
-                all_accts = db.list_accounts(include_inactive=False)
+                all_accts = await asyncio.to_thread(
+                    db.list_accounts, include_inactive=False
+                )
                 primed = 0
                 attempted = 0
                 for a in all_accts:
@@ -1066,7 +1104,15 @@ async def active_account_poll_loop(app):
                 )
 
             # -- Read active account data from DB ------------------------
-            accounts = db.list_accounts(include_inactive=False)
+            # One thread hop: the account list and the poll-interval reads
+            # ran back to back on the loop.
+            def _read_tick_accounts():
+                return (
+                    db.list_accounts(include_inactive=False),
+                    _poll_interval_inputs(active_acct_id, db),
+                )
+
+            accounts, _interval_inputs = await asyncio.to_thread(_read_tick_accounts)
             active_acct = None
             for acct in accounts:
                 if acct["id"] == active_acct_id:
@@ -1086,7 +1132,7 @@ async def active_account_poll_loop(app):
             # and can count down accurately instead of guessing.
             _poll_interval, _poll_tier = _compute_poll_interval(
                 active_acct_id,
-                db,
+                _interval_inputs,
                 _burn_rates,
             )
             _poll_interval = _clamp_poll_interval(
@@ -1710,7 +1756,8 @@ async def active_account_poll_loop(app):
                         < _SWAP_COOLDOWN_SECONDS,
                         decision=_decision_action,
                     )
-                    decision_id = db.record_decision(
+                    decision_id = await asyncio.to_thread(
+                        db.record_decision,
                         account_id=active_acct_id,
                         action=_decision_action,
                         trigger=_decision_trigger,
@@ -1745,7 +1792,7 @@ async def active_account_poll_loop(app):
             _ticks_since_prune += 1
             if _ticks_since_prune >= 500 or random.random() < 0.01:
                 try:
-                    db.prune_decision_log()
+                    await asyncio.to_thread(db.prune_decision_log)
                     _ticks_since_prune = 0
                 except Exception:
                     logger.warning("Failed to prune decision log", exc_info=True)
@@ -1910,7 +1957,8 @@ async def all_accounts_refresh_loop(app):
 
             active_id = getattr(app.state, "active_poll_account_id", None)
             refreshed = 0
-            for acct in db.list_accounts(include_inactive=False):
+            accounts = await asyncio.to_thread(db.list_accounts, include_inactive=False)
+            for acct in accounts:
                 if acct.get("id") == active_id:
                     continue  # covered (more often) by active_account_poll_loop
                 is_codex = (acct.get("provider") or "claude") == "codex"
@@ -2212,7 +2260,7 @@ async def _keeper_auth_ladder(
                 await asyncio.to_thread(
                     reconcile_credentials_from_live_store, account_id, db
                 )
-                fresh = db.get_account(account_id) or {}
+                fresh = await asyncio.to_thread(db.get_account, account_id) or {}
                 candidate = fresh.get("cc_access_token")
             except Exception:
                 logger.exception(
@@ -2280,7 +2328,7 @@ async def _keeper_auth_ladder(
         if not out.last.is_auth_failure:
             return out
 
-    row = db.get_account(account_id) or acct
+    row = await asyncio.to_thread(db.get_account, account_id) or acct
     primary = row.get("access_token")
     if primary and primary not in tried:
         tried.add(primary)
@@ -2327,7 +2375,9 @@ async def _keeper_record_success(
     cache_fields = _ping_window_cache_fields(result)
     if cache_fields:
         try:
-            db.update_account_usage_cache(account_id, **cache_fields)
+            await asyncio.to_thread(
+                db.update_account_usage_cache, account_id, **cache_fields
+            )
         except Exception:
             logger.warning(
                 "Window keeper: could not store the ping's window for account %d",
@@ -2346,7 +2396,7 @@ async def _keeper_record_success(
             "Full sweep: fetch_usage for account %d exceeded 10s — moving on",
             account_id,
         )
-    fresh = db.get_account(account_id) or {}
+    fresh = await asyncio.to_thread(db.get_account, account_id) or {}
     window_open = not wk.needs_ping(fresh.get("cached_5h_resets_at"))
     # The row may hold a rotated token now: key the state on the CURRENT
     # candidate set so a persisted backoff survives the next sweep's check.
@@ -2372,10 +2422,10 @@ async def _keeper_record_success(
         fields["next_attempt_at"] = _arm_ping_backoff(
             account_id, fresh_fp, check_interval, now
         )
-    _write_keeper_state(db, account_id, **fields)
+    await asyncio.to_thread(_write_keeper_state, db, account_id, **fields)
 
 
-def _keeper_record_failure(
+async def _keeper_record_failure(
     db,
     acct: dict,
     state: dict,
@@ -2395,6 +2445,9 @@ def _keeper_record_failure(
     immediate retry instead of a latch, while a token the keeper itself
     rotated and then saw rejected is tried and does latch (otherwise every
     sweep would rotate once more: credential churn).
+
+    Async so the DB read and write run off the event loop while every
+    ``_ping_backoff`` change stays on it.
     """
     account_id = acct["id"]
     tried = tried or set()
@@ -2409,7 +2462,7 @@ def _keeper_record_failure(
     auth_failures = int(state.get("consecutive_auth_failures") or 0)
     if result.is_auth_failure:
         auth_failures += 1
-        fresh = db.get_account(account_id) or acct
+        fresh = await asyncio.to_thread(db.get_account, account_id) or acct
         fresh_cc, fresh_primary = _keeper_candidates(fresh)
         fresh_fp = _candidate_fingerprint(fresh_cc, fresh_primary)
         base["token_fp"] = fresh_fp
@@ -2424,7 +2477,8 @@ def _keeper_record_failure(
                 account_id,
             )
             _ping_backoff.pop(account_id, None)
-            _write_keeper_state(
+            await asyncio.to_thread(
+                _write_keeper_state,
                 db,
                 account_id,
                 last_status="auth_failed",
@@ -2444,7 +2498,8 @@ def _keeper_record_failure(
                 account_id,
                 ladder.pending_reason or "pending",
             )
-            _write_keeper_state(
+            await asyncio.to_thread(
+                _write_keeper_state,
                 db,
                 account_id,
                 last_status="auth_failed",
@@ -2462,7 +2517,8 @@ def _keeper_record_failure(
             result.status,
             result.error_type,
         )
-        _write_keeper_state(
+        await asyncio.to_thread(
+            _write_keeper_state,
             db,
             account_id,
             last_status="needs_reauth",
@@ -2494,8 +2550,13 @@ def _keeper_record_failure(
             entry["token_fp"] = fp
             entry["skip_until"] = retry_at
         base["error_type"] = result.error_type or "rate_limited"
-        _write_keeper_state(
-            db, account_id, last_status="rate_limited", next_attempt_at=retry_at, **base
+        await asyncio.to_thread(
+            _write_keeper_state,
+            db,
+            account_id,
+            last_status="rate_limited",
+            next_attempt_at=retry_at,
+            **base,
         )
         return
 
@@ -2505,7 +2566,8 @@ def _keeper_record_failure(
         entry = _ping_backoff.get(account_id)
         if entry is not None:
             entry["skip_until"] = 0.0
-        _write_keeper_state(
+        await asyncio.to_thread(
+            _write_keeper_state,
             db,
             account_id,
             last_status="transport",
@@ -2515,8 +2577,13 @@ def _keeper_record_failure(
         return
 
     skip_until = _arm_ping_backoff(account_id, fp, check_interval, now)
-    _write_keeper_state(
-        db, account_id, last_status="error", next_attempt_at=skip_until, **base
+    await asyncio.to_thread(
+        _write_keeper_state,
+        db,
+        account_id,
+        last_status="error",
+        next_attempt_at=skip_until,
+        **base,
     )
 
 
@@ -2528,22 +2595,24 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
     state = _keeper_state_of(acct)
 
     if (acct.get("provider") or "claude") == "codex":
-        _note_keeper_skip(db, acct, state, "codex_no_keeper")
+        await asyncio.to_thread(_note_keeper_skip, db, acct, state, "codex_no_keeper")
         return "skipped"
 
     needs_5h, needs_7d = _keeper_window_needed(acct, state)
     if not needs_5h and not needs_7d:
         if state.get("skip_reason"):
-            _note_keeper_skip(db, acct, state, None)
+            await asyncio.to_thread(_note_keeper_skip, db, acct, state, None)
         return "skipped"
     if not acct.get("auto_swap_enabled"):
-        _note_keeper_skip(db, acct, state, "auto_swap_disabled")
+        await asyncio.to_thread(
+            _note_keeper_skip, db, acct, state, "auto_swap_disabled"
+        )
         return "skipped"
 
     cc_token, primary_token = _keeper_candidates(acct)
     first_token = cc_token or primary_token
     if not first_token:
-        _note_keeper_skip(db, acct, state, "no_token")
+        await asyncio.to_thread(_note_keeper_skip, db, acct, state, "no_token")
         return "skipped"
     first_is_cc = bool(cc_token)
     # One fingerprint for the whole candidate set: a change to EITHER chain
@@ -2557,7 +2626,7 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
             account_id,
         )
         if state.get("skip_reason"):
-            _note_keeper_skip(db, acct, state, None)
+            await asyncio.to_thread(_note_keeper_skip, db, acct, state, None)
         return "skipped"
 
     entry = _ping_backoff.get(account_id)
@@ -2582,7 +2651,9 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
             account_id,
             skip_until - now,
         )
-        _note_keeper_skip(db, acct, state, "backoff", next_attempt_at=skip_until)
+        await asyncio.to_thread(
+            _note_keeper_skip, db, acct, state, "backoff", next_attempt_at=skip_until
+        )
         return "skipped"
 
     logger.info(
@@ -2606,7 +2677,7 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
     if good_token is not None:
         await _keeper_record_success(db, acct, good_token, result, check_interval, now)
         return "pinged"
-    _keeper_record_failure(
+    await _keeper_record_failure(
         db, acct, state, result, ladder, fp, check_interval, now, tried=tried
     )
     return "failed"
@@ -2616,41 +2687,50 @@ async def _run_window_keeper(db, check_interval: float) -> int:
     """One keeper pass over every enabled account. Returns windows pinged."""
     from jacked.web import window_keeper as wk
 
-    accounts = db.list_accounts(include_inactive=False)
-    wk_start = _setting_str(db, "window_keeper_active_start", "06:00")
-    wk_end = _setting_str(db, "window_keeper_active_end", "23:00")
-    wk_prewake = _setting_str(db, "window_keeper_prewake", "04:00")
+    def _read_pass():
+        """One thread hop for the pass's reads (they ran back to back on the
+        loop) and the plain time math between them."""
+        accounts = db.list_accounts(include_inactive=False)
+        wk_start = _setting_str(db, "window_keeper_active_start", "06:00")
+        wk_end = _setting_str(db, "window_keeper_active_end", "23:00")
+        wk_prewake = _setting_str(db, "window_keeper_prewake", "04:00")
 
-    # Local time intentional: users configure active hours in their local
-    # timezone (e.g. "06:00" means local 6am).
-    now_local = datetime.now()
-    active = wk.is_active_hours(now_local, start=wk_start, end=wk_end)
-    prewake = False
-    if not active:
-        prewake = wk.prewake_due(
-            now_local,
-            prewake=wk_prewake,
-            active_start=wk_start,
-            active_end=wk_end,
-            done_date=db.get_setting(_PREWAKE_DONE_KEY),
-        )
-        if prewake:
-            logger.info(
-                "Window keeper: pre-wake pass for %s", now_local.date().isoformat()
+        # Local time intentional: users configure active hours in their local
+        # timezone (e.g. "06:00" means local 6am).
+        now_local = datetime.now()
+        active = wk.is_active_hours(now_local, start=wk_start, end=wk_end)
+        prewake = False
+        if not active:
+            prewake = wk.prewake_due(
+                now_local,
+                prewake=wk_prewake,
+                active_start=wk_start,
+                active_end=wk_end,
+                done_date=db.get_setting(_PREWAKE_DONE_KEY),
             )
+        return accounts, wk_start, now_local, active, prewake
+
+    accounts, wk_start, now_local, active, prewake = await asyncio.to_thread(_read_pass)
+    if prewake:
+        logger.info(
+            "Window keeper: pre-wake pass for %s", now_local.date().isoformat()
+        )
     next_start = None if (active or prewake) else _next_active_start_epoch(now_local, wk_start)
+
+    def _note_outside_hours(acct: dict) -> None:
+        _note_keeper_skip(
+            db,
+            acct,
+            _keeper_state_of(acct),
+            "outside_active_hours",
+            paused_until=next_start,
+        )
 
     pinged = 0
     for acct in accounts:
         try:
             if not (active or prewake):
-                _note_keeper_skip(
-                    db,
-                    acct,
-                    _keeper_state_of(acct),
-                    "outside_active_hours",
-                    paused_until=next_start,
-                )
+                await asyncio.to_thread(_note_outside_hours, acct)
                 continue
             outcome = await _keeper_process_account(db, acct, check_interval)
             if outcome == "pinged":
@@ -2669,7 +2749,9 @@ async def _run_window_keeper(db, check_interval: float) -> int:
         # Marked only after the whole pass: a pass cut short by a restart
         # runs again on the next sweep (accounts already opened are skipped
         # by their future reset).
-        db.set_setting(_PREWAKE_DONE_KEY, now_local.date().isoformat())
+        await asyncio.to_thread(
+            db.set_setting, _PREWAKE_DONE_KEY, now_local.date().isoformat()
+        )
     return pinged
 
 
@@ -2736,12 +2818,19 @@ async def full_sweep_loop(app):
                 await asyncio.sleep(60)
                 continue
 
-            window_keeper_enabled = _setting_bool(db, "window_keeper_enabled", False)
-            check_interval = _setting_float(db, "usage_check_interval", 300)
+            def _read_sweep_settings():
+                return (
+                    _setting_bool(db, "window_keeper_enabled", False),
+                    _setting_float(db, "usage_check_interval", 300),
+                )
+
+            window_keeper_enabled, check_interval = await asyncio.to_thread(
+                _read_sweep_settings
+            )
             deadline = time.time() + check_interval
 
             if not window_keeper_enabled:
-                _note_keeper_disabled(db)
+                await asyncio.to_thread(_note_keeper_disabled, db)
             else:
                 sweep_pinged = await _run_window_keeper(db, check_interval)
                 logger.info(
