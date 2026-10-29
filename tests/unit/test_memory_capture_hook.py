@@ -528,6 +528,9 @@ def test_capture_is_a_no_op_inside_a_triage_session(env, monkeypatch):
     """Backstop for a hook that still fires (a managed policy can force hooks):
     a capture that runs inside a triage child returns at once, with no claude
     call and no retry-queue drain."""
+    # An enabled vault, so the only thing that can stop the capture is the
+    # triage marker (a disabled vault returns earlier and proves nothing).
+    _init_enabled_vault(env)
     monkeypatch.setenv(capture.TRIAGE_ENV, "1")
     calls = []
     monkeypatch.setattr(capture, "call_claude", lambda *a, **k: calls.append(a) or ("{}", None))
@@ -930,3 +933,17 @@ def test_call_claude_reads_the_api_error_from_the_json_envelope(env):
         text, cause = capture.call_claude("prompt", "haiku", schema=capture.TRIAGE_SCHEMA)
     assert text is None
     assert cause == "claude exited 1: API Error: 400 tools.1.custom.input_schema.type: Field required"
+
+
+@pytest.mark.parametrize("subtype", ["error_during_execution", "error_max_structured_output_retries"])
+def test_call_claude_reads_terminal_errors_from_the_envelope(env, subtype):
+    """Terminal CLI failures carry the message in ``errors`` (a list), not in
+    ``result``. The cause names the first one."""
+    class _P:
+        returncode = 1
+        stdout = json.dumps({"is_error": True, "subtype": subtype,
+                             "errors": ["", "queryParams builder failed: bad input"]})
+        stderr = ""
+    with patch("subprocess.run", return_value=_P()):
+        _text, cause = capture.call_claude("prompt", "haiku", schema=capture.TRIAGE_SCHEMA)
+    assert cause == "claude exited 1: queryParams builder failed: bad input"

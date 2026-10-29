@@ -514,11 +514,15 @@ def call_claude(
 def _envelope_error(stdout: str | None) -> str:
     """The error text of a ``--output-format json`` envelope, else ''.
 
-    With JSON output the CLI reports an API error on stdout (``is_error`` true,
-    the message in ``result``) and leaves stderr empty.
+    With JSON output the CLI reports a failure on stdout and leaves stderr
+    empty: an API error puts its message in ``result``; a terminal failure
+    (``error_during_execution``, ``error_max_structured_output_retries``) puts
+    a list of messages in ``errors``.
 
     >>> _envelope_error('{"is_error": true, "result": "API Error: 400 bad schema"}')
     'API Error: 400 bad schema'
+    >>> _envelope_error('{"is_error": true, "errors": ["", "builder failed"]}')
+    'builder failed'
     >>> _envelope_error('{"is_error": false, "result": "fine"}')
     ''
     >>> _envelope_error("not json")
@@ -531,7 +535,13 @@ def _envelope_error(stdout: str | None) -> str:
     if not isinstance(obj, dict) or obj.get("is_error") is not True:
         return ""
     result = obj.get("result")
-    return _first_line(result) if isinstance(result, str) else ""
+    if isinstance(result, str) and result.strip():
+        return _first_line(result)
+    for err in obj.get("errors") or []:
+        line = _first_line(err) if isinstance(err, str) else ""
+        if line:
+            return line
+    return ""
 
 
 def _first_line(text: str | None) -> str:

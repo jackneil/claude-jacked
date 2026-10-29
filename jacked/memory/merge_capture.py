@@ -170,7 +170,18 @@ def _capture_one_merge(
             "memory merge-capture: distillation failed (%s); using the deterministic fallback note",
             cause,
         )
-    parsed = _note_from_result(capture.parse_triage(text))
+    raw = capture.parse_triage(text)
+    parsed = _note_from_result(raw)
+    if parsed is None and cause is None:
+        # The CLI succeeded and the reply passed the schema, but it is neither a
+        # skip nor a full note (every field is optional in the schema). Name the
+        # keys it carried, never the values.
+        keys = sorted(raw) if isinstance(raw, dict) else None
+        logger.warning(
+            "memory merge-capture: distillation returned no usable note (keys=%s); "
+            "using the deterministic fallback note",
+            keys,
+        )
 
     if parsed is None:
         # Distillation failed -> deterministic fallback so the merge is not lost.

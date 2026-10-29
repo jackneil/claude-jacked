@@ -617,3 +617,26 @@ def test_install_empty_jacked_bin_when_unresolved(env, monkeypatch):
     content = (repo / ".git" / "hooks" / "post-merge").read_text(encoding="utf-8")
     assert 'JACKED_BIN=""' in content
     assert "command -v jacked" in content  # PATH fallback still present
+
+
+@pytest.mark.parametrize("raw", ['{}', '{"skip": false}', '{"title": "X"}'])
+def test_capture_merge_names_a_schema_valid_but_unusable_reply(env, no_gh, monkeypatch, caplog, raw):
+    """The schema keeps every field optional (the API needs an object root, so
+    the skip-or-note choice cannot live in the schema). A reply that passes the
+    schema but is neither a skip nor a full note falls back, and the fallback
+    is logged with the keys it got, never silently."""
+    _init_vault(env)
+    repo = _merge_repo(env.tmp / "widget")
+    _do_merge(repo, message="Merge branch 'feature/x'")
+    _mock_distill(monkeypatch, raw)
+
+    with caplog.at_level("WARNING", logger="jacked.memory"):
+        merge_capture.capture_merge(str(repo))
+
+    notes = _decision_notes(env.vault)
+    assert len(notes) == 1
+    meta, _ = vault_mod.read_note(notes[0])
+    assert "auto-fallback" in meta["tags"]
+    warned = [r.getMessage() for r in caplog.records if "no usable note" in r.getMessage()]
+    assert len(warned) == 1, caplog.text
+    assert "keys=" in warned[0]
