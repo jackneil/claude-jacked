@@ -361,3 +361,33 @@ def test_a_rotation_never_overwrites_a_reauth_that_landed_during_the_exchange(tm
     row = db.get_account(acct["id"])
     assert (row["access_token"], row["refresh_token"]) == ("reauth-at", "reauth-rt")
     assert result.success and result.access_token == "reauth-at"
+
+
+def test_a_reauth_between_the_breaker_and_the_error_write_keeps_a_clean_row(tmp_path, monkeypatch):
+    """#162 review wave 2: after the guarded breaker write, a re-auth can
+    replace the credentials before the error is recorded. The error write
+    is conditioned on the same lineage, so the new login stays clean."""
+    from jacked.web import auth as auth_mod
+    from jacked.web.database import Database
+
+    db = Database(str(tmp_path / "jacked.db"))
+    acct = db.create_account("g@test.com", "old-at", 1)
+    db.update_account(acct["id"], refresh_token="old-rt")
+    real_record = db.record_account_error
+
+    def record_after_reauth(account_id, message, increment_failures=True, expected=None):
+        db.update_account(account_id, access_token="new-at", refresh_token="new-rt",
+                          last_error=None)
+        return real_record(account_id, message, increment_failures, expected)
+
+    monkeypatch.setattr(db, "record_account_error", record_after_reauth)
+
+    async def exchange(refresh_token, timeout=30.0):
+        return auth_mod.TokenExchangeResult(success=False, error="invalid_grant")
+
+    monkeypatch.setattr(auth_mod, "_exchange_refresh_token", exchange)
+    asyncio.run(auth_mod._refresh_token_flow(acct["id"], db, auth_mod.RefreshMode.PRIMARY))
+
+    row = db.get_account(acct["id"])
+    assert row["refresh_token"] == "new-rt"
+    assert row["last_error"] is None

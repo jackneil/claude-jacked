@@ -718,7 +718,12 @@ async def _run_chain_flow(
                     if not _write_lineage(**_breaker_updates("primary", "invalid_grant")):
                         return False
                     if mode == RefreshMode.PRIMARY:
-                        db.record_account_error(account_id, "Refresh token consumed (will retry)")
+                        # Same condition: a re-auth that lands between the two
+                        # writes must not inherit the old token's error.
+                        db.record_account_error(
+                            account_id, "Refresh token consumed (will retry)",
+                            expected={refresh_col: refresh_token},
+                        )
                     return True
 
                 if not await asyncio.to_thread(_record_primary_invalid_grant):
@@ -1307,10 +1312,13 @@ async def refresh_account_token_result(
     if result.status_code in (401, 403):
         prev_failure = account.get("refresh_failure_type")
         if prev_failure in ("http_401", "http_403"):
-            # Second consecutive auth failure — mark invalid
+            # Second consecutive auth failure — mark invalid, but only while
+            # the row still holds the refused lineage: a re-auth that landed
+            # meanwhile is a new, unrefused login.
             await asyncio.to_thread(
-                db.update_account,
+                db.update_account_if_unchanged,
                 account_id,
+                {"refresh_token": account.get("refresh_token")},
                 validation_status="invalid",
                 last_error=f"Token revoked (HTTP {result.status_code})",
                 last_error_at=datetime.now(timezone.utc).isoformat(),
@@ -1321,7 +1329,8 @@ async def refresh_account_token_result(
         await asyncio.to_thread(
             db.record_account_error,
             account_id, "Network error during token refresh",
-            increment_failures=False)
+            increment_failures=False,
+            expected={"refresh_token": account.get("refresh_token")})
 
     return RefreshOutcome.FAILED
 
@@ -1671,10 +1680,16 @@ async def fetch_usage(
                                     account_id,
                                 )
 
-                    # Refresh and live import both failed or already retried — mark invalid
+                    # Refresh and live import both failed or already retried — mark
+                    # invalid, but only while the row still holds the refused
+                    # token: a re-auth that landed meanwhile is a new login.
                     error_msg = f"Usage fetch failed (HTTP {resp.status_code}). Token refresh failed."
-                    db.update_account(
+                    refused_col = (
+                        "cc_access_token" if token_chain(account, token) == "cc" else "access_token"
+                    )
+                    db.update_account_if_unchanged(
                         account_id,
+                        {refused_col: token if token is not None else account.get("access_token")},
                         validation_status="invalid",
                         last_error=error_msg,
                         last_error_at=datetime.now(timezone.utc).isoformat(),

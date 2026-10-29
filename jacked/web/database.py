@@ -1717,33 +1717,38 @@ class Database:
         account_id: int,
         error_message: str,
         increment_failures: bool = True,
+        expected: Optional[Mapping[str, Any]] = None,
     ) -> bool:
         """Record an error for an account.
+
+        ``expected`` makes it a compare-and-set (as in
+        ``update_account_if_unchanged``): the error is recorded only while
+        every listed column still holds its value, so a failure of one token
+        is never written onto a row that a re-auth has moved on from.
 
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@t.com", "tok", 9999999999)
         >>> db.record_account_error(acct["id"], "test error")
         True
+        >>> db.record_account_error(acct["id"], "stale", expected={"access_token": "other"})
+        False
         """
+        expected = dict(expected or {})
+        comparable = self._ACCOUNT_UPDATE_COLS | {"updated_at", "keeper_state"}
+        invalid = set(expected) - comparable
+        if invalid:
+            raise ValueError(f"Invalid columns for account update: {invalid}")
         now = datetime.now(timezone.utc).isoformat()
+        failures = ", consecutive_failures = consecutive_failures + 1" if increment_failures else ""
+        where = "".join(f" AND {k} IS ?" for k in expected)
         with self._writer() as conn:
-            if increment_failures:
-                cursor = conn.execute(
-                    """UPDATE accounts SET
-                        last_error = ?, last_error_at = ?,
-                        consecutive_failures = consecutive_failures + 1,
-                        updated_at = ?
-                       WHERE id = ?""",
-                    (error_message, now, now, account_id),
-                )
-            else:
-                cursor = conn.execute(
-                    """UPDATE accounts SET
-                        last_error = ?, last_error_at = ?,
-                        updated_at = ?
-                       WHERE id = ?""",
-                    (error_message, now, now, account_id),
-                )
+            cursor = conn.execute(
+                f"""UPDATE accounts SET
+                    last_error = ?, last_error_at = ?{failures},
+                    updated_at = ?
+                   WHERE id = ?{where}""",
+                (error_message, now, now, account_id, *expected.values()),
+            )
             return cursor.rowcount > 0
 
     def clear_account_errors(self, account_id: int) -> bool:
