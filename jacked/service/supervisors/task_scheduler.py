@@ -23,12 +23,16 @@ from jacked.service.supervisors._artifacts import (
     snapshot_artifact,
 )
 from jacked.service.supervisors._helpers import atomic_write
+from jacked.service.supervisors._task_xml import first_line, query_task_xml
 
 logger = logging.getLogger(__name__)
 
 _RUN_OPTIONS = {
     "capture_output": True,
     "text": True,
+    # schtasks writes its messages in the console code page; a byte that
+    # code page cannot decode must not turn a refusal into a crash.
+    "errors": "replace",
     "timeout": 15,
     "check": False,
 }
@@ -90,9 +94,8 @@ def _inspect_registered_task(
     request: _InstallRequest,
 ) -> bytes | None | SupervisorAction:
     try:
-        queried = request.run(
-            ["schtasks.exe", "/Query", "/TN", request.spec.service_id, "/XML"],
-            **_RUN_OPTIONS,
+        queried = query_task_xml(
+            request.run, request.spec.service_id, timeout=_RUN_OPTIONS["timeout"]
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return SupervisorAction(False, "install", type(exc).__name__)
@@ -102,9 +105,11 @@ def _inspect_registered_task(
         return SupervisorAction(
             False,
             "refused",
-            f"Task Scheduler inspection exit {queried.returncode}",
+            _step_reason("/Query", queried.returncode, queried.stderr),
         )
-    content = queried.stdout.encode("utf-8")
+    content = queried.xml
+    if content is None:
+        return SupervisorAction(False, "refused", "registered task XML is unreadable")
     marker = extract_marker(content, request.spec.supervisor)
     if marker is None or any(
         marker.get(key) != request.expected.marker[key]
@@ -171,18 +176,14 @@ def _activate_task(transition: _Transition) -> SupervisorAction:
             **_RUN_OPTIONS,
         )
         if created.returncode != 0:
-            return _failed_transition(
-                transition, f"supervisor exit {created.returncode}", True
-            )
+            return _failed_transition(transition, _step_failed("/Create", created), True)
         if transition.evidence.previous_task is not None:
             ended = request.run(
                 ["schtasks.exe", "/End", "/TN", request.spec.service_id],
                 **_RUN_OPTIONS,
             )
             if ended.returncode not in {0, 1}:
-                return _failed_transition(
-                    transition, f"supervisor exit {ended.returncode}", True
-                )
+                return _failed_transition(transition, _step_failed("/End", ended), True)
             transition = replace(transition, prior_running=ended.returncode == 0)
         started = request.run(
             ["schtasks.exe", "/Run", "/TN", request.spec.service_id],
@@ -191,13 +192,29 @@ def _activate_task(transition: _Transition) -> SupervisorAction:
     except (OSError, subprocess.SubprocessError) as exc:
         return _failed_transition(transition, type(exc).__name__, True)
     if started.returncode != 0:
-        return _failed_transition(
-            transition, f"supervisor exit {started.returncode}", True
-        )
+        return _failed_transition(transition, _step_failed("/Run", started), True)
     _remove_task_backup(transition.task_backup, transition.evidence.previous_task)
     return SupervisorAction(
         True, "install", f"activated {request.spec.generation[:12]}"
     )
+
+
+def _step_reason(step: str, returncode: int, stderr: str) -> str:
+    """``schtasks /Create exit 1: ERROR: ...``; schtasks messages carry no secrets.
+
+    >>> _step_reason("/Create", 1, "ERROR: The task XML is malformed.")
+    'schtasks /Create exit 1: ERROR: The task XML is malformed.'
+    >>> _step_reason("/Run", 2, "")
+    'schtasks /Run exit 2'
+    """
+    reason = f"schtasks {step} exit {returncode}"
+    return f"{reason}: {stderr}" if stderr else reason
+
+
+def _step_failed(step: str, result: Any) -> str:
+    reason = _step_reason(step, result.returncode, first_line(getattr(result, "stderr", None)))
+    logger.warning("Task Scheduler step failed: %s", reason)
+    return reason
 
 
 def task_action(content: bytes) -> tuple[str, str, str] | None:
@@ -304,14 +321,13 @@ def _restore_legacy_vbs(path: Path, backup: Path | None) -> bool:
 def _rollback_new_task(transition: _Transition) -> bool:
     request = transition.request
     try:
-        checked = request.run(
-            ["schtasks.exe", "/Query", "/TN", request.spec.service_id, "/XML"],
-            **_RUN_OPTIONS,
+        checked = query_task_xml(
+            request.run, request.spec.service_id, timeout=_RUN_OPTIONS["timeout"]
         )
         if checked.returncode in {1, 3}:
             return True
-        registered = checked.stdout.encode("utf-8")
-        if checked.returncode != 0 or (
+        registered = checked.xml
+        if checked.returncode != 0 or registered is None or (
             extract_marker(registered, request.spec.supervisor)
             != request.expected.marker
         ) or task_action(registered) != task_action(request.expected.content):

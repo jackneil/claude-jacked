@@ -59,13 +59,19 @@ def test_renderers_embed_exact_generation_and_clean_launch(kind, renderer, needl
     if kind is SupervisorKind.TASK_SCHEDULER:
         environment["JACKED_SERVICE_USER"] = "sid:S-1-5-21-123"
     artifact = renderer(spec, environment=environment)
-    assert spec.generation.encode() in artifact.content
-    assert needle in artifact.content
-    assert b"OPENAI_API_KEY" not in artifact.content
+    # A task definition is UTF-16 (#165i); compare the text, not raw bytes.
+    text = (
+        artifact.content.decode("utf-16")
+        if kind is SupervisorKind.TASK_SCHEDULER
+        else artifact.content.decode("utf-8")
+    )
+    assert spec.generation in text
+    assert needle.decode() in text
+    assert "OPENAI_API_KEY" not in text
     if kind is SupervisorKind.TASK_SCHEDULER:
-        assert b"ExecutionPolicy Bypass" in artifact.content
-        assert b"ExecutionPolicy AllSigned" not in artifact.content
-        assert b"windows/2004/02/mit/task" in artifact.content
+        assert "ExecutionPolicy Bypass" in text
+        assert "ExecutionPolicy AllSigned" not in text
+        assert "windows/2004/02/mit/task" in text
         root = ElementTree.fromstring(artifact.content)
         namespace = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
         assert (
@@ -313,3 +319,36 @@ def test_install_systemd_restores_old_generation_after_restart_failure(tmp_path)
     assert runner.call_args_list[4].args[0][-1] == "daemon-reload"
     assert runner.call_args_list[5].args[0][-2:] == ["enable", "jacked.service"]
     assert runner.call_args_list[6].args[0][-2:] == ["restart", "jacked.service"]
+
+
+@pytest.mark.parametrize("printed_as", ["utf-16-bom", "console-text"])
+def test_task_restart_recognizes_its_own_task_however_schtasks_prints_it(
+    tmp_path, printed_as
+):
+    """#165i: schtasks /Query /XML output declares UTF-16. Re-encoding it as
+    UTF-8 made the restart refuse its own task as "identity differs"."""
+    import codecs
+
+    from jacked.service.supervisors._task_xml import decode_task_xml
+
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.TASK_SCHEDULER
+    )
+    text = decode_task_xml(rendered.content)
+    printed = (
+        codecs.BOM_UTF16_LE + text.encode("utf-16-le")
+        if printed_as == "utf-16-bom"
+        else text.encode("utf-8")
+    )
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "/Query":
+            return SimpleNamespace(returncode=0, stdout=printed, stderr=b"")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    result = restart_owned_supervisor(spec, path, environment=environment, run=run)
+
+    assert result.ok is True, result.reason
+    assert calls[-1] == ["schtasks.exe", "/Run", "/TN", spec.service_id]

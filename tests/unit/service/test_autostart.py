@@ -115,3 +115,27 @@ def test_linux_unit_requires_manager_enabled_state(tmp_path):
         )
     assert disabled.state is AutostartState.OWNED_DISABLED
     assert enabled.state is AutostartState.OWNED_ENABLED
+
+
+def test_windows_owned_task_printed_as_utf16_is_enabled(tmp_path):
+    """#165i: the real query output declares UTF-16. A text-mode decode plus
+    a UTF-8 re-encode used to make our own task read as unowned."""
+    import codecs
+
+    from jacked.service.spec import SupervisorKind
+    from jacked.service.supervisors._task_xml import decode_task_xml
+    from tests.unit.service.supervisor_test_support import installed_artifact
+
+    _, _, rendered, _ = installed_artifact(tmp_path, SupervisorKind.TASK_SCHEDULER)
+    printed = codecs.BOM_UTF16_LE + decode_task_xml(rendered.content).encode("utf-16-le")
+    run = Mock(return_value=SimpleNamespace(returncode=0, stdout=printed, stderr=b""))
+
+    result = inspect_autostart(
+        platform="win32",
+        run=run,
+        task_path=tmp_path / "task.xml",
+        legacy_vbs_path=tmp_path / "missing.vbs",
+    )
+
+    assert result.state is AutostartState.OWNED_ENABLED
+    assert run.call_args.kwargs.get("text") is not True  # bytes, decoded by us

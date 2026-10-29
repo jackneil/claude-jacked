@@ -19,6 +19,7 @@ from ._artifacts import (
 )
 from ._transition import SupervisorTransitionLease, TransitionBusy
 from . import render_for_spec
+from ._task_xml import canonical_task_xml
 
 
 def uninstall_owned_supervisor(
@@ -72,7 +73,13 @@ def _uninstall_locked(
     )
     if marker is None:
         return _refused(artifact_path, "supervisor ownership marker is invalid")
-    common = {"capture_output": True, "text": True, "timeout": 15, "check": False}
+    common = {
+        "capture_output": True,
+        "text": True,
+        "errors": "replace",
+        "timeout": 15,
+        "check": False,
+    }
     try:
         if spec.supervisor is SupervisorKind.LAUNCHD:
             action = _uninstall_launchd(
@@ -168,7 +175,8 @@ def _uninstall_task(spec, path, marker, run, common) -> SupervisorAction:
         return SupervisorAction(True, "uninstall", "Task Scheduler task was absent")
     if queried.returncode != 0:
         return _refused(path, f"Task Scheduler inspection exit {queried.returncode}")
-    registered = extract_marker(queried.stdout.encode("utf-8"), spec.supervisor)
+    # The task XML declares UTF-16 whatever the console wrote (#165i).
+    registered = extract_marker(canonical_task_xml(queried.stdout), spec.supervisor)
     if registered != marker:
         return _refused(path, "registered task identity is foreign")
     # /End returns 1 when no instance is running. Deletion is still required

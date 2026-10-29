@@ -16,6 +16,7 @@ from xml.etree import ElementTree
 from jacked.service import CLAUDE_DIR, LAUNCHD_LABEL
 from jacked.service.spec import SupervisorKind
 from jacked.service.supervisors import extract_marker
+from jacked.service.supervisors._task_xml import query_task_xml
 
 
 class AutostartState(str, Enum):
@@ -117,19 +118,16 @@ def _inspect_launchd(path: Path, run: Any) -> AutostartInspection:
 
 def _inspect_windows(path: Path, legacy: Path, run: Any) -> AutostartInspection:
     legacy_present = legacy.exists()
-    common = {"capture_output": True, "text": True, "timeout": 5, "check": False}
     try:
-        result = run(
-            ["schtasks.exe", "/Query", "/TN", LAUNCHD_LABEL, "/XML"], **common
-        )
+        result = query_task_xml(run, LAUNCHD_LABEL, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return AutostartInspection(AutostartState.UNKNOWN, "Task Scheduler unavailable")
     registered = result.returncode == 0
     if result.returncode not in {0, 1}:
         return AutostartInspection(AutostartState.UNKNOWN, "Task Scheduler indeterminate")
     marker = (
-        extract_marker(result.stdout.encode(), SupervisorKind.TASK_SCHEDULER)
-        if registered
+        extract_marker(result.xml, SupervisorKind.TASK_SCHEDULER)
+        if registered and result.xml is not None
         else None
     )
     if registered and not _owned(marker):
@@ -137,7 +135,7 @@ def _inspect_windows(path: Path, legacy: Path, run: Any) -> AutostartInspection:
     if registered and legacy_present:
         return AutostartInspection(AutostartState.DUPLICATE, "task and legacy VBS coexist")
     if registered:
-        enabled = _task_enabled(result.stdout)
+        enabled = _task_enabled(result.xml)
         return AutostartInspection(
             AutostartState.OWNED_ENABLED if enabled else AutostartState.OWNED_DISABLED,
             "registered task is disabled" if not enabled else "",
@@ -154,7 +152,7 @@ def _inspect_windows(path: Path, legacy: Path, run: Any) -> AutostartInspection:
     return AutostartInspection(AutostartState.ABSENT)
 
 
-def _task_enabled(content: str) -> bool:
+def _task_enabled(content: bytes) -> bool:
     """Treat any explicit disabled task or trigger flag as disabled."""
     try:
         root = ElementTree.fromstring(content)
