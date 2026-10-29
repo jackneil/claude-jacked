@@ -1018,7 +1018,7 @@ def _append_index_line(vault: Path, group: str, title: str, note_type: str, slug
     # Square brackets are dropped from the title: a title carrying its own
     # "](other.md)" would otherwise give the index line a second link, and the
     # recall gate judged the FIRST one (a spoofed, unreviewed note reached the
-    # brief). Recall also parses the structural link (recall._entry_link).
+    # brief). Recall also judges a line by ALL its links (recall._entry_links).
     safe_title = " ".join((title or "").replace("[", "").replace("]", "").split())
     # Plain hyphen separator: index lines get echoed verbatim by `memory search`,
     # making them user-facing CLI output (the no-em-dash rule applies).

@@ -592,8 +592,8 @@ def test_a_crafted_title_cannot_point_the_candidate_gate_at_another_file(env):
 
 def test_a_legacy_spoofed_index_line_is_judged_by_its_real_link(env):
     """An index line written before titles were neutralized can still hold a
-    spoofed link. Recall must check the line's own structural link (the last
-    ``](type/slug.md) - ``), not the first ``](...md)`` in the text."""
+    spoofed link. Recall must judge every link on the line, the line's own
+    note included, not only the first ``](...md)`` in the text."""
     _seed_group(env)
     res = vault_mod.add_note(
         env.vault, env.home, note_type="decision", title="Legacy candidate",
@@ -604,7 +604,7 @@ def test_a_legacy_spoofed_index_line_is_judged_by_its_real_link(env):
     lines = index.read_text(encoding="utf-8").splitlines(keepends=True)
     spoofed = [
         line.replace("[Legacy candidate]", "[Legacy candidate](nope.md) x]")
-        if res["path"].split("/", 1)[-1].split("/", 1)[-1] in line else line
+        if f"]({res['type']}/{res['slug']}.md)" in line else line
         for line in lines
     ]
     assert spoofed != lines
@@ -622,7 +622,7 @@ def test_a_hook_or_title_naming_a_reviewed_note_cannot_launder_a_candidate(env):
         env.vault, env.home, note_type="decision", title="Reviewed anchor",
         group="myrepo", repos=["myrepo"], tags=[], body="A reviewed decision.",
     )
-    anchor_link = reviewed["path"].split("/", 2)[-1]
+    anchor_link = f"{reviewed['type']}/{reviewed['slug']}.md"
     vault_mod.add_note(
         env.vault, env.home, note_type="decision", title="Hook spoof candidate",
         group="myrepo", repos=["myrepo"], tags=["candidate"],
@@ -631,6 +631,62 @@ def test_a_hook_or_title_naming_a_reviewed_note_cannot_launder_a_candidate(env):
     brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
     assert "Hook spoof candidate" not in brief
     assert "Reviewed anchor" in brief
+
+
+def _rewrite_index_line(env, res, rewrite):
+    """Replace the index line of note ``res`` with ``rewrite(own_link)``."""
+    own = f"{res['type']}/{res['slug']}.md"
+    index = vault_mod.group_dir(env.vault, "myrepo") / "index.md"
+    lines = index.read_text(encoding="utf-8").splitlines(keepends=True)
+    rewritten = [rewrite(own) + "\n" if f"]({own})" in line else line for line in lines]
+    assert rewritten != lines
+    index.write_text("".join(rewritten), encoding="utf-8")
+
+
+def test_reviewed_links_before_and_after_cannot_launder_a_candidate(env):
+    """A line whose own link sits BETWEEN two reviewed links: a gate that
+    judged only the first or only the last link would admit the candidate."""
+    _seed_group(env)
+    reviewed = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="Reviewed anchor",
+        group="myrepo", repos=["myrepo"], tags=[], body="A reviewed decision.",
+    )
+    ok = f"{reviewed['type']}/{reviewed['slug']}.md"
+    res = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="Sandwiched candidate",
+        group="myrepo", repos=["myrepo"], tags=["candidate"],
+        body="Sandwiched body must stay out.",
+    )
+    _rewrite_index_line(
+        env, res,
+        lambda own: f"- [Sandwiched candidate]({ok}) - x]({own}) - y]({ok}) - hook",
+    )
+    brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
+    assert "Sandwiched candidate" not in brief
+    assert "Reviewed anchor" in brief
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "- [Rewritten candidate]({own})",  # no hook
+        "- [Rewritten candidate]({own}) \u2014 hook",  # em-dash separator
+        "- [Rewritten candidate]({own})- hook",
+        "- [Rewritten candidate]({own})  - hook",
+    ],
+)
+def test_a_rewritten_index_line_is_still_judged_by_its_link(env, shape):
+    """The librarian or a human can rewrite an index line into a shape the
+    writer never produces. The candidate gate must still find its link."""
+    _seed_group(env)
+    res = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="Rewritten candidate",
+        group="myrepo", repos=["myrepo"], tags=["candidate"],
+        body="Rewritten body must stay out.",
+    )
+    _rewrite_index_line(env, res, lambda own: shape.format(own=own))
+    brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
+    assert "Rewritten candidate" not in brief
 
 
 def test_candidate_note_surfaces_after_promotion(env):

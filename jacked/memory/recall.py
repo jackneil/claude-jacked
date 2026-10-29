@@ -311,23 +311,31 @@ def _index_excerpt_section(lines: list[str], exclude: set[str] | None = None) ->
     return "# Recent notes (index)\n" + "\n".join(kept)
 
 
-# A structural note link in an index line: "](<type>/<slug>.md) - ". The title
-# before it and the hook after it can both carry text of external origin, so a
-# line may hold more than one such link, and its position proves nothing.
-_INDEX_LINK_RE = re.compile(
-    r"\]\(((?:decision|convention|vision|reference|progress)/[^()\s\]\[]+\.md)\) - "
-)
+# A note link in an index line: "](<path>.md)". The title before the line's
+# own link and the hook after it can both carry text of external origin, so a
+# line may hold more than one link, and position proves nothing. The pattern is
+# deliberately loose (any separator after the link, spaces allowed, no hook
+# needed): a line the librarian or a human rewrote must still be judged by its
+# links, never kept as "no link found". Brackets and parentheses are excluded
+# from the path so a fragment such as "](a](decision/x.md)" still yields the
+# real link.
+_INDEX_LINK_RE = re.compile(r"\]\(([^()\[\]]+\.md)\)")
 
 
 def _entry_links(line: str) -> list[str]:
-    """Every structural note link in an index line. The line's own note is
-    always one of them; the recall gate requires ALL of them to be reviewed.
+    """Every note link in an index line. The line's own note is always one of
+    them; the recall gate requires ALL of them to be reviewed, so an extra link
+    can only exclude a line, never admit one.
 
     >>> _entry_links("- [T](decision/t.md) - hook (updated 2026-10-29)")
     ['decision/t.md']
     >>> _entry_links("- [T](decision/ok.md) - x](decision/t.md) - hook")
     ['decision/ok.md', 'decision/t.md']
-    >>> _entry_links("- [T](nope.md) x - plain text")
+    >>> _entry_links("- [T](decision/t.md)")
+    ['decision/t.md']
+    >>> _entry_links("- [T](a](decision/t.md) \u2014 hook")
+    ['decision/t.md']
+    >>> _entry_links("- plain text, no link")
     []
     """
     return _INDEX_LINK_RE.findall(line)
