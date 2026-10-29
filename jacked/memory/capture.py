@@ -59,7 +59,10 @@ _MAX_ATTEMPTS = 3
 
 # Flags that isolate the triage session. `--tools ""` disables the built-in
 # tool set; `--strict-mcp-config` with no `--mcp-config` loads no MCP server;
-# `disableAllHooks` stops every hook from settings and plugins (without it the
+# `--disallowedTools "mcp__*"` is the documented belt for MCP tools, which
+# `--tools` does not cover (the child's init message already lists no MCP
+# server, checked live); `disableAllHooks` stops every hook from settings and
+# plugins (without it the
 # child's own SessionEnd re-runs this capture hook, which drains the retry queue
 # a second time); `--no-session-persistence` writes no transcript. User settings
 # still load, so auth from `env` / `apiKeyHelper` keeps working. Structured
@@ -67,6 +70,7 @@ _MAX_ATTEMPTS = 3
 _ISOLATION_ARGS = (
     "--tools", "",
     "--strict-mcp-config",
+    "--disallowedTools", "mcp__*",
     "--settings", json.dumps({"disableAllHooks": True}),
     "--no-session-persistence",
 )
@@ -74,6 +78,11 @@ _ISOLATION_ARGS = (
 # Set in the triage child's environment. A capture hook that still runs inside
 # that child (a managed policy can force hooks on) sees it and does nothing.
 TRIAGE_ENV = "JACKED_MEMORY_TRIAGE"
+
+# The triage child runs here, not in the session's repo, so the repo's
+# CLAUDE.md and project settings do not load into a summarizing pass (#189i).
+# One fixed directory, so Claude Code keeps one project entry for it.
+_TRIAGE_DIR_NAME = "jacked-memory-triage"
 
 # How much of the child's first stderr line a failure cause keeps.
 _STDERR_CAUSE_CHARS = 200
@@ -499,6 +508,7 @@ def call_claude(
             text=True,
             timeout=_TRIAGE_TIMEOUT,
             env={**os.environ, TRIAGE_ENV: "1"},
+            cwd=_triage_cwd(),
         )
     except subprocess.TimeoutExpired:
         return None, f"claude timed out after {_TRIAGE_TIMEOUT}s"
@@ -509,6 +519,22 @@ def call_claude(
         cause = f"claude exited {proc.returncode}"
         return None, f"{cause}: {detail}" if detail else cause
     return proc.stdout, None
+
+
+def _triage_cwd() -> str | None:
+    """The private working directory for the triage child (mode 0700).
+
+    Returns None (inherit the caller's cwd) when it cannot be made, so a
+    read-only home never blocks capture.
+    """
+    path = vault_mod.jacked_home() / ".claude" / _TRIAGE_DIR_NAME
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
+    except OSError:
+        logger.debug("memory capture: no private triage dir at %s", path, exc_info=True)
+        return None
+    return str(path)
 
 
 def _envelope_error(stdout: str | None) -> str:
@@ -549,11 +575,14 @@ def _first_line(text: str | None) -> str:
 
     >>> _first_line("\\n  Error: bad flag\\nmore")
     'Error: bad flag'
+    >>> _first_line("\\x1b[31mred\\x1b[0m")
+    '[31mred[0m'
     >>> _first_line(None)
     ''
     """
     for line in (text or "").splitlines():
-        line = line.strip()
+        # one_line strips control characters: the cause is echoed to terminals.
+        line = vault_mod.one_line(line)
         if line:
             return line[:_STDERR_CAUSE_CHARS]
     return ""

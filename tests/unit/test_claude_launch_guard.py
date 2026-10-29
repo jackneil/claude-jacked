@@ -82,3 +82,27 @@ def test_every_structured_output_schema_has_an_object_root():
     for where, schema in found:
         assert schema.get("type") == "object", where
         assert not {"anyOf", "oneOf", "allOf"} & set(schema), where
+
+
+def _docstring_ids(tree):
+    """ids of bare string statements: docstrings and attribute docstrings."""
+    return {
+        id(node.value) for node in ast.walk(tree)
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+
+
+def test_no_claude_print_command_hidden_in_a_string():
+    """Second net: a launch written as one string (``shlex.split("claude -p
+    ...")``, ``shell=True``) has no list literal for the scan above to see."""
+    hits = []
+    for path in sorted(PACKAGE.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docs = _docstring_ids(tree)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docs
+                    and ("claude -p" in node.value or "claude --print" in node.value)):
+                hits.append(f"{path.relative_to(PACKAGE)}:{node.lineno}")
+    assert hits == [], hits

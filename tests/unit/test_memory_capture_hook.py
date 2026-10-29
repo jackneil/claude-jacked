@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
@@ -499,6 +500,7 @@ def test_call_claude_gives_the_triage_session_no_tools(env):
         at = argv.index("--tools")
         assert argv[at + 1] == ""
         assert "--strict-mcp-config" in argv
+        assert argv[argv.index("--disallowedTools") + 1] == "mcp__*"
         assert "--mcp-config" not in argv
         assert "--dangerously-skip-permissions" not in argv
 
@@ -947,3 +949,33 @@ def test_call_claude_reads_terminal_errors_from_the_envelope(env, subtype):
     with patch("subprocess.run", return_value=_P()):
         _text, cause = capture.call_claude("prompt", "haiku", schema=capture.TRIAGE_SCHEMA)
     assert cause == "claude exited 1: queryParams builder failed: bad input"
+
+
+def test_call_claude_runs_the_child_in_a_private_directory(env):
+    """The child must not run in the session's repo: that would load the
+    repo's CLAUDE.md and project settings into a summarizing pass (#189i)."""
+    class _P:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+    with patch("subprocess.run", return_value=_P()) as run:
+        capture.call_claude("prompt", "haiku")
+    cwd = Path(run.call_args.kwargs["cwd"])
+    assert cwd == env.home / ".claude" / "jacked-memory-triage"
+    assert cwd.is_dir()
+    if os.name != "nt":
+        assert (cwd.stat().st_mode & 0o777) == 0o700
+
+
+def test_call_claude_still_runs_when_the_private_directory_cannot_be_made(env, monkeypatch):
+    class _P:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+    def _boom(*a, **k):
+        raise PermissionError("read-only home")
+    monkeypatch.setattr(Path, "mkdir", _boom)
+    with patch("subprocess.run", return_value=_P()) as run:
+        text, cause = capture.call_claude("prompt", "haiku")
+    assert (text, cause) == ("{}", None)
+    assert run.call_args.kwargs["cwd"] is None
