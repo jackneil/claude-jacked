@@ -79,9 +79,24 @@ jobs:
           python -m pip install --require-hashes --only-binary=:all: -r .github/requirements/ci-audit.txt
 
       - name: Audit every locked package (OSV)
+        # Markers are stripped so the macOS-only and Windows-only pins are
+        # audited too (pip-audit would evaluate them for this Linux runner and
+        # skip them); the step fails unless the audited set is exactly the
+        # lock's registry packages.
         run: |
-          uv export --frozen --format requirements-txt --no-emit-project -o "$RUNNER_TEMP/locked.txt"
-          pip-audit -r "$RUNNER_TEMP/locked.txt" --require-hashes --disable-pip --vulnerability-service osv
+          uv export --frozen --format requirements-txt --no-emit-project --no-hashes --no-annotate --no-header -o "$RUNNER_TEMP/export.txt"
+          sed -E 's/ *;.*$//' "$RUNNER_TEMP/export.txt" | sort -u > "$RUNNER_TEMP/locked.txt"
+          python - "$RUNNER_TEMP/locked.txt" <<'PY'
+          import re, sys
+          lock = open("uv.lock", encoding="utf-8").read()
+          locked = {f"{n}=={v}".lower() for n, v in re.findall(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"\nsource = \{ registry', lock)}
+          audited = {line.strip().lower() for line in open(sys.argv[1], encoding="utf-8") if line.strip()}
+          print(f"auditing {len(audited)} of {len(locked)} locked packages")
+          sys.exit(0 if locked and audited == locked else f"coverage mismatch: missing {sorted(locked - audited)}, extra {sorted(audited - locked)}")
+          PY
+          pip-audit -r "$RUNNER_TEMP/locked.txt" --no-deps --disable-pip --vulnerability-service osv
 
       - name: Audit the workflows (zizmor)
-        run: zizmor --no-progress .github/workflows
+        # --strict-collection: a workflow zizmor cannot parse fails the job
+        # instead of being skipped.
+        run: zizmor --no-progress --strict-collection .github/workflows
