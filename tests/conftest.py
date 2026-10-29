@@ -309,6 +309,28 @@ def quiet_lifespan(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _process_tree_through_subprocess_run(request):
+    """jacked.service.updater.run_process_tree spawns with Popen. Tests
+    script the upgrade's child processes through a mocked subprocess.run (and
+    often mock Popen too, whose pid coerces to 1), so route it there: every
+    child stays visible to the scripted run, and the call-order assertions
+    keep meaning what they say (#178i). Tests of the real process-tree logic
+    import run_process_tree / run_tree directly, or opt out with
+    ``@pytest.mark.real_process_tree``."""
+    if request.node.get_closest_marker("real_process_tree"):
+        yield
+        return
+    import subprocess as _subprocess
+
+    def _via_run(argv, *, timeout, log_fh=None, relay=False):
+        return _subprocess.run(argv, stdout=log_fh, stderr=log_fh, check=False,
+                               timeout=timeout).returncode
+
+    with patch("jacked.service.updater.run_process_tree", side_effect=_via_run):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _no_real_service_processes(request, monkeypatch):
     """Tripwire: a test must never start the real jacked service or drive a
     real supervisor.

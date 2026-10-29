@@ -1079,23 +1079,19 @@ def run_update(
             return
         _end("preflight", "ok")
 
-        # Phase: migrating_settings
+        # Phase: migrating_settings. Skill packs are refreshed AFTER the new
+        # service is up (refreshing_packs): their download was the slow part
+        # of this step (61 s seen) and kept the machine without a service.
         _begin("migrating_settings")
-        log(f"Running: {jacked} install --force")
-        migrate_result = subprocess.run(
-            [jacked, "install", "--force"],
-            stdout=log_fh,
-            stderr=log_fh,
-            check=False,
-            creationflags=NO_WINDOW,
-        )
-        log(f"jacked install returncode: {migrate_result.returncode}")
+        log(f"Running: {jacked} install --force --no-packs")
+        migrate_code, migrate_error = run_migrate_settings(jacked, log_fh)
+        log(f"jacked install result: {migrate_error or 'exit 0'}")
 
-        if migrate_result.returncode != 0:
+        if migrate_code != 0:
             _end(
                 "migrating_settings",
                 "failed",
-                error=f"jacked install exit {migrate_result.returncode}",
+                error=migrate_error,
                 recovery="jacked install --force",
             )
             log(
@@ -1109,7 +1105,7 @@ def run_update(
             restored_ready = _start_and_verify(_current_version) == "ok"
             _fail_and_recover(
                 f"v{_target} could not migrate settings "
-                f"(jacked install exit {migrate_result.returncode}); "
+                f"({migrate_error}); "
                 "backups are at ~/.claude/settings.json.bak-*",
                 rollback.ok and restored_ready,
                 rollback.step or (None if restored_ready else ROLLBACK_STEP_RESTART),
@@ -1120,6 +1116,11 @@ def run_update(
         outcome = _start_and_verify(target_version)
         if outcome == "ok":
             log(f"Updater done - new service is listening on :{port}")
+            # Phase: refreshing_packs, now that the service is up. Never fatal.
+            _begin("refreshing_packs")
+            packs_reason = run_refresh_packs(jacked, log_fh)
+            log(f"jacked packs update: {packs_reason or 'ok'}")
+            _end("refreshing_packs", "ok" if packs_reason is None else "warning")
             if RECOVERY_FILE.exists():
                 try:
                     RECOVERY_FILE.unlink()
@@ -1177,6 +1178,92 @@ def run_update(
                 logger.exception("Final-guard native_restart raised")
         _release_update_lock(_update_lock)
         log_fh.close()
+
+
+# `jacked install --force --no-packs`: settings migration only, a few seconds
+# normally. 600 s is ten times the slowest full install observed (61 s, with
+# pack downloads), so only a hung install reaches it; the timeout then fails
+# the step and the upgrade rolls back instead of waiting forever (#178i).
+MIGRATE_TIMEOUT_SECONDS = 600
+# `jacked packs update` clones from GitHub; generous, and never fatal.
+PACK_REFRESH_TIMEOUT_SECONDS = 900
+
+
+def run_process_tree(
+    argv: list[str], *, timeout: float | None, log_fh=None, relay: bool = False
+) -> int:
+    """Run ``argv`` as a whole process tree and return its exit code.
+
+    A timeout or an interrupt stops the child and every worker it started
+    (jacked.proctree), so no npx or uv process keeps writing after the
+    upgrade gives up on it (#178i). Raises ``subprocess.TimeoutExpired`` and
+    ``OSError`` like ``subprocess.run``.
+    """
+    from jacked.proctree import run_tree
+
+    return run_tree(argv, timeout=timeout, log_fh=log_fh, relay=relay).returncode
+
+
+def run_migrate_settings(jacked: str, log_fh=None) -> tuple[int, str | None]:
+    """Run the settings migration with a timeout. Returns (code, error text).
+
+    A timeout or a launch failure is a non-zero code with a values-free
+    reason, so every caller takes its own failure (rollback) path.
+    """
+    try:
+        code = run_process_tree(
+            [jacked, "install", "--force", "--no-packs"],
+            timeout=MIGRATE_TIMEOUT_SECONDS,
+            log_fh=log_fh,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, f"jacked install timed out after {MIGRATE_TIMEOUT_SECONDS}s"
+    except OSError as exc:
+        return 127, f"jacked install could not start ({type(exc).__name__})"
+    if code != 0:
+        return code, f"jacked install exit {code}"
+    return 0, None
+
+
+def run_refresh_packs(jacked: str, log_fh=None) -> str | None:
+    """Run `jacked packs update` after the service is back. None when it
+    worked, else a values-free reason. Never raises."""
+    try:
+        code = run_process_tree(
+            [jacked, "packs", "update"],
+            timeout=PACK_REFRESH_TIMEOUT_SECONDS,
+            log_fh=log_fh,
+        )
+    except subprocess.TimeoutExpired:
+        return f"timed out after {PACK_REFRESH_TIMEOUT_SECONDS}s"
+    except OSError as exc:
+        return f"could not start ({type(exc).__name__})"
+    return None if code == 0 else f"exit {code}"
+
+
+def windows_refresh_packs_block(drift_guard: str = "") -> str:
+    """Batch lines for the refreshing_packs phase (Windows helpers).
+
+    Runs after the service is verified. A failure is a warning, never a
+    rollback. Flat labels, no nested blocks (cmd.exe parsing).
+
+    >>> block = windows_refresh_packs_block()
+    >>> "jacked packs update 2>&1" in block and ":packsdone" in block
+    True
+    """
+    return (
+        "jacked _update_status refreshing_packs in_progress\r\n"
+        + drift_guard
+        + "jacked packs update 2>&1\r\n"
+        + 'if "%ERRORLEVEL%"=="0" goto packsok\r\n'
+        + "jacked _update_status refreshing_packs warning\r\n"
+        + "echo [%date% %time%] skill packs not refreshed; run: jacked packs update\r\n"
+        + "goto packsdone\r\n"
+        + ":packsok\r\n"
+        + "jacked _update_status refreshing_packs ok\r\n"
+        + ":packsdone\r\n"
+        + drift_guard
+    )
 
 
 def _find_updater_python() -> str | None:
@@ -1238,6 +1325,9 @@ def spawn_updater_from_tray(
     _spawn_detached(
         [
             py,
+            # Isolated: the tray's working directory, PYTHONPATH and the user
+            # site never shadow the installed package (same as the service).
+            "-I",
             "-m",
             "jacked.service.updater",
             str(parent_pid),
@@ -1679,7 +1769,7 @@ def _spawn_windows_tray_updater(
         # Phase: migrating_settings
         "jacked _update_status migrating_settings in_progress\r\n"
         + DRIFT_GUARD
-        + "jacked install --force 2>&1\r\n"
+        + "jacked install --force --no-packs 2>&1\r\n"
         + goto_on_failure("migrate_failed")
         + "jacked _update_status migrating_settings ok\r\n"
         + DRIFT_GUARD
@@ -1730,6 +1820,7 @@ def _spawn_windows_tray_updater(
         ")\r\n"
         "jacked _update_status verifying_service ok\r\n"
         + DRIFT_GUARD
+        + windows_refresh_packs_block(DRIFT_GUARD)
         + "jacked _update_status_succeed\r\n"
         # A clean update retires the breadcrumb an earlier failure left behind,
         # so the next tray boot never warns about a repaired failure.

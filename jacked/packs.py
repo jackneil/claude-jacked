@@ -793,11 +793,11 @@ def _run_skills(cmd: list[str], *, home: Path, timeout: int) -> tuple[bool, str]
     """
     logger.info("Running skills command: %s", " ".join(cmd))
     env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
+    from jacked.proctree import run_tree
+
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            stdin=subprocess.DEVNULL, env=env, cwd=str(home),
-        )
+        # The whole npx tree: a timeout stops node workers too, not only npx.
+        proc = run_tree(cmd, timeout=timeout, capture=True, env=env, cwd=str(home))
     except subprocess.TimeoutExpired as e:
         out = _tail((e.stderr or "") + (e.stdout or ""))
         logger.warning("skills command timed out after %ss: %s", timeout, " ".join(cmd))

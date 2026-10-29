@@ -971,15 +971,17 @@ def test_run_skills_pins_cwd_to_home(skills_env, monkeypatch):
     ancestor) node_modules/skills over the pinned registry package, so an
     inherited launch cwd inside an untrusted checkout defeats the version pin
     (proven empirically). Every subprocess call must pin cwd."""
+    from jacked import proctree
+
     env = skills_env
     calls = []
-    real_run = packs.subprocess.run
+    real_run = proctree.run_tree
 
     def spy_run(cmd, **kwargs):
         calls.append(kwargs)
         return real_run(cmd, **kwargs)
 
-    monkeypatch.setattr(packs.subprocess, "run", spy_run)
+    monkeypatch.setattr(proctree, "run_tree", spy_run)
     p = _pack(skills=("alpha",))
     packs.install_pack(p, env.home, include_codex=False)
     packs.update_packs([p], env.home, include_codex=False)

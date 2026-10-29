@@ -2,7 +2,25 @@
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
+
+from jacked.service.platform import launchd_job_never_ran as _real_launchd_job_never_ran
+
+
+@pytest.fixture(autouse=True)
+def _no_real_supervisor_probes():
+    """doctor's NOT RUNNING path asks launchctl whether the job ever ran and
+    asks the supervisor for the autostart state. On a CI runner the port is
+    free, so both reach the real-supervisor tripwire; on a developer machine
+    the live service holds the port and hides that. Tests that care about
+    either answer patch it again inside the test."""
+    from jacked.service.autostart import AutostartInspection, AutostartState
+
+    with patch("jacked.service.platform.launchd_job_never_ran", return_value=False), \
+         patch("jacked.service.platform.inspect_autostart",
+               return_value=AutostartInspection(AutostartState.ABSENT)):
+        yield
 
 
 def test_doctor_reports_version_and_method():
@@ -132,3 +150,64 @@ def test_doctor_pip_install_recovery(monkeypatch):
     from jacked.cli import main
     result = CliRunner().invoke(main, ["doctor"])
     assert "uv tool install" in result.output
+
+
+# #178i: doctor's recovery and the launchd job that never ran
+
+
+def _autostart(state_name):
+    from jacked.service.autostart import AutostartState
+
+    return MagicMock(state=getattr(AutostartState, state_name), reason="")
+
+
+@pytest.mark.parametrize("state, expected", [
+    ("OWNED_ENABLED", "jacked service restart"),
+    ("ABSENT", "jacked service start"),
+])
+def test_doctor_recovery_matches_the_autostart_state(state, expected):
+    """With autostart on, `service start` runs in the foreground and never
+    returns; `service restart` hands the start to the supervisor."""
+    from jacked.cli import main
+
+    with patch("jacked.service.process.is_port_available", return_value=True), \
+         patch("jacked.service.platform.inspect_autostart", return_value=_autostart(state)), \
+         patch("jacked.service.platform.launchd_job_never_ran", return_value=False):
+        result = CliRunner().invoke(main, ["doctor"])
+    assert f"Recovery: {expected}" in result.output
+
+
+def test_doctor_names_a_launchd_job_that_never_ran():
+    from jacked.cli import main
+
+    with patch("jacked.service.process.is_port_available", return_value=True), \
+         patch("jacked.service.platform.inspect_autostart", return_value=_autostart("OWNED_ENABLED")), \
+         patch("jacked.service.platform.launchd_job_never_ran", return_value=True):
+        result = CliRunner().invoke(main, ["doctor"])
+    assert "loaded but never ran" in result.output
+    assert "Recovery: jacked service restart" in result.output
+
+
+@pytest.mark.parametrize("stdout, expected", [
+    ("gui/501/ai.hank.jacked = {\n\tstate = not running\n\truns = 0\n\t\tstate = active\n}", True),
+    ("gui/501/ai.hank.jacked = {\n\tstate = running\n\truns = 1\n\tpid = 66875\n}", False),
+    ("gui/501/ai.hank.jacked = {\n\tstate = not running\n\truns = 3\n}", False),
+])
+def test_launchd_never_ran_reads_only_the_top_level_fields(monkeypatch, stdout, expected):
+    from jacked.service import platform
+
+    monkeypatch.setattr(platform.sys, "platform", "darwin")
+    probe = MagicMock(returncode=0, stdout=stdout)
+    assert _real_launchd_job_never_ran(run=lambda *a, **k: probe, uid=501) is expected
+
+
+def test_launchd_never_ran_is_false_off_macos_and_on_a_probe_failure(monkeypatch):
+    from jacked.service import platform
+
+    monkeypatch.setattr(platform.sys, "platform", "linux")
+    assert _real_launchd_job_never_ran(run=lambda *a, **k: 1 / 0) is False
+    monkeypatch.setattr(platform.sys, "platform", "darwin")
+    assert _real_launchd_job_never_ran(run=lambda *a, **k: MagicMock(returncode=113, stdout="")) is False
+    # A platform without os.getuid (Windows) never raises.
+    monkeypatch.delattr(platform.os, "getuid", raising=False)
+    assert _real_launchd_job_never_ran(run=lambda *a, **k: MagicMock(returncode=0, stdout="")) is False
