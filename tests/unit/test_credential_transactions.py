@@ -719,3 +719,14 @@ def test_the_preflight_request_is_the_one_written() -> None:
     assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
     oauth = store.read().payload.to_mapping()["claudeAiOauth"]
     assert oauth["accessToken"] == "rebuilt"
+
+
+def test_a_preflight_cannot_switch_the_account_being_written() -> None:
+    engine, store, _ = _engine_with_lease(_payload(1, "before"))
+    other = replace(_request(_payload(3, "foreign")), account_id=3)
+    request = replace(_request(_payload(2, "target")), preflight=lambda: other)
+
+    result = engine.activate(request)
+
+    assert result.outcome is SwitchOutcome.UNUSABLE
+    assert store.read().payload.identity.account_id == 1

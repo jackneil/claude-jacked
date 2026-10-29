@@ -10,6 +10,7 @@ path. The ``oauthAccount`` identity in ``~/.claude.json`` is written only by
 import contextlib
 import json
 import logging
+import math
 import os
 import random
 import shutil
@@ -424,6 +425,37 @@ def clear_ownership_cache() -> None:
     _ownership_cache.clear()
 
 
+def expiry_seconds(raw) -> int | None:
+    """A Claude Code ``expiresAt`` as epoch seconds, or None when absent or
+    not a real time. Claude Code writes milliseconds; older payloads and
+    jacked's own rows use seconds.
+
+    >>> expiry_seconds(1_900_000_000_000), expiry_seconds(1_900_000_000)
+    (1900000000, 1900000000)
+    >>> [expiry_seconds(x) for x in (None, 0, -5, True, "1900000000", float("inf"), float("nan"))]
+    [None, None, None, None, None, None, None]
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if not math.isfinite(raw) or raw <= 0:
+        return None
+    return int(raw / 1000) if raw > 1e12 else int(raw)
+
+
+def _malformed_expiry(raw) -> bool:
+    """True when ``expiresAt`` is present but is not a real time: such a
+    payload is not a Claude Code rotation, so nothing in it is imported.
+
+    >>> [_malformed_expiry(x) for x in (None, 0, 1_900_000_000_000)]
+    [False, False, False]
+    >>> [_malformed_expiry(x) for x in ("soon", float("nan"), True, False, -1)]
+    [True, True, True, True, True]
+    """
+    if raw is None or (raw == 0 and not isinstance(raw, bool)):
+        return False  # absent: nothing claims a time
+    return expiry_seconds(raw) is None
+
+
 def _live_tokens_belong_to(
     account: dict, live_access: str, live_refresh: str | None, live_expires
 ) -> bool:
@@ -450,10 +482,11 @@ def _live_tokens_belong_to(
         return True
     if live_refresh and live_refresh == account.get("cc_refresh_token"):
         return True
-    if live_expires:
-        expires_s = live_expires / 1000 if live_expires > 1e12 else live_expires
-        if expires_s <= time.time():
-            return False
+    if _malformed_expiry(live_expires):
+        return False
+    expires_s = expiry_seconds(live_expires)
+    if expires_s is not None and expires_s <= time.time():
+        return False
     try:
         import asyncio
 
@@ -762,15 +795,10 @@ def _platform_store_holds(live: dict) -> bool:
     so ``read_live_credentials`` returns a stale copy after a failed Keychain
     read. A decision that admits an OLDER payload (the dead-token override)
     must not act on that copy. Other platforms have no separate store: the
-    file is the store, and so is a macOS build whose certified authority is
-    the file.
+    file is the store.
     """
     if sys.platform != "darwin":
         return True
-    from jacked.credentials.runtime import scoped_launch_needs_global_activation
-
-    if not scoped_launch_needs_global_activation():
-        return True  # this Claude build's certified authority IS the file
     store = read_platform_credentials()
     if not isinstance(store, dict):
         return False
@@ -897,6 +925,14 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
     live_access = oauth.get("accessToken")
     live_refresh = oauth.get("refreshToken")
     live_expires = oauth.get("expiresAt")  # milliseconds
+    if _malformed_expiry(live_expires):
+        logger.warning(
+            "Account %d: live credentials carry an unreadable expiry; not "
+            "importing them",
+            account_id,
+        )
+        return None
+    live_expires = expiry_seconds(live_expires)  # seconds from here on
 
     # jacked's own primary-fallback publication is not a Claude Code token.
     if is_primary_publication(account, live_access):
@@ -928,7 +964,7 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
     # expires sooner is the one that works (#179i).
     row_expires = account.get("cc_expires_at") or 0
     if live_expires and row_expires:
-        live_expires_s = int(live_expires / 1000) if live_expires > 1e12 else int(live_expires)
+        live_expires_s = live_expires
         if live_expires_s < row_expires:
             if not cc_token_known_dead(account):
                 logger.info(
@@ -959,7 +995,7 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
 
     # Import expiry (convert ms -> seconds)
     if live_expires:
-        live_expires_s = int(live_expires / 1000) if live_expires > 1e12 else int(live_expires)
+        live_expires_s = live_expires
         if live_expires_s != account.get("cc_expires_at"):
             updates["cc_expires_at"] = live_expires_s
 

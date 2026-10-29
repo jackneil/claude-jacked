@@ -239,14 +239,6 @@ def _match_account(db, email: str, organization_uuid: str | None) -> dict | None
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _expiry_seconds(raw: Any) -> int | None:
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return None
-    if raw <= 0:
-        return None
-    return int(raw / 1000) if raw > 1e12 else int(raw)
-
-
 # _import_rotated_tokens result: the row kept changing under every attempt.
 ADOPTION_RACE_LOST = -1
 _ADOPTION_ATTEMPTS = 3
@@ -314,6 +306,7 @@ def _import_rotated_tokens(
 def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | None:
     """The fields that adopt ``payload`` into ``row``; None when refused."""
     from jacked.api.credential_helpers import (
+        expiry_seconds,
         is_primary_publication,
         live_payload_belongs_to,
     )
@@ -335,7 +328,7 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
     if access_token and access_token != row.get("cc_access_token"):
         updates["cc_access_token"] = access_token
 
-    expires_at = _expiry_seconds(oauth.get("expiresAt"))
+    expires_at = expiry_seconds(oauth.get("expiresAt"))
     if expires_at is not None and expires_at != row.get("cc_expires_at"):
         updates["cc_expires_at"] = expires_at
 

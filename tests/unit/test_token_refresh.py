@@ -650,7 +650,7 @@ class TestReconcileOwnershipProof:
             ch.reconcile_credentials_from_live_store(aid, db)
         assert db.get_account(aid)["cc_access_token"] == "fresh-access"
 
-    def _override_on_macos(self, tmp_path, monkeypatch, keychain, authority_is_keychain=True):
+    def _override_on_macos(self, tmp_path, monkeypatch, keychain):
         """Run the dead-token override as on macOS: ``read_live_credentials``
         returns ``live`` and the Keychain itself returns ``keychain``."""
         import sys
@@ -661,10 +661,6 @@ class TestReconcileOwnershipProof:
         db, aid, live = self._older_live_over_newer_row(
             tmp_path, cc_refresh_failure_type="auth_rejected")
         monkeypatch.setattr(sys, "platform", "darwin")
-        monkeypatch.setattr(
-            "jacked.credentials.runtime.scoped_launch_needs_global_activation",
-            lambda: authority_is_keychain,
-        )
         with patch("jacked.api.credential_helpers.read_live_credentials", return_value=live), \
              patch("jacked.api.credential_helpers.read_platform_credentials",
                    return_value=keychain(live)), \
@@ -691,12 +687,16 @@ class TestReconcileOwnershipProof:
         row = self._override_on_macos(tmp_path, monkeypatch, keychain=lambda live: live)
         assert (row["cc_access_token"], row["cc_refresh_token"]) == ("new-access", "new-refresh")
 
-    def test_on_a_macos_file_authority_build_the_file_is_the_store(self, tmp_path, monkeypatch):
-        """A certified macOS build whose authority is the credentials file has
-        no Keychain copy to compare with: the file read is the store itself."""
-        row = self._override_on_macos(tmp_path, monkeypatch, keychain=lambda live: None,
-                                      authority_is_keychain=False)
-        assert row["cc_access_token"] == "new-access"
+    @pytest.mark.parametrize("expires", ["soon", float("nan"), float("inf"), True])
+    def test_a_live_payload_with_an_unreadable_expiry_is_not_imported(self, tmp_path, expires):
+        """Such a payload is not a Claude Code rotation. Before, a string
+        expiry raised TypeError in the backward check, and every activation
+        that saves the outgoing tokens first refused with BUSY."""
+        db, aid = self._account(tmp_path)
+        live = self._live(aid)
+        live["claudeAiOauth"]["expiresAt"] = expires
+        self._reconcile(db, aid, live, _owner_profile("owner@test.com", "org-a", "uuid-a"))
+        assert not self._imported(db, aid)
 
     def test_the_pre_overwrite_reconcile_ignores_the_cache(self, tmp_path):
         """A switch or launch is about to overwrite the store, so it must

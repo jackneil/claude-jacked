@@ -329,6 +329,13 @@ class CredentialTransactionEngine:
                         message=OUTGOING_ACCOUNT_BUSY_MESSAGE,
                         code=OUTGOING_ACCOUNT_BUSY_CODE,
                     )
+                if (
+                    prepared.account_id != request.account_id
+                    or prepared.payload.identity.account_id != request.account_id
+                ):
+                    return _result(
+                        request, SwitchOutcome.UNUSABLE, message="account stamp mismatch"
+                    )
                 request = prepared
             return operation(request)
 

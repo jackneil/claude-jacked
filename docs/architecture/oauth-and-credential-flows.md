@@ -683,9 +683,6 @@ activation stops with `busy` and code `outgoing_account_busy`, and writes
 nothing. The switch route answers that code with `OUTGOING_ACCOUNT_BUSY`
 (409).
 
-On a macOS build whose certified authority is the credentials file, the file
-is the store, and the #179i exception reads it as such.
-
 One case still loses a refresh lineage. Claude Code rotates the token, and the
 access token expires before any reconcile pass sees it (for example, the
 computer sleeps). A switch then overwrites the item. Reconcile logs a warning

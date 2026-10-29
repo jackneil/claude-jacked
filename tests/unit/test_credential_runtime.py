@@ -663,3 +663,18 @@ def test_a_failed_outgoing_reconcile_refuses_the_overwrite(tmp_path: Path, caplo
     assert result.outcome is SwitchOutcome.BUSY
     assert not (tmp_path / ".claude" / ".credentials.json").exists()
     assert "outgoing account" in caplog.text
+
+
+def test_a_target_removed_during_activation_is_not_written(tmp_path: Path) -> None:
+    (tmp_path / ".claude").mkdir()
+
+    class _GoneDb(_MutableRowDb):
+        def get_account(self, account_id):
+            return None
+
+    result, _ = _activate_with_outgoing(
+        tmp_path, 3, lambda *a, **k: True, db=_GoneDb(_account())
+    )
+
+    assert result.outcome is SwitchOutcome.BUSY
+    assert not (tmp_path / ".claude" / ".credentials.json").exists()

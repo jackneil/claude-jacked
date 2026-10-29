@@ -384,7 +384,10 @@ def activate_account(db, account: dict, context: SwitchContext, operation_id: st
         try:
             if not reconcile_outgoing_before_activation(db, target_id):
                 return None
-            row = db.get_account(target_id) or account
+            row = db.get_account(target_id)
+            if row is None:
+                logger.warning("Account %d was removed during activation", target_id)
+                return None
         except Exception:  # noqa: BLE001 - any failure refuses the overwrite
             logger.warning(
                 "Could not save the outgoing account's live tokens; not "
