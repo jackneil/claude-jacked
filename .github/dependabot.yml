@@ -3,7 +3,9 @@
 # delays accepting newly-published versions long enough for the community to flag them.
 version: 2
 updates:
-  - package-ecosystem: "pip"
+  # "uv", not "pip": the pip ecosystem bumped pyproject.toml ranges without
+  # touching uv.lock, so its PRs never changed what CI or installs resolve.
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"
@@ -13,6 +15,18 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
+      include: "scope"
+
+  # Hash-locked CI tooling (uv, build, hatchling, twine, cyclonedx-bom).
+  - package-ecosystem: "pip"
+    directory: "/.github/requirements"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(ci-deps)"
       include: "scope"
 
   - package-ecosystem: "github-actions"

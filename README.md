@@ -400,7 +400,7 @@ Run `jacked service status` for the dashboard's actual URL. It normally uses `ht
 
 Upgrading later is one command: `jacked upgrade` (from the terminal) or click the Update line in the tray menu. Both auto-detect that you installed via uv and re-use it. Don't have uv anymore? Reinstall it first: same curl/powershell commands as step 1.
 
-Requirements: Python 3.10+ (uv will fetch one for you if your system doesn't have a compatible version - you don't need to install Python separately).
+Requirements: Python 3.11 or later. uv fetches a compatible Python for you if your system does not have one, so you do not need to install Python separately.
 
 ---
 
