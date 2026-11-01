@@ -361,6 +361,43 @@ out({
         assert result["counterId"] is True
 
 
+class TestExhaustionBanner:
+    """The all-accounts-exhausted banner names no 5-hour window: a verified
+    Ultra account has none, and the recovery time comes from whichever
+    window of each account is full."""
+
+    def _banner(self, tmp_path, minutes):
+        return _run_js(tmp_path, """
+const el = __makeEl('div');
+el.id = 'swap-exhaustion-banner';
+__body.appendChild(el);
+const at = __MINUTES__ === null ? null : new Date(Date.now() + __MINUTES__ * 60000).toISOString();
+window.jackedState._exhaustionData = { next_recovery_at: at };
+renderExhaustionBanner();
+out({ html: el.innerHTML, hidden: el.classList.contains('hidden') });
+""".replace("__MINUTES__", json.dumps(minutes)))
+
+    @pytest.mark.parametrize(
+        "minutes, text",
+        [
+            (199.5, "Usage is available again in 3h 20m"),
+            (11.5, "Usage is available again in 12m"),
+            (-1, "Usage should be available again soon"),
+        ],
+    )
+    def test_recovery_text(self, tmp_path, minutes, text):
+        result = self._banner(tmp_path, minutes)
+        assert result["hidden"] is False
+        assert f">{text}</div>" in result["html"]
+        assert "All accounts at capacity" in result["html"]
+        assert "5h" not in result["html"] and "window" not in result["html"]
+        assert "\u2014" not in result["html"] and "\u2013" not in result["html"]
+
+    def test_no_recovery_time_shows_no_text(self, tmp_path):
+        result = self._banner(tmp_path, None)
+        assert "available again" not in result["html"]
+
+
 class TestWebsocketHandlers:
     def test_new_events_dispatch_to_handlers(self, tmp_path):
         result = _run_js(tmp_path, """

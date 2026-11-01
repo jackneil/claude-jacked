@@ -79,7 +79,8 @@ const accts = [
     { id: 2, email: 'jack@x.com', organization_uuid: 'org-123', organization_name: 'Acme', priority: 0,
       cached_usage_5h: 96, cached_usage_7d: 78,
       cached_5h_resets_at: reset5h, cached_7d_resets_at: reset7d,
-      subscription_type: 'max', rate_limit_tier: 'default_claude_max_20x' },
+      subscription_type: 'max', rate_limit_tier: 'default_claude_max_20x',
+      plan: { id: 'ultra', label: 'Ultra', formerly: 'Max 20x', drift: [] } },
 ];
 const html = buildPanelHtml(groupAccountsByLogin(accts, 2));
 out({ html });
@@ -101,8 +102,11 @@ out({ html });
     # Active org marked (account id 2 is active)
     assert "active-badge" in html
     assert 'data-account-id="2"' in html
-    # Plan badge derived from subscription + tier
-    assert "Max 20x" in html
+    # Plan badge from the server's plan label, the former name in its hover;
+    # an account without a plan object falls back to its subscription type.
+    assert '<span class="plan-badge" title="Formerly Max 20x">Ultra</span>' in html
+    assert '<span class="plan-badge">Pro</span>' in html
+    assert ">Max 20x<" not in html
 
 
 def test_binding_model_adds_third_compact_bar(tmp_path):

@@ -45,7 +45,7 @@ function usageTextClass(colorClass) {
  * @param {string} resetTime - ISO timestamp or human-readable reset time string.
  * @param {number|null} elapsedFraction - 0-1 fraction of time elapsed in the window.
  * @param {string} label - Label like "5h limit" or "7d limit".
- * @param {{compact?: boolean, reason?: ({text: string, tone?: string, muted?: boolean, absent?: boolean}|null)}} [opts]
+ * @param {{compact?: boolean, hint?: string, reason?: ({text: string, tone?: string, muted?: boolean, absent?: boolean, none?: boolean, hint?: string}|null)}} [opts]
  *   compact drops the fixed reset-time column
  *   (it's moved to the row's hover title) and narrows the label so the bar gets
  *   the width back — for tight surfaces like the menu-bar panel popover. The
@@ -55,8 +55,11 @@ function usageTextClass(colorClass) {
  *   tone for a re-auth). When the reading is stale, the bar and the percent
  *   are dimmed; the reason text that explains the dimming stays readable.
  *   reason.absent marks a window the provider does not report: the bar has
- *   no fill and the percent reads "n/a". reason.hint, when set, is the hover
- *   text of the reset column.
+ *   no fill and the percent reads "n/a". reason.none marks a window the
+ *   plan does not have: the same empty track, the percent reads "none", and
+ *   the reason replaces any reset time. reason.hint, when set, is the hover
+ *   text of the reset column. hint (a temporary window's note) is added to
+ *   the hover text of the row and of the reset column.
  * @returns {string} HTML string.
  */
 function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
@@ -73,22 +76,29 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
 
     let resetDisplay = resetTime ? formatResetTime(resetTime) : '';
     const reason = opts && opts.reason;
+    // A window the plan does not have ("none") has no reset to show either.
+    const none = !!(reason && reason.none);
     let resetTone = 'text-slate-500';
     let staleDim = '';
     let hasReason = false;
-    if (reason && reason.text && !/^resets\s+/i.test(resetDisplay)) {
+    if (reason && reason.text && (none || !/^resets\s+/i.test(resetDisplay))) {
         resetDisplay = reason.text;
         hasReason = true;
         if (reason.tone === 'warn') resetTone = 'text-amber-400';
         if (reason.muted) staleDim = ' opacity-60';
     }
-    // A window the provider does not report has no reading: an empty track
-    // and "n/a", never a 0% bar that reads as free headroom.
-    const absent = !!(reason && reason.absent);
-    // Hover text: the reason's own explanation when it has one.
-    const resetTitle = hasReason && reason.hint ? reason.hint : resetDisplay;
+    // A window the provider does not report ("n/a") or the plan does not
+    // have ("none") has no reading: an empty track, never a 0% bar that
+    // reads as free headroom.
+    const absent = none || !!(reason && reason.absent);
+    // Hover text: the reason's own explanation when it has one, then the
+    // window's note (a temporary 5-hour limit, for example).
+    let resetTitle = hasReason && reason.hint ? reason.hint : resetDisplay;
+    const hint = opts && opts.hint ? String(opts.hint) : '';
+    if (hint && hint !== resetTitle) resetTitle = resetTitle ? resetTitle + ' · ' + hint : hint;
+    const rowTitle = (label || '') + (resetTitle ? ' · ' + resetTitle : '');
     const fillHtml = absent ? '' : `<div class="fill ${colorClass}" style="width: ${pct.toFixed(1)}%"></div>`;
-    const pctText = absent ? 'n/a' : Math.round(pct) + '%';
+    const pctText = absent ? (none ? 'none' : 'n/a') : Math.round(pct) + '%';
     const pctTone = absent ? 'text-slate-500' : pctColor;
     if (absent) markerHtml = '';
 
@@ -112,7 +122,7 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
             ? `<span class="reset-caption text-[10px] ${resetTone} shrink-0 text-right tabular-nums whitespace-nowrap" title="${escapeHtml(resetTitle)}">${escapeHtml(resetShort)}</span>`
             : '';
         return `
-        <div class="flex items-center gap-2 mb-0.5" title="${escapeHtml(label || '')}${resetTitle ? ' · ' + escapeHtml(resetTitle) : ''}">
+        <div class="flex items-center gap-2 mb-0.5" title="${escapeHtml(rowTitle)}">
             <span class="text-[10px] text-slate-400 w-10 shrink-0 truncate">${escapeHtml(label || '')}</span>
             <div class="usage-bar flex-1${staleDim}">
                 ${fillHtml}
@@ -124,8 +134,11 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
     `;
     }
 
+    // The dashboard row has a hover title only when the window has a note: the
+    // label and the reset column carry their own titles.
+    const rowTitleAttr = hint ? ` title="${escapeHtml(rowTitle)}"` : '';
     return `
-        <div class="flex items-center gap-3 mb-1">
+        <div class="flex items-center gap-3 mb-1"${rowTitleAttr}>
             <span class="text-xs text-slate-400 w-14 shrink-0 truncate" title="${escapeHtml(label || '')}">${escapeHtml(label || '')}</span>
             <div class="usage-bar flex-1${staleDim}">
                 ${fillHtml}
@@ -137,46 +150,85 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
     `;
 }
 
+// ---------------------------------------------------------------------------
+// Window lengths and the elapsed ("now") marker
+// ---------------------------------------------------------------------------
+
 /**
- * Compute elapsed fraction for a 5-hour window.
- * @param {string} resetsAt - ISO timestamp when the window resets.
- * @returns {number|null} 0-1 fraction elapsed; null when there is no reset or
- *   the reset is already past (a lapsed window has no "now" marker to draw).
+ * The account fields of each usage window, keyed like the server's
+ * acct.windows object. seconds is the length a payload from an older server
+ * implies (it sends no windows object): 5 hours and 7 days.
  */
-function computeElapsedFraction5h(resetsAt) {
-    if (!resetsAt) return null;
-    try {
-        const resetMs = new Date(resetsAt).getTime();
-        const windowMs = 5 * 60 * 60 * 1000; // 5 hours
-        const startMs = resetMs - windowMs;
-        const nowMs = Date.now();
-        const elapsed = (nowMs - startMs) / windowMs;
-        if (!Number.isFinite(elapsed) || elapsed >= 1) return null;
-        return Math.max(0, elapsed);
-    } catch {
-        return null;
-    }
+const USAGE_WINDOW_FIELDS = {
+    five_hour: { value: 'cached_usage_5h', reset: 'cached_5h_resets_at', seconds: 5 * 3600, short: '5h', long: '5-hour' },
+    seven_day: { value: 'cached_usage_7d', reset: 'cached_7d_resets_at', seconds: 7 * 86400, short: '7d', long: '7-day' },
+};
+
+/** The fields of a window key, or null for a key that is not a window. */
+function _usageWindowFields(windowKey) {
+    return Object.prototype.hasOwnProperty.call(USAGE_WINDOW_FIELDS, windowKey)
+        ? USAGE_WINDOW_FIELDS[windowKey]
+        : null;
+}
+
+/** The server's facts about one window of an account (acct.windows[key]):
+ *  {state, temporary, seconds, note}, or null when the payload has none. */
+function _usageWindowInfo(acct, windowKey) {
+    const win = acct && acct.windows && acct.windows[windowKey];
+    return win && typeof win === 'object' ? win : null;
 }
 
 /**
- * Compute elapsed fraction for a 7-day window.
+ * Fraction of a usage window that has elapsed, for the white "now" marker.
  * @param {string} resetsAt - ISO timestamp when the window resets.
- * @returns {number|null} 0-1 fraction elapsed; null when there is no reset or
- *   the reset is already past (a lapsed window has no "now" marker to draw).
+ * @param {number} windowSeconds - Length of the window in seconds.
+ * @param {number} [nowMs] - Current time in ms (tests).
+ * @returns {number|null} 0-1 fraction elapsed; null when there is no reset,
+ *   the reset is already past (a lapsed window has no "now" marker to draw),
+ *   or the window length is missing or not positive.
  */
-function computeElapsedFraction7d(resetsAt) {
+function computeElapsedFraction(resetsAt, windowSeconds, nowMs) {
     if (!resetsAt) return null;
-    try {
-        const resetMs = new Date(resetsAt).getTime();
-        const windowMs = 7 * 24 * 60 * 60 * 1000; // 7 days
-        const startMs = resetMs - windowMs;
-        const nowMs = Date.now();
-        const elapsed = (nowMs - startMs) / windowMs;
-        if (!Number.isFinite(elapsed) || elapsed >= 1) return null;
-        return Math.max(0, elapsed);
-    } catch {
-        return null;
-    }
+    const seconds = Number(windowSeconds);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    const resetMs = new Date(resetsAt).getTime();
+    if (!Number.isFinite(resetMs)) return null;
+    const windowMs = seconds * 1000;
+    const now = (nowMs === undefined || nowMs === null) ? Date.now() : nowMs;
+    const elapsed = (now - (resetMs - windowMs)) / windowMs;
+    if (!Number.isFinite(elapsed) || elapsed >= 1) return null;
+    return Math.max(0, elapsed);
+}
+
+/**
+ * Elapsed fraction of an account's 5h or 7d window: its cached reset and the
+ * window length the server sent (acct.windows[windowKey].seconds). A payload
+ * without a usable length (an older server) uses 5 hours or 7 days.
+ * @param {object} acct - Account payload.
+ * @param {'five_hour'|'seven_day'} windowKey - The window.
+ * @returns {number|null} 0-1 fraction elapsed, or null (no marker).
+ */
+function windowElapsed(acct, windowKey) {
+    const fields = _usageWindowFields(windowKey);
+    if (!acct || !fields) return null;
+    const win = _usageWindowInfo(acct, windowKey);
+    const sent = win ? Number(win.seconds) : NaN;
+    const seconds = Number.isFinite(sent) && sent > 0 ? sent : fields.seconds;
+    return computeElapsedFraction(acct[fields.reset], seconds);
+}
+
+/**
+ * Render the bar of one model-scoped limit: a per-model entry or the binding
+ * model (the Fable weekly limit, a Codex named limit). This is the one path
+ * for every such bar, so each one gets the elapsed marker of its own window
+ * (model.window_seconds). A payload without window_seconds draws no marker.
+ * @param {{utilization: number, resets_at: (string|null), window_seconds?: number, label?: string}} model
+ * @param {object} [opts] - renderUsageBar opts (compact).
+ * @returns {string} HTML string.
+ */
+function renderModelBar(model, opts) {
+    const m = model || {};
+    return renderUsageBar(m.utilization, m.resets_at, computeElapsedFraction(m.resets_at, m.window_seconds), m.label || 'model', opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,35 +258,58 @@ function _keeperReadDate(epochSecs) {
     return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
+/** Longest reason caption the compact panel column holds ("Oct 27 3:45 PM"). */
+const USAGE_REASON_SHORT_MAX = 14;
+
 /**
- * Explain a usage window that has no future reset, from the account's
- * keeper_state and usage freshness. Returns null when the window is open
- * (the normal "resets ..." text applies) or when nothing better than the
- * plain "no active window" is known.
- * @param {object} acct - Account payload (keeper_state, usage_cached_at, provider).
- * @param {string|null} resetsAt - ISO reset timestamp of this window.
+ * Explain a usage window that the plan does not have, that the provider did
+ * not report, or that has no future reset (window keeper state and usage
+ * freshness). Returns null when the window is open (the normal "resets ..."
+ * text applies) or when nothing better than the plain "no active window" is
+ * known.
+ * @param {object} acct - Account payload (windows, plan, keeper_state,
+ *   usage_cached_at, provider, and the cached value and reset of the window).
+ * @param {'five_hour'|'seven_day'} windowKey - The window.
  * @param {number} [nowMs] - Current time in ms (tests).
- * @param {number|null} [percentage] - This window's cached reading (null = none).
- * @returns {{text: string, short: string, tone: ('warn'|'muted'), muted: boolean, absent?: boolean, hint?: string}|null}
+ * @returns {{text: string, short: string, tone: ('warn'|'muted'), muted: boolean, absent?: boolean, none?: boolean, hint?: string}|null}
  *   text is the dashboard column copy; short is the compact-panel caption
  *   (at most 14 characters); muted marks a stale reading (the bar dims);
- *   absent marks a Codex window that Codex does not report; hint is its
- *   hover text.
+ *   absent marks a window with no reading; none marks a window the plan does
+ *   not have; hint is the hover text.
  */
-function windowReason(acct, resetsAt, nowMs, percentage) {
-    if (!acct) return null;
-    // Codex reports only the windows a plan has (a weekly-only plan has no
-    // 5h window), and a window it stops reporting is cleared. No reading
-    // there means "not reported", not 0% used. A Claude window with no
-    // reading is "no active window", which is 0% used, so it keeps its bar.
-    // Only an explicit null is "no reading": a caller that passes no
-    // percentage (undefined) gets the plain reason logic.
-    if (acct.provider === 'codex' && percentage === null && Number(acct.usage_cached_at) > 0) {
+function windowReason(acct, windowKey, nowMs) {
+    const fields = _usageWindowFields(windowKey);
+    if (!acct || !fields) return null;
+    const win = _usageWindowInfo(acct, windowKey);
+    // The plan has no such window (a verified Ultra account has no 5-hour
+    // limit). The server decides this from the plan catalog and the payload.
+    if (win && win.state === 'absent') {
+        const plan = acct.plan && typeof acct.plan.label === 'string' ? acct.plan.label.trim() : '';
+        const generic = 'no ' + fields.short + ' limit';
+        const text = windowKey === 'five_hour' && plan ? 'not on ' + plan : generic;
         return {
-            text: 'not reported', short: 'not reported', tone: 'muted', muted: false, absent: true,
-            hint: 'Codex does not report this limit for this account.',
+            text,
+            short: text.length <= USAGE_REASON_SHORT_MAX ? text : generic,
+            tone: 'muted', muted: false, absent: true, none: true,
+            hint: win.note || ('This plan has no ' + fields.long + ' limit.'),
         };
     }
+    // A window the provider did not report has no reading: "not reported",
+    // not 0% used. That is a window in the "unknown" state, and a Codex window
+    // in any state (Codex never turns a missing reading into 0%, and an older
+    // server sends no windows). A Claude window that the plan has and that
+    // has no reading is "no active window", which is 0% used, so it keeps its
+    // bar.
+    const value = acct[fields.value];
+    const unreported = (win && win.state === 'unknown') || acct.provider === 'codex';
+    if (unreported && (value === null || value === undefined) && Number(acct.usage_cached_at) > 0) {
+        const provider = acct.provider === 'codex' ? 'Codex' : 'Anthropic';
+        return {
+            text: 'not reported', short: 'not reported', tone: 'muted', muted: false, absent: true,
+            hint: provider + ' does not report this limit for this account.',
+        };
+    }
+    const resetsAt = acct[fields.reset];
     const now = (nowMs === undefined || nowMs === null) ? Date.now() : nowMs;
     const resetMs = resetsAt ? new Date(resetsAt).getTime() : NaN;
     if (Number.isFinite(resetMs) && resetMs > now) return null;
@@ -292,10 +367,20 @@ function windowReason(acct, resetsAt, nowMs, percentage) {
     return null;
 }
 
-/** renderUsageBar opts for an account window: merges the window reason.
- *  percentage is the window's cached reading (null when it has none). */
-function usageBarOpts(acct, resetsAt, base, percentage) {
-    return Object.assign({}, base || {}, { reason: windowReason(acct, resetsAt, undefined, percentage) });
+/**
+ * renderUsageBar opts for an account window: base plus the window reason,
+ * plus the window's note as hint when the window is temporary (an Ultra
+ * account that is not verified yet has a temporary 5-hour limit).
+ * @param {object} acct - Account payload.
+ * @param {'five_hour'|'seven_day'} windowKey - The window.
+ * @param {object} [base] - Other renderUsageBar opts (compact).
+ * @returns {object} renderUsageBar opts.
+ */
+function usageBarOpts(acct, windowKey, base) {
+    const opts = Object.assign({}, base || {}, { reason: windowReason(acct, windowKey) });
+    const win = _usageWindowInfo(acct, windowKey);
+    if (win && win.temporary && win.note) opts.hint = String(win.note);
+    return opts;
 }
 
 /**
