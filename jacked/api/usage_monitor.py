@@ -92,11 +92,13 @@ _STALL_WARNING_COOLDOWN_SECONDS = 1800
 # (wall-clock epoch), "token_fp": str | None}. A consecutively-failing ping
 # (e.g. an exhausted account answering 429) must not be retried every sweep
 # forever — 2026-06 incident: one account pinged every 120s for hours, 429
-# every time. Exponential backoff capped at 1h; cleared on the first
-# successful ping, and dropped as soon as the account's token fingerprint
-# changes (a re-auth must never wait out the old token's backoff). Wall
-# clock, not monotonic: macOS monotonic time stops while the lid is closed,
-# which would stretch a 1h backoff across a whole night of dark wakes.
+# every time. Exponential backoff capped at 1h; cleared on the first ping
+# whose windows are confirmed open (a 200 that opens nothing, verdict
+# ping_ok_no_window, escalates it), and dropped as soon as the account's
+# token fingerprint changes (a re-auth must never wait out the old token's
+# backoff). Wall clock, not monotonic: macOS monotonic time stops while the
+# lid is closed, which would stretch a 1h backoff across a whole night of
+# dark wakes.
 # Transport errors and 5xx never increment ``fails``.
 _ping_backoff: dict[int, dict] = {}
 _PING_BACKOFF_CAP_SECONDS = 3600
@@ -250,6 +252,21 @@ def _setting_str(db, key: str, default: str) -> str:
     """Read a string setting from DB."""
     val = db.get_setting(key)
     return val if val is not None else default
+
+
+def _pct_text(value) -> str:
+    """A usage percent for a log line; "n/a" when there is no reading.
+
+    A null 5h value is an account without a 5-hour window (or no reading
+    yet), never 0% used.
+
+    >>> _pct_text(95), _pct_text(None), _pct_text("junk")
+    ('95.0%', 'n/a', 'n/a')
+    """
+    from jacked.service.usage_pacing import coerce_pct
+
+    pct = coerce_pct(value)
+    return "n/a" if pct is None else f"{pct:.1f}%"
 
 
 def _apply_emergence_persistence(
@@ -419,16 +436,92 @@ def _trigger_for_reason(reason: str | None) -> str:
 # -----------------------------------------------------------------------
 
 
+def _project_rows(rows) -> list[dict]:
+    """Account rows as every polling and auto-swap decision must read them.
+
+    The cache keeps a 5h reading until a payload clears it, so an account
+    without a 5-hour window (a verified Ultra, ChatGPT Pro) can still carry a
+    stale 5h=100 and its reset. :func:`jacked.usage_plans.project_row` drops
+    both; any other row comes back unchanged. Applied once where the rows are
+    read from the database, so the departure rules, the candidate pick, the
+    poll clamps, the burn rate and the recovery time all see the same row.
+    A projected row is a copy: never write one back to the database. A row
+    the resolver cannot read is kept as stored, with a WARNING: jacked never
+    drops a window it cannot rule out.
+    """
+    from jacked.usage_plans import project_row
+
+    out: list[dict] = []
+    for row in rows:
+        try:
+            out.append(project_row(row))
+        except Exception:
+            logger.warning(
+                "Plan resolver failed for account %s; its decisions read the "
+                "cached 5h value as stored",
+                row.get("id") if isinstance(row, dict) else "?",
+                exc_info=True,
+            )
+            out.append(row)
+    return out
+
+
+def _list_decision_accounts(db) -> list[dict]:
+    """The enabled accounts, projected for decisions (see _project_rows).
+
+    Sync (a DB read plus payload parsing): the poll loop runs it off the
+    event loop.
+    """
+    return _project_rows(db.list_accounts(include_inactive=False))
+
+
+def urgency_inputs(row: dict | None) -> dict:
+    """The account-dependent arguments of ``compute_urgency_tier`` for a row.
+
+    ``usage_5h`` / ``usage_7d`` come from the projected row (no 5h value on
+    an account without a 5-hour window); ``has_session`` is False only for an
+    absent window; ``usage_model`` is the utilization of the binding
+    model-weekly limit (for example the weekly Fable limit), or None when the
+    payload reports none. A missing row reads as an idle account with a
+    window. Parses the cached payload once.
+
+    >>> ultra = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x",
+    ...          "cached_usage_5h": 100.0, "cached_usage_7d": 40.0,
+    ...          "cached_usage_raw": '{"limits": [{"kind": "weekly_all", "percent": 40}]}'}
+    >>> urgency_inputs(ultra)
+    {'usage_5h': None, 'usage_7d': 40.0, 'has_session': False, 'usage_model': None}
+    >>> urgency_inputs(None)["has_session"]
+    True
+    """
+    from jacked.service.menubar_summary import binding_model, parse_per_model
+    from jacked.service.usage_pacing import coerce_pct
+    from jacked.usage_plans import account_view, raw_usage
+
+    if not row:
+        return {"usage_5h": None, "usage_7d": None, "has_session": True, "usage_model": None}
+    raw = raw_usage(row)
+    view = account_view(row, raw)
+    projected = view.projected_row()
+    model = binding_model(parse_per_model(raw))
+    return {
+        "usage_5h": projected.get("cached_usage_5h"),
+        "usage_7d": projected.get("cached_usage_7d"),
+        "has_session": view.session.state != "absent",
+        "usage_model": coerce_pct(model.get("utilization")) if model else None,
+    }
+
+
 def _poll_interval_inputs(active_id: int | None, db) -> tuple | None:
-    """The DB reads behind ``_compute_poll_interval``: (account row,
-    critical_5h). Sync, so the poll loop runs it off the event loop. None
-    when there is nothing to read or a read fails (the interval falls back).
+    """The DB reads behind ``_compute_poll_interval``: (urgency_inputs of the
+    active row, critical_5h). Sync, so the poll loop runs it off the event
+    loop. None when there is nothing to read or a read fails (the interval
+    falls back).
     """
     if active_id is None or db is None:
         return None
     try:
         return (
-            db.get_account(active_id),
+            urgency_inputs(db.get_account(active_id)),
             _setting_float(db, "auto_swap_5h_critical", 90),
         )
     except Exception:
@@ -458,12 +551,11 @@ def _compute_poll_interval(
             _TIER_INTERVALS,
         )
 
-        acct, critical_5h = inputs
+        account_inputs, critical_5h = inputs
         br = burn_rates.get(active_id)
         state = _get_usage_state(active_id)
         tier, base = compute_urgency_tier(
-            usage_5h=acct.get("cached_usage_5h") if acct else None,
-            usage_7d=acct.get("cached_usage_7d") if acct else None,
+            **account_inputs,
             burn_rate_5h=br.rate_5h_per_min if br else 0.0,
             critical_5h=critical_5h,
         )
@@ -502,6 +594,10 @@ def _clamp_poll_interval(
       (The literal "excluded by _has_5h_headroom" condition is
       unsatisfiable here: headroom already admits accounts within
       RESET_SUPPRESS_MINUTES of reset, which dwarfs any poll interval.)
+
+    ``accounts`` are the projected rows (``_project_rows``): an account
+    without a 5-hour window has no 5h value, so it never takes the 60 s
+    clamp.
     """
     from jacked.web.auto_swap import (
         TIER_T0,
@@ -573,6 +669,9 @@ def _candidate_staleness_override(acct: dict) -> bool:
       reset, exactly when an account becomes most useful.
     - ``needs_7d_ping`` says the 7d window reset but the cache predates
       the reset (a fresh 7d window means a fresh tier classification).
+
+    ``acct`` is a projected row (``_project_rows``): a stale 5h reading on
+    an account without a 5-hour window never forces a re-fetch.
     """
     from jacked.web.window_keeper import needs_7d_ping
 
@@ -604,7 +703,8 @@ async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> lis
     reset). Non-active accounts rarely change, so there's no need to hit
     the API every tick. Each fetch is bounded by a 30s timeout and a
     catch-all so one bad candidate can't stall the pass.
-    Returns the refreshed accounts list from DB.
+    Returns the refreshed accounts list from DB, projected for decisions
+    (``_project_rows``).
     """
     from jacked.web.auth import fetch_usage
 
@@ -639,7 +739,7 @@ async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> lis
     if fetched:
         logger.debug("Candidate usage: refreshed %d stale accounts", fetched)
 
-    return await asyncio.to_thread(db.list_accounts, include_inactive=False)
+    return await asyncio.to_thread(_list_decision_accounts, db)
 
 
 async def _drain_advisor_tick(
@@ -952,11 +1052,14 @@ async def active_account_poll_loop(app):
     Interval adapts based on urgency tier. The tier thresholds + interval
     values are defined ONCE in jacked.web.auth (compute_urgency_tier +
     _TIER_INTERVALS) — that is the source of truth; keep this doc in sync:
-    - Idle (5h ≤50%, no burn): 10 min
+    - Idle (5h ≤50%, no burn): 5 min
     - Normal (5h 50-70%, or low burn): 5 min
     - Warning (5h 70-85%, or projects critical within 15 min): 4 min
     - Critical (5h >85%, or projects critical within 5 min): 3 min
-    A 7d window above 80% bumps the tier up one. ±15% jitter on each tick to
+    A weekly value above 80% (the 7d window or the binding model-weekly
+    limit, whichever is higher) bumps the tier up one. An account without a
+    5-hour window takes its tier from that weekly value alone (>95%
+    critical, >90% warning, >80% normal). ±15% jitter on each tick to
     prevent sync patterns; the interval can clamp tighter near a window reset.
 
     Handles auto-swap decisions, TOCTOU guard, burn-rate tracking with
@@ -1045,12 +1148,13 @@ async def active_account_poll_loop(app):
             # -- Late imports (avoid circular deps) ----------------------
             from jacked.web.auth import fetch_usage
             from jacked.api.credential_helpers import read_fresh_active_token
+            from jacked.service.usage_pacing import account_recovery_at
+            from jacked.usage_plans import account_view, resolve_plan
             from jacked.web.auto_swap import (
                 should_swap_now,
                 pick_best_target,
                 update_burn_rate,
                 tier_critical_threshold,
-                tier_label as _tier_label,
                 tier_for,
                 target_for_tier,
                 deficit_vs_target,
@@ -1124,10 +1228,12 @@ async def active_account_poll_loop(app):
 
             # -- Read active account data from DB ------------------------
             # One thread hop: the account list and the poll-interval reads
-            # ran back to back on the loop.
+            # ran back to back on the loop. Every row is projected here,
+            # once (_project_rows): no decision below reads a 5h value on
+            # an account without a 5-hour window.
             def _read_tick_accounts():
                 return (
-                    db.list_accounts(include_inactive=False),
+                    _list_decision_accounts(db),
                     _poll_interval_inputs(active_acct_id, db),
                 )
 
@@ -1216,6 +1322,25 @@ async def active_account_poll_loop(app):
                 safe_acct["_poll_interval"] = int(_poll_interval)
                 safe_acct["_poll_tier"] = _poll_tier
                 safe_acct["_last_poll_at"] = int(time.time())
+                # Plan and window facts, the same objects GET
+                # /api/auth/accounts carries, so a live refresh draws the
+                # bars the plan really has (an absent 5h window included).
+                # Guarded like the binding-model block: a resolver failure
+                # omits the two keys and never drops the broadcast.
+                _view = None
+                try:
+                    _view = account_view(active_acct)
+                    _plan_payload = _view.plan_payload()
+                    _windows_payload = _view.windows_payload()
+                except Exception as _view_err:
+                    logger.warning(
+                        "plan/windows payload failed for account %d: %s",
+                        active_acct_id,
+                        _view_err,
+                    )
+                else:
+                    safe_acct["plan"] = _plan_payload
+                    safe_acct["windows"] = _windows_payload
                 # Compact binding-model cap so the dashboard can surgically
                 # refresh the inline bar (this payload is whitelisted flat
                 # fields, not the full AccountResponse the bulk path sends).
@@ -1224,7 +1349,8 @@ async def active_account_poll_loop(app):
 
                     _raw = active_acct.get("cached_usage_raw")
                     safe_acct["_binding_model"] = binding_model_compact(
-                        json.loads(_raw) if _raw else None
+                        json.loads(_raw) if _raw else None,
+                        _view.plan if _view is not None else None,
                     )
                 except (
                     json.JSONDecodeError,
@@ -1255,10 +1381,18 @@ async def active_account_poll_loop(app):
             usage_7d = active_acct.get("cached_usage_7d")
 
             # -- Burn rate (skip if usage unchanged) ---------------------
+            # "Unchanged" needs BOTH windows unchanged: an account without a
+            # 5-hour window reads 5h=0 forever, and judging on 5h alone
+            # decayed its rate while its weekly usage climbed.
             prev = _burn_rates.get(active_acct_id)
             current_5h_val = usage_5h or 0
+            current_7d_val = usage_7d or 0
 
-            if prev is not None and current_5h_val == prev.last_check_5h:
+            if (
+                prev is not None
+                and current_5h_val == prev.last_check_5h
+                and current_7d_val == prev.last_check_7d
+            ):
                 # Usage unchanged — track consecutive ticks
                 ticks = _burn_rate_unchanged_ticks.get(active_acct_id, 0) + 1
                 _burn_rate_unchanged_ticks[active_acct_id] = ticks
@@ -1281,7 +1415,7 @@ async def active_account_poll_loop(app):
                     _burn_rates,
                     active_acct_id,
                     current_5h=current_5h_val,
-                    current_7d=usage_7d or 0,
+                    current_7d=current_7d_val,
                 )
 
             # -- Tier-aware threshold ------------------------------------
@@ -1483,7 +1617,7 @@ async def active_account_poll_loop(app):
                     _decision_trigger = "tick"
                     _decision_reason = (
                         f"stay: no candidate has deficit "
-                        f"(tier {_tier_label(active_acct).strip() or 'unset'})"
+                        f"(plan {resolve_plan(active_acct).label or 'unknown'})"
                     )
                 else:
                     _decision_target_id = best["id"]
@@ -1542,25 +1676,24 @@ async def active_account_poll_loop(app):
                 if now_ts - _last_exhaustion_warning > _EXHAUSTION_COOLDOWN_SECONDS:
                     logger.warning(
                         "Auto-swap needed but no eligible target "
-                        "(active account %d at 5h=%.1f%%)",
+                        "(active account %d at 5h=%s, 7d=%s)",
                         active_acct_id,
-                        usage_5h or 0,
+                        _pct_text(usage_5h),
+                        _pct_text(usage_7d),
                     )
                     _last_exhaustion_warning = now_ts
 
-                next_recovery_at = None
-                for acct in accounts:
-                    resets = acct.get("cached_5h_resets_at")
-                    if not resets:
-                        continue
-                    try:
-                        r = datetime.fromisoformat(resets.replace("Z", "+00:00"))
-                        if r > now_utc and (
-                            next_recovery_at is None or r < next_recovery_at
-                        ):
-                            next_recovery_at = r
-                    except (ValueError, TypeError):
-                        continue
+                # The earliest time some account becomes workable again:
+                # per account, the latest future reset among its constrained
+                # windows (a plan without a 5-hour window offers its weekly
+                # reset, never a stale 5h one). Accounts with no constrained
+                # window, or none with a knowable reset, offer nothing.
+                recoveries = [
+                    r
+                    for r in (account_recovery_at(a, now_utc) for a in accounts)
+                    if r is not None
+                ]
+                next_recovery_at = min(recoveries) if recoveries else None
 
                 if ws_registry:
                     await ws_registry.broadcast(
@@ -1589,12 +1722,12 @@ async def active_account_poll_loop(app):
             else:
                 trigger = _trigger_for_reason(reason)
                 logger.info(
-                    "Auto-swap: switching from account %d (5h=%.1f%%) to "
-                    "account %d (5h=%.1f%%) — %s [%s]",
+                    "Auto-swap: switching from account %d (5h=%s) to "
+                    "account %d (5h=%s) — %s [%s]",
                     active_acct_id,
-                    usage_5h or 0,
+                    _pct_text(usage_5h),
                     best["id"],
-                    best.get("cached_usage_5h") or 0,
+                    _pct_text(best.get("cached_usage_5h")),
                     reason,
                     trigger,
                 )
@@ -2120,7 +2253,9 @@ def _bounded_reset(iso: str | None, now: float, max_ahead: float) -> str | None:
     return None
 
 
-def _ping_window_cache_fields(result, now: float | None = None) -> dict:
+def _ping_window_cache_fields(
+    result, now: float | None = None, has_session: bool = True
+) -> dict:
     """update_account_usage_cache kwargs from a successful ping's headers.
 
     A window is written only when the ping reports BOTH its reset and its
@@ -2130,15 +2265,37 @@ def _ping_window_cache_fields(result, now: float | None = None) -> dict:
     opened). A reset-only reply leaves the cache to the usage read-back.
     Resets outside a sane horizon (5h: 6h ahead; 7d: 8d ahead) are ignored.
     Utilization headers are a 0..1 fraction; the cache columns use percent.
+
+    The write stamps usage_cached_at for the whole row. On an account that
+    has a 5-hour window (*has_session*, the default) the 5h pair must
+    therefore be complete: a 7d-only measurement would stamp a stale 5h
+    utilization as fresh. An account whose plan has no 5-hour window (a
+    verified Ultra, ChatGPT Pro) has no 5h reading to go stale: its 5h
+    headers are ignored completely, and a complete 7d pair is written alone.
+
+    >>> from jacked.web.window_keeper import PingResult
+    >>> now = 1_800_000_000
+    >>> reply = PingResult(ok=True, rate_limit={
+    ...     "anthropic-ratelimit-unified-5h-reset": str(now + 3600),
+    ...     "anthropic-ratelimit-unified-7d-reset": str(now + 86400),
+    ...     "anthropic-ratelimit-unified-7d-utilization": "0.4"})
+    >>> _ping_window_cache_fields(reply, now)  # the 5h pair is incomplete
+    {}
+    >>> sorted(_ping_window_cache_fields(reply, now, has_session=False).items())
+    [('seven_day', 40.0), ('seven_day_resets_at', '2027-01-16T08:00:00+00:00')]
     """
     now = time.time() if now is None else now
     fields: dict = {}
-    windows = (
-        ("five_hour", result.reset_5h_iso(), _KEEPER_MAX_RETRY_SECONDS,
-         "anthropic-ratelimit-unified-5h-utilization"),
+    windows = [
         ("seven_day", result.reset_7d_iso(), _KEEPER_MAX_7D_RESET_SECONDS,
          "anthropic-ratelimit-unified-7d-utilization"),
-    )
+    ]
+    if has_session:
+        windows.insert(
+            0,
+            ("five_hour", result.reset_5h_iso(), _KEEPER_MAX_RETRY_SECONDS,
+             "anthropic-ratelimit-unified-5h-utilization"),
+        )
     for key, reset_iso, horizon, util_header in windows:
         reset = _bounded_reset(reset_iso, now, horizon)
         raw = result.rate_limit.get(util_header)
@@ -2149,10 +2306,10 @@ def _ping_window_cache_fields(result, now: float | None = None) -> dict:
         if reset and value is not None and 0.0 <= value <= 1.0:
             fields[f"{key}_resets_at"] = reset
             fields[key] = round(value * 100.0, 2)
-    # The write stamps usage_cached_at for the whole row, so the 5h window
-    # (the one the keeper opened) must be complete; a 7d-only measurement
+    # The write stamps usage_cached_at for the whole row, so on an account
+    # with a 5h window that window must be complete; a 7d-only measurement
     # would stamp a stale 5h utilization as fresh.
-    if "five_hour" not in fields:
+    if has_session and "five_hour" not in fields:
         return {}
     return fields
 
@@ -2361,10 +2518,22 @@ async def _keeper_auth_ladder(
 
 
 def _keeper_window_needed(acct: dict, state: dict) -> tuple[bool, bool]:
-    """(5h window lapsed, 7d window lapsed) for one account."""
+    """(5h window lapsed, 7d window lapsed) for one account.
+
+    An account whose plan has no 5-hour window (session state ``absent``: a
+    verified Ultra, ChatGPT Pro) never needs a 5h ping, whatever reset lingers
+    in its cache; a ping cannot open a window the plan does not have. An
+    ``unknown`` state keeps the check: jacked never skips a window it cannot
+    rule out (:func:`jacked.usage_plans.has_session`).
+
+    *state* feeds the recent-success rule for a missing 7d reset below. The
+    post-ping confirmation passes the ping that just succeeded as that
+    success.
+    """
+    from jacked.usage_plans import has_session
     from jacked.web import window_keeper as wk
 
-    needs_5h = wk.needs_ping(acct.get("cached_5h_resets_at"))
+    needs_5h = has_session(acct) and wk.needs_ping(acct.get("cached_5h_resets_at"))
     needs_7d = wk.needs_7d_ping(
         acct.get("cached_7d_resets_at"), acct.get("usage_cached_at")
     )
@@ -2383,15 +2552,45 @@ def _keeper_window_needed(acct: dict, state: dict) -> tuple[bool, bool]:
 
 
 async def _keeper_record_success(
-    db, acct: dict, good_token: str, result, check_interval: float, now: float
+    db,
+    acct: dict,
+    good_token: str,
+    result,
+    check_interval: float,
+    now: float,
+    *,
+    needed: tuple[bool, bool],
 ) -> None:
-    """Persist the window a successful ping opened, then the keeper state."""
+    """Persist what a successful ping opened, then the keeper verdict.
+
+    *needed* is ``(needs_5h, needs_7d)``: the windows that made the keeper
+    ping. After the usage read-back each of them is confirmed against the
+    fresh row, judged as of THIS ping (it is the recent success that the
+    missing-7d-reset rule of :func:`_keeper_window_needed` speaks of):
+
+    1. 5h, strict: a needed 5h window is confirmed only when the fresh row
+       shows a future 5h reset.
+    2. 7d with no reset: a needed 7d window whose fresh reset is null is
+       confirmed when the 5h window is open or absent. The 200 started the
+       weekly window; the API omits the reset (one account here read
+       ``resets_at: null`` for 9 days), and no further ping can change that.
+    3. 7d with a lapsed reset: a needed 7d window whose fresh reset is set
+       but still lapsed (``needs_7d_ping`` true: no header, and the
+       read-back did not land) is NOT confirmed.
+
+    The verdict is ``ok`` only when every needed window is confirmed.
+    Otherwise it is ``ping_ok_no_window``, the WARNING names the windows
+    that did not open, and the backoff escalates one step (600 s, 1200 s,
+    2400 s, then the one-hour cap at the default interval). The escalation
+    count is dropped ONLY on success: a ping that never opens its window must
+    not restart at the first step on every sweep.
+    """
+    from jacked.usage_plans import has_session
     from jacked.web import auth as auth_mod
-    from jacked.web import window_keeper as wk
 
     account_id = acct["id"]
-    _ping_backoff.pop(account_id, None)
-    cache_fields = _ping_window_cache_fields(result)
+    needs_5h, needs_7d = needed
+    cache_fields = _ping_window_cache_fields(result, has_session=has_session(acct))
     if cache_fields:
         try:
             await asyncio.to_thread(
@@ -2416,13 +2615,28 @@ async def _keeper_record_success(
             account_id,
         )
     fresh = await asyncio.to_thread(db.get_account, account_id) or {}
-    window_open = not wk.needs_ping(fresh.get("cached_5h_resets_at"))
+    if fresh:
+        # Judge the windows as of THIS ping: it is the recent success the
+        # missing-7d-reset rule speaks of (a 200 starts the weekly window,
+        # and no further ping can make a read report a reset it omits). A
+        # lapsed 7d reset that nothing refreshed still counts as not open.
+        after_5h, after_7d = _keeper_window_needed(
+            fresh, {"last_status": "ok", "last_ping_at": now}
+        )
+    else:
+        # The row is gone (deleted mid-sweep): nothing is confirmed open.
+        after_5h, after_7d = needs_5h, needs_7d
+    missing = [
+        name
+        for name, before, after in (("5h", needs_5h, after_5h), ("7d", needs_7d, after_7d))
+        if before and after
+    ]
     # The row may hold a rotated token now: key the state on the CURRENT
     # candidate set so a persisted backoff survives the next sweep's check.
     fresh_fp = _candidate_fingerprint(*_keeper_candidates(fresh)) if fresh else None
     fields = {
         "last_ping_at": int(now),
-        "last_status": "ok" if window_open else "ping_ok_no_window",
+        "last_status": "ping_ok_no_window" if missing else "ok",
         "error_type": None,
         "request_id": result.request_id,
         "consecutive_auth_failures": 0,
@@ -2431,16 +2645,18 @@ async def _keeper_record_success(
         "paused_until": None,
         "token_fp": fresh_fp,
     }
-    if not window_open:
+    if missing:
         logger.warning(
-            "Window keeper: ping for account %d succeeded but no open 5h "
-            "window is recorded (no reset header, usage read-back did not "
-            "land)",
+            "Window keeper: ping for account %d succeeded but the %s did not "
+            "open (no reset header, usage read-back did not land)",
             account_id,
+            " and ".join(missing) + (" windows" if len(missing) > 1 else " window"),
         )
         fields["next_attempt_at"] = _arm_ping_backoff(
             account_id, fresh_fp, check_interval, now
         )
+    else:
+        _ping_backoff.pop(account_id, None)
     await asyncio.to_thread(_write_keeper_state, db, account_id, **fields)
 
 
@@ -2608,6 +2824,7 @@ async def _keeper_record_failure(
 
 async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
     """Run the keeper for one account. Returns 'pinged', 'failed' or 'skipped'."""
+    from jacked.usage_plans import has_session
     from jacked.web import window_keeper as wk
 
     account_id = acct["id"]
@@ -2619,7 +2836,13 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
 
     needs_5h, needs_7d = _keeper_window_needed(acct, state)
     if not needs_5h and not needs_7d:
-        if state.get("skip_reason"):
+        if not has_session(acct):
+            # The plan has no 5-hour window (a verified Ultra): no ping can
+            # open one, so say why the keeper stays idle on this account.
+            await asyncio.to_thread(
+                _note_keeper_skip, db, acct, state, "no_session_window"
+            )
+        elif state.get("skip_reason"):
             await asyncio.to_thread(_note_keeper_skip, db, acct, state, None)
         return "skipped"
     if not acct.get("auto_swap_enabled"):
@@ -2694,7 +2917,10 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
 
     now = time.time()
     if good_token is not None:
-        await _keeper_record_success(db, acct, good_token, result, check_interval, now)
+        await _keeper_record_success(
+            db, acct, good_token, result, check_interval, now,
+            needed=(needs_5h, needs_7d),
+        )
         return "pinged"
     await _keeper_record_failure(
         db, acct, state, result, ladder, fp, check_interval, now, tried=tried
