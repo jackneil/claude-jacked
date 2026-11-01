@@ -477,7 +477,7 @@ account_recovery_at(acct, now, constrained_threshold=90.0) -&gt; datetime | None
 
 <h3>Task B2a: monitor and keeper (Opus builder, worktree pw-b2a)</h3>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> Keeper skip (<code>no_session_window</code>), 7d-only header cache, success confirmed against the windows that required the ping, backoff popped only on success; repeated-sweep, read-back-timeout and restart tests.</li>
+  <li><input type="checkbox" disabled> Keeper skip (<code>no_session_window</code>), 7d-only header cache, success confirmed against the windows that required the ping (a needed 5h window must show a future reset; a needed 7d window is confirmed by a fresh read with no reset at all, because the API omits it for days at a time, or by a reset that is no longer lapsed; a non-null reset that is still lapsed is not confirmed), backoff popped only on success; repeated-sweep, read-back-timeout and restart tests.</li>
   <li><input type="checkbox" disabled> Projection: every account dict the active poll loop, the candidate refresh, the poll-interval inputs and the clamps read passes through <code>project_row</code>, so no decision sees a stale 5h value on an absent window (cross-consumer regression test with a stale 5h=100 Ultra row: no 5h-critical departure, no 5h urgency).</li>
   <li><input type="checkbox" disabled> <code>usage_cache_updates</code>: an authoritative payload (a <code>limits</code> list whose kinds jacked knows) with no session entry and no <code>five_hour</code> object clears the 5h columns, even when the <code>five_hour</code> key is missing.</li>
   <li><input type="checkbox" disabled> Burn rate: unchanged only when 5h and 7d are both unchanged.</li>

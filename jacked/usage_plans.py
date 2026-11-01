@@ -72,7 +72,10 @@ GENERIC_NO_SESSION_NOTE = "This plan has no 5-hour limit. Weekly limits still ap
 _LABEL_MAX = 40
 _NOTE_MAX = 300
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_PROSE_DASHES = ("—", "–")  # em-dash, en-dash: banned in UI copy
+# Em-dash and en-dash, banned as prose dashes in UI copy. Built with chr() so
+# the repo's em-dash guard (tests/unit/test_no_em_dash_in_user_text.py), which
+# reads string constants, does not mistake this detector for UI text.
+_PROSE_DASHES = (chr(0x2014), chr(0x2013))
 
 _MISSING: Any = object()
 
