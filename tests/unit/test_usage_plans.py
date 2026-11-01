@@ -117,7 +117,7 @@ class TestBundledCatalog:
 
     def test_ships_inside_the_package(self):
         assert (up.DATA_ROOT / up.CATALOG_FILE).is_file()
-        assert up.DATA_ROOT == Path(up.__file__).parent / "data"
+        assert up.DATA_ROOT == Path(up.__file__).resolve().parents[1] / "data"
 
     def test_catalog_is_not_excluded_from_the_wheel(self):
         """Hatchling ships every file under jacked/ that git does not ignore
@@ -129,7 +129,7 @@ class TestBundledCatalog:
 
         if shutil.which("git") is None:
             pytest.skip("git not installed")
-        repo = Path(up.__file__).resolve().parents[1]
+        repo = Path(up.__file__).resolve().parents[2]
         if not (repo / ".git").exists():
             pytest.skip("not a git checkout")
         result = subprocess.run(
