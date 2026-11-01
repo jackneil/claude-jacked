@@ -198,7 +198,10 @@ def _entry(spec, parent: PlanEntry, entry_id: Optional[str]) -> PlanEntry:
             raise _EntryError("windows is not an object")
         for kind, seconds in raw_windows.items():
             if kind not in WINDOW_KINDS:
-                raise _EntryError(f"unknown window kind {kind!r}")
+                # A window kind this release does not know: ignored, never a
+                # reason to drop an otherwise valid plan.
+                logger.warning("Plan catalog: ignoring unknown window kind %r", kind)
+                continue
             if not (isinstance(seconds, int) and not isinstance(seconds, bool) and seconds > 0):
                 raise _EntryError(f"invalid {kind} window length {seconds!r}")
             windows[kind] = seconds

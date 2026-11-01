@@ -119,6 +119,25 @@ class TestBundledCatalog:
         assert (up.DATA_ROOT / up.CATALOG_FILE).is_file()
         assert up.DATA_ROOT == Path(up.__file__).parent / "data"
 
+    def test_catalog_is_not_excluded_from_the_wheel(self):
+        """Hatchling ships every file under jacked/ that git does not ignore
+        (pyproject.toml: packages = ["jacked"], no include list). A .gitignore
+        pattern that matched the catalog would drop it from the wheel while
+        the source tree, and every other test here, still had it."""
+        import shutil
+        import subprocess
+
+        if shutil.which("git") is None:
+            pytest.skip("git not installed")
+        repo = Path(up.__file__).resolve().parents[1]
+        if not (repo / ".git").exists():
+            pytest.skip("not a git checkout")
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", "jacked/data/usage_plans.json"],
+            cwd=repo, capture_output=True,
+        )
+        assert result.returncode == 1, "jacked/data/usage_plans.json is git-ignored"
+
     def test_known_plans_are_present(self):
         cat = up.load_catalog(up.DATA_ROOT)
         claude = cat.providers["claude"]
@@ -644,8 +663,18 @@ class TestWindowLengths:
         assert team.session.seconds == 18000
         assert up.resolve_plan({"subscription_type": "pro"}).window_seconds("session") == 10800
 
-    @pytest.mark.parametrize("windows", [{"session": 0}, {"session": True},
-                                         {"monthly": 100}, "x"])
+    def test_unknown_window_kind_is_ignored_not_fatal(self, tmp_path, caplog):
+        root = _write(tmp_path, {"version": 1, "providers": {"claude": {"subscriptions": {
+            "pro": {"label": "Pro", "session": "always",
+                    "windows": {"monthly": 100, "session": 7200}}}}}})
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        pro = cat.providers["claude"].subscriptions["pro"].plan
+        assert dict(pro.windows)["session"] == 7200
+        assert "monthly" not in dict(pro.windows)
+        assert any("monthly" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("windows", [{"session": 0}, {"session": True}, "x"])
     def test_invalid_plan_lengths_skip_the_entry(self, tmp_path, caplog, windows):
         root = _write(tmp_path, {"version": 1, "providers": {"claude": {"subscriptions": {
             "pro": {"label": "Pro", "session": "always", "windows": windows}}}}})
