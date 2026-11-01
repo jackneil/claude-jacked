@@ -89,6 +89,16 @@ class TestRecovery:
     def test_nothing_constrained(self):
         assert pacing.account_recovery_at(_max(), NOW) is None
 
+    def test_recovery_names_the_window_that_frees_the_account(self):
+        reset, kind = pacing.account_recovery(_max(cached_usage_5h=95.0), NOW)
+        assert (reset.isoformat(), kind) == ("2026-11-01T19:00:00+00:00", "5h")
+        reset, kind = pacing.account_recovery(_max(cached_usage_5h=95.0, cached_usage_7d=99.0), NOW)
+        assert (reset.isoformat(), kind) == ("2026-11-02T05:00:00+00:00", "7d")
+        # An Ultra account is freed by its weekly window, never a stale 5h one.
+        ultra = _ultra(cached_usage_5h=100.0, cached_5h_resets_at="2026-11-01T20:00:00+00:00",
+                       cached_usage_7d=96.0)
+        assert pacing.account_recovery(ultra, NOW)[1] == "7d"
+
 
 class TestSummary:
     def test_best_account_names_its_window(self):

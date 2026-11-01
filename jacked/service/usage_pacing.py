@@ -214,36 +214,51 @@ def worst_window(
     return max(ordered, key=lambda w: w[1])
 
 
-def account_recovery_at(
+def account_recovery(
     acct: dict, now: datetime, constrained_threshold: float = 90.0
-) -> Optional[datetime]:
-    """When the account becomes workable again, or None.
+) -> Optional[tuple[datetime, str]]:
+    """When the account becomes workable again, and the window that decides it.
 
-    That is the LATEST future reset among its constrained windows (effective
-    percent at or above ``constrained_threshold``): one window resetting while
-    another is still constrained does not make the account usable. None when
-    no window is constrained, or when a constrained window has no knowable
-    future reset (a partial answer would name a time at which the account is
-    still walled).
+    Returns ``(reset, kind)``: the LATEST future reset among its constrained
+    windows (effective percent at or above ``constrained_threshold``), and
+    that window's kind ("5h" or "7d"). One window resetting while another is
+    still constrained does not make the account usable. None when no window
+    is constrained, or when a constrained window has no knowable future reset
+    (a partial answer would name a time at which the account is still
+    walled).
 
     >>> now = datetime(2026, 1, 2, tzinfo=timezone.utc)
     >>> cached = int(now.timestamp()) - 60
     >>> acct = {"cached_usage_5h": 95.0, "cached_5h_resets_at": "2026-01-02T03:00:00Z",
     ...         "cached_usage_7d": 97.0, "cached_7d_resets_at": "2026-01-05T00:00:00Z",
     ...         "usage_cached_at": cached}
-    >>> account_recovery_at(acct, now).isoformat()
-    '2026-01-05T00:00:00+00:00'
-    >>> account_recovery_at({"cached_usage_7d": 10.0}, now) is None
+    >>> reset, kind = account_recovery(acct, now)
+    >>> reset.isoformat(), kind
+    ('2026-01-05T00:00:00+00:00', '7d')
+    >>> account_recovery({"cached_usage_7d": 10.0}, now) is None
     True
     """
-    constrained: list[datetime] = []
-    for _kind, pct, reset in account_windows(acct, now):
+    constrained: list[tuple[datetime, str]] = []
+    for kind, pct, reset in account_windows(acct, now):
         if pct is None or pct < constrained_threshold:
             continue
         if reset is None or reset <= now:
             return None
-        constrained.append(reset)
+        constrained.append((reset, kind))
     return max(constrained) if constrained else None
+
+
+def account_recovery_at(
+    acct: dict, now: datetime, constrained_threshold: float = 90.0
+) -> Optional[datetime]:
+    """:func:`account_recovery` without the window kind.
+
+    >>> now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    >>> account_recovery_at({"cached_usage_7d": 10.0}, now) is None
+    True
+    """
+    found = account_recovery(acct, now, constrained_threshold)
+    return found[0] if found else None
 
 
 def compute_best_account_summary(

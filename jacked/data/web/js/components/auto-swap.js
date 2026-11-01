@@ -534,15 +534,16 @@ function renderExhaustionBanner() {
         const now = Date.now();
         const diffMin = Math.max(0, Math.ceil((recoverAt.getTime() - now) / 60000));
         // The recovery time is the earliest moment an account has usage
-        // again, from whichever of its windows is full (5-hour, weekly or a
-        // model limit), so the text names no window. No em-dashes: this is
+        // again: the reset of the window that walls it (next_recovery_window,
+        // "5h" or "7d"). Name that window: a model limit (Fable, for
+        // example) can still be full after it resets. No em-dashes: this is
         // user-facing copy.
-        if (diffMin > 60) {
-            recoveryText = `Usage is available again in ${Math.floor(diffMin/60)}h ${diffMin%60}m`;
-        } else if (diffMin > 0) {
-            recoveryText = `Usage is available again in ${diffMin}m`;
+        const windowName = { '5h': 'The 5-hour limit', '7d': 'The weekly limit' }[data.next_recovery_window];
+        if (diffMin > 0) {
+            const span = diffMin > 60 ? `${Math.floor(diffMin/60)}h ${diffMin%60}m` : `${diffMin}m`;
+            recoveryText = windowName ? `${windowName} resets in ${span}` : `Usage is available again in ${span}`;
         } else {
-            recoveryText = 'Usage should be available again soon';
+            recoveryText = windowName ? `${windowName} should reset soon` : 'Usage should be available again soon';
         }
     }
     el.classList.remove('hidden');

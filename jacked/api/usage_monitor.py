@@ -1148,7 +1148,7 @@ async def active_account_poll_loop(app):
             # -- Late imports (avoid circular deps) ----------------------
             from jacked.web.auth import fetch_usage
             from jacked.api.credential_helpers import read_fresh_active_token
-            from jacked.service.usage_pacing import account_recovery_at
+            from jacked.service.usage_pacing import account_recovery
             from jacked.usage_plans import account_view
             from jacked.web.auto_swap import (
                 should_swap_now,
@@ -1691,10 +1691,11 @@ async def active_account_poll_loop(app):
                 # window, or none with a knowable reset, offer nothing.
                 recoveries = [
                     r
-                    for r in (account_recovery_at(a, now_utc) for a in accounts)
+                    for r in (account_recovery(a, now_utc) for a in accounts)
                     if r is not None
                 ]
-                next_recovery_at = min(recoveries) if recoveries else None
+                next_recovery = min(recoveries) if recoveries else None
+                next_recovery_at = next_recovery[0] if next_recovery else None
 
                 if ws_registry:
                     await ws_registry.broadcast(
@@ -1707,6 +1708,12 @@ async def active_account_poll_loop(app):
                                 next_recovery_at.isoformat()
                                 if next_recovery_at
                                 else None
+                            ),
+                            # "5h" or "7d": the window whose reset frees the
+                            # account, so the banner names it instead of
+                            # promising usage in general.
+                            "next_recovery_window": (
+                                next_recovery[1] if next_recovery else None
                             ),
                         },
                     )

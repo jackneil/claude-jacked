@@ -3445,6 +3445,7 @@ class TestNoSessionProjection:
             datetime.fromisoformat(resets_7d.replace("Z", "+00:00"))
         )
         assert exhausted[0]["usage_5h"] is None
+        assert exhausted[0]["next_recovery_window"] == "7d"
         warnings = [r.getMessage() for r in caplog.records if "no eligible target" in r.getMessage()]
         assert warnings and "5h=n/a" in warnings[0] and "7d=100.0%" in warnings[0]
 
@@ -3474,6 +3475,7 @@ class TestNoSessionProjection:
         )
         assert datetime.fromisoformat(exhausted[0]["next_recovery_at"]) == expected
         assert expected == datetime.fromisoformat(walled["cached_5h_resets_at"].replace("Z", "+00:00"))
+        assert exhausted[0]["next_recovery_window"] == "5h"
 
 
 @pytest.mark.usefixtures("_fresh_auth_usage_state")
