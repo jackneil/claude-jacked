@@ -100,6 +100,21 @@ def _classify_windows(primary, secondary) -> dict:
     ):
         if not window:
             continue
+        if not isinstance(window, Mapping):
+            # A window that is not an object (a string, a list, a bare
+            # number) is a payload shape jacked does not understand: it is
+            # not placed, and the payload stops being authoritative so no
+            # cache column is cleared on its account.
+            slots["dropped"] = True
+            key = f"nonobject:{positional_slot}:{type(window).__name__}"
+            log = logger.debug if key in _warned_shapes else logger.warning
+            _warned_shapes.add(key)
+            log(
+                "codex rate-limit %s window is a %s, not an object; ignoring "
+                "it. The app-server payload shape may have changed",
+                positional_slot, type(window).__name__,
+            )
+            continue
         dur = window.get("windowDurationMins")
         if _usable_duration(dur):
             slot = "five_hour" if dur < _SHORT_WINDOW_MAX_MINS else "seven_day"

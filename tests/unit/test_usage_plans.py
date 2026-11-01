@@ -771,3 +771,23 @@ class TestPerModelWindowSeconds:
         monkeypatch.setattr(up, "_catalog_cache", up.load_catalog(root))
         plan = up.resolve_plan({"subscription_type": "max"})
         assert parse_per_model(ULTRA_RAW, plan)[0]["window_seconds"] == 86400
+
+
+class TestCodexNonObjectWindows:
+    @pytest.mark.parametrize("junk", ["10080", [1, 2], 7, True])
+    def test_non_object_window_is_ignored_not_a_crash(self, junk):
+        from jacked.codex.usage import normalize_rate_limits
+
+        raw = {"rateLimits": {"primary": junk, "secondary": None}}
+        norm = normalize_rate_limits(raw)
+        assert norm["five_hour"]["reported"] is False
+        assert norm["windows_complete"] is False  # never authoritative
+        row = {"provider": "codex", "subscription_type": "plus"}
+        assert up.account_view(row, raw).session.state == "unknown"
+        assert up.has_session(row, raw) is True
+        # The secondary slot is guarded the same way.
+        raw = {"rateLimits": {"primary": {"usedPercent": 3, "windowDurationMins": 300},
+                              "secondary": junk}}
+        norm = normalize_rate_limits(raw)
+        assert norm["five_hour"]["reported"] is True
+        assert norm["windows_complete"] is False
