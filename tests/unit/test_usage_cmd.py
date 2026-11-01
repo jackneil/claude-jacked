@@ -20,7 +20,9 @@ tests pin the JSON contract that skill depends on:
 - windows are plan-aware: a plan without a 5-hour window (a verified Ultra,
   ChatGPT Pro) reports null 5h fields, and its worst window is the weekly
   one even when a stale 5h value lingers in the cache;
-- ``active`` comes from jacked's own database, never the credential store;
+- ``selected`` comes from jacked's own database (desired account first),
+  and ``in_use`` from the session tracker by process ancestry, never the
+  credential store;
 - ``--provider`` limits the rows AND the summary to one provider.
 """
 
@@ -29,6 +31,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from jacked.cli import main
@@ -39,9 +42,19 @@ ROW_KEYS = {
     "validation_status", "usage_5h_pct", "usage_7d_pct",
     "resets_5h_at", "resets_7d_at", "cache_age_seconds",
     "plan", "plan_id", "session_window", "model_limits",
-    "worst_window_pct", "worst_window", "worst_window_resets_at", "active",
+    "worst_window_pct", "worst_window", "worst_window_resets_at", "selected",
+    "in_use",
 }
 MODEL_LIMIT_KEYS = {"label", "pct", "resets_at", "window_seconds"}
+
+
+@pytest.fixture(autouse=True)
+def _no_calling_session(monkeypatch):
+    """No test walks the real process table: by default no tracked session
+    runs the command. Tests of ``in_use`` set the ancestry themselves."""
+    import jacked.session_ancestry as ancestry
+
+    monkeypatch.setattr(ancestry, "ancestor_pids", lambda *a, **k: [])
 
 
 def _seed_db(home: Path, accounts: list[dict]) -> list[int]:
@@ -522,7 +535,8 @@ def test_verified_ultra_row_reports_no_5h_window(tmp_path, monkeypatch):
     assert row["model_limits"] == [
         {"label": "Fable", "pct": 61.0, "resets_at": future_7d, "window_seconds": 604800},
     ]
-    assert row["active"] is False
+    assert row["selected"] is False
+    assert row["in_use"] is False
     assert payload["summary"]["best_account_worst_window"] == "7d"
     assert "tok-secret" not in result.output
 
@@ -589,7 +603,7 @@ def test_model_limit_entries_are_allowlisted_and_coerced(tmp_path, monkeypatch):
     assert "should-not-leak" not in result.output
 
 
-def test_active_is_read_from_jacked_database_once_per_provider(tmp_path, monkeypatch):
+def test_selected_is_read_from_jacked_database_once_per_provider(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     ids = _seed_db(tmp_path, [
         {"email": "a@test.com", "validation_status": "valid", "cached_usage_7d": 10.0},
@@ -599,23 +613,25 @@ def test_active_is_read_from_jacked_database_once_per_provider(tmp_path, monkeyp
     ])
     calls: list[str] = []
 
-    def fake_active(self, provider="claude"):
+    def fake_selected(self, provider="claude"):
         calls.append(provider)
         return {"claude": ids[1], "codex": ids[2]}.get(provider)
 
-    monkeypatch.setattr(Database, "get_active_account_id", fake_active)
+    monkeypatch.setattr(Database, "get_selected_account_id", fake_selected)
     touched = _forbid_credential_store(monkeypatch)
     _, payload = _run_json()
     by_email = {a["email"]: a for a in payload["accounts"]}
-    assert by_email["a@test.com"]["active"] is False
-    assert by_email["b@test.com"]["active"] is True
-    assert by_email["c@test.com"]["active"] is True
+    assert by_email["a@test.com"]["selected"] is False
+    assert by_email["b@test.com"]["selected"] is True
+    assert by_email["c@test.com"]["selected"] is True
     assert sorted(calls) == ["claude", "codex"]  # one read per provider
     assert touched == []
 
 
-def test_active_follows_the_database_setting(tmp_path, monkeypatch):
-    """No stub: the real settings row decides, per provider."""
+def test_selected_prefers_the_desired_account(tmp_path, monkeypatch):
+    """The common macOS switch outcome (observed_target_unfenced) writes
+    only desired_account_id and leaves active_account_id behind: the
+    selected row is the desired account, not the stale active one."""
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     ids = _seed_db(tmp_path, [
         {"email": "a@test.com"}, {"email": "b@test.com"},
@@ -624,13 +640,58 @@ def test_active_follows_the_database_setting(tmp_path, monkeypatch):
     db = Database(str(tmp_path / ".claude" / "jacked.db"))
     try:
         db.set_active_account_id(ids[0], provider="claude")
+        db.set_setting("desired_account_id", str(ids[1]))
+        db.set_active_account_id(ids[2], provider="codex")
     finally:
         db.close()
     touched = _forbid_credential_store(monkeypatch)
     _, payload = _run_json()
-    active = {a["email"]: a["active"] for a in payload["accounts"]}
-    assert active == {"a@test.com": True, "b@test.com": False, "c@test.com": False}
+    selected = {a["email"]: a["selected"] for a in payload["accounts"]}
+    assert selected == {"a@test.com": False, "b@test.com": True, "c@test.com": True}
     assert touched == []
+
+
+def test_in_use_is_the_calling_sessions_account(tmp_path, monkeypatch):
+    """The command descends from a tracked Claude Code process: that
+    session's account is in_use, whatever account is selected."""
+    import jacked.session_ancestry as ancestry
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ids = _seed_db(tmp_path, [{"email": "a@test.com"}, {"email": "b@test.com"}])
+    db = Database(str(tmp_path / ".claude" / "jacked.db"))
+    try:
+        db.set_setting("desired_account_id", str(ids[0]))
+        db.record_session_account("old", account_id=ids[0], email="a@test.com",
+                                  detection_method="session_start", pid=4100)
+        db.end_session_account("old")
+        db.record_session_account("s-1", account_id=ids[1], email="b@test.com",
+                                  detection_method="session_start", pid=4100)
+    finally:
+        db.close()
+    monkeypatch.setattr(ancestry, "ancestor_pids", lambda *a, **k: [5000, 4100, 300])
+    touched = _forbid_credential_store(monkeypatch)
+    _, payload = _run_json()
+    by_email = {a["email"]: a for a in payload["accounts"]}
+    assert by_email["b@test.com"]["in_use"] is True
+    assert by_email["a@test.com"]["in_use"] is False
+    assert by_email["a@test.com"]["selected"] is True
+    assert touched == []
+
+
+def test_no_tracked_session_marks_nothing_in_use(tmp_path, monkeypatch):
+    import jacked.session_ancestry as ancestry
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ids = _seed_db(tmp_path, [{"email": "a@test.com"}])
+    db = Database(str(tmp_path / ".claude" / "jacked.db"))
+    try:
+        db.record_session_account("s-1", account_id=ids[0], email="a@test.com",
+                                  detection_method="session_start", pid=4100)
+    finally:
+        db.close()
+    monkeypatch.setattr(ancestry, "ancestor_pids", lambda *a, **k: [7777])
+    _, payload = _run_json()
+    assert [a["in_use"] for a in payload["accounts"]] == [False]
 
 
 def test_provider_filter_limits_rows_and_summary(tmp_path, monkeypatch):

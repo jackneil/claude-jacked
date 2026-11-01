@@ -8473,7 +8473,7 @@ def claude_cmd(account, claude_args):
 # ── Subscription usage snapshot ────────────────────────────────────
 
 
-def _usage_row(acct: dict, now, active_ids: dict) -> dict:
+def _usage_row(acct: dict, now, selected_ids: dict, in_use_id=None) -> dict:
     """Shape one account row for `jacked usage` output.
 
     Field-ALLOWLISTED on purpose: token columns must never reach stdout, and
@@ -8488,9 +8488,13 @@ def _usage_row(acct: dict, now, active_ids: dict) -> dict:
     value is still in the cache. ``worst_window`` / ``worst_window_pct`` /
     ``worst_window_resets_at`` name the most constrained window that has a
     reading, with the summary's staleness rule
-    (:func:`jacked.service.usage_pacing.worst_window`). ``active`` is True
-    for the active account of the row's provider, from *active_ids*
-    (``{provider: account id}``, read from jacked's database).
+    (:func:`jacked.service.usage_pacing.worst_window`). ``selected`` is True
+    for the account jacked last selected for new sessions of the row's
+    provider, from *selected_ids* (``{provider: account id}``, read from
+    jacked's database). ``in_use`` is True for the account of the Claude Code
+    session that runs this command (*in_use_id*, found through the session
+    tracker by process ancestry); a running session can differ from the
+    selected account.
 
     >>> from datetime import datetime, timezone
     >>> now = datetime(2026, 11, 1, tzinfo=timezone.utc)
@@ -8499,8 +8503,10 @@ def _usage_row(acct: dict, now, active_ids: dict) -> dict:
     ...          "cached_usage_raw": '{"five_hour": null, "limits": [{"kind": "weekly_all"}]}',
     ...          "cached_usage_5h": 99.0, "cached_usage_7d": 40.0}
     >>> row = _usage_row(ultra, now, {"claude": 7})
-    >>> row["plan"], row["session_window"], row["usage_5h_pct"], row["worst_window"], row["active"]
+    >>> row["plan"], row["session_window"], row["usage_5h_pct"], row["worst_window"], row["selected"]
     ('Ultra', 'absent', None, '7d', True)
+    >>> row["in_use"], _usage_row(ultra, now, {}, in_use_id=7)["in_use"]
+    (False, True)
     """
     from jacked.service.menubar_summary import parse_per_model
     from jacked.service.usage_pacing import cache_age_seconds, coerce_pct, worst_window
@@ -8520,7 +8526,7 @@ def _usage_row(acct: dict, now, active_ids: dict) -> dict:
         }
         for m in parse_per_model(raw, view.plan)
     ]
-    active_id = active_ids.get(provider)
+    selected_id = selected_ids.get(provider)
 
     return {
         "id": acct.get("id"),
@@ -8543,7 +8549,8 @@ def _usage_row(acct: dict, now, active_ids: dict) -> dict:
         "worst_window_resets_at": (
             worst[2].isoformat() if worst and worst[2] else None
         ),
-        "active": active_id is not None and acct.get("id") == active_id,
+        "selected": selected_id is not None and acct.get("id") == selected_id,
+        "in_use": in_use_id is not None and acct.get("id") == in_use_id,
     }
 
 
@@ -8621,8 +8628,10 @@ def usage_cmd(as_json, provider, include_inactive):
 
     --provider claude or --provider codex shows only the accounts of that
     provider, and the summary uses only those accounts. In each JSON row,
-    "active" is true for the active account of that provider in the
-    jacked database.
+    "selected" is true for the account jacked last selected for new sessions
+    of that provider, and "in_use" is true for the account of the Claude
+    Code session that runs this command (from the session tracker, by
+    process ancestry; false everywhere when no tracked session runs it).
 
     Autonomous loops (for example, the night-shift skill) use --json to
     decide when to pause. summary.pause_until is the earliest future reset
@@ -8653,17 +8662,22 @@ def usage_cmd(as_json, provider, include_inactive):
         accounts = db.list_accounts(include_inactive=include_inactive)
         if provider:
             accounts = [a for a in accounts if (a.get("provider") or "claude") == provider]
-        # The active account of each provider, from jacked's own database
-        # (one read per provider). Never the credential store or keychain.
-        active_ids = {
-            p: db.get_active_account_id(p)
+        # The selected account of each provider, from jacked's own database
+        # (one read per provider), and the account of the Claude Code session
+        # that runs this command, from the session tracker by process
+        # ancestry. Never the credential store or keychain.
+        selected_ids = {
+            p: db.get_selected_account_id(p)
             for p in sorted({a.get("provider") or "claude" for a in accounts})
         }
+        from jacked.session_ancestry import calling_session_account
+
+        in_use_id = calling_session_account(db)
     finally:
         db.close()
 
     now = datetime.now(timezone.utc)
-    rows = [_usage_row(a, now, active_ids) for a in accounts]
+    rows = [_usage_row(a, now, selected_ids, in_use_id) for a in accounts]
     summary = compute_best_account_summary(accounts, now=now)
 
     if as_json:

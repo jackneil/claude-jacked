@@ -2195,6 +2195,59 @@ class Database:
         except (TypeError, ValueError):
             return None
 
+    def get_selected_account_id(self, provider: str = "claude") -> Optional[int]:
+        """The account jacked last selected for new sessions of ``provider``.
+
+        Claude: ``desired_account_id``, else ``active_account_id`` (the same
+        order every credential surface uses). A switch writes the desired id
+        on every successful outcome, including ``observed_target_unfenced``,
+        which leaves the active id behind. Codex: its active account id.
+
+        >>> db = Database(":memory:")
+        >>> db.set_setting("active_account_id", "3")
+        >>> db.get_selected_account_id()
+        3
+        >>> db.set_setting("desired_account_id", "5")
+        >>> db.get_selected_account_id()
+        5
+        >>> db.get_selected_account_id("codex") is None
+        True
+        """
+        if provider == "claude":
+            for key in ("desired_account_id", "active_account_id"):
+                raw = self.get_setting(key)
+                try:
+                    account_id = int(raw) if raw else 0
+                except (TypeError, ValueError):
+                    continue
+                if account_id > 0:
+                    return account_id
+            return None
+        return self.get_active_account_id(provider)
+
+    def find_open_session_account(self, pids) -> Optional[int]:
+        """Account id of the newest open tracked session whose Claude Code
+        process id is in *pids*, or None.
+
+        >>> db = Database(":memory:")
+        >>> _ = db.record_session_account("s-1", account_id=4, email="a@b.com",
+        ...                               detection_method="session_start", pid=4242)
+        >>> db.find_open_session_account([100, 4242]), db.find_open_session_account([7])
+        (4, None)
+        """
+        wanted = [int(p) for p in pids if isinstance(p, int) and p > 1]
+        if not wanted:
+            return None
+        marks = ",".join("?" * len(wanted))
+        with self._reader() as conn:
+            row = conn.execute(
+                f"SELECT account_id FROM session_accounts WHERE pid IN ({marks}) "
+                "AND ended_at IS NULL AND account_id IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1",
+                wanted,
+            ).fetchone()
+        return int(row[0]) if row else None
+
     def set_active_account_id(self, account_id: int, provider: str = "claude") -> None:
         """Set the active account id for ``provider``."""
         self.set_setting(
