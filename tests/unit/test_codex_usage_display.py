@@ -117,6 +117,16 @@ class TestAccountApi:
     def test_open_account_has_no_usage_block(self):
         assert _account_to_response(_codex_row(OPEN, seven=40.0)).usage_block is None
 
+    def test_pro_plan_drops_a_stale_five_hour_value(self):
+        # ChatGPT Pro has no 5h window in Codex: a 5h value left in the cache
+        # from an older payload is not a reading.
+        row = _codex_row(OPEN, five=55.0, seven=40.0)
+        row["subscription_type"] = "pro"
+        resp = _account_to_response(row)
+        assert resp.usage.five_hour is None
+        assert resp.windows.five_hour.state == "absent"
+        assert resp.plan.label == "Pro"
+
 
 class TestMenubarSummary:
     def test_codex_missing_window_stays_none(self):
@@ -146,6 +156,14 @@ class TestMenubarSummary:
         s = summarize_account({"id": 1, "cached_usage_5h": None, "cached_usage_7d": 30})
         assert s["five_hour"] == 0.0
         assert menubar_title(s) == "0%·30%"
+
+    def test_pro_plan_keeps_the_five_hour_slot_empty(self):
+        row = _codex_row(OPEN, five=55.0, seven=40.0)
+        row["subscription_type"] = "pro"
+        s = summarize_account(row)
+        assert s["five_hour"] is None
+        assert s["max_pct"] == 40.0
+        assert menubar_title(s) == "-·40%"
 
 
 class TestReviewEngineBlock:

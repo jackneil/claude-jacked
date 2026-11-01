@@ -24,6 +24,12 @@ from pydantic import BaseModel, computed_field
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on the JSON text of a stored raw usage payload, in characters.
+# A guard against a runaway payload, not a size a provider is expected to
+# reach: live payloads are 1.2-2.8 KB. The old 10 KB bound skipped larger
+# payloads without a word and kept the previous one beside the new readings.
+_RAW_USAGE_MAX_CHARS = 256 * 1024
+
 # A query made on an event-loop thread blocks every route and background
 # loop of the service until it returns (#162). Every query is checked: the
 # first query from each call site logs a WARNING that names the site, so a
@@ -1679,6 +1685,17 @@ class Database:
         >>> row = db.get_account(acct["id"])
         >>> (row["cached_usage_5h"], row["cached_5h_resets_at"])
         (8.0, None)
+
+        A raw payload is stored when its JSON text is at most
+        ``_RAW_USAGE_MAX_CHARS`` characters. A larger payload clears the
+        stored one in the same write (with a WARNING that names the account
+        and the size), so the stored payload is never older than the
+        readings beside it:
+
+        >>> _ = db.update_account_usage_cache(
+        ...     acct["id"], raw={"pad": "x" * _RAW_USAGE_MAX_CHARS})
+        >>> db.get_account(acct["id"])["cached_usage_raw"] is None
+        True
         """
         updates: dict[str, Any] = {"usage_cached_at": int(time.time())}
         if clear_five_hour:
@@ -1701,8 +1718,22 @@ class Database:
             updates["cached_7d_resets_at"] = None
         if raw is not None:
             raw_str = json.dumps(raw)
-            if len(raw_str) <= 10240:  # 10KB guard
+            if len(raw_str) <= _RAW_USAGE_MAX_CHARS:
                 updates["cached_usage_raw"] = raw_str
+            else:
+                # Never keep the previous payload beside the new readings:
+                # the plan resolver reads the stored payload as evidence (for
+                # example "this account has no 5-hour window"), and an old
+                # payload must not contradict the numbers of this write.
+                updates["cached_usage_raw"] = None
+                logger.warning(
+                    "Usage payload for account %s is %d characters, more than "
+                    "the %d-character limit; cleared the stored payload and "
+                    "kept the new readings",
+                    account_id,
+                    len(raw_str),
+                    _RAW_USAGE_MAX_CHARS,
+                )
         ok = self.update_account(account_id, **updates)
         if ok:
             # Wake same-process watchers (the menu-bar pill) immediately

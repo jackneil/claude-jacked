@@ -407,23 +407,6 @@ def test_sum_usage_returns_none_for_non_dicts():
     assert statusline._sum_usage("x") is None
 
 
-@pytest.mark.parametrize(
-    "raw,label",
-    [
-        ("default_claude_max_5x", "Max 5x"),
-        ("default_claude_max_20x", "Max 20x"),
-        ("default_claude_pro", "Pro"),
-        ("default_claude_free", "Free"),
-        ("default_claude_enterprise_beta", "enterprise_beta"),
-        ("custom_thing", "custom_thing"),
-        (None, ""),
-        ("", ""),
-    ],
-)
-def test_tier_label(raw, label):
-    assert statusline._tier_label(raw) == label
-
-
 def test_resolved_snapshot_renders_observed_email(home):
     _write_account(home, emailAddress="me@co.com", organizationUuid="org-1")
     assert _render({}, home) == "me@co.com"

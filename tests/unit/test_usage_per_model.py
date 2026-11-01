@@ -230,6 +230,35 @@ def test_parse_usage_details_returns_binding_key():
     assert extra is None
 
 
+def test_parse_usage_details_carries_window_seconds():
+    # The dashboard draws the week-elapsed marker from window_seconds, so
+    # every per-model entry carries the length of its limit's window.
+    pm, _, _ = _parse_usage_details(json.dumps(CLAUDE_FABLE_ACTIVE))
+    assert pm["fable"].window_seconds == 7 * 86400
+    pm, _, _ = _parse_usage_details(json.dumps(CODEX_SPARK))
+    # Spark has no weekly window here: the primary slot, 5 hours.
+    assert pm["codex_bengalfox"].window_seconds == 5 * 3600
+    pm, _, _ = _parse_usage_details(json.dumps(LEGACY_SEVEN_DAY))
+    assert pm["sonnet"].window_seconds == 7 * 86400
+
+
+def test_parse_usage_details_passes_the_plan_through(monkeypatch):
+    from jacked.service import menubar_summary
+
+    seen = []
+    real = menubar_summary.parse_per_model
+
+    def _spy(raw, plan=None):
+        seen.append(plan)
+        return real(raw, plan)
+
+    monkeypatch.setattr(menubar_summary, "parse_per_model", _spy)
+    marker = object()
+    _parse_usage_details(json.dumps(CLAUDE_FABLE_ACTIVE), marker)
+    _parse_usage_details(json.dumps(CLAUDE_FABLE_ACTIVE))
+    assert seen == [marker, None]
+
+
 # --- Robustness against malformed provider payloads -----------------------
 
 def test_parse_coerces_string_percents():
@@ -277,17 +306,21 @@ def test_parse_malformed_shapes_do_not_raise():
 
 def test_build_account_usage_survives_malformed_raw():
     # A single corrupt cached_usage_raw must not 500 the accounts endpoint —
-    # it degrades to no per-model data while 5h/7d still render.
+    # it degrades to no per-model data while 5h/7d still render. The limits
+    # list names the session limit, as a real payload with a 5h window does
+    # (a list without one says the account has no 5h window).
     row = {
         "id": 1, "email": "u@x.com",
         "cached_usage_5h": 20.0, "cached_usage_7d": 40.0,
-        "cached_usage_raw": '{"limits": [{"kind": "weekly_scoped", '
+        "cached_usage_raw": '{"limits": [{"kind": "session", "percent": 20}, '
+                            '{"kind": "weekly_scoped", '
                             '"percent": {"nested": "junk"}, '
                             '"scope": {"model": {"display_name": "Fable"}}}]}',
     }
     u = _build_account_usage(row)  # must not raise
     assert u is not None
     assert u.five_hour == 20.0  # windows still surface
+    assert u.seven_day == 40.0
 
 
 def test_account_response_includes_binding_model_for_ws_payload():
@@ -298,3 +331,5 @@ def test_account_response_includes_binding_model_for_ws_payload():
     dumped = _account_to_response(row).model_dump()
     assert dumped["usage"]["binding_model"]["label"] == "Fable"
     assert dumped["usage"]["per_model"]["fable"]["utilization"] == 90
+    assert dumped["usage"]["binding_model"]["window_seconds"] == 7 * 86400
+    assert dumped["usage"]["per_model"]["fable"]["window_seconds"] == 7 * 86400
