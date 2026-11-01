@@ -1057,6 +1057,9 @@ def test_null_7d_reset_alone_does_not_reping_after_success(db):
     pings = _Pings({"cc-tok": _ok()})  # 5h header only, no 7d header
     _run_pass(db, pings)
     assert db.get_account(aid)["cached_7d_resets_at"] is None
+    # The 200 started the weekly window: the first verdict is ok, not a
+    # no-window retry (confirmation rule 2 of _keeper_record_success).
+    assert _state(db, aid)["last_status"] == "ok"
     _run_pass(db, pings)
     assert pings.calls == ["cc-tok"]
 

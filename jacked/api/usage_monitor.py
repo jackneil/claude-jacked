@@ -2564,12 +2564,26 @@ async def _keeper_record_success(
     """Persist what a successful ping opened, then the keeper verdict.
 
     *needed* is ``(needs_5h, needs_7d)``: the windows that made the keeper
-    ping. The verdict is ``ok`` only when every one of them is open after the
-    usage read-back. Otherwise it is ``ping_ok_no_window`` and the backoff
-    escalates one step (600 s, 1200 s, 2400 s, then the one-hour cap at the
-    default interval). The escalation count is dropped ONLY on success: a
-    ping that never opens its window must not restart at the first step on
-    every sweep.
+    ping. After the usage read-back each of them is confirmed against the
+    fresh row, judged as of THIS ping (it is the recent success that the
+    missing-7d-reset rule of :func:`_keeper_window_needed` speaks of):
+
+    1. 5h, strict: a needed 5h window is confirmed only when the fresh row
+       shows a future 5h reset.
+    2. 7d with no reset: a needed 7d window whose fresh reset is null is
+       confirmed when the 5h window is open or absent. The 200 started the
+       weekly window; the API omits the reset (one account here read
+       ``resets_at: null`` for 9 days), and no further ping can change that.
+    3. 7d with a lapsed reset: a needed 7d window whose fresh reset is set
+       but still lapsed (``needs_7d_ping`` true: no header, and the
+       read-back did not land) is NOT confirmed.
+
+    The verdict is ``ok`` only when every needed window is confirmed.
+    Otherwise it is ``ping_ok_no_window``, the WARNING names the windows
+    that did not open, and the backoff escalates one step (600 s, 1200 s,
+    2400 s, then the one-hour cap at the default interval). The escalation
+    count is dropped ONLY on success: a ping that never opens its window must
+    not restart at the first step on every sweep.
     """
     from jacked.usage_plans import has_session
     from jacked.web import auth as auth_mod
