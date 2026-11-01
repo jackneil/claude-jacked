@@ -225,7 +225,7 @@ Not every plan has a 5-hour window. On 2026-10-30 Anthropic renamed Max 5x to **
 
 jacked reads these facts from a plan catalog that ships with each release: `jacked/data/usage_plans.json`. For each plan, the catalog gives the name, the windows the plan has, how long each window is, and where the facts come from. The live usage payload of each account has priority over the catalog. When the two disagree, jacked writes one warning to the log and shows the disagreement on the account, so an old catalog is visible. A new release updates the catalog when a provider changes a plan again.
 
-For an account without a 5-hour window, the dashboard shows "none" and "not on Ultra" in the 5h row, the menu-bar pill shows `-` in the 5h slot, the window keeper does not ping for a 5-hour window, and auto-swap uses the weekly windows only. `jacked usage --json` reports the plan name, the 5-hour window state, the model limits, and the most constrained window for each account.
+For an account without a 5-hour window, the dashboard shows "none" and "not on Ultra" in the 5h row, the menu-bar pill shows `-` in the 5h slot, the window keeper does not ping for a 5-hour window, and auto-swap uses the weekly windows only. `jacked usage --json` reports the plan name, the 5-hour window state, the model limits, and the most constrained window for each account. It also marks the account that jacked selected for new sessions (`selected`) and the account of the Claude Code session that runs the command (`in_use`, from the session tracker). `--provider claude` limits the rows and the summary to one provider.
 
 ---
 
