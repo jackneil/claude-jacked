@@ -454,13 +454,22 @@ def test_endpoint_worst_codex_keeps_unreported_window_null(db):
         app.state.db = None
 
 
-def test_endpoint_survives_a_payload_the_resolver_cannot_read(db, _fresh_plan_state):
-    """One account whose cached payload breaks the plan resolver must not
-    take the pill down for the whole fleet."""
+def test_endpoint_survives_a_payload_the_resolver_cannot_read(db, _fresh_plan_state, monkeypatch):
+    """One account the plan resolver fails on must not take the pill down
+    for the whole fleet."""
     import time
 
+    import jacked.usage_plans as usage_plans
     from jacked.api.main import app
 
+    real_view = usage_plans.account_view
+
+    def failing_view(row, *args, **kwargs):
+        if row.get("email") == "junk@x.com":
+            raise RuntimeError("resolver failure")
+        return real_view(row, *args, **kwargs)
+
+    monkeypatch.setattr(usage_plans, "account_view", failing_view)
     junk = {"rateLimits": {"primary": "unexpected", "secondary": None}}
     with db._writer() as conn:
         conn.execute(

@@ -351,11 +351,19 @@ class TestResolverFailure:
         bad = db.create_account("bad@x.com", "tok-b", int(time.time()) + 3600,
                                 provider="codex", subscription_type="pro")
         db.update_account_usage_cache(good["id"], five_hour=5.0, seven_day=6.0)
-        # A payload shape the Codex window parser does not expect.
-        db.update_account_usage_cache(
-            bad["id"], seven_day=9.0,
-            raw={"rateLimits": {"primary": "unexpected", "secondary": None}},
-        )
+        db.update_account_usage_cache(bad["id"], seven_day=9.0)
+        # Make the plan resolver fail for one row (any future payload shape
+        # it cannot read must degrade the same way).
+        import jacked.usage_plans as usage_plans
+
+        real_view = usage_plans.account_view
+
+        def failing_view(row, *args, **kwargs):
+            if row.get("email") == "bad@x.com":
+                raise RuntimeError("resolver failure")
+            return real_view(row, *args, **kwargs)
+
+        monkeypatch.setattr(usage_plans, "account_view", failing_view)
         monkeypatch.setattr(routes_auth, "_get_active_account_id_cached", lambda: None)
         request = MagicMock()
         request.app.state.db = db
