@@ -533,12 +533,16 @@ function renderExhaustionBanner() {
         const recoverAt = new Date(data.next_recovery_at);
         const now = Date.now();
         const diffMin = Math.max(0, Math.ceil((recoverAt.getTime() - now) / 60000));
+        // The recovery time is the earliest moment an account has usage
+        // again, from whichever of its windows is full (5-hour, weekly or a
+        // model limit), so the text names no window. No em-dashes: this is
+        // user-facing copy.
         if (diffMin > 60) {
-            recoveryText = `Next 5h window opens in ${Math.floor(diffMin/60)}h ${diffMin%60}m`;
+            recoveryText = `Usage is available again in ${Math.floor(diffMin/60)}h ${diffMin%60}m`;
         } else if (diffMin > 0) {
-            recoveryText = `Next 5h window opens in ${diffMin}m`;
+            recoveryText = `Usage is available again in ${diffMin}m`;
         } else {
-            recoveryText = 'A 5h window should be opening soon';
+            recoveryText = 'Usage should be available again soon';
         }
     }
     el.classList.remove('hidden');

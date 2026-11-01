@@ -2,7 +2,7 @@
 
 renderBindingBar() (the inline binding cap under the 5h/7d bars) and
 renderPerModelBars() (the full list in the details expander) reuse
-renderUsageBar() from usage.js, so the harness evals both under node and asserts
+renderModelBar() from usage.js, so the harness evals both under node and asserts
 on the rendered HTML: the binding wrapper is always emitted (so websocket.js can
 patch it in place), the provider's model label is shown, and the empty states
 behave. Skipped when node is not on PATH.
@@ -24,8 +24,9 @@ pytestmark = pytest.mark.skipif(
 
 # accounts.js only declares functions/consts at the top level (no top-level
 # execution), so eval'ing it just defines renderBindingBar/renderPerModelBars.
-# The only deps those two exercise are renderUsageBar (usage.js) + escapeHtml +
-# formatResetTime, all provided here.
+# The only deps those two exercise are renderModelBar and renderUsageBar
+# (usage.js) + escapeHtml + formatResetTime, all provided here. The elapsed
+# marker of these bars is covered in test_web_js_plan_windows.py.
 _HARNESS = r"""
 const fs = require('fs');
 global.escapeHtml = (s) => String(s == null ? '' : s)

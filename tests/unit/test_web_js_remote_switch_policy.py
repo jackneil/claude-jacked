@@ -197,8 +197,8 @@ for (const fn of ['renderTokenPills', 'renderUsageBar', 'renderActiveSessions',
                   '_usageUpdateCardDOM', 'renderUsageBlockBadge']) {
     global[fn] = () => '';
 }
-global.computeElapsedFraction5h = () => 0;
-global.computeElapsedFraction7d = () => 0;
+global.windowElapsed = () => 0;
+global.renderModelBar = () => '';
 global.usageBarOpts = () => undefined;
 // The optional sub-panels guard on `typeof x === 'function'`; leaving them
 // undefined is the real "not loaded yet" path.
@@ -318,8 +318,8 @@ for (const fn of ['renderTokenPills', 'renderUsageBar', 'renderActiveSessions',
                   '_usageUpdateCardDOM', 'renderUsageBlockBadge']) {
     global[fn] = () => '';
 }
-global.computeElapsedFraction5h = () => 0;
-global.computeElapsedFraction7d = () => 0;
+global.windowElapsed = () => 0;
+global.renderModelBar = () => '';
 global.usageBarOpts = () => undefined;
 localStorage.setItem('jacked_tip_dismissed', '1');
 window.jackedState.activeCredentialAccountId = null;

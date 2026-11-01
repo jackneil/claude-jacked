@@ -57,10 +57,15 @@ def _run(tmp_path, snippet):
 
 
 def _reason(tmp_path, acct, resets_at=PAST, settings=None):
+    """windowReason of the account's 5h window with this reset. The window
+    carries a reading unless the account sets cached_usage_5h itself."""
+    acct = dict(acct)
+    acct.setdefault("cached_usage_5h", 40.0)
+    acct["cached_5h_resets_at"] = resets_at
     return _run(
         tmp_path,
         f"window.jackedState.settings = {json.dumps(settings or {})};\n"
-        f"out(windowReason({json.dumps(acct)}, {json.dumps(resets_at)}));",
+        f"out(windowReason({json.dumps(acct)}, 'five_hour'));",
     )
 
 
@@ -196,12 +201,13 @@ class TestWindowReason:
 class TestRenderUsageBar:
     def _bar(self, tmp_path, acct, resets_at, compact=False):
         base = "{ compact: true }" if compact else "undefined"
+        acct = dict(acct, cached_usage_5h=40, cached_5h_resets_at=resets_at)
         return _run(
             tmp_path,
             f"const a = {json.dumps(acct)};\n"
-            f"out(renderUsageBar(40, {json.dumps(resets_at)}, "
-            f"computeElapsedFraction5h({json.dumps(resets_at)}), '5h limit', "
-            f"usageBarOpts(a, {json.dumps(resets_at)}, {base})));",
+            f"out(renderUsageBar(a.cached_usage_5h, a.cached_5h_resets_at, "
+            f"windowElapsed(a, 'five_hour'), '5h limit', "
+            f"usageBarOpts(a, 'five_hour', {base})));",
         )
 
     def test_reason_replaces_no_active_window(self, tmp_path):
@@ -248,19 +254,50 @@ class TestRenderUsageBar:
 
 class TestElapsedFraction:
     def test_past_reset_has_no_marker(self, tmp_path):
-        r = _run(tmp_path, f"out([computeElapsedFraction5h({json.dumps(PAST)}), computeElapsedFraction7d({json.dumps(PAST)})]);")
+        r = _run(
+            tmp_path,
+            f"out([computeElapsedFraction({json.dumps(PAST)}, 18000), "
+            f"computeElapsedFraction({json.dumps(PAST)}, 604800)]);",
+        )
         assert r == [None, None]
 
     def test_mid_window_fraction(self, tmp_path):
         r = _run(
             tmp_path,
             "const reset = new Date(Date.now() + 2.5 * 3600 * 1000).toISOString();\n"
-            "out(computeElapsedFraction5h(reset));",
+            "out(computeElapsedFraction(reset, 5 * 3600));",
         )
         assert 0.45 < r < 0.55
 
     def test_missing_reset(self, tmp_path):
-        assert _run(tmp_path, "out([computeElapsedFraction5h(null), computeElapsedFraction7d('')]);") == [None, None]
+        r = _run(tmp_path, "out([computeElapsedFraction(null, 18000), computeElapsedFraction('', 604800)]);")
+        assert r == [None, None]
+
+    def test_missing_or_non_positive_length_has_no_marker(self, tmp_path):
+        r = _run(
+            tmp_path,
+            "const reset = new Date(Date.now() + 3600 * 1000).toISOString();\n"
+            "out([computeElapsedFraction(reset), computeElapsedFraction(reset, null),\n"
+            "     computeElapsedFraction(reset, 0), computeElapsedFraction(reset, -5),\n"
+            "     computeElapsedFraction(reset, 'x')]);",
+        )
+        assert r == [None] * 5
+
+    def test_reset_further_than_one_window_reads_as_the_start(self, tmp_path):
+        r = _run(
+            tmp_path,
+            "const reset = new Date(Date.now() + 10 * 3600 * 1000).toISOString();\n"
+            "out(computeElapsedFraction(reset, 5 * 3600));",
+        )
+        assert r == 0
+
+    def test_unparseable_reset(self, tmp_path):
+        assert _run(tmp_path, "out(computeElapsedFraction('not a date', 18000));") is None
+
+    def test_fixed_length_helpers_are_gone(self, tmp_path):
+        """Every bar reads its window length from the payload: no fixed 5h/7d math."""
+        r = _run(tmp_path, "out([typeof computeElapsedFraction5h, typeof computeElapsedFraction7d]);")
+        assert r == ["undefined", "undefined"]
 
 
 class TestUnreportedCodexWindow:
@@ -273,17 +310,21 @@ class TestUnreportedCodexWindow:
 
     def _bar(self, tmp_path, acct, pct, compact=False):
         base = "{ compact: true }" if compact else "null"
+        acct = dict(acct, cached_usage_5h=pct, cached_5h_resets_at=None)
         return _run(
             tmp_path,
             f"const a = {json.dumps(acct)};\n"
-            f"out(renderUsageBar({json.dumps(pct)}, null, null, '5h limit', "
-            f"usageBarOpts(a, null, {base}, {json.dumps(pct)})));",
+            f"out(renderUsageBar(a.cached_usage_5h, a.cached_5h_resets_at, "
+            f"windowElapsed(a, 'five_hour'), '5h limit', "
+            f"usageBarOpts(a, 'five_hour', {base})));",
         )
 
     def test_codex_null_window_is_not_reported(self, tmp_path):
-        r = _run(tmp_path, f"out(windowReason({json.dumps(_fresh(provider='codex'))}, null, undefined, null));")
+        acct = dict(_fresh(provider="codex"), cached_usage_5h=None)
+        r = _run(tmp_path, f"out(windowReason({json.dumps(acct)}, 'five_hour'));")
         assert r["text"] == "not reported"
         assert r["absent"] is True
+        assert "none" not in r, "not reported is n/a, never none"
 
     def test_codex_null_window_draws_no_fill_and_no_percent(self, tmp_path):
         html = self._bar(tmp_path, _fresh(provider="codex"), None)
@@ -311,8 +352,8 @@ class TestUnreportedCodexWindow:
         assert "not reported" not in html
 
     def test_never_read_codex_account_has_no_absent_reason(self, tmp_path):
-        acct = {"id": 1, "provider": "codex", "usage_cached_at": None}
-        assert _run(tmp_path, f"out(windowReason({json.dumps(acct)}, null, undefined, null));") is None
+        acct = {"id": 1, "provider": "codex", "usage_cached_at": None, "cached_usage_5h": None}
+        assert _run(tmp_path, f"out(windowReason({json.dumps(acct)}, 'five_hour'));") is None
 
 
 class TestUsageBlockBadge:
@@ -353,9 +394,11 @@ class TestBlockAndHintTitles:
         assert "Last usage read" not in r["title"]
 
     def test_not_reported_hover_explains_itself(self, tmp_path):
+        acct = dict(_fresh(provider="codex"), cached_usage_5h=None)
         html = _run(
             tmp_path,
-            f"const a = {json.dumps(_fresh(provider='codex'))};\n"
-            "out(renderUsageBar(null, null, null, '5h limit', usageBarOpts(a, null, null, null)));",
+            f"const a = {json.dumps(acct)};\n"
+            "out(renderUsageBar(a.cached_usage_5h, a.cached_5h_resets_at, "
+            "windowElapsed(a, 'five_hour'), '5h limit', usageBarOpts(a, 'five_hour')));",
         )
         assert 'title="Codex does not report this limit for this account."' in html
