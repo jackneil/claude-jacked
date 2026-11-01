@@ -102,6 +102,16 @@ _STALL_WARNING_COOLDOWN_SECONDS = 1800
 # Transport errors and 5xx never increment ``fails``.
 _ping_backoff: dict[int, dict] = {}
 _PING_BACKOFF_CAP_SECONDS = 3600
+# Past this many doublings every delay is at the cap already, and a larger
+# exponent overflows the float conversion (2 ** 1024 is not a float).
+_PING_BACKOFF_MAX_DOUBLINGS = 16
+# A persisted count above this is corrupt (10,000 failures at the one-hour
+# cap is more than a year).
+_PING_BACKOFF_MAX_FAILS = 10_000
+# Statuses whose persisted retry deadline a restart honors. A transport
+# error is not one: its retry is the next sweep (its next_attempt_at is
+# only the displayed estimate).
+_RESTORED_SCHEDULE_STATUSES = ("rate_limited", "auth_failed", "error", "ping_ok_no_window")
 # Seconds between a keeper pass's per-ping pacing sleeps.
 _KEEPER_PING_PACING_SECONDS = 2
 # Upper bound on a single wall-clock wait slice. Short slices let a dark
@@ -2242,8 +2252,9 @@ def _arm_ping_backoff(
         account_id, {"fails": 0, "skip_until": 0.0, "token_fp": token_fp}
     )
     entry["token_fp"] = token_fp
-    entry["fails"] += 1
-    delay = min(check_interval * 2 ** entry["fails"], _PING_BACKOFF_CAP_SECONDS)
+    entry["fails"] = min(entry["fails"] + 1, _PING_BACKOFF_MAX_FAILS)
+    doublings = min(entry["fails"], _PING_BACKOFF_MAX_DOUBLINGS)
+    delay = min(check_interval * 2 ** doublings, _PING_BACKOFF_CAP_SECONDS)
     entry["skip_until"] = now + delay
     logger.info(
         "Window keeper: ping failed for account %d — backing off %.0fs "
@@ -2253,6 +2264,45 @@ def _arm_ping_backoff(
         entry["fails"],
     )
     return entry["skip_until"]
+
+
+def _restore_ping_backoff(account_id: int, state: dict, fp: str | None) -> float | None:
+    """Rebuild an account's backoff from its persisted state after a restart.
+
+    For the same token only. The escalation count resumes whatever the last
+    status was: a transport error keeps the count, so a restart after one
+    must not drop it. The retry deadline is honored only for the statuses
+    that set a backoff deadline. Returns that deadline, or None.
+
+    >>> _restore_ping_backoff(1, {"token_fp": "a", "last_status": "ping_ok_no_window",
+    ...     "next_attempt_at": 50.0, "backoff_fails": 4}, "a"), _ping_backoff.pop(1)["fails"]
+    (50.0, 4)
+    >>> _restore_ping_backoff(1, {"token_fp": "a", "last_status": "transport",
+    ...     "next_attempt_at": 50.0, "backoff_fails": 4}, "a"), _ping_backoff.pop(1)["fails"]
+    (None, 4)
+    >>> _restore_ping_backoff(1, {"token_fp": "a", "backoff_fails": 10**9}, "a"), _ping_backoff.pop(1)["fails"]
+    (None, 10000)
+    >>> _restore_ping_backoff(1, {"token_fp": "a", "backoff_fails": "x"}, "b"), 1 in _ping_backoff
+    (None, False)
+    """
+    if state.get("token_fp") != fp:
+        return None
+    skip_until = None
+    if state.get("last_status") in _RESTORED_SCHEDULE_STATUSES:
+        try:
+            skip_until = float(state["next_attempt_at"])
+        except (KeyError, TypeError, ValueError):
+            skip_until = None
+    try:
+        fails = int(state.get("backoff_fails") or 0)
+    except (TypeError, ValueError, OverflowError):
+        fails = 0
+    fails = min(max(0, fails), _PING_BACKOFF_MAX_FAILS)
+    if fails:
+        _ping_backoff[account_id] = {
+            "fails": fails, "skip_until": skip_until or 0.0, "token_fp": fp,
+        }
+    return skip_until
 
 
 def _bounded_reset(iso: str | None, now: float, max_ahead: float) -> str | None:
@@ -2547,9 +2597,9 @@ def _keeper_window_needed(acct: dict, state: dict) -> tuple[bool, bool]:
     ``unknown`` state keeps the check: jacked never skips a window it cannot
     rule out (:func:`jacked.usage_plans.has_session`).
 
-    *state* feeds the recent-success rule for a missing 7d reset below. The
-    post-ping confirmation passes the ping that just succeeded as that
-    success.
+    *state* feeds the recent-success rule for a missing 7d reset below (a
+    recent ``ok`` ping). The post-ping confirmation does not use this
+    function: it reads :func:`_window_confirmed`.
     """
     from jacked.usage_plans import has_session
     from jacked.web import window_keeper as wk
@@ -2572,27 +2622,29 @@ def _keeper_window_needed(acct: dict, state: dict) -> tuple[bool, bool]:
     return needs_5h, needs_7d
 
 
-def _window_confirmed(fresh: dict, kind: str, pinged_at: float) -> bool:
+def _window_confirmed(fresh: dict, kind: str, *, evidence: bool) -> bool:
     """True when the fresh row shows *kind* ("5h" or "7d") open after a ping.
 
     1. A future reset confirms either window.
-    2. A 7d window with NO reset at all is confirmed only by a row written at
-       or after the ping (``usage_cached_at``): a usage read that landed and
-       reported no reset (the API omits it for days at a time; the 200
-       started the weekly window). A row that nothing wrote proves nothing.
-    3. A lapsed or unreadable reset never confirms a window, however new the
-       row is: scheduling may read a fresh row as "running", confirmation
+    2. A 7d window with NO reset at all (``None``) is confirmed only by
+       *evidence* from after the ping: a usage read that landed (the API
+       omits the weekly reset for days at a time), or this ping's own window
+       headers (a counted request starts the weekly window). A row that
+       nothing new wrote proves nothing.
+    3. A lapsed or unreadable reset never confirms a window, an empty string
+       included: scheduling may read a fresh row as "running", confirmation
        may not.
 
     >>> import time
-    >>> _window_confirmed({"cached_7d_resets_at": None, "usage_cached_at": 10}, "7d", 5)
+    >>> _window_confirmed({"cached_7d_resets_at": None}, "7d", evidence=True)
     True
-    >>> _window_confirmed({"cached_7d_resets_at": None, "usage_cached_at": 4}, "7d", 5)
+    >>> _window_confirmed({"cached_7d_resets_at": None}, "7d", evidence=False)
     False
-    >>> _window_confirmed({"cached_5h_resets_at": None, "usage_cached_at": 10}, "5h", 5)
+    >>> _window_confirmed({"cached_7d_resets_at": ""}, "7d", evidence=True)
     False
-    >>> _window_confirmed({"cached_7d_resets_at": "2000-01-01T00:00:00+00:00",
-    ...                    "usage_cached_at": int(time.time())}, "7d", 5)
+    >>> _window_confirmed({"cached_5h_resets_at": None}, "5h", evidence=True)
+    False
+    >>> _window_confirmed({"cached_7d_resets_at": "2000-01-01T00:00:00+00:00"}, "7d", evidence=True)
     False
     """
     from jacked.web import window_keeper as wk
@@ -2600,13 +2652,7 @@ def _window_confirmed(fresh: dict, kind: str, pinged_at: float) -> bool:
     reset = fresh.get("cached_5h_resets_at" if kind == "5h" else "cached_7d_resets_at")
     if not wk.needs_ping(reset):
         return True  # a future reset
-    if kind != "7d" or reset:
-        return False
-    try:
-        written = int(fresh.get("usage_cached_at") or 0)
-    except (TypeError, ValueError):
-        return False
-    return written >= int(pinged_at)
+    return kind == "7d" and reset is None and evidence
 
 
 async def _keeper_record_success(
@@ -2624,11 +2670,13 @@ async def _keeper_record_success(
     *needed* is ``(needs_5h, needs_7d)``: the windows that made the keeper
     ping. After the header write and the usage read-back, each of them is
     confirmed against the fresh row by :func:`_window_confirmed` (a future
-    reset; for a weekly window with no reset at all, a row written after this
-    ping; never a lapsed reset). The API omits the weekly reset for days at a
-    time (one account here read ``resets_at: null`` for 9 days), so a read
-    that lands without one confirms the window the 200 started; a read that
-    never lands confirms nothing.
+    reset; for a weekly window with no reset at all, evidence from after this
+    ping; never a lapsed or unreadable reset). The API omits the weekly reset for days at a
+    time (one account here read ``resets_at: null`` for 9 days), so a weekly
+    window with no reset is confirmed by a read that landed, or by this
+    ping's own window headers (a counted request starts the weekly window).
+    A 200 with no window headers and a read that never lands confirms
+    nothing.
 
     The verdict is ``ok`` only when every needed window is confirmed.
     Otherwise it is ``ping_ok_no_window``, the WARNING names the windows
@@ -2654,8 +2702,9 @@ async def _keeper_record_success(
                 account_id,
                 exc_info=True,
             )
+    read = None
     try:
-        await asyncio.wait_for(
+        read = await asyncio.wait_for(
             auth_mod.fetch_usage(
                 account_id, db, access_token=good_token, post_ping=True
             ),
@@ -2666,12 +2715,17 @@ async def _keeper_record_success(
             "Full sweep: fetch_usage for account %d exceeded 10s — moving on",
             account_id,
         )
+    # fetch_usage stores a read before it returns it; a cached or backed-off
+    # answer, None, or a timeout is a read that never landed.
+    landed = isinstance(read, dict) and not (read.get("_cached") or read.get("_backed_off"))
     fresh = await asyncio.to_thread(db.get_account, account_id) or {}
     # A deleted row (gone mid-sweep) confirms nothing.
     missing = [
         name
         for name, needed_before in (("5h", needs_5h), ("7d", needs_7d))
-        if needed_before and not (fresh and _window_confirmed(fresh, name, now))
+        if needed_before and not (
+            fresh and _window_confirmed(fresh, name, evidence=landed or bool(cache_fields))
+        )
     ]
     # The row may hold a rotated token now: key the state on the CURRENT
     # candidate set so a persisted backoff survives the next sweep's check.
@@ -2921,26 +2975,11 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
         )
         _ping_backoff.pop(account_id, None)
         entry = None
-    skip_until = entry["skip_until"] if entry is not None else None
-    if (
-        skip_until is None
-        and state.get("token_fp") == fp
-        and state.get("last_status") in ("rate_limited", "auth_failed", "error", "ping_ok_no_window")
-    ):
-        # Restart: honor the schedule persisted before the process died, and
-        # resume its escalation count so the next failure does not fall back
-        # to the first step.
-        skip_until = state.get("next_attempt_at")
-        try:
-            fails = max(0, int(state.get("backoff_fails") or 0))
-        except (TypeError, ValueError):
-            fails = 0
-        if fails:
-            _ping_backoff[account_id] = {
-                "fails": fails,
-                "skip_until": float(skip_until or 0.0),
-                "token_fp": fp,
-            }
+    # No in-memory entry: a restart. Resume the persisted schedule and count.
+    skip_until = (
+        entry["skip_until"] if entry is not None
+        else _restore_ping_backoff(account_id, state, fp)
+    )
     if skip_until and skip_until > now:
         logger.debug(
             "Window keeper: account %d in ping backoff for %.0fs more — skipping",

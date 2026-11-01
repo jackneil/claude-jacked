@@ -2225,28 +2225,42 @@ class Database:
             return None
         return self.get_active_account_id(provider)
 
-    def find_open_session_account(self, pids) -> Optional[int]:
-        """Account id of the newest open tracked session whose Claude Code
-        process id is in *pids*, or None.
+    def find_open_sessions(self, pids) -> dict:
+        """The newest open tracked session of each Claude Code process id in
+        *pids*: ``{pid: {"account_id": int or None, "detected_at": str}}``.
+
+        A session whose account is unknown is kept with ``account_id`` None:
+        the caller decides, never an older row or an outer session.
 
         >>> db = Database(":memory:")
         >>> _ = db.record_session_account("s-1", account_id=4, email="a@b.com",
         ...                               detection_method="session_start", pid=4242)
-        >>> db.find_open_session_account([100, 4242]), db.find_open_session_account([7])
-        (4, None)
+        >>> _ = db.record_session_account("s-2", detection_method="session_start", pid=5151)
+        >>> found = db.find_open_sessions([100, 4242, 5151])
+        >>> sorted(found), found[4242]["account_id"], found[5151]["account_id"]
+        ([4242, 5151], 4, None)
+        >>> db.find_open_sessions([True, -3, "7"])
+        {}
         """
-        wanted = [int(p) for p in pids if isinstance(p, int) and p > 1]
+        wanted = sorted({
+            p for p in pids if isinstance(p, int) and not isinstance(p, bool) and p > 1
+        })
         if not wanted:
-            return None
+            return {}
         marks = ",".join("?" * len(wanted))
         with self._reader() as conn:
-            row = conn.execute(
-                f"SELECT account_id FROM session_accounts WHERE pid IN ({marks}) "
-                "AND ended_at IS NULL AND account_id IS NOT NULL "
-                "ORDER BY id DESC LIMIT 1",
+            rows = conn.execute(
+                f"SELECT pid, account_id, detected_at FROM session_accounts "
+                f"WHERE pid IN ({marks}) AND ended_at IS NULL ORDER BY id DESC",
                 wanted,
-            ).fetchone()
-        return int(row[0]) if row else None
+            ).fetchall()
+        found: dict = {}
+        for pid, account_id, detected_at in rows:
+            found.setdefault(int(pid), {
+                "account_id": None if account_id is None else int(account_id),
+                "detected_at": detected_at,
+            })
+        return found
 
     def set_active_account_id(self, account_id: int, provider: str = "claude") -> None:
         """Set the active account id for ``provider``."""

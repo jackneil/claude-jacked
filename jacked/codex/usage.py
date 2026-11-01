@@ -68,7 +68,7 @@ def _usable_duration(dur) -> bool:
     """
     if not isinstance(dur, (int, float)) or isinstance(dur, bool):
         return False
-    return math.isfinite(dur) and dur > 0
+    return dur > 0 and (isinstance(dur, int) or math.isfinite(dur))  # big ints never overflow
 
 
 def _classify_windows(primary, secondary) -> dict:

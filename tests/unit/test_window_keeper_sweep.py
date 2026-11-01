@@ -1423,3 +1423,78 @@ class TestPingWindowCacheFields:
     def test_without_a_session_an_incomplete_7d_pair_writes_nothing(self):
         reply = self._reply(r5=str(int(self.NOW) + 3600), u5="0.9", r7=str(int(self.NOW) + 86400))
         assert um._ping_window_cache_fields(reply, self.NOW, has_session=False) == {}
+
+
+# ---------------------------------------------------------------------------
+# dcr wave 2: confirmation evidence, blank resets, and bounded escalation
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmationEvidenceAndBackoffBounds:
+    def test_a_blank_weekly_reset_never_confirms_and_backs_off(self, db):
+        """F1: a stored "" read as "no reset" confirmed the window, while the
+        scheduler read it as unparseable and pinged every sweep, no backoff."""
+        aid = _mk_ultra(db, cached_7d_resets_at="", usage_cached_at=int(time.time()) - 7200)
+
+        async def _blank(account_id, db_, **_kw):
+            db_.update_account_usage_cache(account_id, seven_day=41.0, seven_day_resets_at="")
+            return {}
+
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        for _ in range(2):
+            _run_pass(db, pings, fetch=AsyncMock(side_effect=_blank))
+        assert pings.calls == ["cc-tok"]
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert st["backoff_fails"] == 1
+
+    @pytest.mark.parametrize("answer", [{"_cached": True}, {"_backed_off": True}, None])
+    def test_a_row_written_without_a_landed_read_is_not_evidence(self, db, answer):
+        """L4: a write stamp proves nothing by itself. A weekly window with
+        no reset needs a read that landed or the ping's own window headers."""
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 7200)
+
+        async def _stamp_only(account_id, db_, **_kw):
+            db_.update_account_usage_cache(account_id, seven_day=41.0, clear_seven_day_reset=True)
+            return answer
+
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_stamp_only))
+        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+
+    def test_a_transport_error_before_a_restart_keeps_the_escalation(self, db):
+        """L1: a transport failure persists the count under the status
+        "transport"; the restart must resume it, not fall back to 600 s."""
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        pings = _Pings({"cc-tok": [NO_HEADERS] * 4 + [TRANSPORT, NO_HEADERS]})
+        for sweep in range(5):
+            if sweep:
+                um._ping_backoff[aid]["skip_until"] = 0.0  # the retry is due
+            _run_pass(db, pings)
+        st = _state(db, aid)
+        assert (st["last_status"], st["backoff_fails"]) == ("transport", 4)
+        um._ping_backoff.clear()  # a restart: the in-memory count is gone
+        db.set_keeper_state(aid, next_attempt_at=time.time() - 1)
+        _run_pass(db, pings)
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert st["next_attempt_at"] - st["last_ping_at"] == pytest.approx(3600, abs=1.01)
+        assert st["backoff_fails"] == 5
+
+    def test_the_backoff_exponent_is_bounded(self):
+        """L2: with a float interval, 2 ** 1025 overflowed the conversion and
+        raised before the deadline was written: the keeper pinged every sweep."""
+        um._ping_backoff[77] = {"fails": 5000, "skip_until": 0.0, "token_fp": "fp"}
+        now = time.time()
+        assert um._arm_ping_backoff(77, "fp", 300.0, now) == now + 3600
+
+    def test_a_huge_persisted_count_is_clamped_on_restart(self, db):
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)
+        um._ping_backoff.clear()  # a restart
+        db.set_keeper_state(aid, backoff_fails=10**6, next_attempt_at=time.time() - 1)
+        _run_pass(db, pings)
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert st["next_attempt_at"] - st["last_ping_at"] == pytest.approx(3600, abs=1.01)
+        assert st["backoff_fails"] == um._PING_BACKOFF_MAX_FAILS

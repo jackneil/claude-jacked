@@ -109,11 +109,17 @@ def provider_key(provider) -> str:
 
 
 def _is_number(value) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
+    """A real number (never a bool, NaN or infinity).
+
+    An int is always finite: ``math.isfinite`` would raise OverflowError on
+    one beyond the float range, so ints skip it.
+
+    >>> _is_number(5), _is_number(10**400), _is_number(float("nan")), _is_number(True)
+    (True, True, False, False)
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return isinstance(value, int) or math.isfinite(value)
 
 
 def _text(value, limit: int) -> Optional[str]:
@@ -160,6 +166,8 @@ def window_length_ok(seconds) -> bool:
 
     >>> window_length_ok(18000), window_length_ok(0), window_length_ok(float("inf"))
     (True, False, False)
+    >>> window_length_ok(10**400)
+    False
     """
     return _is_number(seconds) and 0 < seconds <= MAX_WINDOW_SECONDS
 

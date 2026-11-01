@@ -51,10 +51,12 @@ MODEL_LIMIT_KEYS = {"label", "pct", "resets_at", "window_seconds"}
 @pytest.fixture(autouse=True)
 def _no_calling_session(monkeypatch):
     """No test walks the real process table: by default no tracked session
-    runs the command. Tests of ``in_use`` set the ancestry themselves."""
+    runs the command. Tests of ``in_use`` set the ancestry themselves; every
+    tracked process counts as started long before its tracker row."""
     import jacked.session_ancestry as ancestry
 
     monkeypatch.setattr(ancestry, "ancestor_pids", lambda *a, **k: [])
+    monkeypatch.setattr(ancestry, "process_start", lambda pid: 1.0)
 
 
 def _seed_db(home: Path, accounts: list[dict]) -> list[int]:
@@ -690,6 +692,22 @@ def test_no_tracked_session_marks_nothing_in_use(tmp_path, monkeypatch):
     finally:
         db.close()
     monkeypatch.setattr(ancestry, "ancestor_pids", lambda *a, **k: [7777])
+    _, payload = _run_json()
+    assert [a["in_use"] for a in payload["accounts"]] == [False]
+
+
+def test_an_ancestry_error_never_fails_the_command(tmp_path, monkeypatch):
+    """The in_use lookup is advisory: an unreadable process table (hidepid,
+    a locked DB) leaves in_use False and the command still answers."""
+    import jacked.session_ancestry as ancestry
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _seed_db(tmp_path, [{"email": "a@test.com"}])
+
+    def _boom(*_a, **_k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(ancestry, "ancestor_pids", _boom)
     _, payload = _run_json()
     assert [a["in_use"] for a in payload["accounts"]] == [False]
 
