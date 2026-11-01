@@ -72,7 +72,9 @@ def _attach_next_refresh(active: dict, rows: list, state) -> None:
     Preferred source is the REAL schedule the active-poll loop publishes to
     app.state (exact interval, incl. clamps/burn). Falls back to a tier-table
     estimate (compute_urgency_tier — same _TIER_INTERVALS, no hardcoding) when
-    the loop hasn't ticked yet this process.
+    the loop hasn't ticked yet this process. The estimate is plan-aware like
+    the loop's own tier (``usage_monitor.urgency_inputs``): an account
+    without a 5-hour window follows its weekly and model-weekly windows.
     """
     next_at = interval = tier = None
     acct_id = active.get("account_id")
@@ -88,10 +90,11 @@ def _attach_next_refresh(active: dict, rows: list, state) -> None:
         cached_at = row.get("usage_cached_at") if row else None
         if cached_at:
             try:
+                from jacked.api.usage_monitor import urgency_inputs
                 from jacked.web.auth import compute_urgency_tier
 
                 tier, interval = compute_urgency_tier(
-                    row.get("cached_usage_5h"), row.get("cached_usage_7d"), 0.0
+                    **urgency_inputs(row), burn_rate_5h=0.0
                 )
                 next_at = cached_at + interval
             except Exception:

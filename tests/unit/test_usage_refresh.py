@@ -414,6 +414,63 @@ class TestUrgencyTier:
         assert tier == "idle"
         assert interval == 300
 
+    # An account whose plan has no 5-hour window (a verified Ultra): its
+    # weekly value, folded with the binding model-weekly limit, sets the
+    # tier alone, with no extra 7d bump and no 5h burn projection.
+
+    def test_no_session_tier_follows_the_weekly_value(self):
+        from jacked.web.auth import compute_urgency_tier
+
+        cases = [
+            (96.0, ("critical", 180)),
+            (95.0, ("warning", 240)),
+            (91.0, ("warning", 240)),
+            (90.0, ("normal", 300)),
+            (81.0, ("normal", 300)),
+            (80.0, ("idle", 300)),
+            (None, ("idle", 300)),
+        ]
+        for usage_7d, expected in cases:
+            got = compute_urgency_tier(
+                usage_5h=None, usage_7d=usage_7d, burn_rate_5h=0.0,
+                has_session=False,
+            )
+            assert got == expected, usage_7d
+
+    def test_no_session_ignores_a_5h_value_and_its_burn(self):
+        """A stale 5h=100 and a steep 5h burn on a plan without the window
+        must not pull the poll to critical."""
+        from jacked.web.auth import compute_urgency_tier
+
+        assert compute_urgency_tier(
+            usage_5h=100.0, usage_7d=40.0, burn_rate_5h=9.0, critical_5h=95.0,
+            has_session=False,
+        ) == ("idle", 300)
+
+    def test_no_session_tier_folds_the_model_weekly_limit(self):
+        """Fable at 96% walls the account while the all-models week is 40%."""
+        from jacked.web.auth import compute_urgency_tier
+
+        assert compute_urgency_tier(
+            None, 40.0, 0.0, has_session=False, usage_model=96.0,
+        ) == ("critical", 180)
+
+    def test_no_session_has_no_extra_7d_bump(self):
+        from jacked.web.auth import compute_urgency_tier
+
+        assert compute_urgency_tier(None, 85.0, 0.0, has_session=False) == ("normal", 300)
+
+    def test_model_weekly_limit_feeds_the_7d_bump(self):
+        """With a 5h window, the model-weekly value bumps the tier like 7d."""
+        from jacked.web.auth import compute_urgency_tier
+
+        assert compute_urgency_tier(
+            usage_5h=20.0, usage_7d=30.0, burn_rate_5h=0.0, usage_model=85.0,
+        ) == ("normal", 300)
+        assert compute_urgency_tier(
+            usage_5h=20.0, usage_7d=30.0, burn_rate_5h=0.0, usage_model=None,
+        ) == ("idle", 300)
+
 
 class TestConstants:
     """Verify constants are properly defined."""
@@ -771,3 +828,82 @@ class TestNullWindows:
         row = db.get_account(1)
         assert row["cached_usage_7d"] == 50.0
         assert row["cached_7d_resets_at"] == "R7-old"
+
+    # An authoritative Claude limits list (every kind known) names every
+    # limit the account has. With no session entry the account has no
+    # 5-hour window, so a 5h reading left in the cache must go, even when
+    # the payload omits the five_hour key (a missing key keeps the cache).
+
+    _WEEKLY_LIMITS = [
+        {"kind": "weekly_all", "percent": 40, "is_active": False},
+        {"kind": "weekly_scoped", "percent": 12, "is_active": False,
+         "scope": {"model": {"display_name": "Fable"}}},
+    ]
+
+    def _stale_5h_db(self, tmp_path):
+        db = _real_db(tmp_path)
+        db.update_account_usage_cache(
+            1, five_hour=100.0, five_hour_resets_at="2026-11-01T20:00:00Z",
+            seven_day=30.0, seven_day_resets_at="R7-old")
+        db.update_account(1, usage_cached_at=0)
+        return db
+
+    def test_authoritative_limits_without_a_session_clear_a_missing_5h_key(self, tmp_path):
+        db = self._stale_5h_db(tmp_path)
+        self._fetch(db, {
+            "seven_day": {"utilization": 41.0, "resets_at": "R7"},
+            "limits": self._WEEKLY_LIMITS,
+        })
+        row = db.get_account(1)
+        assert row["cached_usage_5h"] is None
+        assert row["cached_5h_resets_at"] is None
+        assert row["cached_usage_7d"] == 41.0
+
+    def test_limits_with_a_session_entry_keep_a_missing_5h_key(self, tmp_path):
+        db = self._stale_5h_db(tmp_path)
+        self._fetch(db, {
+            "limits": [{"kind": "session", "percent": 100}, *self._WEEKLY_LIMITS],
+        })
+        row = db.get_account(1)
+        assert row["cached_usage_5h"] == 100.0
+        assert row["cached_5h_resets_at"] == "2026-11-01T20:00:00Z"
+
+    def test_an_unknown_limit_kind_keeps_a_missing_5h_key(self, tmp_path):
+        """A renamed session kind must never read as "no 5-hour limit"."""
+        db = self._stale_5h_db(tmp_path)
+        self._fetch(db, {
+            "limits": [{"kind": "rolling_5h", "percent": 9}, *self._WEEKLY_LIMITS],
+        })
+        assert db.get_account(1)["cached_usage_5h"] == 100.0
+
+    def test_a_reported_five_hour_window_wins_over_a_session_free_list(self, tmp_path):
+        db = self._stale_5h_db(tmp_path)
+        self._fetch(db, {
+            "five_hour": {"utilization": 7.0, "resets_at": "R5-new"},
+            "limits": self._WEEKLY_LIMITS,
+        })
+        row = db.get_account(1)
+        assert row["cached_usage_5h"] == 7.0
+        assert row["cached_5h_resets_at"] == "R5-new"
+
+    def test_the_rule_matches_the_resolver_on_edge_lists(self):
+        """usage_cache_updates clears exactly when jacked.usage_plans reads
+        the payload as authoritative and silent about a session."""
+        from jacked.usage_plans import session_window
+        from jacked.web.auth import usage_cache_updates
+
+        ultra = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x"}
+        cases = [
+            [],                                    # an empty list names no window
+            [{"kind": "weekly_all"}],              # weekly only
+            [{"kind": "weekly_all"}, "junk"],      # a non-object entry
+            [{"kind": None}],                      # a kind that is not a string
+            [{"kind": {"nested": 1}}],             # an unhashable kind
+            [{"kind": "session"}],                 # a reported session
+            "weekly_all",                          # not a list at all
+        ]
+        for limits in cases:
+            payload = {"limits": limits}
+            absent = session_window(ultra, payload).state == "absent"
+            cleared = usage_cache_updates(payload).get("clear_five_hour", False)
+            assert cleared is absent, limits
