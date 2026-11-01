@@ -76,7 +76,6 @@ from jacked.statusline_common import (
     _pct_color,
     _round_pct,
     _sum_usage,
-    _tier_label as _tier_label,
 )
 from jacked.statusline_transcript import _cost_segment, _served_segment
 

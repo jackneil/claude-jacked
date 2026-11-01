@@ -127,6 +127,8 @@ class ModelUsage(BaseModel):
     ``label`` is the provider's display name (e.g. "Fable", "GPT-5.3-Codex-Spark").
     ``severity`` / ``is_active`` come from Claude's ``limits`` array — ``is_active``
     flags the single binding constraint (surfaced as the inline binding bar).
+    ``window_seconds`` is the length of the limit's window in seconds; the
+    dashboard draws the elapsed marker from it.
     """
 
     utilization: float = 0
@@ -134,6 +136,7 @@ class ModelUsage(BaseModel):
     label: Optional[str] = None
     severity: Optional[str] = None
     is_active: bool = False
+    window_seconds: Optional[int] = None
 
 
 class ExtraUsage(BaseModel):
@@ -148,9 +151,17 @@ class ExtraUsage(BaseModel):
 class AccountUsage(BaseModel):
     """Usage statistics for an account with per-model breakdowns.
 
-    A window is None only for a Codex window that Codex does not report for
-    the account (a weekly-only plan has no 5h window). A Claude window with
-    no reading is "no active window", which is 0% used.
+    ``five_hour`` follows the account's plan (:mod:`jacked.usage_plans`). It
+    is None when the account has no 5-hour window (a verified Ultra account,
+    ChatGPT Pro in Codex), even when an old reading is still in the cache,
+    and ``five_hour_resets_at`` is then None too. A Claude account that has
+    the window but no reading has no window open, which is 0% used. With no
+    reading, a Codex window and a window that jacked cannot confirm are None.
+    When the plan resolver fails, ``five_hour`` is the cached reading.
+
+    ``seven_day`` keeps the cached rule: a Codex window with no reading is a
+    window Codex does not report for the account, so it is None; a Claude
+    window with no reading is 0% used.
     """
 
     five_hour: Optional[float] = 0
@@ -222,6 +233,50 @@ class UsageBlock(BaseModel):
     read_at: Optional[int] = None
 
 
+class PlanInfo(BaseModel):
+    """The account's plan, from the plan catalog (:mod:`jacked.usage_plans`).
+
+    ``label`` is the provider's own plan name when the account profile has
+    one, else the catalog label, else the raw subscription type
+    (``label_source`` names which: ``provider``, ``catalog``, ``raw`` or
+    ``none``). ``formerly`` is the plan's previous name (for example
+    "Max 20x" for Ultra). ``drift`` lists the codes for each point where the
+    live payload contradicts the catalog. ``catalog_verified_at`` is the
+    date of the catalog that ships with this jacked release.
+    """
+
+    id: Optional[str] = None
+    label: Optional[str] = None
+    formerly: Optional[str] = None
+    label_source: str = "none"
+    drift: list[str] = Field(default_factory=list)
+    catalog_verified_at: Optional[str] = None
+
+
+class WindowInfo(BaseModel):
+    """One usage window of the account.
+
+    ``state`` is ``present`` (the account has the window), ``absent`` (the
+    account does not have it) or ``unknown`` (jacked cannot tell yet; every
+    decision counts it as a window). ``temporary`` marks a window that the
+    provider removes later (an Ultra account before verification).
+    ``seconds`` is the length of the window. ``note`` is the text to show
+    for the window state, or None.
+    """
+
+    state: str
+    temporary: bool = False
+    seconds: int
+    note: Optional[str] = None
+
+
+class AccountWindows(BaseModel):
+    """The account's 5-hour and 7-day windows."""
+
+    five_hour: WindowInfo
+    seven_day: WindowInfo
+
+
 class AccountResponse(BaseModel):
     """Account data with computed fields for API responses."""
 
@@ -266,6 +321,10 @@ class AccountResponse(BaseModel):
     usage: Optional[AccountUsage] = None
     keeper_state: Optional[KeeperState] = None
     usage_block: Optional[UsageBlock] = None
+    # The plan and its windows from the plan catalog. None only when the plan
+    # resolver fails for this row (logged); the row is still served.
+    plan: Optional[PlanInfo] = None
+    windows: Optional[AccountWindows] = None
 
 
 class AccountPatchRequest(BaseModel):
@@ -571,12 +630,16 @@ def _claim_switch_action(db, request: Request, account_id: int):
 
 def _parse_usage_details(
     raw_json: Optional[str],
+    plan=None,
 ) -> tuple[Optional[dict[str, ModelUsage]], Optional[str], Optional[ExtraUsage]]:
     """Parse cached_usage_raw JSON into (per_model dict, binding key, ExtraUsage).
 
     The binding key names the per_model entry to surface as the inline bar (the
     active or notably-high model), or None. Selection lives in the shared
-    ``menubar_summary.binding_model`` so every surface agrees.
+    ``menubar_summary.binding_model`` so every surface agrees. *plan* is the
+    account's :class:`jacked.usage_plans.PlanMatch`; it gives the
+    plan-specific window lengths that each entry's ``window_seconds`` carries
+    (provider lengths when it is None).
 
     >>> _parse_usage_details(None)
     (None, None, None)
@@ -586,8 +649,8 @@ def _parse_usage_details(
     >>> pm["sonnet"].utilization, bk, eu is None
     (42.5, 'sonnet', True)
     >>> pm, bk, _ = _parse_usage_details('{"limits": [{"kind": "weekly_scoped", "percent": 92, "severity": "critical", "is_active": true, "scope": {"model": {"display_name": "Fable"}}}]}')
-    >>> pm["fable"].utilization, pm["fable"].label, bk
-    (92.0, 'Fable', 'fable')
+    >>> pm["fable"].utilization, pm["fable"].label, bk, pm["fable"].window_seconds
+    (92.0, 'Fable', 'fable', 604800)
     """
     if not raw_json:
         return None, None, None
@@ -605,7 +668,7 @@ def _parse_usage_details(
     from jacked.service.menubar_summary import binding_model, parse_per_model
 
     try:
-        parsed = parse_per_model(data)
+        parsed = parse_per_model(data, plan)
         per_model: dict[str, ModelUsage] = {}
         for m in parsed:
             per_model[m["key"]] = ModelUsage(
@@ -614,6 +677,7 @@ def _parse_usage_details(
                 label=m.get("label"),
                 severity=m.get("severity"),
                 is_active=bool(m.get("is_active")),
+                window_seconds=m.get("window_seconds"),
             )
         bm = binding_model(parsed)
         binding_key = bm["key"] if bm else None
@@ -643,8 +707,13 @@ def _parse_usage_details(
     return (per_model or None), binding_key, extra
 
 
-def _build_account_usage(row: dict) -> Optional[AccountUsage]:
+def _build_account_usage(row: dict, view=None) -> Optional[AccountUsage]:
     """Build AccountUsage from a DB account row if usage data exists.
+
+    *view* is the row's plan view (:func:`jacked.usage_plans.account_view`);
+    it is resolved here when the caller does not pass one. The 5-hour value
+    follows the plan, as :class:`AccountUsage` says; when the resolver fails
+    it is the cached reading. The 7-day value keeps the cached rule.
 
     >>> _build_account_usage({}) is None
     True
@@ -653,25 +722,70 @@ def _build_account_usage(row: dict) -> Optional[AccountUsage]:
     25.0
     >>> _build_account_usage({"provider": "codex", "cached_usage_7d": 100.0}).five_hour is None
     True
+
+    A verified Ultra account lists its limits without a 5-hour session. It
+    has no 5-hour window, so an old 5-hour value in the cache is no reading:
+
+    >>> ultra = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x",
+    ...          "cached_usage_5h": 67.0, "cached_usage_7d": 33.0,
+    ...          "cached_usage_raw": json.dumps({"five_hour": None,
+    ...              "limits": [{"kind": "weekly_all", "percent": 33}]})}
+    >>> u = _build_account_usage(ultra)
+    >>> u.five_hour is None, u.seven_day
+    (True, 33.0)
+
+    A Max account whose payload lists a session limit, with no 5-hour
+    reading, has no window open (0% used):
+
+    >>> max5 = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_5x",
+    ...         "cached_usage_5h": None, "cached_usage_7d": 23.0,
+    ...         "cached_usage_raw": json.dumps({"five_hour": None, "limits": [
+    ...             {"kind": "session", "percent": 0},
+    ...             {"kind": "weekly_all", "percent": 23}]})}
+    >>> _build_account_usage(max5).five_hour
+    0.0
+
+    ChatGPT Pro has no 5-hour window in Codex. Its payload lists one weekly
+    window and no other, so an old 5-hour value is no reading:
+
+    >>> pro = {"provider": "codex", "subscription_type": "pro",
+    ...        "cached_usage_5h": 12.0, "cached_usage_7d": 38.0,
+    ...        "cached_usage_raw": json.dumps({"rateLimits": {
+    ...            "primary": {"usedPercent": 38, "windowDurationMins": 10080},
+    ...            "secondary": None}})}
+    >>> _build_account_usage(pro).five_hour is None
+    True
     """
     if row.get("cached_usage_5h") is None and row.get("cached_usage_7d") is None:
         return None
+    if view is None:
+        from jacked.service.menubar_summary import safe_account_view
+
+        view = safe_account_view(row)
     per_model, binding_key, extra_usage = _parse_usage_details(
-        row.get("cached_usage_raw")
+        row.get("cached_usage_raw"), view.plan if view is not None else None
     )
     binding = per_model.get(binding_key) if (per_model and binding_key) else None
     codex = (row.get("provider") or "claude") == "codex"
 
-    def _window(value):
-        # A Codex window with no reading is not reported, not 0% used.
-        if value is None:
-            return None if codex else 0
-        return value
+    if view is not None:
+        five_hour = view.five_hour_reading()
+        # The reset of a window the account does not have is stale too.
+        five_hour_resets_at = view.projected_row().get("cached_5h_resets_at")
+    else:
+        five_hour = row.get("cached_usage_5h")
+        five_hour_resets_at = row.get("cached_5h_resets_at")
+
+    seven_day = row.get("cached_usage_7d")
+    if seven_day is None and not codex:
+        # A Claude window with no reading has no window open: 0% used. A
+        # Codex window with no reading is not reported, not 0% used.
+        seven_day = 0
 
     return AccountUsage(
-        five_hour=_window(row.get("cached_usage_5h")),
-        seven_day=_window(row.get("cached_usage_7d")),
-        five_hour_resets_at=row.get("cached_5h_resets_at"),
+        five_hour=five_hour,
+        seven_day=seven_day,
+        five_hour_resets_at=five_hour_resets_at,
         seven_day_resets_at=row.get("cached_7d_resets_at"),
         per_model=per_model,
         binding_model=binding,
@@ -751,6 +865,17 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
             except Exception:
                 pass
 
+    # Resolve the plan and its windows once, from the final row. A resolver
+    # failure is logged and serves the row without plan and windows: one
+    # account must never fail the account list.
+    from jacked.service.menubar_summary import safe_account_view
+
+    view = safe_account_view(row)
+    plan = windows = None
+    if view is not None:
+        plan = PlanInfo(**view.plan_payload())
+        windows = AccountWindows(**view.windows_payload())
+
     # Build response without access_token or refresh_token (never expose)
     return AccountResponse(
         id=row["id"],
@@ -796,8 +921,10 @@ def _account_to_response(row: dict, db=None) -> AccountResponse:
         is_default=row.get("priority", 0) == 0,
         is_expired=now >= row["expires_at"],
         expires_in_seconds=max(0, row["expires_at"] - now),
-        usage=_build_account_usage(row),
+        usage=_build_account_usage(row, view),
         usage_block=_build_usage_block(row),
+        plan=plan,
+        windows=windows,
     )
 
 
@@ -1477,53 +1604,53 @@ async def refresh_all_usage(
                     fetch_failed = not is_cached and usage_data is None
 
                     def _final_reads():
-                        # Both account re-reads in one thread hop, as they ran
-                        # back to back on the loop before. They run before the
-                        # completion count below, so that count and its
-                        # broadcast still have no await between them.
+                        # The account re-reads in one thread hop. They run
+                        # before the completion count below, so that count
+                        # and its broadcast still have no await between them.
+                        # A pass that did not fail reads the row the fetch
+                        # left behind: the WebSocket payload's read when
+                        # there is one, else its own.
                         error_row = (
                             db.get_account(acct["id"]) if fetch_failed else None
                         )
+                        stored_row = None
                         payload = None
                         if ws_registry:
-                            updated_row = db.get_account(acct["id"])
+                            stored_row = db.get_account(acct["id"])
                             payload = (
-                                _account_to_response(updated_row).model_dump()
-                                if updated_row
+                                _account_to_response(stored_row).model_dump()
+                                if stored_row
                                 else None
                             )
-                        return error_row, payload
+                        elif not fetch_failed:
+                            stored_row = db.get_account(acct["id"])
+                        return error_row, stored_row, payload
 
-                    updated_acct, acct_payload = await asyncio.to_thread(
+                    error_acct, stored_acct, acct_payload = await asyncio.to_thread(
                         _final_reads
                     )
 
-                    if usage_data is not None:
-                        five_hour = usage_data.get("five_hour", {})
-                        seven_day = usage_data.get("seven_day", {})
+                    if not fetch_failed:
+                        # Fetched, or served from the cache: report the
+                        # values now stored in the DB. The provider payload is
+                        # not parsed here: a verified Ultra account answers
+                        # "five_hour": null, and a Codex result has no
+                        # five_hour key at all.
+                        stored = stored_acct or acct
                         row = {
                             "account_id": acct["id"],
                             "email": acct["email"],
                             "success": True,
-                            "cached_usage_5h": five_hour.get("utilization"),
-                            "cached_usage_7d": seven_day.get("utilization"),
-                        }
-                    elif is_cached:
-                        # Cache hit — report existing DB values, count as success
-                        row = {
-                            "account_id": acct["id"],
-                            "email": acct["email"],
-                            "success": True,
-                            "cached_usage_5h": acct.get("cached_usage_5h"),
-                            "cached_usage_7d": acct.get("cached_usage_7d"),
+                            "cached_usage_5h": stored.get("cached_usage_5h"),
+                            "cached_usage_7d": stored.get("cached_usage_7d"),
                         }
                     else:
                         row = {
                             "account_id": acct["id"],
                             "email": acct["email"],
                             "success": False,
-                            "error": updated_acct.get("last_error")
-                            if updated_acct
+                            "error": error_acct.get("last_error")
+                            if error_acct
                             else None,
                         }
 

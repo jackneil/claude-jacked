@@ -2022,3 +2022,105 @@ class TestDeadChainCleanupRace:
         after = db.get_account(aid)
         assert after["cc_access_token"] is None and after["cc_refresh_token"] is None
         assert after["cc_refresh_failure_type"] == "invalid_grant"
+
+
+# ---------------------------------------------------------------------------
+# OAuth store: a usage payload with a null 5-hour window
+# ---------------------------------------------------------------------------
+
+
+class TestOAuthStoreNullFiveHour:
+    """A verified Ultra account answers ``"five_hour": null`` (live shape,
+    2026-11-01). The OAuth add and re-auth store used to parse
+    ``usage.get("five_hour", {}).get(...)``, so the null raised AttributeError
+    and the whole add or re-auth failed after the tokens were exchanged."""
+
+    ULTRA_USAGE = {
+        "five_hour": None,
+        "seven_day": {"utilization": 3, "resets_at": "2026-11-07T04:59:59+00:00"},
+        "limits": [
+            {"kind": "weekly_all", "group": "weekly", "percent": 3,
+             "resets_at": "2026-11-07T04:59:59+00:00", "scope": None,
+             "is_active": False},
+        ],
+    }
+
+    @staticmethod
+    def _complete(flow, tokens, usage):
+        from jacked.web.oauth import OAuthFlow
+
+        with (
+            patch.object(flow, "_exchange_code", new_callable=AsyncMock, return_value=tokens),
+            patch.object(flow, "_fetch_profile", new_callable=AsyncMock, return_value={}),
+            patch.object(flow, "_fetch_usage", new_callable=AsyncMock, return_value=usage),
+            patch.object(OAuthFlow, "start", new_callable=AsyncMock, return_value={"flow_id": "cc"}),
+        ):
+            return asyncio.run(flow._complete_auth("test_code"))
+
+    @patch("jacked.web.oauth._activate_oauth_account")
+    def test_reauth_clears_the_5h_window_and_stores_the_7d(self, mock_activation, tmp_path):
+        from jacked.web.oauth import OAuthFlow
+
+        db = _make_db(tmp_path)  # alice=1, bob=2
+        db.set_setting("active_account_id", "2")  # re-auth a background account
+        # A 5h reading from before Anthropic verified the account.
+        db.update_account_usage_cache(
+            1, five_hour=67.0, five_hour_resets_at="2026-10-30T18:59:59+00:00",
+            seven_day=20.0,
+        )
+        flow = OAuthFlow(db, purpose="primary", target_account_id=1)
+        tokens = {
+            "access_token": "alice_new_at", "refresh_token": "alice_new_rt",
+            "expires_in": 3600, "scope": "user:profile", "email": "alice@test.com",
+        }
+
+        result = self._complete(flow, tokens, self.ULTRA_USAGE)
+
+        assert result["account_id"] == 1
+        row = db.get_account(1)
+        assert row["access_token"] == "alice_new_at"
+        assert row["cached_usage_5h"] is None
+        assert row["cached_5h_resets_at"] is None
+        assert row["cached_usage_7d"] == 3
+        assert row["cached_7d_resets_at"] == "2026-11-07T04:59:59+00:00"
+        assert json.loads(row["cached_usage_raw"]) == self.ULTRA_USAGE
+        assert row["usage_cached_at"] is not None
+        mock_activation.assert_not_called()
+
+    @patch("jacked.web.oauth._activate_oauth_account")
+    def test_add_stores_the_7d_reading(self, mock_activation, tmp_path):
+        from jacked.web.oauth import OAuthFlow
+
+        db = _make_db(tmp_path)
+        db.set_setting("active_account_id", "1")
+        flow = OAuthFlow(db, purpose="primary")
+        tokens = {
+            "access_token": "dana_at", "refresh_token": "dana_rt",
+            "expires_in": 3600, "scope": "user:profile", "email": "dana@test.com",
+        }
+
+        self._complete(flow, tokens, self.ULTRA_USAGE)
+
+        row = db.get_account_by_email("dana@test.com")
+        assert row is not None
+        assert row["cached_usage_5h"] is None
+        assert row["cached_usage_7d"] == 3
+        assert json.loads(row["cached_usage_raw"])["five_hour"] is None
+
+    @patch("jacked.web.oauth._activate_oauth_account")
+    def test_empty_usage_writes_no_cache(self, mock_activation, tmp_path):
+        from jacked.web.oauth import OAuthFlow
+
+        db = _make_db(tmp_path)
+        db.set_setting("active_account_id", "1")
+        flow = OAuthFlow(db, purpose="primary")
+        tokens = {
+            "access_token": "eve_at", "refresh_token": "eve_rt",
+            "expires_in": 3600, "scope": "user:profile", "email": "eve@test.com",
+        }
+
+        self._complete(flow, tokens, {})
+
+        row = db.get_account_by_email("eve@test.com")
+        assert row["usage_cached_at"] is None
+        assert row["cached_usage_raw"] is None

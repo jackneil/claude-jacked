@@ -5,6 +5,7 @@ worst-account selection, pill title) and the GET /api/menubar-summary endpoint
 against a real fixture DB with the active-account resolver patched for
 determinism.
 """
+import json
 from unittest import mock
 
 import pytest
@@ -55,6 +56,115 @@ def test_summarize_account():
 def test_summarize_account_none_without_usage():
     assert summarize_account({"id": 1, "email": "a@x.com"}) is None
     assert summarize_account({}) is None
+
+
+# ---------------------------------------------------------------------------
+# The 5h slot follows the account's plan (jacked.usage_plans)
+# ---------------------------------------------------------------------------
+
+# Live shape (2026-11-01): a verified Ultra account answers five_hour: null
+# and lists only weekly limits.
+_ULTRA_RAW = json.dumps({
+    "five_hour": None,
+    "seven_day": {"utilization": 33.0, "resets_at": "2026-11-02T22:59:59+00:00"},
+    "limits": [
+        {"kind": "weekly_all", "group": "weekly", "percent": 33},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 61, "is_active": True,
+         "scope": {"model": {"display_name": "Fable"}}},
+    ],
+})
+
+
+@pytest.fixture
+def _fresh_plan_state(monkeypatch):
+    from jacked import usage_plans
+    from jacked.service import menubar_summary
+
+    monkeypatch.setattr(usage_plans, "_catalog_cache", None)
+    monkeypatch.setattr(usage_plans, "_drift_logged", set())
+    monkeypatch.setattr(menubar_summary, "_VIEW_FAILURES_LOGGED", set())
+
+
+def _ultra(**extra):
+    row = {"id": 3, "email": "u@x.com", "subscription_type": "max",
+           "rate_limit_tier": "default_claude_max_20x",
+           "cached_usage_5h": 67.0,  # stale, from before verification
+           "cached_usage_7d": 33.0, "cached_usage_raw": _ULTRA_RAW}
+    row.update(extra)
+    return row
+
+
+@pytest.mark.usefixtures("_fresh_plan_state")
+class TestPlanAwareFiveHour:
+    def test_verified_ultra_has_no_5h_slot(self):
+        s = summarize_account(_ultra())
+        assert s["five_hour"] is None
+        assert s["seven_day"] == 33.0
+        assert s["max_pct"] == 33.0  # from 7d, the stale 67% is not a reading
+        assert s["color"] == "green"
+        assert menubar_title(s) == "-·33%"
+
+    def test_idle_max_reads_zero(self):
+        raw = json.dumps({"five_hour": None, "limits": [
+            {"kind": "session", "percent": 0}, {"kind": "weekly_all", "percent": 23}]})
+        s = summarize_account({"id": 4, "subscription_type": "max",
+                               "rate_limit_tier": "default_claude_max_5x",
+                               "cached_usage_5h": None, "cached_usage_7d": 23,
+                               "cached_usage_raw": raw})
+        assert s["five_hour"] == 0.0
+        assert menubar_title(s) == "0%·23%"
+
+    def test_rounding_is_kept(self):
+        raw = json.dumps({"limits": [{"kind": "session", "percent": 41}]})
+        s = summarize_account({"id": 5, "subscription_type": "max",
+                               "rate_limit_tier": "default_claude_max_5x",
+                               "cached_usage_5h": 41.26, "cached_usage_7d": 9.04,
+                               "cached_usage_raw": raw})
+        assert (s["five_hour"], s["seven_day"]) == (41.3, 9.0)
+
+    def test_no_reading_in_either_slot_is_no_summary(self):
+        # The Codex payload lists every window the account has, and it lists
+        # none: the stale 5h value is no reading, and Codex never turns a
+        # null 7d into 0%. Nothing is left to show (and max() of nothing
+        # must not raise).
+        raw = json.dumps({"rateLimits": {"primary": None, "secondary": None}})
+        assert summarize_account({"id": 9, "provider": "codex",
+                                  "subscription_type": "pro",
+                                  "cached_usage_5h": 40.0,
+                                  "cached_usage_7d": None,
+                                  "cached_usage_raw": raw}) is None
+
+    def test_a_cached_five_hour_reading_without_a_payload_is_kept(self):
+        # No payload to read: the cached 5h reading is prior evidence of a
+        # window, and a partial read must never erase a live window.
+        s = summarize_account({"id": 9, "provider": "codex",
+                               "subscription_type": "pro",
+                               "cached_usage_5h": 40.0, "cached_usage_7d": None})
+        assert (s["five_hour"], s["seven_day"], s["max_pct"]) == (40.0, None, 40.0)
+
+    def test_worst_ignores_a_stale_5h_on_a_plan_without_the_window(self):
+        busy = {"id": 1, "email": "busy@x.com", "cached_usage_5h": 50, "cached_usage_7d": 40}
+        worst = compute_worst_account_summary([_ultra(cached_usage_5h=99.0), busy])
+        assert worst["email"] == "busy@x.com"
+
+    def test_resolver_error_falls_back_to_the_cached_readings(self, monkeypatch, caplog):
+        import logging
+
+        from jacked import usage_plans
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("unexpected payload shape")
+
+        monkeypatch.setattr(usage_plans, "account_view", _boom)
+        with caplog.at_level(logging.WARNING, logger="jacked.service.menubar_summary"):
+            s = summarize_account(_ultra())
+            worst = compute_worst_account_summary([_ultra(), _ultra(id=8)])
+        assert (s["five_hour"], s["seven_day"]) == (67.0, 33.0)
+        assert worst is not None
+        assert summarize_account(_ultra(cached_usage_5h=None))["five_hour"] is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2  # once per account
+        assert all("RuntimeError" in w and "unexpected" not in w for w in warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -340,5 +450,37 @@ def test_endpoint_worst_codex_keeps_unreported_window_null(db):
         assert worst["blocked"] is True
         assert worst["color"] == "red"
         assert menubar_title(worst) == "-·100%"
+    finally:
+        app.state.db = None
+
+
+def test_endpoint_survives_a_payload_the_resolver_cannot_read(db, _fresh_plan_state):
+    """One account whose cached payload breaks the plan resolver must not
+    take the pill down for the whole fleet."""
+    import time
+
+    from jacked.api.main import app
+
+    junk = {"rateLimits": {"primary": "unexpected", "secondary": None}}
+    with db._writer() as conn:
+        conn.execute(
+            """INSERT INTO accounts
+               (id, provider, email, access_token, expires_at, is_active, is_deleted,
+                validation_status, cached_usage_5h, cached_usage_7d, usage_cached_at,
+                cached_usage_raw)
+               VALUES (10, 'codex', 'junk@x.com', 'at10', 1900000000, 1, 0, 'valid',
+                       NULL, 12, ?, ?)""",
+            (int(time.time()), json.dumps(junk)),
+        )
+    app.state.db = db
+    try:
+        with _patch_active(10):
+            resp = TestClient(app, raise_server_exceptions=False).get("/api/menubar-summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active"]["email"] == "junk@x.com"
+        assert data["active"]["five_hour"] is None
+        assert data["active"]["seven_day"] == 12.0
+        assert data["worst"]["email"] == "hot@x.com"
     finally:
         app.state.db = None

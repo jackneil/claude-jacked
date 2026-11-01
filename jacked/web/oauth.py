@@ -1116,17 +1116,16 @@ class OAuthFlow:
                     account["id"], type(e).__name__,
                 )
 
-        # Update usage cache if we got usage data
-        five_hour = usage.get("five_hour", {})
-        seven_day = usage.get("seven_day", {})
-        if five_hour or seven_day:
+        # Seed the usage cache from the usage this flow fetched, through the
+        # same mapping as every usage fetch. A null window (a verified Ultra
+        # account answers "five_hour": null) clears that window; it is never
+        # parsed as an object.
+        if isinstance(usage, dict) and usage:
+            # Lazy: jacked.web.auth imports this module at module level.
+            from jacked.web.auth import usage_cache_updates
+
             self.db.update_account_usage_cache(
-                account["id"],
-                five_hour=five_hour.get("utilization"),
-                seven_day=seven_day.get("utilization"),
-                five_hour_resets_at=five_hour.get("resets_at"),
-                seven_day_resets_at=seven_day.get("resets_at"),
-                raw=usage,
+                account["id"], raw=usage, **usage_cache_updates(usage)
             )
 
         logger.info("Account stored: id=%d", account["id"])

@@ -15,13 +15,58 @@ The green/yellow/red thresholds here are the Python mirror of
 ``usageColorClass`` in ``jacked/data/web/js/components/usage.js`` — keep them in
 lockstep so the pill's color can never disagree with the bar a user sees in the
 panel/dashboard.
+
+The 5-hour slot follows the account's plan (:mod:`jacked.usage_plans`), the
+same rule the account API uses: an account that has no 5-hour window (a
+verified Ultra account, ChatGPT Pro in Codex) shows no 5-hour number, even
+when an old reading is still in the cache.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
+
+logger = logging.getLogger(__name__)
+
+# (account id, exception type) pairs whose resolver failure was already
+# logged at WARNING in this process. Repeats log at DEBUG: the account list
+# and the pill read every account on each poll.
+_VIEW_FAILURES_LOGGED: set = set()
+
+
+def safe_account_view(acct: Mapping):
+    """The plan view of an account row (``usage_plans.account_view``), or None.
+
+    Every surface that lists accounts reads the 5-hour window through this
+    view. A payload shape that makes the resolver fail must not stop the
+    account list or the pill for every account, so a failure returns None
+    and the caller shows the cached readings. The failure is logged as a
+    WARNING with the account id and the exception type, once for each pair
+    in a process; the WARNING never holds the payload or the exception text.
+    Each failure also logs its traceback at DEBUG.
+
+    >>> safe_account_view({"subscription_type": "pro"}).plan.label
+    'Pro'
+    """
+    from jacked.usage_plans import account_view
+
+    try:
+        return account_view(acct)
+    except Exception as exc:  # noqa: BLE001 - one bad row must not fail a list
+        account_id = acct.get("id") if isinstance(acct, Mapping) else None
+        key = (account_id, type(exc).__name__)
+        if key not in _VIEW_FAILURES_LOGGED:
+            _VIEW_FAILURES_LOGGED.add(key)
+            logger.warning(
+                "Plan resolver failed for account %s (%s); showing its cached "
+                "usage readings without plan and window facts",
+                *key,
+            )
+        logger.debug("Plan resolver failure for account %s (%s)", *key, exc_info=True)
+        return None
 
 
 def usage_color_class(pct: Optional[float]) -> str:
@@ -58,12 +103,20 @@ def _eligible(acct: dict) -> bool:
 def summarize_account(acct: dict) -> Optional[dict]:
     """Build a pill summary for a single account, or None if it has no usage.
 
-    A Claude window with no reading is "no active window", which is 0% used.
-    A Codex window with no reading is a window Codex does not report for the
-    account (a weekly-only plan has no 5h window), so it stays None instead
-    of reading as 0% headroom. ``blocked`` carries the provider's own
-    usage-blocked verdict (:func:`usage_block_of_row`); a blocked account is
-    red at any percent.
+    The 5-hour slot follows the account's plan (:func:`safe_account_view`):
+    it is None when the account has no 5-hour window. A Claude account that
+    has the window but no reading has no window open, which is 0% used. With
+    no reading, a Codex window and a window that jacked cannot confirm are
+    None. When the plan resolver fails, the 5-hour slot shows the cached
+    reading.
+
+    The 7-day slot keeps the cached rule: a Claude window with no reading is
+    0% used, and a Codex window with no reading is a window Codex does not
+    report, so it stays None instead of reading as 0% headroom.
+    ``max_pct`` and ``color`` come from the slots that have a value; with no
+    value in either slot there is no summary. ``blocked`` carries the
+    provider's own usage-blocked verdict (:func:`usage_block_of_row`); a
+    blocked account is red at any percent.
 
     >>> s = summarize_account({"id": 1, "email": "a@x.com",
     ...                        "cached_usage_5h": 37, "cached_usage_7d": 87})
@@ -74,6 +127,18 @@ def summarize_account(acct: dict) -> Optional[dict]:
     >>> c = summarize_account({"id": 2, "provider": "codex", "cached_usage_7d": 40})
     >>> c["five_hour"], c["seven_day"], c["max_pct"], c["color"]
     (None, 40.0, 40.0, 'green')
+
+    A verified Ultra account lists its limits without a 5-hour session, so
+    an old 5-hour value in the cache is not a reading:
+
+    >>> ultra = {"id": 3, "subscription_type": "max",
+    ...          "rate_limit_tier": "default_claude_max_20x",
+    ...          "cached_usage_5h": 67.0, "cached_usage_7d": 33.0,
+    ...          "cached_usage_raw": json.dumps({"five_hour": None,
+    ...              "limits": [{"kind": "weekly_all", "percent": 33}]})}
+    >>> u = summarize_account(ultra)
+    >>> u["five_hour"], u["max_pct"], u["color"], menubar_title(u)
+    (None, 33.0, 'green', '-·33%')
     """
     if not acct:
         return None
@@ -83,14 +148,19 @@ def summarize_account(acct: dict) -> Optional[dict]:
         return None
     provider = acct.get("provider") or "claude"
 
-    def _window(value):
-        if value is None and provider == "codex":
-            return None
-        return round(float(value or 0.0), 1)
-
-    f5 = _window(u5)
-    f7 = _window(u7)
-    worst = max(v for v in (f5, f7) if v is not None)
+    view = safe_account_view(acct)
+    five = view.five_hour_reading() if view is not None else u5
+    f5 = None if five is None else round(float(five), 1)
+    if u7 is None and provider == "codex":
+        f7 = None
+    else:
+        f7 = round(float(u7 or 0.0), 1)
+    readings = [v for v in (f5, f7) if v is not None]
+    if not readings:
+        # No window has a reading (a Codex plan without a 5-hour window and
+        # no weekly reading): nothing to show.
+        return None
+    worst = max(readings)
     blocked = usage_block_of_row(acct) is not None
     return {
         "account_id": acct.get("id"),
