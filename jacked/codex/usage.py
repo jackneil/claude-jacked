@@ -98,25 +98,18 @@ def _classify_windows(primary, secondary) -> dict:
         ("five_hour", primary),
         ("seven_day", secondary),
     ):
-        # Only None (or an empty object) means "no window here". Any other
-        # value that is not an object, falsy ones included ([], 0, ""), is a
-        # shape jacked does not understand.
+        # Only None or {} means "no window". Any other non-object ([], 0, a
+        # string) is an unknown shape: dropped, so nothing is cleared.
         if window is None or (isinstance(window, Mapping) and not window):
             continue
         if not isinstance(window, Mapping):
-            # A window that is not an object (a string, a list, a bare
-            # number) is a payload shape jacked does not understand: it is
-            # not placed, and the payload stops being authoritative so no
-            # cache column is cleared on its account.
             slots["dropped"] = True
             key = f"nonobject:{positional_slot}:{type(window).__name__}"
-            log = logger.debug if key in _warned_shapes else logger.warning
-            _warned_shapes.add(key)
-            log(
-                "codex rate-limit %s window is a %s, not an object; ignoring "
-                "it. The app-server payload shape may have changed",
+            (logger.debug if key in _warned_shapes else logger.warning)(
+                "codex rate-limit %s window is a %s, not an object; ignoring it",
                 positional_slot, type(window).__name__,
             )
+            _warned_shapes.add(key)
             continue
         dur = window.get("windowDurationMins")
         if _usable_duration(dur):
@@ -167,13 +160,12 @@ def normalize_rate_limits(result: Mapping) -> dict:
     preserve the last known cache, never clear it.
     """
     result = result if isinstance(result, Mapping) else {}
-    rl = result.get("rateLimits")
-    # A rateLimits value that is not an object is a shape jacked does not
-    # understand: no windows, and never authoritative (both keys missing).
-    rl = rl if isinstance(rl, Mapping) else {}
+    # A non-object rateLimits: no windows, never authoritative.
+    rl = result.get("rateLimits") if isinstance(result.get("rateLimits"), Mapping) else {}
     slots = _classify_windows(rl.get("primary"), rl.get("secondary"))
     five = slots["five_hour"] or {}
     seven = slots["seven_day"] or {}
+
     def _minutes(window: Mapping) -> Optional[float]:
         dur = window.get("windowDurationMins")
         return dur if _usable_duration(dur) else None
