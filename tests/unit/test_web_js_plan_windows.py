@@ -357,6 +357,20 @@ out(renderUsageBar(a.cached_usage_5h, a.cached_5h_resets_at, windowElapsed(a, 'f
         assert r["text"] == r["short"] == "no 5h limit"
         assert r["hint"] == "This plan has no 5-hour limit."
 
+    def test_drift_uses_the_generic_text(self, tmp_path):
+        """On catalog drift the label can be a family name ("Max" for an
+        unlisted Max tier): "not on Max" would describe every Max account."""
+        acct = _ultra(plan={"label": "Max", "drift": ["unknown_tier"]})
+        r = _run(tmp_path, [USAGE_JS], f"out(windowReason({json.dumps(acct)}, 'five_hour'));")
+        assert r["text"] == r["short"] == "no 5h limit"
+        assert r["none"] is True
+
+    def test_absent_track_is_dimmed_and_a_live_track_is_not(self, tmp_path):
+        html = _run(tmp_path, _CARD_FILES, f"out(renderAccountCard({json.dumps(_ultra())}, 0, 1));")
+        five, seven = _bars(html)[0], _bars(html)[1]
+        assert five.startswith(' flex-1 opacity-40"'), five[:60]
+        assert "opacity-40" not in seven.split(">")[0]
+
     def test_absent_7d_window(self, tmp_path):
         acct = _ultra(provider="codex", cached_usage_7d=None)
         acct["windows"]["seven_day"] = {"state": "absent", "temporary": False, "seconds": 604800, "note": None}

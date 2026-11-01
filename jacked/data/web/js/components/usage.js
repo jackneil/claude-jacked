@@ -101,6 +101,9 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
     const pctText = absent ? (none ? 'none' : 'n/a') : Math.round(pct) + '%';
     const pctTone = absent ? 'text-slate-500' : pctColor;
     if (absent) markerHtml = '';
+    // An empty track at full strength reads as a 0% bar at a glance: dim the
+    // track of a window with no reading so "not applicable" shows first.
+    const trackDim = absent && !staleDim ? ' opacity-40' : '';
 
     if (compact) {
         // Narrow label + bar + percent, then a short reset caption so the
@@ -124,7 +127,7 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
         return `
         <div class="flex items-center gap-2 mb-0.5" title="${escapeHtml(rowTitle)}">
             <span class="text-[10px] text-slate-400 w-10 shrink-0 truncate">${escapeHtml(label || '')}</span>
-            <div class="usage-bar flex-1${staleDim}">
+            <div class="usage-bar flex-1${staleDim}${trackDim}">
                 ${fillHtml}
                 ${markerHtml}
             </div>
@@ -140,7 +143,7 @@ function renderUsageBar(percentage, resetTime, elapsedFraction, label, opts) {
     return `
         <div class="flex items-center gap-3 mb-1"${rowTitleAttr}>
             <span class="text-xs text-slate-400 w-14 shrink-0 truncate" title="${escapeHtml(label || '')}">${escapeHtml(label || '')}</span>
-            <div class="usage-bar flex-1${staleDim}">
+            <div class="usage-bar flex-1${staleDim}${trackDim}">
                 ${fillHtml}
                 ${markerHtml}
             </div>
@@ -284,7 +287,12 @@ function windowReason(acct, windowKey, nowMs) {
     // The plan has no such window (a verified Ultra account has no 5-hour
     // limit). The server decides this from the plan catalog and the payload.
     if (win && win.state === 'absent') {
-        const plan = acct.plan && typeof acct.plan.label === 'string' ? acct.plan.label.trim() : '';
+        // "not on <Plan>" only when the catalog knows this plan: on catalog
+        // drift (an unlisted tier, say) the plan name can be a family name
+        // such as "Max", and "not on Max" would wrongly describe every Max
+        // account. Then the generic text applies.
+        const drift = acct.plan && Array.isArray(acct.plan.drift) && acct.plan.drift.length > 0;
+        const plan = !drift && acct.plan && typeof acct.plan.label === 'string' ? acct.plan.label.trim() : '';
         const generic = 'no ' + fields.short + ' limit';
         const text = windowKey === 'five_hour' && plan ? 'not on ' + plan : generic;
         return {
