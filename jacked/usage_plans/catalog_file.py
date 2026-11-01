@@ -40,6 +40,12 @@ GENERIC_NO_SESSION_NOTE = "This plan has no 5-hour limit. Weekly limits still ap
 _LABEL_MAX = 40
 _NOTE_MAX = 300
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ID_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+# Longest window length jacked accepts, from the catalog or a payload. Usage
+# windows are hours to weeks; a longer value is a sentinel (an "unlimited"
+# i64 from an app-server, say), not a window, and date math on it overflows.
+# Such a length falls back to the plan's length; the reading itself is kept.
+MAX_WINDOW_SECONDS = 366 * 86400
 # Em-dash and en-dash, banned as prose dashes in UI copy. Built with chr() so
 # the repo's em-dash guard (tests/unit/test_no_em_dash_in_user_text.py), which
 # reads string constants, does not mistake this detector for UI text.
@@ -111,15 +117,51 @@ def _is_number(value) -> bool:
 
 
 def _text(value, limit: int) -> Optional[str]:
-    """A clean single-line string, or None when the value is not usable."""
+    """A clean single-line string, or None when the value is not usable.
+
+    Any non-printable character (control codes, C1, bidi overrides,
+    zero-width characters) rejects the value: it would reach a terminal or
+    the dashboard. A space is printable.
+
+    >>> _text("Ultra", 40), _text("Max\u202eartlU", 40), _text("A\x9bB", 40)
+    ('Ultra', None, None)
+    """
     if not isinstance(value, str):
         return None
     text = value.strip()
     if not text or len(text) > limit or any(ch in text for ch in _PROSE_DASHES):
         return None
-    if any(ord(ch) < 32 for ch in text):
+    if not text.isprintable():
         return None
     return text
+
+
+def clean_label(value, limit: int = _LABEL_MAX) -> Optional[str]:
+    """A provider-supplied display name made safe to show, or None.
+
+    Non-printable characters are removed (never shown), whitespace runs
+    collapse to one space, and the result is cut to *limit* characters.
+    Used for model names, where hiding the whole limit would be worse than
+    showing a cleaned name.
+
+    >>> clean_label("Fable" + chr(27) + "[2J beta"), clean_label(chr(0x200B))
+    ('Fable [2J beta', None)
+    """
+    if not isinstance(value, str):
+        return None
+    kept = "".join(ch if ch.isprintable() else " " for ch in value)
+    text = " ".join(kept.split())[:limit].strip()
+    return text or None
+
+
+def window_length_ok(seconds) -> bool:
+    """True for a usable window length: a positive number of seconds that
+    is at most :data:`MAX_WINDOW_SECONDS` (never a bool).
+
+    >>> window_length_ok(18000), window_length_ok(0), window_length_ok(float("inf"))
+    (True, False, False)
+    """
+    return _is_number(seconds) and 0 < seconds <= MAX_WINDOW_SECONDS
 
 
 class _EntryError(ValueError):
@@ -142,7 +184,7 @@ def _entry_windows(spec: dict, parent: PlanEntry) -> tuple:
         if kind not in WINDOW_KINDS:
             logger.warning("Plan catalog: ignoring unknown window kind %r", kind)
             continue
-        if not (isinstance(seconds, int) and not isinstance(seconds, bool) and seconds > 0):
+        if not (isinstance(seconds, int) and window_length_ok(seconds)):
             raise _EntryError(f"invalid {kind} window length {seconds!r}")
         windows[kind] = seconds
     return tuple(sorted(windows.items()))
@@ -202,7 +244,7 @@ def _windows(provider: str, spec) -> dict[str, int]:
         if kind not in WINDOW_KINDS:
             logger.warning("Plan catalog: %s has unknown window kind %r", provider, kind)
             continue
-        if isinstance(seconds, int) and not isinstance(seconds, bool) and seconds > 0:
+        if isinstance(seconds, int) and window_length_ok(seconds):
             windows[kind] = seconds
         else:
             logger.warning(
@@ -221,8 +263,13 @@ def _tiers(name: str, sub_name, sub_spec: dict, plan: PlanEntry) -> dict[str, Pl
         return tiers
     for tier_name, tier_spec in raw_tiers.items():
         tier_id = tier_spec.get("id") if isinstance(tier_spec, dict) else None
-        if not (isinstance(tier_id, str) and tier_id.strip()):
-            logger.warning("Plan catalog: skipping %s tier %r: missing id", name, tier_name)
+        if not (isinstance(tier_id, str) and _ID_RE.match(tier_id.strip())):
+            logger.warning(
+                "Plan catalog: skipping %s tier %r: missing or invalid id", name, tier_name
+            )
+            continue
+        if len(str(tier_name)) > 80:
+            logger.warning("Plan catalog: skipping an over-long %s tier key", name)
             continue
         try:
             tiers[str(tier_name).strip().lower()] = _entry(tier_spec, plan, tier_id.strip())
@@ -247,6 +294,9 @@ def _provider(name: str, spec) -> Optional[ProviderCatalog]:
         raw_subs = {}
     for sub_name, sub_spec in raw_subs.items():
         key = str(sub_name).strip().lower()
+        if not _ID_RE.match(key):
+            logger.warning("Plan catalog: skipping %s subscription %r: invalid key", name, sub_name)
+            continue
         try:
             plan = _entry(sub_spec, default, key)
         except _EntryError as e:

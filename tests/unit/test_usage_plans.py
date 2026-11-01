@@ -79,10 +79,19 @@ CODEX_PLUS_RAW = {
 
 
 def _ultra(**extra):
-    row = {"provider": "claude", "subscription_type": "max",
+    row = {"provider": "claude", "email": "u@x.com", "subscription_type": "max",
            "rate_limit_tier": "default_claude_max_20x"}
     row.update(extra)
     return row
+
+
+def _profile(plan_name, email="u@x.com", org_uuid=None):
+    """A stored profile that belongs to the row (the owner rule needs
+    account.email, and organization.uuid when the row has an org)."""
+    org = {"plan_display_name": plan_name}
+    if org_uuid:
+        org["uuid"] = org_uuid
+    return json.dumps({"account": {"email": email}, "organization": org})
 
 
 def _max5(**extra):
@@ -328,14 +337,14 @@ class TestResolvePlan:
         assert plan.drift == ()
 
     def test_provider_name_wins(self):
-        profile = json.dumps({"organization": {"plan_display_name": "Ultra"}})
+        profile = _profile("Ultra")
         plan = up.resolve_plan(_ultra(profile_json=profile))
         assert plan.label == "Ultra"
         assert plan.label_source == "provider"
         assert plan.drift == ()
 
     def test_provider_rename_is_drift(self, caplog):
-        profile = json.dumps({"organization": {"plan_display_name": "Ultra Plus"}})
+        profile = _profile("Ultra Plus")
         with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
             plan = up.resolve_plan(_ultra(profile_json=profile))
             up.resolve_plan(_ultra(profile_json=profile))
@@ -346,9 +355,9 @@ class TestResolvePlan:
 
     def test_provider_name_is_sanitized(self):
         long_name = "U" * 200
-        profile = json.dumps({"organization": {"plan_display_name": long_name}})
+        profile = _profile(long_name)
         assert up.resolve_plan(_ultra(profile_json=profile)).label_source == "catalog"
-        profile = json.dumps({"organization": {"plan_display_name": "  "}})
+        profile = _profile("  ")
         assert up.resolve_plan(_ultra(profile_json=profile)).label == "Ultra"
         assert up.resolve_plan(_ultra(profile_json="not json")).label == "Ultra"
         assert up.resolve_plan(_ultra(profile_json={"organization": "x"})).label == "Ultra"
@@ -581,7 +590,7 @@ class TestModelWindowSeconds:
 
 class TestAccountView:
     def test_ultra_payloads(self):
-        profile = json.dumps({"organization": {"plan_display_name": "Ultra"}})
+        profile = _profile("Ultra")
         row = _ultra(profile_json=profile, cached_usage_raw=json.dumps(ULTRA_RAW),
                      cached_usage_5h=None, cached_usage_7d=33.0)
         view = up.account_view(row)
@@ -845,3 +854,97 @@ class TestCodexNonObjectWindows:
         raw = {"rateLimits": {"primary": {}, "secondary": {
             "usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1793790000}}}
         assert normalize_rate_limits(raw)["windows_complete"] is True
+
+
+# --------------------------------------------------------------------------- #
+# dcr wave 1 security findings
+# --------------------------------------------------------------------------- #
+
+
+class TestSecurityFindings:
+    def test_plan_label_ignores_a_stored_profile_of_another_org(self, caplog):
+        """M1: a re-auth moved the row to org B and kept org A's profile.
+        Org A's plan name must not label the row, and no false drift."""
+        foreign = json.dumps({"account": {"email": "jack@x.com"},
+                              "organization": {"uuid": "org-A", "plan_display_name": "Enterprise"}})
+        row = {"id": 9, "email": "jack@x.com", "organization_uuid": "org-B",
+               "subscription_type": "team", "profile_json": foreign}
+        with caplog.at_level(logging.INFO, logger="jacked.usage_plans"):
+            plan = up.resolve_plan(row)
+            up.resolve_plan(row)
+        assert (plan.label, plan.label_source, plan.drift) == ("Team", "catalog", ())
+        owner_logs = [r for r in caplog.records if "another owner" in r.getMessage()]
+        assert len(owner_logs) == 1  # once per account and field
+        owned = dict(row, profile_json=_profile("Team Plus", "jack@x.com", "org-B"))
+        assert up.resolve_plan(owned).label == "Team Plus"
+        assert up.resolve_plan(owned).label_source == "provider"
+        # A profile with no account object has no owner: never trusted.
+        ownerless = dict(row, organization_uuid="",
+                         profile_json=json.dumps({"organization": {"plan_display_name": "X"}}))
+        assert up.resolve_plan(ownerless).label == "Team"
+
+    def test_another_email_is_another_owner(self):
+        row = _ultra(email="me@x.com", profile_json=_profile("Ultra Plus", "other@x.com"))
+        assert up.resolve_plan(row).label == "Ultra"
+
+    @pytest.mark.parametrize("name", ["Max\u202eartlU", "A\x9bB", "Ultra\x7f", "Ul\u200btra"])
+    def test_non_printable_plan_names_are_rejected(self, name):
+        """L1: control, C1, bidi and zero-width characters never label a plan."""
+        assert up.resolve_plan(_ultra(profile_json=_profile(name))).label == "Ultra"
+
+    def test_model_labels_are_cleaned(self):
+        from jacked.service.menubar_summary import parse_per_model
+
+        raw = {"limits": [{"kind": "weekly_scoped", "percent": 5,
+                           "scope": {"model": {"display_name": "Fable\x1b]0;owned\x1b\\x"}}}],
+               "rateLimitsByLimitId": {"k": {"limitName": "Spark\x1b[2J",
+                                             "secondary": {"usedPercent": 1}}}}
+        labels = sorted(m["label"] for m in parse_per_model(raw))
+        assert all("\x1b" not in label for label in labels)
+        assert labels == ["Fable ]0;owned \\x", "Spark [2J"]
+
+    @pytest.mark.parametrize("mins", [1.7976931348623157e308, float("inf"), 2**63 - 1, 10**9])
+    def test_absurd_window_lengths_fall_back(self, mins):
+        """L2: an "unlimited" sentinel or an overflowing length is not a window."""
+        assert up.model_window_seconds("codex", {"windowDurationMins": mins}, "weekly") == 7 * 86400
+        raw = {"rateLimits": {"primary": {"usedPercent": 1, "windowDurationMins": 300},
+                              "secondary": {"usedPercent": 2, "windowDurationMins": mins}}}
+        view = up.account_view({"provider": "codex", "subscription_type": "plus"}, raw)
+        assert view.weekly_seconds == 7 * 86400
+
+    def test_catalog_window_lengths_are_bounded(self, tmp_path):
+        root = _write(tmp_path, {"version": 1, "providers": {"claude": {
+            "windows": {"weekly": up.MAX_WINDOW_SECONDS + 1},
+            "subscriptions": {"pro": {"label": "Pro", "windows": {"session": 10**12}}}}}})
+        cat = up.load_catalog(root)
+        assert cat.providers["claude"].windows["weekly"] == 7 * 86400
+        assert "pro" not in cat.providers["claude"].subscriptions
+
+    def test_unknown_limit_kinds_never_forge_log_lines(self, caplog):
+        """L3: a provider string in a drift WARNING is escaped."""
+        raw = {"limits": [{"kind": "x\nFORGED: everything is fine"}]}
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            up.session_window(_ultra(), raw)
+        (record,) = [r for r in caplog.records if "drift" in r.getMessage()]
+        assert "\n" not in record.getMessage()
+        assert "\\n" in record.getMessage()
+
+    def test_the_drift_log_is_bounded(self, monkeypatch):
+        monkeypatch.setattr(up, "_DRIFT_LOG_MAX", 3)
+        for i in range(10):
+            up.session_window(_ultra(), {"limits": [{"kind": f"k{i}"}]})
+        assert len(up._drift_logged) == 3
+
+    def test_account_view_repr_hides_the_row(self):
+        """L4: the row holds tokens; a view's repr must never print them."""
+        row = _ultra(access_token="sk-ant-oat-SECRET", cc_refresh_token="rt-SECRET")
+        assert "SECRET" not in repr(up.account_view(row, None))
+
+    @pytest.mark.parametrize("tier", [{"id": "U" * 200, "label": "X"}, {"id": "bad id!", "label": "X"}])
+    def test_catalog_ids_are_bounded(self, tmp_path, tier):
+        """L5: a tier id reaches the API and the CLI: [a-z0-9_]{1,40} only."""
+        root = _write(tmp_path, {"version": 1, "providers": {"claude": {"subscriptions": {
+            "max": {"label": "Max", "tiers": {"t": tier}}, "Bad Key!": {"label": "Y"}}}}})
+        subs = up.load_catalog(root).providers["claude"].subscriptions
+        assert subs["max"].tiers == {}
+        assert "bad key!" not in subs

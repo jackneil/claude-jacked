@@ -326,7 +326,7 @@ def _as_num(v) -> float | int:
 
 def _claude_scoped_models(raw: dict, plan=None) -> list[dict]:
     """Claude ``weekly_scoped`` model caps from the ``limits`` array."""
-    from jacked.usage_plans import model_window_seconds
+    from jacked.usage_plans import clean_label, model_window_seconds
 
     window_secs = model_window_seconds("claude", None, "weekly_model", plan)
     out: list[dict] = []
@@ -338,7 +338,9 @@ def _claude_scoped_models(raw: dict, plan=None) -> list[dict]:
             continue
         scope = lim.get("scope")
         model = scope.get("model") if isinstance(scope, dict) else None
-        label = model.get("display_name") if isinstance(model, dict) else None
+        # Provider text reaches the dashboard and the terminal: no control
+        # or invisible characters, at most 40 characters.
+        label = clean_label(model.get("display_name")) if isinstance(model, dict) else None
         if not label:
             continue
         out.append(
@@ -362,7 +364,7 @@ def _codex_named_models(raw: dict, plan=None) -> list[dict]:
     it has one, else the length of the slot it came from (``weekly`` for a
     secondary window, ``session`` for a primary one).
     """
-    from jacked.usage_plans import model_window_seconds
+    from jacked.usage_plans import clean_label, model_window_seconds
 
     out: list[dict] = []
     by_limit = raw.get("rateLimitsByLimitId")
@@ -371,7 +373,7 @@ def _codex_named_models(raw: dict, plan=None) -> list[dict]:
     for limit_id, entry in by_limit.items():
         if not isinstance(entry, dict):
             continue
-        label = entry.get("limitName")
+        label = clean_label(entry.get("limitName"))
         if not label:
             continue  # bare overall limit — already the 5h/7d bars
         # Prefer the weekly (secondary) window; fall back to primary (5h).

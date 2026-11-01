@@ -24,9 +24,10 @@ from .catalog_file import (
     GENERIC_NO_SESSION_NOTE,
     WINDOW_KINDS,
     PlanEntry,
-    _is_number,
     _text,
+    logger,
     provider_key,
+    window_length_ok,
 )
 
 # Kinds of entries in the Claude ``limits`` list that jacked understands. A
@@ -47,8 +48,20 @@ def _raw_label(subscription: str) -> Optional[str]:
     return label[:_LABEL_MAX] or None
 
 
+# (account id, field) pairs already logged for a foreign stored profile;
+# bounded, because the resolver runs per row on every poll.
+_FOREIGN_PROFILE_LOGGED: set = set()
+
+
 def _profile_plan_name(row: Mapping) -> Optional[str]:
-    """The plan name Anthropic puts on the account's profile, if usable."""
+    """The plan name Anthropic puts on the account's profile, if usable.
+
+    Only a profile that belongs to this row counts: the codebase's one owner
+    rule (:func:`jacked.api.claude_identity.profile_owner_mismatch`, the rule
+    the other stored-profile reader applies). A re-auth that moved the row to
+    another organization can leave the old organization's profile stored, and
+    its plan name must never label this account.
+    """
     profile = row.get("profile_json")
     if isinstance(profile, str):
         try:
@@ -56,6 +69,21 @@ def _profile_plan_name(row: Mapping) -> Optional[str]:
         except ValueError:
             return None
     if not isinstance(profile, dict):
+        return None
+    from jacked.api.claude_identity import profile_owner_mismatch  # lazy: light, stdlib-only
+
+    mismatch = profile_owner_mismatch(
+        row.get("email"), row.get("organization_uuid"), row.get("account_uuid"),
+        profile, require_uuid=False,
+    )
+    if mismatch is not None:
+        key = (row.get("id"), mismatch)
+        if key not in _FOREIGN_PROFILE_LOGGED and len(_FOREIGN_PROFILE_LOGGED) < 256:
+            _FOREIGN_PROFILE_LOGGED.add(key)
+            logger.info(
+                "Plan label: the stored profile of account %s belongs to another "
+                "owner (%s); using the catalog label", row.get("id"), mismatch,
+            )
         return None
     org = profile.get("organization")
     if not isinstance(org, dict):
@@ -204,7 +232,9 @@ def _claude_evidence(raw: Optional[dict]) -> tuple[bool, bool, tuple]:
             elif kind == "session":
                 reported = True
             elif kind not in KNOWN_CLAUDE_LIMIT_KINDS:
-                unknown.append(kind[:40])
+                # ascii(): a provider string never writes raw control
+                # characters (a forged log line) into the drift WARNING.
+                unknown.append(ascii(kind[:40]))
     authoritative = isinstance(limits, list) and not unknown
     five = raw.get("five_hour")
     if isinstance(five, dict) and (
@@ -244,7 +274,7 @@ def codex_observed_seconds(raw: Optional[dict]) -> dict[str, int]:
         return out
     for slot, kind in (("five_hour", "session"), ("seven_day", "weekly")):
         mins = norm[slot].get("window_minutes")
-        if _is_number(mins) and mins > 0:
+        if window_length_ok(mins) and window_length_ok(mins * 60):
             out[kind] = int(mins * 60)
     return out
 
@@ -377,7 +407,7 @@ def model_window_seconds(
     """
     if isinstance(window, Mapping):
         mins = window.get("windowDurationMins")
-        if _is_number(mins) and mins > 0:
+        if window_length_ok(mins) and window_length_ok(mins * 60):
             return int(mins * 60)
     if slot not in WINDOW_KINDS:
         slot = "weekly_model"

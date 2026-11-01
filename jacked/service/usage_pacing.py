@@ -182,7 +182,11 @@ def account_windows(
 
     cached_at = acct.get("usage_cached_at")
     sources = [("7d", acct.get("cached_usage_7d"), acct.get("cached_7d_resets_at"))]
-    if session_window(acct).state != "absent":
+    try:
+        has_5h = session_window(acct).state != "absent"
+    except Exception:  # noqa: BLE001 - one unreadable row must not stop pacing
+        has_5h = True  # never rule out a window jacked cannot read
+    if has_5h:
         sources.insert(0, ("5h", acct.get("cached_usage_5h"), acct.get("cached_5h_resets_at")))
     return [
         (kind, _effective_pct(pct, resets, cached_at, now), parse_reset_ts(resets))
@@ -320,7 +324,10 @@ def compute_best_account_summary(
     for acct in accounts:
         if not _pacing_eligible(acct):
             continue
-        codes = account_view(acct).plan_payload()["drift"]
+        try:
+            codes = account_view(acct).plan_payload()["drift"]
+        except Exception:  # noqa: BLE001 - one unreadable row must not stop pacing
+            codes = []
         if codes:
             drift.append({"account_id": acct.get("id"), "codes": codes})
         worst = worst_window(acct, now)

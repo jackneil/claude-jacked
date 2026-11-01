@@ -785,10 +785,44 @@ def test_table_prints_provider_names_as_text(tmp_path, monkeypatch):
         "email": "u@test.com", "subscription_type": "max",
         "rate_limit_tier": "default_claude_max_20x",
         "cached_usage_raw": json.dumps(raw),
-        "profile_json": json.dumps({"organization": {"plan_display_name": "Ultra [beta]"}}),
+        "profile_json": json.dumps({
+            "account": {"email": "u@test.com"},
+            "organization": {"uuid": "org-u@test.com", "plan_display_name": "Ultra [beta]"},
+        }),
     }])
     result = CliRunner().invoke(main, ["usage"])
     assert result.exit_code == 0, result.output
     row = _table_row(result.output, "u@test.com")
     assert row["Plan"] == "Ultra [beta]"
     assert row["Model"] == "Fable [/x] 61%"
+
+
+def test_table_strips_terminal_control_sequences(tmp_path, monkeypatch):
+    """A provider name with escape sequences never reaches the terminal raw
+    (Rich escapes markup but passes ESC through)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("COLUMNS", "300")
+    future_7d = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+    raw = json.loads(_ultra_raw(future_7d))
+    raw["limits"][1]["scope"]["model"]["display_name"] = "Fable\x1b]0;owned\x07\x1b[2J"
+    _seed_db(tmp_path, [{
+        "email": "u@test.com", "subscription_type": "max",
+        "rate_limit_tier": "default_claude_max_20x", "cached_usage_raw": json.dumps(raw),
+    }])
+    result = CliRunner().invoke(main, ["usage"])
+    assert result.exit_code == 0, result.output
+    assert "\x1b" not in result.output and "\x07" not in result.output
+
+
+def test_absurd_window_length_never_crashes_the_command(tmp_path, monkeypatch):
+    """An "unlimited" sentinel window length falls back to the plan length."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    raw = {"rateLimits": {"primary": {"usedPercent": 3, "windowDurationMins": 10080,
+                                      "resetsAt": 1793780314}, "secondary": None},
+           "rateLimitsByLimitId": {"spark": {"limitName": "Spark", "secondary": {
+               "usedPercent": 4, "windowDurationMins": 1.7976931348623157e308}}}}
+    _seed_db(tmp_path, [{"email": "c@test.com", "provider": "codex", "subscription_type": "pro",
+                         "cached_usage_raw": json.dumps(raw), "cached_usage_7d": 3.0}])
+    _, payload = _run_json()
+    (limit,) = payload["accounts"][0]["model_limits"]
+    assert limit["window_seconds"] == 7 * 86400

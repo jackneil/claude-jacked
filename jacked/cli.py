@@ -8508,14 +8508,17 @@ def _usage_row(acct: dict, now, selected_ids: dict, in_use_id=None) -> dict:
     >>> row["in_use"], _usage_row(ultra, now, {}, in_use_id=7)["in_use"]
     (False, True)
     """
-    from jacked.service.menubar_summary import parse_per_model
+    from jacked.service.menubar_summary import parse_per_model, safe_account_view
     from jacked.service.usage_pacing import cache_age_seconds, coerce_pct, worst_window
-    from jacked.usage_plans import account_view, raw_usage
+    from jacked.usage_plans import raw_usage
 
     provider = acct.get("provider") or "claude"
     raw = raw_usage(acct)
-    view = account_view(acct, raw)
-    has_5h = view.session.state != "absent"
+    # A row the plan resolver cannot read still prints: no plan facts, and
+    # its 5-hour window counts as unknown (never ruled out).
+    view = safe_account_view(acct)
+    session_state = view.session.state if view is not None else "unknown"
+    has_5h = session_state != "absent"
     worst = worst_window(acct, now)
     model_limits = [
         {
@@ -8524,7 +8527,7 @@ def _usage_row(acct: dict, now, selected_ids: dict, in_use_id=None) -> dict:
             "resets_at": m.get("resets_at"),
             "window_seconds": m.get("window_seconds"),
         }
-        for m in parse_per_model(raw, view.plan)
+        for m in parse_per_model(raw, view.plan if view is not None else None)
     ]
     selected_id = selected_ids.get(provider)
 
@@ -8540,9 +8543,9 @@ def _usage_row(acct: dict, now, selected_ids: dict, in_use_id=None) -> dict:
         "resets_5h_at": acct.get("cached_5h_resets_at") if has_5h else None,
         "resets_7d_at": acct.get("cached_7d_resets_at"),
         "cache_age_seconds": cache_age_seconds(acct, now),
-        "plan": view.plan.label,
-        "plan_id": view.plan.id,
-        "session_window": view.session.state,
+        "plan": view.plan.label if view is not None else None,
+        "plan_id": view.plan.id if view is not None else None,
+        "session_window": session_state,
         "model_limits": model_limits,
         "worst_window_pct": worst[1] if worst else None,
         "worst_window": worst[0] if worst else None,
@@ -8566,6 +8569,9 @@ def _render_usage_table(rows: list[dict], summary: dict) -> None:
 
     def _pct(v):
         return f"{v:.0f}%" if isinstance(v, (int, float)) else "?"
+
+    def _printable(text):
+        return "".join(ch if ch.isprintable() else " " for ch in text)
 
     def _model(limits):
         # model_limits is sorted by percent (highest first): show the first.
@@ -8593,7 +8599,9 @@ def _render_usage_table(rows: list[dict], summary: dict) -> None:
             "none" if no_5h else (r["resets_5h_at"] or "?"),
             r["resets_7d_at"] or "?", age,
         )
-        t.add_row(*(_escape(str(c)) for c in cells))
+        # Strip control and invisible characters, then escape Rich markup:
+        # a provider-supplied name can carry terminal escape sequences.
+        t.add_row(*(_escape(_printable(str(c))) for c in cells))
     console.print(t)
     if summary.get("pause_until"):
         # pause_until is set when ANY eligible window is constrained — it does

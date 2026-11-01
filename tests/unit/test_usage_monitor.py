@@ -3569,6 +3569,24 @@ class TestPollPayloadPlanAndWindows:
             for r in caplog.records
         )
 
+    def test_the_payload_carries_no_secret_or_raw_payload(self):
+        """The whitelisted row plus plan/windows/_binding_model/_poll_*:
+        no token, no raw usage payload, no stored profile."""
+        ultra = _ultra(1, model_pct=96)
+        ultra.update(
+            access_token="at-SECRET", refresh_token="rt-SECRET",
+            cc_access_token="cc-SECRET", cc_refresh_token="ccr-SECRET",
+            profile_json=json.dumps({"account": {"email": ultra["email"]},
+                                     "note": "PROFILE-SECRET"}),
+        )
+        ws = AsyncMock()
+        _run_one_tick(_make_app(db=_db_with_rows([ultra]), ws_registry=ws))
+        data = self._poll_payload(ws)
+        assert "SECRET" not in json.dumps(data)
+        assert not {"cached_usage_raw", "profile_json", "keeper_state"} & set(data)
+        assert not [k for k in data if "token" in k and k != "cc_expires_at"]
+        assert {"plan", "windows", "_binding_model", "_poll_interval"} <= set(data)
+
     def test_the_only_monitor_broadcast_with_an_account_row_is_the_poll_update(self):
         """Every other broadcast in usage_monitor carries ids, labels or
         numbers for banners, never an account row the dashboard draws bars
@@ -3588,7 +3606,11 @@ class TestDecisionReasonPlanLabel:
 
     def test_reason_prefers_the_provider_plan_name(self):
         row = _ultra(1, usage_5h=None)
-        row["profile_json"] = json.dumps({"organization": {"plan_display_name": "Ultra Team"}})
+        row["profile_json"] = json.dumps({
+            "account": {"email": row["email"]},
+            "organization": {"uuid": row.get("organization_uuid"),
+                             "plan_display_name": "Ultra Team"},
+        })
         db = _db_with_rows([row])
         _run_one_tick(_make_app(db=db))
         assert _decision_reasons(db) == ["stay: no candidate has deficit (plan Ultra Team)"]

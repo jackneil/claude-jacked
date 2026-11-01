@@ -8,7 +8,7 @@ must read it (no 5-hour value on an account without a 5-hour window).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 from jacked import usage_plans as _pkg
@@ -29,7 +29,9 @@ from .resolve import (
 class AccountView:
     """Plan and window facts for one account row, resolved once."""
 
-    row: Mapping
+    # repr=False: the row holds the account's tokens; a debug log or a test
+    # diff of a view must never print them.
+    row: Mapping = field(repr=False, compare=False)
     plan: PlanMatch
     session: SessionWindow
     weekly_state: str

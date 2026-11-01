@@ -698,7 +698,7 @@ def _parse_usage_details(
                 else None,
                 utilization=extra_raw.get("utilization"),
             )
-    except (TypeError, ValueError, AttributeError, KeyError):
+    except (TypeError, ValueError, AttributeError, KeyError, ArithmeticError):
         logger.warning(
             "Malformed cached_usage_raw — dropping per-model details", exc_info=True
         )

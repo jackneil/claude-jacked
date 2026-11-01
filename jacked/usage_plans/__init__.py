@@ -56,6 +56,7 @@ from .catalog_file import (
     CATALOG_FILE,
     DATA_ROOT,
     GENERIC_NO_SESSION_NOTE,
+    MAX_WINDOW_SECONDS,
     SESSION_POLICIES,
     SUPPORTED_VERSION,
     WINDOW_KINDS,
@@ -63,13 +64,16 @@ from .catalog_file import (
     PlanEntry,
     ProviderCatalog,
     SubscriptionEntry,
+    clean_label,
     load_catalog,
     logger,
     provider_key,
+    window_length_ok,
 )
 
 _catalog_cache: Optional[Catalog] = None
 _drift_logged: set = set()
+_DRIFT_LOG_MAX = 512
 
 
 def catalog() -> Catalog:
@@ -99,6 +103,11 @@ def _note_drift(provider: str, plan_key: str, code: str, detail: str) -> None:
     key = (provider, plan_key, code, detail)
     if key in _drift_logged:
         return
+    if len(_drift_logged) >= _DRIFT_LOG_MAX:
+        # A payload that varies its shape on every read must not grow this
+        # set without bound; the first shapes are already logged.
+        logger.debug("Plan catalog drift (%s) for %s plan %r", code, provider, plan_key)
+        return
     _drift_logged.add(key)
     logger.warning(
         "Plan catalog drift (%s) for %s plan %r: %s. This jacked release's plan "
@@ -124,7 +133,8 @@ from .view import AccountView, account_view, project_row  # noqa: E402
 
 __all__ = [
     "CATALOG_FILE", "DATA_ROOT", "GENERIC_NO_SESSION_NOTE", "KNOWN_CLAUDE_LIMIT_KINDS",
-    "SESSION_POLICIES", "SUPPORTED_VERSION", "WINDOW_KINDS",
+    "MAX_WINDOW_SECONDS", "SESSION_POLICIES", "SUPPORTED_VERSION", "WINDOW_KINDS",
+    "clean_label", "window_length_ok",
     "AccountView", "Catalog", "PlanEntry", "PlanMatch", "ProviderCatalog",
     "SessionWindow", "SubscriptionEntry",
     "account_view", "catalog", "has_session", "load_catalog", "model_window_seconds",

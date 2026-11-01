@@ -149,8 +149,10 @@ def test_plan_label(row, label):
     assert plan_label(row) == label
 
 def test_plan_label_uses_the_provider_plan_name():
-    row = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x",
-           "profile_json": json.dumps({"organization": {"plan_display_name": "Ultra Plus"}})}
+    row = {"email": "u@x.com", "subscription_type": "max",
+           "rate_limit_tier": "default_claude_max_20x",
+           "profile_json": json.dumps({"account": {"email": "u@x.com"},
+                                       "organization": {"plan_display_name": "Ultra Plus"}})}
     assert plan_label(row) == "Ultra Plus"
 
 def test_plan_label_replaces_tier_label_in_the_facade():

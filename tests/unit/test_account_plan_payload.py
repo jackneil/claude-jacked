@@ -82,9 +82,12 @@ CODEX_PRO_RAW = {
     },
 }
 
-ULTRA_PROFILE = json.dumps(
-    {"organization": {"organization_type": "claude_max", "plan_display_name": "Ultra"}}
-)
+# The stored profile belongs to the row (account.email matches): only an
+# owned profile may name the plan (claude_identity.profile_owner_mismatch).
+ULTRA_PROFILE = json.dumps({
+    "account": {"email": "u@x.com"},
+    "organization": {"organization_type": "claude_max", "plan_display_name": "Ultra"},
+})
 
 
 def _row(**fields):
@@ -415,3 +418,16 @@ class TestModelWindowSeconds:
                    cached_usage_7d=38.0, cached_usage_raw=raw)
         usage = _build_account_usage(row)
         assert usage.per_model["codex_bengalfox"].window_seconds == 300 * 60
+
+
+def test_absurd_window_length_never_fails_the_account_response():
+    """L2: a named Codex limit with a huge windowDurationMins must not raise
+    (the account list answers for every account)."""
+    raw = {"rateLimits": {"primary": {"usedPercent": 3, "windowDurationMins": 10080},
+                          "secondary": None},
+           "rateLimitsByLimitId": {"spark": {"limitName": "Spark", "secondary": {
+               "usedPercent": 4, "windowDurationMins": 1.7976931348623157e308}}}}
+    row = _row(provider="codex", subscription_type="pro", cached_usage_7d=3.0,
+               cached_usage_raw=raw)
+    resp = routes_auth._account_to_response(row)
+    assert resp.usage.per_model["spark"].window_seconds == 7 * 86400
