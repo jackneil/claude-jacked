@@ -157,6 +157,95 @@ def _pacing_eligible(acct: dict) -> bool:
     return _eligible(acct) and acct.get("validation_status") != "invalid"
 
 
+def account_windows(
+    acct: dict, now: datetime
+) -> list[tuple[str, Optional[float], Optional[datetime]]]:
+    """``(kind, effective percent, reset)`` for the windows the account has.
+
+    ``kind`` is ``"5h"`` or ``"7d"``. The 5-hour window is listed only when the
+    account's plan has one (:func:`jacked.usage_plans.session_window`): a
+    verified Ultra or a ChatGPT Pro account has none, and a 5-hour value that
+    lingers in its cache is stale, so it never counts. Percents carry the
+    staleness rule of :func:`_effective_pct`; a window with no reading has
+    percent None.
+
+    >>> now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    >>> ultra = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x",
+    ...          "cached_usage_raw": '{"five_hour": null, "limits": [{"kind": "weekly_all"}]}',
+    ...          "cached_usage_5h": 99.0, "cached_usage_7d": 40.0}
+    >>> [(k, p) for k, p, _ in account_windows(ultra, now)]
+    [('7d', 40.0)]
+    >>> [(k, p) for k, p, _ in account_windows({"cached_usage_5h": 12.0, "cached_usage_7d": 3.0}, now)]
+    [('5h', 12.0), ('7d', 3.0)]
+    """
+    from jacked.usage_plans import session_window
+
+    cached_at = acct.get("usage_cached_at")
+    sources = [("7d", acct.get("cached_usage_7d"), acct.get("cached_7d_resets_at"))]
+    if session_window(acct).state != "absent":
+        sources.insert(0, ("5h", acct.get("cached_usage_5h"), acct.get("cached_5h_resets_at")))
+    return [
+        (kind, _effective_pct(pct, resets, cached_at, now), parse_reset_ts(resets))
+        for kind, pct, resets in sources
+    ]
+
+
+def worst_window(
+    acct: dict, now: datetime
+) -> Optional[tuple[str, float, Optional[datetime]]]:
+    """The account's most constrained window ``(kind, percent, reset)``, or None.
+
+    Only windows with a reading count. On a tie the weekly window wins: it
+    takes longer to come back.
+
+    >>> now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    >>> worst_window({"cached_usage_5h": 50.0, "cached_usage_7d": 50.0}, now)[0]
+    '7d'
+    >>> worst_window({"cached_usage_5h": 80.0, "cached_usage_7d": 50.0}, now)[:2]
+    ('5h', 80.0)
+    >>> worst_window({}, now) is None
+    True
+    """
+    known = [w for w in account_windows(acct, now) if w[1] is not None]
+    if not known:
+        return None
+    # max() keeps the first maximum: put 7d first so it wins ties.
+    ordered = sorted(known, key=lambda w: 0 if w[0] == "7d" else 1)
+    return max(ordered, key=lambda w: w[1])
+
+
+def account_recovery_at(
+    acct: dict, now: datetime, constrained_threshold: float = 90.0
+) -> Optional[datetime]:
+    """When the account becomes workable again, or None.
+
+    That is the LATEST future reset among its constrained windows (effective
+    percent at or above ``constrained_threshold``): one window resetting while
+    another is still constrained does not make the account usable. None when
+    no window is constrained, or when a constrained window has no knowable
+    future reset (a partial answer would name a time at which the account is
+    still walled).
+
+    >>> now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    >>> cached = int(now.timestamp()) - 60
+    >>> acct = {"cached_usage_5h": 95.0, "cached_5h_resets_at": "2026-01-02T03:00:00Z",
+    ...         "cached_usage_7d": 97.0, "cached_7d_resets_at": "2026-01-05T00:00:00Z",
+    ...         "usage_cached_at": cached}
+    >>> account_recovery_at(acct, now).isoformat()
+    '2026-01-05T00:00:00+00:00'
+    >>> account_recovery_at({"cached_usage_7d": 10.0}, now) is None
+    True
+    """
+    constrained: list[datetime] = []
+    for _kind, pct, reset in account_windows(acct, now):
+        if pct is None or pct < constrained_threshold:
+            continue
+        if reset is None or reset <= now:
+            return None
+        constrained.append(reset)
+    return max(constrained) if constrained else None
+
+
 def compute_best_account_summary(
     accounts: Iterable[dict],
     now: Optional[datetime] = None,
@@ -166,19 +255,27 @@ def compute_best_account_summary(
 
     Mirrors ``menubar_summary.compute_worst_account_summary`` in the
     opposite direction. ``pause_until`` is the earliest time some eligible
-    account becomes WORKABLE: per account, that is the LATEST future reset
-    among its CONSTRAINED windows (effective percent at or above
-    ``constrained_threshold``) — one window resetting while the account's
-    other window is still constrained does not make the account usable, so
-    the earlier reset alone must not set the wake time. The fleet target is
-    the min of those per-account times. An idle window's reset carries no
-    information and never participates. An account with a constrained
-    window whose wake time is unknowable (no parseable FUTURE ``resets_at``)
-    contributes nothing — a partial answer would name a wake time at which
-    the account is still walled. ``pause_until`` CAN therefore be null
-    while the best percent is constrained; consumers must treat that as
-    "pause time unknown" and fall back to error-driven pacing, never "no
+    account becomes WORKABLE (:func:`account_recovery_at`): per account, the
+    LATEST future reset among its CONSTRAINED windows (effective percent at
+    or above ``constrained_threshold``) — one window resetting while the
+    account's other window is still constrained does not make the account
+    usable, so the earlier reset alone must not set the wake time. The fleet
+    target is the min of those per-account times. An idle window's reset
+    carries no information and never participates. An account with a
+    constrained window whose wake time is unknowable (no parseable FUTURE
+    ``resets_at``) contributes nothing — a partial answer would name a wake
+    time at which the account is still walled. ``pause_until`` CAN therefore
+    be null while the best percent is constrained; consumers must treat that
+    as "pause time unknown" and fall back to error-driven pacing, never "no
     pause needed".
+
+    Windows are plan-aware (:func:`account_windows`): an account whose plan
+    has no 5-hour window is judged on its weekly window alone.
+    ``best_account_worst_window`` names the window behind
+    ``best_account_worst_window_pct`` ("5h" or "7d"), and
+    ``best_account_worst_window_resets_at`` is that window's reset.
+    ``plan_catalog`` reports the release's plan catalog date and every
+    eligible account whose payload disagrees with it (catalog drift).
 
     >>> now = datetime(2026, 1, 2, tzinfo=timezone.utc)
     >>> cached = int(now.timestamp()) - 60
@@ -191,61 +288,50 @@ def compute_best_account_summary(
     ...      "cached_5h_resets_at": "2026-01-02T01:00:00Z",
     ...      "cached_7d_resets_at": "2026-01-05T00:00:00Z"},
     ... ], now=now)
-    >>> s["best_account_email"], s["best_account_worst_window_pct"]
-    ('live@x.com', 96.0)
+    >>> s["best_account_email"], s["best_account_worst_window_pct"], s["best_account_worst_window"]
+    ('live@x.com', 96.0, '7d')
     >>> s["pause_until"]        # the CONSTRAINED 7d window, not the idle 5h
     '2026-01-05T00:00:00+00:00'
     """
+    from jacked.usage_plans import account_view, catalog
+
     now = now or datetime.now(timezone.utc)
     best: Optional[dict] = None
-    best_pct: Optional[float] = None
+    best_window: Optional[tuple[str, float, Optional[datetime]]] = None
     with_data = 0
-    constrained_resets: list[datetime] = []
+    recoveries: list[datetime] = []
+    drift: list[dict] = []
 
     for acct in accounts:
         if not _pacing_eligible(acct):
             continue
-        cached_at = acct.get("usage_cached_at")
-        windows = [
-            (acct.get("cached_usage_5h"), acct.get("cached_5h_resets_at")),
-            (acct.get("cached_usage_7d"), acct.get("cached_7d_resets_at")),
-        ]
-        effective = [
-            (_effective_pct(pct, resets, cached_at, now), parse_reset_ts(resets))
-            for pct, resets in windows
-        ]
-        known = [e for e, _ in effective if e is not None]
-        if not known:
+        codes = account_view(acct).plan_payload()["drift"]
+        if codes:
+            drift.append({"account_id": acct.get("id"), "codes": codes})
+        worst = worst_window(acct, now)
+        if worst is None:
             continue
         with_data += 1
-        worst = max(known)
-        acct_constrained: list[datetime] = []
-        acct_wake_unknown = False
-        for e, reset in effective:
-            if e is None or e < constrained_threshold:
-                continue
-            if reset and reset > now:
-                acct_constrained.append(reset)
-            else:
-                acct_wake_unknown = True
-        if acct_constrained and not acct_wake_unknown:
-            # The account is workable only once its LAST constrained window
-            # resets; any unknowable constrained window poisons the estimate.
-            constrained_resets.append(max(acct_constrained))
+        recovery = account_recovery_at(acct, now, constrained_threshold)
+        if recovery is not None:
+            recoveries.append(recovery)
         # Strict < keeps the first-seen account on ties (priority order).
-        if best_pct is None or worst < best_pct:
-            best_pct = worst
+        if best_window is None or worst[1] < best_window[1]:
+            best_window = worst
             best = acct
 
     return {
         "accounts_with_usage_data": with_data,
         "best_account_email": best.get("email") if best else None,
         "best_account_id": best.get("id") if best else None,
-        "best_account_worst_window_pct": best_pct,
+        "best_account_worst_window_pct": best_window[1] if best_window else None,
+        "best_account_worst_window": best_window[0] if best_window else None,
+        "best_account_worst_window_resets_at": (
+            best_window[2].isoformat() if best_window and best_window[2] else None
+        ),
         "best_account_cache_age_seconds": (
             cache_age_seconds(best, now) if best else None
         ),
-        "pause_until": min(constrained_resets).isoformat()
-        if constrained_resets
-        else None,
+        "pause_until": min(recoveries).isoformat() if recoveries else None,
+        "plan_catalog": {"verified_at": catalog().verified_at, "drift": drift},
     }

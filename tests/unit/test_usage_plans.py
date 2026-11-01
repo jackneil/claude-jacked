@@ -1,0 +1,691 @@
+"""Tests for the release-shipped usage-window catalog (jacked/usage_plans.py).
+
+The catalog says which usage windows each provider plan has, what the plan
+is called, and how long each window is. The live payload stays the truth for
+one account; the catalog decides how to read silence for a plan.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+import pytest
+
+from jacked import usage_plans as up
+
+EM_DASH = "—"
+EN_DASH = "–"
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state(monkeypatch):
+    """Every test starts with the bundled catalog and an empty drift log."""
+    monkeypatch.setattr(up, "_catalog_cache", None)
+    monkeypatch.setattr(up, "_drift_logged", set())
+
+
+ULTRA_RAW = {
+    "five_hour": None,
+    "seven_day": {"utilization": 33.0, "resets_at": "2026-11-02T22:59:59+00:00"},
+    "limits": [
+        {"kind": "weekly_all", "group": "weekly", "percent": 33,
+         "resets_at": "2026-11-02T22:59:59+00:00", "scope": None, "is_active": False},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 61,
+         "resets_at": "2026-11-02T22:59:59+00:00", "is_active": True,
+         "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
+    ],
+}
+
+SESSION_RAW = {
+    "five_hour": {"utilization": 67.0, "resets_at": "2026-11-01T18:59:59+00:00"},
+    "seven_day": {"utilization": 23.0, "resets_at": "2026-11-02T04:59:59+00:00"},
+    "limits": [
+        {"kind": "session", "group": "session", "percent": 67,
+         "resets_at": "2026-11-01T18:59:59+00:00", "scope": None, "is_active": True},
+        {"kind": "weekly_all", "group": "weekly", "percent": 23,
+         "resets_at": "2026-11-02T04:59:59+00:00", "scope": None, "is_active": False},
+    ],
+}
+
+# Authoritative Claude payload (limits list present) that reports no session.
+WEEKLY_ONLY_RAW = {
+    "five_hour": None,
+    "seven_day": {"utilization": 10.0, "resets_at": "2026-11-05T00:00:00+00:00"},
+    "limits": [{"kind": "weekly_all", "group": "weekly", "percent": 10}],
+}
+
+CODEX_PRO_RAW = {
+    "rateLimits": {
+        "primary": {"usedPercent": 38, "windowDurationMins": 10080, "resetsAt": 1793780314},
+        "secondary": None,
+        "planType": "pro",
+    },
+}
+
+CODEX_PLUS_RAW = {
+    "rateLimits": {
+        "primary": {"usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1793780000},
+        "secondary": {"usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1793990000},
+        "planType": "plus",
+    },
+}
+
+
+def _ultra(**extra):
+    row = {"provider": "claude", "subscription_type": "max",
+           "rate_limit_tier": "default_claude_max_20x"}
+    row.update(extra)
+    return row
+
+
+def _max5(**extra):
+    row = {"provider": "claude", "subscription_type": "max",
+           "rate_limit_tier": "default_claude_max_5x"}
+    row.update(extra)
+    return row
+
+
+def _write(tmp_path: Path, payload) -> Path:
+    path = tmp_path / up.CATALOG_FILE
+    if isinstance(payload, str):
+        path.write_text(payload, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    return tmp_path
+
+
+# --------------------------------------------------------------------------- #
+# Bundled catalog
+# --------------------------------------------------------------------------- #
+
+
+class TestBundledCatalog:
+    def test_loads_without_warnings(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(up.DATA_ROOT)
+        assert [r.getMessage() for r in caplog.records] == []
+        assert cat.version == 1
+        assert cat.verified_at == "2026-11-01"
+        assert {"claude", "codex"} <= set(cat.providers)
+
+    def test_ships_inside_the_package(self):
+        assert (up.DATA_ROOT / up.CATALOG_FILE).is_file()
+        assert up.DATA_ROOT == Path(up.__file__).parent / "data"
+
+    def test_known_plans_are_present(self):
+        cat = up.load_catalog(up.DATA_ROOT)
+        claude = cat.providers["claude"]
+        assert set(claude.subscriptions) >= {"max", "team", "pro", "free", "enterprise"}
+        tiers = claude.subscriptions["max"].tiers
+        assert tiers["default_claude_max_20x"].id == "ultra"
+        assert tiers["default_claude_max_5x"].id == "max"
+        codex = cat.providers["codex"]
+        assert codex.subscriptions["pro"].plan.session == "never"
+
+    def test_every_plan_carries_provenance(self):
+        cat = up.load_catalog(up.DATA_ROOT)
+        for provider, pcat in cat.providers.items():
+            for name, sub in pcat.subscriptions.items():
+                entries = [sub.plan, *sub.tiers.values()]
+                for entry in entries:
+                    assert entry.verified_at, (provider, name, entry.id)
+                    assert entry.sources, (provider, name, entry.id)
+                    assert all(s.startswith("https://") for s in entry.sources)
+
+    def test_user_facing_strings_have_no_prose_dashes(self):
+        # The labels and notes render in the dashboard (no em-dash rule).
+        cat = up.load_catalog(up.DATA_ROOT)
+        for pcat in cat.providers.values():
+            for sub in pcat.subscriptions.values():
+                for entry in (sub.plan, *sub.tiers.values()):
+                    for text in (entry.label, entry.formerly, entry.session_note,
+                                 entry.session_temporary_note):
+                        if text:
+                            assert EM_DASH not in text and EN_DASH not in text, text
+
+    def test_window_lengths(self):
+        assert up.window_seconds("claude", "session") == 5 * 3600
+        assert up.window_seconds("claude", "weekly") == 7 * 86400
+        assert up.window_seconds("claude", "weekly_model") == 7 * 86400
+        assert up.window_seconds("codex", "session") == 5 * 3600
+        # An unknown provider falls back to the built-in lengths.
+        assert up.window_seconds("other", "weekly") == 7 * 86400
+        with pytest.raises(ValueError):
+            up.window_seconds("claude", "monthly")
+
+
+# --------------------------------------------------------------------------- #
+# Loader degradation
+# --------------------------------------------------------------------------- #
+
+
+class TestLoader:
+    def test_missing_file_degrades_to_defaults(self, tmp_path, caplog):
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(tmp_path)
+        assert cat.providers == {}
+        assert any("not found" in r.getMessage() for r in caplog.records)
+
+    def test_malformed_json_degrades(self, tmp_path, caplog):
+        root = _write(tmp_path, "{not json")
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        assert cat.providers == {}
+        assert any("unreadable" in r.getMessage() for r in caplog.records)
+
+    def test_non_object_top_level_degrades(self, tmp_path, caplog):
+        root = _write(tmp_path, [1, 2])
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        assert cat.providers == {}
+
+    @pytest.mark.parametrize("version", [None, "1", True, 0, -3])
+    def test_bad_version_degrades(self, tmp_path, caplog, version):
+        root = _write(tmp_path, {"version": version, "providers": {}})
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        assert cat.providers == {}
+        assert any("version" in r.getMessage() for r in caplog.records)
+
+    def test_newer_version_warns_and_reads_best_effort(self, tmp_path, caplog):
+        root = _write(tmp_path, {
+            "version": up.SUPPORTED_VERSION + 1,
+            "providers": {"claude": {"subscriptions": {
+                "pro": {"label": "Pro", "session": "always", "session_critical_pct": 80}}}},
+        })
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        assert "pro" in cat.providers["claude"].subscriptions
+        assert any("newer" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("bad", [
+        {"label": "Pro", "session": "sometimes"},
+        {"label": "Pro", "session": "always", "session_critical_pct": True},
+        {"label": "Pro", "session": "always", "session_critical_pct": 0},
+        {"label": "Pro", "session": "always", "session_critical_pct": 101},
+        {"label": "Pro " + EM_DASH + " legacy", "session": "always"},
+        {"label": "", "session": "always"},
+        {"label": "Pro", "session": "always", "sources": ["http://x.example"]},
+        {"label": "Pro", "session": "always", "sources": "https://x.example"},
+        {"label": "Pro", "session": "always", "verified_at": "yesterday"},
+        {"label": "Pro", "session": "always", "session_note": "a" * 400},
+        "not an object",
+    ])
+    def test_invalid_subscription_is_skipped_with_a_warning(self, tmp_path, caplog, bad):
+        root = _write(tmp_path, {
+            "version": 1,
+            "providers": {"claude": {"subscriptions": {
+                "pro": bad,
+                "team": {"label": "Team", "session": "always"},
+            }}},
+        })
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        subs = cat.providers["claude"].subscriptions
+        assert "pro" not in subs
+        assert "team" in subs  # one bad entry never takes the rest down
+        assert any("'pro'" in r.getMessage() for r in caplog.records)
+
+    def test_invalid_tier_is_skipped_but_subscription_kept(self, tmp_path, caplog):
+        root = _write(tmp_path, {
+            "version": 1,
+            "providers": {"claude": {"subscriptions": {"max": {
+                "label": "Max", "session": "reported",
+                "tiers": {
+                    "default_claude_max_20x": {"label": "Ultra", "session": "until_verified"},
+                    "default_claude_max_5x": {"id": "max", "label": "Max", "session": "always"},
+                },
+            }}}},
+        })
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        tiers = cat.providers["claude"].subscriptions["max"].tiers
+        assert "default_claude_max_20x" not in tiers  # no id
+        assert "default_claude_max_5x" in tiers
+        assert any("default_claude_max_20x" in r.getMessage() for r in caplog.records)
+
+    def test_bad_window_length_falls_back(self, tmp_path, caplog):
+        root = _write(tmp_path, {
+            "version": 1,
+            "providers": {"claude": {"windows": {"session": -5, "weekly": "x", "weekly_model": 3600}}},
+        })
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        windows = cat.providers["claude"].windows
+        assert windows["session"] == 5 * 3600
+        assert windows["weekly"] == 7 * 86400
+        assert windows["weekly_model"] == 3600
+
+    def test_tiers_inherit_from_their_subscription(self, tmp_path):
+        root = _write(tmp_path, {
+            "version": 1,
+            "providers": {"claude": {
+                "default": {"session": "reported", "session_critical_pct": 70},
+                "subscriptions": {"max": {
+                    "label": "Max", "session": "always", "session_critical_pct": 91,
+                    "verified_at": "2026-11-01", "sources": ["https://example.com/a"],
+                    "tiers": {"t9": {"id": "nine", "label": "Nine"}},
+                }},
+            }},
+        })
+        cat = up.load_catalog(root)
+        nine = cat.providers["claude"].subscriptions["max"].tiers["t9"]
+        assert nine.session == "always"
+        assert nine.session_critical_pct == 91
+        assert nine.verified_at == "2026-11-01"
+        assert nine.sources == ("https://example.com/a",)
+
+    def test_resolution_uses_builtin_defaults_without_a_catalog(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(up, "_catalog_cache", up.load_catalog(tmp_path))
+        plan = up.resolve_plan(_ultra())
+        assert plan.id is None
+        assert plan.session == "reported"
+        assert plan.session_critical_pct == 80
+        assert plan.label == "Max"
+        # Silence from an authoritative payload still reads as "no window".
+        assert up.session_window(_ultra(), ULTRA_RAW).state == "absent"
+        assert up.session_window(_max5(), SESSION_RAW).state == "present"
+
+
+# --------------------------------------------------------------------------- #
+# Plan resolution
+# --------------------------------------------------------------------------- #
+
+
+class TestResolvePlan:
+    def test_ultra(self):
+        plan = up.resolve_plan(_ultra())
+        assert (plan.id, plan.label, plan.formerly) == ("ultra", "Ultra", "Max 20x")
+        assert plan.session == "until_verified"
+        assert plan.session_critical_pct == 95
+        assert plan.label_source == "catalog"
+        assert plan.drift == ()
+
+    def test_provider_name_wins(self):
+        profile = json.dumps({"organization": {"plan_display_name": "Ultra"}})
+        plan = up.resolve_plan(_ultra(profile_json=profile))
+        assert plan.label == "Ultra"
+        assert plan.label_source == "provider"
+        assert plan.drift == ()
+
+    def test_provider_rename_is_drift(self, caplog):
+        profile = json.dumps({"organization": {"plan_display_name": "Ultra Plus"}})
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            plan = up.resolve_plan(_ultra(profile_json=profile))
+            up.resolve_plan(_ultra(profile_json=profile))
+        assert plan.label == "Ultra Plus"
+        assert plan.drift == ("renamed",)
+        drift_logs = [r for r in caplog.records if "drift" in r.getMessage()]
+        assert len(drift_logs) == 1  # once per shape per process
+
+    def test_provider_name_is_sanitized(self):
+        long_name = "U" * 200
+        profile = json.dumps({"organization": {"plan_display_name": long_name}})
+        assert up.resolve_plan(_ultra(profile_json=profile)).label_source == "catalog"
+        profile = json.dumps({"organization": {"plan_display_name": "  "}})
+        assert up.resolve_plan(_ultra(profile_json=profile)).label == "Ultra"
+        assert up.resolve_plan(_ultra(profile_json="not json")).label == "Ultra"
+        assert up.resolve_plan(_ultra(profile_json={"organization": "x"})).label == "Ultra"
+
+    def test_max(self):
+        plan = up.resolve_plan(_max5())
+        assert (plan.id, plan.label, plan.formerly) == ("max", "Max", "Max 5x")
+        assert plan.session == "always"
+        assert plan.session_critical_pct == 90
+
+    def test_unknown_max_tier_is_drift(self):
+        plan = up.resolve_plan({"subscription_type": "max",
+                                "rate_limit_tier": "default_claude_max_40x"})
+        assert plan.label == "Max"
+        assert plan.session == "reported"
+        assert plan.session_critical_pct == 90
+        assert plan.drift == ("unknown_tier",)
+
+    def test_max_without_tier(self):
+        plan = up.resolve_plan({"subscription_type": "max", "rate_limit_tier": None})
+        assert plan.label == "Max"
+        assert plan.session_critical_pct == 90
+        assert plan.drift == ()
+
+    def test_team_ignores_its_tier(self):
+        plan = up.resolve_plan({"subscription_type": "team",
+                                "rate_limit_tier": "default_claude_max_5x"})
+        assert (plan.id, plan.label, plan.session) == ("team", "Team", "always")
+        assert plan.session_critical_pct == 90
+        assert plan.drift == ()
+
+    @pytest.mark.parametrize("sub,label,policy,crit", [
+        ("pro", "Pro", "always", 80),
+        ("free", "Free", "always", 80),
+        ("enterprise", "Enterprise", "reported", 80),
+        ("PRO", "Pro", "always", 80),
+    ])
+    def test_subscription_plans(self, sub, label, policy, crit):
+        plan = up.resolve_plan({"subscription_type": sub})
+        assert (plan.label, plan.session, plan.session_critical_pct) == (label, policy, crit)
+
+    def test_unknown_subscription_uses_the_raw_name(self):
+        plan = up.resolve_plan({"subscription_type": "galaxy_brain"})
+        assert plan.id is None
+        assert plan.label == "Galaxy Brain"
+        assert plan.label_source == "raw"
+        assert plan.session == "reported"
+        assert plan.session_critical_pct == 80
+
+    def test_nothing_known(self):
+        plan = up.resolve_plan({})
+        assert plan.id is None and plan.label is None
+        assert plan.session_critical_pct == 80
+
+    def test_tier_without_subscription(self):
+        assert up.resolve_plan({"rate_limit_tier": "default_claude_max_20x"}).id == "ultra"
+        assert up.resolve_plan({"rate_limit_tier": "default_claude_max_5x"}).id == "max"
+        assert up.resolve_plan({"rate_limit_tier": "mystery"}).session_critical_pct == 80
+
+    def test_codex_plans(self):
+        pro = up.resolve_plan({"provider": "codex", "subscription_type": "pro"})
+        assert (pro.label, pro.session) == ("Pro", "never")
+        plus = up.resolve_plan({"provider": "codex", "subscription_type": "plus"})
+        assert (plus.label, plus.session) == ("Plus", "always")
+        biz = up.resolve_plan({"provider": "codex", "subscription_type": "business"})
+        assert (biz.id, biz.label, biz.session) == (None, "Business", "reported")
+        # A Codex row never takes a label from a Claude profile.
+        profile = json.dumps({"organization": {"plan_display_name": "Ultra"}})
+        assert up.resolve_plan({"provider": "codex", "subscription_type": "pro",
+                                "profile_json": profile}).label == "Pro"
+
+
+# --------------------------------------------------------------------------- #
+# Session window resolution
+# --------------------------------------------------------------------------- #
+
+
+class TestSessionWindowClaude:
+    def test_verified_ultra_has_no_session(self):
+        sw = up.session_window(_ultra(), ULTRA_RAW)
+        assert sw.state == "absent"
+        assert sw.temporary is False
+        assert "no 5-hour limit" in sw.note
+        assert sw.seconds == 5 * 3600
+        assert sw.drift == ()
+
+    def test_unverified_ultra_has_a_temporary_session(self):
+        sw = up.session_window(_ultra(), SESSION_RAW)
+        assert sw.state == "present"
+        assert sw.temporary is True
+        assert "temporary" in sw.note
+
+    def test_ultra_without_a_payload_is_unknown(self):
+        # No payload and no cached reading: jacked cannot rule a window out.
+        assert up.session_window(_ultra(), None).state == "unknown"
+        assert up.has_session(_ultra(), None) is True
+
+    def test_partial_ultra_read_keeps_a_cached_window(self):
+        # A temporary 5-hour window at 99% must survive a payload that
+        # omits five_hour and limits until an authoritative read clears it.
+        row = _ultra(cached_usage_5h=99.0, cached_5h_resets_at="2026-11-01T20:00:00+00:00")
+        sw = up.session_window(row, {"seven_day": {"utilization": 40.0}})
+        assert (sw.state, sw.temporary) == ("present", True)
+        assert up.account_view(row, {"seven_day": {}}).five_hour_reading() == 99.0
+        # An authoritative read still wins over the cache.
+        assert up.session_window(row, ULTRA_RAW).state == "absent"
+
+    def test_unknown_limit_kind_is_never_proof_of_absence(self, caplog):
+        raw = {"five_hour": None, "limits": [
+            {"kind": "weekly_all"}, {"kind": "rolling_session"}]}
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            sw = up.session_window(_ultra(), raw)
+            up.session_window(_ultra(), raw)
+        assert sw.state == "unknown"
+        assert sw.drift == ("unknown_limit_kind",)
+        logs = [r.getMessage() for r in caplog.records if "drift" in r.getMessage()]
+        assert len(logs) == 1 and "rolling_session" in logs[0]
+        # A plan with a fixed window keeps it.
+        assert up.session_window(_max5(), raw).state == "present"
+
+    def test_raw_is_read_from_the_row(self):
+        row = _ultra(cached_usage_raw=json.dumps(ULTRA_RAW))
+        assert up.session_window(row).state == "absent"
+        row = _ultra(cached_usage_raw=json.dumps(SESSION_RAW))
+        assert up.session_window(row).state == "present"
+        row = _ultra(cached_usage_raw="{broken")
+        assert up.session_window(row).state == "unknown"
+
+    def test_max_with_a_session(self):
+        sw = up.session_window(_max5(), SESSION_RAW)
+        assert (sw.state, sw.temporary, sw.drift) == ("present", False, ())
+
+    def test_max_silence_reads_idle_but_flags_drift(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            sw = up.session_window(_max5(), WEEKLY_ONLY_RAW)
+            up.session_window(_max5(), WEEKLY_ONLY_RAW)
+        assert sw.state == "present"
+        assert sw.drift == ("session_missing",)
+        assert len([r for r in caplog.records if "drift" in r.getMessage()]) == 1
+
+    def test_max_without_a_payload_is_present(self):
+        sw = up.session_window(_max5(), None)
+        assert (sw.state, sw.drift) == ("present", ())
+
+    def test_legacy_null_five_hour_without_limits_is_not_authoritative(self):
+        # Older payloads had no limits list; null meant "no window open".
+        sw = up.session_window(_max5(), {"five_hour": None})
+        assert (sw.state, sw.drift) == ("present", ())
+
+    def test_reported_plan_follows_an_authoritative_payload(self):
+        row = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_40x"}
+        assert up.session_window(row, WEEKLY_ONLY_RAW).state == "absent"
+        assert up.session_window(row, SESSION_RAW).state == "present"
+        # Silence without a limits list keeps the legacy idle reading.
+        assert up.session_window(row, {"five_hour": None}).state == "present"
+
+    def test_five_hour_object_counts_as_reported(self):
+        row = {"subscription_type": "enterprise"}
+        raw = {"five_hour": {"utilization": 3.0, "resets_at": None}, "limits": []}
+        assert up.session_window(row, raw).state == "present"
+        raw = {"five_hour": {"utilization": None, "resets_at": None}, "limits": []}
+        assert up.session_window(row, raw).state == "absent"
+
+    def test_never_plan_with_a_reported_session_follows_the_payload(self, tmp_path, monkeypatch):
+        root = _write(tmp_path, {"version": 1, "providers": {"claude": {"subscriptions": {
+            "pro": {"label": "Pro", "session": "never"}}}}})
+        monkeypatch.setattr(up, "_catalog_cache", up.load_catalog(root))
+        sw = up.session_window({"subscription_type": "pro"}, SESSION_RAW)
+        assert (sw.state, sw.drift) == ("present", ("session_on_never_plan",))
+        assert up.session_window({"subscription_type": "pro"}, WEEKLY_ONLY_RAW).state == "absent"
+
+
+class TestSessionWindowCodex:
+    def test_pro_has_no_session(self):
+        sw = up.session_window({"provider": "codex", "subscription_type": "pro"}, CODEX_PRO_RAW)
+        assert sw.state == "absent"
+        assert "ChatGPT Pro" in sw.note
+        assert sw.drift == ()
+
+    def test_pro_without_a_payload_is_absent(self):
+        row = {"provider": "codex", "subscription_type": "pro"}
+        assert up.session_window(row, None).state == "absent"
+
+    def test_pro_reporting_a_session_follows_the_payload(self):
+        row = {"provider": "codex", "subscription_type": "pro"}
+        sw = up.session_window(row, CODEX_PLUS_RAW)
+        assert (sw.state, sw.drift) == ("present", ("session_on_never_plan",))
+
+    def test_plus_with_a_session(self):
+        row = {"provider": "codex", "subscription_type": "plus"}
+        assert up.session_window(row, CODEX_PLUS_RAW).state == "present"
+
+    def test_plus_weekly_only_is_absent_with_drift(self):
+        row = {"provider": "codex", "subscription_type": "plus"}
+        sw = up.session_window(row, CODEX_PRO_RAW)
+        assert (sw.state, sw.drift) == ("absent", ("session_missing",))
+
+    def test_partial_payload_is_unknown(self):
+        row = {"provider": "codex", "subscription_type": "business"}
+        partial = {"rateLimits": {"primary": {"usedPercent": 5, "windowDurationMins": 10080}}}
+        assert up.session_window(row, partial).state == "unknown"
+        assert up.session_window(row, None).state == "unknown"
+
+    def test_business_weekly_only_is_absent(self):
+        row = {"provider": "codex", "subscription_type": "business"}
+        sw = up.session_window(row, CODEX_PRO_RAW)
+        assert (sw.state, sw.drift) == ("absent", ())
+
+
+# --------------------------------------------------------------------------- #
+# Model windows and payloads
+# --------------------------------------------------------------------------- #
+
+
+class TestModelWindowSeconds:
+    def test_claude_scoped_limit_is_weekly(self):
+        assert up.model_window_seconds("claude") == 7 * 86400
+
+    def test_codex_duration_wins(self):
+        assert up.model_window_seconds("codex", {"windowDurationMins": 300}, "weekly") == 5 * 3600
+        assert up.model_window_seconds("codex", {"windowDurationMins": 10080}, "session") == 7 * 86400
+
+    @pytest.mark.parametrize("window", [None, {}, {"windowDurationMins": True},
+                                        {"windowDurationMins": 0}, {"windowDurationMins": "300"},
+                                        {"windowDurationMins": float("nan")}])
+    def test_codex_falls_back_to_the_slot(self, window):
+        assert up.model_window_seconds("codex", window, "session") == 5 * 3600
+        assert up.model_window_seconds("codex", window, "weekly") == 7 * 86400
+
+
+class TestAccountView:
+    def test_ultra_payloads(self):
+        profile = json.dumps({"organization": {"plan_display_name": "Ultra"}})
+        row = _ultra(profile_json=profile, cached_usage_raw=json.dumps(ULTRA_RAW),
+                     cached_usage_5h=None, cached_usage_7d=33.0)
+        view = up.account_view(row)
+        assert view.plan_payload() == {
+            "id": "ultra", "label": "Ultra", "formerly": "Max 20x",
+            "label_source": "provider", "drift": [], "catalog_verified_at": "2026-11-01",
+        }
+        windows = view.windows_payload()
+        assert windows["five_hour"]["state"] == "absent"
+        assert windows["five_hour"]["seconds"] == 5 * 3600
+        assert windows["five_hour"]["temporary"] is False
+        assert windows["five_hour"]["note"].startswith("Verified Ultra")
+        assert windows["seven_day"] == {"state": "present", "temporary": False,
+                                        "seconds": 7 * 86400, "note": None}
+
+    def test_drift_from_both_sources_is_merged(self):
+        row = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_5x",
+               "cached_usage_raw": json.dumps(WEEKLY_ONLY_RAW)}
+        assert up.account_view(row).plan_payload()["drift"] == ["session_missing"]
+
+    def test_five_hour_reading(self):
+        # Absent: no reading, even if a stale value is still cached.
+        ultra = _ultra(cached_usage_raw=json.dumps(ULTRA_RAW), cached_usage_5h=67.0)
+        assert up.account_view(ultra).five_hour_reading() is None
+        # Present Claude window with no reading: no window open, 0% used.
+        idle = _max5(cached_usage_raw=json.dumps(SESSION_RAW), cached_usage_5h=None)
+        assert up.account_view(idle).five_hour_reading() == 0.0
+        busy = _max5(cached_usage_raw=json.dumps(SESSION_RAW), cached_usage_5h=41.5)
+        assert up.account_view(busy).five_hour_reading() == 41.5
+        # Codex never turns a missing reading into 0%.
+        plus = {"provider": "codex", "subscription_type": "plus",
+                "cached_usage_raw": json.dumps(CODEX_PLUS_RAW), "cached_usage_5h": None}
+        assert up.account_view(plus).five_hour_reading() is None
+        partial = {"provider": "codex", "subscription_type": "business", "cached_usage_5h": None}
+        assert up.account_view(partial).five_hour_reading() is None
+
+    def test_codex_weekly_state(self):
+        pro = {"provider": "codex", "subscription_type": "pro",
+               "cached_usage_raw": json.dumps(CODEX_PRO_RAW)}
+        assert up.account_view(pro).windows_payload()["seven_day"]["state"] == "present"
+        partial = {"provider": "codex", "subscription_type": "pro",
+                   "cached_usage_raw": json.dumps(
+                       {"rateLimits": {"primary": {"usedPercent": 5, "windowDurationMins": 300}}})}
+        assert up.account_view(partial).windows_payload()["seven_day"]["state"] == "unknown"
+
+    def test_has_session(self):
+        assert up.has_session(_ultra(cached_usage_raw=json.dumps(ULTRA_RAW))) is False
+        assert up.has_session(_max5()) is True
+        assert up.has_session({"provider": "codex", "subscription_type": "business"}) is True
+
+    def test_raw_usage_tolerates_garbage(self):
+        assert up.raw_usage({}) is None
+        assert up.raw_usage({"cached_usage_raw": "[1]"}) is None
+        assert up.raw_usage({"cached_usage_raw": "nope"}) is None
+        assert up.raw_usage({"cached_usage_raw": {"a": 1}}) == {"a": 1}
+        assert up.raw_usage({"cached_usage_raw": '{"a": 1}'}) == {"a": 1}
+
+
+# --------------------------------------------------------------------------- #
+# Window lengths per plan and as observed
+# --------------------------------------------------------------------------- #
+
+
+class TestWindowLengths:
+    def test_plan_can_override_its_provider_lengths(self, tmp_path, monkeypatch):
+        root = _write(tmp_path, {"version": 1, "providers": {"claude": {
+            "windows": {"session": 18000, "weekly": 604800},
+            "subscriptions": {
+                "pro": {"label": "Pro", "session": "always", "windows": {"session": 10800}},
+                "team": {"label": "Team", "session": "always"},
+            },
+        }}})
+        monkeypatch.setattr(up, "_catalog_cache", up.load_catalog(root))
+        pro = up.account_view({"subscription_type": "pro"}, None)
+        assert pro.session.seconds == 10800
+        assert pro.windows_payload()["five_hour"]["seconds"] == 10800
+        assert pro.windows_payload()["seven_day"]["seconds"] == 604800
+        team = up.account_view({"subscription_type": "team"}, None)
+        assert team.session.seconds == 18000
+        assert up.resolve_plan({"subscription_type": "pro"}).window_seconds("session") == 10800
+
+    @pytest.mark.parametrize("windows", [{"session": 0}, {"session": True},
+                                         {"monthly": 100}, "x"])
+    def test_invalid_plan_lengths_skip_the_entry(self, tmp_path, caplog, windows):
+        root = _write(tmp_path, {"version": 1, "providers": {"claude": {"subscriptions": {
+            "pro": {"label": "Pro", "session": "always", "windows": windows}}}}})
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        assert "pro" not in cat.providers["claude"].subscriptions
+
+    def test_codex_observed_lengths_win(self):
+        raw = {"rateLimits": {
+            "primary": {"usedPercent": 1, "windowDurationMins": 240, "resetsAt": 1},
+            "secondary": {"usedPercent": 2, "windowDurationMins": 20160, "resetsAt": 2},
+        }}
+        view = up.account_view({"provider": "codex", "subscription_type": "plus"}, raw)
+        assert view.session.seconds == 240 * 60
+        assert view.windows_payload()["seven_day"]["seconds"] == 20160 * 60
+
+    def test_codex_without_durations_uses_the_catalog(self):
+        view = up.account_view({"provider": "codex", "subscription_type": "pro"}, None)
+        assert view.session.seconds == 5 * 3600
+        assert view.windows_payload()["seven_day"]["seconds"] == 7 * 86400
+
+
+class TestProjectRow:
+    def test_absent_window_drops_stale_values(self):
+        row = _ultra(cached_usage_raw=json.dumps(ULTRA_RAW), cached_usage_5h=100.0,
+                     cached_5h_resets_at="2026-11-01T20:00:00+00:00", cached_usage_7d=40.0)
+        projected = up.project_row(row)
+        assert projected["cached_usage_5h"] is None
+        assert projected["cached_5h_resets_at"] is None
+        assert projected["cached_usage_7d"] == 40.0
+        assert row["cached_usage_5h"] == 100.0  # the caller's row is not mutated
+
+    def test_present_window_is_untouched(self):
+        row = _max5(cached_usage_raw=json.dumps(SESSION_RAW), cached_usage_5h=67.0)
+        assert up.project_row(row) is row
+
+    def test_absent_window_with_nothing_cached_is_untouched(self):
+        row = _ultra(cached_usage_raw=json.dumps(ULTRA_RAW), cached_usage_5h=None)
+        assert up.project_row(row) is row
+
+    def test_unknown_window_keeps_its_values(self):
+        row = _ultra(cached_usage_5h=55.0)  # no payload: prior evidence keeps it
+        assert up.project_row(row)["cached_usage_5h"] == 55.0
