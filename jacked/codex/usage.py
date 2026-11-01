@@ -163,8 +163,11 @@ def normalize_rate_limits(result: Mapping) -> dict:
     "this window no longer exists" — a partial or unrecognized payload must
     preserve the last known cache, never clear it.
     """
-    result = result or {}
-    rl = result.get("rateLimits") or {}
+    result = result if isinstance(result, Mapping) else {}
+    rl = result.get("rateLimits")
+    # A rateLimits value that is not an object is a shape jacked does not
+    # understand: no windows, and never authoritative (both keys missing).
+    rl = rl if isinstance(rl, Mapping) else {}
     slots = _classify_windows(rl.get("primary"), rl.get("secondary"))
     five = slots["five_hour"] or {}
     seven = slots["seven_day"] or {}

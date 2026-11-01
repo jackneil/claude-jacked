@@ -791,3 +791,12 @@ class TestCodexNonObjectWindows:
         norm = normalize_rate_limits(raw)
         assert norm["five_hour"]["reported"] is True
         assert norm["windows_complete"] is False
+
+    @pytest.mark.parametrize("junk", [[1], "x", 5])
+    def test_non_object_rate_limits_is_ignored(self, junk):
+        from jacked.codex.usage import normalize_rate_limits
+
+        norm = normalize_rate_limits({"rateLimits": junk})
+        assert norm["five_hour"]["reported"] is False
+        assert norm["windows_complete"] is False
+        assert normalize_rate_limits(None)["windows_complete"] is False
