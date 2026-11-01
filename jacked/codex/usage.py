@@ -98,7 +98,10 @@ def _classify_windows(primary, secondary) -> dict:
         ("five_hour", primary),
         ("seven_day", secondary),
     ):
-        if not window:
+        # Only None (or an empty object) means "no window here". Any other
+        # value that is not an object, falsy ones included ([], 0, ""), is a
+        # shape jacked does not understand.
+        if window is None or (isinstance(window, Mapping) and not window):
             continue
         if not isinstance(window, Mapping):
             # A window that is not an object (a string, a list, a bare

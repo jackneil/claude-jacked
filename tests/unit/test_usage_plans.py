@@ -774,7 +774,7 @@ class TestPerModelWindowSeconds:
 
 
 class TestCodexNonObjectWindows:
-    @pytest.mark.parametrize("junk", ["10080", [1, 2], 7, True])
+    @pytest.mark.parametrize("junk", ["10080", [1, 2], 7, True, [], 0, "", False])
     def test_non_object_window_is_ignored_not_a_crash(self, junk):
         from jacked.codex.usage import normalize_rate_limits
 
@@ -800,3 +800,19 @@ class TestCodexNonObjectWindows:
         assert norm["five_hour"]["reported"] is False
         assert norm["windows_complete"] is False
         assert normalize_rate_limits(None)["windows_complete"] is False
+
+
+    def test_falsey_junk_window_never_clears_a_cached_session(self):
+        """A falsey non-object window ([], 0, "") is not absence: the
+        payload is not authoritative, so the cached 5h reading stays."""
+        from jacked.codex.usage import normalize_rate_limits
+
+        raw = {"rateLimits": {"primary": [], "secondary": {
+            "usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1793790000}}}
+        norm = normalize_rate_limits(raw)
+        assert norm["windows_complete"] is False
+        assert norm["seven_day"]["reported"] is True
+        # An empty object still means "no window here".
+        raw = {"rateLimits": {"primary": {}, "secondary": {
+            "usedPercent": 40, "windowDurationMins": 10080, "resetsAt": 1793790000}}}
+        assert normalize_rate_limits(raw)["windows_complete"] is True

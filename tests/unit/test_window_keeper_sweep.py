@@ -1292,14 +1292,77 @@ class TestNoSessionWindow:
 
     def test_a_week_without_a_reset_after_a_200_on_ultra_is_ok(self, db):
         """The same rule on a plan without a 5-hour window: a ping sent for a
-        weekly window that the read-back reports without a reset is ok."""
+        weekly window that a LANDED read-back reports without a reset is ok
+        (the API omits the reset for days at a time)."""
         aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 7200)
+
+        async def _read_back(account_id, db_, **_kw):
+            db_.update_account_usage_cache(account_id, seven_day=41.0, clear_seven_day_reset=True)
+            return {}
+
         pings = _Pings({"cc-tok": NO_HEADERS})
-        _run_pass(db, pings)
+        _run_pass(db, pings, fetch=AsyncMock(side_effect=_read_back))
         assert _state(db, aid)["last_status"] == "ok"
         # The recent ok holds the next sweep off: no ping every sweep.
-        _run_pass(db, pings)
+        _run_pass(db, pings, fetch=AsyncMock(side_effect=_read_back))
         assert pings.calls == ["cc-tok"]
+
+    def test_a_week_without_a_reset_and_no_read_back_is_not_ok(self, db):
+        """A 200 with no headers and a read-back that never lands leaves a
+        days-old reading: nothing confirmed the weekly window, so the verdict
+        is ping_ok_no_window and the retry backs off (never a silent ok)."""
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 3 * 86400)
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))  # fetch mock writes nothing
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert st["next_attempt_at"] > time.time()
+        assert um._ping_backoff[aid]["fails"] == 1
+
+    def test_a_stale_weekly_reset_rewritten_by_the_read_back_is_not_ok(self, db):
+        """The read-back lands (the row is new) but still carries the lapsed
+        weekly reset: a new row is not an open window."""
+        lapsed = _iso_in(-3600)
+        aid = _mk_ultra(db, cached_7d_resets_at=lapsed, usage_cached_at=int(time.time()) - 7200)
+
+        async def _same_reset(account_id, db_, **_kw):
+            db_.update_account_usage_cache(account_id, seven_day=99.0, seven_day_resets_at=lapsed)
+            return {}
+
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_same_reset))
+        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+
+    def test_the_escalation_count_survives_a_restart(self, db):
+        """After the cap, a restart must resume the escalation (3600 s), not
+        fall back to the first step (600 s)."""
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        for sweep in range(4):
+            if sweep:
+                um._ping_backoff[aid]["skip_until"] = 0.0
+            _run_pass(db, pings)
+        assert _state(db, aid)["backoff_fails"] == 4
+        um._ping_backoff.clear()  # a restart: the in-memory count is gone
+        db.set_keeper_state(aid, next_attempt_at=time.time() - 1)  # the retry is due
+        _run_pass(db, pings)
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert st["next_attempt_at"] - st["last_ping_at"] == pytest.approx(3600, abs=1.01)
+        assert st["backoff_fails"] == 5
+
+    def test_success_clears_the_persisted_count(self, db):
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))
+        assert _state(db, aid)["backoff_fails"] == 1
+        um._ping_backoff[aid]["skip_until"] = 0.0
+        reset_7d = int(time.time()) + 7 * 86400 - 60
+        reply = PingResult(ok=True, status=200, rate_limit={
+            "anthropic-ratelimit-unified-7d-reset": str(reset_7d),
+            "anthropic-ratelimit-unified-7d-utilization": "0.02",
+        })
+        _run_pass(db, _Pings({"cc-tok": reply}))
+        st = _state(db, aid)
+        assert st["last_status"] == "ok"
+        assert st["backoff_fails"] == 0
 
     def test_unknown_ultra_keeps_the_5h_ping(self, db):
         """No payload and no cached 5h reading: jacked cannot rule the 5h

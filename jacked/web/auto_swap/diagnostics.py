@@ -24,7 +24,7 @@ def plan_label(account: dict) -> str:
 
     The name comes from :func:`jacked.usage_plans.resolve_plan`: the
     provider's own plan name first, then the catalog label, then the raw
-    subscription type. Logs and swap notifications use it.
+    subscription type. The auto-swap decision log names the plan with it.
 
     >>> plan_label({"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x"})
     'Ultra'

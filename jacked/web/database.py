@@ -1577,6 +1577,7 @@ class Database:
             "skip_reason",
             "paused_until",
             "token_fp",
+            "backoff_fails",
         }
     )
 

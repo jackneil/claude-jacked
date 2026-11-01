@@ -1149,10 +1149,11 @@ async def active_account_poll_loop(app):
             from jacked.web.auth import fetch_usage
             from jacked.api.credential_helpers import read_fresh_active_token
             from jacked.service.usage_pacing import account_recovery_at
-            from jacked.usage_plans import account_view, resolve_plan
+            from jacked.usage_plans import account_view
             from jacked.web.auto_swap import (
                 should_swap_now,
                 pick_best_target,
+                plan_label,
                 update_burn_rate,
                 tier_critical_threshold,
                 tier_for,
@@ -1617,7 +1618,7 @@ async def active_account_poll_loop(app):
                     _decision_trigger = "tick"
                     _decision_reason = (
                         f"stay: no candidate has deficit "
-                        f"(plan {resolve_plan(active_acct).label or 'unknown'})"
+                        f"(plan {plan_label(active_acct) or 'unknown'})"
                     )
                 else:
                     _decision_target_id = best["id"]
@@ -2175,7 +2176,20 @@ def _keeper_state_of(acct: dict) -> dict:
 
 
 def _write_keeper_state(db, account_id: int, **fields) -> None:
-    """Persist keeper state; a DB hiccup must never break the sweep."""
+    """Persist keeper state; a DB hiccup must never break the sweep.
+
+    A write that sets a retry deadline (``next_attempt_at``) also persists
+    the in-memory escalation count (``backoff_fails``), and a write that
+    clears the deadline clears the count: a restart then resumes the
+    escalation where it stopped instead of falling back to the first step.
+    """
+    if "next_attempt_at" in fields and "backoff_fails" not in fields:
+        entry = _ping_backoff.get(account_id)
+        fields["backoff_fails"] = (
+            int(entry["fails"])
+            if entry is not None and fields["next_attempt_at"] is not None
+            else 0
+        )
     try:
         db.set_keeper_state(account_id, **fields)
     except Exception:
@@ -2551,6 +2565,43 @@ def _keeper_window_needed(acct: dict, state: dict) -> tuple[bool, bool]:
     return needs_5h, needs_7d
 
 
+def _window_confirmed(fresh: dict, kind: str, pinged_at: float) -> bool:
+    """True when the fresh row shows *kind* ("5h" or "7d") open after a ping.
+
+    1. A future reset confirms either window.
+    2. A 7d window with NO reset at all is confirmed only by a row written at
+       or after the ping (``usage_cached_at``): a usage read that landed and
+       reported no reset (the API omits it for days at a time; the 200
+       started the weekly window). A row that nothing wrote proves nothing.
+    3. A lapsed or unreadable reset never confirms a window, however new the
+       row is: scheduling may read a fresh row as "running", confirmation
+       may not.
+
+    >>> import time
+    >>> _window_confirmed({"cached_7d_resets_at": None, "usage_cached_at": 10}, "7d", 5)
+    True
+    >>> _window_confirmed({"cached_7d_resets_at": None, "usage_cached_at": 4}, "7d", 5)
+    False
+    >>> _window_confirmed({"cached_5h_resets_at": None, "usage_cached_at": 10}, "5h", 5)
+    False
+    >>> _window_confirmed({"cached_7d_resets_at": "2000-01-01T00:00:00+00:00",
+    ...                    "usage_cached_at": int(time.time())}, "7d", 5)
+    False
+    """
+    from jacked.web import window_keeper as wk
+
+    reset = fresh.get("cached_5h_resets_at" if kind == "5h" else "cached_7d_resets_at")
+    if not wk.needs_ping(reset):
+        return True  # a future reset
+    if kind != "7d" or reset:
+        return False
+    try:
+        written = int(fresh.get("usage_cached_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return written >= int(pinged_at)
+
+
 async def _keeper_record_success(
     db,
     acct: dict,
@@ -2564,19 +2615,13 @@ async def _keeper_record_success(
     """Persist what a successful ping opened, then the keeper verdict.
 
     *needed* is ``(needs_5h, needs_7d)``: the windows that made the keeper
-    ping. After the usage read-back each of them is confirmed against the
-    fresh row, judged as of THIS ping (it is the recent success that the
-    missing-7d-reset rule of :func:`_keeper_window_needed` speaks of):
-
-    1. 5h, strict: a needed 5h window is confirmed only when the fresh row
-       shows a future 5h reset.
-    2. 7d with no reset: a needed 7d window whose fresh reset is null is
-       confirmed when the 5h window is open or absent. The 200 started the
-       weekly window; the API omits the reset (one account here read
-       ``resets_at: null`` for 9 days), and no further ping can change that.
-    3. 7d with a lapsed reset: a needed 7d window whose fresh reset is set
-       but still lapsed (``needs_7d_ping`` true: no header, and the
-       read-back did not land) is NOT confirmed.
+    ping. After the header write and the usage read-back, each of them is
+    confirmed against the fresh row by :func:`_window_confirmed` (a future
+    reset; for a weekly window with no reset at all, a row written after this
+    ping; never a lapsed reset). The API omits the weekly reset for days at a
+    time (one account here read ``resets_at: null`` for 9 days), so a read
+    that lands without one confirms the window the 200 started; a read that
+    never lands confirms nothing.
 
     The verdict is ``ok`` only when every needed window is confirmed.
     Otherwise it is ``ping_ok_no_window``, the WARNING names the windows
@@ -2615,21 +2660,11 @@ async def _keeper_record_success(
             account_id,
         )
     fresh = await asyncio.to_thread(db.get_account, account_id) or {}
-    if fresh:
-        # Judge the windows as of THIS ping: it is the recent success the
-        # missing-7d-reset rule speaks of (a 200 starts the weekly window,
-        # and no further ping can make a read report a reset it omits). A
-        # lapsed 7d reset that nothing refreshed still counts as not open.
-        after_5h, after_7d = _keeper_window_needed(
-            fresh, {"last_status": "ok", "last_ping_at": now}
-        )
-    else:
-        # The row is gone (deleted mid-sweep): nothing is confirmed open.
-        after_5h, after_7d = needs_5h, needs_7d
+    # A deleted row (gone mid-sweep) confirms nothing.
     missing = [
         name
-        for name, before, after in (("5h", needs_5h, after_5h), ("7d", needs_7d, after_7d))
-        if before and after
+        for name, needed_before in (("5h", needs_5h), ("7d", needs_7d))
+        if needed_before and not (fresh and _window_confirmed(fresh, name, now))
     ]
     # The row may hold a rotated token now: key the state on the CURRENT
     # candidate set so a persisted backoff survives the next sweep's check.
@@ -2885,8 +2920,20 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
         and state.get("token_fp") == fp
         and state.get("last_status") in ("rate_limited", "auth_failed", "error", "ping_ok_no_window")
     ):
-        # Restart: honor the schedule persisted before the process died.
+        # Restart: honor the schedule persisted before the process died, and
+        # resume its escalation count so the next failure does not fall back
+        # to the first step.
         skip_until = state.get("next_attempt_at")
+        try:
+            fails = max(0, int(state.get("backoff_fails") or 0))
+        except (TypeError, ValueError):
+            fails = 0
+        if fails:
+            _ping_backoff[account_id] = {
+                "fails": fails,
+                "skip_until": float(skip_until or 0.0),
+                "token_fp": fp,
+            }
     if skip_until and skip_until > now:
         logger.debug(
             "Window keeper: account %d in ping backoff for %.0fs more — skipping",
