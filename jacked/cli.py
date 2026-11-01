@@ -8473,52 +8473,120 @@ def claude_cmd(account, claude_args):
 # ── Subscription usage snapshot ────────────────────────────────────
 
 
-def _usage_row(acct: dict, now) -> dict:
+def _usage_row(acct: dict, now, active_ids: dict) -> dict:
     """Shape one account row for `jacked usage` output.
 
-    Field-ALLOWLISTED on purpose: token columns must never reach stdout.
-    Percents are defensively coerced (SQLite dynamic typing can hand back
-    TEXT); cache_age_seconds is SIGNED — negative means clock skew, which
-    should be visible, not silently clamped to "fresh".
+    Field-ALLOWLISTED on purpose: token columns must never reach stdout, and
+    each ``model_limits`` entry carries only its four named keys. Percents
+    are defensively coerced (SQLite dynamic typing can hand back TEXT);
+    cache_age_seconds is SIGNED: a negative age means clock skew, which must
+    be visible, not silently clamped to "fresh".
+
+    Windows are plan-aware (:mod:`jacked.usage_plans`). When the account's
+    plan has no 5-hour window (``session_window == "absent"``),
+    ``usage_5h_pct`` and ``resets_5h_at`` are None, even when a stale 5h
+    value is still in the cache. ``worst_window`` / ``worst_window_pct`` /
+    ``worst_window_resets_at`` name the most constrained window that has a
+    reading, with the summary's staleness rule
+    (:func:`jacked.service.usage_pacing.worst_window`). ``active`` is True
+    for the active account of the row's provider, from *active_ids*
+    (``{provider: account id}``, read from jacked's database).
+
+    >>> from datetime import datetime, timezone
+    >>> now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    >>> ultra = {"id": 7, "subscription_type": "max",
+    ...          "rate_limit_tier": "default_claude_max_20x",
+    ...          "cached_usage_raw": '{"five_hour": null, "limits": [{"kind": "weekly_all"}]}',
+    ...          "cached_usage_5h": 99.0, "cached_usage_7d": 40.0}
+    >>> row = _usage_row(ultra, now, {"claude": 7})
+    >>> row["plan"], row["session_window"], row["usage_5h_pct"], row["worst_window"], row["active"]
+    ('Ultra', 'absent', None, '7d', True)
     """
-    from jacked.service.usage_pacing import cache_age_seconds, coerce_pct
+    from jacked.service.menubar_summary import parse_per_model
+    from jacked.service.usage_pacing import cache_age_seconds, coerce_pct, worst_window
+    from jacked.usage_plans import account_view, raw_usage
+
+    provider = acct.get("provider") or "claude"
+    raw = raw_usage(acct)
+    view = account_view(acct, raw)
+    has_5h = view.session.state != "absent"
+    worst = worst_window(acct, now)
+    model_limits = [
+        {
+            "label": m.get("label"),
+            "pct": coerce_pct(m.get("utilization")),
+            "resets_at": m.get("resets_at"),
+            "window_seconds": m.get("window_seconds"),
+        }
+        for m in parse_per_model(raw, view.plan)
+    ]
+    active_id = active_ids.get(provider)
 
     return {
         "id": acct.get("id"),
-        "provider": acct.get("provider") or "claude",
+        "provider": provider,
         "email": acct.get("email"),
         "subscription_type": acct.get("subscription_type"),
         "is_active": bool(acct.get("is_active", 1)),
         "validation_status": acct.get("validation_status"),
-        "usage_5h_pct": coerce_pct(acct.get("cached_usage_5h")),
+        "usage_5h_pct": coerce_pct(acct.get("cached_usage_5h")) if has_5h else None,
         "usage_7d_pct": coerce_pct(acct.get("cached_usage_7d")),
-        "resets_5h_at": acct.get("cached_5h_resets_at"),
+        "resets_5h_at": acct.get("cached_5h_resets_at") if has_5h else None,
         "resets_7d_at": acct.get("cached_7d_resets_at"),
         "cache_age_seconds": cache_age_seconds(acct, now),
+        "plan": view.plan.label,
+        "plan_id": view.plan.id,
+        "session_window": view.session.state,
+        "model_limits": model_limits,
+        "worst_window_pct": worst[1] if worst else None,
+        "worst_window": worst[0] if worst else None,
+        "worst_window_resets_at": (
+            worst[2].isoformat() if worst and worst[2] else None
+        ),
+        "active": active_id is not None and acct.get("id") == active_id,
     }
 
 
 def _render_usage_table(rows: list[dict], summary: dict) -> None:
-    """Human table for `jacked usage` (JSON mode is the machine contract)."""
+    """Human table for `jacked usage` (JSON mode is the machine contract).
+
+    Every cell is escaped: emails, plan names and model names come from the
+    provider, and Rich would read a bracketed name as markup (``[beta]`` is
+    dropped from the cell, and ``[/x]`` stops the whole table with an error).
+    """
+    from rich.markup import escape as _escape
     from rich.table import Table as _Table
 
     def _pct(v):
         return f"{v:.0f}%" if isinstance(v, (int, float)) else "?"
 
+    def _model(limits):
+        # model_limits is sorted by percent (highest first): show the first.
+        if not limits:
+            return "-"
+        first = limits[0]
+        return f"{first['label'] or '?'} {_pct(first['pct'])}"
+
     t = _Table(title="Subscription usage (cached)")
-    for col in ("ID", "Provider", "Email", "Plan", "5h %", "7d %",
+    for col in ("ID", "Provider", "Email", "Plan", "5h %", "7d %", "Model",
                 "5h resets (UTC)", "7d resets (UTC)", "Cache age"):
         t.add_column(col)
     for r in rows:
         age_s = r["cache_age_seconds"]
         # Negative age = clock skew (deliberately unclamped); label it.
         age = "?" if age_s is None else ("skew" if age_s < 0 else f"{age_s // 60}m")
-        t.add_row(
-            str(r["id"]), r["provider"], r["email"] or "?",
-            r["subscription_type"] or "?",
-            _pct(r["usage_5h_pct"]), _pct(r["usage_7d_pct"]),
-            r["resets_5h_at"] or "?", r["resets_7d_at"] or "?", age,
+        # A plan without a 5-hour window has nothing to show there.
+        no_5h = r["session_window"] == "absent"
+        cells = (
+            r["id"], r["provider"], r["email"] or "?",
+            r["plan"] or r["subscription_type"] or "?",
+            "none" if no_5h else _pct(r["usage_5h_pct"]),
+            _pct(r["usage_7d_pct"]),
+            _model(r["model_limits"]),
+            "none" if no_5h else (r["resets_5h_at"] or "?"),
+            r["resets_7d_at"] or "?", age,
         )
+        t.add_row(*(_escape(str(c)) for c in cells))
     console.print(t)
     if summary.get("pause_until"):
         # pause_until is set when ANY eligible window is constrained — it does
@@ -8531,22 +8599,38 @@ def _render_usage_table(rows: list[dict], summary: dict) -> None:
 @main.command(name="usage")
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
 @click.option(
+    "--provider", "provider",
+    type=click.Choice(["claude", "codex"], case_sensitive=False), default=None,
+    help="Show only the accounts of this provider. The summary uses only these accounts.",
+)
+@click.option(
     "--include-inactive", is_flag=True,
     help="Include accounts marked inactive in the dashboard.",
 )
-def usage_cmd(as_json, include_inactive):
-    """Show cached subscription usage per account (5h/7d windows + resets).
+def usage_cmd(as_json, provider, include_inactive):
+    """Show the cached subscription usage of each account.
 
-    Reads the same cached rate-limit windows the dashboard shows. Does NOT
-    call any provider API — data is as fresh as the last dashboard/menubar
-    refresh (see cache_age_seconds). Autonomous loops (e.g. the night-shift
-    skill) use --json to decide whether to pause: summary.pause_until is the
-    earliest FUTURE reset among CONSTRAINED (>=90% effective) windows of
-    eligible accounts, staleness-adjusted (a past resets_at means the cached
-    percent is stale headroom). The JSON contract is pinned by
-    tests/unit/test_usage_cmd.py.
+    Each account shows the usage windows that its plan has, and when they
+    reset. A plan without a 5-hour window (a verified Ultra plan, ChatGPT
+    Pro) shows "none" in the 5h columns. In JSON, its usage_5h_pct and
+    resets_5h_at are null. Each JSON row also gives the plan name, the
+    model limits, and its most constrained window (worst_window_pct).
 
-    >>> # CLI command: jacked usage [--json] [--include-inactive]
+    This command does not call a provider API. The data is as fresh as the
+    last refresh of the dashboard or the menu bar (see cache_age_seconds).
+
+    --provider claude or --provider codex shows only the accounts of that
+    provider, and the summary uses only those accounts. In each JSON row,
+    "active" is true for the active account of that provider in the
+    jacked database.
+
+    Autonomous loops (for example, the night-shift skill) use --json to
+    decide when to pause. summary.pause_until is the earliest future reset
+    of the constrained windows (90% or more, effective) of the eligible
+    accounts. A past resets_at makes the cached percent stale headroom.
+    tests/unit/test_usage_cmd.py pins the JSON contract.
+
+    >>> # CLI command: jacked usage [--json] [--provider claude|codex] [--include-inactive]
     """
     import json as _json
     from datetime import datetime, timezone
@@ -8563,18 +8647,30 @@ def usage_cmd(as_json, include_inactive):
             console.print("[yellow]jacked database not found. Run 'jacked webux' first.[/yellow]")
         return
 
+    provider = provider.lower() if provider else None
     db = Database(str(db_path))
     try:
         accounts = db.list_accounts(include_inactive=include_inactive)
+        if provider:
+            accounts = [a for a in accounts if (a.get("provider") or "claude") == provider]
+        # The active account of each provider, from jacked's own database
+        # (one read per provider). Never the credential store or keychain.
+        active_ids = {
+            p: db.get_active_account_id(p)
+            for p in sorted({a.get("provider") or "claude" for a in accounts})
+        }
     finally:
         db.close()
 
     now = datetime.now(timezone.utc)
-    rows = [_usage_row(a, now) for a in accounts]
+    rows = [_usage_row(a, now, active_ids) for a in accounts]
     summary = compute_best_account_summary(accounts, now=now)
 
     if as_json:
-        click.echo(_json.dumps({"available": True, "accounts": rows, "summary": summary}))
+        click.echo(_json.dumps({
+            "available": True, "provider": provider,
+            "accounts": rows, "summary": summary,
+        }))
         return
     if not rows:
         console.print("[yellow]No accounts found.[/yellow]")

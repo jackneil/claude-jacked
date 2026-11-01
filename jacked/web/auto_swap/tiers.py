@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from jacked.usage_plans import account_view
 from jacked.web.auto_swap.burn import (
     compute_burn_per_window,
     compute_effective_working_hours,
@@ -114,12 +115,17 @@ def tier_for(
 
 
 def white_bar(account: dict, now: datetime | None = None) -> float | None:
-    """Wall-clock elapsed fraction (0.0-1.0) of the 7d window.
+    """Wall-clock elapsed fraction (0.0-1.0) of the account's weekly window.
 
-    Matches the UI's computeElapsedFraction7d in
-    jacked/data/web/js/components/usage.js — same formula:
-    (now - (resets_at - 7d)) / 7d. No active-hours adjustment.
-    Clamped to [0, 1] (also matches the UI's Math.max/min clamp).
+    Matches the UI's elapsed marker in jacked/data/web/js/components/usage.js
+    (computeElapsedFraction, fed by the account's
+    ``windows.seven_day.seconds``). Same formula: (now - (resets_at - W)) / W,
+    where W is the account's weekly window length,
+    ``jacked.usage_plans.account_view(account).weekly_seconds``. The API
+    sends that same value as ``windows.seven_day.seconds``, so the two
+    markers agree. The plan catalog gives 7 days for every current plan.
+    No active-hours adjustment. Clamped to [0, 1] (also matches the UI's
+    Math.max/min clamp).
 
     Returns None when 7d data is missing.
     """
@@ -134,7 +140,7 @@ def white_bar(account: dict, now: datetime | None = None) -> float | None:
         return None
 
     now = _resolve_now(now)
-    window_seconds = 7 * 24 * 3600
+    window_seconds = account_view(account).weekly_seconds
     start = resets_at - timedelta(seconds=window_seconds)
     elapsed = (now - start).total_seconds() / window_seconds
     return max(0.0, min(1.0, elapsed))
