@@ -15,9 +15,9 @@ from .diagnostics import (
     achievable_burn,
     compute_7d_deficit,
     format_account_label,
+    plan_label,
     stranding_estimate,
     tier_critical_threshold,
-    tier_label,
 )
 from .selection import (
     REASON_PREFIX_BURN_RATE,
@@ -50,7 +50,7 @@ __all__ = [
     "compute_burn_per_window", "compute_effective_working_hours",
     "has_viable_headroom", "update_burn_rate",
     "achievable_burn", "compute_7d_deficit", "format_account_label",
-    "stranding_estimate", "tier_critical_threshold", "tier_label",
+    "plan_label", "stranding_estimate", "tier_critical_threshold",
     "pick_best_target", "should_swap_now",
     "_has_5h_headroom",
     "REASON_PREFIX_HIGHER_TIER", "REASON_PREFIX_INTRA_TIER",
