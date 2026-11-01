@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from jacked.usage_plans import has_session
 from jacked.web.auto_swap.burn import (
     BurnRate,
     RESET_SUPPRESS_MINUTES,
@@ -70,7 +71,16 @@ def _has_5h_headroom(account: dict, now: datetime | None = None) -> bool:
     cached_5h_resets_at is headroom too — the window already reset and the
     >=90 cached usage is stale, so the most-usable candidate must not be
     excluded until the cache refreshes.
+
+    An account whose plan has no 5h window (a verified Ultra plan, ChatGPT
+    Pro) always has 5h headroom. :func:`jacked.usage_plans.has_session`
+    makes this decision from the plan catalog and the cached payload, and
+    it comes first. A 5h value that stays in such an account's cache is
+    stale, so it never blocks the account. An unknown window state counts
+    as a window, so the plan alone never lets an account through.
     """
+    if not has_session(account):
+        return True
     usage_5h = account.get("cached_usage_5h") or 0
     if usage_5h < _FIVE_H_HEADROOM_LIMIT:
         return True
@@ -155,7 +165,13 @@ def pick_best_target(
     ``consecutive_failures``, ``validation_status``, ``cc_access_token``,
     ``cc_refresh_failure_type`` (a dead Claude Code chain is never a swap
     target: its refresh token is spent), ``auto_swap_enabled``, ``cached_5h_resets_at``, ``cached_7d_resets_at``,
-    ``cached_usage_5h``, ``cached_usage_7d``. Nothing else is consulted —
+    ``cached_usage_5h``, ``cached_usage_7d``, and the plan fields
+    ``provider``, ``subscription_type``, ``rate_limit_tier`` and
+    ``cached_usage_raw``. The plan fields decide, through the plan catalog,
+    whether the account has a 5h window at all (``_has_5h_headroom``) and
+    how long its weekly window is (``white_bar`` in the T2/T3 targets). The
+    plan resolver also reads ``profile_json``, but only for the plan name,
+    and no decision here uses the name. Nothing else is consulted —
     do NOT add fields here without updating callers and tests.
     """
     now = _resolve_now(now)

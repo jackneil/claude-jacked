@@ -23,6 +23,7 @@ from typing import Literal, Optional
 import httpx
 
 from jacked.web.database import Database
+from jacked.web.window_keeper import cache_reset_value
 from jacked.web.oauth import (
     CC_LINEAGE_WRITE_LOCK,
     CLIENT_ID,
@@ -958,30 +959,86 @@ def _usage_429_rotation_interval(db) -> float:
     return float(_USAGE_429_ROTATION_POLL_PERIODS * max(period, _USAGE_POLL_PERIOD_FLOOR))
 
 
+# (window, value type) pairs already logged; two windows times the few JSON
+# types bound it.
+_UNREADABLE_RESETS_LOGGED: set = set()
+
+
+def _note_unreadable_reset(window: str, value) -> None:
+    """Log, once per window and value type, a reset stored as no reset."""
+    key = (window, type(value).__name__)
+    if key in _UNREADABLE_RESETS_LOGGED:
+        return
+    _UNREADABLE_RESETS_LOGGED.add(key)
+    logger.warning(
+        "Usage payload: the %s reset is not a timestamp (a %s value); "
+        "it is stored as no reset", window, type(value).__name__,
+    )
+
+
 def usage_cache_updates(data: dict) -> dict:
     """Map a usage API response to ``update_account_usage_cache`` arguments.
 
     A window key that is missing keeps the old cache. A window that is null
     (no active window) clears that window. A window object with a null
-    ``resets_at`` keeps its utilization and clears the stale reset time.
+    ``resets_at`` keeps its utilization and clears the stale reset time. A
+    ``resets_at`` that is not a timestamp (an empty string, junk) is stored
+    as no reset (:func:`jacked.web.window_keeper.cache_reset_value`).
+
+    One exception to "a missing key keeps the cache": an authoritative Claude
+    ``limits`` list (a list in which every entry has a kind in
+    ``jacked.usage_plans.KNOWN_CLAUDE_LIMIT_KINDS``) names every limit the
+    account has. When that list has no ``session`` entry and ``five_hour``
+    is not an object with a reading or a reset, the account has no 5-hour
+    window (a verified Ultra): the 5-hour columns are cleared even when the
+    ``five_hour`` key is missing. A list with an unknown kind is not
+    authoritative, so a renamed session kind can never clear a live window.
 
     >>> usage_cache_updates({"five_hour": None, "seven_day": {"utilization": 3}})
     {'clear_five_hour': True, 'seven_day': 3, 'clear_seven_day_reset': True}
-    >>> usage_cache_updates({"five_hour": {"utilization": 9, "resets_at": "R"}})
-    {'five_hour': 9, 'five_hour_resets_at': 'R'}
+    >>> usage_cache_updates({"five_hour": {"utilization": 9, "resets_at": "2026-11-02T00:00:00Z"}})
+    {'five_hour': 9, 'five_hour_resets_at': '2026-11-02T00:00:00Z'}
+    >>> usage_cache_updates({"seven_day": {"utilization": 3, "resets_at": ""}})
+    {'seven_day': 3, 'clear_seven_day_reset': True}
     >>> usage_cache_updates({})
     {}
+    >>> usage_cache_updates({"limits": [{"kind": "weekly_all"}],
+    ...                      "seven_day": {"utilization": 3, "resets_at": "2026-11-08T00:00:00Z"}})
+    {'clear_five_hour': True, 'seven_day': 3, 'seven_day_resets_at': '2026-11-08T00:00:00Z'}
+    >>> usage_cache_updates({"limits": [{"kind": "session"}, {"kind": "weekly_all"}]})
+    {}
+    >>> usage_cache_updates({"limits": [{"kind": "rolling_5h"}]})
+    {}
     """
+    from jacked.usage_plans import KNOWN_CLAUDE_LIMIT_KINDS
+
+    limits = data.get("limits")
+    kinds = (
+        [lim.get("kind") if isinstance(lim, dict) else None for lim in limits]
+        if isinstance(limits, list)
+        else None
+    )
+    no_session_window = (
+        kinds is not None
+        and all(isinstance(k, str) and k in KNOWN_CLAUDE_LIMIT_KINDS for k in kinds)
+        and "session" not in kinds
+    )
     updates: dict = {}
     for key, short in (("five_hour", "five_hour"), ("seven_day", "seven_day")):
         if key not in data:
+            if key == "five_hour" and no_session_window:
+                # A missing key keeps the cache, but the authoritative list
+                # says this account has no 5-hour window at all.
+                updates["clear_five_hour"] = True
             continue
         window = data.get(key)
         if not isinstance(window, dict):
             updates[f"clear_{short}"] = True
             continue
         utilization = window.get("utilization")
-        resets_at = window.get("resets_at")
+        resets_at = cache_reset_value(window.get("resets_at"))
+        if resets_at is None and window.get("resets_at") is not None:
+            _note_unreadable_reset(short, window.get("resets_at"))
         if utilization is None and resets_at is None:
             updates[f"clear_{short}"] = True
             continue
@@ -1000,13 +1057,43 @@ def compute_urgency_tier(
     usage_7d: float | None,
     burn_rate_5h: float,
     critical_5h: float = 90.0,
+    *,
+    has_session: bool = True,
+    usage_model: float | None = None,
 ) -> tuple[str, int]:
     """Compute the adaptive polling urgency tier and interval.
 
-    Returns (tier_name, interval_seconds).
+    Returns (tier_name, interval_seconds). *usage_model* is the binding
+    model-weekly limit (for example the weekly Fable limit), or None; it is
+    folded into the weekly value: ``max(usage_7d, usage_model)``.
+
+    With a 5-hour window (*has_session*, the default) the 5h value and its
+    burn projection set the tier, and a weekly value above 80% bumps it one
+    step. Without one (a verified Ultra, ChatGPT Pro) the weekly value sets
+    the tier alone: above 95% critical, above 90% warning, above 80% normal,
+    else idle. A 5h value or burn rate is ignored there: it cannot exist.
+
+    >>> compute_urgency_tier(88.0, 30.0, 0.0)
+    ('critical', 180)
+    >>> compute_urgency_tier(100.0, 40.0, 9.0, has_session=False)
+    ('idle', 300)
+    >>> compute_urgency_tier(None, 40.0, 0.0, has_session=False, usage_model=96.0)
+    ('critical', 180)
     """
     u5 = usage_5h if usage_5h is not None else 0.0
     u7 = usage_7d if usage_7d is not None else 0.0
+    u7 = max(u7, usage_model or 0)
+
+    if not has_session:
+        if u7 > 95:
+            tier = "critical"
+        elif u7 > 90:
+            tier = "warning"
+        elif u7 > 80:
+            tier = "normal"
+        else:
+            tier = "idle"
+        return tier, _TIER_INTERVALS[tier]
 
     if u5 > 85:
         tier = "critical"

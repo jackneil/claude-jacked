@@ -312,6 +312,8 @@ function _usageRemoveOverlay(card) {
  *
  * Depends on data attributes set in accounts.js card template:
  *   [data-usage-container] — wraps 5h + 7d bar elements (children 0, 1)
+ *   [data-binding-bar]     — the inline binding-model bar wrapper
+ *   [data-plan-label]      — the plan label in the info row
  *   [data-cache-age]       — the cache age span in the info row
  */
 function _usageUpdateCardDOM(card, acctData) {
@@ -339,32 +341,29 @@ function _usageUpdateCardDOM(card, acctData) {
             acct.usage = Object.assign({}, acct.usage, { binding_model: resolvedBinding });
         }
     }
+    // The merged account from state: a partial event (the poll payload has no
+    // keeper_state, provider, plan or windows) keeps what the state knows, so
+    // the bars keep their window states and the reset column keeps its reason.
+    const merged = (window.jackedState && window.jackedState.accounts || []).find(a => a.id === acctData.id) || acctData;
 
-    // Re-render usage bars using existing renderUsageBar function
+    // Re-render usage bars using the shared bar helpers (usage.js)
     const usageContainer = card.querySelector('[data-usage-container]');
     if (usageContainer &&
         typeof renderUsageBar === 'function' &&
-        typeof computeElapsedFraction5h === 'function' &&
-        typeof computeElapsedFraction7d === 'function') {
-
-        const elapsed5h = computeElapsedFraction5h(acctData.cached_5h_resets_at);
-        const elapsed7d = computeElapsedFraction7d(acctData.cached_7d_resets_at);
+        typeof windowElapsed === 'function' &&
+        typeof usageBarOpts === 'function' &&
+        typeof renderModelBar === 'function') {
 
         // First two children of [data-usage-container] are the 5h and 7d bar wrappers
         const bar5h = usageContainer.children[0];
         const bar7d = usageContainer.children[1];
         if (bar5h && bar7d) {
             const temp5h = document.createElement('div');
-            // The poll payload may lack keeper_state/provider: read the merged
-            // account from state so the reset column keeps its reason.
-            const merged = (window.jackedState && window.jackedState.accounts || []).find(a => a.id === acctData.id) || acctData;
-            const barOpts5h = typeof usageBarOpts === 'function' ? usageBarOpts(merged, acctData.cached_5h_resets_at, null, acctData.cached_usage_5h) : undefined;
-            const barOpts7d = typeof usageBarOpts === 'function' ? usageBarOpts(merged, acctData.cached_7d_resets_at, null, acctData.cached_usage_7d) : undefined;
-            temp5h.insertAdjacentHTML('afterbegin', renderUsageBar(acctData.cached_usage_5h, acctData.cached_5h_resets_at, elapsed5h, '5h limit', barOpts5h));
+            temp5h.insertAdjacentHTML('afterbegin', renderUsageBar(merged.cached_usage_5h, merged.cached_5h_resets_at, windowElapsed(merged, 'five_hour'), '5h limit', usageBarOpts(merged, 'five_hour')));
             if (temp5h.firstElementChild) bar5h.replaceWith(temp5h.firstElementChild);
 
             const temp7d = document.createElement('div');
-            temp7d.insertAdjacentHTML('afterbegin', renderUsageBar(acctData.cached_usage_7d, acctData.cached_7d_resets_at, elapsed7d, '7d limit', barOpts7d));
+            temp7d.insertAdjacentHTML('afterbegin', renderUsageBar(merged.cached_usage_7d, merged.cached_7d_resets_at, windowElapsed(merged, 'seven_day'), '7d limit', usageBarOpts(merged, 'seven_day')));
             if (temp7d.firstElementChild) bar7d.replaceWith(temp7d.firstElementChild);
         }
 
@@ -372,12 +371,23 @@ function _usageUpdateCardDOM(card, acctData) {
         // active-poll payload carries a flat _binding_model; the bulk-refresh
         // payload is the full response with a nested usage.binding_model —
         // accept either. Swapping innerHTML (not the wrapper) keeps the 5h/7d
-        // child indexing above stable.
+        // child indexing above stable. renderModelBar draws the elapsed marker
+        // of the limit's own window (window_seconds).
         const bindingWrap = usageContainer.querySelector('[data-binding-bar]');
         if (bindingWrap) {
-            bindingWrap.innerHTML = resolvedBinding
-                ? renderUsageBar(resolvedBinding.utilization, resolvedBinding.resets_at, null, resolvedBinding.label || 'model')
-                : '';
+            bindingWrap.innerHTML = resolvedBinding ? renderModelBar(resolvedBinding) : '';
+        }
+    }
+
+    // Plan label: only an event that carries a plan changes it. An event
+    // without one (the active-poll payload from an older server) keeps the
+    // label the card has.
+    if (acctData.plan && typeof acctData.plan === 'object' && typeof renderPlanLabel === 'function') {
+        const planSpan = card.querySelector('[data-plan-label]');
+        if (planSpan) {
+            const tempPlan = document.createElement('div');
+            tempPlan.insertAdjacentHTML('afterbegin', renderPlanLabel(merged));
+            if (tempPlan.firstElementChild) planSpan.replaceWith(tempPlan.firstElementChild);
         }
     }
 
@@ -386,7 +396,7 @@ function _usageUpdateCardDOM(card, acctData) {
         const cacheSpan = card.querySelector('[data-cache-age]');
         if (cacheSpan) {
             const tempCache = document.createElement('div');
-            tempCache.insertAdjacentHTML('afterbegin', renderCacheAge(acctData.usage_cached_at, acctData.id));
+            tempCache.insertAdjacentHTML('afterbegin', renderCacheAge(merged.usage_cached_at, merged.id));
             const newCache = tempCache.firstElementChild;
             if (newCache) cacheSpan.replaceWith(newCache);
         }

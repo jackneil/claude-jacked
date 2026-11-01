@@ -16,13 +16,6 @@ ARROW = "→"
 MIDDOT = "·"
 SEP = f" {DIM}|{RESET} "
 
-_TIER_LABELS = {
-    "max_5x": "Max 5x",
-    "max_20x": "Max 20x",
-    "pro": "Pro",
-    "free": "Free",
-}
-
 
 def _round_pct(value) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -79,10 +72,3 @@ def _sum_usage(usage) -> int | None:
             value = 0
         total += value
     return int(total)
-
-
-def _tier_label(raw) -> str:
-    if not isinstance(raw, str) or not raw:
-        return ""
-    key = raw.removeprefix("default_claude_")
-    return _TIER_LABELS.get(key, key)

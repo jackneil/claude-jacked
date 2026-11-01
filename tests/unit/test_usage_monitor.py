@@ -5,6 +5,7 @@ asyncio.run() for async tests (no pytest-asyncio dependency).
 """
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -13,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import jacked.api.usage_monitor as um
 from jacked.api.usage_monitor import (
     _setting_bool,
     _setting_float,
@@ -3255,3 +3257,403 @@ class TestDbWorkOffTheLoop:
 
         loop_tid = asyncio.run(_run())
         _assert_off_loop(seen, names, loop_tid)
+
+
+# ---------------------------------------------------------------------------
+# Plan-aware decisions: no decision reads a 5h value on an account without a
+# 5-hour window (a verified Ultra), whatever lingers in its cache.
+# ---------------------------------------------------------------------------
+
+
+def _ultra_raw(usage_7d=40.0, model_pct=10, resets_7d=None, model_active=False):
+    """The live verified-Ultra payload shape: an authoritative limits list
+    with no session entry, and a null five_hour."""
+    return json.dumps({
+        "five_hour": None,
+        "seven_day": {"utilization": usage_7d, "resets_at": resets_7d},
+        "limits": [
+            {"kind": "weekly_all", "percent": usage_7d, "is_active": False,
+             "resets_at": resets_7d},
+            {"kind": "weekly_scoped", "percent": model_pct,
+             "is_active": model_active, "resets_at": resets_7d,
+             "scope": {"model": {"display_name": "Fable"}}},
+        ],
+    })
+
+
+def _ultra(id, *, usage_5h=100.0, resets_5h=None, usage_7d=40.0, model_pct=10,
+           model_active=False, **kw):
+    """A verified Ultra row whose cache still holds a 5h reading from before
+    the account was verified (the 2026-10-30 transition)."""
+    row = _acct(
+        id, usage_5h=usage_5h, usage_7d=usage_7d, resets_at=resets_5h,
+        subscription_type="max", rate_limit_tier="default_claude_max_20x", **kw,
+    )
+    row["cached_usage_raw"] = _ultra_raw(
+        usage_7d, model_pct, row["cached_7d_resets_at"], model_active,
+    )
+    return row
+
+
+def _db_with_rows(accounts, settings=None):
+    """_make_db whose get_account serves the same rows (the poll-interval
+    inputs read the active row through it)."""
+    db = _make_db(settings=settings or _swap_settings(), accounts=accounts)
+    db.get_account.side_effect = lambda aid: next(
+        (dict(a) for a in accounts if a["id"] == aid), None,
+    )
+    return db
+
+
+def _tick_with_fetch(app):
+    """One active-poll tick; returns (sync mock, fetch_usage mock)."""
+
+    async def _run():
+        with (
+            patch(
+                "jacked.api.usage_monitor.asyncio.sleep",
+                side_effect=_sleep_canceller(max_sleeps=0),
+            ),
+            patch("jacked.api.usage_monitor._read_active_account_id", return_value=1),
+            patch(
+                "jacked.web.auth.fetch_usage",
+                new_callable=AsyncMock,
+                return_value={"_cached": True},
+            ) as mock_fetch,
+            patch(
+                "jacked.api.credential_helpers.read_fresh_active_token",
+                return_value="tok",
+            ),
+            patch(
+                "jacked.api.credential_helpers.sync_credential_to_all_stores",
+            ) as mock_sync,
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await active_account_poll_loop(app)
+            return mock_sync, mock_fetch
+
+    return asyncio.run(_run())
+
+
+def _broadcasts(ws, event):
+    return [c.args[1] for c in ws.broadcast.call_args_list if c.args[0] == event]
+
+
+@pytest.fixture
+def _fresh_auth_usage_state():
+    """_compute_poll_interval keeps per-account state in jacked.web.auth; a
+    leftover 429 streak would force the idle tier."""
+    import jacked.web.auth as auth_mod
+
+    auth_mod._account_usage_state.pop(1, None)
+    yield
+    auth_mod._account_usage_state.pop(1, None)
+
+
+@pytest.mark.usefixtures("_fresh_auth_usage_state")
+class TestNoSessionProjection:
+    """Cross-consumer regression: a verified Ultra whose cache still says
+    5h=100 must produce no 5h-critical departure, no 5h urgency tier, no
+    5h headroom veto, no 5h re-fetch or clamp, and no 5h recovery time."""
+
+    def _future(self, **delta):
+        return _iso(datetime.now(timezone.utc) + timedelta(**delta))
+
+    def test_stale_5h_on_the_active_ultra_drives_no_departure_or_urgency(self):
+        accounts = [
+            _ultra(1, usage_5h=100.0, resets_5h=self._future(hours=2)),
+            _acct(2, usage_5h=10, usage_7d=10),
+        ]
+        db = _db_with_rows(accounts)
+        app = _make_app(db=db)
+
+        mock_sync = _run_one_tick(app)
+
+        mock_sync.assert_not_called()
+        assert "forced_critical" not in _decision_triggers(db)
+        assert _decision_actions(db) == ["stay"]
+        assert app.state.active_poll_tier == "idle"
+        detail = db.record_decision.call_args.kwargs["detail"]
+        assert detail["active"]["5h"] is None
+
+    def test_a_stale_5h_does_not_veto_an_ultra_candidates_headroom(self):
+        """The active Max is 5h-critical. The only candidate is a verified
+        Ultra whose cache says 5h=100 with a future reset: it has no 5h
+        window, so it has room and takes the swap."""
+        active = _acct(
+            1, usage_5h=96, usage_7d=50, resets_at=self._future(hours=3),
+            subscription_type="max", rate_limit_tier="default_claude_max_5x",
+        )
+        ultra = _ultra(2, usage_5h=100.0, resets_5h=self._future(hours=2), usage_7d=10.0)
+        db = _db_with_rows([active, ultra])
+
+        mock_sync = _run_one_tick(_make_app(db=db))
+
+        assert mock_sync.call_count >= 1
+        assert mock_sync.call_args[0][0] == 2
+        assert "forced_critical" in _decision_triggers(db)
+
+    def test_a_stale_saturated_5h_forces_no_candidate_refetch(self):
+        """The staleness override re-fetches a candidate whose saturated 5h
+        cache is past its reset. A verified Ultra has no such window, so its
+        fresh cache is left alone."""
+        active = _acct(1, usage_5h=30, usage_7d=50)
+        ultra = _ultra(
+            2, usage_5h=95.0, resets_5h=_iso(datetime.now(timezone.utc) - timedelta(minutes=10)),
+        )
+        db = _db_with_rows([active, ultra])
+
+        _sync, mock_fetch = _tick_with_fetch(_make_app(db=db))
+
+        assert [c.args[0] for c in mock_fetch.call_args_list] == [1]
+
+    def test_a_stale_saturated_5h_does_not_clamp_the_poll_to_60s(self):
+        """A T0 candidate with a deficit clamps the poll to 90 s. The 60 s
+        clamp is for a saturated 5h window that resets within the interval,
+        which a verified Ultra does not have."""
+        active = _acct(1, usage_5h=30, usage_7d=50)
+        ultra = _ultra(
+            2, usage_5h=95.0, resets_5h=self._future(seconds=45), usage_7d=50.0,
+            cached_7d_resets_at=_t0_resets_at(),
+        )
+        db = _db_with_rows([active, ultra])
+        app = _make_app(db=db)
+
+        _run_one_tick(app)
+
+        assert app.state.active_poll_interval == 90
+
+    def test_exhaustion_recovery_time_ignores_a_stale_5h_reset(self, caplog):
+        """A single verified Ultra drained on its weekly window: the banner's
+        recovery time is the weekly reset, never the stale 5h reset, and the
+        log line prints n/a for the 5h value."""
+        resets_7d = self._future(hours=12)  # T0: drains to 100%
+        ultra = _ultra(
+            1, usage_5h=100.0, resets_5h=self._future(hours=2), usage_7d=100.0,
+            cached_7d_resets_at=resets_7d,
+        )
+        ws = AsyncMock()
+        db = _db_with_rows([ultra])
+        app = _make_app(db=db, ws_registry=ws)
+
+        with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
+            _run_one_tick(app)
+
+        exhausted = _broadcasts(ws, "all_accounts_exhausted")
+        assert len(exhausted) == 1
+        assert datetime.fromisoformat(exhausted[0]["next_recovery_at"]) == (
+            datetime.fromisoformat(resets_7d.replace("Z", "+00:00"))
+        )
+        assert exhausted[0]["usage_5h"] is None
+        assert exhausted[0]["next_recovery_window"] == "7d"
+        warnings = [r.getMessage() for r in caplog.records if "no eligible target" in r.getMessage()]
+        assert warnings and "5h=n/a" in warnings[0] and "7d=100.0%" in warnings[0]
+
+    def test_recovery_is_the_earliest_account_recovery_and_skips_unconstrained(self):
+        """next_recovery_at is the minimum over accounts of the time each
+        becomes workable; an account with no constrained window adds none."""
+        from jacked.service.usage_pacing import account_recovery_at
+
+        now = datetime.now(timezone.utc)
+        drained = _ultra(
+            1, usage_5h=None, usage_7d=100.0, cached_7d_resets_at=self._future(hours=12),
+        )
+        walled = _acct(
+            2, usage_5h=97, usage_7d=50, resets_at=self._future(hours=3),
+            auto_swap=False,  # ineligible as a target, still recovers
+        )
+        idle = _acct(3, usage_5h=5, usage_7d=5, resets_at=self._future(minutes=30), auto_swap=False)
+        ws = AsyncMock()
+        db = _db_with_rows([drained, walled, idle])
+
+        _run_one_tick(_make_app(db=db, ws_registry=ws))
+
+        exhausted = _broadcasts(ws, "all_accounts_exhausted")
+        assert len(exhausted) == 1
+        expected = min(
+            r for r in (account_recovery_at(a, now) for a in (drained, walled, idle)) if r
+        )
+        assert datetime.fromisoformat(exhausted[0]["next_recovery_at"]) == expected
+        assert expected == datetime.fromisoformat(walled["cached_5h_resets_at"].replace("Z", "+00:00"))
+        assert exhausted[0]["next_recovery_window"] == "5h"
+
+
+@pytest.mark.usefixtures("_fresh_auth_usage_state")
+class TestBurnRateWeeklyOnly:
+    def test_a_climbing_7d_updates_the_rate_when_5h_stays_at_zero(self):
+        """A verified Ultra's 5h value stays 0. The old "unchanged" check read
+        5h alone, so it decayed the rate and never tracked the weekly burn."""
+        from jacked.web.auto_swap import BurnRate
+
+        um._burn_rates[1] = BurnRate(
+            rate_5h_per_min=0.0, last_check_5h=0.0,
+            rate_7d_per_min=1.0, last_check_7d=40.0,
+            last_check_time=time.time() - 600,
+        )
+        um._burn_rate_unchanged_ticks[1] = 4  # an unchanged tick would decay now
+        db = _db_with_rows([_ultra(1, usage_5h=None, usage_7d=45.0)])
+
+        _run_one_tick(_make_app(db=db))
+
+        br = um._burn_rates[1]
+        assert br.last_check_7d == 45.0
+        assert br.rate_7d_per_min == pytest.approx(0.5, rel=0.05)
+        assert um._burn_rate_unchanged_ticks[1] == 0
+
+    def test_a_stale_5h_never_becomes_a_5h_burn(self):
+        from jacked.web.auto_swap import BurnRate
+
+        um._burn_rates[1] = BurnRate(
+            rate_5h_per_min=0.0, last_check_5h=0.0,
+            rate_7d_per_min=0.0, last_check_7d=40.0,
+            last_check_time=time.time() - 600,
+        )
+        db = _db_with_rows([
+            _ultra(1, usage_5h=100.0, resets_5h=_iso(datetime.now(timezone.utc) + timedelta(hours=2))),
+        ])
+
+        _run_one_tick(_make_app(db=db))
+
+        br = um._burn_rates[1]
+        assert br.rate_5h_per_min == 0.0
+        assert br.last_check_5h == 0.0
+
+
+@pytest.mark.usefixtures("_fresh_auth_usage_state")
+class TestPollPayloadPlanAndWindows:
+    def _poll_payload(self, ws):
+        payloads = _broadcasts(ws, "usage_poll_updated")
+        assert len(payloads) == 1
+        return payloads[0]["account_data"]
+
+    def test_usage_poll_updated_carries_plan_and_windows(self):
+        ultra = _ultra(
+            1, usage_5h=100.0,
+            resets_5h=_iso(datetime.now(timezone.utc) + timedelta(hours=2)),
+            model_pct=96, model_active=True,
+        )
+        ws = AsyncMock()
+        _run_one_tick(_make_app(db=_db_with_rows([ultra]), ws_registry=ws))
+
+        data = self._poll_payload(ws)
+        assert data["plan"]["id"] == "ultra"
+        assert data["plan"]["label"] == "Ultra"
+        assert data["plan"]["formerly"] == "Max 20x"
+        assert data["windows"]["five_hour"]["state"] == "absent"
+        assert data["windows"]["seven_day"]["seconds"] == 604800
+        # The flat 5h fields are the projected row: no stale reading.
+        assert data["cached_usage_5h"] is None
+        assert data["cached_5h_resets_at"] is None
+        bm = data["_binding_model"]
+        assert bm["label"] == "Fable"
+        assert bm["window_seconds"] == 604800
+        assert bm["is_active"] is True
+
+    def test_a_resolver_failure_omits_the_keys_and_keeps_the_broadcast(self, caplog):
+        ws = AsyncMock()
+        app = _make_app(db=_db_with_rows([_ultra(1, model_pct=96)]), ws_registry=ws)
+        with (
+            patch(
+                "jacked.usage_plans.AccountView.plan_payload",
+                side_effect=RuntimeError("catalog boom"),
+            ),
+            caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"),
+        ):
+            _run_one_tick(app)
+
+        data = self._poll_payload(ws)
+        assert "plan" not in data and "windows" not in data
+        assert data["_binding_model"]["label"] == "Fable"
+        assert any(
+            "account 1" in r.getMessage() and "catalog boom" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_the_payload_carries_no_secret_or_raw_payload(self):
+        """The whitelisted row plus plan/windows/_binding_model/_poll_*:
+        no token, no raw usage payload, no stored profile."""
+        ultra = _ultra(1, model_pct=96)
+        ultra.update(
+            access_token="at-SECRET", refresh_token="rt-SECRET",
+            cc_access_token="cc-SECRET", cc_refresh_token="ccr-SECRET",
+            profile_json=json.dumps({"account": {"email": ultra["email"]},
+                                     "note": "PROFILE-SECRET"}),
+        )
+        ws = AsyncMock()
+        _run_one_tick(_make_app(db=_db_with_rows([ultra]), ws_registry=ws))
+        data = self._poll_payload(ws)
+        assert "SECRET" not in json.dumps(data)
+        assert not {"cached_usage_raw", "profile_json", "keeper_state"} & set(data)
+        assert not [k for k in data if "token" in k and k != "cc_expires_at"]
+        assert {"plan", "windows", "_binding_model", "_poll_interval"} <= set(data)
+
+    def test_the_only_monitor_broadcast_with_an_account_row_is_the_poll_update(self):
+        """Every other broadcast in usage_monitor carries ids, labels or
+        numbers for banners, never an account row the dashboard draws bars
+        from: plan and windows ride on usage_poll_updated only."""
+        import inspect
+
+        src = inspect.getsource(um)
+        assert src.count('"account_data"') == 1
+
+
+@pytest.mark.usefixtures("_fresh_auth_usage_state")
+class TestDecisionReasonPlanLabel:
+    def test_reason_names_the_catalog_plan(self):
+        db = _db_with_rows([_ultra(1, usage_5h=None)])
+        _run_one_tick(_make_app(db=db))
+        assert _decision_reasons(db) == ["stay: no candidate has deficit (plan Ultra)"]
+
+    def test_reason_prefers_the_provider_plan_name(self):
+        row = _ultra(1, usage_5h=None)
+        row["profile_json"] = json.dumps({
+            "account": {"email": row["email"]},
+            "organization": {"uuid": row.get("organization_uuid"),
+                             "plan_display_name": "Ultra Team"},
+        })
+        db = _db_with_rows([row])
+        _run_one_tick(_make_app(db=db))
+        assert _decision_reasons(db) == ["stay: no candidate has deficit (plan Ultra Team)"]
+
+    def test_reason_without_a_known_plan_reads_unknown(self):
+        db = _db_with_rows([_acct(1, usage_5h=10, subscription_type="")])
+        _run_one_tick(_make_app(db=db))
+        assert _decision_reasons(db) == ["stay: no candidate has deficit (plan unknown)"]
+
+    def test_tier_label_is_no_longer_imported(self):
+        import inspect
+
+        assert "tier_label" not in inspect.getsource(um.active_account_poll_loop)
+
+
+@pytest.mark.usefixtures("_fresh_auth_usage_state")
+class TestPollUrgencyInputs:
+    def _tier(self, row):
+        db = _db_with_rows([row])
+        _interval, tier = um._compute_poll_interval(1, um._poll_interval_inputs(1, db), {})
+        return tier
+
+    def test_a_stale_5h_alone_does_not_raise_urgency(self):
+        row = _ultra(1, usage_5h=100.0, resets_5h=_iso(datetime.now(timezone.utc) + timedelta(hours=2)))
+        assert self._tier(row) == "idle"
+
+    def test_a_no_session_account_polls_on_its_model_weekly_limit(self):
+        assert self._tier(_ultra(1, usage_5h=None, usage_7d=40.0, model_pct=96)) == "critical"
+
+    def test_a_session_account_keeps_the_5h_rules(self):
+        assert self._tier(_acct(1, usage_5h=88, usage_7d=30)) == "critical"
+        assert self._tier(_acct(1, usage_5h=20, usage_7d=30)) == "idle"
+
+    def test_urgency_inputs_project_the_row(self):
+        row = _ultra(1, usage_5h=100.0, usage_7d=40.0, model_pct=12)
+        assert um.urgency_inputs(row) == {
+            "usage_5h": None, "usage_7d": 40.0, "has_session": False, "usage_model": 12.0,
+        }
+        assert um.urgency_inputs(None) == {
+            "usage_5h": None, "usage_7d": None, "has_session": True, "usage_model": None,
+        }
+
+    def test_a_missing_row_falls_back_to_idle(self):
+        db = _db_with_rows([])
+        _interval, tier = um._compute_poll_interval(1, um._poll_interval_inputs(1, db), {})
+        assert tier == "idle"

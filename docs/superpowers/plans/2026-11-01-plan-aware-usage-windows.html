@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!--
+  jacked artifact template — for plans, specs, research, checkpoints.
+  Replace placeholders, keep what you need, delete sections you don't.
+  Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
+-->
+<title>Plan-aware usage windows: a release-shipped plan catalog</title>
+
+<!-- Metadata block — adjust fields per artifact type -->
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="in-progress">
+<meta name="jacked:branch" content="jack_20261101_plan_window_catalog">
+<meta name="jacked:date" content="2026-11-01">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 .25rem;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 .5rem;
+    color: var(--fg-muted);
+  }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+
+  /* Metadata strip under title */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    margin: .5rem 0 2rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    font-size: .9rem;
+  }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+
+  /* Status badges — drop into a <span class="badge X"> */
+  .badge {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 99px;
+    font-size: .8rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .badge.ok       { background: var(--ok-bg);     color: var(--ok); }
+  .badge.warn     { background: var(--warn-bg);   color: var(--warn); }
+  .badge.danger   { background: var(--danger-bg); color: var(--danger); }
+  .badge.info     { background: var(--accent-bg); color: var(--accent); }
+
+  /* Table of contents */
+  nav.toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    margin: 0 0 .5rem;
+    font-size: .9rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--fg-muted);
+    border: none;
+    padding: 0;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.5rem;
+  }
+  nav.toc li { margin: .15rem 0; }
+
+  /* Callouts — drop into <aside class="callout warn"> ... </aside> */
+  aside.callout {
+    margin: 1rem 0;
+    padding: .9rem 1.1rem;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  aside.callout.warn   { border-color: var(--warn);   background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok     { border-color: var(--ok);     background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child  { margin-bottom: 0; }
+
+  /* Code */
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: var(--code-bg);
+    padding: .12em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: .88rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    font-size: .9rem;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  /* Task checklist — use <ul class="tasks"> + <li><input type="checkbox" disabled> ...</li> */
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li {
+    padding: .25rem 0;
+    display: flex;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+
+  /* Mermaid diagram wrappers */
+  .diagram {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  /* If mermaid fails (no network), fall back to showing the source in a code block */
+  .diagram pre.mermaid-source {
+    text-align: left;
+    display: none;
+  }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+
+  blockquote {
+    border-left: 3px solid var(--border);
+    padding: .2rem 1rem;
+    margin: 1rem 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  /* Print: paginate cleanly, drop the dark-mode flip, expand TOC */
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Plan-aware usage windows: a release-shipped plan catalog</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">in-progress</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-11-01</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">jack_20261101_plan_window_catalog</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec + plan</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#evidence">Evidence</a></li>
+    <li><a href="#spec">Spec: acceptance criteria and non-goals</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#contract">Payload contract</a></li>
+    <li><a href="#files">File structure and ownership</a></li>
+    <li><a href="#tasks">Tasks</a></li>
+    <li><a href="#filed">Filed, not fixed here</a></li>
+    <li><a href="#open-questions">Decisions made (reviewable)</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal</h2>
+<p>jacked assumes every account has a 5-hour window. On 2026-10-30 Anthropic renamed Max 5x to <b>Max</b> and Max 20x to <b>Ultra</b>,
+and removed the 5-hour limit for verified Ultra accounts (weekly limits unchanged, plus a separate weekly Fable limit). ChatGPT Pro
+also has no 5-hour limit in Codex. This change moves "which windows does this account type have, what is it called, and how long is
+each window" into a data file that ships with each jacked release (<code>jacked/data/usage_plans.json</code>), so the next provider
+change is a data edit, and makes every consumer read windows through it. It also fixes the missing week-elapsed marker on the Fable
+row, for the whole class of model-scoped bars.</p>
+
+<aside class="callout info">
+  <strong>Precedence rule:</strong> the provider's live payload is the truth for one account right now; the catalog says what each
+  plan is expected to have, decides how to read silence for that plan, names the plan, and gives window lengths. When the two
+  disagree, jacked follows the payload where it is explicit and logs a catalog-drift warning once per shape.
+</aside>
+
+<h2 id="evidence">Evidence</h2>
+<ul>
+  <li>Anthropic help center, "What is the Ultra plan?" (support.claude.com/en/articles/17728952): "The Max 20x plan is now called the
+  Ultra plan." "Verified Ultra accounts don't have a five-hour limit." "If your account isn't verified yet, a temporary limit applies."
+  "If you don't see a Current session bar, your account is verified." Separate weekly Fable limit.</li>
+  <li>Help center, "How do usage and length limits work?" (articles/11647753): weekly limits reset at a fixed time per account.</li>
+  <li>Live payloads on this machine (2026-11-01): all 5 <code>default_claude_max_20x</code> accounts return <code>five_hour: null</code>
+  and a <code>limits[]</code> with only <code>weekly_all</code> + <code>weekly_scoped</code> (Fable). Max 5x and Team return
+  <code>kind: "session"</code>. Profiles carry <code>organization.plan_display_name: "Ultra"</code> on the 20x rows.</li>
+  <li>Codex Pro payload: one primary window, <code>windowDurationMins: 10080</code>, <code>secondary: null</code>.</li>
+  <li>Keeper log: pings jumped from ~28/day to ~150/day on 2026-10-31; 290 pings at the 5 Ultra accounts since 10-30, each
+  <code>ping_ok_no_window</code>, backoff stuck at 600 s ("1 consecutive failures" every time).</li>
+  <li>Dashboard before: Ultra cards show "5h limit 0% retry due" and "Max subscription (20x tier)"; Fable rows have no marker.</li>
+</ul>
+
+<h2 id="spec">Spec: acceptance criteria and non-goals</h2>
+<h3>User-facing goal</h3>
+<p>Every surface shows the windows an account really has, under the plan's current name, with a week-elapsed marker on every bar;
+jacked stops spending pings and quota on windows that cannot exist; a future provider change is a catalog edit in a release.</p>
+<h3>Acceptance criteria</h3>
+<ol>
+  <li><b>AC1 Catalog.</b> <code>jacked/data/usage_plans.json</code> ships in the wheel, has <code>version</code>, <code>verified_at</code>,
+  per-plan <code>sources</code>, window lengths, and plan entries for Claude (Ultra, Max, Team, Pro, Enterprise, Free, unknown-tier Max)
+  and Codex (Pro, Plus). A missing or malformed file degrades to built-in defaults with a WARNING, never a crash. A newer
+  <code>version</code> warns and reads best-effort.</li>
+  <li><b>AC2 Resolution.</b> Given a verified Ultra row (payload without a session limit), the resolver returns session state
+  <code>absent</code>; an unverified Ultra (payload with a session limit) returns <code>present</code> + <code>temporary</code>; a Max or Team
+  row returns <code>present</code> whether or not a window is open; Codex Pro returns <code>absent</code>; a Codex partial read returns
+  <code>unknown</code>.</li>
+  <li><b>AC3 Labels.</b> Plan label precedence: provider <code>plan_display_name</code>, then catalog label, then the raw subscription type.
+  Ultra rows read "Ultra" (hover "Formerly Max 20x"), Max 5x rows read "Max", Team reads "Team". No regex on the tier multiplier remains.</li>
+  <li><b>AC4 API.</b> <code>GET /api/auth/accounts</code> and every WebSocket account payload carry <code>plan</code> and <code>windows</code>;
+  <code>usage.five_hour</code> is <code>null</code> (not 0) for an absent window; every per-model and binding entry carries
+  <code>window_seconds</code>.</li>
+  <li><b>AC5 Marker.</b> Every usage bar that has a future reset shows the white elapsed marker, including the Fable binding row on the
+  card, the per-model details list, the WebSocket live refresh, and the menu-bar panel. A source-scan test fails if any
+  <code>renderUsageBar</code> call passes a literal <code>null</code> elapsed fraction.</li>
+  <li><b>AC6 Display.</b> An absent 5h window renders an empty track, "none", and "not on Ultra" (hover: the catalog note); the panel
+  caption reads "not on Ultra"; the tray pill reads "-·33%"; <code>jacked usage</code> shows "none" in the 5h columns and the plan label.</li>
+  <li><b>AC7 Keeper.</b> The keeper never pings for a 5h window on an account whose session is absent (skip reason
+  <code>no_session_window</code>); it still pings for a turned-over weekly window, and a 7d-only header reading is stored for such
+  accounts; a <code>ping_ok_no_window</code> backoff escalates 600, 1200, 2400, 3600 s instead of resetting to 600 s.</li>
+  <li><b>AC8 Crashes.</b> "Refresh all usage" and OAuth add/re-auth both succeed for an account whose payload has <code>five_hour: null</code>.</li>
+  <li><b>AC9 Decisions.</b> Auto-swap's 5h headroom gate is explicit for absent windows; the 5h critical threshold comes from the catalog
+  (Ultra 95, Max 90, Team 90, Pro/Free/Enterprise/unknown 80, unknown-tier Max 90); poll urgency for a no-session account follows its
+  weekly and model-weekly windows; the burn-rate tracker updates when only 7d moves; the exhaustion banner's recovery time comes from
+  each account's constrained windows and its text names no 5h window.</li>
+  <li><b>AC10 Pacing + skill text.</b> <code>jacked usage --json</code> rows add <code>plan</code>, <code>plan_id</code>,
+  <code>session_window</code>, <code>model_limits</code>; the summary adds <code>best_account_worst_window</code>,
+  <code>best_account_worst_window_resets_at</code>, <code>plan_catalog</code>; the pinned fields keep their meaning. chain-of-command rule 7
+  reads the plan-agnostic fields.</li>
+  <li><b>AC11 Aging.</b> A payload that contradicts the catalog (session on a never plan, silence on an always plan, an unlisted
+  tier of a tier-split subscription, a provider plan name that differs from the catalog) logs one WARNING per shape per process and
+  appears in <code>plan.drift</code> and <code>summary.plan_catalog.drift</code>.</li>
+</ol>
+<h3>Non-goals</h3>
+<ul>
+  <li>No new auto-swap departure rule for an account walled on its weekly or Fable limit (filed, see below).</li>
+  <li>No change to the tray pill's color formula (the Fable cap does not tint the pill yet; filed).</li>
+  <li>No user-editable override of the catalog; the catalog changes only with a release.</li>
+  <li>No reading of <code>pace</code>, <code>weekly_scoped_shares</code>, <code>seven_day_breakdown</code>, or the dollar-denominated codename windows.</li>
+  <li>No change to the 5h-window throughput heuristic in <code>auto_swap/burn.py</code>.</li>
+</ul>
+
+<h2 id="architecture">Architecture</h2>
+<div class="diagram">
+  <pre class="mermaid">
+flowchart LR
+    J[jacked/data/usage_plans.json] --> L[jacked/usage_plans.py loader + resolver]
+    R[(accounts row: subscription_type, rate_limit_tier, profile_json, cached_usage_raw)] --> L
+    L --> P[resolve_plan: label, policy, critical pct, drift]
+    L --> S[session_window: present / absent / unknown, temporary, seconds]
+    L --> M[model window_seconds]
+    P & S & M --> API[routes/auth.py AccountResponse.plan + windows]
+    P & S & M --> WS[usage_monitor WS payload plan + windows]
+    S --> K[window keeper skip + 7d-only cache]
+    P --> D[auto_swap thresholds + labels]
+    S --> U[compute_urgency_tier]
+    S --> C[jacked usage + pacing summary]
+    API & WS --> JS[usage.js renderModelBar + usageBarOpts per window key]
+  </pre>
+  <pre class="mermaid-source">
+json catalog + account row -> usage_plans resolver -> {plan, session window, model window lengths}
+-> API/WS payloads -> JS bars; -> keeper, auto-swap, urgency, CLI/pacing
+  </pre>
+</div>
+
+<h3>Session resolution (evidence order)</h3>
+<ol>
+  <li><b>The payload reports a session window</b> (a <code>limits[]</code> entry with <code>kind == "session"</code>, a <code>five_hour</code> object with a
+  non-null utilization or reset, or a Codex short window): <code>present</code>; <code>temporary</code> on an <code>until_verified</code> plan; drift
+  <code>session_on_never_plan</code> on a <code>never</code> plan (the payload still wins).</li>
+  <li><b>The payload is authoritative and silent</b>: <code>absent</code>, except a Claude <code>always</code> plan, which stays <code>present</code> (silence can
+  mean "no window open") with drift <code>session_missing</code>. A Codex <code>always</code> plan reads <code>absent</code> with drift
+  <code>session_missing</code> (Codex lists every window an account has).</li>
+  <li><b>The payload is not authoritative, but the row still holds a 5-hour reading or reset</b> (prior evidence): <code>present</code>
+  (<code>temporary</code> on <code>until_verified</code>). A partial read must never erase a live window.</li>
+  <li><b>No evidence</b>: <code>never</code> &rarr; <code>absent</code>; <code>until_verified</code> or any Codex plan &rarr; <code>unknown</code>; Claude
+  <code>always</code>/<code>reported</code> &rarr; <code>present</code> (legacy idle reading).</li>
+</ol>
+<p>"Authoritative" for Claude: the raw payload has a <code>limits</code> list AND every entry's kind is one jacked knows
+(<code>session</code>, <code>weekly_all</code>, <code>weekly_scoped</code>). An unknown kind makes the list non-authoritative and is drift
+<code>unknown_limit_kind</code>, so a renamed session kind can never read as "no 5-hour limit". For Codex:
+<code>jacked.codex.usage.normalize_rate_limits(raw)</code> gives <code>five_hour.reported</code> and <code>windows_complete</code> (authoritative).
+<code>unknown</code> counts as having a window for every decision (keeper, headroom, urgency): jacked never skips a window it cannot rule out.</p>
+
+<h2 id="contract">Payload contract</h2>
+<pre><code>"plan": {
+  "id": "ultra",                 // catalog id, or null when no entry matched
+  "label": "Ultra",              // provider plan_display_name &gt; catalog label &gt; raw subscription type (Title Case)
+  "formerly": "Max 20x",         // or null
+  "label_source": "provider",    // provider | catalog | raw
+  "drift": [],                   // codes: session_missing, session_on_never_plan, unknown_tier, unknown_limit_kind, renamed
+  "catalog_verified_at": "2026-11-01"
+}
+"windows": {
+  "five_hour": {"state": "absent", "temporary": false, "seconds": 18000,
+                "note": "Verified Ultra accounts have no 5-hour limit. Weekly limits still apply."},
+  "seven_day": {"state": "present", "temporary": false, "seconds": 604800, "note": null}
+}
+ModelUsage / binding entries: + "window_seconds": 604800</code></pre>
+<p><code>AccountUsage.five_hour</code>: the cached value; when the cached value is null it is <code>0</code> only for a Claude account whose
+session state is <code>present</code>, otherwise <code>null</code>. <code>seven_day</code> keeps today's rule (Codex null stays null, Claude
+null reads 0). <code>menubar_summary.summarize_account</code> uses the same rule.</p>
+
+<h2 id="files">File structure and ownership</h2>
+<table>
+  <thead><tr><th>Owner</th><th>Files</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td>Core (main loop, done first)</td><td><code>jacked/data/usage_plans.json</code>, <code>jacked/usage_plans.py</code>, <code>jacked/service/usage_pacing.py</code>, <code>tests/unit/test_usage_plans.py</code>, <code>tests/unit/test_usage_pacing_windows.py</code></td>
+      <td>Catalog, loader, <code>resolve_plan</code>, <code>session_window</code>, <code>account_view</code> (plan/windows payloads, <code>five_hour_reading</code>, <code>projected_row</code>), <code>project_row</code>, per-plan and observed window lengths, drift log; pacing helpers <code>account_windows</code>, <code>worst_window</code>, <code>account_recovery_at</code> and the new summary fields.</td></tr>
+    <tr><td>B1 API + display backend</td><td><code>jacked/api/routes/auth.py</code>, <code>jacked/service/menubar_summary.py</code>, <code>jacked/web/oauth.py</code>, <code>jacked/web/database.py</code> (raw-payload size guard only), <code>jacked/statusline_common.py</code>, <code>jacked/statusline.py</code> (import line only) + their tests</td>
+      <td>AccountResponse plan/windows, five_hour rule, ModelUsage window_seconds, bulk-refresh crash, OAuth crash, summarize_account rule, per-model window_seconds, binding_model_compact window_seconds + is_active, raw-payload guard raised and logged, delete dead <code>_tier_label</code>.</td></tr>
+    <tr><td>B2a monitor + keeper</td><td><code>jacked/api/usage_monitor.py</code>, <code>jacked/web/auth.py</code> (<code>compute_urgency_tier</code> and <code>usage_cache_updates</code> only), <code>jacked/api/routes/menubar.py</code> (urgency fallback only) + their tests</td>
+      <td>Keeper skip / 7d-only cache / confirmed success / escalating backoff, burn-rate, WS payload plan + windows, projection at every decision entry point, recovery time, urgency, decision reason text, ingestion clears a 5h reading an authoritative payload no longer lists.</td></tr>
+    <tr><td>B2b auto-swap + CLI</td><td><code>jacked/web/auto_swap/diagnostics.py</code>, <code>selection.py</code>, <code>__init__.py</code>, <code>tiers.py</code>, <code>jacked/cli.py</code> (usage command only), <code>tests/unit/test_auto_swap.py</code>, <code>tests/unit/test_usage_cmd.py</code></td>
+      <td>Thresholds and labels from the catalog, explicit headroom gate, weekly length per account, <code>jacked usage</code> rows (plan, session_window, model_limits, worst window, active), <code>--provider</code> filter.</td></tr>
+    <tr><td>B3 frontend</td><td><code>jacked/data/web/js/components/usage.js</code>, <code>accounts.js</code>, <code>panel.js</code>, <code>auto-swap.js</code>, <code>jacked/data/web/js/websocket.js</code> + <code>tests/unit/test_web_js_*.py</code>, the JS call-site guard in <code>tests/unit/test_codex_usage_display.py</code></td>
+      <td>computeElapsedFraction(resetsAt, seconds) fed by <code>windows[key].seconds</code>, renderModelBar, usageBarOpts(acct, key, base), plan-aware windowReason, plan label (also refreshed by WebSocket updates), banner text, call-site guard.</td></tr>
+    <tr><td>Main loop (text)</td><td><code>jacked/data/skills/chain-of-command/SKILL.md</code>, <code>README.md</code>, <code>docs/architecture/auto-swap-system.md</code>, <code>lessons.md</code></td>
+      <td>Rule 7 rewrite, README text that assumes a 5h window, architecture sections 3 and 11.1, one lesson.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="tasks">Tasks</h2>
+
+<h3>Task 0 (core, main loop): catalog, resolver, pacing helpers, TDD &mdash; DONE before dispatch</h3>
+<ul class="tasks">
+  <li><input type="checkbox" checked disabled> <code>tests/unit/test_usage_plans.py</code> (91 tests) + module doctests; <code>tests/unit/test_usage_pacing_windows.py</code>; the pinned <code>tests/unit/test_usage_cmd.py</code> contract still passes.</li>
+  <li><input type="checkbox" checked disabled> <code>jacked/data/usage_plans.json</code>, <code>jacked/usage_plans.py</code> (stdlib only at import; the Codex parser is imported lazily).</li>
+  <li><input type="checkbox" checked disabled> <code>usage_pacing.account_windows / worst_window / account_recovery_at</code>; summary adds <code>best_account_worst_window</code>, <code>best_account_worst_window_resets_at</code>, <code>plan_catalog</code>.</li>
+  <li><input type="checkbox" checked disabled> Plan-review cycle 2 fixes (core): a non-string <code>limits[]</code> kind is <code>unknown_limit_kind</code> drift, never a crash; <code>normalize_rate_limits</code> exposes each selected window's <code>window_minutes</code> and the resolver reuses it (a dropped or positional window never lends its length); <code>model_window_seconds(..., plan=)</code> honors per-plan lengths, and <code>menubar_summary.parse_per_model(raw, plan=None)</code> / <code>binding_model_compact(raw, plan=None)</code> emit <code>window_seconds</code> (+ <code>is_active</code> on the compact form) for every model entry (moved from B1 to core).</li>
+</ul>
+<pre><code>Public API (jacked/usage_plans.py)
+load_catalog(data_root=None) -&gt; Catalog ; catalog() -&gt; Catalog (cached)
+window_seconds(provider, kind) -&gt; int                 # provider length (session | weekly | weekly_model)
+resolve_plan(row) -&gt; PlanMatch                        # id, label, formerly, label_source, session policy, session_critical_pct, drift, window_seconds(kind)
+session_window(row, raw=MISSING, plan=None) -&gt; SessionWindow   # state present|absent|unknown, temporary, seconds, note, drift
+has_session(row, raw=MISSING) -&gt; bool                  # False only for absent; unknown counts as a window
+account_view(row, raw=MISSING) -&gt; AccountView         # .plan .session .weekly_state .weekly_seconds
+    .plan_payload() .windows_payload() .five_hour_reading() .projected_row()
+project_row(row) -&gt; row                               # 5h value and reset dropped when the window is absent
+model_window_seconds(provider, window=None, slot="weekly_model") -&gt; int
+raw_usage(row) -&gt; dict | None
+
+jacked/service/usage_pacing.py
+account_windows(acct, now) -&gt; [(kind, pct, reset)]    # "5h" only when the plan has one
+worst_window(acct, now) -&gt; (kind, pct, reset) | None  # 7d wins ties
+account_recovery_at(acct, now, constrained_threshold=90.0) -&gt; datetime | None</code></pre>
+
+<h3>Task B1: API and display backend (Opus builder, worktree pw-b1)</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> <code>routes/auth.py</code>: <code>PlanInfo</code>, <code>WindowInfo</code>, <code>AccountWindows</code>; <code>AccountResponse.plan</code>, <code>.windows</code>; <code>ModelUsage.window_seconds</code>; <code>_build_account_usage</code> five_hour from <code>five_hour_reading()</code>; a resolver error never 500s the list.</li>
+  <li><input type="checkbox" disabled> Bulk refresh row from the DB row read after the fetch; regression tests (Claude null five_hour, Codex raw result).</li>
+  <li><input type="checkbox" disabled> <code>web/oauth.py</code>: seed with <code>usage_cache_updates(usage)</code>; regression test.</li>
+  <li><input type="checkbox" disabled> <code>menubar_summary.py</code>: <code>summarize_account</code> via <code>five_hour_reading()</code> (all-None guard); the API passes the row's plan into <code>parse_per_model</code> (window lengths are already in core).</li>
+  <li><input type="checkbox" disabled> <code>web/database.py</code> raw-payload guard: the silent 10 KB skip becomes a generous bound (256 KiB); a payload over it CLEARS <code>cached_usage_raw</code> (never keeps the previous payload as evidence for fresh readings) and logs a WARNING that names the account and size (data-integrity rule: no silent drop); tests for both.</li>
+  <li><input type="checkbox" disabled> Delete dead <code>_tier_label</code> + re-export + its test.</li>
+</ul>
+
+<h3>Task B2a: monitor and keeper (Opus builder, worktree pw-b2a)</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Keeper skip (<code>no_session_window</code>), 7d-only header cache, success confirmed against the windows that required the ping (a needed 5h window must show a future reset; a needed 7d window is confirmed by a fresh read with no reset at all, because the API omits it for days at a time, or by a reset that is no longer lapsed; a non-null reset that is still lapsed is not confirmed), backoff popped only on success; repeated-sweep, read-back-timeout and restart tests.</li>
+  <li><input type="checkbox" disabled> Projection: every account dict the active poll loop, the candidate refresh, the poll-interval inputs and the clamps read passes through <code>project_row</code>, so no decision sees a stale 5h value on an absent window (cross-consumer regression test with a stale 5h=100 Ultra row: no 5h-critical departure, no 5h urgency).</li>
+  <li><input type="checkbox" disabled> <code>usage_cache_updates</code>: an authoritative payload (a <code>limits</code> list whose kinds jacked knows) with no session entry and no <code>five_hour</code> object clears the 5h columns, even when the <code>five_hour</code> key is missing.</li>
+  <li><input type="checkbox" disabled> Burn rate: unchanged only when 5h and 7d are both unchanged.</li>
+  <li><input type="checkbox" disabled> WS payloads that carry an account row: add <code>plan</code> and <code>windows</code>.</li>
+  <li><input type="checkbox" disabled> Exhaustion: <code>next_recovery_at</code> = min of <code>account_recovery_at</code>; log lines print "n/a" for a null 5h.</li>
+  <li><input type="checkbox" disabled> <code>compute_urgency_tier(..., *, has_session=True, usage_model=None)</code> and its two callers.</li>
+  <li><input type="checkbox" disabled> Decision reason reads "(plan Ultra)": <code>usage_monitor</code> stops importing <code>tier_label</code> (B2b deletes it) and uses <code>resolve_plan(active_acct).label</code> directly.</li>
+</ul>
+
+<h3>Task B2b: auto-swap and the usage CLI (Opus builder, worktree pw-b2b)</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> <code>diagnostics.tier_critical_threshold</code> from the catalog; <code>tier_label</code> replaced by <code>plan_label</code>; exports and tests (realistic fixture for the fake 10x tier; Team and Codex Pro cases).</li>
+  <li><input type="checkbox" disabled> <code>selection._has_5h_headroom</code>: True when the window is absent; docstring of consulted fields.</li>
+  <li><input type="checkbox" disabled> <code>tiers.white_bar</code> and the 7d constant: the account's weekly length (<code>account_view(acct).weekly_seconds</code>).</li>
+  <li><input type="checkbox" disabled> <code>jacked usage</code>: rows add <code>plan</code>, <code>plan_id</code>, <code>session_window</code>, <code>model_limits</code>, <code>worst_window_pct</code>, <code>worst_window</code>, <code>worst_window_resets_at</code>, <code>active</code> (the provider's active account in jacked's database, <code>db.get_active_account_id(provider)</code>; no credential-store read); <code>--provider claude|codex</code> filters rows and the summary; table: plan label, "none" 5h cells, a Model column.</li>
+</ul>
+
+<h3>Task B3: frontend (Opus builder, worktree pw-b3)</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> <code>usage.js</code>: <code>computeElapsedFraction(resetsAt, windowSeconds)</code>; the 5h/7d helpers delegate to it; <code>windowElapsed(acct, key)</code> uses <code>acct.windows[key].seconds</code>; <code>renderModelBar(model, opts)</code> uses <code>model.window_seconds</code>; <code>usageBarOpts(acct, windowKey, base)</code>; <code>windowReason(acct, windowKey, nowMs)</code>: absent returns "not on &lt;Plan&gt;" / short form, <code>absent</code> + <code>none</code>, hint = note; unknown keeps "not reported"; <code>renderUsageBar</code> prints "none" for <code>reason.none</code>.</li>
+  <li><input type="checkbox" disabled> <code>accounts.js</code>: plan text from <code>acct.plan.label</code> in a stable <code>[data-plan-label]</code> target (title "Formerly Max 20x", drift hint); binding + per-model bars through <code>renderModelBar</code>; card bars through the new helpers; the poll-tier fallback no longer guesses from 5h.</li>
+  <li><input type="checkbox" disabled> <code>panel.js</code>: plan badge from <code>org.plan.label</code>; BOTH aggregate bars migrate to the window-key helpers; binding bar through <code>renderModelBar</code>.</li>
+  <li><input type="checkbox" disabled> <code>websocket.js</code>: bars through the new helpers; binding through <code>renderModelBar</code>; refresh <code>[data-plan-label]</code> from the merged account (an event without <code>plan</code> keeps the current label).</li>
+  <li><input type="checkbox" disabled> <code>auto-swap.js</code>: banner "Usage is available again in 3h 20m".</li>
+  <li><input type="checkbox" disabled> Tests with the real shared helpers: markers on every bar class; absent 5h reads "none" + "not on Ultra" on the card and in the panel; plan labels; a WebSocket plan transition; call-site guard (no literal null elapsed fraction in any <code>renderUsageBar</code> call).</li>
+</ul>
+
+<h3>Task 4 (main loop): text</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> chain-of-command rule 7: <code>jacked usage --json --provider claude</code>; read the row with <code>active: true</code> (<code>worst_window_pct</code>, <code>worst_window_resets_at</code>), and its Fable entry in <code>model_limits</code> for a Fable fan-out; fall back to <code>summary.best_account_worst_window_pct</code> when no row is active; keep the phrases the tests pin.</li>
+  <li><input type="checkbox" disabled> README, <code>docs/architecture/auto-swap-system.md</code> sections 3 and 11.1, <code>lessons.md</code>.</li>
+</ul>
+
+<h3>Task 5 (main loop): combine, gate, review, prove</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> Merge pw-b1, b2a, b2b, b3 into the feature branch; full local CI once (<code>uv run --frozen ruff check .</code>, <code>uv run --frozen python -m pytest</code>) to a log with the exit captured.</li>
+  <li><input type="checkbox" disabled> /dcr at LARGE tier beside the gate.</li>
+  <li><input type="checkbox" disabled> <b>Proof with zero side effects</b> (never start a server on real tokens): (1) a read-only script resolves <code>account_view</code> for every real row of <code>~/.claude/jacked.db</code> (opened read-only) and prints plan + windows + projected 5h, compared against the live payload facts; (2) the dashboard and panel rendered by the branch in the scratch-HOME rig (temporary HOME, seeded fake accounts whose <code>cached_usage_raw</code> copies the real payload SHAPES with no tokens or emails, auto-swap and the keeper off, so no outbound call) and screenshotted; (3) the keeper exercised only through tests with every external call stubbed.</li>
+  <li><input type="checkbox" disabled> PR with evidence; file the two issues below and link them.</li>
+</ul>
+
+<h2 id="filed">Filed, not fixed here</h2>
+<ul>
+  <li>Auto-swap has no departure rule for an active account walled on its weekly (T2/T3) or Fable weekly limit; with no 5h window,
+  Ultra accounts lose the de-facto exhaustion trigger. Pre-existing, account-switching behavior change, own PR.</li>
+  <li>Tray pill color and <code>max_pct</code> ignore the model-scoped weekly cap (a Fable cap at 96% with 7d at 60% shows green). Product choice plus ranking change, own PR.</li>
+</ul>
+
+<h2 id="open-questions">Decisions made (reviewable)</h2>
+<ul>
+  <li>Known plans documented to have a 5h limit use <code>always</code> (silence reads as an idle window), so an idle Max is never mistaken for a plan without the limit; drift logs if Anthropic ever drops the window for them.</li>
+  <li>An Ultra row with no authoritative payload and no cached reading is <code>unknown</code> (treated as having a window), and a cached reading keeps a temporary window alive through a partial read: a wrong "absent" would also bypass the headroom gate and pacing, not just one keeper ping (pre-mortem finding).</li>
+  <li>The 5h row stays on every card (empty track, "none", "not on Ultra") instead of disappearing: it states the plan fact, keeps cards in the grid aligned, and keeps the WebSocket child indexing stable.</li>
+  <li>The provider's own plan name wins over the catalog label, so a rename shows up without a release; a mismatch is drift, not an error.</li>
+</ul>
+
+</div>
+
+<!-- Mermaid: render diagrams, fail gracefully if CDN unreachable -->
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    // startOnLoad waits for the window "load" event, which has already fired by the time this
+    // dynamic import resolves, so it never renders. Render explicitly instead.
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+    await mermaid.run({ querySelector: ".diagram pre.mermaid" });
+  } catch (err) {
+    // Network unreachable or import failed — show source instead of broken diagrams.
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>

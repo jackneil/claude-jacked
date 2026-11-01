@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "verified_at": "2026-11-01",
+  "providers": {
+    "claude": {
+      "windows": {
+        "session": 18000,
+        "weekly": 604800,
+        "weekly_model": 604800
+      },
+      "default": {
+        "session": "reported",
+        "session_critical_pct": 80
+      },
+      "subscriptions": {
+        "max": {
+          "label": "Max",
+          "session": "reported",
+          "session_critical_pct": 90,
+          "verified_at": "2026-11-01",
+          "sources": [
+            "https://support.claude.com/en/articles/17728952-what-is-the-ultra-plan"
+          ],
+          "tiers": {
+            "default_claude_max_20x": {
+              "id": "ultra",
+              "label": "Ultra",
+              "formerly": "Max 20x",
+              "session": "until_verified",
+              "session_critical_pct": 95,
+              "session_note": "Verified Ultra accounts have no 5-hour limit. Weekly limits still apply.",
+              "session_temporary_note": "This Ultra account has a temporary 5-hour limit. Anthropic removes it after it verifies the account.",
+              "verified_at": "2026-11-01",
+              "sources": [
+                "https://support.claude.com/en/articles/17728952-what-is-the-ultra-plan",
+                "https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work"
+              ]
+            },
+            "default_claude_max_5x": {
+              "id": "max",
+              "label": "Max",
+              "formerly": "Max 5x",
+              "session": "always",
+              "session_critical_pct": 90,
+              "verified_at": "2026-11-01",
+              "sources": [
+                "https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work"
+              ]
+            }
+          }
+        },
+        "team": {
+          "label": "Team",
+          "session": "always",
+          "session_critical_pct": 90,
+          "verified_at": "2026-11-01",
+          "sources": [
+            "https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work"
+          ]
+        },
+        "pro": {
+          "label": "Pro",
+          "session": "always",
+          "session_critical_pct": 80,
+          "verified_at": "2026-11-01",
+          "sources": [
+            "https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work"
+          ]
+        },
+        "free": {
+          "label": "Free",
+          "session": "always",
+          "session_critical_pct": 80,
+          "verified_at": "2026-11-01",
+          "sources": [
+            "https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work"
+          ]
+        },
+        "enterprise": {
+          "label": "Enterprise",
+          "session": "reported",
+          "session_critical_pct": 80,
+          "verified_at": "2026-11-01",
+          "sources": [
+            "https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work"
+          ]
+        }
+      }
+    },
+    "codex": {
+      "windows": {
+        "session": 18000,
+        "weekly": 604800,
+        "weekly_model": 604800
+      },
+      "default": {
+        "session": "reported",
+        "session_critical_pct": 80
+      },
+      "subscriptions": {
+        "pro": {
+          "label": "Pro",
+          "session": "never",
+          "session_critical_pct": 80,
+          "session_note": "ChatGPT Pro has no 5-hour limit in Codex. Weekly limits can still apply.",
+          "verified_at": "2026-11-01",
+          "sources": [
+            "https://learn.chatgpt.com/docs/pricing"
+          ]
+        },
+        "plus": {
+          "label": "Plus",
+          "session": "always",
+          "session_critical_pct": 80,
+          "verified_at": "2026-11-01",
+          "sources": [
+            "https://learn.chatgpt.com/docs/pricing"
+          ]
+        }
+      }
+    }
+  }
+}

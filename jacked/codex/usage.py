@@ -68,7 +68,7 @@ def _usable_duration(dur) -> bool:
     """
     if not isinstance(dur, (int, float)) or isinstance(dur, bool):
         return False
-    return math.isfinite(dur) and dur > 0
+    return dur > 0 and (isinstance(dur, int) or math.isfinite(dur))  # big ints never overflow
 
 
 def _classify_windows(primary, secondary) -> dict:
@@ -98,7 +98,18 @@ def _classify_windows(primary, secondary) -> dict:
         ("five_hour", primary),
         ("seven_day", secondary),
     ):
-        if not window:
+        # Only None or {} means "no window". Any other non-object ([], 0, a
+        # string) is an unknown shape: dropped, so nothing is cleared.
+        if window is None or (isinstance(window, Mapping) and not window):
+            continue
+        if not isinstance(window, Mapping):
+            slots["dropped"] = True
+            key = f"nonobject:{positional_slot}:{type(window).__name__}"
+            (logger.debug if key in _warned_shapes else logger.warning)(
+                "codex rate-limit %s window is a %s, not an object; ignoring it",
+                positional_slot, type(window).__name__,
+            )
+            _warned_shapes.add(key)
             continue
         dur = window.get("windowDurationMins")
         if _usable_duration(dur):
@@ -133,12 +144,13 @@ def _classify_windows(primary, secondary) -> dict:
 def normalize_rate_limits(result: Mapping) -> dict:
     """Map an ``account/rateLimits/read`` result to jacked's two-window shape.
 
-    Returns ``{"five_hour": {"utilization", "resets_at", "reported"},
-    "seven_day": {...}, "windows_complete", "plan_type", "credits",
-    "reset_credits", "by_limit"}``. Utilization is the app-server
-    ``usedPercent``; resets_at is an ISO string. A window Codex did not
-    report comes back as ``{"utilization": None, "resets_at": None,
-    "reported": False}``.
+    Returns ``{"five_hour": {"utilization", "resets_at", "reported",
+    "window_minutes"}, "seven_day": {...}, "windows_complete", "plan_type",
+    "credits", "reset_credits", "by_limit"}``. Utilization is the app-server
+    ``usedPercent``; resets_at is an ISO string; window_minutes is the
+    selected window's own ``windowDurationMins`` (None when unusable). A
+    window Codex did not report comes back as ``{"utilization": None,
+    "resets_at": None, "reported": False, "window_minutes": None}``.
 
     ``windows_complete`` is True only when the payload was AUTHORITATIVE
     about which windows exist: both window keys present (an explicit null
@@ -147,21 +159,29 @@ def normalize_rate_limits(result: Mapping) -> dict:
     "this window no longer exists" — a partial or unrecognized payload must
     preserve the last known cache, never clear it.
     """
-    result = result or {}
-    rl = result.get("rateLimits") or {}
+    result = result if isinstance(result, Mapping) else {}
+    # A non-object rateLimits: no windows, never authoritative.
+    rl = result.get("rateLimits") if isinstance(result.get("rateLimits"), Mapping) else {}
     slots = _classify_windows(rl.get("primary"), rl.get("secondary"))
     five = slots["five_hour"] or {}
     seven = slots["seven_day"] or {}
+
+    def _minutes(window: Mapping) -> Optional[float]:
+        dur = window.get("windowDurationMins")
+        return dur if _usable_duration(dur) else None
+
     return {
         "five_hour": {
             "utilization": five.get("usedPercent"),
             "resets_at": _epoch_to_iso(five.get("resetsAt")),
             "reported": slots["five_hour"] is not None,
+            "window_minutes": _minutes(five),
         },
         "seven_day": {
             "utilization": seven.get("usedPercent"),
             "resets_at": _epoch_to_iso(seven.get("resetsAt")),
             "reported": slots["seven_day"] is not None,
+            "window_minutes": _minutes(seven),
         },
         "windows_complete": (
             "primary" in rl

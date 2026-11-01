@@ -1,10 +1,10 @@
-"""Diagnostic helpers — labels, tier-aware threshold, and the 7d-deficit summary."""
+"""Diagnostic helpers: labels, the plan-aware threshold, and the 7d-deficit summary."""
 
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
 
+from jacked.usage_plans import resolve_plan
 from jacked.web.auto_swap.burn import (
     compute_burn_per_window,
     compute_effective_working_hours,
@@ -19,11 +19,21 @@ from .tiers import (
 )
 
 
-def tier_label(account: dict) -> str:
-    """Return a human-readable tier label like '(tier 20x)' or ''."""
-    tier = (account.get("rate_limit_tier") or "").lower()
-    match = re.search(r"(\d+)x", tier)
-    return f" (tier {match.group(1)}x)" if match else ""
+def plan_label(account: dict) -> str:
+    """Return the name of the account's plan, or "" when it is not known.
+
+    The name comes from :func:`jacked.usage_plans.resolve_plan`: the
+    provider's own plan name first, then the catalog label, then the raw
+    subscription type. The auto-swap decision log names the plan with it.
+
+    >>> plan_label({"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x"})
+    'Ultra'
+    >>> plan_label({"subscription_type": "team"})
+    'Team'
+    >>> plan_label({})
+    ''
+    """
+    return resolve_plan(account).label or ""
 
 
 def format_account_label(account: dict) -> str:
@@ -60,26 +70,22 @@ def format_account_label(account: dict) -> str:
 
 
 def tier_critical_threshold(account: dict) -> float:
-    """Compute the auto-swap critical threshold based on account tier.
+    """Return the auto-swap 5h critical threshold for the account's plan.
 
-    Higher-tier accounts can sustain usage longer before needing a swap.
-    Known tiers from Anthropic: default_claude_max_20x, default_claude_max_5x.
-    Test fixtures use t1/t2 which are not real tiers — they fall to the
-    subscription_type fallback.
+    A plan with more capacity can use more of its 5h window before a swap.
+    The value is the plan's ``session_critical_pct`` in the plan catalog
+    (``jacked/data/usage_plans.json``): Ultra 95, Max 90, Team 90, and 80
+    for Pro, Free, Enterprise and an unknown plan. A Max tier that the
+    catalog does not list reads the Max value, and the resolver logs it as
+    catalog drift. A catalog edit, not a code change, moves a threshold.
+
+    >>> tier_critical_threshold({"subscription_type": "max",
+    ...                          "rate_limit_tier": "default_claude_max_20x"})
+    95.0
+    >>> tier_critical_threshold({"provider": "codex", "subscription_type": "pro"})
+    80.0
     """
-    tier = (account.get("rate_limit_tier") or "").lower()
-    match = re.search(r"(\d+)x", tier)
-    if match:
-        multiplier = int(match.group(1))
-        if multiplier >= 20:
-            return 95.0
-        if multiplier >= 5:
-            return 90.0
-    # Fallback: subscription_type when tier is missing or unrecognized
-    sub = (account.get("subscription_type") or "").lower()
-    if sub == "max":
-        return 90.0  # max without tier info — conservative
-    return 80.0  # pro, free, or unknown
+    return float(resolve_plan(account).session_critical_pct)
 
 
 def achievable_burn(

@@ -117,6 +117,16 @@ class TestAccountApi:
     def test_open_account_has_no_usage_block(self):
         assert _account_to_response(_codex_row(OPEN, seven=40.0)).usage_block is None
 
+    def test_pro_plan_drops_a_stale_five_hour_value(self):
+        # ChatGPT Pro has no 5h window in Codex: a 5h value left in the cache
+        # from an older payload is not a reading.
+        row = _codex_row(OPEN, five=55.0, seven=40.0)
+        row["subscription_type"] = "pro"
+        resp = _account_to_response(row)
+        assert resp.usage.five_hour is None
+        assert resp.windows.five_hour.state == "absent"
+        assert resp.plan.label == "Pro"
+
 
 class TestMenubarSummary:
     def test_codex_missing_window_stays_none(self):
@@ -146,6 +156,14 @@ class TestMenubarSummary:
         s = summarize_account({"id": 1, "cached_usage_5h": None, "cached_usage_7d": 30})
         assert s["five_hour"] == 0.0
         assert menubar_title(s) == "0%·30%"
+
+    def test_pro_plan_keeps_the_five_hour_slot_empty(self):
+        row = _codex_row(OPEN, five=55.0, seven=40.0)
+        row["subscription_type"] = "pro"
+        s = summarize_account(row)
+        assert s["five_hour"] is None
+        assert s["max_pct"] == 40.0
+        assert menubar_title(s) == "-·40%"
 
 
 class TestReviewEngineBlock:
@@ -283,23 +301,131 @@ class TestVerdictGate:
 
 
 class TestCallSites:
-    def test_every_usage_bar_opts_call_passes_the_reading(self):
-        """A call without the 4th argument silently brings back a 0% bar for
-        an unreported Codex window (windowReason only treats an explicit
-        null as absent). Every call must match the checked shape, so a new
-        call in another shape fails here instead of going unchecked."""
+    """Source guards on the JavaScript call sites of the usage bar helpers.
+
+    A literal ``null`` elapsed fraction is how the Fable row lost its
+    week-elapsed marker while the 7d row above it kept one, and a bar whose
+    options do not name their window cannot read the plan's window state
+    (an absent 5h window then reads as a 0% bar). Every call must have the
+    checked shape, so a new call in another shape fails here.
+    """
+
+    @staticmethod
+    def _is_window_key(arg):
+        """True for a quoted 'five_hour' or 'seven_day' literal."""
+        import re
+
+        return re.fullmatch(r"""(['"])(five_hour|seven_day)\1""", arg) is not None
+
+    @staticmethod
+    def _skip_quoted(text, i):
+        """Index after the string literal that starts at text[i]."""
+        quote = text[i]
+        i += 1
+        while text[i] != quote:
+            i += 2 if text[i] == "\\" else 1
+        return i + 1
+
+    @classmethod
+    def _skip_template(cls, text, i):
+        """Index after the template literal that starts at text[i]."""
+        i += 1
+        while text[i] != "`":
+            if text[i] == "\\":
+                i += 2
+            elif text.startswith("${", i):
+                i = cls._scan(text, i + 2, "}")[1]
+            else:
+                i += 1
+        return i + 1
+
+    @classmethod
+    def _scan(cls, text, i, close):
+        """Top-level comma-separated parts up to the matching ``close``.
+
+        Returns (parts, index after the close). Strings, template literals
+        and nested brackets are skipped as units.
+        """
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        stack, parts, start = [close], [], i
+        while True:
+            ch = text[i]
+            if ch in "'\"":
+                i = cls._skip_quoted(text, i)
+                continue
+            if ch == "`":
+                i = cls._skip_template(text, i)
+                continue
+            if ch in pairs:
+                stack.append(pairs[ch])
+            elif ch in ")]}":
+                assert ch == stack.pop(), f"unbalanced {ch!r} at {i}"
+                if not stack:
+                    parts.append(text[start:i].strip())
+                    return [p for p in parts if p], i + 1
+            elif ch == "," and len(stack) == 1:
+                parts.append(text[start:i].strip())
+                start = i + 1
+            i += 1
+
+    @classmethod
+    def _calls(cls, name):
+        """(file, line, args) for every call of ``name`` in the web JS.
+
+        Skips the vendored libraries, the function's own definition and
+        comment lines (a docblock may name the function with parentheses).
+        """
         import re
         from pathlib import Path
 
         web = Path(__file__).resolve().parents[2] / "jacked" / "data" / "web" / "js"
-        total = 0
-        checked = []
-        for path in web.rglob("*.js"):
-            text = path.read_text()
-            total += len(re.findall(r"(?<!function )usageBarOpts\(", text))
-            for m in re.finditer(r"usageBarOpts\(([^;\n]*)\)\s*[:;)+]", text):
-                checked.append((path.name, m.group(1)))
-        assert total >= 6
-        assert len(checked) == total, checked
-        for name, args in checked:
-            assert re.search(r"cached_usage_(5h|7d)\s*\)?\s*$", args), (name, args)
+        calls = []
+        pattern = re.compile(r"(?<![\w.$])" + re.escape(name) + r"\s*\(")
+        for path in sorted(web.rglob("*.js")):
+            if "vendor" in path.parts:
+                continue
+            text = path.read_text(encoding="utf-8")
+            for m in pattern.finditer(text):
+                line_start = text.rfind("\n", 0, m.start()) + 1
+                prefix = text[line_start:m.start()]
+                if re.search(r"function\s*$", prefix):
+                    continue
+                if prefix.lstrip().startswith(("*", "//", "/*")) or "//" in prefix:
+                    continue
+                args, _ = cls._scan(text, m.end(), ")")
+                line = text.count("\n", 0, m.start()) + 1
+                calls.append((path.name, line, args))
+        return calls
+
+    def test_scanner_reads_nested_and_quoted_arguments(self):
+        text = "f(a(1, 2), `x ${g(3, 4)} ,`, 'a,b', {c: [5, 6]}, ')')"
+        args, end = self._scan(text, 2, ")")
+        assert args == ["a(1, 2)", "`x ${g(3, 4)} ,`", "'a,b'", "{c: [5, 6]}", "')'"]
+        assert end == len(text)
+
+    def test_every_usage_bar_passes_an_elapsed_fraction(self):
+        calls = self._calls("renderUsageBar")
+        # card 5h/7d, panel 5h/7d, WebSocket 5h/7d and renderModelBar.
+        assert len(calls) >= 7, calls
+        for name, line, args in calls:
+            assert len(args) >= 3, (name, line, args)
+            assert args[2] not in ("null", "undefined", "void 0"), (
+                f"{name}:{line} passes a literal {args[2]} elapsed fraction: "
+                "route model bars through renderModelBar and window bars "
+                "through windowElapsed"
+            )
+
+    def test_every_usage_bar_opts_call_names_its_window(self):
+        calls = self._calls("usageBarOpts")
+        assert len(calls) >= 6, calls
+        for name, line, args in calls:
+            assert len(args) >= 2 and self._is_window_key(args[1]), (
+                f"{name}:{line} must pass a quoted window key "
+                f"('five_hour' or 'seven_day') as the second argument: {args}"
+            )
+
+    def test_every_window_elapsed_call_names_its_window(self):
+        calls = self._calls("windowElapsed")
+        assert len(calls) >= 6, calls
+        for name, line, args in calls:
+            assert len(args) == 2 and self._is_window_key(args[1]), (name, line, args)

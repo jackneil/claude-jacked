@@ -932,7 +932,12 @@ class TestWindowPersistedFromPing:
         st = _state(db, aid)
         assert st["last_status"] == "ping_ok_no_window"
         assert st["next_attempt_at"] > time.time()
-        assert any("no open 5h window" in r.getMessage() for r in caplog.records)
+        # The warning names every window that made the keeper ping and is
+        # still not open (a fresh row lacks both).
+        assert any(
+            "the 5h and 7d windows did not open" in r.getMessage()
+            for r in caplog.records
+        )
         _run_pass(db, pings)
         assert pings.calls == ["cc-tok"]
 
@@ -1052,6 +1057,9 @@ def test_null_7d_reset_alone_does_not_reping_after_success(db):
     pings = _Pings({"cc-tok": _ok()})  # 5h header only, no 7d header
     _run_pass(db, pings)
     assert db.get_account(aid)["cached_7d_resets_at"] is None
+    # The 200 started the weekly window: the first verdict is ok, not a
+    # no-window retry (confirmation rule 2 of _keeper_record_success).
+    assert _state(db, aid)["last_status"] == "ok"
     _run_pass(db, pings)
     assert pings.calls == ["cc-tok"]
 
@@ -1112,3 +1120,381 @@ class TestKeeperDbWorkOffTheLoop:
 
         _assert_off_loop(seen, names, loop_tid)
         assert db.get_setting(um._PREWAKE_DONE_KEY) is not None
+
+
+# ---------------------------------------------------------------------------
+# AC7 - plan-aware keeper: an account whose plan has no 5-hour window
+# ---------------------------------------------------------------------------
+
+
+def _iso_in(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+def _ultra_payload() -> dict:
+    """The live verified-Ultra usage shape (2026-11-01): an authoritative
+    limits list with no session entry, and a null five_hour."""
+    return {
+        "five_hour": None,
+        "seven_day": {"utilization": 40.0, "resets_at": _iso_in(3 * 86400)},
+        "limits": [
+            {"kind": "weekly_all", "percent": 40, "is_active": False},
+            {
+                "kind": "weekly_scoped", "percent": 12, "is_active": False,
+                "scope": {"model": {"display_name": "Fable"}},
+            },
+        ],
+    }
+
+
+_UNSET = object()
+
+
+def _mk_ultra(db, *, raw=_UNSET, **columns) -> int:
+    """A Max 20x (Ultra) row. raw=None models a row with no usage payload
+    yet; the default is the verified shape. Every other column defaults to
+    an open weekly window read a minute ago."""
+    aid = _mk(db, email="ultra@test.com")
+    payload = _ultra_payload() if raw is _UNSET else raw
+    fields = {
+        "subscription_type": "max",
+        "rate_limit_tier": "default_claude_max_20x",
+        "cached_usage_raw": json.dumps(payload) if payload is not None else None,
+        "cached_usage_7d": 40.0,
+        "cached_7d_resets_at": _iso_in(3 * 86400),
+        "usage_cached_at": int(time.time()) - 60,
+    }
+    fields.update(columns)
+    db.update_account(aid, **fields)
+    return aid
+
+
+def _weekly_lapsed() -> dict:
+    """Columns of a weekly window that turned over after the last read."""
+    return {
+        "cached_7d_resets_at": _iso_in(-3600),
+        "usage_cached_at": int(time.time()) - 7200,
+    }
+
+
+NO_HEADERS = PingResult(ok=True, status=200, request_id="req_bare")
+
+
+class TestNoSessionWindow:
+    def test_verified_ultra_is_never_pinged_for_a_5h_window(self, db):
+        """The cache still holds a 5h reading from before the account was
+        verified, with a lapsed reset: the old keeper pinged this row every
+        sweep (290 pings in two days, each ping_ok_no_window)."""
+        aid = _mk_ultra(
+            db, cached_usage_5h=100.0, cached_5h_resets_at=_iso_in(-3600)
+        )
+        writes = []
+        real = db.set_keeper_state
+
+        def _spy(account_id, **fields):
+            writes.append(fields)
+            return real(account_id, **fields)
+
+        pings = _Pings({"cc-tok": _ok()})
+        with patch.object(db, "set_keeper_state", side_effect=_spy):
+            for _ in range(3):
+                assert _run_pass(db, pings) == 0
+        assert pings.calls == []
+        assert _state(db, aid)["skip_reason"] == "no_session_window"
+        assert len(writes) == 1  # recorded on the change only
+
+    def test_turned_over_weekly_window_is_pinged_and_its_7d_header_stored(self, db):
+        aid = _mk_ultra(db, cached_usage_7d=88.0, **_weekly_lapsed())
+        reset_7d = int(time.time()) + 7 * 86400 - 60
+        reply = PingResult(
+            ok=True,
+            status=200,
+            rate_limit={
+                # A 5h pair the plan cannot have: ignored completely.
+                "anthropic-ratelimit-unified-5h-reset": FUTURE_RESET_EPOCH,
+                "anthropic-ratelimit-unified-5h-utilization": "0.5",
+                "anthropic-ratelimit-unified-7d-reset": str(reset_7d),
+                "anthropic-ratelimit-unified-7d-utilization": "0.02",
+            },
+        )
+        pings = _Pings({"cc-tok": reply})
+        assert _run_pass(db, pings) == 1
+        row = db.get_account(aid)
+        stored = datetime.fromisoformat(row["cached_7d_resets_at"]).timestamp()
+        assert stored == pytest.approx(reset_7d, abs=1)
+        assert row["cached_usage_7d"] == pytest.approx(2.0)
+        assert row["cached_usage_5h"] is None
+        assert row["cached_5h_resets_at"] is None
+        st = _state(db, aid)
+        assert st["last_status"] == "ok"
+        assert st["next_attempt_at"] is None
+        assert aid not in um._ping_backoff
+        # Next sweep: the weekly window is open, and no 5h window exists.
+        assert _run_pass(db, pings) == 0
+        assert pings.calls == ["cc-tok"]
+        assert _state(db, aid)["skip_reason"] == "no_session_window"
+
+    def test_a_read_back_that_never_lands_escalates_the_backoff(self, db, caplog):
+        """The live log showed "backing off 600s (1 consecutive failures)" on
+        every ping: the success path dropped the backoff before it armed it
+        again, so the delay never grew. It must double per sweep up to 1 h."""
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        delays = []
+        with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
+            for sweep in range(5):
+                if sweep:
+                    um._ping_backoff[aid]["skip_until"] = 0.0  # the retry is due
+                _run_pass(db, pings)
+                st = _state(db, aid)
+                assert st["last_status"] == "ping_ok_no_window"
+                delays.append(st["next_attempt_at"] - st["last_ping_at"])
+        assert pings.calls == ["cc-tok"] * 5
+        assert delays == pytest.approx([600, 1200, 2400, 3600, 3600], abs=1.01)
+        assert um._ping_backoff[aid]["fails"] == 5
+        assert any(
+            "the 7d window did not open" in r.getMessage() for r in caplog.records
+        )
+
+    def test_a_no_window_backoff_survives_a_restart(self, db):
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)
+        assert _state(db, aid)["next_attempt_at"] > time.time()
+        um._ping_backoff.clear()  # a restart: the in-memory backoff is gone
+        _run_pass(db, pings)
+        assert pings.calls == ["cc-tok"]
+        assert _state(db, aid)["skip_reason"] == "backoff"
+
+    def test_success_needs_every_window_that_caused_the_ping(self, db):
+        """A 5h-capable row with both windows lapsed and a reply that opens
+        neither: the warning names both, and the escalation starts."""
+        aid = _mk(db)
+        db.update_account(aid, **_weekly_lapsed())
+        db.update_account(aid, cached_5h_resets_at=_iso_in(-60))
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert um._ping_backoff[aid]["fails"] == 1
+
+    def test_a_200_that_opens_the_5h_window_also_starts_an_unreported_week(self, db):
+        """No 7d reset is recorded before or after the ping. The 200 started
+        the weekly window, and no further ping can make a usage read report a
+        reset it omits: the verdict is ok, and the backoff is cleared."""
+        aid = _mk(db)
+        um._ping_backoff[aid] = {"fails": 3, "skip_until": 0.0, "token_fp": _fp(db, aid)}
+        _run_pass(db, _Pings({"cc-tok": _ok()}))
+        row = db.get_account(aid)
+        assert row["cached_5h_resets_at"] is not None
+        assert row["cached_7d_resets_at"] is None
+        assert _state(db, aid)["last_status"] == "ok"
+        assert aid not in um._ping_backoff
+
+    def test_a_week_without_a_reset_after_a_200_on_ultra_is_ok(self, db):
+        """The same rule on a plan without a 5-hour window: a ping sent for a
+        weekly window that a LANDED read-back reports without a reset is ok
+        (the API omits the reset for days at a time)."""
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 7200)
+
+        async def _read_back(account_id, db_, **_kw):
+            db_.update_account_usage_cache(account_id, seven_day=41.0, clear_seven_day_reset=True)
+            return {}
+
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings, fetch=AsyncMock(side_effect=_read_back))
+        assert _state(db, aid)["last_status"] == "ok"
+        # The recent ok holds the next sweep off: no ping every sweep.
+        _run_pass(db, pings, fetch=AsyncMock(side_effect=_read_back))
+        assert pings.calls == ["cc-tok"]
+
+    def test_a_week_without_a_reset_and_no_read_back_is_not_ok(self, db):
+        """A 200 with no headers and a read-back that never lands leaves a
+        days-old reading: nothing confirmed the weekly window, so the verdict
+        is ping_ok_no_window and the retry backs off (never a silent ok)."""
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 3 * 86400)
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))  # fetch mock writes nothing
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert st["next_attempt_at"] > time.time()
+        assert um._ping_backoff[aid]["fails"] == 1
+
+    def test_a_stale_weekly_reset_rewritten_by_the_read_back_is_not_ok(self, db):
+        """The read-back lands (the row is new) but still carries the lapsed
+        weekly reset: a new row is not an open window."""
+        lapsed = _iso_in(-3600)
+        aid = _mk_ultra(db, cached_7d_resets_at=lapsed, usage_cached_at=int(time.time()) - 7200)
+
+        async def _same_reset(account_id, db_, **_kw):
+            db_.update_account_usage_cache(account_id, seven_day=99.0, seven_day_resets_at=lapsed)
+            return {}
+
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_same_reset))
+        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+
+    def test_the_escalation_count_survives_a_restart(self, db):
+        """After the cap, a restart must resume the escalation (3600 s), not
+        fall back to the first step (600 s)."""
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        for sweep in range(4):
+            if sweep:
+                um._ping_backoff[aid]["skip_until"] = 0.0
+            _run_pass(db, pings)
+        assert _state(db, aid)["backoff_fails"] == 4
+        um._ping_backoff.clear()  # a restart: the in-memory count is gone
+        db.set_keeper_state(aid, next_attempt_at=time.time() - 1)  # the retry is due
+        _run_pass(db, pings)
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert st["next_attempt_at"] - st["last_ping_at"] == pytest.approx(3600, abs=1.01)
+        assert st["backoff_fails"] == 5
+
+    def test_success_clears_the_persisted_count(self, db):
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))
+        assert _state(db, aid)["backoff_fails"] == 1
+        um._ping_backoff[aid]["skip_until"] = 0.0
+        reset_7d = int(time.time()) + 7 * 86400 - 60
+        reply = PingResult(ok=True, status=200, rate_limit={
+            "anthropic-ratelimit-unified-7d-reset": str(reset_7d),
+            "anthropic-ratelimit-unified-7d-utilization": "0.02",
+        })
+        _run_pass(db, _Pings({"cc-tok": reply}))
+        st = _state(db, aid)
+        assert st["last_status"] == "ok"
+        assert st["backoff_fails"] == 0
+
+    def test_unknown_ultra_keeps_the_5h_ping(self, db):
+        """No payload and no cached 5h reading: jacked cannot rule the 5h
+        window out (state unknown), so the keeper pings for it as before and
+        stores the 5h header pair."""
+        aid = _mk_ultra(db, raw=None)
+        pings = _Pings({"cc-tok": _ok()})
+        assert _run_pass(db, pings) == 1
+        row = db.get_account(aid)
+        assert row["cached_5h_resets_at"] is not None
+        assert row["cached_usage_5h"] == pytest.approx(12.0)
+        assert _state(db, aid)["last_status"] == "ok"
+
+
+class TestKeeperWindowNeeded:
+    def test_a_missing_7d_reset_waits_out_a_recent_ok(self, db):
+        aid = _mk(db)
+        db.update_account(aid, cached_5h_resets_at=_iso_in(3600))
+        acct = db.get_account(aid)  # no 7d reset recorded
+        recent = {"last_status": "ok", "last_ping_at": time.time() - 60}
+        stale = {"last_status": "ok", "last_ping_at": time.time() - 6 * 3600}
+        assert um._keeper_window_needed(acct, recent) == (False, False)
+        assert um._keeper_window_needed(acct, stale) == (False, True)
+        assert um._keeper_window_needed(acct, {}) == (False, True)
+
+    def test_an_absent_5h_window_is_never_needed(self, db):
+        aid = _mk_ultra(db, cached_5h_resets_at=_iso_in(-60))
+        assert um._keeper_window_needed(db.get_account(aid), {}) == (False, False)
+
+
+class TestPingWindowCacheFields:
+    NOW = 1_800_000_000.0
+
+    def _reply(self, **headers):
+        names = {
+            "r5": "anthropic-ratelimit-unified-5h-reset",
+            "u5": "anthropic-ratelimit-unified-5h-utilization",
+            "r7": "anthropic-ratelimit-unified-7d-reset",
+            "u7": "anthropic-ratelimit-unified-7d-utilization",
+        }
+        return PingResult(
+            ok=True, status=200, rate_limit={names[k]: v for k, v in headers.items()}
+        )
+
+    def test_with_a_session_the_5h_pair_must_be_complete(self):
+        reply = self._reply(r5=str(int(self.NOW) + 3600), r7=str(int(self.NOW) + 86400), u7="0.4")
+        assert um._ping_window_cache_fields(reply, self.NOW) == {}
+
+    def test_without_a_session_the_7d_pair_is_written_alone(self):
+        reply = self._reply(
+            r5=str(int(self.NOW) + 3600), u5="0.9",
+            r7=str(int(self.NOW) + 86400), u7="0.4",
+        )
+        fields = um._ping_window_cache_fields(reply, self.NOW, has_session=False)
+        assert sorted(fields) == ["seven_day", "seven_day_resets_at"]
+        assert fields["seven_day"] == pytest.approx(40.0)
+
+    def test_without_a_session_an_incomplete_7d_pair_writes_nothing(self):
+        reply = self._reply(r5=str(int(self.NOW) + 3600), u5="0.9", r7=str(int(self.NOW) + 86400))
+        assert um._ping_window_cache_fields(reply, self.NOW, has_session=False) == {}
+
+
+# ---------------------------------------------------------------------------
+# dcr wave 2: confirmation evidence, blank resets, and bounded escalation
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmationEvidenceAndBackoffBounds:
+    def test_a_blank_weekly_reset_never_confirms_and_backs_off(self, db):
+        """F1: a stored "" read as "no reset" confirmed the window, while the
+        scheduler read it as unparseable and pinged every sweep, no backoff."""
+        aid = _mk_ultra(db, cached_7d_resets_at="", usage_cached_at=int(time.time()) - 7200)
+
+        async def _blank(account_id, db_, **_kw):
+            db_.update_account_usage_cache(account_id, seven_day=41.0, seven_day_resets_at="")
+            return {}
+
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        for _ in range(2):
+            _run_pass(db, pings, fetch=AsyncMock(side_effect=_blank))
+        assert pings.calls == ["cc-tok"]
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert st["backoff_fails"] == 1
+
+    @pytest.mark.parametrize("answer", [{"_cached": True}, {"_backed_off": True}, None])
+    def test_a_row_written_without_a_landed_read_is_not_evidence(self, db, answer):
+        """L4: a write stamp proves nothing by itself. A weekly window with
+        no reset needs a read that landed or the ping's own window headers."""
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 7200)
+
+        async def _stamp_only(account_id, db_, **_kw):
+            db_.update_account_usage_cache(account_id, seven_day=41.0, clear_seven_day_reset=True)
+            return answer
+
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_stamp_only))
+        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+
+    def test_a_transport_error_before_a_restart_keeps_the_escalation(self, db):
+        """L1: a transport failure persists the count under the status
+        "transport"; the restart must resume it, not fall back to 600 s."""
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        pings = _Pings({"cc-tok": [NO_HEADERS] * 4 + [TRANSPORT, NO_HEADERS]})
+        for sweep in range(5):
+            if sweep:
+                um._ping_backoff[aid]["skip_until"] = 0.0  # the retry is due
+            _run_pass(db, pings)
+        st = _state(db, aid)
+        assert (st["last_status"], st["backoff_fails"]) == ("transport", 4)
+        um._ping_backoff.clear()  # a restart: the in-memory count is gone
+        db.set_keeper_state(aid, next_attempt_at=time.time() - 1)
+        _run_pass(db, pings)
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert st["next_attempt_at"] - st["last_ping_at"] == pytest.approx(3600, abs=1.01)
+        assert st["backoff_fails"] == 5
+
+    def test_the_backoff_exponent_is_bounded(self):
+        """L2: with a float interval, 2 ** 1025 overflowed the conversion and
+        raised before the deadline was written: the keeper pinged every sweep."""
+        um._ping_backoff[77] = {"fails": 5000, "skip_until": 0.0, "token_fp": "fp"}
+        now = time.time()
+        assert um._arm_ping_backoff(77, "fp", 300.0, now) == now + 3600
+
+    def test_a_huge_persisted_count_is_clamped_on_restart(self, db):
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)
+        um._ping_backoff.clear()  # a restart
+        db.set_keeper_state(aid, backoff_fails=10**6, next_attempt_at=time.time() - 1)
+        _run_pass(db, pings)
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_ok_no_window"
+        assert st["next_attempt_at"] - st["last_ping_at"] == pytest.approx(3600, abs=1.01)
+        assert st["backoff_fails"] == um._PING_BACKOFF_MAX_FAILS

@@ -361,6 +361,51 @@ out({
         assert result["counterId"] is True
 
 
+class TestExhaustionBanner:
+    """The all-accounts-exhausted banner names the window whose reset frees
+    an account (next_recovery_window), and never promises usage in general:
+    a model limit (Fable) can still be full after that reset. Without a
+    window kind (an older server) it keeps the generic text."""
+
+    def _banner(self, tmp_path, minutes, window=None):
+        return _run_js(tmp_path, """
+const el = __makeEl('div');
+el.id = 'swap-exhaustion-banner';
+__body.appendChild(el);
+const at = __MINUTES__ === null ? null : new Date(Date.now() + __MINUTES__ * 60000).toISOString();
+window.jackedState._exhaustionData = { next_recovery_at: at, next_recovery_window: __WINDOW__ };
+renderExhaustionBanner();
+out({ html: el.innerHTML, hidden: el.classList.contains('hidden') });
+""".replace("__MINUTES__", json.dumps(minutes)).replace("__WINDOW__", json.dumps(window)))
+
+    @pytest.mark.parametrize(
+        "minutes, window, text",
+        [
+            (199.5, "7d", "The weekly limit resets in 3h 20m"),
+            (11.5, "5h", "The 5-hour limit resets in 12m"),
+            (-1, "7d", "The weekly limit should reset soon"),
+            (199.5, None, "Usage is available again in 3h 20m"),
+            (11.5, None, "Usage is available again in 12m"),
+            (-1, None, "Usage should be available again soon"),
+        ],
+    )
+    def test_recovery_text(self, tmp_path, minutes, window, text):
+        result = self._banner(tmp_path, minutes, window)
+        assert result["hidden"] is False
+        assert f">{text}</div>" in result["html"]
+        assert "All accounts at capacity" in result["html"]
+        assert "\u2014" not in result["html"] and "\u2013" not in result["html"]
+
+    def test_unknown_window_kind_keeps_the_generic_text(self, tmp_path):
+        result = self._banner(tmp_path, 30, "monthly")
+        assert ">Usage is available again in 30m</div>" in result["html"]
+
+    def test_no_recovery_time_shows_no_text(self, tmp_path):
+        result = self._banner(tmp_path, None)
+        assert "available again" not in result["html"]
+        assert "resets in" not in result["html"]
+
+
 class TestWebsocketHandlers:
     def test_new_events_dispatch_to_handlers(self, tmp_path):
         result = _run_js(tmp_path, """

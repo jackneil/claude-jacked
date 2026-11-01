@@ -1,10 +1,13 @@
 """Tests for the auto-swap decision engine (pure functions, no I/O)."""
 
+import json
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from jacked import usage_plans
 from jacked.web.auto_swap import (
     BurnRate,
     _resets_within,
@@ -13,9 +16,33 @@ from jacked.web.auto_swap import (
     format_account_label,
     has_viable_headroom,
     pick_best_target,
+    plan_label,
     tier_critical_threshold,
     update_burn_rate,
 )
+
+# A verified Ultra payload (live shape, 2026-11-01): an authoritative limits
+# list with no session entry, so the account has no 5-hour window.
+ULTRA_RAW = json.dumps({
+    "five_hour": None,
+    "seven_day": {"utilization": 33.0, "resets_at": "2026-11-02T22:59:59+00:00"},
+    "limits": [
+        {"kind": "weekly_all", "group": "weekly", "percent": 33,
+         "resets_at": "2026-11-02T22:59:59+00:00", "scope": None, "is_active": False},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 61,
+         "resets_at": "2026-11-02T22:59:59+00:00", "is_active": True,
+         "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
+    ],
+})
+
+
+def _write_catalog(root, providers: dict):
+    """Write a test plan catalog under *root* and return the loaded Catalog."""
+    (root / usage_plans.CATALOG_FILE).write_text(
+        json.dumps({"version": 1, "verified_at": "2026-11-01", "providers": providers}),
+        encoding="utf-8",
+    )
+    return usage_plans.load_catalog(root)
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +89,15 @@ class TestUpdateBurnRate:
 def test_tier_threshold_20x():
     assert tier_critical_threshold({"rate_limit_tier": "default_claude_max_20x"}) == 95.0
 
-def test_tier_threshold_10x():
-    assert tier_critical_threshold({"rate_limit_tier": "default_claude_max_10x"}) == 90.0
+def test_tier_threshold_unlisted_max_tier(monkeypatch, caplog):
+    """A Max tier the catalog does not list (a realistic row: the subscription
+    type is set) reads the Max plan's 90%, and is logged as catalog drift."""
+    monkeypatch.setattr(usage_plans, "_drift_logged", set())
+    row = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_10x"}
+    with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+        assert tier_critical_threshold(row) == 90.0
+    assert "unknown_tier" in caplog.text
+    assert "default_claude_max_10x" in caplog.text
 
 def test_tier_threshold_5x():
     assert tier_critical_threshold({"rate_limit_tier": "default_claude_max_5x"}) == 90.0
@@ -78,6 +112,54 @@ def test_tier_threshold_none_max_sub():
 def test_tier_threshold_unknown():
     """Unknown/missing everything falls to 80%."""
     assert tier_critical_threshold({}) == 80.0
+
+def test_tier_threshold_team():
+    assert tier_critical_threshold({"subscription_type": "team"}) == 90.0
+
+def test_tier_threshold_codex_pro():
+    assert tier_critical_threshold({"provider": "codex", "subscription_type": "pro"}) == 80.0
+
+def test_tier_threshold_comes_from_the_catalog(tmp_path, monkeypatch):
+    """No regex on the tier multiplier: the catalog value is the threshold,
+    so a catalog edit (not a code change) moves it."""
+    monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
+        "claude": {"subscriptions": {"max": {
+            "label": "Max", "session_critical_pct": 85,
+            "tiers": {"default_claude_max_20x": {"id": "ultra", "label": "Ultra",
+                                                 "session_critical_pct": 97}},
+        }}},
+    }))
+    assert tier_critical_threshold({"rate_limit_tier": "default_claude_max_20x"}) == 97.0
+    assert tier_critical_threshold(
+        {"subscription_type": "max", "rate_limit_tier": "default_claude_max_5x"}
+    ) == 85.0
+
+
+# ---------------------------------------------------------------------------
+# plan_label (replaces the regex-based tier_label)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("row, label", [
+    ({"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x"}, "Ultra"),
+    ({"subscription_type": "max", "rate_limit_tier": "default_claude_max_5x"}, "Max"),
+    ({"subscription_type": "team"}, "Team"),
+    ({}, ""),
+])
+def test_plan_label(row, label):
+    assert plan_label(row) == label
+
+def test_plan_label_uses_the_provider_plan_name():
+    row = {"email": "u@x.com", "subscription_type": "max",
+           "rate_limit_tier": "default_claude_max_20x",
+           "profile_json": json.dumps({"account": {"email": "u@x.com"},
+                                       "organization": {"plan_display_name": "Ultra Plus"}})}
+    assert plan_label(row) == "Ultra Plus"
+
+def test_plan_label_replaces_tier_label_in_the_facade():
+    import jacked.web.auto_swap as auto_swap
+    assert "plan_label" in auto_swap.__all__
+    assert "tier_label" not in auto_swap.__all__
+    assert not hasattr(auto_swap, "tier_label")
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +605,37 @@ class TestWhiteBar:
         acct = _acct(1, resets_7d=_iso(now - timedelta(hours=1)))
         assert white_bar(acct, now=now) == 1.0
 
+    def test_weekly_length_comes_from_the_plan_catalog(self, tmp_path, monkeypatch):
+        """The elapsed fraction uses the account's own weekly window length,
+        the same ``windows.seven_day.seconds`` the dashboard marker reads."""
+        from jacked.web.auto_swap import white_bar
+        monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
+            "claude": {"subscriptions": {
+                "max": {"label": "Max", "windows": {"weekly": 14 * 86400}},
+                "pro": {"label": "Pro"},
+            }},
+        }))
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        resets = _iso(now + timedelta(days=1))
+        two_weeks = _acct(1, resets_7d=resets, subscription_type="max")
+        one_week = _acct(2, resets_7d=resets, subscription_type="pro")
+        assert abs(white_bar(two_weeks, now=now) - 13 / 14) < 1e-6
+        assert abs(white_bar(one_week, now=now) - 6 / 7) < 1e-6
+        # Parity with the JS elapsed marker: the same length reaches the payload.
+        view = usage_plans.account_view(two_weeks)
+        assert view.windows_payload()["seven_day"]["seconds"] == 14 * 86400
+
+    def test_t3_target_follows_the_weekly_length(self, tmp_path, monkeypatch):
+        from jacked.web.auto_swap import TIER_T3, target_for_tier
+        monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
+            "claude": {"subscriptions": {
+                "max": {"label": "Max", "windows": {"weekly": 14 * 86400}},
+            }},
+        }))
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, resets_7d=_iso(now + timedelta(days=5)))
+        assert abs(target_for_tier(TIER_T3, acct, now) - 9 / 14 * 100) < 1e-6
+
 
 class TestTarget7d:
     def test_t0_target_is_100(self):
@@ -820,6 +933,83 @@ class TestHas5hHeadroom:
         target = pick_best_target([active, stale], current_id=99, now=now)
         assert target is not None
         assert target["id"] == 1
+
+    # -- plan-aware gate: an absent 5h window is headroom, explicitly ------
+
+    def test_verified_ultra_passes_despite_a_stale_5h_reading(self):
+        """A verified Ultra has no 5h window. A 5h value that lingers in its
+        cache is stale and must not block it (explicit, not None-reads-0)."""
+        from jacked.web.auto_swap import _has_5h_headroom
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, usage_5h=100, resets_5h=_iso(now + timedelta(hours=3)),
+                     rate_limit_tier="default_claude_max_20x")
+        acct["cached_usage_raw"] = ULTRA_RAW
+        assert usage_plans.session_window(acct).state == "absent"
+        assert _has_5h_headroom(acct, now=now) is True
+
+    def test_ultra_with_a_partial_read_keeps_the_5h_rule(self):
+        """No payload proves the window absent (a partial read), and the row
+        still holds a 95% reading: the window counts as present (temporary),
+        so today's rule applies and a distant reset excludes the account."""
+        from jacked.web.auto_swap import _has_5h_headroom
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        acct = _acct(1, usage_5h=95, resets_5h=_iso(now + timedelta(hours=2)),
+                     rate_limit_tier="default_claude_max_20x")
+        acct["cached_usage_raw"] = json.dumps({"five_hour": None})  # no limits list
+        assert usage_plans.session_window(acct).state == "present"
+        assert _has_5h_headroom(acct, now=now) is False
+        # An unknown limit kind makes even a limits list a partial read.
+        acct["cached_usage_raw"] = json.dumps({"limits": [{"kind": "session_v2"}]})
+        assert usage_plans.session_window(acct).state == "present"
+        assert _has_5h_headroom(acct, now=now) is False
+
+    def test_unverified_ultra_reporting_a_session_keeps_the_5h_rule(self):
+        from jacked.web.auto_swap import _has_5h_headroom
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        resets = _iso(now + timedelta(hours=2))
+        acct = _acct(1, usage_5h=95, resets_5h=resets,
+                     rate_limit_tier="default_claude_max_20x")
+        acct["cached_usage_raw"] = json.dumps({
+            "five_hour": {"utilization": 95.0, "resets_at": resets},
+            "limits": [{"kind": "session", "percent": 95, "resets_at": resets},
+                       {"kind": "weekly_all", "percent": 20}],
+        })
+        window = usage_plans.session_window(acct)
+        assert (window.state, window.temporary) == ("present", True)
+        assert _has_5h_headroom(acct, now=now) is False
+
+    def test_unknown_ultra_counts_as_having_a_window(self):
+        """No payload and no reading: the state is unknown, which counts as a
+        window (has_session is True), so the account is never waved through
+        on its plan alone; with nothing recorded, today's rule finds room."""
+        from jacked.web.auto_swap import _has_5h_headroom
+        acct = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x"}
+        assert usage_plans.session_window(acct).state == "unknown"
+        assert usage_plans.has_session(acct) is True
+        assert _has_5h_headroom(acct) is True
+
+    def test_pick_best_target_admits_a_verified_ultra(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        ultra = _acct(1, usage_5h=100, usage_7d=50,
+                      resets_5h=_iso(now + timedelta(hours=3)),
+                      resets_7d=_iso(now + timedelta(hours=12)),
+                      rate_limit_tier="default_claude_max_20x")
+        ultra["cached_usage_raw"] = ULTRA_RAW
+        target = pick_best_target([active, ultra], current_id=99, now=now)
+        assert target is not None
+        assert target["id"] == 1
+
+    def test_pick_best_target_still_excludes_a_saturated_unverified_ultra(self):
+        from jacked.web.auto_swap import pick_best_target
+        now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+        active = _acct(99, resets_7d=_iso(now + timedelta(days=3)))
+        ultra = _acct(1, usage_5h=100, usage_7d=50,
+                      resets_5h=_iso(now + timedelta(hours=3)),
+                      resets_7d=_iso(now + timedelta(hours=12)),
+                      rate_limit_tier="default_claude_max_20x")
+        assert pick_best_target([active, ultra], current_id=99, now=now) is None
 
 
 class TestShouldSwapNow:

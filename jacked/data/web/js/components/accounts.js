@@ -48,18 +48,44 @@ function getAccountStatus(acct) {
 }
 
 /**
- * Get subscription display text.
+ * Get subscription display text: "<plan> subscription". The plan name is the
+ * one the server resolved (acct.plan.label: the provider's own plan name,
+ * else the plan catalog's), so a renamed plan ("Max 20x" is now "Ultra")
+ * needs no change here. A payload from an older server has no plan object:
+ * then the subscription type, capitalized.
  */
 function getSubDisplay(acct) {
-    const sub = acct.subscription_type || 'unknown';
-    const tier = acct.rate_limit_tier || '';
+    const plan = acct && acct.plan;
+    let label = plan && typeof plan.label === 'string' ? plan.label.trim() : '';
+    if (!label) {
+        const sub = String((acct && acct.subscription_type) || '').trim();
+        label = sub ? sub.charAt(0).toUpperCase() + sub.slice(1) : 'Unknown';
+    }
+    return label + ' subscription';
+}
 
-    // Extract multiplier from tier string like "default_claude_max_20x"
-    const tierMatch = tier.match(/(\d+)x/);
-    const tierSuffix = tierMatch ? ` (${tierMatch[1]}x tier)` : '';
+// Hover text of a plan label when the account does not match the plan catalog
+// that ships with this jacked release (acct.plan.drift). Only a jacked update
+// changes the catalog. No em-dashes: this is user-facing copy.
+const PLAN_DRIFT_HINT = 'The plan catalog in this jacked release does not match this account. Update jacked.';
 
-    const subLabel = sub.charAt(0).toUpperCase() + sub.slice(1);
-    return `${subLabel} subscription${tierSuffix}`;
+/**
+ * Render the plan label of the card info row. The hover gives the former plan
+ * name ("Formerly Max 20x") and, on catalog drift, the update hint; a drift
+ * label is underlined (dotted) so the hover can be found.
+ * NOTE: data-plan-label is a DOM contract: _usageUpdateCardDOM (websocket.js)
+ * replaces this span when a WebSocket event carries a plan.
+ */
+function renderPlanLabel(acct) {
+    const plan = (acct && acct.plan) || {};
+    const parts = [];
+    if (plan.formerly) parts.push('Formerly ' + plan.formerly);
+    const drift = Array.isArray(plan.drift) && plan.drift.length > 0;
+    if (drift) parts.push(PLAN_DRIFT_HINT);
+    const title = parts.join('. ');
+    const cls = 'text-xs text-slate-400' + (drift ? ' underline decoration-dotted underline-offset-2 cursor-help' : '');
+    const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+    return `<span class="${cls}" data-plan-label${titleAttr}>${escapeHtml(getSubDisplay(acct))}</span>`;
 }
 
 /**
@@ -71,6 +97,9 @@ function getPriorityBadge(priority) {
     }
     return `<span class="badge badge-muted">#${priority + 1}</span>`;
 }
+
+/** The backend's default usage check interval (usage_check_interval, seconds). */
+const USAGE_POLL_DEFAULT_SECS = 300;
 
 /**
  * Render cache age display.
@@ -88,24 +117,15 @@ function renderCacheAge(usageCachedAt, acctId) {
         var acctArr = window.jackedState.accounts || [];
         var acctObj = acctArr.find(function(a) { return a.id === acctId; });
         var ageS = Math.floor(Date.now() / 1000) - usageCachedAt;
-        var u5 = acctObj ? (acctObj.cached_usage_5h || 0) : 0;
-        // Prefer the REAL interval/tier the backend published over the
-        // active-poll WS broadcast; fall back to the tier table (mirrors
-        // auth._TIER_INTERVALS) only before the first broadcast arrives.
-        var pollInterval;
-        if (acctObj && acctObj._poll_interval) pollInterval = acctObj._poll_interval;
-        else if (u5 > 85) pollInterval = 180;
-        else if (u5 > 70) pollInterval = 240;
-        else if (u5 > 50) pollInterval = 300;
-        else pollInterval = 600;
+        // The active-poll WS broadcast publishes the REAL interval and tier
+        // (_poll_interval, _poll_tier). Before the first broadcast, count down
+        // from the backend default and show no tier: a tier guessed from the
+        // 5h value is wrong for a plan with no 5-hour window.
+        var published = acctObj ? Number(acctObj._poll_interval) : NaN;
+        var pollInterval = Number.isFinite(published) && published > 0 ? published : USAGE_POLL_DEFAULT_SECS;
         var rem = Math.max(0, pollInterval - ageS);
         var label = rem > 0 ? escapeHtml(rem + 's') : 'checking\u2026';
-        var tierLabel = '';
-        if (acctObj && acctObj._poll_tier) tierLabel = ' (' + escapeHtml(acctObj._poll_tier) + ')';
-        else if (u5 > 85) tierLabel = ' (critical)';
-        else if (u5 > 70) tierLabel = ' (warning)';
-        else if (u5 > 50) tierLabel = ' (normal)';
-        else tierLabel = ' (idle)';
+        var tierLabel = (acctObj && acctObj._poll_tier) ? ' (' + acctObj._poll_tier + ')' : '';
         checkHtml = ' \u00b7 <span class="text-teal-500" data-next-check data-cached-at="' + usageCachedAt + '">' + label + escapeHtml(tierLabel) + '</span>';
     }
     return '<span class="text-xs text-slate-500" data-cache-age>Usage updated ' + escapeHtml(ago) + checkHtml + '</span>';
@@ -119,13 +139,14 @@ function renderPerModelBars(usage) {
         return '<div class="text-xs text-slate-500 mb-2">No per-model breakdown available</div>';
     }
 
-    let html = '<div class="text-xs text-slate-400 font-medium mb-1.5">7-Day Per-Model Breakdown</div>';
+    // Not "7-Day": a Codex named limit can have a window of another length.
+    let html = '<div class="text-xs text-slate-400 font-medium mb-1.5">Per-Model Breakdown</div>';
     for (const [key, model] of Object.entries(usage.per_model)) {
         // Prefer the provider's display name (e.g. "Fable", "GPT-5.3-Codex-Spark");
-        // fall back to the legacy static map, then the raw key.
+        // fall back to the legacy static map, then the raw key. renderModelBar
+        // draws the elapsed marker from the entry's own window_seconds.
         const label = model.label || MODEL_DISPLAY_NAMES[key] || key;
-        const pct = model.utilization || 0;
-        html += renderUsageBar(pct, model.resets_at, null, label);
+        html += renderModelBar(Object.assign({}, model, { label }));
     }
     return html;
 }
@@ -139,13 +160,13 @@ function renderPerModelBars(usage) {
  */
 function renderBindingBar(acct) {
     const bm = acct.usage && acct.usage.binding_model;
-    const inner = bm
-        ? renderUsageBar(bm.utilization, bm.resets_at, null, bm.label || 'model')
-        : '';
+    // renderModelBar draws the elapsed marker of the limit's own window.
+    const inner = bm ? renderModelBar(bm) : '';
     // Title stays on the wrapper (not the inner bar) so it survives websocket.js's
-    // innerHTML swaps and clarifies that this row is a per-model weekly cap, not
-    // another time window like the 5h/7d bars above it.
-    return `<div data-binding-bar title="Per-model weekly usage cap for this account">${inner}</div>`;
+    // innerHTML swaps and clarifies that this row is a per-model cap, not
+    // another time window like the 5h/7d bars above it. Not "weekly": a Codex
+    // named limit can have a window of another length.
+    return `<div data-binding-bar title="Per-model usage cap for this account">${inner}</div>`;
 }
 
 /**
@@ -422,7 +443,6 @@ function renderAccountCard(acct, idx, total) {
     const hasCustomLabel = acct.display_name && acct.display_name !== acct.email;
     const label = hasCustomLabel ? acct.display_name : '';
     const orgLabel = accountOrgLabel(acct);
-    const subDisplay = getSubDisplay(acct);
     const priorityBadge = getPriorityBadge(acct.priority || 0);
 
     // Token pills replace status/CC badges
@@ -434,11 +454,10 @@ function renderAccountCard(acct, idx, total) {
         disabledBadge = '<span class="badge badge-muted">Disabled</span>';
     }
 
-    // Usage bars
-    const elapsed5h = computeElapsedFraction5h(acct.cached_5h_resets_at);
-    const elapsed7d = computeElapsedFraction7d(acct.cached_7d_resets_at);
-    const usage5h = renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, elapsed5h, '5h limit', usageBarOpts(acct, acct.cached_5h_resets_at, null, acct.cached_usage_5h));
-    const usage7d = renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, elapsed7d, '7d limit', usageBarOpts(acct, acct.cached_7d_resets_at, null, acct.cached_usage_7d));
+    // Usage bars: the window key reads the plan's window state and length
+    // (acct.windows), so a plan with no 5-hour window reads "none".
+    const usage5h = renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, windowElapsed(acct, 'five_hour'), '5h limit', usageBarOpts(acct, 'five_hour'));
+    const usage7d = renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, windowElapsed(acct, 'seven_day'), '7d limit', usageBarOpts(acct, 'seven_day'));
     const usageBlockBadge = renderUsageBlockBadge(acct);
     const cacheAgeHtml = renderCacheAge(acct.usage_cached_at, acct.id);
 
@@ -492,7 +511,7 @@ function renderAccountCard(acct, idx, total) {
                     <div class="flex items-center gap-3 mb-2 ml-5">
                         <span class="text-xs text-slate-400">${escapeHtml(email)}${orgLabel ? ` (${escapeHtml(orgLabel)})` : ''}</span>
                         <span class="text-slate-600">|</span>
-                        <span class="text-xs text-slate-400">${escapeHtml(subDisplay)}</span>
+                        ${renderPlanLabel(acct)}
                         <span class="text-slate-600">|</span>
                         ${cacheAgeHtml}
                         <button class="btn-refresh-single text-slate-500 hover:text-slate-300 transition-colors p-1.5 -m-1 rounded relative" data-id="${acct.id}" title="Refresh usage" aria-label="Refresh usage">

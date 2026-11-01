@@ -15,7 +15,7 @@ It is also a skills manager for Claude Code: one `jacked install` deploys 20 cur
 
 ## What you get: multi-account Claude Code, live usage tracking, and a skills suite
 
-- **Run multiple Claude accounts without losing account truth.** Add every account you own, watch each account's 5-hour, 7-day, and per-model usage live, and let auto-swap recommend a fresh account before you hit a limit. Credential changes report what was actually verified, and session cards distinguish where a session started, what configuration was later observed, and whether the provider runtime is still unverified. Works for Codex accounts too, side by side with Claude.
+- **Run multiple Claude accounts without losing account truth.** Add every account you own, watch each account's 5-hour (when its plan has one), 7-day, and per-model usage live, and let auto-swap recommend a fresh account before you hit a limit. Credential changes report what was actually verified, and session cards distinguish where a session started, what configuration was later observed, and whether the provider runtime is still unverified. Works for Codex accounts too, side by side with Claude.
 - **A menu-bar app that actually earns its pixels.** A live pill shows usage for the account jacked can currently resolve next to the clock (`18%·4%`, tinted green/yellow/red). Left-click drops the whole fleet down in a compact panel: every account, every org, per-model caps, reset times, and the current credential state. Right-click for actions, or pin the panel to your screen edge. It refreshes within about a second of any account switch or usage change, and it tells you when a new jacked version ships: a badge on the icon, a notification banner, and a one-click update.
 - **A curated skills suite, one command to install.** `jacked install` puts 20 battle-tested slash commands, 28 skills, and 10 review agents into Claude Code (`/dcr` risk-tiered multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more; skills are slash-invocable too, so all 48 answer to a `/name`), plus design-engineering skills for UI animation and polish adapted with credit from [Emil Kowalski's skills](https://github.com/emilkowalski/skills) and a website-cloning skill adapted with credit from [JCodesMore's ai-website-cloner-template](https://github.com/JCodesMore/ai-website-cloner-template). When Codex is installed too, the same pass deploys the suite into Codex's native formats: skills into `~/.agents/skills`, commands as both prompts and command-derived skills, the behavioral rules (Codex-adapted) into `~/.codex/AGENTS.md`, the 10 review agents as Codex TOML custom agents, the chrome-devtools MCP server, and a `$qa` suggestion hook, with a few Claude-only helpers held back and everything tracked in a Codex manifest so `jacked uninstall` reverses it. Upgrades diff cleanly: added/changed/removed, never touching your own files. On top of the bundled suite, `jacked install` also installs curated third-party skill packs live from their upstream repos (a 28-skill `marketing` pack and a `design-extras` pack, on by default), opt out with `--no-packs` or `jacked packs disable`.
 - **Manage everything from a web dashboard.** Accounts, usage analytics, feature toggles, appearance themes, swap history, logs, all from your browser. No config files, no terminal commands.
@@ -219,6 +219,14 @@ The launcher prepares a per-account `CLAUDE_CONFIG_DIR` and passes every remaini
 
 Auto-swap still evaluates account headroom and records a recommendation. It performs the credential mutation only when a certified cooperative transaction engine and writer fence are installed for the exact runtime. Without that capability, it stays recommendation-only.
 
+### Plans and usage windows
+
+Not every plan has a 5-hour window. On 2026-10-30 Anthropic renamed Max 5x to **Max** and Max 20x to **Ultra**, and removed the 5-hour limit for verified Ultra accounts. Weekly limits still apply, and Ultra also has a separate weekly Fable limit. ChatGPT Pro has no 5-hour limit in Codex.
+
+jacked reads these facts from a plan catalog that ships with each release: `jacked/data/usage_plans.json`. For each plan, the catalog gives the name, the windows the plan has, how long each window is, and where the facts come from. The live usage payload of each account has priority over the catalog. When the two disagree, jacked writes one warning to the log and shows the disagreement on the account, so an old catalog is visible. A new release updates the catalog when a provider changes a plan again.
+
+For an account without a 5-hour window, the dashboard shows "none" and "not on Ultra" in the 5h row, the menu-bar pill shows `-` in the 5h slot, the window keeper does not ping for a 5-hour window, and auto-swap uses the weekly windows only. `jacked usage --json` reports the plan name, the 5-hour window state, the model limits, and the most constrained window for each account. It also marks the account that jacked selected for new sessions (`selected`) and the account of the Claude Code session that runs the command (`in_use`, from the session tracker). `--provider claude` limits the rows and the summary to one provider.
+
 ---
 
 ## Background Service and Tray Icon
@@ -238,7 +246,7 @@ jacked install --force                  # wires up hooks AND starts the tray (au
 
 ### What You Get (macOS menu bar)
 
-- **A live usage pill, always visible.** The menu-bar item is a colored "J" plus the resolved account's usage as `5h%·7d%` (e.g. `18%·4%`). The J tints green, yellow, or red on the worse of the two windows, so a glance at the clock tells you whether you're about to hit a limit. A small dot marks the corner when the resolved account is a Codex account.
+- **A live usage pill, always visible.** The menu-bar item is a colored "J" plus the resolved account's usage as `5h%·7d%` (e.g. `18%·4%`; a plan with no 5-hour window shows `-·4%`). The J tints green, yellow, or red on the worse of the two windows, so a glance at the clock tells you whether you're about to hit a limit. A small dot marks the corner when the resolved account is a Codex account.
 - **Left-click: the fleet dropdown.** A compact panel (the screenshot up top) drops down with every account you've added: 5h and 7d bars with reset times, per-model caps (your Fable or Codex model usage inline), plan badges, multi-org accounts grouped under one login, an `active` badge with a live countdown to the next usage refresh, and a refresh-all button. It's pre-warmed, so it opens instantly.
 - **Pin it as a side panel.** "Toggle Side Panel" docks the same panel to the right edge of your screen, floating above other windows and on every Space, for a permanent fleet view while you work.
 - **Right-click: the actions menu.** Open Usage Dropdown, Toggle Side Panel, Open Dashboard, Add Account, an Auto-swap toggle, Start on Login, Restart, Quit, the version line, "Last checked", and **Check for updates...** to force a fresh PyPI poll on demand.
@@ -704,11 +712,11 @@ Jacked identifies an eligible account that still has headroom and records an aut
 
 ### Can jacked switch Claude accounts automatically?
 
-Only on a runtime with a certified cooperative credential capability. Auto-swap always watches the 5-hour and 7-day headroom, but current unsupported or unfenced builds stay recommendation-only. Manual **Use Account** requests return the exact outcome instead of claiming success from a database setting, and are gated by the remote-access setting (always allowed on the host; from a remote browser only inside the enabled scope).
+Only on a runtime with a certified cooperative credential capability. Auto-swap always watches the 5-hour headroom (on plans that have a 5-hour window) and the 7-day headroom, but current unsupported or unfenced builds stay recommendation-only. Manual **Use Account** requests return the exact outcome instead of claiming success from a database setting, and are gated by the remote-access setting (always allowed on the host; from a remote browser only inside the enabled scope).
 
 ### How do I check how much Claude usage I have left?
 
-Three places: the statusline inside every Claude Code session, the tray or menu-bar pill next to your clock, and the dashboard's Accounts page. All of them show the 5-hour window, the 7-day window, per-model caps, and reset times.
+Three places: the statusline inside every Claude Code session, the tray or menu-bar pill next to your clock, and the dashboard's Accounts page. All of them show the 5-hour window (when the plan has one), the 7-day window, per-model caps, and reset times. The white line on each bar shows how much of that window has passed.
 
 ### Does jacked work with Codex?
 

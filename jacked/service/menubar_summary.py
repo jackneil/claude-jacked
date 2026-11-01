@@ -15,13 +15,58 @@ The green/yellow/red thresholds here are the Python mirror of
 ``usageColorClass`` in ``jacked/data/web/js/components/usage.js`` — keep them in
 lockstep so the pill's color can never disagree with the bar a user sees in the
 panel/dashboard.
+
+The 5-hour slot follows the account's plan (:mod:`jacked.usage_plans`), the
+same rule the account API uses: an account that has no 5-hour window (a
+verified Ultra account, ChatGPT Pro in Codex) shows no 5-hour number, even
+when an old reading is still in the cache.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
+
+logger = logging.getLogger(__name__)
+
+# (account id, exception type) pairs whose resolver failure was already
+# logged at WARNING in this process. Repeats log at DEBUG: the account list
+# and the pill read every account on each poll.
+_VIEW_FAILURES_LOGGED: set = set()
+
+
+def safe_account_view(acct: Mapping):
+    """The plan view of an account row (``usage_plans.account_view``), or None.
+
+    Every surface that lists accounts reads the 5-hour window through this
+    view. A payload shape that makes the resolver fail must not stop the
+    account list or the pill for every account, so a failure returns None
+    and the caller shows the cached readings. The failure is logged as a
+    WARNING with the account id and the exception type, once for each pair
+    in a process; the WARNING never holds the payload or the exception text.
+    Each failure also logs its traceback at DEBUG.
+
+    >>> safe_account_view({"subscription_type": "pro"}).plan.label
+    'Pro'
+    """
+    from jacked.usage_plans import account_view
+
+    try:
+        return account_view(acct)
+    except Exception as exc:  # noqa: BLE001 - one bad row must not fail a list
+        account_id = acct.get("id") if isinstance(acct, Mapping) else None
+        key = (account_id, type(exc).__name__)
+        if key not in _VIEW_FAILURES_LOGGED:
+            _VIEW_FAILURES_LOGGED.add(key)
+            logger.warning(
+                "Plan resolver failed for account %s (%s); showing its cached "
+                "usage readings without plan and window facts",
+                *key,
+            )
+        logger.debug("Plan resolver failure for account %s (%s)", *key, exc_info=True)
+        return None
 
 
 def usage_color_class(pct: Optional[float]) -> str:
@@ -58,12 +103,20 @@ def _eligible(acct: dict) -> bool:
 def summarize_account(acct: dict) -> Optional[dict]:
     """Build a pill summary for a single account, or None if it has no usage.
 
-    A Claude window with no reading is "no active window", which is 0% used.
-    A Codex window with no reading is a window Codex does not report for the
-    account (a weekly-only plan has no 5h window), so it stays None instead
-    of reading as 0% headroom. ``blocked`` carries the provider's own
-    usage-blocked verdict (:func:`usage_block_of_row`); a blocked account is
-    red at any percent.
+    The 5-hour slot follows the account's plan (:func:`safe_account_view`):
+    it is None when the account has no 5-hour window. A Claude account that
+    has the window but no reading has no window open, which is 0% used. With
+    no reading, a Codex window and a window that jacked cannot confirm are
+    None. When the plan resolver fails, the 5-hour slot shows the cached
+    reading.
+
+    The 7-day slot keeps the cached rule: a Claude window with no reading is
+    0% used, and a Codex window with no reading is a window Codex does not
+    report, so it stays None instead of reading as 0% headroom.
+    ``max_pct`` and ``color`` come from the slots that have a value; with no
+    value in either slot there is no summary. ``blocked`` carries the
+    provider's own usage-blocked verdict (:func:`usage_block_of_row`); a
+    blocked account is red at any percent.
 
     >>> s = summarize_account({"id": 1, "email": "a@x.com",
     ...                        "cached_usage_5h": 37, "cached_usage_7d": 87})
@@ -74,6 +127,18 @@ def summarize_account(acct: dict) -> Optional[dict]:
     >>> c = summarize_account({"id": 2, "provider": "codex", "cached_usage_7d": 40})
     >>> c["five_hour"], c["seven_day"], c["max_pct"], c["color"]
     (None, 40.0, 40.0, 'green')
+
+    A verified Ultra account lists its limits without a 5-hour session, so
+    an old 5-hour value in the cache is not a reading:
+
+    >>> ultra = {"id": 3, "subscription_type": "max",
+    ...          "rate_limit_tier": "default_claude_max_20x",
+    ...          "cached_usage_5h": 67.0, "cached_usage_7d": 33.0,
+    ...          "cached_usage_raw": json.dumps({"five_hour": None,
+    ...              "limits": [{"kind": "weekly_all", "percent": 33}]})}
+    >>> u = summarize_account(ultra)
+    >>> u["five_hour"], u["max_pct"], u["color"], menubar_title(u)
+    (None, 33.0, 'green', '-·33%')
     """
     if not acct:
         return None
@@ -83,14 +148,19 @@ def summarize_account(acct: dict) -> Optional[dict]:
         return None
     provider = acct.get("provider") or "claude"
 
-    def _window(value):
-        if value is None and provider == "codex":
-            return None
-        return round(float(value or 0.0), 1)
-
-    f5 = _window(u5)
-    f7 = _window(u7)
-    worst = max(v for v in (f5, f7) if v is not None)
+    view = safe_account_view(acct)
+    five = view.five_hour_reading() if view is not None else u5
+    f5 = None if five is None else round(float(five), 1)
+    if u7 is None and provider == "codex":
+        f7 = None
+    else:
+        f7 = round(float(u7 or 0.0), 1)
+    readings = [v for v in (f5, f7) if v is not None]
+    if not readings:
+        # No window has a reading (a Codex plan without a 5-hour window and
+        # no weekly reading): nothing to show.
+        return None
+    worst = max(readings)
     blocked = usage_block_of_row(acct) is not None
     return {
         "account_id": acct.get("id"),
@@ -254,8 +324,11 @@ def _as_num(v) -> float | int:
         return 0
 
 
-def _claude_scoped_models(raw: dict) -> list[dict]:
+def _claude_scoped_models(raw: dict, plan=None) -> list[dict]:
     """Claude ``weekly_scoped`` model caps from the ``limits`` array."""
+    from jacked.usage_plans import clean_label, model_window_seconds
+
+    window_secs = model_window_seconds("claude", None, "weekly_model", plan)
     out: list[dict] = []
     limits = raw.get("limits")
     if not isinstance(limits, list):
@@ -265,7 +338,9 @@ def _claude_scoped_models(raw: dict) -> list[dict]:
             continue
         scope = lim.get("scope")
         model = scope.get("model") if isinstance(scope, dict) else None
-        label = model.get("display_name") if isinstance(model, dict) else None
+        # Provider text reaches the dashboard and the terminal: no control
+        # or invisible characters, at most 40 characters.
+        label = clean_label(model.get("display_name")) if isinstance(model, dict) else None
         if not label:
             continue
         out.append(
@@ -276,13 +351,21 @@ def _claude_scoped_models(raw: dict) -> list[dict]:
                 "resets_at": lim.get("resets_at"),
                 "severity": lim.get("severity"),
                 "is_active": bool(lim.get("is_active")),
+                "window_seconds": window_secs,
             }
         )
     return out
 
 
-def _codex_named_models(raw: dict) -> list[dict]:
-    """Codex named per-model limits from ``rateLimitsByLimitId``."""
+def _codex_named_models(raw: dict, plan=None) -> list[dict]:
+    """Codex named per-model limits from ``rateLimitsByLimitId``.
+
+    ``window_seconds`` is the chosen window's own ``windowDurationMins`` when
+    it has one, else the length of the slot it came from (``weekly`` for a
+    secondary window, ``session`` for a primary one).
+    """
+    from jacked.usage_plans import clean_label, model_window_seconds
+
     out: list[dict] = []
     by_limit = raw.get("rateLimitsByLimitId")
     if not isinstance(by_limit, dict):
@@ -290,15 +373,17 @@ def _codex_named_models(raw: dict) -> list[dict]:
     for limit_id, entry in by_limit.items():
         if not isinstance(entry, dict):
             continue
-        label = entry.get("limitName")
+        label = clean_label(entry.get("limitName"))
         if not label:
             continue  # bare overall limit — already the 5h/7d bars
         # Prefer the weekly (secondary) window; fall back to primary (5h).
         window = entry.get("secondary")
+        slot = "weekly"
         if not isinstance(window, dict) or window.get("usedPercent") is None:
             window = (
                 entry.get("primary") if isinstance(entry.get("primary"), dict) else {}
             )
+            slot = "session"
         out.append(
             {
                 "key": str(limit_id).lower(),
@@ -307,13 +392,17 @@ def _codex_named_models(raw: dict) -> list[dict]:
                 "resets_at": _epoch_to_iso(window.get("resetsAt")),
                 "severity": None,
                 "is_active": False,
+                "window_seconds": model_window_seconds("codex", window, slot, plan),
             }
         )
     return out
 
 
-def _legacy_seven_day_models(raw: dict) -> list[dict]:
+def _legacy_seven_day_models(raw: dict, plan=None) -> list[dict]:
     """Legacy ``seven_day_<model>`` caps — dict OR bare numeric (old payloads)."""
+    from jacked.usage_plans import model_window_seconds
+
+    window_secs = model_window_seconds("claude", None, "weekly_model", plan)
     out: list[dict] = []
     for suffix, label in _LEGACY_MODEL_LABELS.items():
         val = raw.get(f"seven_day_{suffix}")
@@ -326,6 +415,7 @@ def _legacy_seven_day_models(raw: dict) -> list[dict]:
                     "resets_at": val.get("resets_at"),
                     "severity": None,
                     "is_active": False,
+                    "window_seconds": window_secs,
                 }
             )
         elif isinstance(val, (int, float)) and not isinstance(val, bool):
@@ -337,17 +427,20 @@ def _legacy_seven_day_models(raw: dict) -> list[dict]:
                     "resets_at": None,
                     "severity": None,
                     "is_active": False,
+                    "window_seconds": window_secs,
                 }
             )
     return out
 
 
-def parse_per_model(raw: Optional[dict]) -> list[dict]:
+def parse_per_model(raw: Optional[dict], plan=None) -> list[dict]:
     """Extract per-model usage caps from a raw usage payload (Claude or Codex).
 
-    Returns a list of dicts, each shaped
-    ``{"key", "label", "utilization", "resets_at", "severity", "is_active"}``,
-    sorted by utilization descending. Providers are merged with the first
+    Returns a list of dicts, each shaped ``{"key", "label", "utilization",
+    "resets_at", "severity", "is_active", "window_seconds"}``, sorted by
+    utilization descending. ``window_seconds`` is the length of the limit's
+    window (the dashboard draws the elapsed marker from it); *plan* (a
+    :class:`jacked.usage_plans.PlanMatch`) supplies plan-specific lengths. Providers are merged with the first
     source (Claude limits) winning on key collisions; the legacy source only
     fills keys not already present. Empty list when the payload has no per-model
     breakdown or is not a dict.
@@ -382,9 +475,9 @@ def parse_per_model(raw: Optional[dict]) -> list[dict]:
 
     out: dict[str, dict] = {}
     for entry in (
-        *_claude_scoped_models(raw),
-        *_codex_named_models(raw),
-        *_legacy_seven_day_models(raw),
+        *_claude_scoped_models(raw, plan),
+        *_codex_named_models(raw, plan),
+        *_legacy_seven_day_models(raw, plan),
     ):
         out.setdefault(entry["key"], entry)  # first source wins per key
 
@@ -420,19 +513,20 @@ def binding_model(per_model: list[dict]) -> Optional[dict]:
     return per_model[0] if per_model else None
 
 
-def binding_model_compact(raw: Optional[dict]) -> Optional[dict]:
+def binding_model_compact(raw: Optional[dict], plan=None) -> Optional[dict]:
     """Compact binding-model summary for a raw usage payload, for the inline
     bar's WebSocket payloads. Returns ``{label, utilization, resets_at,
-    severity}`` or None.
+    severity, is_active, window_seconds}`` or None. *plan* supplies
+    plan-specific window lengths (see :func:`parse_per_model`).
 
     >>> binding_model_compact({"limits": [
     ...     {"kind": "weekly_scoped", "percent": 92, "severity": "critical",
     ...      "is_active": True, "scope": {"model": {"display_name": "Fable"}}}]})
-    {'label': 'Fable', 'utilization': 92, 'resets_at': None, 'severity': 'critical'}
+    {'label': 'Fable', 'utilization': 92, 'resets_at': None, 'severity': 'critical', 'is_active': True, 'window_seconds': 604800}
     >>> binding_model_compact({}) is None
     True
     """
-    bm = binding_model(parse_per_model(raw))
+    bm = binding_model(parse_per_model(raw, plan))
     if bm is None:
         return None
     return {
@@ -440,6 +534,8 @@ def binding_model_compact(raw: Optional[dict]) -> Optional[dict]:
         "utilization": bm["utilization"],
         "resets_at": bm.get("resets_at"),
         "severity": bm.get("severity"),
+        "is_active": bool(bm.get("is_active")),
+        "window_seconds": bm.get("window_seconds"),
     }
 
 

@@ -16,13 +16,22 @@ tests pin the JSON contract that skill depends on:
   reset never sets the pause target (the wake/pause-treadmill bug), and
   one window resetting while the account's other window stays constrained
   does not either (the intra-account premature-wake bug);
-- one hostile row (TEXT percent, naive timestamp) degrades, never crashes.
+- one hostile row (TEXT percent, naive timestamp) degrades, never crashes;
+- windows are plan-aware: a plan without a 5-hour window (a verified Ultra,
+  ChatGPT Pro) reports null 5h fields, and its worst window is the weekly
+  one even when a stale 5h value lingers in the cache;
+- ``selected`` comes from jacked's own database (desired account first),
+  and ``in_use`` from the session tracker by process ancestry, never the
+  credential store;
+- ``--provider`` limits the rows AND the summary to one provider.
 """
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from jacked.cli import main
@@ -32,13 +41,30 @@ ROW_KEYS = {
     "id", "provider", "email", "subscription_type", "is_active",
     "validation_status", "usage_5h_pct", "usage_7d_pct",
     "resets_5h_at", "resets_7d_at", "cache_age_seconds",
+    "plan", "plan_id", "session_window", "model_limits",
+    "worst_window_pct", "worst_window", "worst_window_resets_at", "selected",
+    "in_use",
 }
+MODEL_LIMIT_KEYS = {"label", "pct", "resets_at", "window_seconds"}
 
 
-def _seed_db(home: Path, accounts: list[dict]) -> None:
+@pytest.fixture(autouse=True)
+def _no_calling_session(monkeypatch):
+    """No test walks the real process table: by default no tracked session
+    runs the command. Tests of ``in_use`` set the ancestry themselves; every
+    tracked process counts as started long before its tracker row."""
+    import jacked.session_ancestry as ancestry
+
+    monkeypatch.setattr(ancestry, "ancestor_pids", lambda *a, **k: [])
+    monkeypatch.setattr(ancestry, "process_start", lambda pid: 1.0)
+
+
+def _seed_db(home: Path, accounts: list[dict]) -> list[int]:
+    """Create the accounts and return their ids, in order."""
     db_path = home / ".claude" / "jacked.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = Database(str(db_path))
+    ids: list[int] = []
     try:
         for acct in accounts:
             row = db.create_account(
@@ -49,6 +75,7 @@ def _seed_db(home: Path, accounts: list[dict]) -> None:
                 organization_uuid=acct.get("organization_uuid", "org-" + acct["email"]),
                 provider=acct.get("provider", "claude"),
             )
+            ids.append(row["id"])
             updates = {
                 k: v for k, v in acct.items()
                 if k in {
@@ -56,12 +83,83 @@ def _seed_db(home: Path, accounts: list[dict]) -> None:
                     "cached_5h_resets_at", "cached_7d_resets_at",
                     "usage_cached_at", "subscription_type",
                     "validation_status", "is_active",
+                    "rate_limit_tier", "cached_usage_raw", "profile_json",
                 }
             }
             if updates:
                 db.update_account(row["id"], **updates)
     finally:
         db.close()
+    return ids
+
+
+def _ultra_raw(resets_7d: str) -> str:
+    """A verified Ultra payload (live shape, 2026-11-01): no session limit."""
+    return json.dumps({
+        "five_hour": None,
+        "seven_day": {"utilization": 33.0, "resets_at": resets_7d},
+        "limits": [
+            {"kind": "weekly_all", "group": "weekly", "percent": 33,
+             "resets_at": resets_7d, "scope": None, "is_active": False},
+            {"kind": "weekly_scoped", "group": "weekly", "percent": 61,
+             "resets_at": resets_7d, "is_active": True,
+             "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None}},
+        ],
+    })
+
+
+def _max_raw(resets_5h: str, resets_7d: str) -> str:
+    """A Max (formerly Max 5x) payload: session + weekly limits."""
+    return json.dumps({
+        "five_hour": {"utilization": 67.0, "resets_at": resets_5h},
+        "seven_day": {"utilization": 23.0, "resets_at": resets_7d},
+        "limits": [
+            {"kind": "session", "group": "session", "percent": 67,
+             "resets_at": resets_5h, "scope": None, "is_active": True},
+            {"kind": "weekly_all", "group": "weekly", "percent": 23,
+             "resets_at": resets_7d, "scope": None, "is_active": False},
+        ],
+    })
+
+
+def _codex_pro_raw(resets_epoch: int) -> str:
+    """A ChatGPT Pro Codex payload: one weekly primary window, no 5h window."""
+    return json.dumps({"rateLimits": {
+        "primary": {"usedPercent": 38, "windowDurationMins": 10080, "resetsAt": resets_epoch},
+        "secondary": None,
+        "planType": "pro",
+    }})
+
+
+def _forbid_credential_store(monkeypatch) -> list:
+    """Make every credential-store read fail loudly; return the touch log."""
+    import jacked.api.credential_helpers as helpers
+    from jacked.credentials import file_store, macos_store
+
+    touched: list = []
+
+    def _boom(*_args, **_kwargs):
+        touched.append(True)
+        raise AssertionError("jacked usage must never read the credential store")
+
+    monkeypatch.setattr(macos_store.MacOSCredentialStore, "read", _boom)
+    monkeypatch.setattr(macos_store.SecurityCliBackend, "read", _boom)
+    monkeypatch.setattr(file_store.FileCredentialStore, "read", _boom)
+    monkeypatch.setattr(helpers, "read_platform_credentials", _boom)
+    return touched
+
+
+def _table_row(output: str, email: str) -> dict:
+    """The human table's cells for *email*, keyed by column header."""
+    header = next(
+        line for line in output.splitlines() if "Plan" in line and "Model" in line
+    )
+    row = next(line for line in output.splitlines() if email in line)
+
+    def cells(line: str) -> list[str]:
+        return [c.strip() for c in re.split(r"[│┃|]", line)[1:-1]]
+
+    return dict(zip(cells(header), cells(row)))
 
 
 def _run_json(args=("usage", "--json")):
@@ -402,3 +500,347 @@ def test_table_constrained_line_wording(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "Earliest constrained-window reset" in result.output
     assert "All eligible accounts constrained" not in result.output
+
+
+# --------------------------------------------------------------------------- #
+# Plan-aware windows, active account, provider filter
+# --------------------------------------------------------------------------- #
+
+
+def test_verified_ultra_row_reports_no_5h_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    now = datetime.now(timezone.utc)
+    future_5h = (now + timedelta(hours=2)).isoformat()
+    future_7d = (now + timedelta(days=3)).isoformat()
+    _seed_db(tmp_path, [{
+        "email": "ultra@test.com", "validation_status": "valid",
+        "subscription_type": "max", "rate_limit_tier": "default_claude_max_20x",
+        "cached_usage_raw": _ultra_raw(future_7d),
+        # A stale 5h reading from before verification, HIGHER than the 7d
+        # one: if anything still counted it, the worst window would be "5h".
+        "cached_usage_5h": 88.0, "cached_5h_resets_at": future_5h,
+        "cached_usage_7d": 33.0, "cached_7d_resets_at": future_7d,
+        "usage_cached_at": int(now.timestamp()) - 60,
+    }])
+    result, payload = _run_json()
+    row = payload["accounts"][0]
+    assert set(row) == ROW_KEYS
+    assert row["plan"] == "Ultra"
+    assert row["plan_id"] == "ultra"
+    assert row["session_window"] == "absent"
+    assert row["usage_5h_pct"] is None
+    assert row["resets_5h_at"] is None
+    assert row["usage_7d_pct"] == 33.0
+    assert row["worst_window"] == "7d"
+    assert row["worst_window_pct"] == 33.0
+    assert row["worst_window_resets_at"] == datetime.fromisoformat(future_7d).isoformat()
+    assert row["model_limits"] == [
+        {"label": "Fable", "pct": 61.0, "resets_at": future_7d, "window_seconds": 604800},
+    ]
+    assert row["selected"] is False
+    assert row["in_use"] is False
+    assert payload["summary"]["best_account_worst_window"] == "7d"
+    assert "tok-secret" not in result.output
+
+
+def test_max_row_worst_window_is_the_higher_5h(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    now = datetime.now(timezone.utc)
+    future_5h = (now + timedelta(hours=2)).isoformat()
+    future_7d = (now + timedelta(days=3)).isoformat()
+    _seed_db(tmp_path, [{
+        "email": "max@test.com", "validation_status": "valid",
+        "subscription_type": "max", "rate_limit_tier": "default_claude_max_5x",
+        "cached_usage_raw": _max_raw(future_5h, future_7d),
+        "cached_usage_5h": 67.0, "cached_5h_resets_at": future_5h,
+        "cached_usage_7d": 23.0, "cached_7d_resets_at": future_7d,
+        "usage_cached_at": int(now.timestamp()) - 60,
+    }])
+    _, payload = _run_json()
+    row = payload["accounts"][0]
+    assert (row["plan"], row["plan_id"], row["session_window"]) == ("Max", "max", "present")
+    assert row["usage_5h_pct"] == 67.0
+    assert row["resets_5h_at"] == future_5h
+    assert row["worst_window"] == "5h"
+    assert row["worst_window_pct"] == 67.0
+    assert row["worst_window_resets_at"] == datetime.fromisoformat(future_5h).isoformat()
+    assert row["model_limits"] == []
+
+
+def test_codex_pro_row_reports_no_5h_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    now = datetime.now(timezone.utc)
+    reset = now + timedelta(days=4)
+    _seed_db(tmp_path, [{
+        "email": "codex@test.com", "provider": "codex", "validation_status": "valid",
+        "subscription_type": "pro",
+        "cached_usage_raw": _codex_pro_raw(int(reset.timestamp())),
+        "cached_usage_7d": 38.0, "cached_7d_resets_at": reset.isoformat(),
+        "usage_cached_at": int(now.timestamp()) - 60,
+    }])
+    _, payload = _run_json()
+    row = payload["accounts"][0]
+    assert row["provider"] == "codex"
+    assert (row["plan"], row["plan_id"], row["session_window"]) == ("Pro", "pro", "absent")
+    assert row["usage_5h_pct"] is None
+    assert row["worst_window"] == "7d"
+    assert row["worst_window_pct"] == 38.0
+
+
+def test_model_limit_entries_are_allowlisted_and_coerced(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    future_7d = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+    raw = json.loads(_ultra_raw(future_7d))
+    # Extra keys in the provider entry must never reach the row.
+    raw["limits"][1]["secret_ish"] = "should-not-leak"
+    _seed_db(tmp_path, [{
+        "email": "u@test.com", "subscription_type": "max",
+        "rate_limit_tier": "default_claude_max_20x",
+        "cached_usage_raw": json.dumps(raw),
+    }])
+    result, payload = _run_json()
+    (limit,) = payload["accounts"][0]["model_limits"]
+    assert set(limit) == MODEL_LIMIT_KEYS
+    assert isinstance(limit["pct"], float)
+    assert "should-not-leak" not in result.output
+
+
+def test_selected_is_read_from_jacked_database_once_per_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ids = _seed_db(tmp_path, [
+        {"email": "a@test.com", "validation_status": "valid", "cached_usage_7d": 10.0},
+        {"email": "b@test.com", "validation_status": "valid", "cached_usage_7d": 20.0},
+        {"email": "c@test.com", "provider": "codex", "validation_status": "valid",
+         "cached_usage_7d": 30.0},
+    ])
+    calls: list[str] = []
+
+    def fake_selected(self, provider="claude"):
+        calls.append(provider)
+        return {"claude": ids[1], "codex": ids[2]}.get(provider)
+
+    monkeypatch.setattr(Database, "get_selected_account_id", fake_selected)
+    touched = _forbid_credential_store(monkeypatch)
+    _, payload = _run_json()
+    by_email = {a["email"]: a for a in payload["accounts"]}
+    assert by_email["a@test.com"]["selected"] is False
+    assert by_email["b@test.com"]["selected"] is True
+    assert by_email["c@test.com"]["selected"] is True
+    assert sorted(calls) == ["claude", "codex"]  # one read per provider
+    assert touched == []
+
+
+def test_selected_prefers_the_desired_account(tmp_path, monkeypatch):
+    """The common macOS switch outcome (observed_target_unfenced) writes
+    only desired_account_id and leaves active_account_id behind: the
+    selected row is the desired account, not the stale active one."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ids = _seed_db(tmp_path, [
+        {"email": "a@test.com"}, {"email": "b@test.com"},
+        {"email": "c@test.com", "provider": "codex"},
+    ])
+    db = Database(str(tmp_path / ".claude" / "jacked.db"))
+    try:
+        db.set_active_account_id(ids[0], provider="claude")
+        db.set_setting("desired_account_id", str(ids[1]))
+        db.set_active_account_id(ids[2], provider="codex")
+    finally:
+        db.close()
+    touched = _forbid_credential_store(monkeypatch)
+    _, payload = _run_json()
+    selected = {a["email"]: a["selected"] for a in payload["accounts"]}
+    assert selected == {"a@test.com": False, "b@test.com": True, "c@test.com": True}
+    assert touched == []
+
+
+def test_in_use_is_the_calling_sessions_account(tmp_path, monkeypatch):
+    """The command descends from a tracked Claude Code process: that
+    session's account is in_use, whatever account is selected."""
+    import jacked.session_ancestry as ancestry
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ids = _seed_db(tmp_path, [{"email": "a@test.com"}, {"email": "b@test.com"}])
+    db = Database(str(tmp_path / ".claude" / "jacked.db"))
+    try:
+        db.set_setting("desired_account_id", str(ids[0]))
+        db.record_session_account("old", account_id=ids[0], email="a@test.com",
+                                  detection_method="session_start", pid=4100)
+        db.end_session_account("old")
+        db.record_session_account("s-1", account_id=ids[1], email="b@test.com",
+                                  detection_method="session_start", pid=4100)
+    finally:
+        db.close()
+    monkeypatch.setattr(ancestry, "ancestor_pids", lambda *a, **k: [5000, 4100, 300])
+    touched = _forbid_credential_store(monkeypatch)
+    _, payload = _run_json()
+    by_email = {a["email"]: a for a in payload["accounts"]}
+    assert by_email["b@test.com"]["in_use"] is True
+    assert by_email["a@test.com"]["in_use"] is False
+    assert by_email["a@test.com"]["selected"] is True
+    assert touched == []
+
+
+def test_no_tracked_session_marks_nothing_in_use(tmp_path, monkeypatch):
+    import jacked.session_ancestry as ancestry
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    ids = _seed_db(tmp_path, [{"email": "a@test.com"}])
+    db = Database(str(tmp_path / ".claude" / "jacked.db"))
+    try:
+        db.record_session_account("s-1", account_id=ids[0], email="a@test.com",
+                                  detection_method="session_start", pid=4100)
+    finally:
+        db.close()
+    monkeypatch.setattr(ancestry, "ancestor_pids", lambda *a, **k: [7777])
+    _, payload = _run_json()
+    assert [a["in_use"] for a in payload["accounts"]] == [False]
+
+
+def test_an_ancestry_error_never_fails_the_command(tmp_path, monkeypatch):
+    """The in_use lookup is advisory: an unreadable process table (hidepid,
+    a locked DB) leaves in_use False and the command still answers."""
+    import jacked.session_ancestry as ancestry
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _seed_db(tmp_path, [{"email": "a@test.com"}])
+
+    def _boom(*_a, **_k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(ancestry, "ancestor_pids", _boom)
+    _, payload = _run_json()
+    assert [a["in_use"] for a in payload["accounts"]] == [False]
+
+
+def test_provider_filter_limits_rows_and_summary(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    now = datetime.now(timezone.utc)
+    cached = int(now.timestamp()) - 60
+    _seed_db(tmp_path, [
+        {"email": "claude@test.com", "validation_status": "valid",
+         "cached_usage_7d": 80.0, "usage_cached_at": cached},
+        {"email": "codex@test.com", "provider": "codex", "validation_status": "valid",
+         "cached_usage_7d": 10.0, "usage_cached_at": cached},
+    ])
+    _, payload = _run_json()
+    assert payload["provider"] is None
+    assert {a["email"] for a in payload["accounts"]} == {"claude@test.com", "codex@test.com"}
+    assert payload["summary"]["best_account_email"] == "codex@test.com"
+
+    _, payload = _run_json(("usage", "--json", "--provider", "claude"))
+    assert payload["provider"] == "claude"
+    assert {a["email"] for a in payload["accounts"]} == {"claude@test.com"}
+    assert payload["summary"]["best_account_email"] == "claude@test.com"
+    assert payload["summary"]["best_account_worst_window_pct"] == 80.0
+    assert payload["summary"]["accounts_with_usage_data"] == 1
+
+    _, payload = _run_json(("usage", "--json", "--provider", "codex"))
+    assert payload["provider"] == "codex"
+    assert {a["email"] for a in payload["accounts"]} == {"codex@test.com"}
+    assert payload["summary"]["best_account_email"] == "codex@test.com"
+
+    _, payload = _run_json(("usage", "--json", "--provider", "Claude"))
+    assert payload["provider"] == "claude"
+    assert {a["email"] for a in payload["accounts"]} == {"claude@test.com"}
+
+    bad = CliRunner().invoke(main, ["usage", "--json", "--provider", "gemini"])
+    assert bad.exit_code == 2
+
+
+def test_table_shows_plan_none_and_model_columns(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("COLUMNS", "300")
+    now = datetime.now(timezone.utc)
+    future_5h = (now + timedelta(hours=2)).isoformat()
+    future_7d = (now + timedelta(days=3)).isoformat()
+    cached = int(now.timestamp()) - 60
+    _seed_db(tmp_path, [
+        {"email": "ultra@test.com", "validation_status": "valid",
+         "subscription_type": "max", "rate_limit_tier": "default_claude_max_20x",
+         "cached_usage_raw": _ultra_raw(future_7d),
+         "cached_usage_5h": 88.0, "cached_5h_resets_at": future_5h,
+         "cached_usage_7d": 33.0, "cached_7d_resets_at": future_7d,
+         "usage_cached_at": cached},
+        {"email": "max@test.com", "validation_status": "valid",
+         "subscription_type": "max", "rate_limit_tier": "default_claude_max_5x",
+         "cached_usage_raw": _max_raw(future_5h, future_7d),
+         "cached_usage_5h": 67.0, "cached_5h_resets_at": future_5h,
+         "cached_usage_7d": 23.0, "cached_7d_resets_at": future_7d,
+         "usage_cached_at": cached},
+        {"email": "bare@test.com", "cached_usage_5h": 5.0},
+    ])
+    result = CliRunner().invoke(main, ["usage"])
+    assert result.exit_code == 0, result.output
+
+    ultra = _table_row(result.output, "ultra@test.com")
+    assert ultra["Plan"] == "Ultra"
+    assert ultra["5h %"] == "none"
+    assert ultra["5h resets (UTC)"] == "none"
+    assert ultra["7d %"] == "33%"
+    assert ultra["Model"] == "Fable 61%"
+
+    max_row = _table_row(result.output, "max@test.com")
+    assert max_row["Plan"] == "Max"
+    assert max_row["5h %"] == "67%"
+    assert max_row["5h resets (UTC)"] == future_5h
+    assert max_row["Model"] == "-"
+
+    bare = _table_row(result.output, "bare@test.com")
+    assert bare["Plan"] == "?"
+    assert bare["5h %"] == "5%"
+
+
+def test_table_prints_provider_names_as_text(tmp_path, monkeypatch):
+    """Plan and model names come from the provider. Rich must print them as
+    text: read as markup, "[beta]" vanishes from the cell and "[/x]" stops
+    the whole table with an error."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("COLUMNS", "300")
+    future_7d = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+    raw = json.loads(_ultra_raw(future_7d))
+    raw["limits"][1]["scope"]["model"]["display_name"] = "Fable [/x]"
+    _seed_db(tmp_path, [{
+        "email": "u@test.com", "subscription_type": "max",
+        "rate_limit_tier": "default_claude_max_20x",
+        "cached_usage_raw": json.dumps(raw),
+        "profile_json": json.dumps({
+            "account": {"email": "u@test.com"},
+            "organization": {"uuid": "org-u@test.com", "plan_display_name": "Ultra [beta]"},
+        }),
+    }])
+    result = CliRunner().invoke(main, ["usage"])
+    assert result.exit_code == 0, result.output
+    row = _table_row(result.output, "u@test.com")
+    assert row["Plan"] == "Ultra [beta]"
+    assert row["Model"] == "Fable [/x] 61%"
+
+
+def test_table_strips_terminal_control_sequences(tmp_path, monkeypatch):
+    """A provider name with escape sequences never reaches the terminal raw
+    (Rich escapes markup but passes ESC through)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("COLUMNS", "300")
+    future_7d = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+    raw = json.loads(_ultra_raw(future_7d))
+    raw["limits"][1]["scope"]["model"]["display_name"] = "Fable\x1b]0;owned\x07\x1b[2J"
+    _seed_db(tmp_path, [{
+        "email": "u@test.com", "subscription_type": "max",
+        "rate_limit_tier": "default_claude_max_20x", "cached_usage_raw": json.dumps(raw),
+    }])
+    result = CliRunner().invoke(main, ["usage"])
+    assert result.exit_code == 0, result.output
+    assert "\x1b" not in result.output and "\x07" not in result.output
+
+
+def test_absurd_window_length_never_crashes_the_command(tmp_path, monkeypatch):
+    """An "unlimited" sentinel window length falls back to the plan length."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    raw = {"rateLimits": {"primary": {"usedPercent": 3, "windowDurationMins": 10080,
+                                      "resetsAt": 1793780314}, "secondary": None},
+           "rateLimitsByLimitId": {"spark": {"limitName": "Spark", "secondary": {
+               "usedPercent": 4, "windowDurationMins": 1.7976931348623157e308}}}}
+    _seed_db(tmp_path, [{"email": "c@test.com", "provider": "codex", "subscription_type": "pro",
+                         "cached_usage_raw": json.dumps(raw), "cached_usage_7d": 3.0}])
+    _, payload = _run_json()
+    (limit,) = payload["accounts"][0]["model_limits"]
+    assert limit["window_seconds"] == 7 * 86400

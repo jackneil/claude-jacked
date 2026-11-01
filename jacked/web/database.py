@@ -24,6 +24,12 @@ from pydantic import BaseModel, computed_field
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on the JSON text of a stored raw usage payload, in characters.
+# A guard against a runaway payload, not a size a provider is expected to
+# reach: live payloads are 1.2-2.8 KB. The old 10 KB bound skipped larger
+# payloads without a word and kept the previous one beside the new readings.
+_RAW_USAGE_MAX_CHARS = 256 * 1024
+
 # A query made on an event-loop thread blocks every route and background
 # loop of the service until it returns (#162). Every query is checked: the
 # first query from each call site logs a WARNING that names the site, so a
@@ -1571,6 +1577,7 @@ class Database:
             "skip_reason",
             "paused_until",
             "token_fp",
+            "backoff_fails",
         }
     )
 
@@ -1679,6 +1686,17 @@ class Database:
         >>> row = db.get_account(acct["id"])
         >>> (row["cached_usage_5h"], row["cached_5h_resets_at"])
         (8.0, None)
+
+        A raw payload is stored when its JSON text is at most
+        ``_RAW_USAGE_MAX_CHARS`` characters. A larger payload clears the
+        stored one in the same write (with a WARNING that names the account
+        and the size), so the stored payload is never older than the
+        readings beside it:
+
+        >>> _ = db.update_account_usage_cache(
+        ...     acct["id"], raw={"pad": "x" * _RAW_USAGE_MAX_CHARS})
+        >>> db.get_account(acct["id"])["cached_usage_raw"] is None
+        True
         """
         updates: dict[str, Any] = {"usage_cached_at": int(time.time())}
         if clear_five_hour:
@@ -1701,8 +1719,22 @@ class Database:
             updates["cached_7d_resets_at"] = None
         if raw is not None:
             raw_str = json.dumps(raw)
-            if len(raw_str) <= 10240:  # 10KB guard
+            if len(raw_str) <= _RAW_USAGE_MAX_CHARS:
                 updates["cached_usage_raw"] = raw_str
+            else:
+                # Never keep the previous payload beside the new readings:
+                # the plan resolver reads the stored payload as evidence (for
+                # example "this account has no 5-hour window"), and an old
+                # payload must not contradict the numbers of this write.
+                updates["cached_usage_raw"] = None
+                logger.warning(
+                    "Usage payload for account %s is %d characters, more than "
+                    "the %d-character limit; cleared the stored payload and "
+                    "kept the new readings",
+                    account_id,
+                    len(raw_str),
+                    _RAW_USAGE_MAX_CHARS,
+                )
         ok = self.update_account(account_id, **updates)
         if ok:
             # Wake same-process watchers (the menu-bar pill) immediately
@@ -2162,6 +2194,73 @@ class Database:
             return int(raw)
         except (TypeError, ValueError):
             return None
+
+    def get_selected_account_id(self, provider: str = "claude") -> Optional[int]:
+        """The account jacked last selected for new sessions of ``provider``.
+
+        Claude: ``desired_account_id``, else ``active_account_id`` (the same
+        order every credential surface uses). A switch writes the desired id
+        on every successful outcome, including ``observed_target_unfenced``,
+        which leaves the active id behind. Codex: its active account id.
+
+        >>> db = Database(":memory:")
+        >>> db.set_setting("active_account_id", "3")
+        >>> db.get_selected_account_id()
+        3
+        >>> db.set_setting("desired_account_id", "5")
+        >>> db.get_selected_account_id()
+        5
+        >>> db.get_selected_account_id("codex") is None
+        True
+        """
+        if provider == "claude":
+            for key in ("desired_account_id", "active_account_id"):
+                raw = self.get_setting(key)
+                try:
+                    account_id = int(raw) if raw else 0
+                except (TypeError, ValueError):
+                    continue
+                if account_id > 0:
+                    return account_id
+            return None
+        return self.get_active_account_id(provider)
+
+    def find_open_sessions(self, pids) -> dict:
+        """The newest open tracked session of each Claude Code process id in
+        *pids*: ``{pid: {"account_id": int or None, "detected_at": str}}``.
+
+        A session whose account is unknown is kept with ``account_id`` None:
+        the caller decides, never an older row or an outer session.
+
+        >>> db = Database(":memory:")
+        >>> _ = db.record_session_account("s-1", account_id=4, email="a@b.com",
+        ...                               detection_method="session_start", pid=4242)
+        >>> _ = db.record_session_account("s-2", detection_method="session_start", pid=5151)
+        >>> found = db.find_open_sessions([100, 4242, 5151])
+        >>> sorted(found), found[4242]["account_id"], found[5151]["account_id"]
+        ([4242, 5151], 4, None)
+        >>> db.find_open_sessions([True, -3, "7"])
+        {}
+        """
+        wanted = sorted({
+            p for p in pids if isinstance(p, int) and not isinstance(p, bool) and p > 1
+        })
+        if not wanted:
+            return {}
+        marks = ",".join("?" * len(wanted))
+        with self._reader() as conn:
+            rows = conn.execute(
+                f"SELECT pid, account_id, detected_at FROM session_accounts "
+                f"WHERE pid IN ({marks}) AND ended_at IS NULL ORDER BY id DESC",
+                wanted,
+            ).fetchall()
+        found: dict = {}
+        for pid, account_id, detected_at in rows:
+            found.setdefault(int(pid), {
+                "account_id": None if account_id is None else int(account_id),
+                "detected_at": detected_at,
+            })
+        return found
 
     def set_active_account_id(self, account_id: int, provider: str = "claude") -> None:
         """Set the active account id for ``provider``."""

@@ -56,13 +56,15 @@ function applyPanelColorTheme(theme) {
     return changed;
 }
 
-/** Compact "Max 20x" style plan badge from subscription_type + rate_limit_tier. */
+/** Plan badge text: the plan name the server resolved (org.plan.label, for
+ * example "Ultra", "Max", "Team"), else the capitalized subscription type of
+ * a payload from an older server, else ''. */
 function planLabel(org) {
-    const sub = (org.subscription_type || '').toString();
-    const tierMatch = (org.rate_limit_tier || '').match(/(\d+)x/);
-    if (!sub) return tierMatch ? tierMatch[1] + 'x' : '';
-    const label = sub.charAt(0).toUpperCase() + sub.slice(1);
-    return tierMatch ? label + ' ' + tierMatch[1] + 'x' : label;
+    const plan = org && org.plan;
+    const label = plan && typeof plan.label === 'string' ? plan.label.trim() : '';
+    if (label) return label;
+    const sub = String((org && org.subscription_type) || '').trim();
+    return sub ? sub.charAt(0).toUpperCase() + sub.slice(1) : '';
 }
 
 /** Short data-freshness label from usage_cached_at (unix seconds): now/5m/2h/3d. */
@@ -89,16 +91,15 @@ function formatCountdown(nextAt) {
 /** The compact usage bars for an account/org: 5h + 7d, plus the per-model cap
  * (e.g. Fable) whenever the account reports one — shown at any level, so every
  * account's model usage is visible. Accounts with no per-model cap in their
- * payload get just the two window bars. */
+ * payload get just the two window bars. The window key reads the plan's window
+ * state and length (org.windows): a plan with no 5-hour window reads "none". */
 function orgBarsHtml(org) {
-    const elapsed5h = computeElapsedFraction5h(org.cached_5h_resets_at);
-    const elapsed7d = computeElapsedFraction7d(org.cached_7d_resets_at);
     let html =
-        renderUsageBar(org.cached_usage_5h, org.cached_5h_resets_at, elapsed5h, '5h', usageBarOpts(org, org.cached_5h_resets_at, { compact: true }, org.cached_usage_5h)) +
-        renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, elapsed7d, '7d', usageBarOpts(org, org.cached_7d_resets_at, { compact: true }, org.cached_usage_7d));
+        renderUsageBar(org.cached_usage_5h, org.cached_5h_resets_at, windowElapsed(org, 'five_hour'), '5h', usageBarOpts(org, 'five_hour', { compact: true })) +
+        renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, windowElapsed(org, 'seven_day'), '7d', usageBarOpts(org, 'seven_day', { compact: true }));
     const bm = org.usage && org.usage.binding_model;
     if (bm) {
-        html += renderUsageBar(bm.utilization, bm.resets_at, null, bm.label || 'model', { compact: true });
+        html += renderModelBar(bm, { compact: true });
     }
     return html;
 }
@@ -107,7 +108,10 @@ function orgBarsHtml(org) {
  * and — for the active account — a live "next refresh" countdown. */
 function orgMetaHtml(org, nextRefreshAt) {
     const plan = planLabel(org);
-    const planHtml = plan ? `<span class="plan-badge">${escapeHtml(plan)}</span>` : '';
+    // The former plan name rides the hover ("Formerly Max 20x").
+    const formerly = org.plan && org.plan.formerly ? 'Formerly ' + org.plan.formerly : '';
+    const planTitle = formerly ? ` title="${escapeHtml(formerly)}"` : '';
+    const planHtml = plan ? `<span class="plan-badge"${planTitle}>${escapeHtml(plan)}</span>` : '';
     const activeHtml = org.isActive
         ? '<span class="active-badge" title="Active in Claude Code">active</span>'
         : '';

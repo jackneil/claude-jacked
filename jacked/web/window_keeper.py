@@ -253,6 +253,31 @@ def parse_reset_value(value: str | None) -> str | None:
         return None
 
 
+def cache_reset_value(value) -> str | None:
+    """A usage payload's ``resets_at`` as the cache stores it; None = no reset.
+
+    An ISO string is kept as sent, epoch seconds become ISO, and an empty
+    string, junk or another type is no reset. An unparseable value must never
+    reach the cache: its readers disagree on what it means.
+
+    >>> cache_reset_value("2026-11-02T19:59:59+00:00"), cache_reset_value(1774933200)
+    ('2026-11-02T19:59:59+00:00', '2026-03-31T05:00:00+00:00')
+    >>> [cache_reset_value(v) for v in ("", "  ", "soon", True, {}, None)]
+    [None, None, None, None, None, None]
+    """
+    if value is None or isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    text = str(value).strip()
+    parsed = parse_reset_value(text)
+    if parsed is None or not isinstance(value, str):
+        return parsed
+    try:
+        float(text)
+    except ValueError:
+        return text  # an ISO string: the provider's own form
+    return parsed  # epoch digits sent as text
+
+
 def _parse_retry_after(value: str | None) -> float | None:
     """Seconds to wait from a Retry-After header (delta-seconds or HTTP-date).
 

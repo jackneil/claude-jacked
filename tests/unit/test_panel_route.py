@@ -52,6 +52,22 @@ def test_panel_html_ships_bar_styles():
     assert ".fill.red" in html and ".fill.yellow" in html and ".fill.green" in html
 
 
+def test_panel_html_defines_every_utility_the_bar_renderer_emits():
+    """The panel has no Tailwind: it ships a hand-written subset of utility
+    classes. Every opacity and text-color utility that the shared bar
+    renderer (usage.js) can emit must be in that subset, or the panel row
+    silently loses it (the dimmed track of a window with no reading, for
+    example)."""
+    import re
+
+    usage_js = (WEB_DIR / "js" / "components" / "usage.js").read_text(encoding="utf-8")
+    html = (WEB_DIR / "panel.html").read_text(encoding="utf-8")
+    emitted = set(re.findall(r"\b(opacity-\d+|text-(?:slate|amber|red|yellow)-\d+)\b", usage_js))
+    assert {"opacity-40", "opacity-60"} <= emitted  # the scan sees the renderer's classes
+    missing = sorted(c for c in emitted if f".{c} " not in html and f".{c}{{" not in html)
+    assert missing == [], f"panel.html lacks: {missing}"
+
+
 def test_component_files_exist_on_disk():
     assert (WEB_DIR / "panel.html").is_file()
     assert (WEB_DIR / "js" / "components" / "panel.js").is_file()
