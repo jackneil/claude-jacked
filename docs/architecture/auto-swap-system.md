@@ -243,8 +243,14 @@ The window keeper opens a 5-hour window on each enabled account when the
 window has lapsed. It does not ping for a 5-hour window on an account whose
 plan has none (keeper skip reason `no_session_window`); it can still ping such
 an account when its weekly window turned over. A ping is a success only when
-the windows that caused it are open after the read-back. Otherwise the keeper
-records `ping_ok_no_window` and doubles the retry delay, up to one hour. It runs in `full_sweep_loop`
+each window that caused it is open after the ping. A reset time in the future
+shows that a window is open. The API can omit the weekly reset time. A weekly
+window without a reset time is open when the usage read after the ping
+succeeds, or when the ping reply has window headers. Otherwise the keeper
+records `ping_ok_no_window` and doubles the retry delay, up to one hour. The
+keeper stores the count of failures, so a restart does not reset the delay. A
+reset value that is not a time (for example, an empty string) is stored as no
+reset. It runs in `full_sweep_loop`
 (`jacked/api/usage_monitor.py`) at the `usage_check_interval`. The wait
 between sweeps uses the wall clock, so a closed laptop does not stretch it.
 

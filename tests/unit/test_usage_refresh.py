@@ -573,8 +573,8 @@ def _seq_client(*statuses):
         resp.status_code = status
         resp.headers = {}
         resp.json.return_value = (
-            {"five_hour": {"utilization": 5.0, "resets_at": "R5"},
-             "seven_day": {"utilization": 6.0, "resets_at": "R7"}}
+            {"five_hour": {"utilization": 5.0, "resets_at": "2026-11-02T01:00:00Z"},
+             "seven_day": {"utilization": 6.0, "resets_at": "2026-11-08T19:00:00Z"}}
             if status == 200 else {}
         )
         resps.append(resp)
@@ -787,14 +787,14 @@ class TestNullWindows:
             1, five_hour=40.0, five_hour_resets_at="2026-10-17T10:00:00Z")
         db.update_account(1, usage_cached_at=0)
 
-        body = {"five_hour": None, "seven_day": {"utilization": 12.0, "resets_at": "R7"}}
+        body = {"five_hour": None, "seven_day": {"utilization": 12.0, "resets_at": "2026-11-08T19:00:00Z"}}
         assert self._fetch(db, body) == body
 
         row = db.get_account(1)
         assert row["cached_usage_5h"] is None
         assert row["cached_5h_resets_at"] is None
         assert row["cached_usage_7d"] == 12.0
-        assert row["cached_7d_resets_at"] == "R7"
+        assert row["cached_7d_resets_at"] == "2026-11-08T19:00:00Z"
 
     def test_null_resets_at_clears_the_stale_reset_and_keeps_utilization(self, tmp_path):
         """Account 1 kept a 10-17 reset for 9 days while the API said
@@ -820,14 +820,14 @@ class TestNullWindows:
     def test_missing_window_key_keeps_the_old_cache(self, tmp_path):
         db = _real_db(tmp_path)
         db.update_account_usage_cache(
-            1, seven_day=50.0, seven_day_resets_at="R7-old")
+            1, seven_day=50.0, seven_day_resets_at="2026-10-25T19:00:00Z")
         db.update_account(1, usage_cached_at=0)
 
-        self._fetch(db, {"five_hour": {"utilization": 3.0, "resets_at": "R5"}})
+        self._fetch(db, {"five_hour": {"utilization": 3.0, "resets_at": "2026-11-02T01:00:00Z"}})
 
         row = db.get_account(1)
         assert row["cached_usage_7d"] == 50.0
-        assert row["cached_7d_resets_at"] == "R7-old"
+        assert row["cached_7d_resets_at"] == "2026-10-25T19:00:00Z"
 
     # An authoritative Claude limits list (every kind known) names every
     # limit the account has. With no session entry the account has no
@@ -844,14 +844,14 @@ class TestNullWindows:
         db = _real_db(tmp_path)
         db.update_account_usage_cache(
             1, five_hour=100.0, five_hour_resets_at="2026-11-01T20:00:00Z",
-            seven_day=30.0, seven_day_resets_at="R7-old")
+            seven_day=30.0, seven_day_resets_at="2026-10-25T19:00:00Z")
         db.update_account(1, usage_cached_at=0)
         return db
 
     def test_authoritative_limits_without_a_session_clear_a_missing_5h_key(self, tmp_path):
         db = self._stale_5h_db(tmp_path)
         self._fetch(db, {
-            "seven_day": {"utilization": 41.0, "resets_at": "R7"},
+            "seven_day": {"utilization": 41.0, "resets_at": "2026-11-08T19:00:00Z"},
             "limits": self._WEEKLY_LIMITS,
         })
         row = db.get_account(1)
@@ -879,12 +879,12 @@ class TestNullWindows:
     def test_a_reported_five_hour_window_wins_over_a_session_free_list(self, tmp_path):
         db = self._stale_5h_db(tmp_path)
         self._fetch(db, {
-            "five_hour": {"utilization": 7.0, "resets_at": "R5-new"},
+            "five_hour": {"utilization": 7.0, "resets_at": "2026-11-02T03:00:00Z"},
             "limits": self._WEEKLY_LIMITS,
         })
         row = db.get_account(1)
         assert row["cached_usage_5h"] == 7.0
-        assert row["cached_5h_resets_at"] == "R5-new"
+        assert row["cached_5h_resets_at"] == "2026-11-02T03:00:00Z"
 
     def test_the_rule_matches_the_resolver_on_edge_lists(self):
         """usage_cache_updates clears exactly when jacked.usage_plans reads
