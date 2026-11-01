@@ -133,12 +133,13 @@ def _classify_windows(primary, secondary) -> dict:
 def normalize_rate_limits(result: Mapping) -> dict:
     """Map an ``account/rateLimits/read`` result to jacked's two-window shape.
 
-    Returns ``{"five_hour": {"utilization", "resets_at", "reported"},
-    "seven_day": {...}, "windows_complete", "plan_type", "credits",
-    "reset_credits", "by_limit"}``. Utilization is the app-server
-    ``usedPercent``; resets_at is an ISO string. A window Codex did not
-    report comes back as ``{"utilization": None, "resets_at": None,
-    "reported": False}``.
+    Returns ``{"five_hour": {"utilization", "resets_at", "reported",
+    "window_minutes"}, "seven_day": {...}, "windows_complete", "plan_type",
+    "credits", "reset_credits", "by_limit"}``. Utilization is the app-server
+    ``usedPercent``; resets_at is an ISO string; window_minutes is the
+    selected window's own ``windowDurationMins`` (None when unusable). A
+    window Codex did not report comes back as ``{"utilization": None,
+    "resets_at": None, "reported": False, "window_minutes": None}``.
 
     ``windows_complete`` is True only when the payload was AUTHORITATIVE
     about which windows exist: both window keys present (an explicit null
@@ -152,16 +153,22 @@ def normalize_rate_limits(result: Mapping) -> dict:
     slots = _classify_windows(rl.get("primary"), rl.get("secondary"))
     five = slots["five_hour"] or {}
     seven = slots["seven_day"] or {}
+    def _minutes(window: Mapping) -> Optional[float]:
+        dur = window.get("windowDurationMins")
+        return dur if _usable_duration(dur) else None
+
     return {
         "five_hour": {
             "utilization": five.get("usedPercent"),
             "resets_at": _epoch_to_iso(five.get("resetsAt")),
             "reported": slots["five_hour"] is not None,
+            "window_minutes": _minutes(five),
         },
         "seven_day": {
             "utilization": seven.get("usedPercent"),
             "resets_at": _epoch_to_iso(seven.get("resetsAt")),
             "reported": slots["seven_day"] is not None,
+            "window_minutes": _minutes(seven),
         },
         "windows_complete": (
             "primary" in rl

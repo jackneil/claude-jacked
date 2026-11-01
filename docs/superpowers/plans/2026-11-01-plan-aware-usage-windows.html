@@ -446,6 +446,7 @@ null reads 0). <code>menubar_summary.summarize_account</code> uses the same rule
   <li><input type="checkbox" checked disabled> <code>tests/unit/test_usage_plans.py</code> (91 tests) + module doctests; <code>tests/unit/test_usage_pacing_windows.py</code>; the pinned <code>tests/unit/test_usage_cmd.py</code> contract still passes.</li>
   <li><input type="checkbox" checked disabled> <code>jacked/data/usage_plans.json</code>, <code>jacked/usage_plans.py</code> (stdlib only at import; the Codex parser is imported lazily).</li>
   <li><input type="checkbox" checked disabled> <code>usage_pacing.account_windows / worst_window / account_recovery_at</code>; summary adds <code>best_account_worst_window</code>, <code>best_account_worst_window_resets_at</code>, <code>plan_catalog</code>.</li>
+  <li><input type="checkbox" checked disabled> Plan-review cycle 2 fixes (core): a non-string <code>limits[]</code> kind is <code>unknown_limit_kind</code> drift, never a crash; <code>normalize_rate_limits</code> exposes each selected window's <code>window_minutes</code> and the resolver reuses it (a dropped or positional window never lends its length); <code>model_window_seconds(..., plan=)</code> honors per-plan lengths, and <code>menubar_summary.parse_per_model(raw, plan=None)</code> / <code>binding_model_compact(raw, plan=None)</code> emit <code>window_seconds</code> (+ <code>is_active</code> on the compact form) for every model entry (moved from B1 to core).</li>
 </ul>
 <pre><code>Public API (jacked/usage_plans.py)
 load_catalog(data_root=None) -&gt; Catalog ; catalog() -&gt; Catalog (cached)
@@ -469,8 +470,8 @@ account_recovery_at(acct, now, constrained_threshold=90.0) -&gt; datetime | None
   <li><input type="checkbox" disabled> <code>routes/auth.py</code>: <code>PlanInfo</code>, <code>WindowInfo</code>, <code>AccountWindows</code>; <code>AccountResponse.plan</code>, <code>.windows</code>; <code>ModelUsage.window_seconds</code>; <code>_build_account_usage</code> five_hour from <code>five_hour_reading()</code>; a resolver error never 500s the list.</li>
   <li><input type="checkbox" disabled> Bulk refresh row from the DB row read after the fetch; regression tests (Claude null five_hour, Codex raw result).</li>
   <li><input type="checkbox" disabled> <code>web/oauth.py</code>: seed with <code>usage_cache_updates(usage)</code>; regression test.</li>
-  <li><input type="checkbox" disabled> <code>menubar_summary.py</code>: <code>summarize_account</code> via <code>five_hour_reading()</code> (all-None guard); <code>window_seconds</code> on every per-model entry (Codex: the chosen window's duration, else its slot); <code>binding_model_compact</code> adds <code>window_seconds</code> and <code>is_active</code>.</li>
-  <li><input type="checkbox" disabled> <code>web/database.py</code> raw-payload guard: the silent 10 KB skip becomes a generous bound (256 KiB) with a WARNING that names the account and size when a payload is skipped (data-integrity rule: no silent drop); test.</li>
+  <li><input type="checkbox" disabled> <code>menubar_summary.py</code>: <code>summarize_account</code> via <code>five_hour_reading()</code> (all-None guard); the API passes the row's plan into <code>parse_per_model</code> (window lengths are already in core).</li>
+  <li><input type="checkbox" disabled> <code>web/database.py</code> raw-payload guard: the silent 10 KB skip becomes a generous bound (256 KiB); a payload over it CLEARS <code>cached_usage_raw</code> (never keeps the previous payload as evidence for fresh readings) and logs a WARNING that names the account and size (data-integrity rule: no silent drop); tests for both.</li>
   <li><input type="checkbox" disabled> Delete dead <code>_tier_label</code> + re-export + its test.</li>
 </ul>
 

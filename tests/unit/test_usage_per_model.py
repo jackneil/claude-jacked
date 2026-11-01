@@ -181,6 +181,9 @@ def test_binding_compact_shape():
         "utilization": 90,
         "resets_at": "2026-07-06T05:00:00+00:00",
         "severity": "critical",
+        "is_active": True,
+        # The weekly length lets the dashboard draw the week-elapsed marker.
+        "window_seconds": 7 * 86400,
     }
     # An idle-but-reported model still yields a compact payload (not None).
     assert binding_model_compact(CLAUDE_NO_BINDING)["label"] == "Sonnet"
@@ -257,7 +260,8 @@ def test_parse_legacy_scalar_seven_day():
     # Older cached payloads stored a bare number under seven_day_<model>.
     pm = parse_per_model({"seven_day_opus": 33})
     assert pm == [{"key": "opus", "label": "Opus", "utilization": 33,
-                   "resets_at": None, "severity": None, "is_active": False}]
+                   "resets_at": None, "severity": None, "is_active": False,
+                   "window_seconds": 7 * 86400}]
 
 
 def test_parse_malformed_shapes_do_not_raise():

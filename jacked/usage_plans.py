@@ -561,10 +561,14 @@ def _claude_evidence(raw: Optional[dict]) -> tuple[bool, bool, tuple]:
     if isinstance(limits, list):
         for lim in limits:
             kind = lim.get("kind") if isinstance(lim, dict) else None
-            if kind == "session":
+            if not isinstance(kind, str):
+                # A dict or list kind is unhashable; any non-string is a shape
+                # jacked does not know.
+                unknown.append(f"<{type(kind).__name__}>")
+            elif kind == "session":
                 reported = True
             elif kind not in KNOWN_CLAUDE_LIMIT_KINDS:
-                unknown.append(str(kind)[:40])
+                unknown.append(kind[:40])
     authoritative = isinstance(limits, list) and not unknown
     five = raw.get("five_hour")
     if isinstance(five, dict) and (
@@ -583,24 +587,21 @@ def _cached_session_evidence(row: Mapping) -> bool:
     return row.get("cached_usage_5h") is not None or bool(row.get("cached_5h_resets_at"))
 
 
-# A Codex window shorter than a day is the session (5-hour style) window; the
-# same split jacked.codex.usage uses to classify windows.
-_CODEX_SHORT_WINDOW_MAX_MINS = 1440
-
-
 def _codex_observed_seconds(raw: Optional[dict]) -> dict[str, int]:
-    """Window lengths a Codex payload states (``windowDurationMins``), by kind."""
+    """Lengths of the Codex windows jacked actually uses, by kind.
+
+    Taken from :func:`jacked.codex.usage.normalize_rate_limits`, the one
+    classifier of Codex windows, so a window it drops (a slot collision) or
+    maps by position can never lend its length to another window.
+    """
+    norm = _codex_windows(raw)
     out: dict[str, int] = {}
-    rl = raw.get("rateLimits") if isinstance(raw, dict) else None
-    if not isinstance(rl, dict):
+    if norm is None:
         return out
-    for slot in ("primary", "secondary"):
-        window = rl.get(slot)
-        mins = window.get("windowDurationMins") if isinstance(window, dict) else None
-        if not (_is_number(mins) and mins > 0):
-            continue
-        kind = "session" if mins < _CODEX_SHORT_WINDOW_MAX_MINS else "weekly"
-        out.setdefault(kind, int(mins * 60))
+    for slot, kind in (("five_hour", "session"), ("seven_day", "weekly")):
+        mins = norm[slot].get("window_minutes")
+        if _is_number(mins) and mins > 0:
+            out[kind] = int(mins * 60)
     return out
 
 
@@ -718,14 +719,19 @@ def has_session(row: Mapping, raw: Any = _MISSING) -> bool:
 
 
 def model_window_seconds(
-    provider: Optional[str], window: Optional[Mapping] = None, slot: str = "weekly_model"
+    provider: Optional[str],
+    window: Optional[Mapping] = None,
+    slot: str = "weekly_model",
+    plan: Optional[PlanMatch] = None,
 ) -> int:
     """Length of a model-scoped limit's window, in seconds.
 
-    Claude model limits (``weekly_scoped``) are weekly. A Codex named limit
-    carries ``windowDurationMins`` when the payload has it; otherwise the
-    length of the slot it came from (``session`` for a primary window,
-    ``weekly`` for a secondary one).
+    A Codex named limit carries ``windowDurationMins`` when the payload has
+    it, and that observed length wins. Otherwise the length of *slot* for the
+    account's *plan* (a plan may override its provider's lengths), or for the
+    provider when no plan is given. Claude model limits (``weekly_scoped``)
+    use the ``weekly_model`` slot; a Codex limit uses ``session`` for a
+    primary window and ``weekly`` for a secondary one.
 
     >>> model_window_seconds("claude")
     604800
@@ -738,6 +744,8 @@ def model_window_seconds(
             return int(mins * 60)
     if slot not in WINDOW_KINDS:
         slot = "weekly_model"
+    if plan is not None:
+        return plan.window_seconds(slot)
     return window_seconds(provider, slot)
 
 

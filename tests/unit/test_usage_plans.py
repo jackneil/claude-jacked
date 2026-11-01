@@ -689,3 +689,85 @@ class TestProjectRow:
     def test_unknown_window_keeps_its_values(self):
         row = _ultra(cached_usage_5h=55.0)  # no payload: prior evidence keeps it
         assert up.project_row(row)["cached_usage_5h"] == 55.0
+
+
+# --------------------------------------------------------------------------- #
+# Plan-review cycle 2 regressions
+# --------------------------------------------------------------------------- #
+
+
+class TestCycleTwoRegressions:
+    @pytest.mark.parametrize("kind", [{"name": "session"}, [], 7, None])
+    def test_non_string_limit_kind_is_drift_not_a_crash(self, kind):
+        raw = {"five_hour": None, "limits": [{"kind": "weekly_all"}, {"kind": kind}]}
+        sw = up.session_window(_ultra(), raw)
+        assert sw.state == "unknown"
+        assert sw.drift == ("unknown_limit_kind",)
+
+    def test_non_dict_limit_entry_is_drift(self):
+        raw = {"five_hour": None, "limits": ["session"]}
+        assert up.session_window(_ultra(), raw).drift == ("unknown_limit_kind",)
+
+    def test_model_window_follows_a_plan_override(self, tmp_path, monkeypatch):
+        root = _write(tmp_path, {"version": 1, "providers": {"claude": {"subscriptions": {
+            "pro": {"label": "Pro", "session": "always", "windows": {"weekly_model": 3600}}}}}})
+        monkeypatch.setattr(up, "_catalog_cache", up.load_catalog(root))
+        plan = up.resolve_plan({"subscription_type": "pro"})
+        assert up.model_window_seconds("claude", None, "weekly_model", plan) == 3600
+        assert up.model_window_seconds("claude") == 7 * 86400  # provider length
+        # An observed Codex length still wins over the plan.
+        assert up.model_window_seconds("codex", {"windowDurationMins": 60}, "weekly", plan) == 3600
+
+    def test_codex_dropped_window_never_lends_its_length(self):
+        # primary has no usable duration (positional -> session slot);
+        # secondary also classifies as session and is DROPPED by the
+        # canonical classifier, so its 240 minutes must not be used.
+        raw = {"rateLimits": {
+            "primary": {"usedPercent": 30, "resetsAt": 1793780000},
+            "secondary": {"usedPercent": 9, "windowDurationMins": 240, "resetsAt": 1793790000},
+        }}
+        view = up.account_view({"provider": "codex", "subscription_type": "plus"}, raw)
+        assert view.session.seconds == 5 * 3600
+
+    def test_codex_normalizer_exposes_window_minutes(self):
+        from jacked.codex.usage import normalize_rate_limits
+
+        norm = normalize_rate_limits(CODEX_PLUS_RAW)
+        assert norm["five_hour"]["window_minutes"] == 300
+        assert norm["seven_day"]["window_minutes"] == 10080
+        norm = normalize_rate_limits(CODEX_PRO_RAW)
+        assert norm["five_hour"]["window_minutes"] is None
+        assert norm["seven_day"]["window_minutes"] == 10080
+
+
+class TestPerModelWindowSeconds:
+    def test_claude_scoped_and_legacy_limits(self):
+        from jacked.service.menubar_summary import binding_model_compact, parse_per_model
+
+        models = parse_per_model(ULTRA_RAW)
+        assert [(m["label"], m["window_seconds"]) for m in models] == [("Fable", 7 * 86400)]
+        legacy = parse_per_model({"seven_day_opus": {"utilization": 4, "resets_at": None}})
+        assert legacy[0]["window_seconds"] == 7 * 86400
+        compact = binding_model_compact(ULTRA_RAW)
+        assert compact["window_seconds"] == 7 * 86400
+        assert compact["is_active"] is True
+
+    def test_codex_named_limits(self):
+        from jacked.service.menubar_summary import parse_per_model
+
+        raw = {"rateLimitsByLimitId": {
+            "weekly": {"limitName": "Spark weekly",
+                       "secondary": {"usedPercent": 5, "windowDurationMins": 10080}},
+            "short": {"limitName": "Spark short", "primary": {"usedPercent": 7}},
+        }}
+        lengths = {m["label"]: m["window_seconds"] for m in parse_per_model(raw)}
+        assert lengths == {"Spark weekly": 7 * 86400, "Spark short": 5 * 3600}
+
+    def test_plan_override_reaches_the_model_bars(self, tmp_path, monkeypatch):
+        from jacked.service.menubar_summary import parse_per_model
+
+        root = _write(tmp_path, {"version": 1, "providers": {"claude": {"subscriptions": {
+            "max": {"label": "Max", "session": "reported", "windows": {"weekly_model": 86400}}}}}})
+        monkeypatch.setattr(up, "_catalog_cache", up.load_catalog(root))
+        plan = up.resolve_plan({"subscription_type": "max"})
+        assert parse_per_model(ULTRA_RAW, plan)[0]["window_seconds"] == 86400

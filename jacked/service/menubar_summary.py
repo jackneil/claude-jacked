@@ -254,8 +254,11 @@ def _as_num(v) -> float | int:
         return 0
 
 
-def _claude_scoped_models(raw: dict) -> list[dict]:
+def _claude_scoped_models(raw: dict, plan=None) -> list[dict]:
     """Claude ``weekly_scoped`` model caps from the ``limits`` array."""
+    from jacked.usage_plans import model_window_seconds
+
+    window_secs = model_window_seconds("claude", None, "weekly_model", plan)
     out: list[dict] = []
     limits = raw.get("limits")
     if not isinstance(limits, list):
@@ -276,13 +279,21 @@ def _claude_scoped_models(raw: dict) -> list[dict]:
                 "resets_at": lim.get("resets_at"),
                 "severity": lim.get("severity"),
                 "is_active": bool(lim.get("is_active")),
+                "window_seconds": window_secs,
             }
         )
     return out
 
 
-def _codex_named_models(raw: dict) -> list[dict]:
-    """Codex named per-model limits from ``rateLimitsByLimitId``."""
+def _codex_named_models(raw: dict, plan=None) -> list[dict]:
+    """Codex named per-model limits from ``rateLimitsByLimitId``.
+
+    ``window_seconds`` is the chosen window's own ``windowDurationMins`` when
+    it has one, else the length of the slot it came from (``weekly`` for a
+    secondary window, ``session`` for a primary one).
+    """
+    from jacked.usage_plans import model_window_seconds
+
     out: list[dict] = []
     by_limit = raw.get("rateLimitsByLimitId")
     if not isinstance(by_limit, dict):
@@ -295,10 +306,12 @@ def _codex_named_models(raw: dict) -> list[dict]:
             continue  # bare overall limit — already the 5h/7d bars
         # Prefer the weekly (secondary) window; fall back to primary (5h).
         window = entry.get("secondary")
+        slot = "weekly"
         if not isinstance(window, dict) or window.get("usedPercent") is None:
             window = (
                 entry.get("primary") if isinstance(entry.get("primary"), dict) else {}
             )
+            slot = "session"
         out.append(
             {
                 "key": str(limit_id).lower(),
@@ -307,13 +320,17 @@ def _codex_named_models(raw: dict) -> list[dict]:
                 "resets_at": _epoch_to_iso(window.get("resetsAt")),
                 "severity": None,
                 "is_active": False,
+                "window_seconds": model_window_seconds("codex", window, slot, plan),
             }
         )
     return out
 
 
-def _legacy_seven_day_models(raw: dict) -> list[dict]:
+def _legacy_seven_day_models(raw: dict, plan=None) -> list[dict]:
     """Legacy ``seven_day_<model>`` caps — dict OR bare numeric (old payloads)."""
+    from jacked.usage_plans import model_window_seconds
+
+    window_secs = model_window_seconds("claude", None, "weekly_model", plan)
     out: list[dict] = []
     for suffix, label in _LEGACY_MODEL_LABELS.items():
         val = raw.get(f"seven_day_{suffix}")
@@ -326,6 +343,7 @@ def _legacy_seven_day_models(raw: dict) -> list[dict]:
                     "resets_at": val.get("resets_at"),
                     "severity": None,
                     "is_active": False,
+                    "window_seconds": window_secs,
                 }
             )
         elif isinstance(val, (int, float)) and not isinstance(val, bool):
@@ -337,17 +355,20 @@ def _legacy_seven_day_models(raw: dict) -> list[dict]:
                     "resets_at": None,
                     "severity": None,
                     "is_active": False,
+                    "window_seconds": window_secs,
                 }
             )
     return out
 
 
-def parse_per_model(raw: Optional[dict]) -> list[dict]:
+def parse_per_model(raw: Optional[dict], plan=None) -> list[dict]:
     """Extract per-model usage caps from a raw usage payload (Claude or Codex).
 
-    Returns a list of dicts, each shaped
-    ``{"key", "label", "utilization", "resets_at", "severity", "is_active"}``,
-    sorted by utilization descending. Providers are merged with the first
+    Returns a list of dicts, each shaped ``{"key", "label", "utilization",
+    "resets_at", "severity", "is_active", "window_seconds"}``, sorted by
+    utilization descending. ``window_seconds`` is the length of the limit's
+    window (the dashboard draws the elapsed marker from it); *plan* (a
+    :class:`jacked.usage_plans.PlanMatch`) supplies plan-specific lengths. Providers are merged with the first
     source (Claude limits) winning on key collisions; the legacy source only
     fills keys not already present. Empty list when the payload has no per-model
     breakdown or is not a dict.
@@ -382,9 +403,9 @@ def parse_per_model(raw: Optional[dict]) -> list[dict]:
 
     out: dict[str, dict] = {}
     for entry in (
-        *_claude_scoped_models(raw),
-        *_codex_named_models(raw),
-        *_legacy_seven_day_models(raw),
+        *_claude_scoped_models(raw, plan),
+        *_codex_named_models(raw, plan),
+        *_legacy_seven_day_models(raw, plan),
     ):
         out.setdefault(entry["key"], entry)  # first source wins per key
 
@@ -420,19 +441,20 @@ def binding_model(per_model: list[dict]) -> Optional[dict]:
     return per_model[0] if per_model else None
 
 
-def binding_model_compact(raw: Optional[dict]) -> Optional[dict]:
+def binding_model_compact(raw: Optional[dict], plan=None) -> Optional[dict]:
     """Compact binding-model summary for a raw usage payload, for the inline
     bar's WebSocket payloads. Returns ``{label, utilization, resets_at,
-    severity}`` or None.
+    severity, is_active, window_seconds}`` or None. *plan* supplies
+    plan-specific window lengths (see :func:`parse_per_model`).
 
     >>> binding_model_compact({"limits": [
     ...     {"kind": "weekly_scoped", "percent": 92, "severity": "critical",
     ...      "is_active": True, "scope": {"model": {"display_name": "Fable"}}}]})
-    {'label': 'Fable', 'utilization': 92, 'resets_at': None, 'severity': 'critical'}
+    {'label': 'Fable', 'utilization': 92, 'resets_at': None, 'severity': 'critical', 'is_active': True, 'window_seconds': 604800}
     >>> binding_model_compact({}) is None
     True
     """
-    bm = binding_model(parse_per_model(raw))
+    bm = binding_model(parse_per_model(raw, plan))
     if bm is None:
         return None
     return {
@@ -440,6 +462,8 @@ def binding_model_compact(raw: Optional[dict]) -> Optional[dict]:
         "utilization": bm["utilization"],
         "resets_at": bm.get("resets_at"),
         "severity": bm.get("severity"),
+        "is_active": bool(bm.get("is_active")),
+        "window_seconds": bm.get("window_seconds"),
     }
 
 
