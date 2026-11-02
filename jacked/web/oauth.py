@@ -464,7 +464,7 @@ class OAuthFlow:
                 self._browser_mode = launched.mode
                 self._browser_name = launched.browser
                 logger.info(
-                    "Opened browser for OAuth authorization (mode=%s)",
+                    "OAuth browser launch result (mode=%s)",
                     self._browser_mode,
                 )
             except Exception as e:
@@ -520,7 +520,14 @@ class OAuthFlow:
 
         self._browser_mode = launched.mode
         self._browser_name = launched.browser
-        logger.info("Re-opened OAuth browser (mode=%s)", launched.mode)
+        logger.info("OAuth browser re-open result (mode=%s)", launched.mode)
+        if launched.mode == "manual":
+            # Nothing opened (no supported browser, or the launch failed):
+            # say so, instead of a click that does nothing.
+            return {
+                **self.get_status(),
+                "reopen_error": "jacked could not open the sign-in window. Use the link in the banner.",
+            }
         return self.get_status()
 
     async def _expire_manual_flow(self) -> None:

@@ -278,11 +278,20 @@ def test_manual_flow_expiry_task_marks_the_flow_not_found(fake_web, monkeypatch)
 # ---------------------------------------------------------------------------
 
 
+def _default_browser_db():
+    """A DB whose re-auth browser setting is "default": the system browser.
+    (A MagicMock reads as "profile", and with no supported browser installed
+    the launcher then opens nothing, by design.)"""
+    db = MagicMock()
+    db.get_setting.return_value = "default"
+    return db
+
+
 def test_browser_start_opens_the_local_browser(fake_web):
     """Control for the manual case: browser mode still auto-opens."""
 
     async def _body():
-        flow = OAuthFlow(MagicMock())
+        flow = OAuthFlow(_default_browser_db())
         return await flow.start()
 
     with patch("webbrowser.open") as opened:
@@ -298,7 +307,7 @@ def test_browser_start_survives_a_webbrowser_failure(fake_web):
     link either way, so the flow must come back intact and still pending."""
 
     async def _body():
-        flow = OAuthFlow(MagicMock())
+        flow = OAuthFlow(_default_browser_db())
         return flow, await flow.start(), _background_task_names()
 
     with patch("webbrowser.open", side_effect=RuntimeError("no display")):

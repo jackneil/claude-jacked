@@ -164,8 +164,9 @@ class TestRefreshMode:
         from jacked.web.auth import RefreshMode
         assert RefreshMode.PRIMARY.value == "primary"
         assert RefreshMode.CC.value == "cc"
-        assert RefreshMode.CC_OR_PRIMARY_429.value == "cc_429"
         assert RefreshMode.PRIMARY_CIRCUIT_BREAKER.value == "primary_cb"
+        # A 429 never rotates the cc chain (#149i): no 429 mode is left.
+        assert {m.value for m in RefreshMode} == {"primary", "cc", "primary_cb"}
 
     def test_cooldown_constants_exist(self):
         from jacked.web.auth import CIRCUIT_BREAKER_COOLDOWNS
@@ -242,7 +243,7 @@ class TestRefreshAccountTokenPolicy:
 
 class TestHealLoop:
     def test_heal_clears_circuit_breaker(self, tmp_path):
-        """heal_invalid_accounts clears CB state before attempting recovery."""
+        """heal_invalid_accounts clears a TRANSIENT breaker before recovery."""
         import asyncio
         from unittest.mock import patch, AsyncMock
         from jacked.web.auth import TokenExchangeResult, heal_invalid_accounts
@@ -253,7 +254,7 @@ class TestHealLoop:
         db.update_account(acct["id"],
                           validation_status="invalid",
                           refresh_last_failed_at=int(time.time()),
-                          refresh_failure_type="invalid_grant")
+                          refresh_failure_type="http_503")
 
         # Mock the token exchange to succeed; mock Database() to return our test db
         mock_result = TokenExchangeResult(success=True, access_token="new-at")
@@ -267,6 +268,32 @@ class TestHealLoop:
         # Circuit breaker should be cleared
         assert row["refresh_last_failed_at"] is None
         assert row["refresh_failure_type"] is None
+
+    def test_heal_never_clears_an_invalid_grant_breaker(self, tmp_path):
+        """#152i: the sweep never clears an invalid_grant breaker. A verdict
+        not bound to the stored token gets one exchange; the exchange's own
+        result replaces the breaker (a real success clears it)."""
+        import asyncio
+        from unittest.mock import patch, AsyncMock
+        from jacked.web.auth import TokenExchangeResult, heal_invalid_accounts
+
+        db = Database(str(tmp_path / "test.db"))
+        acct = db.create_account("heal@test.com", "tok", int(time.time()) + 3600,
+                                 refresh_token="rt-test")
+        failed_at = int(time.time()) - 30
+        db.update_account(acct["id"], validation_status="invalid",
+                          refresh_last_failed_at=failed_at,
+                          refresh_failure_type="invalid_grant")
+        flow = AsyncMock(return_value=TokenExchangeResult(success=True, access_token="a"))
+        with patch("jacked.web.auth.Database", return_value=db), \
+             patch("jacked.web.auth._refresh_token_flow", flow):
+            result = asyncio.run(heal_invalid_accounts())
+
+        flow.assert_awaited_once()
+        assert result["healed"] == 1
+        row = db.get_account(acct["id"])
+        assert row["refresh_failure_type"] == "invalid_grant"
+        assert row["refresh_last_failed_at"] == failed_at
 
     def test_heal_attempts_refresh_even_if_not_expiring(self, tmp_path):
         """Heal loop should attempt refresh even if token hasn't expired (no should_refresh gate)."""
@@ -314,37 +341,74 @@ class TestReconciliationSafetyGuard:
         from jacked.api.credential_helpers import invalidate_live_cred_cache
         invalidate_live_cred_cache()
 
-    def test_skips_cc_refresh_token_when_invalid_grant(self, tmp_path):
-        """reconcile_credentials_from_live_store must NOT import cc_refresh_token
-        when circuit breaker failure type is invalid_grant."""
+    def _dead_chain(self, tmp_path, cc_refresh):
+        """A row whose cc chain recorded invalid_grant (#149i shared rule)."""
         db = Database(str(tmp_path / "test.db"))
-        acct = db.create_account("recon@test.com", "tok", int(time.time()) + 3600)
+        acct = db.create_account("recon@test.com", "tok", int(time.time()) + 3600,
+                                 refresh_token="primary-refresh-token")
         db.update_account(acct["id"],
-                          cc_refresh_last_failed_at=int(time.time()),
+                          cc_refresh_last_failed_at=1_800_000_000,
                           cc_refresh_failure_type="invalid_grant",
                           cc_access_token="old-access",
-                          cc_refresh_token=None)
+                          cc_refresh_token=cc_refresh)
+        return db, acct["id"]
 
+    def _reconcile(self, db, account_id, live_refresh):
         from jacked.api.credential_helpers import reconcile_credentials_from_live_store
         from unittest.mock import patch
 
+        live_exp = int(time.time()) + 3600
         live_creds = {
-            "_jackedAccountId": acct["id"],
+            "_jackedAccountId": account_id,
             "claudeAiOauth": {
                 "accessToken": "new-access-from-cc",
-                "refreshToken": "dangerous-refresh-token",
-                "expiresAt": (int(time.time()) + 3600) * 1000,
+                "refreshToken": live_refresh,
+                "expiresAt": live_exp * 1000,
+                "refreshTokenExpiresAt": (live_exp + 86400) * 1000,
             }
         }
         with patch("jacked.api.credential_helpers.read_platform_credentials",
                    return_value=live_creds), \
              patch("jacked.api.credential_helpers._ownership_lookup",
                    return_value=_owner_profile("recon@test.com")):
-            reconcile_credentials_from_live_store(acct["id"], db)
+            reconcile_credentials_from_live_store(account_id, db)
+        return db.get_account(account_id), live_exp
 
-        row = db.get_account(acct["id"])
+    def test_adopts_a_different_proven_refresh_token_over_a_dead_chain(self, tmp_path):
+        """The settled #149i rule (credential_helpers.dead_chain_adoption): a
+        proven live refresh token that is not the failed one is a new
+        lineage. It is adopted with its extras, and the cc breaker clears."""
+        from jacked.credentials.oauth_extra import parse_oauth_extra
+
+        db, account_id = self._dead_chain(tmp_path, cc_refresh=None)
+        row, live_exp = self._reconcile(db, account_id, "new-live-refresh-token")
+
         assert row["cc_access_token"] == "new-access-from-cc"
-        assert row["cc_refresh_token"] is None  # Must NOT be imported
+        assert row["cc_expires_at"] == live_exp
+        assert row["cc_refresh_token"] == "new-live-refresh-token"
+        assert row["cc_refresh_failure_type"] is None
+        assert row["cc_refresh_last_failed_at"] is None
+        extra = parse_oauth_extra(row["cc_oauth_extra"], "new-live-refresh-token")
+        assert extra["refreshTokenExpiresAt"] == (live_exp + 86400) * 1000
+        assert row["refresh_token"] == "primary-refresh-token"  # primary untouched
+
+    @pytest.mark.parametrize("row_refresh, live_refresh", [
+        ("failed-refresh-token", "failed-refresh-token"),  # the token that failed
+        (None, ""),  # an empty live refresh token
+    ])
+    def test_never_adopts_the_failed_or_an_empty_refresh_token(
+        self, tmp_path, row_refresh, live_refresh,
+    ):
+        """The same failed token (or an empty one) brings the access token
+        and its expiry only. The cc breaker stays as recorded."""
+        db, account_id = self._dead_chain(tmp_path, cc_refresh=row_refresh)
+        row, live_exp = self._reconcile(db, account_id, live_refresh)
+
+        assert row["cc_access_token"] == "new-access-from-cc"
+        assert row["cc_expires_at"] == live_exp
+        assert row["cc_refresh_token"] == row_refresh
+        assert row["cc_refresh_failure_type"] == "invalid_grant"
+        assert row["cc_refresh_last_failed_at"] == 1_800_000_000
 
     def test_imports_cc_refresh_token_when_no_invalid_grant(self, tmp_path):
         """When circuit breaker is not invalid_grant, cc_refresh_token IS imported."""

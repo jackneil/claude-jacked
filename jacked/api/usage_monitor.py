@@ -892,6 +892,7 @@ def _auto_swap_request(target: dict):
     from jacked.api.credential_helpers import build_oauth_data
     from jacked.credentials.canonical import CredentialPayload
     from jacked.credentials.models import InteractionMode, SwitchContext
+    from jacked.credentials.refresh_guard import downgrade_check_for
     from jacked.credentials.transaction import SwitchRequest
 
     payload = CredentialPayload.from_mapping(
@@ -908,6 +909,10 @@ def _auto_swap_request(target: dict):
         payload=payload,
         context=SwitchContext.AUTO_SWAP,
         interaction=InteractionMode.BACKGROUND,
+        # Every engine activation carries the check (#149i): a target row
+        # whose cc chain is dead must not put a null refresh token over a
+        # live one of the same account.
+        refresh_downgrade_check=downgrade_check_for(target),
         display_name=target.get("display_name") or None,
         organization_name=target.get("organization_name") or None,
     )
@@ -2405,7 +2410,7 @@ class _LadderOutcome:
 
 # Exchange errors that say the refresh token itself is dead or refused. Any
 # other FAILED outcome (not_sent, reply_lost, http_5xx, circuit_breaker,
-# lock_timeout, chain_changed, db_write_failed, ...) is transient.
+# lock_timeout, db_write_failed, ...) is transient.
 _ROTATION_TERMINAL_ERRORS = frozenset(
     {
         "invalid_grant", "http_400", "http_401", "http_403", "account_not_found",

@@ -458,6 +458,9 @@ function mintSwitchIds() {
 }
 
 // Send the switch and turn whatever comes back into one truthful message.
+// Shown when the server answers a switch with code CC_REAUTH_REQUIRED.
+const CC_REAUTH_REQUIRED_NOTICE = 'Authorize the Claude Code token for this account again (account menu). A running session holds a working token, and jacked does not replace it.';
+
 async function requestSwitch(id, email, ids) {
     const { actionId, operationId, pageSessionId } = ids;
     const headers = {
@@ -491,6 +494,12 @@ async function requestSwitch(id, email, ids) {
             // The current account's row was being updated, so the server
             // refused to overwrite its newest tokens. Transient: warn, retry.
             showToast(e.message || 'The current account is being updated. Try the switch again.', 'warning', 8000);
+        } else if (outcome.code === 'CC_REAUTH_REQUIRED') {
+            // jacked's row holds no working Claude Code refresh token for
+            // this account, while a session of the account still does. The
+            // server refused to publish a null token over it. A retry cannot
+            // help; a new Claude Code authorization can.
+            showToast(CC_REAUTH_REQUIRED_NOTICE, 'warning', 10000);
         } else {
             // Mostly the 403 local-only refusal, which is long: give it the
             // same reading time as its siblings, and never render `undefined`.

@@ -125,18 +125,30 @@ def add_codex_account(
     make_active: bool = False,
     login_runner: Optional[Callable[[Path, Optional[Mapping[str, str]]], None]] = None,
 ) -> dict:
-    """Force file storage, optionally drive ``codex login``, then import.
+    """Check the Codex store, force file storage, optionally drive
+    ``codex login``, then import.
 
     ``run_login`` (CLI) drives the interactive login when no account is present;
     the web route passes ``run_login=False`` and reports that login is needed.
     ``login_runner`` is injectable for tests.
+
+    The checks run before any write. Forcing file storage flips Codex to read
+    ``auth.json``; with no file credential and no login to write one (a
+    keyring store, or "auto" with no usable ``auth.json``, from the web
+    route) that write would sign the user out of Codex and then fail the
+    import. Such a call refuses first and changes nothing.
     """
     home = home if home is not None else codex_home(env)
-    ensure_file_storage(home, env)
 
     status = detect_codex_account(home, env)
     needs_login = status.identity is None or not status.identity.email
-    if needs_login and run_login:
+    if needs_login and not run_login:
+        raise CodexImportError(
+            status.reason
+            or "no Codex account is signed in. Run `codex login` first."
+        )
+    ensure_file_storage(home, env)
+    if needs_login:
         (login_runner or _run_codex_login)(home, env)
 
     return import_codex_account(db, home=home, env=env, make_active=make_active)

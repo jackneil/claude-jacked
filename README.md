@@ -723,6 +723,12 @@ Three places: the statusline inside every Claude Code session, the tray or menu-
 
 Yes. Codex accounts sit side by side with Claude accounts in the same pool. When Codex is installed, `jacked install` also deploys the suite into Codex's native formats (`~/.agents/skills`, `~/.codex/AGENTS.md`, Codex custom-agent TOMLs).
 
+jacked switches a Codex account only when Codex keeps the credential in the `auth.json` file. If `config.toml` sets `cli_auth_credentials_store` to `"keyring"`, or the store mode is `"auto"` and `auth.json` has no usable credential, jacked does not switch the account and does not change `config.toml`. To switch Codex accounts with jacked, set `cli_auth_credentials_store = "file"` in `config.toml`, then sign in to Codex again. jacked does all of its checks before it writes a file: if a check stops the switch, `config.toml` and each `auth.json` stay the same. jacked never writes an older stored copy of an account over the live credential of the same account, and it stops a switch when the stored copy has a different refresh token and a last-refresh time that is not later than the live time. If jacked stops a switch for one of these reasons, run `codex login` to capture the account again.
+
+### What if jacked cannot open the sign-in window for a re-auth?
+
+The re-auth browser setting has three modes: `profile`, `incognito` and `default`. In `profile` and `incognito` mode, jacked opens the sign-in page in a browser window that jacked controls. If jacked cannot find a supported browser, or the browser does not start, jacked does not open the system default browser, because that browser can use a different Claude account. The dashboard then shows the sign-in link: open the link in the browser profile for the account, or paste the code from the sign-in page into the dashboard. In `default` mode, jacked gives the sign-in page to the system default browser. The log records the mode and the reason, never the link, a path or an email address.
+
 ### Does the tray icon work on Windows and Linux, or only macOS?
 
 All three. macOS gets a native menu-bar agent; Windows and Linux get a system-tray icon through pystray. The statusline is cross-platform too, with no bash, `jq`, or PATH dependency.

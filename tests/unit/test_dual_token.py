@@ -320,17 +320,30 @@ class TestSyncTokensCAS:
         assert acct["access_token"] == original["access_token"]
         assert acct["refresh_token"] == original["refresh_token"]
 
-    @pytest.mark.parametrize("verdict, kept", [("auth_rejected", None), ("invalid_grant", "invalid_grant")])
-    def test_a_synced_replacement_drops_only_the_access_verdict(self, tmp_path, verdict, kept):
-        """auth_rejected was about the replaced access token, so it goes; an
-        invalid_grant is about the refresh lineage and stays."""
+    @pytest.mark.parametrize(
+        "verdict, file_refresh, kept",
+        [
+            # The replaced access token's verdict goes with it.
+            ("auth_rejected", "new_cc_rt", None),
+            # A new live lineage over a dead chain is adopted: the breaker clears.
+            ("invalid_grant", "new_cc_rt", None),
+            # The token that failed is never adopted: the lineage verdict stays.
+            ("invalid_grant", "dead_cc_rt", "invalid_grant"),
+        ],
+    )
+    def test_a_synced_replacement_follows_the_shared_dead_chain_rule(
+        self, tmp_path, verdict, file_refresh, kept
+    ):
+        """auth_rejected was about the replaced access token, so it goes. An
+        invalid_grant is about the refresh lineage: the sync applies the same
+        rule as reconcile (credential_helpers.dead_chain_adoption, #244i)."""
         db = _make_db(tmp_path)
-        db.update_account(1, cc_access_token="old_cc_at", cc_refresh_failure_type=verdict,
-                          cc_refresh_last_failed_at=123)
+        db.update_account(1, cc_access_token="old_cc_at", cc_refresh_token="dead_cc_rt",
+                          cc_refresh_failure_type=verdict, cc_refresh_last_failed_at=123)
         config_dir = tmp_path / "accounts" / "1"
         config_dir.mkdir(parents=True)
         (config_dir / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": "new_cc_at", "refreshToken": "new_cc_rt",
+            "claudeAiOauth": {"accessToken": "new_cc_at", "refreshToken": file_refresh,
                               "expiresAt": 9999999999000}
         }))
         from jacked.launch import _sync_tokens_from_file
@@ -340,6 +353,7 @@ class TestSyncTokensCAS:
         assert acct["cc_access_token"] == "new_cc_at"
         assert acct["cc_refresh_failure_type"] == kept
         assert (acct["cc_refresh_last_failed_at"] is None) == (kept is None)
+        assert acct["cc_refresh_token"] == ("dead_cc_rt" if kept else file_refresh)
 
     def test_cas_sql_rejects_stale_write(self, tmp_path):
         """CAS WHERE clause rejects update when old value doesn't match DB."""
@@ -1653,10 +1667,11 @@ def _fresh_auth_locks():
 
 @pytest.mark.usefixtures("_fresh_auth_locks")
 class TestChainAwareFlow:
-    def test_cc_429_primary_invalid_grant_leaves_cc_untouched(self, tmp_path, caplog):
-        """CC_OR_PRIMARY_429 with no cc refresh token runs on the primary
-        chain. A primary invalid_grant records the PRIMARY failure, logs
-        chain=primary, and never claims to clear the cc refresh token."""
+    def test_primary_invalid_grant_leaves_cc_untouched(self, tmp_path, caplog):
+        """A primary-chain mode runs on the primary chain while the row has
+        a cc access token. A primary invalid_grant records the PRIMARY
+        failure, logs chain=primary, and never claims to clear the cc
+        refresh token."""
         import logging
 
         from jacked.web.auth import RefreshMode, _refresh_token_flow
@@ -1668,7 +1683,8 @@ class TestChainAwareFlow:
         client = _token_client(400, {"error": "invalid_grant"})
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
              caplog.at_level(logging.INFO, logger="jacked.auth"):
-            result = asyncio.run(_refresh_token_flow(1, db, RefreshMode.CC_OR_PRIMARY_429))
+            result = asyncio.run(
+                _refresh_token_flow(1, db, RefreshMode.PRIMARY_CIRCUIT_BREAKER))
 
         assert result.success is False
         assert result.error == "invalid_grant"
@@ -1683,7 +1699,7 @@ class TestChainAwareFlow:
         assert any("chain=primary" in m for m in messages)
         assert not any("clearing cc" in m for m in messages)
 
-    def test_cc_429_with_cc_chain_success_writes_cc_columns_and_logs_chain(
+    def test_cc_chain_success_writes_cc_columns_and_logs_chain(
         self, tmp_path, caplog,
     ):
         import logging
@@ -1697,13 +1713,13 @@ class TestChainAwareFlow:
                                      "refresh_token": "cc_rt2", "expires_in": 3600})
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
              caplog.at_level(logging.INFO, logger="jacked.auth"):
-            result = asyncio.run(_refresh_token_flow(1, db, RefreshMode.CC_OR_PRIMARY_429))
+            result = asyncio.run(_refresh_token_flow(1, db, RefreshMode.CC))
 
         assert result.success and result.exchanged and result.chain == "cc"
         acct = db.get_account(1)
         assert acct["cc_refresh_token"] == "cc_rt2"
         assert acct["refresh_token"] == "alice_primary_rt"
-        assert any("cc chain token refreshed (caller cc_429)" in r.getMessage()
+        assert any("cc chain token refreshed (caller cc)" in r.getMessage()
                    for r in caplog.records)
 
     def test_early_return_hands_back_the_primary_token_when_chain_is_primary(
@@ -1731,7 +1747,7 @@ class TestChainAwareFlow:
         client = _token_client(200, {})
         with patch("jacked.web.auth.httpx.AsyncClient", return_value=client):
             result = asyncio.run(
-                auth._refresh_token_flow(1, db, RefreshMode.CC_OR_PRIMARY_429))
+                auth._refresh_token_flow(1, db, RefreshMode.PRIMARY_CIRCUIT_BREAKER))
 
         assert result.success is True
         assert result.access_token == "rotated_at"
@@ -1922,19 +1938,23 @@ class TestLiveRecoveryOwnership:
         acct = db.get_account(1)
         assert acct["cc_access_token"] != "acct5_live_at"
         assert acct["cc_access_token"] is None
+        # An unproven live refresh token is never adopted either.
+        assert acct["cc_refresh_token"] is None
         assert acct["cc_refresh_failure_type"] == "invalid_grant"
 
-    def test_proven_live_token_is_kept_for_the_dead_chain(self, tmp_path):
+    def _recover(self, db, live_refresh):
+        """Run a cc invalid_grant with a proven live payload that holds
+        ``live_refresh``; return (ok, the live expiry in s, the payload)."""
         from jacked.api.authority_guard import ProfileLookup
 
-        db = self._db_with_cc(tmp_path)
         live_exp = int(time.time()) + 3600
-        live = {
-            "_jackedAccountId": 1,
-            "claudeAiOauth": {"accessToken": "own_live_at",
-                              "refreshToken": "own_live_rt",
-                              "expiresAt": live_exp * 1000},
-        }
+        oauth = {"accessToken": "own_live_at", "expiresAt": live_exp * 1000,
+                 "refreshTokenExpiresAt": (live_exp + 86400) * 1000,
+                 "subscriptionType": "max", "subscriptionTypeSource": "profile",
+                 "subscriptionTypeVerifiedAt": 1_798_000_000_000}
+        if live_refresh is not None:
+            oauth["refreshToken"] = live_refresh
+        live = {"_jackedAccountId": 1, "claudeAiOauth": oauth}
         mine = ProfileLookup(200, {"account": {"email": "alice@test.com"},
                                    "organization": {"uuid": None}})
         client = _token_client(400, {"error": "invalid_grant"})
@@ -1944,16 +1964,120 @@ class TestLiveRecoveryOwnership:
              patch("jacked.api.credential_helpers._ownership_lookup",
                    return_value=mine):
             ok = asyncio.run(refresh_cc_token(1, db))
+        assert client.post.await_count == 1  # only the exchange that failed
+        return ok, live_exp, oauth
+
+    def test_proven_different_live_lineage_is_adopted(self, tmp_path, caplog):
+        """#149i item 2 (settled): an ownership-proven live refresh token
+        that is not the failed one becomes the row's cc lineage, and the
+        chain is alive again."""
+        import logging
+
+        from jacked.credentials.oauth_extra import captured_tier, parse_oauth_extra
+
+        db = self._db_with_cc(tmp_path)
+        with caplog.at_level(logging.INFO, logger="jacked.auth"):
+            ok, live_exp, oauth = self._recover(db, "own_live_rt")
+
+        assert ok is True
+        acct = db.get_account(1)
+        assert acct["cc_access_token"] == "own_live_at"
+        assert acct["cc_refresh_token"] == "own_live_rt"
+        assert acct["cc_expires_at"] == live_exp
+        assert acct["cc_refresh_failure_type"] is None
+        assert acct["cc_refresh_last_failed_at"] is None
+        # The pass-through fields are bound to the ADOPTED refresh token.
+        extra = parse_oauth_extra(acct["cc_oauth_extra"], "own_live_rt", current_tier="max")
+        assert extra == {"refreshTokenExpiresAt": oauth["refreshTokenExpiresAt"],
+                         "subscriptionTypeSource": "profile",
+                         "subscriptionTypeVerifiedAt": 1_798_000_000_000}
+        assert captured_tier(acct["cc_oauth_extra"], "own_live_rt") == "max"
+        assert parse_oauth_extra(acct["cc_oauth_extra"], "old_cc_rt") == {}
+        # The live chain is published again, refresh token included.
+        assert build_oauth_data(acct)["refreshToken"] == "own_live_rt"
+        assert (
+            "Account 1: invalid_grant on the cc chain; adopted the live refresh "
+            "lineage (ownership proven)"
+        ) in [r.getMessage() for r in caplog.records]
+        # The primary chain is never touched.
+        assert acct["refresh_token"] == "alice_primary_rt"
+        assert acct["refresh_failure_type"] is None
+
+    def test_the_adoption_decision_is_the_shared_dead_chain_rule(self, tmp_path):
+        """_cc_chain_died asks credential_helpers.dead_chain_adoption, the one
+        rule that reconcile and the launch sync use. The row it passes is the
+        row as the clean-up records it: a dead chain whose cc_refresh_token
+        is the token that failed."""
+        from jacked.api import credential_helpers
+
+        db = self._db_with_cc(tmp_path)
+        spy = MagicMock(wraps=credential_helpers.dead_chain_adoption)
+        with patch("jacked.api.credential_helpers.dead_chain_adoption", spy):
+            ok, _exp, _oauth = self._recover(db, "own_live_rt")
+
+        assert ok is True
+        spy.assert_called_once()
+        row_view, live = spy.call_args.args
+        assert row_view["cc_refresh_token"] == "old_cc_rt"
+        assert row_view["cc_refresh_failure_type"] == "invalid_grant"
+        assert row_view["refresh_token"] == "alice_primary_rt"
+        assert live["refreshToken"] == "own_live_rt"
+        assert db.get_account(1)["cc_refresh_token"] == "own_live_rt"
+
+    def test_a_refusal_by_the_shared_rule_keeps_the_access_only_recovery(
+        self, tmp_path,
+    ):
+        """No local second opinion: when the shared rule says no, nothing is
+        adopted, even a different proven refresh token."""
+        db = self._db_with_cc(tmp_path)
+        with patch("jacked.api.credential_helpers.dead_chain_adoption",
+                   return_value=None):
+            ok, live_exp, _oauth = self._recover(db, "own_live_rt")
 
         assert ok is True
         acct = db.get_account(1)
         assert acct["cc_access_token"] == "own_live_at"
         assert acct["cc_expires_at"] == live_exp
-        # The spent refresh token leaves; the live one is never imported.
+        assert acct["cc_refresh_token"] is None
+        assert acct["cc_refresh_failure_type"] == "invalid_grant"
+
+    @pytest.mark.parametrize("live_refresh", ["old_cc_rt", None, "", 12345])
+    def test_failed_or_missing_live_refresh_keeps_the_access_only_recovery(
+        self, tmp_path, live_refresh,
+    ):
+        db = self._db_with_cc(tmp_path)
+        ok, live_exp, _oauth = self._recover(db, live_refresh)
+
+        assert ok is True
+        acct = db.get_account(1)
+        assert acct["cc_access_token"] == "own_live_at"
+        assert acct["cc_expires_at"] == live_exp
+        # The spent refresh token leaves; nothing replaces it.
         assert acct["cc_refresh_token"] is None
         assert acct["cc_refresh_failure_type"] == "invalid_grant"
         # build_oauth_data hands no refresh token for the dead chain.
         assert build_oauth_data(acct)["refreshToken"] is None
+
+    def test_the_primary_refresh_token_is_never_adopted_as_the_cc_lineage(
+        self, tmp_path, caplog,
+    ):
+        """Two chains never share one single-use refresh token (the shared
+        rule refuses it)."""
+        import logging
+
+        db = self._db_with_cc(tmp_path)
+        with caplog.at_level(logging.INFO, logger="jacked.auth"):
+            ok, _exp, _oauth = self._recover(db, "alice_primary_rt")
+
+        assert ok is True
+        acct = db.get_account(1)
+        assert acct["cc_refresh_token"] is None
+        assert acct["cc_refresh_failure_type"] == "invalid_grant"
+        assert acct["refresh_token"] == "alice_primary_rt"
+        assert (
+            "Account 1: invalid_grant on the cc chain; recovered cc_access_token from "
+            "live credentials (ownership proven; no live refresh lineage adopted)"
+        ) in [r.getMessage() for r in caplog.records]
 
 
 class TestBuildOauthDataDeadChain:

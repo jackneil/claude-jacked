@@ -79,6 +79,11 @@ def _check_not_on_event_loop() -> None:
 
 # Sessions without a heartbeat within this window are considered stale
 SESSION_STALENESS_MINUTES = 60
+# The ceiling of a staleness window. The credential holder window asks for
+# 480 minutes (the life of a Claude Code access token: an idle session keeps
+# its refresh token in memory and spends it when the access token expires),
+# so a session idle for hours still counts as a holder of its lineage.
+MAX_SESSION_STALENESS_MINUTES = 480
 
 # Sessions with no Claude process alive for this long are auto-closed
 DEAD_SESSION_HOURS = 4
@@ -125,8 +130,10 @@ class Account(BaseModel):
     cc_expires_at: Optional[int] = None
     refresh_last_failed_at: Optional[int] = None
     refresh_failure_type: Optional[str] = None
+    refresh_failed_token_fp: Optional[str] = None
     cc_refresh_last_failed_at: Optional[int] = None
     cc_refresh_failure_type: Optional[str] = None
+    cc_refresh_failed_token_fp: Optional[str] = None
     account_uuid: Optional[str] = None
     profile_json: Optional[str] = None
     profile_fetched_at: Optional[float] = None
@@ -280,8 +287,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     cc_expires_at INTEGER,
     refresh_last_failed_at INTEGER,  -- Primary-chain breaker: last failed exchange
     refresh_failure_type TEXT,  -- Primary-chain breaker: failure type
+    refresh_failed_token_fp TEXT,  -- Fingerprint of the primary refresh token an invalid_grant condemned
     cc_refresh_last_failed_at INTEGER,  -- Claude Code chain breaker: last failed exchange
     cc_refresh_failure_type TEXT,  -- Claude Code chain breaker: failure type
+    cc_refresh_failed_token_fp TEXT,  -- Fingerprint of the cc refresh token an invalid_grant condemned
     account_uuid TEXT,  -- Claude account uuid (profile account.uuid / token exchange account.uuid)
     profile_json TEXT,  -- Non-secret profile subset: {"account": {...}, "organization": {...}}
     profile_fetched_at REAL,  -- Epoch seconds of the profile fetch that wrote profile_json
@@ -657,6 +666,66 @@ class Database:
             (Database.CC_BREAKER_SPLIT_MARKER, datetime.now(timezone.utc).isoformat()),
         )
 
+    # The trigger that drops the primary invalid_grant fingerprint when the
+    # stored refresh token changes (see _migrate_refresh_failed_token_fp).
+    REFRESH_FP_TRIGGER = "trg_refresh_failed_token_fp_reset"
+
+    @staticmethod
+    def _migrate_refresh_failed_token_fp(conn: sqlite3.Connection) -> None:
+        """Add the revoked-token fingerprint columns and the reset trigger (#152i).
+
+        ``refresh_failed_token_fp`` binds a primary ``invalid_grant`` verdict
+        to the refresh token it was about (``jacked.web.refresh_verdict.token_fingerprint``).
+        While the row holds that token, no path sends it again. A row that
+        stores a different refresh token (a re-auth, an imported rotation, a
+        re-add) is a new lineage, so the trigger clears the fingerprint for
+        every writer, the raw SQL ones included. A statement that writes a
+        new fingerprint itself keeps it. No backfill: an old verdict without
+        a fingerprint gets one more exchange, which binds it.
+
+        ``cc_refresh_failed_token_fp`` does the same for the Claude Code
+        chain. The cc clean-up removes the failed token from the row, so
+        this value is the only record of which token died: an importer of
+        live tokens must not adopt a refresh token with this fingerprint.
+
+        >>> conn = sqlite3.connect(":memory:")
+        >>> _ = conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, refresh_token TEXT)")
+        >>> _ = conn.execute("INSERT INTO accounts VALUES (1, 'rt')")
+        >>> Database._migrate_refresh_failed_token_fp(conn)
+        >>> Database._migrate_refresh_failed_token_fp(conn)  # idempotent
+        >>> {"refresh_failed_token_fp", "cc_refresh_failed_token_fp"} <= {
+        ...     r[1] for r in conn.execute("PRAGMA table_info(accounts)")}
+        True
+        >>> _ = conn.execute("UPDATE accounts SET refresh_failed_token_fp = 'fp'")
+        >>> _ = conn.execute("UPDATE accounts SET refresh_token = 'rt'")
+        >>> conn.execute("SELECT refresh_failed_token_fp FROM accounts").fetchone()
+        ('fp',)
+        >>> _ = conn.execute("UPDATE accounts SET refresh_token = 'rt2'")
+        >>> conn.execute("SELECT refresh_failed_token_fp FROM accounts").fetchone()
+        (None,)
+        >>> _ = conn.execute(
+        ...     "UPDATE accounts SET refresh_token = 'rt3', refresh_failed_token_fp = 'fp3'")
+        >>> conn.execute("SELECT refresh_failed_token_fp FROM accounts").fetchone()
+        ('fp3',)
+        """
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+        for col_name in ("refresh_failed_token_fp", "cc_refresh_failed_token_fp"):
+            if col_name not in cols:
+                try:
+                    conn.execute(f"ALTER TABLE accounts ADD COLUMN {col_name} TEXT")
+                except sqlite3.OperationalError:
+                    pass  # another worker beat us to it
+        conn.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {Database.REFRESH_FP_TRIGGER} "
+            "AFTER UPDATE OF refresh_token ON accounts "
+            "WHEN OLD.refresh_token IS NOT NEW.refresh_token "
+            "AND NEW.refresh_failed_token_fp IS NOT NULL "
+            "AND NEW.refresh_failed_token_fp IS OLD.refresh_failed_token_fp "
+            "BEGIN "
+            "UPDATE accounts SET refresh_failed_token_fp = NULL WHERE id = NEW.id; "
+            "END"
+        )
+
     def _init_schema(self) -> None:
         with self._writer() as conn:
             # Pre-schema crash recovery: if accounts_new exists but accounts doesn't,
@@ -943,6 +1012,13 @@ class Database:
                 )
                 conn.execute("DROP TABLE accounts")
                 conn.execute("ALTER TABLE accounts_new RENAME TO accounts")
+            # Migration (#152i, revoked refresh token verdict): the primary
+            # invalid_grant fingerprint column and the trigger that clears it
+            # when the refresh token changes. This MUST stay AFTER the
+            # provider rebuild: DROP TABLE accounts drops every trigger on
+            # the old table, and a column added after the rebuild needs no
+            # copy.
+            self._migrate_refresh_failed_token_fp(conn)
             # Migration: add swap outcome tracking to swap_log.
             # status distinguishes committed swaps from pending/failed attempts;
             # residency_seconds is how long the outgoing account was active.
@@ -1331,8 +1407,10 @@ class Database:
             "organization_uuid",
             "refresh_last_failed_at",
             "refresh_failure_type",
+            "refresh_failed_token_fp",
             "cc_refresh_last_failed_at",
             "cc_refresh_failure_type",
+            "cc_refresh_failed_token_fp",
             "account_uuid",
             "profile_json",
             "profile_fetched_at",
@@ -2755,7 +2833,7 @@ class Database:
         """Get session-account records with recent heartbeat activity.
 
         Uses COALESCE(last_activity_at, detected_at) with a configurable
-        staleness window (default 60 min, clamped to 5-120).
+        staleness window (default 60 min, clamped to 5-480).
         Sessions fade from view when idle but are NOT permanently closed —
         a heartbeat update makes them reappear (resurrection).
 
@@ -2771,7 +2849,7 @@ class Database:
         >>> active[0]["last_activity_at"] is not None
         True
         """
-        clamped = max(5, min(120, staleness_minutes))
+        clamped = max(5, min(MAX_SESSION_STALENESS_MINUTES, staleness_minutes))
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
         with self._reader() as conn:
             cursor = conn.execute(
@@ -2796,7 +2874,7 @@ class Database:
         self, staleness_minutes: int = SESSION_STALENESS_MINUTES
     ) -> list[dict]:
         """Return one latest open span per session joined to immutable first use."""
-        clamped = max(5, min(120, staleness_minutes))
+        clamped = max(5, min(MAX_SESSION_STALENESS_MINUTES, staleness_minutes))
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
         with self._reader() as conn:
             rows = conn.execute(
@@ -3097,7 +3175,7 @@ class Database:
         >>> db.get_stale_open_sessions()
         []
         """
-        clamped = max(5, min(120, staleness_minutes))
+        clamped = max(5, min(MAX_SESSION_STALENESS_MINUTES, staleness_minutes))
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
         with self._reader() as conn:
             cursor = conn.execute(
@@ -3134,7 +3212,7 @@ class Database:
         >>> db.bump_all_stale_sessions()
         0
         """
-        clamped = max(5, min(120, staleness_minutes))
+        clamped = max(5, min(MAX_SESSION_STALENESS_MINUTES, staleness_minutes))
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=clamped)).isoformat()
         now = datetime.now(timezone.utc).isoformat()
         with self._writer() as conn:

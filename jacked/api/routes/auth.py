@@ -561,6 +561,10 @@ def _switch_content(result, email: str) -> dict:
         "existing_sessions": result.existing_session_activation.value,
         "provider_verification": result.provider_verification.value,
         "message": result.message,
+        # The stable reason behind a refusal (OUTGOING_ACCOUNT_BUSY,
+        # CC_REAUTH_REQUIRED), so the dashboard can act on it, not only show
+        # the message.
+        "code": result.code or None,
     }
 
 

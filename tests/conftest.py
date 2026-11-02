@@ -661,12 +661,14 @@ def _block_browser_open():
 def _block_profile_browser_launch():
     """Prevent any test from spawning a real browser process.
 
-    Browser-mode OAuth now launches a per-account browser profile through
+    Browser-mode OAuth launches a per-account browser profile through
     jacked.web.browser_launch, which uses subprocess.Popen rather than
-    webbrowser.open. Reporting "no browser installed" sends open_auth_url
-    down its webbrowser fallback, which the fixture above already blocks.
-    Tests that exercise the launcher itself patch find_browser locally,
-    which overrides this.
+    webbrowser.open. Reporting "no browser installed" makes open_auth_url
+    report a "manual" result in profile and incognito mode (nothing opens;
+    the dashboard shows the link), and in "default" mode it uses
+    webbrowser.open, which the fixture above already blocks. Tests that
+    exercise the launcher itself patch find_browser locally, which
+    overrides this.
     """
     with patch("jacked.web.browser_launch.find_browser", return_value=None):
         yield

@@ -23,6 +23,10 @@ from typing import Literal, Optional
 import httpx
 
 from jacked.web.database import Database
+from jacked.web.refresh_verdict import SIGN_IN_REQUIRED_ERROR
+from jacked.web.refresh_verdict import primary_refresh_revoked as _primary_refresh_revoked
+from jacked.web.refresh_verdict import revoked_or as _revoked_or
+from jacked.web.refresh_verdict import token_fingerprint as _token_fingerprint
 from jacked.web.window_keeper import cache_reset_value
 from jacked.web.oauth import (
     CC_LINEAGE_WRITE_LOCK,
@@ -133,8 +137,48 @@ def _profile_owner_mismatch(row: dict, data: dict) -> Optional[str]:
     )
 
 
+class ProfileApply(str, Enum):
+    """What ``_apply_profile`` did with one profile response."""
+
+    APPLIED = "applied"
+    ROW_UNKNOWN = "row_unknown"  # no such account row
+    OWNER_MISMATCH = "owner_mismatch"  # the profile names another account
+    PROFILE_UNREADABLE = "profile_unreadable"  # no owner value to compare
+    IDENTITY_CHANGED = "identity_changed"  # a re-auth moved the row meanwhile
+
+
+def _profile_field_value(data: dict, field: str) -> Optional[str]:
+    """Return the profile's own value for an owner-rule field name, or None.
+
+    A mismatch is evidence of another owner only when the profile carries a
+    readable value for the field. A missing account object or a missing
+    email says nothing about the owner.
+
+    >>> data = {"account": {"email": "b@x.com", "uuid": " "}}
+    >>> _profile_field_value(data, "account.email")
+    'b@x.com'
+    >>> [_profile_field_value(data, f) for f in ("account.uuid", "organization.uuid",
+    ...                                          "account", "profile")]
+    [None, None, None, None]
+    """
+    section, _, key = field.partition(".")
+    obj = data.get(section) if isinstance(data, dict) else None
+    value = obj.get(key) if key and isinstance(obj, dict) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 def _update_profile_metadata(account_id: int, data: dict, db) -> bool:
     """Update the account row from a profile API response.
+
+    Returns True when the profile was applied, False when the row is
+    unknown or the profile does not belong to it. ``_apply_profile`` does
+    the work and says why a profile was not applied.
+    """
+    return _apply_profile(account_id, data, db) is ProfileApply.APPLIED
+
+
+def _apply_profile(account_id: int, data: dict, db) -> ProfileApply:
+    """Apply a profile API response to the account row and say what happened.
 
     This function applies NOTHING when the profile does not belong to the
     row (see ``_profile_owner_mismatch``). It then logs a WARNING that names
@@ -143,44 +187,21 @@ def _update_profile_metadata(account_id: int, data: dict, db) -> bool:
     (the ``account`` and ``organization`` objects only, exactly as the
     endpoint returned them; a missing organization is stored as null) and
     the fetch time.
-
-    Returns True when the profile was applied, False when the row is
-    unknown or the profile does not belong to it.
     """
     row = db.get_account(account_id)
     if not row:
-        return False
+        return ProfileApply.ROW_UNKNOWN
     mismatch = _profile_owner_mismatch(row, data)
     if mismatch is not None:
         logger.warning(
             "Profile for account %d not applied: %s does not match the row",
             account_id, mismatch,
         )
-        return False
+        if _profile_field_value(data, mismatch) is None:
+            return ProfileApply.PROFILE_UNREADABLE
+        return ProfileApply.OWNER_MISMATCH
 
-    acct = data["account"]
-    raw_org = data.get("organization")
-    # The empty-dict fallback is only for reading the plan metadata below;
-    # profile_json keeps the organization value the endpoint returned.
-    org = raw_org if isinstance(raw_org, dict) else {}
-    org_type = org.get("organization_type", "")
-    subscription_type = ORG_TYPE_MAP.get(org_type)
-
-    updates: dict = {
-        "profile_json": json.dumps({"account": acct, "organization": raw_org}),
-        "profile_fetched_at": time.time(),
-    }
-    account_uuid = acct.get("uuid")
-    if isinstance(account_uuid, str) and account_uuid:
-        updates["account_uuid"] = account_uuid
-    if subscription_type:
-        updates["subscription_type"] = subscription_type
-    if org.get("rate_limit_tier"):
-        updates["rate_limit_tier"] = org["rate_limit_tier"]
-    if "has_extra_usage_enabled" in org:
-        updates["has_extra_usage"] = org["has_extra_usage_enabled"]
-    if org.get("name"):
-        updates["organization_name"] = org["name"]
+    updates = _profile_updates(data)
     # Compare-and-set on the identity the ownership check just read: a
     # re-auth that moved this row to another organization or account in the
     # meantime (writers run on threads) makes this a no-op, so one identity's
@@ -199,7 +220,44 @@ def _update_profile_metadata(account_id: int, data: dict, db) -> bool:
             "while the profile was being applied",
             account_id,
         )
-    return applied
+        return ProfileApply.IDENTITY_CHANGED
+    return ProfileApply.APPLIED
+
+
+def _profile_updates(data: dict) -> dict:
+    """Return the row update for a profile that belongs to the row.
+
+    The update holds the plan metadata, the Claude account uuid, the
+    non-secret profile subset and the fetch time.
+
+    >>> up = _profile_updates({"account": {"uuid": "u1"},
+    ...                        "organization": {"name": "Acme", "rate_limit_tier": "t"}})
+    >>> sorted(up)
+    ['account_uuid', 'organization_name', 'profile_fetched_at', 'profile_json', 'rate_limit_tier']
+    """
+    acct = data["account"]
+    raw_org = data.get("organization")
+    # The empty-dict fallback is only for reading the plan metadata below;
+    # profile_json keeps the organization value the endpoint returned.
+    org = raw_org if isinstance(raw_org, dict) else {}
+    subscription_type = ORG_TYPE_MAP.get(org.get("organization_type", ""))
+
+    updates: dict = {
+        "profile_json": json.dumps({"account": acct, "organization": raw_org}),
+        "profile_fetched_at": time.time(),
+    }
+    account_uuid = acct.get("uuid")
+    if isinstance(account_uuid, str) and account_uuid:
+        updates["account_uuid"] = account_uuid
+    if subscription_type:
+        updates["subscription_type"] = subscription_type
+    if org.get("rate_limit_tier"):
+        updates["rate_limit_tier"] = org["rate_limit_tier"]
+    if "has_extra_usage_enabled" in org:
+        updates["has_extra_usage"] = org["has_extra_usage_enabled"]
+    if org.get("name"):
+        updates["organization_name"] = org["name"]
+    return updates
 
 
 @dataclass
@@ -224,10 +282,14 @@ class TokenExchangeResult:
 
 
 class RefreshMode(str, Enum):
-    """Token refresh modes — one per caller, behavior hardcoded per mode."""
+    """Token refresh modes: one per caller, with the behavior fixed per mode.
+
+    Each mode names one refresh lineage (``_mode_chain``). A 429 never
+    rotates the Claude Code chain (#149i), so no mode picks a chain from
+    the row state.
+    """
     PRIMARY = "primary"
     CC = "cc"
-    CC_OR_PRIMARY_429 = "cc_429"
     PRIMARY_CIRCUIT_BREAKER = "primary_cb"
 
 
@@ -429,31 +491,15 @@ def _breaker_updates(chain: Chain, failure_type: str | None) -> dict:
     }
 
 
-def _resolve_chain(mode: RefreshMode, account: dict) -> Chain:
-    """Decide which refresh lineage ``mode`` exchanges for ``account``.
+def _mode_chain(mode: RefreshMode) -> Chain:
+    """Return the refresh lineage that ``mode`` exchanges.
 
-    CC_OR_PRIMARY_429 uses the Claude Code chain while it has a refresh
-    token and no recorded invalid_grant, else the primary chain.
-
-    >>> _resolve_chain(RefreshMode.CC_OR_PRIMARY_429, {"cc_refresh_token": "r"})
+    >>> _mode_chain(RefreshMode.CC)
     'cc'
-    >>> _resolve_chain(RefreshMode.CC_OR_PRIMARY_429, {"cc_refresh_token": None})
-    'primary'
-    >>> _resolve_chain(RefreshMode.CC_OR_PRIMARY_429,
-    ...                {"cc_refresh_token": "r", "cc_refresh_failure_type": "invalid_grant"})
-    'primary'
-    >>> _resolve_chain(RefreshMode.PRIMARY_CIRCUIT_BREAKER, {"cc_refresh_token": "r"})
-    'primary'
+    >>> _mode_chain(RefreshMode.PRIMARY), _mode_chain(RefreshMode.PRIMARY_CIRCUIT_BREAKER)
+    ('primary', 'primary')
     """
-    if mode in (RefreshMode.PRIMARY, RefreshMode.PRIMARY_CIRCUIT_BREAKER):
-        return "primary"
-    if mode == RefreshMode.CC:
-        return "cc"
-    if account.get("cc_refresh_token") and (
-        account.get("cc_refresh_failure_type") != "invalid_grant"
-    ):
-        return "cc"
-    return "primary"
+    return "cc" if mode == RefreshMode.CC else "primary"
 
 
 def _live_recovery_payload(account_id: int, account: dict) -> Optional[dict]:
@@ -493,6 +539,44 @@ def _live_recovery_payload(account_id: int, account: dict) -> Optional[dict]:
     return oauth
 
 
+def _refusal_before_exchange(
+    account_id: int, mode: RefreshMode, chain: Chain, current: dict, refresh_token: str,
+) -> Optional[TokenExchangeResult]:
+    """Return the refusal for an exchange that must not reach the endpoint.
+
+    The caller holds the chain lock and passes the row it read under it.
+    A primary refresh token that an invalid_grant condemned is never sent
+    again, whatever the mode and however old the verdict (#152i). The
+    PRIMARY_CIRCUIT_BREAKER mode also waits for the primary breaker's
+    cooldown. Returns None when the exchange may run.
+    """
+    if chain != "primary":
+        return None
+    if current.get("refresh_token") == refresh_token and _primary_refresh_revoked(current):
+        logger.info(
+            "Account %d: not sending the primary refresh token; it was revoked "
+            "(sign-in required, caller %s)",
+            account_id, mode.value,
+        )
+        return TokenExchangeResult(success=False, error="invalid_grant", chain=chain)
+    last_failed = current.get("refresh_last_failed_at")
+    if mode != RefreshMode.PRIMARY_CIRCUIT_BREAKER or last_failed is None:
+        return None
+    failure_type = current.get("refresh_failure_type")
+    remaining = breaker_cooldown(failure_type) - (time.time() - last_failed)
+    if remaining > 0:
+        logger.info(
+            "Account %d: circuit breaker active (%s, %ds remaining)",
+            account_id, failure_type, int(remaining),
+        )
+        return TokenExchangeResult(success=False, error="circuit_breaker", chain=chain)
+    logger.info(
+        "Account %d: circuit breaker cooldown expired, re-attempting refresh",
+        account_id,
+    )
+    return None
+
+
 async def _refresh_token_flow(
     account_id: int,
     db: Database,
@@ -504,34 +588,19 @@ async def _refresh_token_flow(
     with retry, and error recovery. Each RefreshMode encodes caller-specific
     behavior (which token, timeouts, error handling).
 
-    The flow resolves ONE chain (``cc`` or ``primary``) under the lock and
-    uses it for every column it reads or writes, for the invalid_grant
-    branch, for the log text, and for the token it returns. A failure on
-    one chain never touches the other chain's tokens or breaker.
+    The mode names ONE chain (``cc`` or ``primary``, see ``_mode_chain``).
+    The flow uses it for every column it reads or writes, for the
+    invalid_grant branch, for the log text, and for the token it returns. A
+    failure on one chain never touches the other chain's tokens or breaker.
+    A primary refresh token that an invalid_grant condemned is never sent
+    again (``_refusal_before_exchange``).
 
     Credential refresh is DB-only. It never writes Claude's live stores.
     """
     account = await asyncio.to_thread(db.get_account, account_id)
     if not account:
         return TokenExchangeResult(success=False, error="account_not_found")
-
-    # At most two passes: the first chain is resolved before the lock to
-    # choose the lock. When the locked re-read resolves a different chain (a
-    # concurrent cc invalid_grant cleared the cc refresh token), the flow
-    # releases that lock and runs once more under the correct one.
-    for _attempt in range(2):
-        tentative = _resolve_chain(mode, account)
-        result = await _run_chain_flow(account_id, db, mode, tentative, account)
-        if result.error != "chain_changed":
-            return result
-        account = await asyncio.to_thread(db.get_account, account_id)
-        if not account:
-            return TokenExchangeResult(success=False, error="account_not_found")
-    logger.warning(
-        "Account %d: %s refresh chain kept changing under the lock; aborting",
-        account_id, mode.value,
-    )
-    return TokenExchangeResult(success=False, error="chain_changed")
+    return await _run_chain_flow(account_id, db, mode, _mode_chain(mode), account)
 
 
 async def _run_chain_flow(
@@ -575,29 +644,9 @@ async def _run_chain_flow(
             if not current:
                 return TokenExchangeResult(success=False, error="account_not_found")
 
-            # The chain is resolved ONCE, here, under the lock.
-            if _resolve_chain(mode, current) != chain:
-                return TokenExchangeResult(success=False, error="chain_changed")
-
-            # Circuit breaker (PRIMARY_CIRCUIT_BREAKER only, primary chain).
-            if mode == RefreshMode.PRIMARY_CIRCUIT_BREAKER:
-                last_failed = current.get("refresh_last_failed_at")
-                failure_type = current.get("refresh_failure_type")
-                if last_failed is not None:
-                    cooldown = breaker_cooldown(failure_type)
-                    remaining = cooldown - (time.time() - last_failed)
-                    if remaining > 0:
-                        logger.info(
-                            "Account %d: circuit breaker active (%s, %ds remaining)",
-                            account_id, failure_type, int(remaining),
-                        )
-                        return TokenExchangeResult(
-                            success=False, error="circuit_breaker", chain=chain,
-                        )
-                    logger.info(
-                        "Account %d: circuit breaker cooldown expired, re-attempting refresh",
-                        account_id,
-                    )
+            refusal = _refusal_before_exchange(account_id, mode, chain, current, refresh_token)
+            if refusal is not None:
+                return refusal
 
             # Another path rotated this chain while we waited for the lock:
             # hand back THIS chain's current access token.
@@ -725,13 +774,19 @@ async def _run_chain_flow(
                     return await _cc_chain_died(account_id, db, current, refresh_token)
 
                 def _record_primary_invalid_grant() -> bool:
-                    if not _write_lineage(**_breaker_updates("primary", "invalid_grant")):
+                    # The verdict is bound to the token that failed (#152i):
+                    # no path sends that token again, and a new stored
+                    # refresh token clears the binding (database trigger).
+                    if not _write_lineage(
+                        refresh_failed_token_fp=_token_fingerprint(refresh_token),
+                        **_breaker_updates("primary", "invalid_grant"),
+                    ):
                         return False
                     if mode == RefreshMode.PRIMARY:
                         # Same condition: a re-auth that lands between the two
                         # writes must not inherit the old token's error.
                         db.record_account_error(
-                            account_id, "Refresh token consumed (will retry)",
+                            account_id, SIGN_IN_REQUIRED_ERROR,
                             expected={refresh_col: refresh_token},
                         )
                     return True
@@ -810,19 +865,84 @@ async def _run_chain_flow(
     return flow_result
 
 
+def _cc_dead_verdict(failed_refresh_token: str) -> dict:
+    """Return the cc breaker update for a dead lineage, bound to its token.
+
+    The clean-up removes the failed token from the row, so the fingerprint
+    is the only record of which token died (#152i).
+
+    >>> sorted(_cc_dead_verdict("rt"))
+    ['cc_refresh_failed_token_fp', 'cc_refresh_failure_type', 'cc_refresh_last_failed_at']
+    """
+    return {
+        **_breaker_updates("cc", "invalid_grant"),
+        "cc_refresh_failed_token_fp": _token_fingerprint(failed_refresh_token),
+    }
+
+
+def _live_recovery_updates(
+    oauth: dict, adoption: Optional[dict], failed_refresh_token: str,
+) -> dict:
+    """Return the cc column update for an ownership-proven live recovery.
+
+    ``adoption`` is the answer of the shared dead-chain rule
+    (``credential_helpers.dead_chain_adoption``). When it adopts the live
+    lineage, its update (the refresh token, the pass-through fields bound
+    to it, a clear cc breaker) is written with the access token and its
+    expiry. Otherwise only the access token is kept. It carries no refresh
+    token, so no refresh-token expiry either; the other pass-through fields
+    stay as Claude Code holds them, and the verdict records the dead
+    lineage (``_cc_dead_verdict``).
+
+    >>> adopt = {"cc_refresh_token": "r", "cc_refresh_failure_type": None}
+    >>> up = _live_recovery_updates({"accessToken": "a"}, adopt, "d")
+    >>> up["cc_access_token"], up["cc_refresh_token"], up["cc_refresh_failure_type"]
+    ('a', 'r', None)
+    >>> up = _live_recovery_updates({"accessToken": "a", "refreshTokenExpiresAt": 9}, None, "d")
+    >>> up["cc_refresh_token"], up["cc_refresh_failure_type"], up["cc_oauth_extra"]
+    (None, 'invalid_grant', None)
+    """
+    from jacked.api.credential_helpers import expiry_seconds
+    from jacked.credentials.oauth_extra import encode_oauth_extra, oauth_extra_from
+
+    updates = {
+        "cc_access_token": oauth.get("accessToken"),
+        "cc_expires_at": expiry_seconds(oauth.get("expiresAt")),
+    }
+    if adoption:
+        return {**updates, **adoption}
+    extra = oauth_extra_from(oauth)
+    extra.pop("refreshTokenExpiresAt", None)
+    return {
+        **updates,
+        "cc_refresh_token": None,
+        "cc_oauth_extra": encode_oauth_extra(extra, None, tier=oauth.get("subscriptionType")),
+        **_cc_dead_verdict(failed_refresh_token),
+    }
+
+
 async def _cc_chain_died(
     account_id: int, db: Database, account: dict, failed_refresh_token: str,
 ) -> TokenExchangeResult:
     """Handle invalid_grant on the Claude Code chain (lock held by caller).
 
-    The chain is dead either way. Its refresh token is spent, so it leaves
-    the row, and the cc breaker records invalid_grant. When the live store
-    holds an unexpired access token that the shared ownership rule proves
-    belongs to this account, that token is kept for the rest of its life.
-    Otherwise the dead access token and its expiry leave the row too, so no
-    consumer keeps sending a dead token. The live refresh token is never
-    imported here: it is Claude Code's, and exchanging it would destroy the
-    session that holds it.
+    The failed refresh token is spent, so it always leaves the row. What
+    replaces it depends on the live store (``_live_recovery_payload``):
+
+    - The shared ownership rule proves the live tokens belong to this
+      account, and the shared dead-chain rule
+      (``credential_helpers.dead_chain_adoption``, also used by reconcile
+      and the launch sync) adopts the live refresh token (#149i, settled):
+      the row takes the access token, its expiry and the rule's update (the
+      refresh token, its pass-through fields, a clear cc breaker).
+      ``cc_rotation_block`` still refuses an exchange while a session
+      holds that token.
+    - The ownership is proven, but the rule adopts nothing (the live
+      refresh token is missing, the failed one, or the primary one): only
+      the unexpired access token is kept, for the rest of its life, and the
+      cc breaker records invalid_grant with the failed token's fingerprint.
+    - Otherwise the dead access token and its expiry leave the row too, so
+      no consumer keeps sending a dead token.
     """
     try:
         oauth = await asyncio.to_thread(_live_recovery_payload, account_id, account)
@@ -861,46 +981,46 @@ async def _cc_chain_died(
             return _kept_new_lineage()
 
         if oauth:
-            live_access = oauth.get("accessToken")
-            from jacked.api.credential_helpers import expiry_seconds
+            from jacked.api.credential_helpers import dead_chain_adoption
 
-            live_exp_s = expiry_seconds(oauth.get("expiresAt"))
-            # The recovered access token carries no refresh token, so no
-            # refresh-token expiry either; the other pass-through fields stay as
-            # Claude Code holds them, subscriptionTypeVerifiedAt bound to the
-            # tier beside it (#230i).
-            from jacked.credentials.oauth_extra import encode_oauth_extra, oauth_extra_from
-
-            recovered_extra = oauth_extra_from(oauth)
-            recovered_extra.pop("refreshTokenExpiresAt", None)
-            recovered = encode_oauth_extra(
-                recovered_extra, None, tier=oauth.get("subscriptionType")
+            # The shared dead-chain rule (#149i) reads the row as this
+            # clean-up records it: a dead chain whose cc_refresh_token is
+            # the token that failed.
+            adoption = dead_chain_adoption(
+                {**current, "cc_refresh_token": failed_refresh_token,
+                 **_cc_dead_verdict(failed_refresh_token)},
+                oauth,
             )
             if not _write_if_unchanged(
-                cc_access_token=live_access,
-                cc_expires_at=live_exp_s,
-                cc_refresh_token=None,
-                cc_oauth_extra=recovered,
-                **_breaker_updates("cc", "invalid_grant"),
+                **_live_recovery_updates(oauth, adoption, failed_refresh_token)
             ):
                 return _kept_new_lineage()
-            logger.info(
-                "Account %d: invalid_grant on the cc chain — recovered cc_access_token "
-                "from live credentials (ownership proven; refresh token not imported)",
-                account_id,
+            if adoption:
+                logger.info(
+                    "Account %d: invalid_grant on the cc chain; adopted the live "
+                    "refresh lineage (ownership proven)",
+                    account_id,
+                )
+            else:
+                logger.info(
+                    "Account %d: invalid_grant on the cc chain; recovered cc_access_token "
+                    "from live credentials (ownership proven; no live refresh lineage adopted)",
+                    account_id,
+                )
+            return TokenExchangeResult(
+                success=True, access_token=oauth.get("accessToken"), chain="cc",
             )
-            return TokenExchangeResult(success=True, access_token=live_access, chain="cc")
 
         if not _write_if_unchanged(
             cc_access_token=None,
             cc_refresh_token=None,
             cc_expires_at=None,
             cc_oauth_extra=None,
-            **_breaker_updates("cc", "invalid_grant"),
+            **_cc_dead_verdict(failed_refresh_token),
         ):
             return _kept_new_lineage()
         logger.warning(
-            "Account %d: invalid_grant on the cc chain — clearing cc tokens "
+            "Account %d: invalid_grant on the cc chain; clearing cc tokens "
             "(no recovery; the Claude Code chain needs re-authorization)",
             account_id,
         )
@@ -936,21 +1056,6 @@ def _get_usage_state(account_id: int) -> dict:
     if "last_429_token_fp" not in state:
         state["last_429_token_fp"] = None
     return state
-
-
-def _token_fingerprint(token: Optional[str]) -> Optional[str]:
-    """Return a short, non-reversible fingerprint of a token for state keys.
-
-    >>> _token_fingerprint(None) is None
-    True
-    >>> len(_token_fingerprint("abc"))
-    16
-    """
-    if not token:
-        return None
-    import hashlib
-
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
 
 
 def _usage_429_rotation_interval(db) -> float:
@@ -1446,18 +1551,23 @@ async def refresh_account_token(account_id: int, db: Database) -> bool:
 async def _try_refresh_on_429(
     account_id: int, db: Database, state: dict, stale_token: Optional[str] = None,
 ) -> str | None:
-    """Rotate the lineage that owns ``stale_token`` to clear a per-token limit.
+    """Rotate the primary lineage when ``stale_token`` is not the cc token.
 
-    The Claude Code chain rotates only for a non-active account whose chain
-    is alive; the active account's cc refresh token belongs to the running
-    Claude Code sessions (invariant I2). Every other case rotates the
-    primary chain through the circuit breaker.
+    A 429 on the Claude Code token never rotates anything (#149i): a cc
+    rotation spends a single-use refresh token that a running session may
+    hold, and a primary rotation in its place only dodges a rate limit that
+    the caller must wait out. That case returns None, so the caller backs
+    off. Every other token rotates the primary chain through the circuit
+    breaker.
     """
     account = await asyncio.to_thread(db.get_account, account_id) or {}
-    if token_chain(account, stale_token) == "cc" and await _cc_rotation_allowed(account_id, db):
-        result = await _refresh_token_flow(account_id, db, RefreshMode.CC_OR_PRIMARY_429)
-    else:
-        result = await _refresh_token_flow(account_id, db, RefreshMode.PRIMARY_CIRCUIT_BREAKER)
+    if token_chain(account, stale_token) == "cc":
+        logger.info(
+            "Account %d: 429 on the Claude Code token; backing off, no rotation",
+            account_id,
+        )
+        return None
+    result = await _refresh_token_flow(account_id, db, RefreshMode.PRIMARY_CIRCUIT_BREAKER)
     if not result.success or not result.access_token or result.access_token == stale_token:
         return None
     return result.access_token
@@ -1781,7 +1891,10 @@ async def fetch_usage(
                     # Refresh and live import both failed or already retried — mark
                     # invalid, but only while the row still holds the refused
                     # token: a re-auth that landed meanwhile is a new login.
-                    error_msg = f"Usage fetch failed (HTTP {resp.status_code}). Token refresh failed."
+                    error_msg = _revoked_or(
+                        db.get_account(account_id) or account,
+                        f"Usage fetch failed (HTTP {resp.status_code}). Token refresh failed.",
+                    )
                     refused_col = (
                         "cc_access_token" if token_chain(account, token) == "cc" else "access_token"
                     )
@@ -2125,110 +2238,162 @@ def _validate_codex_account(account_id: int, db: Database) -> dict:
     return {"valid": False, "error": "Codex signed out"}
 
 
-async def validate_account(account_id: int, db: Database) -> dict:
-    """Validate an account by attempting a profile fetch.
+_FOREIGN_TOKEN_ERROR = "Token belongs to a different account"
 
-    If the profile fetch succeeds, the token is valid.
-    If it fails with 401/403, the token is invalid.
+
+def _begin_validation(account_id: int, db: Database) -> tuple[Optional[dict], Optional[dict]]:
+    """Read the row and mark it "checking" in one thread hop.
+
+    Returns ``(account, verdict)``. A verdict ends the validation early: the
+    row does not exist, or it is a Codex account. Codex accounts are NOT
+    Anthropic-token-validated (their stored token is a sentinel): validity
+    is the signed-in state of the account's Codex slot, because the
+    Anthropic profile API would always answer 401 and mark them invalid.
+    """
+    account = db.get_account(account_id)
+    if not account:
+        return None, {"valid": False, "error": "Account not found"}
+    if (account.get("provider") or "claude") == "codex":
+        return account, _validate_codex_account(account_id, db)
+    db.update_account(account_id, validation_status="checking")
+    return account, None
+
+
+async def _get_profile(client: httpx.AsyncClient, token: str) -> httpx.Response:
+    """Send one profile request with ``token``."""
+    return await client.get(
+        PROFILE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+        },
+    )
+
+
+def _settle_profile_verdict(account_id: int, data: dict, token: str, db: Database) -> dict:
+    """Apply a profile 200 and record the validation verdict (worker thread).
+
+    A profile 200 proves that ``token`` works, not that it is this row's
+    token. The profile is applied first. When it names another account,
+    nothing of it is applied and the row is marked invalid (#154i), but only
+    while the row still holds ``token``: a re-auth that stored a new token
+    meanwhile keeps its own status. Every other outcome marks the row
+    validated. That proves the token, not that usage is readable: the usage
+    path's error and failure counter stay until a successful usage fetch
+    clears them (``clear_account_errors``).
+    """
+    if _apply_profile(account_id, data, db) is not ProfileApply.OWNER_MISMATCH:
+        db.mark_account_validated(account_id)
+        return {"valid": True, "error": None}
+    logger.warning(
+        "Account %d: validation failed; the token belongs to a different account",
+        account_id,
+    )
+    db.update_account_if_unchanged(
+        account_id,
+        {"access_token": token},
+        validation_status="invalid",
+        last_validated_at=int(time.time()),
+        last_error=_FOREIGN_TOKEN_ERROR,
+        last_error_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return {"valid": False, "error": _FOREIGN_TOKEN_ERROR}
+
+
+async def _profile_after_refresh(
+    account_id: int, db: Database, account: dict, client: httpx.AsyncClient,
+) -> Optional[tuple[str, httpx.Response]]:
+    """Renew the primary token after a 401/403 and ask for the profile again.
+
+    A revoked primary refresh token is not tried (#152i). Returns
+    ``(new token, response)``, or None when no new token came back.
+    """
+    if _primary_refresh_revoked(account):
+        logger.debug(
+            "Account %d: validation does not renew a revoked refresh token",
+            account["id"],
+        )
+        return None
+    fresh = await _try_refresh_primary_token(
+        account_id, db, stale_token=account["access_token"],
+    )
+    if not fresh:
+        return None
+    return fresh, await _get_profile(client, fresh)
+
+
+def _record_auth_rejection(account_id: int, db: Database, status: int) -> dict:
+    """Mark the row invalid after a 401/403 that no refresh fixed (worker thread).
+
+    A revoked primary refresh token gets the terminal sign-in text (#152i);
+    any other failure names the HTTP status, as before.
+    """
+    row = db.get_account(account_id) or {}
+    stored = _revoked_or(row, f"Token invalid (HTTP {status}), refresh failed")
+    shown = _revoked_or(row, f"Token invalid (HTTP {status})")
+    db.update_account(
+        account_id,
+        validation_status="invalid",
+        last_validated_at=int(time.time()),
+        last_error=stored,
+        last_error_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return {"valid": False, "error": shown}
+
+
+def _record_validation_http(account_id: int, db: Database, account: dict, status: int) -> dict:
+    """Record a profile answer that is not 200, 401 or 403 (worker thread)."""
+    now = datetime.now(timezone.utc).isoformat()
+    if status == 429:
+        # Rate limited: keep the earlier status, only note the error.
+        db.update_account(
+            account_id,
+            validation_status=account.get("validation_status", "unknown"),
+            last_error="Rate limited during validation",
+            last_error_at=now,
+        )
+        return {"valid": False, "error": "Rate limited. Try again later."}
+    db.update_account(
+        account_id,
+        validation_status="unknown",
+        last_error=f"Validation HTTP {status}",
+        last_error_at=now,
+    )
+    return {"valid": False, "error": f"Unexpected HTTP {status}"}
+
+
+async def validate_account(account_id: int, db: Database) -> dict:
+    """Validate an account with a profile request.
+
+    A profile 200 marks the row valid when the profile names this account,
+    and invalid when it names another account (``_settle_profile_verdict``).
+    A 401/403 renews the primary token once (never a revoked refresh token)
+    and asks again; when that does not give a 200, the row is invalid.
 
     Returns dict with 'valid' (bool) and 'error' (str or None).
-
-    This is simpler than ralphx's approach — we don't try to refresh
-    as part of validation. The frontend calls refresh first if needed.
     """
-    def _begin() -> tuple[Optional[dict], Optional[dict]]:
-        # (account, verdict): the read and the "checking" mark are one hop.
-        account = db.get_account(account_id)
-        if not account:
-            return None, {"valid": False, "error": "Account not found"}
-
-        # Codex accounts are NOT Anthropic-token-validated (their stored token is a
-        # sentinel). Validity = signed in to Codex (the account's slot holds a real
-        # credential); hitting the Anthropic profile API would always 401 and
-        # falsely mark them invalid.
-        if (account.get("provider") or "claude") == "codex":
-            return account, _validate_codex_account(account_id, db)
-
-        # Mark as checking
-        db.update_account(account_id, validation_status="checking")
-        return account, None
-
-    account, verdict = await asyncio.to_thread(_begin)
+    account, verdict = await asyncio.to_thread(_begin_validation, account_id, db)
     if verdict is not None:
         return verdict
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(
-                PROFILE_URL,
-                headers={
-                    "Authorization": f"Bearer {account['access_token']}",
-                    "anthropic-beta": OAUTH_BETA_HEADER,
-                },
-            )
-
-            if resp.status_code == 200:
-                # A profile 200 proves the token, not that usage is readable:
-                # the usage path's error and failure counter stay until a
-                # successful usage fetch clears them (clear_account_errors).
-                def _mark_valid() -> None:
-                    db.mark_account_validated(account_id)
-                    _update_profile_metadata(account_id, resp.json(), db)
-
-                await asyncio.to_thread(_mark_valid)
-                return {"valid": True, "error": None}
-
+            token = account["access_token"]
+            resp = await _get_profile(client, token)
             if resp.status_code in (401, 403):
-                fresh = await _try_refresh_primary_token(
-                    account_id, db, stale_token=account['access_token'],
-                )
-                if fresh:
-                    retry_resp = await client.get(
-                        PROFILE_URL,
-                        headers={
-                            "Authorization": f"Bearer {fresh}",
-                            "anthropic-beta": OAUTH_BETA_HEADER,
-                        },
+                retry = await _profile_after_refresh(account_id, db, account, client)
+                if retry is None or retry[1].status_code != 200:
+                    return await asyncio.to_thread(
+                        _record_auth_rejection, account_id, db, resp.status_code,
                     )
-                    if retry_resp.status_code == 200:
-                        # Same rule as the first-try 200 above.
-                        def _mark_retry_valid() -> None:
-                            db.mark_account_validated(account_id)
-                            _update_profile_metadata(account_id, retry_resp.json(), db)
-
-                        await asyncio.to_thread(_mark_retry_valid)
-                        return {"valid": True, "error": None}
-
-                # Refresh failed — truly invalid
-                await asyncio.to_thread(
-                    db.update_account,
-                    account_id,
-                    validation_status="invalid",
-                    last_validated_at=int(time.time()),
-                    last_error=f"Token invalid (HTTP {resp.status_code}), refresh failed",
-                    last_error_at=datetime.now(timezone.utc).isoformat(),
+                token, resp = retry
+            if resp.status_code == 200:
+                return await asyncio.to_thread(
+                    _settle_profile_verdict, account_id, resp.json(), token, db,
                 )
-                return {"valid": False, "error": f"Token invalid (HTTP {resp.status_code})"}
-
-            if resp.status_code == 429:
-                # Rate limited — don't mark invalid, just note the error
-                await asyncio.to_thread(
-                    db.update_account,
-                    account_id,
-                    validation_status=account.get("validation_status", "unknown"),
-                    last_error="Rate limited during validation",
-                    last_error_at=datetime.now(timezone.utc).isoformat(),
-                )
-                return {"valid": False, "error": "Rate limited. Try again later."}
-
-            await asyncio.to_thread(
-                db.update_account,
-                account_id,
-                validation_status="unknown",
-                last_error=f"Validation HTTP {resp.status_code}",
-                last_error_at=datetime.now(timezone.utc).isoformat(),
+            return await asyncio.to_thread(
+                _record_validation_http, account_id, db, account, resp.status_code,
             )
-            return {"valid": False, "error": f"Unexpected HTTP {resp.status_code}"}
 
     except httpx.TimeoutException:
         await asyncio.to_thread(
@@ -2515,17 +2680,123 @@ async def refresh_all_expiring_tokens(
     return result
 
 
+def _network_breaker_waits(account: dict) -> bool:
+    """True while the row's network breaker is in its cooldown.
+
+    A network breaker describes the network, not the credential. While its
+    cooldown runs, a forced renewal can only fail again, and a reply lost
+    on the way back can consume the refresh token, so the heal leaves the
+    breaker and the account for a later pass.
+    """
+    failure_type = account.get("refresh_failure_type")
+    last_failed = account.get("refresh_last_failed_at")
+    if failure_type not in NETWORK_FAILURE_TYPES or last_failed is None:
+        return False
+    remaining = breaker_cooldown(failure_type) - (time.time() - last_failed)
+    if remaining <= 0:
+        return False
+    logger.info(
+        "Account %d: heal waits for the %s breaker (%ds remaining)",
+        account["id"], failure_type, int(remaining),
+    )
+    return True
+
+
+async def _heal_exchange(account: dict, db: Database, probe: dict) -> Optional[bool]:
+    """Try the forced primary renewal for one heal candidate.
+
+    Returns None to defer the account, True when the exchange healed it,
+    and False when the heal falls back to validation. ``probe`` keeps the
+    one network probe of the pass. The flow is called directly:
+    ``refresh_account_token``'s should_refresh gate would report success
+    without an exchange (phantom heal). The flow owns the refresh lock,
+    which is non-reentrant, so no lock is held here.
+    """
+    account_id = account["id"]
+    if not account.get("refresh_token"):
+        return False
+    if _network_breaker_waits(account):
+        return None
+    if probe.get("up") is None:
+        probe["up"] = await _network_reachable()
+    if not probe["up"]:
+        logger.info(
+            "Account %d: heal deferred; the token endpoint host is unreachable",
+            account_id,
+        )
+        return None
+    # A revoked refresh token is never sent again, and the sweep never
+    # clears an invalid_grant breaker: only a new stored refresh token
+    # clears the verdict (#152i).
+    if _primary_refresh_revoked(account):
+        logger.info(
+            "Account %d: heal skips the exchange; the refresh token was revoked "
+            "(sign-in required)",
+            account_id,
+        )
+        return False
+    if _get_refresh_lock(account_id).locked():
+        return False
+    if account.get("refresh_failure_type") != "invalid_grant":
+        logger.info("Account %d: clearing circuit breaker for heal attempt", account_id)
+        await asyncio.to_thread(
+            db.update_account, account_id,
+            refresh_last_failed_at=None, refresh_failure_type=None,
+        )
+    result = await _refresh_token_flow(account_id, db, RefreshMode.PRIMARY)
+    return result.success
+
+
+async def _heal_by_validation(account_id: int, db: Database) -> bool:
+    """Heal through the live store and a profile check (no token exchange)."""
+    try:
+        from jacked.api.credential_helpers import reconcile_credentials_from_live_store
+
+        await asyncio.to_thread(reconcile_credentials_from_live_store, account_id, db)
+    except Exception:
+        logger.debug("Credential reconciliation failed for account %d", account_id)
+    try:
+        validation = await asyncio.wait_for(validate_account(account_id, db), timeout=60)
+    except asyncio.TimeoutError:
+        logger.error(
+            "Account %d: heal validation timed out after 60s; treating as not healed",
+            account_id,
+        )
+        return False
+    return bool(validation.get("valid", False))
+
+
+async def _mark_healed(account: dict, db: Database) -> None:
+    """Record a healed account and note a Claude Code chain that needs sign-in."""
+    account_id = account["id"]
+    await asyncio.to_thread(
+        db.update_account, account_id,
+        validation_status="valid", last_validated_at=int(time.time()),
+    )
+    from jacked.api.credential_helpers import cc_chain_dead
+
+    if cc_chain_dead(account) or (
+        not account.get("cc_refresh_token") and account.get("cc_access_token")
+    ):
+        logger.info(
+            "Account %d healed but CC token needs re-authorization",
+            account_id,
+        )
+
+
 async def heal_invalid_accounts() -> dict:
     """Attempt recovery for accounts with validation_status 'invalid' or 'unknown'.
 
-    Called every 5 minutes by the background heal loop.
-    For each stuck account:
-    - If has refresh_token and token near/past expiry → attempt refresh
-    - Otherwise → validate via profile fetch (works for API key accounts too)
-    - Mark healed (valid) or confirmed-invalid
+    Called every 5 minutes by the background heal loop. For each stuck
+    account, the heal tries a forced primary renewal (``_heal_exchange``),
+    then the live store and a profile check (``_heal_by_validation``), and
+    marks the account healed (valid) or confirmed-invalid.
 
     A network breaker in its cooldown, or an unreachable token endpoint
-    host, defers the account to a later pass (counted as ``deferred``).
+    host, defers the account to a later pass (counted as ``deferred``). A
+    revoked refresh token (#152i) is never sent again: the account goes
+    straight to the profile check, so an access token that still works
+    still heals it, and otherwise it counts as ``confirmed_invalid``.
 
     Returns dict with counts: {"checked": N, "healed": N, "confirmed_invalid": N,
     "deferred": N}
@@ -2533,109 +2804,24 @@ async def heal_invalid_accounts() -> dict:
     db = await asyncio.to_thread(Database)
     result = {"checked": 0, "healed": 0, "confirmed_invalid": 0, "deferred": 0}
     # Probed once per pass, and only when a forced renewal is about to run.
-    network_up: Optional[bool] = None
+    probe: dict = {}
 
     accounts = await asyncio.to_thread(db.list_accounts, include_inactive=True)
     for account in accounts:
         if account.get("is_deleted"):
             continue
-        status = account.get("validation_status", "valid")
-        if status not in ("invalid", "unknown", "checking"):
+        if account.get("validation_status", "valid") not in ("invalid", "unknown", "checking"):
             continue
-
         result["checked"] += 1
-        account_id = account["id"]
-
-        # Try refresh first if has refresh token. Call _refresh_token_flow
-        # directly — refresh_account_token's should_refresh gate would
-        # report success without exchanging when the token isn't near
-        # expiry, marking accounts healed without proving the credentials
-        # work (phantom heal). The flow owns locking, so no lock is held
-        # here (it's non-reentrant — holding it would self-deadlock).
-        healed = False
-        if account.get("refresh_token"):
-            # A network breaker describes the network, not the credential.
-            # While its cooldown runs, or while the network is unreachable,
-            # a forced renewal can only fail again, and a reply lost on the
-            # way back can consume the refresh token. Leave the breaker and
-            # the account for a later pass.
-            failure_type = account.get("refresh_failure_type")
-            last_failed = account.get("refresh_last_failed_at")
-            if failure_type in NETWORK_FAILURE_TYPES and last_failed is not None:
-                cooldown = breaker_cooldown(failure_type)
-                remaining = cooldown - (time.time() - last_failed)
-                if remaining > 0:
-                    logger.info(
-                        "Account %d: heal waits for the %s breaker (%ds remaining)",
-                        account_id, failure_type, int(remaining),
-                    )
-                    result["deferred"] += 1
-                    continue
-            if network_up is None:
-                network_up = await _network_reachable()
-            if not network_up:
-                logger.info(
-                    "Account %d: heal deferred; the token endpoint host is unreachable",
-                    account_id,
-                )
-                result["deferred"] += 1
-                continue
-            lock = _get_refresh_lock(account_id)
-            if not lock.locked():
-                # Clear circuit breaker state before recovery attempt
-                logger.info(
-                    "Account %d: clearing circuit breaker for heal attempt",
-                    account_id,
-                )
-                await asyncio.to_thread(
-                    db.update_account,
-                    account_id,
-                    refresh_last_failed_at=None,
-                    refresh_failure_type=None,
-                )
-                refresh_result = await _refresh_token_flow(
-                    account_id, db, RefreshMode.PRIMARY,
-                )
-                healed = refresh_result.success
-
+        healed = await _heal_exchange(account, db, probe)
+        if healed is None:
+            result["deferred"] += 1
+            continue
         if not healed:
-            # Try reconciling from live credentials before validate
-            try:
-                from jacked.api.credential_helpers import reconcile_credentials_from_live_store
-                await asyncio.to_thread(
-                    reconcile_credentials_from_live_store, account_id, db
-                )
-            except Exception:
-                logger.debug("Credential reconciliation failed for account %d", account_id)
-
-            try:
-                validation = await asyncio.wait_for(
-                    validate_account(account_id, db), timeout=60,
-                )
-                healed = validation.get("valid", False)
-            except asyncio.TimeoutError:
-                logger.error(
-                    "Account %d: heal validation timed out after 60s — "
-                    "treating as not healed",
-                    account_id,
-                )
-                healed = False
-
+            healed = await _heal_by_validation(account["id"], db)
         if healed:
             result["healed"] += 1
-            await asyncio.to_thread(db.update_account, account_id,
-                                    validation_status="valid",
-                                    last_validated_at=int(time.time()))
-            # Check if CC tokens need re-auth after primary heals
-            from jacked.api.credential_helpers import cc_chain_dead
-
-            if cc_chain_dead(account) or (
-                not account.get("cc_refresh_token") and account.get("cc_access_token")
-            ):
-                logger.info(
-                    "Account %d healed but CC token needs re-authorization",
-                    account_id,
-                )
+            await _mark_healed(account, db)
         else:
             result["confirmed_invalid"] += 1
 

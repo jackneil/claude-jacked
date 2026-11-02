@@ -277,9 +277,11 @@ def test_accounts_container_locked_0700(tmp_path):
 
 
 def test_swap_forces_file_storage(tmp_path, db):
+    """"auto" with a live auth.json is file-backed, so the swap pins "file".
+    A "keyring" store is refused instead (test_codex_swap_guards.py)."""
     base = tmp_path / ".codex"
     (base).mkdir(parents=True)
-    (base / "config.toml").write_text('cli_auth_credentials_store = "keyring"\n')
+    (base / "config.toml").write_text('cli_auth_credentials_store = "auto"\n')
     _write(base / "auth.json", _auth("acct-B"))
     _write(sw.codex_slot_auth_path(1, base), _auth("acct-A"))
     db.set_active_account_id(2, provider="codex")

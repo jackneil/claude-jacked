@@ -29,6 +29,7 @@ from .models import (
     SwitchResult,
 )
 from .oauth_extra import PASSTHROUGH_KEYS
+from .refresh_guard import CC_REAUTH_REQUIRED_CODE
 from .repository import CredentialSwitchRepository
 from .resolver import ResolverSnapshotSink, ResolverState, SnapshotUpdate
 from .store import CredentialStore
@@ -68,6 +69,12 @@ class SwitchRequest:
     # None when the store must not be overwritten yet: the outgoing account's
     # newest tokens could not be saved to its row. None refuses with BUSY.
     preflight: Callable[[], SwitchRequest | None] | None = None
+    # Runs inside the switch lease, after the authority read and before any
+    # write. It gets the payload the authority holds now (None when there is
+    # none) and returns a reason when this write would put a null refresh
+    # token over the account's live one (refresh_guard). The engine then
+    # refuses with UNUSABLE and code CC_REAUTH_REQUIRED, and writes nothing.
+    refresh_downgrade_check: Callable[[CredentialPayload | None], str | None] | None = None
 
 
 IdentityPublisher = Callable[[SwitchRequest], None]
@@ -365,6 +372,9 @@ class CredentialTransactionEngine:
             return self._record(request, outcome, message=reason)
         assert prepared is not None
         request = prepared
+        refused = self._refuse_refresh_downgrade(request, before)
+        if refused is not None:
+            return refused
         _warn_on_schema_drift(before, request)
         # Even though this mode has no recovery key and can never commit an
         # active pointer, persist the operation before the native write. A
@@ -574,6 +584,9 @@ class CredentialTransactionEngine:
         assert before.payload is not None
         assert prepared is not None
         request = prepared
+        refused = self._refuse_refresh_downgrade(request, before)
+        if refused is not None:
+            return refused
         key = self._deps.install_key.get_key()
         if not key:
             return _result(
@@ -782,6 +795,32 @@ class CredentialTransactionEngine:
         )
         return self._record(request, outcome, message=reason)
 
+    def _refuse_refresh_downgrade(
+        self, request: SwitchRequest, before: StoreReadResult
+    ) -> SwitchResult | None:
+        """Refuse a write that puts a null refresh token over a live one.
+
+        The request's check compares its target with the authority read
+        (``before``). A refusal happens before the pending row and before any
+        store write, so the authority stays byte-identical. The log line
+        names the account id and the reason, never a token.
+        """
+        check = request.refresh_downgrade_check
+        reason = check(before.payload) if check is not None else None
+        if not reason:
+            return None
+        logger.warning("Account %d: %s", request.account_id, reason)
+        observed = (
+            before.payload.identity if before.payload is not None else CredentialIdentity()
+        )
+        return self._record(
+            request,
+            SwitchOutcome.UNUSABLE,
+            observed,
+            reason,
+            code=CC_REAUTH_REQUIRED_CODE,
+        )
+
     def _record(
         self,
         request: SwitchRequest,
@@ -789,6 +828,7 @@ class CredentialTransactionEngine:
         observed: CredentialIdentity = CredentialIdentity(),
         message: str = "",
         sessions_follow: bool | None = None,
+        code: str = "",
     ) -> SwitchResult:
         self._deps.repository.record_outcome(
             OutcomeSwitchRecord(
@@ -807,4 +847,5 @@ class CredentialTransactionEngine:
             observed=observed,
             message=message,
             sessions_follow=sessions_follow,
+            code=code,
         )

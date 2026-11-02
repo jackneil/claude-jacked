@@ -458,6 +458,76 @@ def cc_chain_dead(account: dict) -> bool:
     return account.get("cc_refresh_failure_type") in CC_CHAIN_DEAD_FAILURES
 
 
+# Logged by every importer when it adopts a live lineage over a dead chain.
+ADOPTED_LINEAGE_MESSAGE = (
+    "Account %d: adopted the live Claude Code refresh lineage after "
+    "invalid_grant (ownership proven)"
+)
+
+
+def dead_chain_adoption(account: dict, oauth: dict) -> dict | None:
+    """The row updates that adopt a live refresh lineage over a dead chain.
+
+    This is the ONE dead-chain rule for every importer of live Claude Code
+    tokens: reconcile (``_reconcile_decision``) and the launch token sync
+    (``launch._sync_tokens_from_file``). Call it only after the shared
+    ownership rule proved that ``oauth`` belongs to ``account``.
+    ``account["cc_refresh_token"]`` is the token that failed (None after the
+    clean-up).
+
+    When the chain is dead (``cc_chain_dead``) and the live refresh token is
+    a non-empty string that is NOT the failed one, Claude Code rotated a new
+    lineage: the result holds that refresh token, its pass-through fields
+    and a cleared cc breaker. The caller writes them with the access token
+    and its expiry in one compare-and-swap write that guards
+    ``cc_refresh_token`` and ``cc_refresh_failure_type``. Exchanges stay
+    blocked while a session holds the lineage (``cc_rotation_block``).
+
+    None means nothing beyond the access token and its expiry may be written:
+    the chain is not dead (the normal import rules apply), or the live
+    refresh token is missing, empty, the failed one (the row's value, or the
+    fingerprint ``cc_refresh_failed_token_fp`` after the clean-up removed
+    it), or the row's PRIMARY refresh token (two chains never share one
+    single-use refresh token).
+
+    >>> row = {"cc_refresh_failure_type": "invalid_grant", "cc_refresh_token": None,
+    ...        "refresh_token": "primary-rt"}
+    >>> sorted(dead_chain_adoption(row, {"accessToken": "a", "refreshToken": "r2"}))
+    ['cc_oauth_extra', 'cc_refresh_failure_type', 'cc_refresh_last_failed_at', 'cc_refresh_token']
+    >>> [dead_chain_adoption({**row, "cc_refresh_token": "r2"}, {"refreshToken": v})
+    ...  for v in ("r2", "primary-rt", "", None, 5)]
+    [None, None, None, None, None]
+    >>> from jacked.web.refresh_verdict import token_fingerprint
+    >>> dead_chain_adoption({**row, "cc_refresh_failed_token_fp": token_fingerprint("r2")},
+    ...                     {"refreshToken": "r2"}) is None
+    True
+    >>> dead_chain_adoption({"cc_refresh_token": None}, {"refreshToken": "r2"}) is None
+    True
+    """
+    if not cc_chain_dead(account):
+        return None
+    refresh = oauth.get("refreshToken") if isinstance(oauth, dict) else None
+    if not isinstance(refresh, str) or not refresh:
+        return None
+    if refresh in (account.get("cc_refresh_token"), account.get("refresh_token")):
+        return None
+    from jacked.web.refresh_verdict import cc_refresh_condemned
+
+    if cc_refresh_condemned(account, refresh):
+        # The clean-up after invalid_grant removes the failed token from the
+        # row; its fingerprint (cc_refresh_failed_token_fp) still names it.
+        # A live store that still holds that token offers nothing new.
+        return None
+    from jacked.credentials.oauth_extra import capture_oauth_extra
+
+    return {
+        "cc_refresh_token": refresh,
+        "cc_oauth_extra": capture_oauth_extra(oauth, refresh),
+        "cc_refresh_failure_type": None,
+        "cc_refresh_last_failed_at": None,
+    }
+
+
 def cc_token_known_dead(account: dict) -> bool:
     """True when the row's Claude Code access token is known not to work.
 
@@ -646,6 +716,14 @@ def _row_holds_live_tokens(row: dict, live: dict | None) -> bool:
     return bool(refresh) and refresh == row.get("cc_refresh_token")
 
 
+# How long a tracked session counts as a holder of its account's refresh
+# lineage with no heartbeat: the life of a Claude Code access token (about
+# 8 hours). An idle session keeps its refresh token in memory and spends it
+# when its access token expires, so the 60-minute dashboard staleness window
+# (SESSION_STALENESS_MINUTES) would let jacked rotate a lineage it holds.
+HOLDER_WINDOW_MINUTES = 480
+
+
 def live_holder_account_ids(db, live: dict | None = None) -> set[int] | None:
     """Ids of the rows whose Claude Code tokens the live authority holds.
 
@@ -657,11 +735,22 @@ def live_holder_account_ids(db, live: dict | None = None) -> set[int] | None:
 
     The session tracker's accounts join the set: a session started on X
     keeps X's refresh token in memory even after the authority moved to Y,
-    so rotating X would send that session to /login (2026-09-05).
+    so rotating X would send that session to /login (2026-09-05). A session
+    counts while it was active in the last ``HOLDER_WINDOW_MINUTES``.
 
-    Returns ``None`` when the holders are UNKNOWN (the live store could not
-    be read, the account list or the session tracker failed): a caller must
+    Returns ``None`` when the holders are UNKNOWN: the live store could not
+    be read, the account list or the session tracker failed, or an active
+    session has no account id (its account may be any row). A caller must
     treat that as "every chain may be held", never as an empty set.
+
+    >>> class _Db:
+    ...     def __init__(self, sessions): self.sessions = sessions
+    ...     def list_accounts(self, include_inactive=False): return []
+    ...     def get_active_sessions(self, staleness_minutes=60): return self.sessions
+    >>> live_holder_account_ids(_Db([{"account_id": 9}]), {})
+    {9}
+    >>> live_holder_account_ids(_Db([{"account_id": 9}, {"account_id": None}]), {}) is None
+    True
     """
     if live is None:
         try:
@@ -673,17 +762,22 @@ def live_holder_account_ids(db, live: dict | None = None) -> set[int] | None:
         return None
     held: set[int] = set()
     try:
-        rows = db.list_accounts(include_inactive=True)
-        for row in rows:
+        for row in db.list_accounts(include_inactive=True):
             if _row_holds_live_tokens(row, live):
                 held.add(int(row["id"]))
-        for session in db.get_active_sessions():
-            account_id = session.get("account_id") if isinstance(session, dict) else None
-            if isinstance(account_id, int) and not isinstance(account_id, bool):
-                held.add(account_id)
+        sessions = list(db.get_active_sessions(staleness_minutes=HOLDER_WINDOW_MINUTES))
     except Exception:
         logger.debug("live_holder_account_ids: holder discovery failed", exc_info=True)
         return None
+    for session in sessions:
+        account_id = session.get("account_id") if isinstance(session, dict) else None
+        if not isinstance(account_id, int) or isinstance(account_id, bool):
+            logger.debug(
+                "live_holder_account_ids: an active session has no account id; "
+                "the holders are unknown"
+            )
+            return None
+        held.add(account_id)
     return held
 
 
@@ -788,9 +882,13 @@ def reconcile_credentials_from_live_store(
     about to overwrite that store (an account switch, a launch) must not.
     Returns True in every other case, imported or not.
 
-    SAFETY: Never imports cc_refresh_token when circuit breaker shows
-    invalid_grant — the live token is Claude Code's active token and
-    importing+exchanging it would destroy CC's session.
+    SAFETY: When the cc breaker shows invalid_grant, the failed refresh token
+    is never imported. A proven NEW live lineage is adopted with a cleared
+    breaker (dead_chain_adoption, the rule the launch sync also applies).
+    jacked does not exchange it while a session holds it: cc_rotation_block
+    refuses that exchange, so Claude Code's session keeps its token.
+
+    >>> # Tested via test_launch_sync_dead_chain.py and test_token_refresh.py
     """
     # Check cache first to avoid Keychain subprocess calls; ``fresh`` callers
     # are about to overwrite the store and need what it holds now.
@@ -838,6 +936,9 @@ def reconcile_credentials_from_live_store(
                 "Account %d: reconciled %d credential field(s) from live store",
                 account_id, len(updates),
             )
+            if cc_chain_dead(account) and "cc_refresh_token" in updates:
+                # Under a dead chain only the adoption writes a refresh token.
+                logger.info(ADOPTED_LINEAGE_MESSAGE, account_id)
             _clear_keeper_backoff(account_id)
             return True
         logger.info(
@@ -860,7 +961,20 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
     """``(updates, guard columns)`` to import ``live`` into ``account``, or a
     falsy value (nothing to import), or ``_RECONCILE_RETRY_FRESH``.
 
-    Pure apart from the ownership lookup, which is cached per token.
+    Pure apart from the ownership lookup, which is cached per token. Under a
+    dead chain a proven NEW live lineage is adopted and the breaker cleared
+    (dead_chain_adoption); the failed token gives the access token and its
+    expiry only.
+
+    >>> row = {"id": 1, "cc_access_token": "a1", "cc_refresh_token": None,
+    ...        "cc_refresh_failure_type": "invalid_grant"}
+    >>> live = {"_jackedAccountId": 1,
+    ...         "claudeAiOauth": {"accessToken": "a1", "refreshToken": "r2"}}
+    >>> updates, _cols = _reconcile_decision(1, row, live, False)
+    >>> updates["cc_refresh_token"], updates["cc_refresh_failure_type"]
+    ('r2', None)
+    >>> _reconcile_decision(1, {**row, "cc_refresh_token": "r2"}, live, False) is None
+    True
     """
     oauth = live.get("claudeAiOauth", {})
     live_access = oauth.get("accessToken")
@@ -926,8 +1040,6 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
             # The verdict decided this import, so it is guarded too.
             guard_cols = CC_IMPORT_GUARD_COLS + CC_VERDICT_GUARD_COLS
 
-    db_cc_refresh = account.get("cc_refresh_token")
-
     updates = {}
 
     # Always import the latest access token
@@ -940,34 +1052,11 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
         if live_expires_s != account.get("cc_expires_at"):
             updates["cc_expires_at"] = live_expires_s
 
-    # Reconcile refresh token — BUT skip if circuit breaker shows invalid_grant
-    # Importing a live CC refresh token during invalid_grant would compete with
-    # Claude Code for the single-use token, destroying CC's session.
-    if live_refresh:
-        # The Claude Code chain breaker guards this import. The primary
-        # chain's breaker says nothing about the Claude Code lineage.
-        if cc_chain_dead(account):
-            logger.debug(
-                "Account %d: skipping cc_refresh_token import (invalid_grant active)",
-                account_id,
-            )
-        elif db_cc_refresh is None:
-            # Recovery: our token was cleared but Claude Code has one
-            logger.info(
-                "Account %d: recovering cc_refresh_token from live credentials",
-                account_id,
-            )
-            updates["cc_refresh_token"] = live_refresh
-        elif live_refresh != db_cc_refresh:
-            # Rotation: Claude Code got a new token
-            logger.info(
-                "Account %d: importing rotated cc_refresh_token from live credentials",
-                account_id,
-            )
-            updates["cc_refresh_token"] = live_refresh
+    updates.update(_refresh_import(account_id, account, oauth))
 
     # A newer access token replaces one the API refused, so that refusal no
-    # longer applies. A dead lineage (invalid_grant) stays recorded.
+    # longer applies. A dead lineage (invalid_grant) stays recorded unless
+    # the dead-chain rule adopted a new one.
     if (
         "cc_access_token" in updates
         and account.get("cc_refresh_failure_type") == "auth_rejected"
@@ -975,20 +1064,60 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
         updates["cc_refresh_failure_type"] = None
         updates["cc_refresh_last_failed_at"] = None
 
-    # The pass-through fields (#174i) as Claude Code holds them now; it has
-    # already applied its own keep-the-previous-value rule. Skipped when the
-    # refresh lineage is dead, because they describe a refresh token jacked
-    # does not take.
-    if not cc_chain_dead(account):
-        from jacked.credentials.oauth_extra import capture_oauth_extra
-
-        # Bound to the refresh token the row holds after this write.
-        row_refresh = updates.get("cc_refresh_token", account.get("cc_refresh_token"))
-        extra = capture_oauth_extra(oauth, row_refresh)
-        if extra != account.get("cc_oauth_extra"):
-            updates["cc_oauth_extra"] = extra
-
     return (updates, guard_cols) if updates else None
+
+
+def _refresh_import(account_id: int, account: dict, oauth: dict) -> dict:
+    """The refresh-token updates of one reconcile decision, with the
+    pass-through fields (#174i) that describe the row's refresh token.
+
+    A dead chain follows the shared dead-chain rule
+    (:func:`dead_chain_adoption`, also used by the launch sync): a NEW live
+    lineage is adopted with a cleared breaker, and the failed token is never
+    imported. A live chain imports a recovered or rotated refresh token and
+    the fields as Claude Code holds them now (it has already applied its own
+    keep-the-previous-value rule). Ownership is proven by the caller.
+
+    >>> dead = {"cc_refresh_failure_type": "invalid_grant", "cc_refresh_token": "spent"}
+    >>> _refresh_import(1, dead, {"refreshToken": "spent"})
+    {}
+    >>> _refresh_import(1, dead, {"refreshToken": "new"})["cc_refresh_token"]
+    'new'
+    >>> _refresh_import(1, {"cc_refresh_token": "old"}, {"refreshToken": "new"})["cc_refresh_token"]
+    'new'
+    """
+    live_refresh = oauth.get("refreshToken")
+    if cc_chain_dead(account):
+        adoption = dead_chain_adoption(account, oauth)
+        if adoption is None and live_refresh:
+            logger.debug(
+                "Account %d: skipping cc_refresh_token import (invalid_grant active)",
+                account_id,
+            )
+        return adoption or {}
+    updates = {}
+    db_cc_refresh = account.get("cc_refresh_token")
+    if live_refresh and live_refresh != db_cc_refresh:
+        # The primary chain's breaker says nothing about this lineage.
+        if db_cc_refresh is None:
+            logger.info(
+                "Account %d: recovering cc_refresh_token from live credentials",
+                account_id,
+            )
+        else:
+            logger.info(
+                "Account %d: importing rotated cc_refresh_token from live credentials",
+                account_id,
+            )
+        updates["cc_refresh_token"] = live_refresh
+    from jacked.credentials.oauth_extra import capture_oauth_extra
+
+    # Bound to the refresh token the row holds after this write.
+    row_refresh = updates.get("cc_refresh_token", db_cc_refresh)
+    extra = capture_oauth_extra(oauth, row_refresh)
+    if extra != account.get("cc_oauth_extra"):
+        updates["cc_oauth_extra"] = extra
+    return updates
 
 
 def _clear_keeper_backoff(account_id: int) -> None:

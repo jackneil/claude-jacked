@@ -51,6 +51,7 @@ from .models import (
     SwitchOutcome,
     SwitchResult,
 )
+from .refresh_guard import downgrade_check_for
 from .resolver import (
     CanonicalCredentialResolver,
     FileResolverSnapshotSink,
@@ -357,44 +358,25 @@ def claude_config_identity_publisher(home: Path, db=None):
     return publish
 
 
-def activate_account(db, account: dict, context: SwitchContext, operation_id: str) -> SwitchResult:
-    """Resolve the exact runtime contract and activate one local account."""
-    home = Path.home()
-    try:
-        identity = detect_claude_identity(home)
-    except OSError as exc:
-        return _unsupported(operation_id, account, str(exc))
-    resolution = SHIPPED_REGISTRY.resolve(identity)
-    if not resolution.can_mutate:
-        return _unsupported(operation_id, account, resolution.reason)
-    engine = _engine_for(db, resolution, home)
-    if isinstance(engine, str):
-        return _unsupported(operation_id, account, engine)
-    target_id = int(account["id"])
-
-    def _payload(row: dict) -> CredentialPayload:
-        return CredentialPayload.from_mapping(
-            {"_jackedAccountId": target_id, "claudeAiOauth": build_oauth_data(row)}
-        )
-
-    request = SwitchRequest(
-        operation_id=operation_id,
-        account_id=target_id,
-        email=account.get("email") or "",
-        organization_id=account.get("organization_uuid") or None,
-        payload=_payload(account),
-        context=context,
-        interaction=InteractionMode.FOREGROUND,
-        display_name=account.get("display_name") or None,
-        organization_name=account.get("organization_name") or None,
+def _row_payload(target_id: int, row: dict) -> CredentialPayload:
+    """The payload an activation of ``target_id`` publishes from ``row``."""
+    return CredentialPayload.from_mapping(
+        {"_jackedAccountId": target_id, "claudeAiOauth": build_oauth_data(row)}
     )
 
+
+def _activation_preflight(db, request: SwitchRequest):
+    """The preflight of one activation, run inside the switch lease.
+
+    It saves the active account's newest live tokens before they are
+    overwritten, then rebuilds the payload and the downgrade check from the
+    row as it is now (a same-account activation may just have imported a
+    rotation). Fail closed: a refusal is retryable, a lost refresh lineage
+    is not.
+    """
+    target_id = request.account_id
+
     def preflight() -> SwitchRequest | None:
-        # Inside the switch lease: save the active account's newest live
-        # tokens before they are overwritten, then build the payload from the
-        # row as it is now (a same-account activation may just have imported
-        # a rotation). Fail closed: a refusal is retryable, a lost refresh
-        # lineage is not.
         try:
             if not reconcile_outgoing_before_activation(db, target_id):
                 return None
@@ -409,9 +391,50 @@ def activate_account(db, account: dict, context: SwitchContext, operation_id: st
                 exc_info=True,
             )
             return None
-        return replace(request, payload=_payload(row), preflight=None)
+        return replace(
+            request,
+            payload=_row_payload(target_id, row),
+            preflight=None,
+            refresh_downgrade_check=downgrade_check_for(row),
+        )
 
-    return engine.activate(replace(request, preflight=preflight))
+    return preflight
+
+
+def activate_account(db, account: dict, context: SwitchContext, operation_id: str) -> SwitchResult:
+    """Resolve the exact runtime contract and activate one local account.
+
+    The engine refuses (UNUSABLE, code CC_REAUTH_REQUIRED) a write that would
+    put a null refresh token over a live one of this account, and leaves the
+    authority unchanged (#149i).
+
+    >>> # Tested via test_credential_runtime.py and test_refresh_downgrade_guard.py
+    """
+    home = Path.home()
+    try:
+        identity = detect_claude_identity(home)
+    except OSError as exc:
+        return _unsupported(operation_id, account, str(exc))
+    resolution = SHIPPED_REGISTRY.resolve(identity)
+    if not resolution.can_mutate:
+        return _unsupported(operation_id, account, resolution.reason)
+    engine = _engine_for(db, resolution, home)
+    if isinstance(engine, str):
+        return _unsupported(operation_id, account, engine)
+    target_id = int(account["id"])
+    request = SwitchRequest(
+        operation_id=operation_id,
+        account_id=target_id,
+        email=account.get("email") or "",
+        organization_id=account.get("organization_uuid") or None,
+        payload=_row_payload(target_id, account),
+        context=context,
+        interaction=InteractionMode.FOREGROUND,
+        display_name=account.get("display_name") or None,
+        organization_name=account.get("organization_name") or None,
+        refresh_downgrade_check=downgrade_check_for(account),
+    )
+    return engine.activate(replace(request, preflight=_activation_preflight(db, request)))
 
 
 def scoped_launch_needs_global_activation() -> bool:

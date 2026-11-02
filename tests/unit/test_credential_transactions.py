@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
+
+import pytest
 
 from jacked.credentials.canonical import CredentialPayload
 from jacked.credentials.models import (
@@ -791,3 +794,97 @@ def test_a_preflight_cannot_switch_the_account_being_written() -> None:
 
     assert result.outcome is SwitchOutcome.UNUSABLE
     assert store.read().payload.identity.account_id == 1
+
+
+# ------------------------------------------------------------------
+# The refresh downgrade check (#149i)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "mode", [CapabilityMode.GLOBAL_UNCOOPERATIVE, CapabilityMode.GLOBAL_COOPERATIVE]
+)
+def test_a_refresh_downgrade_is_refused_before_any_write(mode, caplog) -> None:
+    from jacked.credentials.refresh_guard import (
+        CC_REAUTH_REQUIRED_CODE,
+        REFRESH_DOWNGRADE_REASON,
+    )
+
+    before = _payload(2, "live")
+    engine, repository, store = _engine(mode, before)
+    seen = []
+
+    def check(live):
+        seen.append(live)
+        return REFRESH_DOWNGRADE_REASON
+
+    request = replace(_request(_payload(2, "target")), refresh_downgrade_check=check)
+    with caplog.at_level(logging.WARNING, logger="jacked.credentials.transaction"):
+        result = engine.activate(request)
+
+    assert seen == [before]  # the check sees what the authority holds now
+    assert result.outcome is SwitchOutcome.UNUSABLE
+    assert result.code == CC_REAUTH_REQUIRED_CODE
+    assert result.message == REFRESH_DOWNGRADE_REASON
+    assert result.committed_authority.account_id is None
+    assert result.existing_session_activation is SessionActivationState.UNCHANGED
+    assert result.observed_identity.account_id == 2
+    assert store.write_count == 0
+    assert store.read().payload == before
+    assert repository.created == []  # no pending row: nothing to recover
+    assert repository.outcomes[-1].outcome is SwitchOutcome.UNUSABLE
+    assert caplog.text.count(f"Account 2: {REFRESH_DOWNGRADE_REASON}") == 1
+
+
+@pytest.mark.parametrize(
+    "mode", [CapabilityMode.GLOBAL_UNCOOPERATIVE, CapabilityMode.GLOBAL_COOPERATIVE]
+)
+def test_a_check_with_no_reason_lets_the_switch_write(mode) -> None:
+    engine, _repository, store = _engine(mode, _payload(1, "before"))
+    request = replace(
+        _request(_payload(2, "target")), refresh_downgrade_check=lambda live: None
+    )
+
+    result = engine.activate(request)
+
+    assert result.outcome in {
+        SwitchOutcome.COMMITTED,
+        SwitchOutcome.OBSERVED_TARGET_UNFENCED,
+    }
+    assert store.read().payload.to_mapping()["claudeAiOauth"]["accessToken"] == "target"
+
+
+def test_the_preflight_request_carries_the_check_that_runs() -> None:
+    """The preflight rebuilds the request from the freshest row; the check it
+    carries (made from that row) is the one the engine asks."""
+    engine, store, _ = _engine_with_lease(_payload(1, "before"))
+    asked = []
+    fresh = replace(
+        _request(_payload(2, "rebuilt")),
+        refresh_downgrade_check=lambda live: asked.append("fresh") or None,
+    )
+    request = replace(
+        _request(_payload(2, "stale")),
+        refresh_downgrade_check=lambda live: asked.append("stale") or "refuse",
+        preflight=lambda: fresh,
+    )
+
+    result = engine.activate(request)
+
+    assert asked == ["fresh"]
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    assert store.read().payload.to_mapping()["claudeAiOauth"]["accessToken"] == "rebuilt"
+
+
+def test_a_missing_authority_gives_the_check_no_payload() -> None:
+    engine, _repository, store = _engine(CapabilityMode.GLOBAL_UNCOOPERATIVE, None)
+    seen = []
+    request = replace(
+        _request(_payload(2, "target")),
+        refresh_downgrade_check=lambda live: seen.append(live),
+    )
+
+    result = engine.activate(request)
+
+    assert seen == [None]
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED

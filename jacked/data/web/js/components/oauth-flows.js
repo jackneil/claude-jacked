@@ -34,7 +34,15 @@ const OAUTH_CODE_BUTTON_CLASS = 'px-3 py-1 bg-blue-600 hover:bg-blue-500 text-wh
 // Manual mode: no server-side browser, no localhost callback — the user opens
 // the link themselves and pastes back the code Claude shows.
 const OAUTH_SUBTITLE_MANUAL = 'Click the link and approve. Claude then shows a code. Copy the code and paste it below.';
+// Activation outcomes after a sign-in that need no notice: the account became
+// active (three truthful outcomes), or no activation was attempted because the
+// dashboard runs on another machine (local_only).
+const ACTIVATION_OK = ['committed', 'committed_degraded', 'observed_target_unfenced', 'local_only'];
 const OAUTH_SUBTITLE_BROWSER = 'A browser window should open on this machine. If it does not open, use the link.';
+// The launcher found no supported browser, or the browser did not start.
+// jacked does not fall back to the system browser (it can hold a different
+// account), so the user opens the link in the right profile, or pastes the code.
+const OAUTH_SUBTITLE_NO_WINDOW = 'jacked could not open a browser window for this account. Open the link in the browser profile for this account, or paste the code below.';
 
 // Every chained-step failure ends the same way: the sign-in is stored, only
 // the token is missing, and there is a way to get it. Reasons are written
@@ -101,7 +109,9 @@ function buildOAuthCodeEntry(textDiv, accent, authUrl, manual, identity) {
     const subtitle = document.createElement('div');
     subtitle.className = accent.subtitle;
     let subtitleText = manual ? OAUTH_SUBTITLE_MANUAL : OAUTH_SUBTITLE_BROWSER;
-    if (browserMode === 'profile') {
+    if (!manual && browserMode === 'manual') {
+        subtitleText = OAUTH_SUBTITLE_NO_WINDOW;
+    } else if (browserMode === 'profile') {
         subtitleText += ' A dedicated ' + (browserName || 'browser') + ' window opened for '
             + (email || 'this login') + '. It may be behind this window or on the taskbar.';
     } else if (browserMode === 'incognito') {
@@ -164,6 +174,13 @@ function buildOAuthCodeEntry(textDiv, accent, authUrl, manual, identity) {
         link.rel = 'noopener';
         link.href = authUrl;
         textDiv.appendChild(link);
+        if (browserMode === 'manual') {
+            // The link opens in the dashboard's own browser, which may hold
+            // another account; the caveat the reopen path shows applies here.
+            textDiv.appendChild(
+                document.createTextNode(' (uses whatever account this browser is already signed in to)')
+            );
+        }
     }
 
     const codeRow = document.createElement('div');
@@ -413,6 +430,21 @@ async function runOAuthFlow(opts) {
             flowId: flowId,
         });
 
+    // The sign-in is stored either way; the activation that follows it can
+    // still be refused (for example CC_REAUTH_REQUIRED: a running session
+    // holds a working token that jacked does not replace). Say so, instead
+    // of a success banner over an account that did not become active.
+    function noticeRefusedActivation(poll) {
+        const status = poll && poll.activation_status;
+        if (!status || ACTIVATION_OK.includes(status)) return;
+        showToast(
+            'The account was saved, but it was not made active: '
+                + (poll.activation_message || status) + '.',
+            'warning',
+            10000,
+        );
+    }
+
     // Server verdict, shared by the poller and the code submission.
     // Returns true once the flow is done and the banner has been replaced.
     async function handleFlowResult(poll) {
@@ -447,6 +479,7 @@ async function runOAuthFlow(opts) {
             // which would wipe a banner drawn before it. Render the success
             // message into the fresh slot afterwards.
             await refreshAndRender();
+            noticeRefusedActivation(poll);
             renderBanner(OAUTH_SUCCESS_CLASS, success.text, success.duration);
         } else if (poll.status === 'error') {
             const reason = poll.error || 'Unknown error';

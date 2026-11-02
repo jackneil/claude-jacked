@@ -38,7 +38,12 @@ from jacked.api.credential_helpers import (
     is_primary_publication,
     live_payload_ownership,
 )
+from jacked.credentials.refresh_guard import (
+    CC_REAUTH_REQUIRED_CODE,
+    refuses_refresh_downgrade,
+)
 from jacked.credentials.runtime import scoped_launch_needs_global_activation
+from jacked.launch_sync_writes import sync_held_access, write_rotation
 from jacked.web.auth import should_refresh, should_refresh_cc
 from jacked.web.database import Database
 
@@ -332,15 +337,54 @@ def _ensure_shared_symlinks(config_dir: Path) -> None:
                 logger.warning("Failed to symlink %s (non-fatal)", name)
 
 
+def _authority_keeps_own_lineage(activation, account_id: int) -> bool:
+    """True when the activation refused only to put a null refresh token over
+    this account's own live one, and the authority still names the account.
+
+    >>> from types import SimpleNamespace as NS
+    >>> from jacked.credentials.models import CredentialIdentity, SwitchOutcome
+    >>> refused = NS(outcome=SwitchOutcome.UNUSABLE, code="CC_REAUTH_REQUIRED",
+    ...              observed_identity=CredentialIdentity(account_id=3))
+    >>> _authority_keeps_own_lineage(refused, 3), _authority_keeps_own_lineage(refused, 4)
+    (True, False)
+    """
+    from jacked.credentials.models import SwitchOutcome
+
+    return (
+        activation.outcome is SwitchOutcome.UNUSABLE
+        and activation.code == CC_REAUTH_REQUIRED_CODE
+        and activation.observed_identity.account_id == account_id
+    )
+
+
 def _activate_global_authority(account: dict, db: Database, account_id: int):
     """Switch the global credential authority and report what was observed.
 
     On macOS the Keychain outranks CLAUDE_CONFIG_DIR, so a scoped launch must
-    also switch the global authority. Unknown builds fail closed here.
+    also switch the global authority. Unknown builds fail closed here. One
+    refusal lets the launch go on: the authority already holds this
+    account's own live refresh token, and the row would replace it with null
+    (CC_REAUTH_REQUIRED). Claude then starts with those tokens.
+
+    >>> # Tested via test_launch.py and test_refresh_downgrade_guard.py
     """
     from jacked.credentials.models import SwitchOutcome
 
     activation = _activate_launch_credentials(account, db)
+    if _authority_keeps_own_lineage(activation, account_id):
+        # The engine refused only to put a null refresh token over this
+        # account's own live one (#149i): the authority already holds the
+        # account's working tokens, so Claude starts with them.
+        click.echo(
+            f"Note: account {account_id}: {activation.message}. Claude starts "
+            "with the current credentials of this account.",
+            err=True,
+        )
+        evidence = (
+            "launch:scoped-file-readback",
+            "launch:global-authority:live-refresh-kept",
+        )
+        return activation.observed_identity, evidence, f"switch:{activation.operation_id}"
     truthful_outcomes = {
         SwitchOutcome.COMMITTED,
         SwitchOutcome.COMMITTED_DEGRADED,
@@ -474,6 +518,27 @@ def _publish_launch_credentials(
         )
 
 
+def _keeps_scoped_lineage(account: dict, existing: dict) -> bool:
+    """True when the row's pair would put a null refresh token over the
+    per-account file's live one of this account (refresh_guard, #149i).
+
+    The file is unstamped, so the shared ownership rule does not require a
+    stamp. A refusal is logged once with the row id and no token.
+
+    >>> row = {"id": 4, "cc_access_token": "at", "cc_refresh_token": None,
+    ...        "cc_expires_at": 9999999999, "cc_refresh_failure_type": "invalid_grant"}
+    >>> _keeps_scoped_lineage(row, {"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt"}})
+    True
+    >>> _keeps_scoped_lineage(row, {})
+    False
+    """
+    reason = refuses_refresh_downgrade(build_oauth_data(account), existing, account)
+    if reason is None:
+        return False
+    logger.warning("Account %d: %s", int(account["id"]), reason)
+    return True
+
+
 def prepare_account_dir(account: dict, db: Database) -> Path:
     """Create account config and verify its certified credential authority.
 
@@ -494,7 +559,12 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     account is remembered beside the file by its digests and is replaced
     without a request, expired or not.
 
-    >>> # Tested via test_launch.py and test_launch_token_sync.py
+    The write never puts a null refresh token over a live one of this
+    account (#149i). When the row publishes no refresh token (a dead chain)
+    and the file holds the account's own working one, the launch keeps the
+    file's tokens, logs why, and starts.
+
+    >>> # Tested via test_launch.py, test_launch_token_sync.py and test_refresh_downgrade_guard.py
     """
     account_id = account["id"]
     if account_id <= 0:
@@ -682,6 +752,10 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             "not be checked (lookup failed); keeping them for this launch",
             account_id,
         )
+    elif _keeps_scoped_lineage(account, existing):
+        # The file holds this account's own live refresh token and the row
+        # would replace it with null: the launch keeps the file's tokens.
+        pass
     else:
         if file_pair_differs:
             # Attributable: the file carried a pair that is not the row's and
@@ -1019,6 +1093,9 @@ def _sync_row(conn, account_id: int, cols: set) -> dict | None:
             "organization_uuid",
             "account_uuid",
             "access_token",
+            # Read by the dead-chain rule: a primary refresh token is never
+            # adopted as the Claude Code lineage.
+            "refresh_token",
             "cc_access_token",
             "cc_refresh_token",
             "cc_expires_at",
@@ -1148,8 +1225,12 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> str:
     the owner of the row. The per-account .claude.json is not proof, because
     jacked and Claude Code both write it from the token that a process holds.
     The other import rules of reconcile also apply: an unreadable expiry is
-    refused, the primary-token fallback is not imported, and an older pair
-    does not replace newer tokens.
+    refused, the primary-token fallback is not imported, an older pair does
+    not replace newer tokens, and a dead chain (invalid_grant) follows the
+    shared dead-chain rule (credential_helpers.dead_chain_adoption): a NEW
+    refresh token is adopted and the breaker cleared in the same
+    compare-and-swap write, while the failed token gives the access token and
+    its expiry only (#244i).
 
     The function uses raw sqlite3 and not the Database class, because it
     runs in a thread.
@@ -1168,6 +1249,8 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> str:
       directory name that is not an id, no row, a row without a Claude Code
       token, the primary-token fallback, or a pair older than the row's
       pair), or another writer changed the row first. Nothing is written.
+
+    >>> # Tested via test_launch_token_sync*.py and test_launch_sync_dead_chain.py
     """
     cred_path = config_dir / ".credentials.json"
     try:
@@ -1221,27 +1304,8 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> str:
                 old_cc_access_token = account.get("cc_access_token")
                 if old_cc_access_token == access_token:
                     # The row holds this access token, so the tokens are the
-                    # row's with no profile request. The file may carry
-                    # pass-through fields the row lacks (a row from before
-                    # #174i, or a field Claude Code changed without rotating):
-                    # take them, bound to the row's own refresh token, CAS on
-                    # the access token.
-                    if "cc_oauth_extra" in cols and refresh_token == account.get(
-                        "cc_refresh_token"
-                    ):
-                        from jacked.credentials.oauth_extra import capture_oauth_extra
-
-                        extra = capture_oauth_extra(oauth, refresh_token)
-                        # CAS on BOTH tokens: an invalid_grant recovery keeps
-                        # the access token but replaces the lineage.
-                        conn.execute(
-                            "UPDATE accounts SET cc_oauth_extra = ? "
-                            "WHERE id = ? AND cc_access_token IS ? "
-                            "AND cc_refresh_token IS ? AND cc_oauth_extra IS NOT ?",
-                            (extra, account_id, access_token, refresh_token, extra),
-                        )
-                        conn.commit()
-                    return "imported"  # Token unchanged
+                    # row's with no profile request.
+                    return sync_held_access(conn, account, oauth, cols, account_id)
 
                 # If cc_access_token is NULL in DB, skip sync. NULL means
                 # CC auth was never done — file contains primary fallback
@@ -1305,82 +1369,7 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> str:
                         conn, account, account_id, cols, outcome,
                         config_dir=config_dir, oauth=oauth,
                     )
-
-                now = int(_time.time())
-                # Column names are hardcoded below, not from user input
-                set_clauses = ["cc_access_token = ?"]
-                params: list = [access_token]
-
-                # Only overwrite cc_expires_at if we have a real value
-                if expires_at:
-                    set_clauses.append("cc_expires_at = ?")
-                    params.append(expires_at)
-
-                # Write cc_refresh_token as-is (including NULL).
-                # Do NOT use COALESCE — if Claude Code consumed the refresh
-                # token and wrote null to the file, we must propagate that
-                # null so should_refresh_cc() knows the token is gone.
-                set_clauses.append("cc_refresh_token = ?")
-                params.append(refresh_token)
-
-                # A new access token is not the one the API refused: drop an
-                # auth_rejected verdict (it would mark the replacement dead).
-                # An invalid_grant verdict is about the refresh lineage and
-                # stays.
-                if "cc_refresh_failure_type" in cols:
-                    set_clauses.append(
-                        "cc_refresh_last_failed_at = CASE WHEN cc_refresh_failure_type = "
-                        "'auth_rejected' THEN NULL ELSE cc_refresh_last_failed_at END"
-                    )
-                    set_clauses.append(
-                        "cc_refresh_failure_type = CASE WHEN cc_refresh_failure_type = "
-                        "'auth_rejected' THEN NULL ELSE cc_refresh_failure_type END"
-                    )
-
-                # Claude Code's pass-through fields (#174i) as the file holds them.
-                if "cc_oauth_extra" in cols:
-                    from jacked.credentials.oauth_extra import capture_oauth_extra
-
-                    set_clauses.append("cc_oauth_extra = ?")
-                    params.append(capture_oauth_extra(oauth, refresh_token))
-
-                set_clauses.extend([
-                    "validation_status = 'valid'",
-                    "last_validated_at = ?",
-                ])
-                params.append(now)
-                params.extend([account_id, old_cc_access_token])
-
-                # CAS WHERE clause: only update if cc_access_token hasn't
-                # changed since we read it (prevents stale overwrites from
-                # concurrent refresh_cc_token in the async event loop, and
-                # from any writer during the profile request above), AND the
-                # identity the ownership proof was made against is unchanged
-                # (a primary re-auth can move the row to another org without
-                # touching cc_access_token). Uses IS for NULL comparison.
-                identity_cols = [c for c in ("email", "organization_uuid", "account_uuid") if c in cols]
-                identity_guard = "".join(f" AND {c} IS ?" for c in identity_cols)
-                params.extend(account.get(c) for c in identity_cols)
-                result = conn.execute(
-                    f"UPDATE accounts SET {', '.join(set_clauses)} "
-                    f"WHERE id = ? AND cc_access_token IS ?{identity_guard}",
-                    params,
-                )
-                if result.rowcount > 0:
-                    conn.commit()
-                    logger.debug(
-                        "Synced CC tokens for account %d", account_id
-                    )
-                    return "imported"
-                else:
-                    # The proof was made against a row that changed: the next
-                    # attempt must prove the token against the new identity.
-                    forget_ownership_verdicts(account_id)
-                    logger.debug(
-                        "CAS skip for account %d: another writer updated first",
-                        account_id,
-                    )
-                    return "unchanged"
+                return write_rotation(conn, account, oauth, cols, account_id)
             else:
                 # Pre-migration fallback: write to primary columns
                 if account.get("access_token") == access_token:

@@ -458,3 +458,101 @@ class TestRotationAtRealCadence:
         assert 1 <= len(rotations) <= 12 * 3600 / guard + 1
         for earlier, later in zip(rotations, rotations[1:]):
             assert later - earlier >= guard
+
+
+# ---------------------------------------------------------------------------
+# #149i item 4: a 429 on the Claude Code token backs off and never rotates
+# ---------------------------------------------------------------------------
+
+
+class TestCcToken429NeverRotates:
+    """A cc rotation on a 429 spends a single-use refresh token that a
+    running session may hold. A 429 on the cc token backs off only: no
+    chain is exchanged, whether or not the cc chain could rotate."""
+
+    LINE = "429 on the Claude Code token; backing off, no rotation"
+
+    def setup_method(self):
+        mod._account_usage_state.clear()
+        mod.reset_locks()
+
+    def teardown_method(self):
+        mod._account_usage_state.clear()
+        mod.reset_locks()
+
+    @pytest.mark.parametrize("block", [None, "active", "live_session_holds"])
+    def test_five_consecutive_429s_never_call_the_token_endpoint(
+        self, tmp_path, caplog, block,
+    ):
+        import logging
+
+        from jacked.web.database import Database
+
+        db = Database(str(tmp_path / "cc429.db"))
+        acct = db.create_account("cc429@test.com", "primary_at", int(time.time()) + 3600,
+                                 refresh_token="primary_rt")
+        aid = acct["id"]
+        db.update_account(aid, cc_access_token="cc_at", cc_refresh_token="cc_rt",
+                          cc_expires_at=int(time.time()) + 3600)
+        state = mod._get_usage_state(aid)
+        client = _mock_client([(429, {}, {"retry-after": "0"})] * 5)
+        client.post = AsyncMock()  # the token endpoint
+        backoffs = []
+        with patch("jacked.web.auth.httpx.AsyncClient", return_value=client), \
+             patch("jacked.api.credential_helpers.cc_rotation_block", return_value=block), \
+             caplog.at_level(logging.INFO, logger="jacked.auth"):
+            for _ in range(5):
+                state["last_fetched_at"] = time.time() - 200
+                state["backoff_until"] = 0
+                # Every 429 from the third on is due a rotation.
+                state["last_429_rotation_at"] = 0.0
+                start = time.time()
+                assert asyncio.run(fetch_usage(aid, db, access_token="cc_at")) is None
+                backoffs.append(state["backoff_until"] - start)
+
+        client.post.assert_not_called()
+        assert client.get.call_count == 5
+        # The backoff advances exactly as before: escalating, capped at 900 s.
+        assert state["consecutive_429s"] == 5
+        expected = [min(mod._USAGE_RATE_LIMIT_CEILING * 2 ** (n - 1), 900)
+                    for n in range(1, 6)]
+        for got, want in zip(backoffs, expected):
+            assert want <= got <= want + 5
+        lines = [r.getMessage() for r in caplog.records if self.LINE in r.getMessage()]
+        assert lines == [f"Account {aid}: {self.LINE}"] * 3
+        row = db.get_account(aid)
+        assert (row["cc_refresh_token"], row["refresh_token"]) == ("cc_rt", "primary_rt")
+        assert row["cc_refresh_failure_type"] is None
+
+    def test_try_refresh_on_429_returns_none_for_the_cc_token(self, tmp_path):
+        from jacked.web.database import Database
+
+        db = Database(str(tmp_path / "direct.db"))
+        acct = db.create_account("d@test.com", "primary_at", int(time.time()) + 3600,
+                                 refresh_token="primary_rt")
+        db.update_account(acct["id"], cc_access_token="cc_at", cc_refresh_token="cc_rt")
+        flow = AsyncMock()
+        allowed = AsyncMock(return_value=True)
+        with patch("jacked.web.auth._refresh_token_flow", flow), \
+             patch("jacked.web.auth._cc_rotation_allowed", allowed):
+            fresh = asyncio.run(mod._try_refresh_on_429(
+                acct["id"], db, mod._get_usage_state(acct["id"]), stale_token="cc_at"))
+        assert fresh is None
+        flow.assert_not_awaited()
+        allowed.assert_not_awaited()
+
+    def test_the_primary_token_branch_is_unchanged(self, tmp_path):
+        from jacked.web.database import Database
+
+        db = Database(str(tmp_path / "primary.db"))
+        acct = db.create_account("p@test.com", "primary_at", int(time.time()) + 3600,
+                                 refresh_token="primary_rt")
+        db.update_account(acct["id"], cc_access_token="cc_at", cc_refresh_token="cc_rt")
+        flow = AsyncMock(return_value=TokenExchangeResult(
+            success=True, access_token="primary_at2", chain="primary"))
+        with patch("jacked.web.auth._refresh_token_flow", flow):
+            fresh = asyncio.run(mod._try_refresh_on_429(
+                acct["id"], db, mod._get_usage_state(acct["id"]),
+                stale_token="primary_at"))
+        assert fresh == "primary_at2"
+        assert flow.await_args.args[2] is mod.RefreshMode.PRIMARY_CIRCUIT_BREAKER

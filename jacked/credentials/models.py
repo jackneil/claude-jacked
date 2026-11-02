@@ -181,7 +181,7 @@ class SwitchResult:
     observed_identity: CredentialIdentity = CredentialIdentity()
     message: str = ""
     # A stable machine-readable reason, when ``outcome`` alone is not enough
-    # (transaction.OUTGOING_ACCOUNT_BUSY_CODE).
+    # (transaction.OUTGOING_ACCOUNT_BUSY_CODE, refresh_guard.CC_REAUTH_REQUIRED_CODE).
     code: str = ""
 
 
