@@ -128,6 +128,29 @@ def is_newer(latest: str, current: str) -> bool:
         return False
 
 
+def _cache_ttl(pypi_latest, simple_latest, installable, current_version) -> int:
+    """How long one check of the index stays fresh, in seconds.
+
+    A failed probe retries within an hour. An "ahead" answer (the installed
+    version is newer than the index) also retries within an hour: right after
+    a release the index CDN can still serve the previous version for some
+    minutes, and the installed version came from that index, so the answer is
+    most likely stale. A real development build pays one check an hour.
+
+    >>> _cache_ttl("1.0", "1.0", "1.0", "1.0") == CACHE_TTL
+    True
+    >>> _cache_ttl("1.0", "1.0", "1.0", "1.1") == CACHE_TTL_PROBE_FAILURE
+    True
+    >>> _cache_ttl(None, "1.0", "1.0", "1.0") == CACHE_TTL_PROBE_FAILURE
+    True
+    """
+    if not (pypi_latest and simple_latest):
+        return CACHE_TTL_PROBE_FAILURE
+    if installable and is_newer(current_version, installable):
+        return CACHE_TTL_PROBE_FAILURE
+    return CACHE_TTL
+
+
 def check_version_cached(current_version: str, force: bool = False) -> dict | None:
     """Check PyPI with 24h cache. Returns dict with keys:
        latest (alias for installable_latest, kept for back-compat),
@@ -151,10 +174,17 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
                     # so we retry within an hour, not a day.
                     cached_pypi = cache.get("pypi_latest")
                     cached_simple = cache.get("simple_latest")
-                    cache_ttl = CACHE_TTL if (cached_pypi and cached_simple) else CACHE_TTL_PROBE_FAILURE
-                    if 0 <= age < cache_ttl:
+                    installable = cache.get("installable_latest")
+                    cache_ttl = _cache_ttl(
+                        cached_pypi, cached_simple, installable, current_version
+                    )
+                    # A check made for another installed version is stale: an
+                    # upgrade (or a downgrade) replaced the version it compared,
+                    # and an upgraded service would show "dev" until the TTL.
+                    recorded = cache.get("current")
+                    same_install = recorded is None or recorded == current_version
+                    if same_install and 0 <= age < cache_ttl:
                         # New-schema cache hit
-                        installable = cache.get("installable_latest")
                         if installable:
                             return {
                                 "latest": installable,                     # back-compat alias
@@ -198,9 +228,9 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
             "current": current_version,
             "outdated": outdated,
         }
-        # Shorter TTL when a probe failed — bounce back faster after transient
-        # network/PyPI issues instead of pretending we know for 24 hours.
-        effective_ttl = CACHE_TTL if (pypi_latest and simple_latest) else CACHE_TTL_PROBE_FAILURE
+        # Shorter TTL when a probe failed or the answer says "ahead" (see
+        # _cache_ttl): bounce back faster instead of pretending we know.
+        effective_ttl = _cache_ttl(pypi_latest, simple_latest, installable, current_version)
 
         # Atomic write — tempfile + os.replace — preserves the crash-safety
         # guarantee the prior implementation had. Half-written cache files
