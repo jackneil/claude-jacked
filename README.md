@@ -231,7 +231,7 @@ For an account without a 5-hour window, the dashboard shows "none" and "not on U
 
 ## Background Service and Tray Icon
 
-Here's the deal: if you don't want to remember to run `jacked webux` every time, run it as a background service instead. On macOS you get a live usage pill in the menu bar with the whole fleet one click away; on Windows and Linux you get a "J" in the system tray that stays out of your way until you need it.
+Here's the deal: if you don't want to remember to run `jacked webux` every time, run it as a background service instead. On macOS you get a live usage pill in the menu bar with the whole fleet one click away; on Windows and Linux you get the jacked arm icon in the system tray that stays out of your way until you need it.
 
 ![macOS menu bar - the jacked pill next to the clock](docs/screenshots/menubar-pill.png)
 
@@ -246,16 +246,16 @@ jacked install --force                  # wires up hooks AND starts the tray (au
 
 ### What You Get (macOS menu bar)
 
-- **A live usage pill, always visible.** The menu-bar item is a colored "J" plus the limits of the resolved account. The pill shows only the limits that the account's plan has, in this order: the 5-hour window, the 7-day window, and the model limit with its one-letter tag (`F` for Fable). Two numbers without a tag are always 5h and 7d, for example `18%·4%·F9%`. A plan with no 5-hour window tags the weekly number, for example `7d 33%·F61%`, so the first number keeps its meaning when auto-swap changes the account. The J tints green, yellow, or red on the worst of these limits, so a glance at the clock tells you whether you're about to hit a limit. A Fable limit at 100% makes the J red even when the other windows have headroom. A small dot marks the corner when the resolved account is a Codex account.
+- **A live usage pill, always visible.** The menu-bar item is the jacked arm icon, tinted by usage, plus the limits of the resolved account. The pill shows only the limits that the account's plan has, in this order: the 5-hour window, the 7-day window, and the model limit with its one-letter tag (`F` for Fable). Two numbers without a tag are always 5h and 7d, for example `18%·4%·F9%`. A plan with no 5-hour window tags the weekly number, for example `7d 33%·F61%`, so the first number keeps its meaning when auto-swap changes the account. The icon tints green, yellow, or red on the worst of these limits, so a glance at the clock tells you whether you're about to hit a limit. A Fable limit at 100% makes the icon red even when the other windows have headroom. A small dot marks the corner when the resolved account is a Codex account.
 - **Left-click: the fleet dropdown.** A compact panel (the screenshot up top) drops down with every account you've added: 5h and 7d bars with reset times, per-model caps (your Fable or Codex model usage inline), plan badges, multi-org accounts grouped under one login, an `active` badge with a live countdown to the next usage refresh, and a refresh-all button. It's pre-warmed, so it opens instantly.
 - **Pin it as a side panel.** "Toggle Side Panel" docks the same panel to the right edge of your screen, floating above other windows and on every Space, for a permanent fleet view while you work.
 - **Right-click: the actions menu.** Open Usage Dropdown, Toggle Side Panel, Open Dashboard, Add Account, an Auto-swap toggle, Start on Login, Restart, Quit, the version line, "Last checked", and **Check for updates...** to force a fresh PyPI poll on demand.
 - **It never goes stale.** The pill and panel update within about one second of any usage refresh, credential-state change, or Codex swap (an in-process change counter, no polling lag), with a 30-second heartbeat backstop and a 10-minute background refresh across the whole fleet.
-- **Update notifications you'll actually see.** When a new version ships: a blue badge appears on the J icon, a macOS notification banner fires, and the version line in the menu flips to a clickable `v{current} -> v{latest} (update)`. One click runs the full upgrade (`uv tool install --force` + `jacked install --force` + service restart) in a detached helper that survives its own binary being replaced, with a live progress page in your browser that reconnects on its own while the service restarts.
+- **Update notifications you'll actually see.** When a new version ships: a blue badge appears on the arm icon, a macOS notification banner fires, and the version line in the menu flips to a clickable `v{current} -> v{latest} (update)`. One click runs the full upgrade (`uv tool install --force` + `jacked install --force` + service restart) in a detached helper that survives its own binary being replaced, with a live progress page in your browser that reconnects on its own while the service restarts.
 
 ### On Windows and Linux
 
-- **System tray icon** ("J", colored by service state) with the same right-click menu essentials: Open Dashboard, Restart, Stop, Start on Login, version line, and Check for updates.
+- **System tray icon** (the jacked arm, colored by service state) with the same right-click menu essentials: Open Dashboard, Restart, Stop, Start on Login, version line, and Check for updates.
 - **Usage on hover.** The icon tooltip shows the limits of the resolved account with full names, for example `Jacked · Claude · 7d 74% · Fable 100%`. It changes within about one second of a usage refresh or an account switch, with a 30-second heartbeat.
 - **The full update flow**: the icon badge, native tray notifications, the clickable one-click update, and the browser progress page all work the same as on macOS. The usage pill, dropdown panel, and side panel are macOS-only today.
 
