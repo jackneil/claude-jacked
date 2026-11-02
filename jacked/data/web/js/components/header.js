@@ -61,8 +61,14 @@ async function startUpgrade() {
     try {
         await api.post('/api/upgrade');
     } catch (e) {
-        if (e.status === 409) return; // already in progress — WS handles UI
-        _showUpgradeError('Failed to start upgrade: ' + e.message);
+        const detail = e.payload?.detail;
+        if (e.status === 409 && detail === 'Upgrade already in progress') {
+            return; // the running upgrade's WS events drive the modal
+        }
+        // A refused start (remote access off, an account switch holding the
+        // lease, a network error): say why and give the button back.
+        if (btn) btn.disabled = false;
+        _showUpgradeError('Failed to start upgrade: ' + (detail || e.message));
     }
 }
 

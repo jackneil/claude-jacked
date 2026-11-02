@@ -533,6 +533,17 @@ def _reset_claude_identity_cache():
 
 
 @pytest.fixture(autouse=True)
+def _reset_mutation_gate_throttle():
+    """The gate folds repeated denials per host for a minute; no test may
+    inherit another test's fold."""
+    from jacked.api import mutation_gate
+
+    mutation_gate.reset_denial_throttle()
+    yield
+    mutation_gate.reset_denial_throttle()
+
+
+@pytest.fixture(autouse=True)
 def _reset_keychain_latches():
     from jacked.credentials.macos_store import (
         clear_keychain_latches,

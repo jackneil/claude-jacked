@@ -506,6 +506,11 @@ jackedWS.on('upgrade_complete', () => {
 jackedWS.on('upgrade_failed', (msg) => {
     const d = msg.payload || msg;
     if (typeof _showUpgradeError === 'function') _showUpgradeError(d.error || 'Upgrade failed');
+    // The route accepted the request, then the task refused (an account
+    // switch took the lease first) or the install failed: give the button
+    // back so the user can retry without reloading the page.
+    const btn = document.getElementById('version-upgrade-btn');
+    if (btn) btn.disabled = false;
 });
 
 /** Remote-access restart: the server is re-binding the network. Whether this page

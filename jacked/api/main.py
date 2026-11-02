@@ -34,6 +34,7 @@ from jacked.api.security import (
     origin_allowed,
 )
 from jacked.api.websocket import WebSocketRegistry
+from jacked.credentials.startup_recovery import recover_pending_switches
 
 logger = logging.getLogger(__name__)
 
@@ -101,10 +102,17 @@ async def _token_refresh_loop():
             logger.warning("Token refresh loop error: %s", e)
 
 
-async def _heal_sweep_loop():
-    """Background task to heal stuck accounts every 5 minutes."""
+async def _heal_sweep_loop(app=None):
+    """Background task to heal stuck accounts every 5 minutes.
+
+    The same cadence retries the pending-switch recovery sweep: a sweep the
+    service start skipped because another process held the switch lease
+    would otherwise wait for the next restart. With nothing pending the
+    retry returns at once.
+    """
     while True:
         await asyncio.sleep(HEAL_SWEEP_INTERVAL)
+        await _retry_pending_switch_recovery(app)
         try:
             from jacked.web.auth import heal_invalid_accounts
 
@@ -120,6 +128,19 @@ async def _heal_sweep_loop():
             )
         except Exception as e:
             logger.warning("Heal sweep error: %s", e)
+
+
+async def _retry_pending_switch_recovery(app) -> None:
+    db = getattr(getattr(app, "state", None), "db", None)
+    if db is None:
+        return
+    try:
+        settled = await asyncio.to_thread(recover_pending_switches, db)
+    except Exception as e:  # noqa: BLE001 - the loop must continue
+        logger.warning("Pending credential switch recovery failed: %s", type(e).__name__)
+        return
+    if settled:
+        logger.info("Settled %d pending credential switch(es)", len(settled))
 
 
 async def _stuck_checking_watchdog_loop(app):
@@ -348,13 +369,28 @@ async def lifespan(app: FastAPI):
             host,
         )
 
+    if app.state.db is not None:
+        # Settle any credential switch an earlier process left pending (a
+        # crash or an upgrade's exec between the journal row and the store
+        # writes). Observation only, under the switch lease, after the log
+        # handlers are attached (so the outcome is in the service log) and
+        # before any poll loop can start a new switch; a failure is logged,
+        # never fatal.
+        try:
+            recovered = await asyncio.to_thread(recover_pending_switches, app.state.db)
+        except Exception as e:  # noqa: BLE001 - startup must continue
+            logger.warning("Pending credential switch recovery failed: %s", type(e).__name__)
+        else:
+            if recovered:
+                logger.info("Settled %d pending credential switch(es)", len(recovered))
+
     # Start background tasks
     refresh_task = asyncio.create_task(_token_refresh_loop())
     session_watch_task = asyncio.create_task(session_accounts_watch_loop(app))
     session_observer_task = asyncio.create_task(session_observation_loop(app))
     logs_watch_task = asyncio.create_task(logs_watch_loop(app))
     sweeper_task = asyncio.create_task(process_alive_sweeper_loop(app))
-    heal_task = asyncio.create_task(_heal_sweep_loop())
+    heal_task = asyncio.create_task(_heal_sweep_loop(app))
     active_poll_task = asyncio.create_task(active_account_poll_loop(app))
     # Expose poll-loop liveness state for the watchdog. The watchdog
     # respawns the task if heartbeat goes stale — see the 2026-05-10
@@ -407,6 +443,16 @@ async def lifespan(app: FastAPI):
         logger.warning("Analytics module unavailable: %s", e)
 
     yield
+
+    # Shutdown: a running upgrade first, while the log handlers are still
+    # attached: its installer child is terminated and awaited inside the
+    # switch lease, and the outcome lands in the service log.
+    try:
+        from jacked.api.routes.system import cancel_running_upgrade
+
+        await cancel_running_upgrade()
+    except Exception as e:  # noqa: BLE001 - shutdown must continue
+        logger.warning("Upgrade cancellation failed: %s", type(e).__name__)
 
     # Shutdown: cancel background tasks. Use the CURRENT active_poll_task
     # from app.state — the watchdog may have respawned it during the run,

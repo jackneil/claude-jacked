@@ -1449,7 +1449,7 @@ def test_a_denied_remote_client_never_consumes_switch_budget(app, db):
 def test_denied_remote_mutation_is_logged_with_its_reason(app, db, caplog):
     _set_remote_access(db, True, "tailscale")
 
-    with caplog.at_level(logging.INFO, logger="jacked.api.routes.auth"):
+    with caplog.at_level(logging.INFO, logger="jacked.api.mutation_gate"):
         _scoped_client(app, LAN_IP).post("/api/auth/accounts/1/use")
 
     assert LAN_IP in caplog.text
@@ -1460,7 +1460,7 @@ def test_allowed_remote_mutation_is_logged(app, db, caplog):
     _set_remote_access(db, True, "tailscale")
 
     with (
-        caplog.at_level(logging.INFO, logger="jacked.api.routes.auth"),
+        caplog.at_level(logging.INFO, logger="jacked.api.mutation_gate"),
         mock.patch("jacked.api.credential_helpers.reconcile_credentials_from_live_store"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None

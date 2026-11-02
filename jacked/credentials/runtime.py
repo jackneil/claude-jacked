@@ -244,6 +244,20 @@ def _engine_for(
     db, resolution: CapabilityResolution, home: Path
 ) -> CredentialTransactionEngine | str:
     """Build the transaction engine for a resolved capability, or a refusal reason."""
+    dependencies = _dependencies_for(db, resolution, home)
+    if isinstance(dependencies, str):
+        return dependencies
+    return CredentialTransactionEngine(dependencies)
+
+
+def _dependencies_for(
+    db, resolution: CapabilityResolution, home: Path
+) -> TransactionDependencies | str:
+    """Assemble the stores, key and lease for a resolved capability.
+
+    One assembly for the engine and for the recovery sweep, so a recovered
+    switch observes exactly the stores the interrupted switch wrote.
+    """
     capability = resolution.capability
     if capability.mode is CapabilityMode.GLOBAL_UNCOOPERATIVE:
         key_provider = StaticInstallKeyProvider(None)
@@ -259,26 +273,26 @@ def _engine_for(
     except (ValueError, RuntimeError) as exc:
         return str(exc)
     authority = stores.pop(capability.authority.locator)
-    return CredentialTransactionEngine(
-        TransactionDependencies(
-            capability=capability,
-            repository=DatabaseCredentialSwitchRepository(db),
-            authority=authority,
-            mirrors=stores,
-            identity_publisher=claude_config_identity_publisher(home, db),
-            writer_fence=WriterFence(StaticWriterInspector((), is_complete=False)),
-            install_key=key_provider,
-            machine_install_id=install_id,
-            snapshot_sink=FileResolverSnapshotSink(
-                home / ".claude" / "jacked-resolver-snapshot.json"
-            ),
-            switch_lease=switch_lease_for(home),
-            # An uninspected newer build may have moved its store; a missing
-            # authority then looks identical to "never logged in". Refuse to
-            # create it so jacked never writes where Claude no longer reads.
-            allow_missing_authority=NEWER_THAN_INSPECTED not in resolution.evidence,
-        )
+    return TransactionDependencies(
+        capability=capability,
+        repository=DatabaseCredentialSwitchRepository(db),
+        authority=authority,
+        mirrors=stores,
+        identity_publisher=claude_config_identity_publisher(home, db),
+        writer_fence=WriterFence(StaticWriterInspector((), is_complete=False)),
+        install_key=key_provider,
+        machine_install_id=install_id,
+        snapshot_sink=FileResolverSnapshotSink(
+            home / ".claude" / "jacked-resolver-snapshot.json"
+        ),
+        switch_lease=switch_lease_for(home),
+        # An uninspected newer build may have moved its store; a missing
+        # authority then looks identical to "never logged in". Refuse to
+        # create it so jacked never writes where Claude no longer reads.
+        allow_missing_authority=NEWER_THAN_INSPECTED not in resolution.evidence,
     )
+
+
 
 
 def _request_matches_row(row: dict, request: SwitchRequest) -> bool:
