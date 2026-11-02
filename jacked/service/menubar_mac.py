@@ -4,7 +4,7 @@ The native face of the jacked service on macOS. Replaces the cross-platform
 pystray tray with a real menu-bar app:
 
 * a live **pill**: the jacked arm mark tinted green/yellow/red by the **active** account's
-  usage, plus that account's ``5h·7d`` % as text — refreshed on a timer from
+  usage, plus that account's limits as text (``menubar_title``) — refreshed on a timer from
   ``/api/menubar-summary``. It tracks the account you're actually using, not the
   worst account in the fleet.
 * **left-click → an NSPopover dropdown** and a **Toggle Side Panel → always-on-top,
@@ -367,7 +367,7 @@ if RUMPS_AVAILABLE:
         def _refresh_pill(self, _timer):
             """Poll the summary; set the active account's % as text and tint the
             arm icon by its color. Degrade to a gray arm + hyphen if down."""
-            from jacked.service.menubar_summary import menubar_title
+            from jacked.service.pill_text import menubar_title
 
             upd = self._update_available()
             try:

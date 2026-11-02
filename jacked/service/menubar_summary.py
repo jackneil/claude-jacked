@@ -16,10 +16,14 @@ The green/yellow/red thresholds here are the Python mirror of
 lockstep so the pill's color can never disagree with the bar a user sees in the
 panel/dashboard.
 
-The 5-hour slot follows the account's plan (:mod:`jacked.usage_plans`), the
-same rule the account API uses: an account that has no 5-hour window (a
-verified Ultra account, ChatGPT Pro in Codex) shows no 5-hour number, even
-when an old reading is still in the cache.
+The pill shows only the limits that the account's plan has
+(:mod:`jacked.usage_plans`, the same rule the account API uses). An account
+that has no 5-hour window (a verified Ultra account, ChatGPT Pro in Codex)
+shows no 5-hour number, even when an old reading is still in the cache. The
+model limit that the dashboard shows (for example the weekly Fable limit)
+is in the pill too, and it counts toward the pill color.
+:mod:`jacked.service.pill_text` turns a summary into the menu-bar text and
+into the hover text of the Windows and Linux tray icon.
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Iterable, Mapping, Optional
+
+from jacked.service.pill_text import model_cap_tag
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +106,34 @@ def _eligible(acct: dict) -> bool:
     )
 
 
+def _model_cap(acct: Mapping, view) -> Optional[dict]:
+    """The model limit that the pill shows for *acct*, or None.
+
+    The selection is the selection of the dashboard (:func:`binding_model`):
+    the limit that the provider marks active, else the limit with the
+    highest use. A payload that jacked cannot read gives None, so one bad
+    row cannot stop the pill.
+    """
+    from jacked.usage_plans import raw_usage
+
+    try:
+        cap = binding_model_compact(
+            raw_usage(acct), view.plan if view is not None else None
+        )
+    except Exception:  # noqa: BLE001 - one bad payload must not stop the pill
+        logger.debug("Model limit unreadable for account %s", acct.get("id"), exc_info=True)
+        return None
+    if cap is None:
+        return None
+    return {
+        "label": cap["label"],
+        "tag": model_cap_tag(cap["label"]),
+        "utilization": round(float(cap["utilization"]), 1),
+        "resets_at": cap.get("resets_at"),
+        "is_active": cap["is_active"],
+    }
+
+
 def summarize_account(acct: dict) -> Optional[dict]:
     """Build a pill summary for a single account, or None if it has no usage.
 
@@ -113,10 +147,12 @@ def summarize_account(acct: dict) -> Optional[dict]:
     The 7-day slot keeps the cached rule: a Claude window with no reading is
     0% used, and a Codex window with no reading is a window Codex does not
     report, so it stays None instead of reading as 0% headroom.
-    ``max_pct`` and ``color`` come from the slots that have a value; with no
-    value in either slot there is no summary. ``blocked`` carries the
-    provider's own usage-blocked verdict (:func:`usage_block_of_row`); a
-    blocked account is red at any percent.
+    ``model_cap`` is the model limit that the dashboard shows for the
+    account (:func:`_model_cap`), or None. ``max_pct`` and ``color`` come
+    from the slots that have a value and from the model limit. With no value
+    in the 5-hour slot and the 7-day slot there is no summary. ``blocked``
+    carries the provider's own usage-blocked verdict
+    (:func:`usage_block_of_row`); a blocked account is red at any percent.
 
     >>> s = summarize_account({"id": 1, "email": "a@x.com",
     ...                        "cached_usage_5h": 37, "cached_usage_7d": 87})
@@ -129,16 +165,22 @@ def summarize_account(acct: dict) -> Optional[dict]:
     (None, 40.0, 40.0, 'green')
 
     A verified Ultra account lists its limits without a 5-hour session, so
-    an old 5-hour value in the cache is not a reading:
+    an old 5-hour value in the cache is not a reading. Its weekly Fable
+    limit is the worst limit, so it sets the color:
 
     >>> ultra = {"id": 3, "subscription_type": "max",
     ...          "rate_limit_tier": "default_claude_max_20x",
-    ...          "cached_usage_5h": 67.0, "cached_usage_7d": 33.0,
-    ...          "cached_usage_raw": json.dumps({"five_hour": None,
-    ...              "limits": [{"kind": "weekly_all", "percent": 33}]})}
+    ...          "cached_usage_5h": 67.0, "cached_usage_7d": 74.0,
+    ...          "cached_usage_raw": json.dumps({"five_hour": None, "limits": [
+    ...              {"kind": "weekly_all", "percent": 74},
+    ...              {"kind": "weekly_scoped", "percent": 100, "is_active": True,
+    ...               "scope": {"model": {"display_name": "Fable"}}}]})}
     >>> u = summarize_account(ultra)
-    >>> u["five_hour"], u["max_pct"], u["color"], menubar_title(u)
-    (None, 33.0, 'green', '-·33%')
+    >>> u["five_hour"], u["model_cap"]["label"], u["max_pct"], u["color"]
+    (None, 'Fable', 100.0, 'red')
+    >>> from jacked.service.pill_text import menubar_title
+    >>> menubar_title(u)
+    '7d 74%·F100%'
     """
     if not acct:
         return None
@@ -160,6 +202,9 @@ def summarize_account(acct: dict) -> Optional[dict]:
         # No window has a reading (a Codex plan without a 5-hour window and
         # no weekly reading): nothing to show.
         return None
+    cap = _model_cap(acct, view)
+    if cap is not None:
+        readings.append(cap["utilization"])
     worst = max(readings)
     blocked = usage_block_of_row(acct) is not None
     return {
@@ -170,6 +215,7 @@ def summarize_account(acct: dict) -> Optional[dict]:
         "organization_name": acct.get("organization_name"),
         "five_hour": f5,
         "seven_day": f7,
+        "model_cap": cap,
         "max_pct": round(worst, 1),
         "color": "red" if blocked else usage_color_class(worst),
         "blocked": blocked,
@@ -208,9 +254,10 @@ def compute_active_account_summary(
 def compute_worst_account_summary(accounts: Iterable[dict]) -> Optional[dict]:
     """Return a summary of the highest-utilization account, or None.
 
-    The "worst" account is the one with the greatest ``max(5h, 7d)`` utilization
-    among enabled, non-deleted accounts that have any usage data. Retained for a
-    fleet-wide "is anything maxed" view; the pill itself uses the active account.
+    The "worst" account is the one with the greatest ``max_pct`` (the 5-hour
+    window, the 7-day window and the model limit) among enabled, non-deleted
+    accounts that have any usage data. Retained for a fleet-wide "is
+    anything maxed" view; the pill itself uses the active account.
 
     >>> s = compute_worst_account_summary([
     ...     {"id": 1, "email": "a@x.com", "cached_usage_5h": 30, "cached_usage_7d": 40},
@@ -231,31 +278,6 @@ def compute_worst_account_summary(accounts: Iterable[dict]) -> Optional[dict]:
         if s is not None and (best is None or s["max_pct"] > best["max_pct"]):
             best = s
     return best
-
-
-def menubar_title(summary: Optional[dict]) -> str:
-    """Render the menu-bar pill text — just the percentages; the "J" icon
-    carries the color. No data → a hyphen placeholder, and a window the
-    provider does not report (None) → a hyphen in its slot. (The agent
-    handles the server-down/degraded state separately; this only ever sees
-    live data.)
-
-    >>> menubar_title(None)
-    '-'
-    >>> menubar_title({"five_hour": 37.0, "seven_day": 87.0, "color": "yellow"})
-    '37%·87%'
-    >>> menubar_title({"five_hour": 40.4, "seven_day": 30.6, "color": "green"})
-    '40%·31%'
-    >>> menubar_title({"five_hour": None, "seven_day": 100.0, "color": "red"})
-    '-·100%'
-    """
-    if not summary:
-        return "-"
-
-    def _slot(value) -> str:
-        return "-" if value is None else f"{round(value)}%"
-
-    return f"{_slot(summary.get('five_hour'))}·{_slot(summary.get('seven_day'))}"
 
 
 # ---------------------------------------------------------------------------

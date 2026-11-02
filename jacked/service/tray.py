@@ -1389,6 +1389,12 @@ class ServiceRunner:
         ).start()
         if self._started_at is not None:
             self._apply_icon("running")
+            from jacked.service.usage_tooltip import UsageTooltip
+
+            tooltip = UsageTooltip(self.port, self._stop_event, lambda: self._icon)
+            threading.Thread(
+                target=tooltip.run, name="jacked-usage-tooltip", daemon=True
+            ).start()
             # Force a menu rebuild so the dynamic "Started ..." item
             # picks up the just-set timestamp on first open. Without
             # this, pystray's macOS backend can show "Started: —"
