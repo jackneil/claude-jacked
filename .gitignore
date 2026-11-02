@@ -58,8 +58,9 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
+# Virtual environments (.venv*/ also keeps a second venv, e.g. .venv311, out of sdists)
 venv/
+.venv*/
 ENV/
 
 # IDE
