@@ -99,6 +99,22 @@ def test_a_malformed_answer_never_raises(payload):
     assert isinstance(icon.title, str) and isinstance(tip.menu_text(), str)
 
 
+def test_a_backend_without_a_menu_is_not_asked_to_rebuild_it(caplog):
+    """pystray's Xorg backend has HAS_MENU = False: no menu line exists there."""
+    class _NoMenu(_Icon):
+        HAS_MENU = False
+
+    tip, icon, _ = _tooltip(icon=_NoMenu())
+    with caplog.at_level(logging.INFO, logger="jacked.service.usage_tooltip"):
+        with patch(_GET, return_value=_ULTRA):
+            tip.refresh()
+        with patch(_GET, return_value={"active": None}):
+            tip.refresh()
+    assert icon.title == "Jacked" and icon.menu_updates == 0
+    notes = [r.getMessage() for r in caplog.records if "has no menu" in r.getMessage()]
+    assert len(notes) == 1
+
+
 def test_a_title_the_backend_refuses_is_contained(caplog):
     class _Refusing(_Icon):
         def __setattr__(self, name, value):

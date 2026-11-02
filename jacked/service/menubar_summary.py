@@ -135,7 +135,9 @@ def _model_cap(acct: Mapping, view, raw) -> Optional[dict]:
     the limit that the provider marks active, else the limit with the
     highest use. *raw* is the row's parsed payload. A payload that jacked
     cannot read, or a percent that is not a finite number, gives None (no
-    reading, never 0%), so one bad row cannot stop the pill.
+    reading, never 0%), so one bad row cannot stop the pill. The result
+    holds only the cleaned name and the finite percent: every field of the
+    summary must be JSON-safe, because /api/menubar-summary refuses NaN.
     """
     try:
         cap = binding_model_compact(raw, view.plan if view is not None else None)
@@ -145,12 +147,7 @@ def _model_cap(acct: Mapping, view, raw) -> Optional[dict]:
         if utilization is None:
             _log_cap_failure(acct.get("id"), "non-finite percent")
             return None
-        return {
-            "label": cap["label"],
-            "utilization": round(utilization, 1),
-            "resets_at": cap.get("resets_at"),
-            "is_active": cap["is_active"],
-        }
+        return {"label": cap["label"], "utilization": round(utilization, 1)}
     except Exception as exc:  # noqa: BLE001 - one bad payload must not stop the pill
         _log_cap_failure(acct.get("id"), type(exc).__name__, with_traceback=True)
         return None

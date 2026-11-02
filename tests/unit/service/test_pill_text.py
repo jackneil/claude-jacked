@@ -272,6 +272,16 @@ class TestUnreadableNumbers:
         assert len(warnings) == 1
         assert "account 9" in warnings[0] and "inf" not in warnings[0].lower()
 
+    @pytest.mark.parametrize("resets_at", ["1e999", "NaN", '"junk"', "[1]"])
+    def test_a_bad_model_reset_never_reaches_the_summary(self, resets_at):
+        # The summary keeps only the cleaned name and the finite percent.
+        raw = ('{"five_hour": null, "limits": [{"kind": "weekly_all", "percent": 20}, '
+               '{"kind": "weekly_scoped", "percent": 40, "is_active": true, '
+               '"resets_at": ' + resets_at + ', "scope": {"model": {"display_name": "Fable"}}}]}')
+        s = summarize_account(_ultra(id=9, cached_usage_7d=20.0, cached_usage_raw=raw))
+        assert s["model_cap"] == {"label": "Fable", "utilization": 40.0}
+        json.dumps(s, allow_nan=False)
+
     @pytest.mark.parametrize("value", [float("inf"), float("nan"), "junk"])
     def test_a_bad_cached_window_value_is_no_reading(self, value):
         s = summarize_account({"id": 1, "cached_usage_5h": value, "cached_usage_7d": 30})

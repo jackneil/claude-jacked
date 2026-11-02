@@ -55,6 +55,7 @@ class UsageTooltip:
         self._get_icon = get_icon
         self._menu_text = USAGE_LINE_EMPTY
         self._failing: Optional[str] = None  # the failure being reported
+        self._no_menu_noted = False
 
     def menu_text(self) -> str:
         """The usage line for the tray menu (a pystray menu text callable)."""
@@ -100,10 +101,23 @@ class UsageTooltip:
         self._menu_text = line
         try:
             icon.title = tooltip  # pystray sends the OS update only on a change
-            if changed:
+            if changed and self._has_menu(icon):
                 icon.update_menu()  # GTK and AppIndicator build the menu once
         except Exception as exc:  # noqa: BLE001 - a backend refusal must not stop the loop
             self._note_failure(f"the tray refused the update ({type(exc).__name__})")
+
+    def _has_menu(self, icon) -> bool:
+        """False on a backend with no menu (pystray Xorg). Say so once: the
+        usage then shows only where the tray displays the icon title."""
+        if getattr(icon, "HAS_MENU", True):
+            return True
+        if not self._no_menu_noted:
+            self._no_menu_noted = True
+            logger.info(
+                "Tray usage: this tray backend has no menu, so the usage line "
+                "is not shown; the dashboard shows the usage"
+            )
+        return False
 
     def run(self) -> None:
         """Refresh on each usage change and at the heartbeat, until the stop event."""
