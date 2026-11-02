@@ -651,19 +651,29 @@ async def _run_chain_flow(
                     # (#174i): take the response's refresh-token expiry when
                     # it sends one, else keep the previous value. The values
                     # are bound to a refresh lineage, so they are re-bound to
-                    # the rotated token either way.
+                    # the rotated token either way. A refresh rotates the
+                    # lineage, not the tier (#230i): subscriptionTypeVerifiedAt
+                    # stays bound to the tier it verified while the row still
+                    # publishes that tier, and is dropped otherwise.
                     from jacked.credentials.oauth_extra import (
+                        captured_tier,
                         encode_oauth_extra,
                         parse_oauth_extra,
                     )
 
                     previous = current or {}
+                    stored = previous.get("cc_oauth_extra")
+                    previous_refresh = previous.get("cc_refresh_token")
                     extra = parse_oauth_extra(
-                        previous.get("cc_oauth_extra"), previous.get("cc_refresh_token")
+                        stored, previous_refresh,
+                        current_tier=previous.get("subscription_type"),
                     )
                     if result.refresh_token_expires_at_ms is not None:
                         extra["refreshTokenExpiresAt"] = result.refresh_token_expires_at_ms
-                    updates["cc_oauth_extra"] = encode_oauth_extra(extra, result.refresh_token)
+                    updates["cc_oauth_extra"] = encode_oauth_extra(
+                        extra, result.refresh_token,
+                        tier=captured_tier(stored, previous_refresh),
+                    )
 
                 db_updated = False
                 for attempt in range(3):
@@ -857,16 +867,20 @@ async def _cc_chain_died(
             live_exp_s = expiry_seconds(oauth.get("expiresAt"))
             # The recovered access token carries no refresh token, so no
             # refresh-token expiry either; the other pass-through fields stay as
-            # Claude Code holds them.
+            # Claude Code holds them, subscriptionTypeVerifiedAt bound to the
+            # tier beside it (#230i).
             from jacked.credentials.oauth_extra import encode_oauth_extra, oauth_extra_from
 
             recovered_extra = oauth_extra_from(oauth)
             recovered_extra.pop("refreshTokenExpiresAt", None)
+            recovered = encode_oauth_extra(
+                recovered_extra, None, tier=oauth.get("subscriptionType")
+            )
             if not _write_if_unchanged(
                 cc_access_token=live_access,
                 cc_expires_at=live_exp_s,
                 cc_refresh_token=None,
-                cc_oauth_extra=encode_oauth_extra(recovered_extra, None),
+                cc_oauth_extra=recovered,
                 **_breaker_updates("cc", "invalid_grant"),
             ):
                 return _kept_new_lineage()

@@ -28,6 +28,7 @@ from .models import (
     SwitchOutcome,
     SwitchResult,
 )
+from .oauth_extra import PASSTHROUGH_KEYS
 from .repository import CredentialSwitchRepository
 from .resolver import ResolverSnapshotSink, ResolverState, SnapshotUpdate
 from .store import CredentialStore
@@ -214,6 +215,12 @@ def _warn_on_schema_drift(before: StoreReadResult, request: SwitchRequest) -> No
     jacked replaces the whole object; a key it does not know is dropped. That
     is logged loudly so a Claude Code schema change is diagnosable from the
     tray log instead of surfacing as a mysterious re-login.
+
+    A pass-through key jacked does carry (``oauth_extra.PASSTHROUGH_KEYS``) is
+    missing from the target only when the target row has no value for it
+    (for example, the outgoing account's fields on a switch to another
+    account). That is not drift, so it is logged at DEBUG. Both lines name
+    keys only, never values.
     """
     if before.payload is None:
         return
@@ -221,12 +228,20 @@ def _warn_on_schema_drift(before: StoreReadResult, request: SwitchRequest) -> No
     target = request.payload.to_mapping().get("claudeAiOauth")
     if not isinstance(current, dict) or not isinstance(target, dict):
         return
-    dropped = sorted(set(current) - set(target))
-    if dropped:
+    dropped = set(current) - set(target)
+    unknown = sorted(dropped - set(PASSTHROUGH_KEYS))
+    carried = sorted(dropped & set(PASSTHROUGH_KEYS))
+    if unknown:
         logger.warning(
             "Credential schema drift: authority carries claudeAiOauth keys jacked "
             "does not write and will drop: %s",
-            ", ".join(dropped),
+            ", ".join(unknown),
+        )
+    if carried:
+        logger.debug(
+            "Account %s has no value to write for %s; Claude Code re-derives them",
+            request.account_id,
+            ", ".join(carried),
         )
 
 

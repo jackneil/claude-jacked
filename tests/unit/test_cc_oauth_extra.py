@@ -226,7 +226,13 @@ def test_the_scoped_file_sync_carries_the_fields(tmp_path):
     (config_dir / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
         "accessToken": "new", "refreshToken": "new-rt", "expiresAt": 9_999_999_999_000,
         "refreshTokenExpiresAt": RT_EXPIRES}}))
-    _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+    # A new token is imported only once its profile names the row (#158i).
+    from jacked.api import credential_helpers
+
+    credential_helpers.clear_ownership_cache()
+    with patch("jacked.api.credential_helpers._ownership_lookup",
+               return_value=_owner_profile("owner@test.com")):
+        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
     row = db.get_account(aid)
     assert parse_oauth_extra(row["cc_oauth_extra"], row["cc_refresh_token"]) == {
         "refreshTokenExpiresAt": RT_EXPIRES}
@@ -263,17 +269,24 @@ def test_fields_from_a_replaced_lineage_are_never_written_back(tmp_path):
     """A writer that replaces the tokens without touching the column (an older
     jacked after a downgrade does a fresh sign-in) leaves the old fields
     behind; they are bound to the old refresh token, so none goes out."""
+    from jacked.credentials.oauth_extra import PASSTHROUGH_KEYS, capture_oauth_extra
+
     db = Database(str(tmp_path / "t.db"))
     aid = db.create_account("owner@test.com", "primary-at", int(time.time()) + 3600)["id"]
+    captured = capture_oauth_extra(
+        {"refreshTokenExpiresAt": RT_EXPIRES, "clientId": "custom", "subscriptionType": "max",
+         "subscriptionTypeSource": "profile", "subscriptionTypeVerifiedAt": 1_798_000_000_000},
+        "old-rt")
     db.update_account(aid, cc_access_token="cc-at", cc_refresh_token="old-rt",
-                      cc_expires_at=int(time.time()) + 3600,
-                      cc_oauth_extra=encode_oauth_extra(
-                          {"refreshTokenExpiresAt": RT_EXPIRES, "clientId": "custom"}, "old-rt"))
-    assert build_oauth_data(db.get_account(aid))["clientId"] == "custom"
-    # The older jacked's sign-in: new tokens, the column untouched.
+                      cc_expires_at=int(time.time()) + 3600, subscription_type="max",
+                      cc_oauth_extra=captured)
+    before = build_oauth_data(db.get_account(aid))
+    assert all(key in before for key in PASSTHROUGH_KEYS)  # all four, this lineage
+    # The older jacked's sign-in: new tokens, the column untouched, the tier
+    # unchanged. The verified pair describes the old lineage too.
     db.update_account(aid, cc_access_token="new-at", cc_refresh_token="new-rt")
     oauth = build_oauth_data(db.get_account(aid))
-    assert "clientId" not in oauth and "refreshTokenExpiresAt" not in oauth
+    assert [key for key in PASSTHROUGH_KEYS if key in oauth] == []
 
 
 def test_the_scoped_sync_takes_fields_even_when_the_token_is_unchanged(tmp_path):

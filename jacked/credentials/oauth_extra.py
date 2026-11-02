@@ -7,7 +7,7 @@ does not keep is dropped (logged by
 kept per account in ``accounts.cc_oauth_extra`` (JSON) and written back on
 the next switch.
 
-What Claude Code does with them (2.1.312, read from the installed binary):
+What Claude Code does with them (2.1.316, read from the installed binary):
 
 - ``refreshTokenExpiresAt`` (ms epoch): ``now + refresh_token_expires_in``
   from a token response; a sign-in without that field gets a 30-day default;
@@ -17,6 +17,10 @@ What Claude Code does with them (2.1.312, read from the installed binary):
   when it is not the default client.
 - ``subscriptionTypeSource``: where ``subscriptionType`` came from
   (``"sign_in"`` or ``"profile"``).
+- ``subscriptionTypeVerifiedAt`` (ms epoch): when a profile fetch verified
+  the tier. Claude Code keeps it across a refresh only while the tier is
+  unchanged; a ``"profile"`` source without it is an unverified tier that
+  Claude Code re-checks on its next profile fetch.
 
 Only this allowlist passes, type-checked: an unknown future key keeps the
 drift warning (and is not stored), and nothing that looks like a token or a
@@ -29,6 +33,13 @@ they are read back only while the row still holds that refresh token. A
 writer that replaces the tokens without touching this column (an older jacked
 after a downgrade, a path added later) therefore can never publish another
 lineage's expiry.
+
+``subscriptionTypeVerifiedAt`` is bound a second way: ``_tier`` records the
+``subscriptionType`` it verified. jacked publishes the tier from its own
+profile poll, so the timestamp is written back only while the row's tier
+still equals the captured one (Claude Code's own merge rule); otherwise the
+source stays and the timestamp is dropped, the shape Claude Code itself
+emits and self-heals.
 """
 from __future__ import annotations
 
@@ -37,12 +48,20 @@ import json
 import math
 from typing import Any
 
-PASSTHROUGH_KEYS = ("refreshTokenExpiresAt", "clientId", "subscriptionTypeSource")
+PASSTHROUGH_KEYS = (
+    "refreshTokenExpiresAt",
+    "clientId",
+    "subscriptionTypeSource",
+    "subscriptionTypeVerifiedAt",
+)
 _MAX_TEXT = 200
 # The latest epoch Python's datetime can represent (9999-12-31T23:59:59Z), in
 # ms: a larger "expiry" is not a date, and would overflow on the way to one.
 _MAX_EPOCH_MS = 253_402_300_799_000
 _LINEAGE_KEY = "_lineage"
+# The subscriptionType that subscriptionTypeVerifiedAt verified, at capture.
+_TIER_KEY = "_tier"
+_VERIFIED_AT = "subscriptionTypeVerifiedAt"
 
 
 def _positive_number(value: Any) -> float | None:
@@ -82,23 +101,61 @@ def oauth_extra_from(oauth: Any) -> dict:
     {}
     >>> oauth_extra_from(None), oauth_extra_from({"refreshTokenExpiresAt": float("inf")})
     ({}, {})
+    >>> oauth_extra_from({"subscriptionTypeVerifiedAt": 1798000000000})
+    {'subscriptionTypeVerifiedAt': 1798000000000}
+    >>> [oauth_extra_from({"subscriptionTypeVerifiedAt": v})
+    ...  for v in (True, float("inf"), 10**309, -1, "soon", 2**60)]
+    [{}, {}, {}, {}, {}, {}]
     """
     if not isinstance(oauth, dict):
         return {}
     out: dict = {}
-    expires = _positive_number(oauth.get("refreshTokenExpiresAt"))
-    if expires is not None and expires <= _MAX_EPOCH_MS:
-        out["refreshTokenExpiresAt"] = int(expires)
-    for key in ("clientId", "subscriptionTypeSource"):
+    for key in PASSTHROUGH_KEYS:  # allowlist order, so the record reads stably
         value = oauth.get(key)
-        if isinstance(value, str) and value and len(value) <= _MAX_TEXT:
+        if key in ("refreshTokenExpiresAt", _VERIFIED_AT):
+            number = _positive_number(value)
+            if number is not None and number <= _MAX_EPOCH_MS:
+                out[key] = int(number)
+        elif isinstance(value, str) and value and len(value) <= _MAX_TEXT:
             out[key] = value
     return out
 
 
-def parse_oauth_extra(raw: Any, refresh_token: str | None) -> dict:
+def _tier_of(value: Any) -> str | None:
+    """``value`` as a tier string, else None (never invented).
+
+    >>> _tier_of("max"), _tier_of(""), _tier_of(5), _tier_of("x" * 201)
+    ('max', None, None, None)
+    """
+    if isinstance(value, str) and value and len(value) <= _MAX_TEXT:
+        return value
+    return None
+
+
+def _stored_record(raw: Any, refresh_token: str | None) -> dict | None:
+    """The stored record for the row's CURRENT refresh token, else None."""
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, dict) or value.get(_LINEAGE_KEY) != lineage_of(refresh_token):
+        return None
+    return value
+
+
+def parse_oauth_extra(
+    raw: Any, refresh_token: str | None, *, current_tier: Any = None
+) -> dict:
     """Decode an ``accounts.cc_oauth_extra`` value for the row's CURRENT
     refresh token: {} when malformed or captured with another lineage.
+
+    ``subscriptionTypeVerifiedAt`` is returned only while ``current_tier``
+    (the tier the row publishes now) equals the tier it verified at capture;
+    otherwise the source is kept and the timestamp dropped, exactly as Claude
+    Code's own refresh merge does. A caller that does not pass the tier never
+    gets the timestamp: a verification is never claimed for an unknown tier.
 
     >>> stored = encode_oauth_extra({"clientId": "c", "accessToken": "never"}, "rt")
     >>> parse_oauth_extra(stored, "rt")
@@ -107,31 +164,93 @@ def parse_oauth_extra(raw: Any, refresh_token: str | None) -> dict:
     {}
     >>> parse_oauth_extra("not json", "rt"), parse_oauth_extra(None, "rt")
     ({}, {})
+    >>> verified = encode_oauth_extra({"subscriptionTypeSource": "profile",
+    ...     "subscriptionTypeVerifiedAt": 1798000000000}, "rt", tier="max")
+    >>> parse_oauth_extra(verified, "rt", current_tier="max")
+    {'subscriptionTypeSource': 'profile', 'subscriptionTypeVerifiedAt': 1798000000000}
+    >>> parse_oauth_extra(verified, "rt", current_tier="pro")
+    {'subscriptionTypeSource': 'profile'}
+    >>> parse_oauth_extra(verified, "rt")
+    {'subscriptionTypeSource': 'profile'}
+    >>> untiered = encode_oauth_extra({"subscriptionTypeSource": "profile",
+    ...     "subscriptionTypeVerifiedAt": 1798000000000}, "rt")
+    >>> parse_oauth_extra(untiered, "rt", current_tier="max")
+    {'subscriptionTypeSource': 'profile'}
     """
-    if not raw or not isinstance(raw, str):
+    value = _stored_record(raw, refresh_token)
+    if value is None:
         return {}
-    try:
-        value = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    if not isinstance(value, dict) or value.get(_LINEAGE_KEY) != lineage_of(refresh_token):
-        return {}
-    return oauth_extra_from(value)
+    fields = oauth_extra_from(value)
+    if _VERIFIED_AT in fields:
+        captured = _tier_of(value.get(_TIER_KEY))
+        if captured is None or captured != _tier_of(current_tier):
+            fields.pop(_VERIFIED_AT)
+    return fields
 
 
-def encode_oauth_extra(extra: dict, refresh_token: str | None) -> str | None:
+def captured_tier(raw: Any, refresh_token: str | None) -> str | None:
+    """The tier recorded with the stored fields for this lineage, or None.
+
+    A refresh rotates the lineage but not the tier, so the re-encoded record
+    carries the same tier forward.
+
+    >>> stored = encode_oauth_extra(
+    ...     {"subscriptionTypeVerifiedAt": 1798000000000}, "rt", tier="max")
+    >>> captured_tier(stored, "rt"), captured_tier(stored, "other")
+    ('max', None)
+    >>> captured_tier(encode_oauth_extra({"clientId": "c"}, "rt", tier="max"), "rt") is None
+    True
+    """
+    value = _stored_record(raw, refresh_token)
+    return _tier_of(value.get(_TIER_KEY)) if value is not None else None
+
+
+def encode_oauth_extra(
+    extra: dict, refresh_token: str | None, *, tier: Any = None
+) -> str | None:
     """The column value for ``extra``, bound to the refresh lineage it
     describes (None when there is nothing to keep).
+
+    ``tier`` is the ``subscriptionType`` beside the fields at capture; it is
+    stored only when there is a verification timestamp to bind it to.
 
     >>> encode_oauth_extra({}, "rt") is None
     True
     >>> sorted(json.loads(encode_oauth_extra({"clientId": "c"}, "rt")))
     ['_lineage', 'clientId']
+    >>> sorted(json.loads(encode_oauth_extra({"clientId": "c"}, "rt", tier="max")))
+    ['_lineage', 'clientId']
+    >>> sorted(json.loads(encode_oauth_extra(
+    ...     {"subscriptionTypeVerifiedAt": 1798000000000}, "rt", tier="max")))
+    ['_lineage', '_tier', 'subscriptionTypeVerifiedAt']
     """
     clean = oauth_extra_from(extra)
     if not clean:
         return None
-    return json.dumps({**clean, _LINEAGE_KEY: lineage_of(refresh_token)}, sort_keys=True)
+    record = {**clean, _LINEAGE_KEY: lineage_of(refresh_token)}
+    captured = _tier_of(tier)
+    if _VERIFIED_AT in clean and captured is not None:
+        record[_TIER_KEY] = captured
+    return json.dumps(record, sort_keys=True)
+
+
+def capture_oauth_extra(oauth: Any, refresh_token: str | None) -> str | None:
+    """The column value for a ``claudeAiOauth`` object Claude Code wrote,
+    bound to ``refresh_token`` and to the tier the object carries.
+
+    >>> capture_oauth_extra({"accessToken": "x"}, "rt") is None
+    True
+    >>> stored = capture_oauth_extra({"subscriptionType": "max",
+    ...     "subscriptionTypeSource": "profile",
+    ...     "subscriptionTypeVerifiedAt": 1798000000000}, "rt")
+    >>> captured_tier(stored, "rt")
+    'max'
+    """
+    if not isinstance(oauth, dict):
+        return None
+    return encode_oauth_extra(
+        oauth_extra_from(oauth), refresh_token, tier=oauth.get("subscriptionType")
+    )
 
 
 def refresh_expiry_from_response(data: Any, now_ms: int) -> int | None:

@@ -27,8 +27,16 @@ import click
 
 from jacked.findbin import find_bin
 from jacked.api.credential_helpers import (
+    _malformed_expiry,
     _safe_replace,
     build_oauth_data,
+    cc_token_known_dead,
+    clear_ownership_cache,
+    forget_ownership_verdicts,
+    ownership_refusal_is_final,
+    expiry_seconds,
+    is_primary_publication,
+    live_payload_ownership,
 )
 from jacked.credentials.runtime import scoped_launch_needs_global_activation
 from jacked.web.auth import should_refresh, should_refresh_cc
@@ -235,10 +243,10 @@ def _seed_oauth_account(config_dir: Path, account: dict, db=None) -> None:
     the account uuid when jacked knows them. When the existing block is the
     same account (same email, org and uuid), the write merges and keeps the
     fields that Claude Code wrote. Otherwise the write replaces the block.
-    This prevents token contamination: if Claude Code re-authenticates as a
-    different Claude account inside this per-account dir, the stale identity
-    is replaced on the next launch, so _sync_tokens_from_file() can detect
-    the mismatch and block the wrong token from polluting the DB.
+    If Claude Code signs in as a different Claude account inside this
+    per-account dir, the next launch replaces that identity. The block is
+    not proof of token ownership: _sync_tokens_from_file() uses the shared
+    ownership rule in credential_helpers.
 
     A symlinked or malformed .claude.json is never written.
     """
@@ -359,13 +367,23 @@ def _activate_global_authority(account: dict, db: Database, account_id: int):
     return activation.observed_identity, evidence, f"switch:{activation.operation_id}"
 
 
-def _read_back_scoped_credentials(account: dict, config_dir: Path, account_id: int):
-    """Prove the launch directory holds this account's credentials.
+def _read_back_scoped_credentials(
+    account: dict,
+    config_dir: Path,
+    account_id: int,
+    *,
+    written_oauth: dict | None = None,
+    kept_rotation: bool = False,
+):
+    """Prove the launch directory holds the credentials the launch wrote.
 
     "Observed" must mean read back. The scoped file was just written; read it
-    through the strict store and compare the OAuth object to what
-    build_oauth_data produced before claiming anything. The scoped file is
-    unstamped by design, so only the organization comes from the readback.
+    through the strict store and compare the OAuth object to what the launch
+    wrote (``written_oauth``: the row's pair from build_oauth_data, or the
+    file's own rotation when a deferred rescue kept it) before claiming
+    anything. The scoped file is unstamped by design, so only the
+    organization comes from the readback. A kept rotation is unproven, and
+    the evidence says so.
     """
     from jacked.credentials.file_store import FileCredentialStore
     from jacked.credentials.models import CredentialIdentity
@@ -379,7 +397,8 @@ def _read_back_scoped_credentials(account: dict, config_dir: Path, account_id: i
         config_dir / ".credentials.json", trusted_root=config_dir
     ).read()
     written = readback.payload.to_mapping() if readback.payload is not None else None
-    if written is None or written.get("claudeAiOauth") != build_oauth_data(account):
+    expected = written_oauth if written_oauth is not None else build_oauth_data(account)
+    if written is None or written.get("claudeAiOauth") != expected:
         raise click.ClickException(
             f"Credentials for account {account_id} did not read back from the "
             f"launch directory: {readback.reason or 'content mismatch'}"
@@ -390,17 +409,28 @@ def _read_back_scoped_credentials(account: dict, config_dir: Path, account_id: i
         organization_id=readback.payload.identity.organization_id,
     )
     evidence = ("launch:scoped-file-readback", "launch:global-authority:skipped")
+    if kept_rotation:
+        evidence += ("launch:scoped-file:unchecked-rotation-kept",)
     return observed, evidence, f"launch:{uuid.uuid4()}"
 
 
 def _publish_launch_credentials(
-    account: dict, db: Database, config_dir: Path, account_id: int
+    account: dict,
+    db: Database,
+    config_dir: Path,
+    account_id: int,
+    *,
+    written_oauth: dict | None = None,
+    kept_rotation: bool = False,
 ) -> None:
     """Establish the credentials Claude will read, then publish the evidence.
 
     The token-free observation is written beside the launch directory for
     session hooks. It is labelled global on purpose: the scoped file is a
-    launch input, not the certified credential authority.
+    launch input, not the certified credential authority. ``written_oauth``
+    is the OAuth object the launch wrote to the scoped file, which the
+    file-authority readback verifies; ``kept_rotation`` says that object is
+    the file's own unchecked rotation, not the row's pair.
     """
     from jacked.credentials.models import CredentialIdentity
     from jacked.credentials.resolver import (
@@ -415,7 +445,11 @@ def _publish_launch_credentials(
         )
     else:
         observed, evidence, revision = _read_back_scoped_credentials(
-            account, config_dir, account_id
+            account,
+            config_dir,
+            account_id,
+            written_oauth=written_oauth,
+            kept_rotation=kept_rotation,
         )
     try:
         FileResolverSnapshotSink(config_dir / "jacked-resolver-snapshot.json").publish(
@@ -445,7 +479,22 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
 
     Returns the directory path (for use as CLAUDE_CONFIG_DIR).
 
-    >>> # Tested via test_launch.py
+    Before any refresh, the function copies a rotation that the last session
+    left in the per-account .credentials.json into the row, when the launch
+    token sync proves it (#158i). A refresh would spend the refresh token of
+    the row, which Claude Code already spent when it rotated, and the write
+    below would replace the rotated pair. A refused or deferred sync changes
+    nothing, and the write below replaces the file, as before.
+
+    Limit: the profile request can prove only an access token that is not
+    expired. A rotation whose access token expired before this launch stays
+    unproven: the sync defers, the file keeps it, and the pre-launch Claude
+    Code refresh is skipped, because that rotation may have spent the row's
+    refresh token. A pair an earlier session proved to belong to another
+    account is remembered beside the file by its digests and is replaced
+    without a request, expired or not.
+
+    >>> # Tested via test_launch.py and test_launch_token_sync.py
     """
     account_id = account["id"]
     if account_id <= 0:
@@ -457,6 +506,49 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
         raise click.ClickException(
             f"Account {account_id} is a Codex account. Use `jacked codex launch {account_id}`."
         )
+
+    config_dir = ACCOUNTS_DIR / str(account_id)
+
+    # Refuse redirects in the credential path (defense-in-depth). These checks
+    # come first, because the token sync below reads the directory.
+    # is_symlink() uses lstat and also catches a broken link. Checking
+    # exists() first misses broken Windows links and lets mkdir fail outside
+    # the intended, user-facing refusal path.
+    if config_dir.is_symlink():
+        raise click.ClickException(
+            f"Account dir is a symlink; refusing to use: {config_dir}"
+        )
+    if os.name == "nt":
+        from jacked.service.windows_state import (
+            reject_windows_reparse_ancestors,
+        )
+
+        try:
+            reject_windows_reparse_ancestors(config_dir)
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(
+                "Account dir path contains an unsafe Windows reparse point; "
+                f"refusing to use: {config_dir}"
+            ) from exc
+
+    # A rotation that the exit-time sync of the last session could not prove
+    # (a failed profile request) goes into the row before a refresh spends
+    # the row's refresh token. The sync proves ownership before it writes.
+    # It reads the database file with raw sqlite3, so it runs only when the
+    # database has a file (not ":memory:", and not a stand-in object).
+    db_file = getattr(db, "db_path", None)
+    rescue = "unchanged"
+    if isinstance(db_file, (str, Path)) and str(db_file) != ":memory:":
+        rescue = _sync_tokens_from_file(config_dir, str(db_file))
+        # Re-read the row whatever the sync answered: a sync that lost its
+        # compare-and-swap ("unchanged") lost it to a writer that stored
+        # NEWER tokens, and those, not this function's earlier snapshot,
+        # are what the scoped file must carry.
+        account = db.get_account(account_id)
+        if not account:
+            raise click.ClickException(
+                f"Account {account_id} disappeared after the token sync"
+            )
 
     # Refresh primary token if near-expiry (refresh_account_token is async)
     if should_refresh(account):
@@ -477,7 +569,17 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     # tracker names, and nothing at all when the active account is unknown
     # (invariant I2 fails closed; the same gate as the background loops).
     # See docs/architecture/oauth-and-credential-flows.md §7.2.
-    if should_refresh_cc(account):
+    file_pair_differs = _scoped_pair_differs(config_dir, account)
+    if rescue == "deferred" and file_pair_differs:
+        # The file holds a rotation jacked could not prove. The row's refresh
+        # token may already be spent by that rotation: exchanging it would
+        # only earn an invalid_grant. Claude Code refreshes from the file.
+        logger.warning(
+            "Account %d: skipping the pre-launch Claude Code refresh; the "
+            "per-account file holds an unchecked rotation",
+            account_id,
+        )
+    elif should_refresh_cc(account):
         from jacked.api.credential_helpers import cc_rotation_block
 
         block = cc_rotation_block(account_id, db)
@@ -536,29 +638,6 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             account_id,
         )
 
-    config_dir = ACCOUNTS_DIR / str(account_id)
-
-    # Refuse redirects in the credential path (defense-in-depth).
-    # is_symlink() uses lstat and also catches a broken link. Checking
-    # exists() first misses broken Windows links and lets mkdir fail outside
-    # the intended, user-facing refusal path.
-    if config_dir.is_symlink():
-        raise click.ClickException(
-            f"Account dir is a symlink; refusing to use: {config_dir}"
-        )
-    if os.name == "nt":
-        from jacked.service.windows_state import (
-            reject_windows_reparse_ancestors,
-        )
-
-        try:
-            reject_windows_reparse_ancestors(config_dir)
-        except (OSError, ValueError) as exc:
-            raise click.ClickException(
-                "Account dir path contains an unsafe Windows reparse point; "
-                f"refusing to use: {config_dir}"
-            ) from exc
-
     # Create dir with user-only permissions
     config_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -593,7 +672,27 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
         except (json.JSONDecodeError, OSError):
             existing = {}
 
-    existing["claudeAiOauth"] = build_oauth_data(account)
+    kept_rotation = rescue == "deferred" and isinstance(existing.get("claudeAiOauth"), dict)
+    if kept_rotation:
+        # The file's tokens could not be checked (the profile request failed):
+        # a refused token is overwritten, an unchecked one is kept. The row's
+        # spent lineage over the only live rotation would be the real loss.
+        logger.warning(
+            "Account %d: the per-account file holds tokens whose ownership could "
+            "not be checked (lookup failed); keeping them for this launch",
+            account_id,
+        )
+    else:
+        if file_pair_differs:
+            # Attributable: the file carried a pair that is not the row's and
+            # the sync answered "%s" (refused: another owner, or unprovable).
+            logger.warning(
+                "Account %d: replacing the per-account file's token pair with the "
+                "row's (sync result: %s)",
+                account_id,
+                rescue,
+            )
+        existing["claudeAiOauth"] = build_oauth_data(account)
     # No _jackedAccountId stamp — account_id is derived from directory path
 
     # Atomic write
@@ -615,7 +714,17 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             pass
         raise
 
-    _publish_launch_credentials(account, db, config_dir, account_id)
+    if not kept_rotation:
+        _forget_foreign_pair(config_dir)
+
+    _publish_launch_credentials(
+        account,
+        db,
+        config_dir,
+        account_id,
+        written_oauth=existing["claudeAiOauth"],
+        kept_rotation=kept_rotation,
+    )
 
     return config_dir
 
@@ -765,116 +874,327 @@ def resolve_account(account_ref, db: Database) -> dict:
     return account
 
 
-def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
-    """Read per-account .credentials.json and sync tokens back to DB.
+_IDENTITY_COLS = ("email", "organization_uuid", "account_uuid")
+# A pair the profile endpoint proved to belong to another account is
+# remembered beside the per-account file by its digests (never a token),
+# so the next launch replaces it without a request, even when its access
+# token expired meanwhile (an expired pair cannot be proven again).
+_FOREIGN_PAIR_MARKER = ".jacked-foreign-pair.json"
 
-    Lightweight: uses raw sqlite3 to avoid importing Database class in threads.
+
+def _pair_digests(oauth: dict, account: dict) -> dict:
+    """The digests that identify a token pair and the row it was refused for.
+
+    >>> d = _pair_digests({"accessToken": "a", "refreshToken": "r"}, {"id": 1, "email": "x@y"})
+    >>> sorted(d) == ["access_sha256", "identity_sha256", "refresh_sha256"] and len(d["access_sha256"]) == 64
+    True
+    """
+    import hashlib
+
+    from jacked.api.credential_helpers import _identity_key
+
+    def digest(value) -> str:
+        return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+    return {
+        "access_sha256": digest(oauth.get("accessToken")),
+        "refresh_sha256": digest(oauth.get("refreshToken")),
+        "identity_sha256": digest("|".join(_identity_key(account))),
+    }
+
+
+def _remember_foreign_pair(config_dir: Path, oauth: dict, account: dict) -> None:
+    """Record beside the per-account file that its pair belongs to another
+    account (a final verdict), as digests. Best effort: a failed write only
+    costs the next launch one profile request."""
+    marker = config_dir / _FOREIGN_PAIR_MARKER
+    try:
+        record = {**_pair_digests(oauth, account), "recorded_at": int(_time.time())}
+        fd, tmp = tempfile.mkstemp(dir=str(config_dir), prefix=".jacked-foreign-pair_", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        _safe_replace(tmp, str(marker))
+    except OSError as exc:
+        logger.debug("Could not record the foreign pair for %s: %s", config_dir.name, exc)
+
+
+def _known_foreign_pair(config_dir: Path, oauth: dict, account: dict) -> bool:
+    """True when the marker names this exact pair, refused for this exact
+    row identity. Any other marker, or none, is ignored (a re-authed row
+    decides again through the profile request)."""
+    marker = config_dir / _FOREIGN_PAIR_MARKER
+    try:
+        if not marker.exists() or marker.is_symlink():
+            return False
+        record = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(record, dict):
+        return False
+    digests = _pair_digests(oauth, account)
+    return all(record.get(name) == value for name, value in digests.items())
+
+
+def _forget_foreign_pair(config_dir: Path) -> None:
+    """Drop the marker: the file now holds the row's own pair."""
+    try:
+        (config_dir / _FOREIGN_PAIR_MARKER).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.debug("Could not drop the foreign-pair marker for %s: %s", config_dir.name, exc)
+
+
+def _settle_unowned(
+    conn,
+    snapshot: dict,
+    account_id: int,
+    cols: set,
+    outcome: str,
+    *,
+    config_dir: Path | None = None,
+    oauth: dict | None = None,
+) -> str:
+    """A refusal holds only for the row it was decided against.
+
+    The ownership verdict compared the profile with the row as it was read
+    before the request. A writer that changed the row identity meanwhile
+    (a primary re-auth moves the row to another organization without
+    touching the Claude Code token) makes that refusal stale: the file's
+    pair may belong to the NEW identity. The sync then defers, and the
+    next pass decides against the new row (the verdict cache is keyed by
+    the identity, so it asks again). A deferral is returned as is.
+    """
+    if outcome != "refused":
+        return outcome
+    fresh = _sync_row(conn, account_id, cols)
+    changed = fresh is None or any(
+        fresh.get(c) != snapshot.get(c) for c in _IDENTITY_COLS if c in cols
+    )
+    if not changed:
+        logger.warning(
+            "Token sync BLOCKED for account %d: ownership not proven", account_id
+        )
+        if (
+            config_dir is not None
+            and isinstance(oauth, dict)
+            and ownership_refusal_is_final(snapshot, oauth.get("accessToken"))
+        ):
+            # The profile named another account: remember the pair, so the
+            # next launch replaces it without a request, expired or not.
+            _remember_foreign_pair(config_dir, oauth, snapshot)
+            logger.info(
+                "Account %d: the per-account file holds another account's "
+                "tokens; the next launch replaces them",
+                account_id,
+            )
+        return outcome
+    forget_ownership_verdicts(account_id)
+    logger.info(
+        "Token sync for account %d: the row identity changed during the "
+        "ownership check; deciding again on the next pass",
+        account_id,
+    )
+    return "deferred"
+
+
+def _sync_row(conn, account_id: int, cols: set) -> dict | None:
+    """The row fields that the launch token sync uses, or None for no row.
+
+    The function reads only the columns that this schema has, so a database
+    from before a migration gives a row without those keys. A database with
+    no accounts table has no row.
+    """
+    if "id" not in cols:
+        return None
+    names = [
+        name
+        for name in (
+            "id",
+            "email",
+            "organization_uuid",
+            "account_uuid",
+            "access_token",
+            "cc_access_token",
+            "cc_refresh_token",
+            "cc_expires_at",
+            "cc_refresh_failure_type",
+            "keeper_state",
+        )
+        if name in cols
+    ]
+    # The column names come from the fixed tuple above, never from input.
+    row = conn.execute(
+        f"SELECT {', '.join(names)} FROM accounts WHERE id = ?", (account_id,)
+    ).fetchone()
+    return dict(zip(names, row)) if row else None
+
+
+# Rows whose deferral was already logged at WARNING in this process.
+_deferral_warned: set[int] = set()
+
+
+def _scoped_pair_differs(config_dir: Path, account: dict) -> bool:
+    """True when the per-account file holds an access or refresh token that
+    is not the row's (a rotation the row does not have). Unreadable: False.
+
+    >>> import tempfile, json as _json
+    >>> d = Path(tempfile.mkdtemp()); row = {"cc_access_token": "a", "cc_refresh_token": "r"}
+    >>> _scoped_pair_differs(d, row)
+    False
+    >>> _ = (d / ".credentials.json").write_text(_json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r"}}))
+    >>> _scoped_pair_differs(d, row)
+    False
+    >>> _ = (d / ".credentials.json").write_text(_json.dumps({"claudeAiOauth": {"accessToken": "a2", "refreshToken": "r2"}}))
+    >>> _scoped_pair_differs(d, row)
+    True
+    """
+    path = config_dir / ".credentials.json"
+    try:
+        if not path.exists() or path.is_symlink():
+            return False
+        oauth = json.loads(path.read_text(encoding="utf-8")).get("claudeAiOauth")
+    except (OSError, ValueError, AttributeError):
+        return False
+    if not isinstance(oauth, dict):
+        return False
+    access, refresh = oauth.get("accessToken"), oauth.get("refreshToken")
+    if not access and not refresh:
+        return False
+    return access != account.get("cc_access_token") or refresh != account.get("cc_refresh_token")
+
+
+def _log_deferral(account_id: int, message: str) -> None:
+    """`jacked claude` logs at WARNING, so the first deferral of a row in a
+    process is a WARNING a user can see; the retries every 30 s stay at INFO."""
+    level = logging.INFO if account_id in _deferral_warned else logging.WARNING
+    _deferral_warned.add(account_id)
+    logger.log(level, message, account_id)
+
+
+def _is_expired_rotation(account: dict, oauth: dict) -> bool:
+    """True when the file holds an expired access token beside a refresh
+    token that is not the row's: a rotation nobody can prove any more.
+
+    >>> row = {"cc_refresh_token": "rt-row"}
+    >>> _is_expired_rotation(row, {"accessToken": "a", "refreshToken": "rt-new", "expiresAt": 1000})
+    True
+    >>> _is_expired_rotation(row, {"accessToken": "a", "refreshToken": "rt-row", "expiresAt": 1000})
+    False
+    >>> _is_expired_rotation(row, {"accessToken": "a", "refreshToken": "rt-new"})
+    False
+    """
+    from jacked.api.credential_helpers import expiry_seconds
+
+    refresh = oauth.get("refreshToken")
+    if not isinstance(refresh, str) or not refresh or refresh == account.get("cc_refresh_token"):
+        return False
+    expires = expiry_seconds(oauth.get("expiresAt"))
+    return expires is not None and expires <= _time.time()
+
+
+def _unowned_outcome(account: dict, payload: dict, account_id: int) -> str | None:
+    """The sync result when the tokens in ``payload`` are not proven to be the
+    tokens of ``account``, or None when they are.
+
+    The shared ownership rule decides (credential_helpers.live_payload_ownership).
+    The per-account file has no jacked stamp, so the rule does not require
+    one. The sync thread has no event loop, so the rule can send its one
+    profile request. The log lines give the row id only.
+
+    >>> _unowned_outcome({"id": 3, "cc_access_token": "a1"},
+    ...                  {"claudeAiOauth": {"accessToken": "a1"}}, 3) is None
+    True
+    """
+    oauth = payload.get("claudeAiOauth") if isinstance(payload, dict) else None
+    if isinstance(oauth, dict) and _is_expired_rotation(account, oauth):
+        # Nobody can prove an expired access token, but its refresh token
+        # may be the only live lineage (Claude Code rotated offline, and the
+        # exit sync could not ask). It is not foreign, it is unproven: keep
+        # it out of the row, and keep it in the file for the next session.
+        _log_deferral(
+            account_id,
+            "Token sync deferred for account %d: the rotated access token expired "
+            "before its owner could be checked; the file keeps the rotation",
+        )
+        return "deferred"
+    owned = live_payload_ownership(account, payload, require_stamp=False)
+    if owned is True:
+        return None
+    if owned is None:
+        _log_deferral(
+            account_id,
+            "Token sync deferred for account %d: ownership lookup failed; jacked "
+            "tries again on the next poll",
+        )
+        return "deferred"
+    # The caller logs the refusal once it stands (_settle_unowned): a refusal
+    # decided against a row whose identity changed meanwhile is deferred
+    # instead, and must not read as BLOCKED.
+    return "refused"
+
+
+def _sync_tokens_from_file(config_dir: Path, db_path: str) -> str:
+    """Copy the tokens in the per-account .credentials.json into the DB row.
+
+    The directory name is the account id. The tokens go into the row only
+    when the shared ownership rule proves that they are the tokens of the
+    row (credential_helpers.live_payload_ownership): the row holds the
+    access token or the refresh token already, or one profile request names
+    the owner of the row. The per-account .claude.json is not proof, because
+    jacked and Claude Code both write it from the token that a process holds.
+    The other import rules of reconcile also apply: an unreadable expiry is
+    refused, the primary-token fallback is not imported, and an older pair
+    does not replace newer tokens.
+
+    The function uses raw sqlite3 and not the Database class, because it
+    runs in a thread.
+
+    The result is one of these values:
+
+    - ``"imported"``: the tokens are the tokens of the row, and the row
+      holds them now. This call wrote them or their pass-through fields, or
+      the row had them before.
+    - ``"refused"``: the rule shows that the tokens are not the tokens of
+      the row, or that nobody can prove it (for example, the token is
+      expired, or its expiry is not a real time). Nothing is written.
+    - ``"deferred"``: the profile request failed, or an error stopped the
+      sync. Nothing is written. A later call can decide.
+    - ``"unchanged"``: there is nothing to copy (no file, no access token, a
+      directory name that is not an id, no row, a row without a Claude Code
+      token, the primary-token fallback, or a pair older than the row's
+      pair), or another writer changed the row first. Nothing is written.
     """
     cred_path = config_dir / ".credentials.json"
     try:
         if not cred_path.exists() or cred_path.is_symlink():
-            return
+            return "unchanged"
         data = json.loads(cred_path.read_text(encoding="utf-8"))
         oauth = data.get("claudeAiOauth", {})
         access_token = oauth.get("accessToken")
         if not access_token:
-            return
+            return "unchanged"
 
         try:
             account_id = int(config_dir.name)
         except (ValueError, TypeError):
-            return
+            return "unchanged"
 
-        # Guard: verify the token still belongs to the expected account.
-        # If Claude Code re-authenticated as a different Claude account
-        # inside this per-account dir, the .claude.json oauthAccount email
-        # will no longer match the DB account's email.  Refuse to sync
-        # the wrong token — it would contaminate the DB permanently.
-        claude_json = config_dir / ".claude.json"
-        if claude_json.exists() and not claude_json.is_symlink():
-            try:
-                cj = json.loads(claude_json.read_text(encoding="utf-8"))
-                oauth_block = cj.get("oauthAccount")
-                if not isinstance(oauth_block, dict):
-                    # oauthAccount key is missing or non-dict — suspicious since
-                    # jacked always seeds this block via _seed_oauth_account().
-                    # Fail closed to prevent unverified token sync.
-                    logger.warning(
-                        "Token sync BLOCKED for account %d: "
-                        "oauthAccount block missing or invalid in .claude.json",
-                        account_id,
-                    )
-                    return
-                file_email = oauth_block.get("emailAddress")
-                if file_email:
-                    import sqlite3 as _sq
-
-                    _conn = _sq.connect(db_path, timeout=2.0)
-                    try:
-                        _conn.execute("PRAGMA busy_timeout = 5000")
-                        _conn.row_factory = _sq.Row
-                        _row = _conn.execute(
-                            "SELECT email, organization_uuid FROM accounts WHERE id = ?",
-                            (account_id,),
-                        ).fetchone()
-                        if _row and _row["email"] and _row["email"].lower() != file_email.lower():
-                            logger.warning(
-                                "Token sync BLOCKED for account %d: "
-                                "oauthAccount.emailAddress differs from the DB row "
-                                "— Claude Code may have re-authenticated as "
-                                "a different account",
-                                account_id,
-                            )
-                            return
-
-                        # Org identity check — fail closed for org-scoped accounts
-                        db_org = _row["organization_uuid"] if _row else ""
-                        if db_org:  # non-empty sentinel = real org
-                            file_org = oauth_block.get("organizationUuid")
-                            if not file_org:
-                                logger.warning(
-                                    "Token sync BLOCKED for account %d: "
-                                    "file missing org for org-scoped account",
-                                    account_id,
-                                )
-                                return
-                            if file_org != db_org:
-                                logger.warning(
-                                    "Token sync BLOCKED for account %d: "
-                                    "oauthAccount.organizationUuid %s differs "
-                                    "from the DB row org %s",
-                                    account_id,
-                                    str(file_org)[:8],
-                                    str(db_org)[:8],
-                                )
-                                return
-                    except _sq.OperationalError as exc:
-                        logger.debug(
-                            "Token sync identity check failed for account %d: %s",
-                            account_id, exc,
-                        )
-                        return
-                    finally:
-                        _conn.close()
-                else:
-                    # oauthAccount exists but emailAddress is missing —
-                    # suspicious (jacked always seeds emailAddress).
-                    # Block sync to prevent unverified token contamination.
-                    logger.warning(
-                        "Token sync BLOCKED for account %d: "
-                        "oauthAccount present but emailAddress missing",
-                        account_id,
-                    )
-                    return
-            except (json.JSONDecodeError, OSError, AttributeError):
-                # Corrupted/unreadable file — fail closed to avoid
-                # syncing tokens without identity verification.
-                logger.debug(
-                    "Token sync skipped for account %d: "
-                    "cannot parse credential file for identity check",
-                    account_id,
-                )
-                return
+        # The import rules of reconcile (credential_helpers._reconcile_decision)
+        # apply here too. The local rules run first, so only a token that
+        # they cannot place costs a profile request. First: a payload whose
+        # expiry is not a real time is not a Claude Code rotation, so nothing
+        # in it is taken. The result settles, so the loop does not read it
+        # again.
+        if _malformed_expiry(oauth.get("expiresAt")):
+            logger.warning(
+                "Token sync BLOCKED for account %d: unreadable expiry", account_id
+            )
+            return "refused"
 
         import sqlite3
 
@@ -888,30 +1208,30 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
             cols = {row[1] for row in cursor.fetchall()}
             has_cc_cols = "cc_access_token" in cols
 
+            account = _sync_row(conn, account_id, cols)
+            if account is None:
+                return "unchanged"
+
             refresh_token = oauth.get("refreshToken")
-            expires_at_ms = oauth.get("expiresAt", 0)
-            expires_at = int(expires_at_ms // 1000) if expires_at_ms else None
+            expires_at = expiry_seconds(oauth.get("expiresAt"))
 
             if has_cc_cols:
                 # Credential files contain CC tokens — sync to cc_* columns.
                 # CAS: only write if DB value hasn't changed under us.
-                row = conn.execute(
-                    "SELECT cc_access_token, cc_refresh_token FROM accounts WHERE id = ?",
-                    (account_id,),
-                ).fetchone()
-                old_cc_access_token = row[0] if row else None
+                old_cc_access_token = account.get("cc_access_token")
                 if old_cc_access_token == access_token:
-                    # Same tokens, but the file may carry pass-through fields
-                    # the row lacks (a row from before #174i, or a field
-                    # Claude Code changed without rotating): take them, bound
-                    # to the row's own refresh token, CAS on the access token.
-                    if "cc_oauth_extra" in cols and refresh_token == row[1]:
-                        from jacked.credentials.oauth_extra import (
-                            encode_oauth_extra,
-                            oauth_extra_from,
-                        )
+                    # The row holds this access token, so the tokens are the
+                    # row's with no profile request. The file may carry
+                    # pass-through fields the row lacks (a row from before
+                    # #174i, or a field Claude Code changed without rotating):
+                    # take them, bound to the row's own refresh token, CAS on
+                    # the access token.
+                    if "cc_oauth_extra" in cols and refresh_token == account.get(
+                        "cc_refresh_token"
+                    ):
+                        from jacked.credentials.oauth_extra import capture_oauth_extra
 
-                        extra = encode_oauth_extra(oauth_extra_from(oauth), refresh_token)
+                        extra = capture_oauth_extra(oauth, refresh_token)
                         # CAS on BOTH tokens: an invalid_grant recovery keeps
                         # the access token but replaces the lineage.
                         conn.execute(
@@ -921,7 +1241,7 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                             (extra, account_id, access_token, refresh_token, extra),
                         )
                         conn.commit()
-                    return  # Token unchanged
+                    return "imported"  # Token unchanged
 
                 # If cc_access_token is NULL in DB, skip sync. NULL means
                 # CC auth was never done — file contains primary fallback
@@ -934,7 +1254,57 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                         "is NULL (awaiting CC auth or post-invalidation)",
                         account_id,
                     )
-                    return
+                    return "unchanged"
+
+                # jacked's own primary-fallback publication is not a Claude
+                # Code token: importing it would merge the two chains.
+                if is_primary_publication(account, access_token):
+                    logger.debug(
+                        "Token sync skipped for account %d: the file holds "
+                        "the primary-token fallback",
+                        account_id,
+                    )
+                    return "unchanged"
+
+                # A pair a previous session proved to belong to another account
+                # (a /login inside this directory) is refused with no request,
+                # even when its access token expired, so the launch replaces it.
+                if _known_foreign_pair(config_dir, oauth, account):
+                    logger.warning(
+                        "Token sync BLOCKED for account %d: the file holds another "
+                        "account's tokens (remembered from an earlier check)",
+                        account_id,
+                    )
+                    return "refused"
+
+                # Never move a row backward: an older pair in the file (on
+                # macOS, the launch-time pair after reconcile took Claude
+                # Code's newer pair from the Keychain) must not replace newer
+                # tokens. Unless the row's token is KNOWN dead: then an owned
+                # token that merely expires sooner is the one that works
+                # (#179i).
+                row_expires = account.get("cc_expires_at") or 0
+                if (
+                    expires_at
+                    and row_expires
+                    and expires_at < row_expires
+                    and not cc_token_known_dead(account)
+                ):
+                    logger.info(
+                        "Token sync skipped for account %d: the file holds "
+                        "older tokens than the row",
+                        account_id,
+                    )
+                    return "unchanged"
+
+                # The checks above are local. Only a token they cannot place
+                # costs a profile request.
+                outcome = _unowned_outcome(account, data, account_id)
+                if outcome is not None:
+                    return _settle_unowned(
+                        conn, account, account_id, cols, outcome,
+                        config_dir=config_dir, oauth=oauth,
+                    )
 
                 now = int(_time.time())
                 # Column names are hardcoded below, not from user input
@@ -969,13 +1339,10 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
 
                 # Claude Code's pass-through fields (#174i) as the file holds them.
                 if "cc_oauth_extra" in cols:
-                    from jacked.credentials.oauth_extra import (
-                        encode_oauth_extra,
-                        oauth_extra_from,
-                    )
+                    from jacked.credentials.oauth_extra import capture_oauth_extra
 
                     set_clauses.append("cc_oauth_extra = ?")
-                    params.append(encode_oauth_extra(oauth_extra_from(oauth), refresh_token))
+                    params.append(capture_oauth_extra(oauth, refresh_token))
 
                 set_clauses.extend([
                     "validation_status = 'valid'",
@@ -986,11 +1353,17 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
 
                 # CAS WHERE clause: only update if cc_access_token hasn't
                 # changed since we read it (prevents stale overwrites from
-                # concurrent refresh_cc_token in the async event loop).
-                # Uses IS instead of = for correct NULL comparison in SQL.
+                # concurrent refresh_cc_token in the async event loop, and
+                # from any writer during the profile request above), AND the
+                # identity the ownership proof was made against is unchanged
+                # (a primary re-auth can move the row to another org without
+                # touching cc_access_token). Uses IS for NULL comparison.
+                identity_cols = [c for c in ("email", "organization_uuid", "account_uuid") if c in cols]
+                identity_guard = "".join(f" AND {c} IS ?" for c in identity_cols)
+                params.extend(account.get(c) for c in identity_cols)
                 result = conn.execute(
                     f"UPDATE accounts SET {', '.join(set_clauses)} "
-                    f"WHERE id = ? AND cc_access_token IS ?",
+                    f"WHERE id = ? AND cc_access_token IS ?{identity_guard}",
                     params,
                 )
                 if result.rowcount > 0:
@@ -998,19 +1371,26 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                     logger.debug(
                         "Synced CC tokens for account %d", account_id
                     )
+                    return "imported"
                 else:
+                    # The proof was made against a row that changed: the next
+                    # attempt must prove the token against the new identity.
+                    forget_ownership_verdicts(account_id)
                     logger.debug(
-                        "CAS skip for account %d — another writer updated first",
+                        "CAS skip for account %d: another writer updated first",
                         account_id,
                     )
+                    return "unchanged"
             else:
                 # Pre-migration fallback: write to primary columns
-                row = conn.execute(
-                    "SELECT access_token FROM accounts WHERE id = ?",
-                    (account_id,),
-                ).fetchone()
-                if row and row[0] == access_token:
-                    return  # unchanged
+                if account.get("access_token") == access_token:
+                    return "imported"  # unchanged
+                outcome = _unowned_outcome(account, data, account_id)
+                if outcome is not None:
+                    return _settle_unowned(
+                        conn, account, account_id, cols, outcome,
+                        config_dir=config_dir, oauth=oauth,
+                    )
 
                 now_iso = datetime.now(timezone.utc).isoformat()
                 updates = [
@@ -1038,20 +1418,35 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> None:
                     "Synced refreshed tokens for account %d (pre-migration)",
                     account_id,
                 )
+                return "imported"
         finally:
             conn.close()
     except Exception as exc:
+        # A half-written file or a locked database: nothing is written, and
+        # the sync loop tries again on its next tick.
         logger.debug("Token sync failed (non-fatal): %s", exc)
+        return "deferred"
 
 
 def _token_sync_loop(proc, config_dir: Path, db_path: str) -> None:
-    """Daemon thread: poll credential file and sync changes to DB."""
+    """Daemon thread: poll credential file and sync changes to DB.
+
+    A sync runs after each change of the file mtime. A "deferred" sync (the
+    profile request failed, or an error stopped it) keeps the old mtime, so
+    the next tick tries again when the file does not change.
+    """
     cred_path = config_dir / ".credentials.json"
     last_mtime = None
     try:
-        last_mtime = cred_path.stat().st_mtime if cred_path.exists() else None
+        initial_mtime = cred_path.stat().st_mtime if cred_path.exists() else None
     except OSError:
-        pass
+        initial_mtime = None
+    if initial_mtime is not None:
+        # A rotation that landed between the launch's own write and this
+        # thread's start would otherwise look "already processed" and stay in
+        # the file until the next change; sync it before accepting the mtime.
+        if _sync_tokens_from_file(config_dir, db_path) != "deferred":
+            last_mtime = initial_mtime
 
     while proc.poll() is None:
         _time.sleep(30)
@@ -1060,8 +1455,8 @@ def _token_sync_loop(proc, config_dir: Path, db_path: str) -> None:
         except OSError:
             continue
         if mtime is not None and mtime != last_mtime:
-            last_mtime = mtime
-            _sync_tokens_from_file(config_dir, db_path)
+            if _sync_tokens_from_file(config_dir, db_path) != "deferred":
+                last_mtime = mtime
 
 
 def _close_sessions_by_pid(pid: int, db_path: str) -> None:
@@ -1158,7 +1553,17 @@ def launch_claude(
             proc.terminate()
 
     if db_path:
-        _sync_tokens_from_file(config_dir, db_path)
+        # The loop can hold a cached "profile request failed" verdict for up
+        # to 5 minutes. The last sync must not reuse it: with the cache
+        # clear, a token that needs a profile request gets one fresh request.
+        clear_ownership_cache()
+        exit_result = _sync_tokens_from_file(config_dir, db_path)
+        if exit_result == "refused":
+            logger.warning(
+                "Account %s: the exit-time token sync refused the per-account "
+                "file's tokens; the next launch writes the row's tokens over them",
+                config_dir.name,
+            )
         _close_sessions_by_pid(proc.pid, db_path)
 
     raise SystemExit(proc.returncode or 0)

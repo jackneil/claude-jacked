@@ -540,8 +540,8 @@ class TestReconcileOwnershipProof:
         db, aid = self._account(tmp_path)
         self._reconcile(db, aid, self._live(aid), self._no_answer())
         ch.invalidate_live_cred_cache()
-        for key, (verdict, at) in list(ch._ownership_cache.items()):
-            ch._ownership_cache[key] = (verdict, at - ch._OWNERSHIP_RETRY_SECONDS - 1)
+        for key, (verdict, at, final) in list(ch._ownership_cache.items()):
+            ch._ownership_cache[key] = (verdict, at - ch._OWNERSHIP_RETRY_SECONDS - 1, final)
         spy = self._reconcile(db, aid, self._live(aid),
                               _owner_profile("owner@test.com", "org-a", "uuid-a"))
         spy.assert_called_once()
