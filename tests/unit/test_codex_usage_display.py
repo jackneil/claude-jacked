@@ -14,11 +14,11 @@ from unittest.mock import patch
 from jacked.api.routes.auth import _account_to_response, _build_account_usage
 from jacked.service.menubar_summary import (
     compute_worst_account_summary,
-    menubar_title,
     summarize_account,
     usage_block,
     usage_block_of_row,
 )
+from jacked.service.pill_text import menubar_title
 
 RESET = int(time.time()) + 6 * 86400
 
@@ -150,7 +150,8 @@ class TestMenubarSummary:
         worst = compute_worst_account_summary([claude, _codex_row(LOCKED_OUT)])
         assert worst["account_id"] == 14
         assert worst["five_hour"] is None
-        assert menubar_title(worst) == "-·100%"
+        # No 5h number: the weekly slot carries its tag, never a dead "-" slot.
+        assert menubar_title(worst) == "7d 100%"
 
     def test_claude_null_window_still_reads_zero(self):
         s = summarize_account({"id": 1, "cached_usage_5h": None, "cached_usage_7d": 30})
@@ -163,7 +164,7 @@ class TestMenubarSummary:
         s = summarize_account(row)
         assert s["five_hour"] is None
         assert s["max_pct"] == 40.0
-        assert menubar_title(s) == "-·40%"
+        assert menubar_title(s) == "7d 40%"
 
 
 class TestReviewEngineBlock:

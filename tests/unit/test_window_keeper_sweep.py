@@ -935,7 +935,7 @@ class TestWindowPersistedFromPing:
         # The warning names every window that made the keeper ping and is
         # still not open (a fresh row lacks both).
         assert any(
-            "the 5h and 7d windows did not open" in r.getMessage()
+            "cannot confirm the 5h and 7d windows open" in r.getMessage()
             for r in caplog.records
         )
         _run_pass(db, pings)
@@ -1253,7 +1253,7 @@ class TestNoSessionWindow:
         assert delays == pytest.approx([600, 1200, 2400, 3600, 3600], abs=1.01)
         assert um._ping_backoff[aid]["fails"] == 5
         assert any(
-            "the 7d window did not open" in r.getMessage() for r in caplog.records
+            "cannot confirm the 7d window open" in r.getMessage() for r in caplog.records
         )
 
     def test_a_no_window_backoff_survives_a_restart(self, db):

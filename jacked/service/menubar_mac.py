@@ -4,7 +4,7 @@ The native face of the jacked service on macOS. Replaces the cross-platform
 pystray tray with a real menu-bar app:
 
 * a live **pill**: the jacked arm mark tinted green/yellow/red by the **active** account's
-  usage, plus that account's ``5h·7d`` % as text — refreshed on a timer from
+  usage, plus that account's limits as text (``menubar_title``) — refreshed on a timer from
   ``/api/menubar-summary``. It tracks the account you're actually using, not the
   worst account in the fleet.
 * **left-click → an NSPopover dropdown** and a **Toggle Side Panel → always-on-top,
@@ -25,11 +25,8 @@ where they're absent; the GUI class is only defined when they're present.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
-import urllib.error
-import urllib.request
 import webbrowser
 
 from jacked import __version__
@@ -97,28 +94,22 @@ except Exception:  # pragma: no cover - non-darwin / frameworks absent
     RUMPS_AVAILABLE = False
 
 
-# --- HTTP helpers (stdlib; loopback to our own uvicorn — fast, main-thread-safe) ---
+# --- HTTP helpers: loopback to our own uvicorn, no proxy, no redirects -------
+# (jacked.service.loopback; fast and main-thread-safe).
 
 
 def _http_get_json(url: str, timeout: float = 2.0) -> dict:
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    from jacked.service import loopback
+
+    return loopback.get_json(url, timeout=timeout)
 
 
 def _http_send_json(
     url: str, method: str, payload: dict | None, timeout: float = 3.0
 ) -> dict:
-    data = json.dumps(payload).encode("utf-8") if payload is not None else b""
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-        return json.loads(body) if body else {}
+    from jacked.service import loopback
+
+    return loopback.send_json(url, method, payload, timeout=timeout)
 
 
 # Per-provider accent dot drawn on the pill when the active account isn't Claude.
@@ -367,7 +358,7 @@ if RUMPS_AVAILABLE:
         def _refresh_pill(self, _timer):
             """Poll the summary; set the active account's % as text and tint the
             arm icon by its color. Degrade to a gray arm + hyphen if down."""
-            from jacked.service.menubar_summary import menubar_title
+            from jacked.service.pill_text import menubar_title
 
             upd = self._update_available()
             try:

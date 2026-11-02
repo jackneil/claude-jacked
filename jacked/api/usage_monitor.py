@@ -2680,7 +2680,9 @@ async def _keeper_record_success(
 
     The verdict is ``ok`` only when every needed window is confirmed.
     Otherwise it is ``ping_ok_no_window``, the WARNING names the windows
-    that did not open, and the backoff escalates one step (600 s, 1200 s,
+    that jacked cannot confirm open (a window can open with no evidence in
+    time: the provider rounds the start down to the hour and the read-back
+    can lag), and the backoff escalates one step (600 s, 1200 s,
     2400 s, then the one-hour cap at the default interval). The escalation
     count is dropped ONLY on success: a ping that never opens its window must
     not restart at the first step on every sweep.
@@ -2743,8 +2745,8 @@ async def _keeper_record_success(
     }
     if missing:
         logger.warning(
-            "Window keeper: ping for account %d succeeded but the %s did not "
-            "open (no reset header, usage read-back did not land)",
+            "Window keeper: ping for account %d succeeded but jacked cannot "
+            "confirm the %s open (no reset header, usage read-back did not land)",
             account_id,
             " and ".join(missing) + (" windows" if len(missing) > 1 else " window"),
         )

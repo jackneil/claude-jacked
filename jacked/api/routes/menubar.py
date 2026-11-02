@@ -24,7 +24,7 @@ router = APIRouter()
 
 @router.get("/menubar-summary")
 async def menubar_summary(request: Request):
-    """Active-account 5h·7d summary for the menu-bar pill.
+    """Active-account usage summary for the menu-bar pill and the tray tooltip.
 
     Returns ``{"active": {...}|null, "active_account_id": N|null,
     "worst": {...}|null, "account_count": N}``. ``active`` is what the pill

@@ -16,18 +16,25 @@ The green/yellow/red thresholds here are the Python mirror of
 lockstep so the pill's color can never disagree with the bar a user sees in the
 panel/dashboard.
 
-The 5-hour slot follows the account's plan (:mod:`jacked.usage_plans`), the
-same rule the account API uses: an account that has no 5-hour window (a
-verified Ultra account, ChatGPT Pro in Codex) shows no 5-hour number, even
-when an old reading is still in the cache.
+The pill shows only the limits that the account's plan has
+(:mod:`jacked.usage_plans`, the same rule the account API uses). An account
+that has no 5-hour window (a verified Ultra account, ChatGPT Pro in Codex)
+shows no 5-hour number, even when an old reading is still in the cache. The
+model limit that the dashboard shows (for example the weekly Fable limit)
+is in the pill too, and it counts toward the pill color.
+:mod:`jacked.service.pill_text` turns a summary into the menu-bar text and
+into the hover text of the Windows and Linux tray icon.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Iterable, Mapping, Optional
+
+from jacked.service.pill_text import finite_number
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +42,13 @@ logger = logging.getLogger(__name__)
 # logged at WARNING in this process. Repeats log at DEBUG: the account list
 # and the pill read every account on each poll.
 _VIEW_FAILURES_LOGGED: set = set()
+# (account id, reason) pairs whose unreadable model limit was already logged
+# at WARNING in this process, on the same rule.
+_CAP_FAILURES_LOGGED: set = set()
+_UNSET = object()
 
 
-def safe_account_view(acct: Mapping):
+def safe_account_view(acct: Mapping, raw=_UNSET):
     """The plan view of an account row (``usage_plans.account_view``), or None.
 
     Every surface that lists accounts reads the 5-hour window through this
@@ -48,13 +59,15 @@ def safe_account_view(acct: Mapping):
     in a process; the WARNING never holds the payload or the exception text.
     Each failure also logs its traceback at DEBUG.
 
+    *raw* is the row's parsed payload when the caller already has it.
+
     >>> safe_account_view({"subscription_type": "pro"}).plan.label
     'Pro'
     """
     from jacked.usage_plans import account_view
 
     try:
-        return account_view(acct)
+        return account_view(acct) if raw is _UNSET else account_view(acct, raw)
     except Exception as exc:  # noqa: BLE001 - one bad row must not fail a list
         account_id = acct.get("id") if isinstance(acct, Mapping) else None
         key = (account_id, type(exc).__name__)
@@ -100,6 +113,60 @@ def _eligible(acct: dict) -> bool:
     )
 
 
+def _log_cap_failure(account_id, reason: str, *, with_traceback: bool = False) -> None:
+    """WARNING once per (account, reason) in a process, never with the
+    payload or the exception text; the traceback goes to DEBUG."""
+    key = (account_id, reason)
+    if key not in _CAP_FAILURES_LOGGED:
+        _CAP_FAILURES_LOGGED.add(key)
+        logger.warning(
+            "Model limit unreadable for account %s (%s); the pill and the tray "
+            "show no model limit for it",
+            *key,
+        )
+    if with_traceback:
+        logger.debug("Model limit failure for account %s (%s)", *key, exc_info=True)
+
+
+def _model_cap(acct: Mapping, view, raw) -> Optional[dict]:
+    """The model limit that the pill shows for *acct*, or None.
+
+    The selection is the selection of the dashboard (:func:`binding_model`):
+    the limit that the provider marks active, else the limit with the
+    highest use. *raw* is the row's parsed payload. A payload that jacked
+    cannot read, or a percent that is not a finite number, gives None (no
+    reading, never 0%), so one bad row cannot stop the pill. The result
+    holds only the cleaned name and the finite percent: every field of the
+    summary must be JSON-safe, because /api/menubar-summary refuses NaN.
+    """
+    try:
+        cap = binding_model_compact(raw, view.plan if view is not None else None)
+        if cap is None:
+            return None
+        utilization = finite_number(cap["utilization"])
+        if utilization is None:
+            _log_cap_failure(acct.get("id"), "non-finite percent")
+            return None
+        return {"label": cap["label"], "utilization": round(utilization, 1)}
+    except Exception as exc:  # noqa: BLE001 - one bad payload must not stop the pill
+        _log_cap_failure(acct.get("id"), type(exc).__name__, with_traceback=True)
+        return None
+
+
+def _reading(value) -> Optional[float]:
+    """A cached window reading rounded to 0.1, or None when it is not a
+    finite number (no reading, never 0%).
+
+    >>> _reading(41.26), _reading("9"), _reading(float("inf")), _reading("x")
+    (41.3, 9.0, None, None)
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return round(number, 1) if math.isfinite(number) else None
+
+
 def summarize_account(acct: dict) -> Optional[dict]:
     """Build a pill summary for a single account, or None if it has no usage.
 
@@ -113,10 +180,13 @@ def summarize_account(acct: dict) -> Optional[dict]:
     The 7-day slot keeps the cached rule: a Claude window with no reading is
     0% used, and a Codex window with no reading is a window Codex does not
     report, so it stays None instead of reading as 0% headroom.
-    ``max_pct`` and ``color`` come from the slots that have a value; with no
-    value in either slot there is no summary. ``blocked`` carries the
-    provider's own usage-blocked verdict (:func:`usage_block_of_row`); a
-    blocked account is red at any percent.
+    A cached value that is not a finite number is no reading.
+    ``model_cap`` is the model limit that the dashboard shows for the
+    account (:func:`_model_cap`), or None. ``max_pct`` and ``color`` come
+    from the slots that have a value and from the model limit. With no value
+    in the 5-hour slot and the 7-day slot there is no summary. ``blocked``
+    carries the provider's own usage-blocked verdict
+    (:func:`usage_block_of_row`); a blocked account is red at any percent.
 
     >>> s = summarize_account({"id": 1, "email": "a@x.com",
     ...                        "cached_usage_5h": 37, "cached_usage_7d": 87})
@@ -129,16 +199,22 @@ def summarize_account(acct: dict) -> Optional[dict]:
     (None, 40.0, 40.0, 'green')
 
     A verified Ultra account lists its limits without a 5-hour session, so
-    an old 5-hour value in the cache is not a reading:
+    an old 5-hour value in the cache is not a reading. Its weekly Fable
+    limit is the worst limit, so it sets the color:
 
     >>> ultra = {"id": 3, "subscription_type": "max",
     ...          "rate_limit_tier": "default_claude_max_20x",
-    ...          "cached_usage_5h": 67.0, "cached_usage_7d": 33.0,
-    ...          "cached_usage_raw": json.dumps({"five_hour": None,
-    ...              "limits": [{"kind": "weekly_all", "percent": 33}]})}
+    ...          "cached_usage_5h": 67.0, "cached_usage_7d": 74.0,
+    ...          "cached_usage_raw": json.dumps({"five_hour": None, "limits": [
+    ...              {"kind": "weekly_all", "percent": 74},
+    ...              {"kind": "weekly_scoped", "percent": 100, "is_active": True,
+    ...               "scope": {"model": {"display_name": "Fable"}}}]})}
     >>> u = summarize_account(ultra)
-    >>> u["five_hour"], u["max_pct"], u["color"], menubar_title(u)
-    (None, 33.0, 'green', '-·33%')
+    >>> u["five_hour"], u["model_cap"]["label"], u["max_pct"], u["color"]
+    (None, 'Fable', 100.0, 'red')
+    >>> from jacked.service.pill_text import menubar_title
+    >>> menubar_title(u)
+    '7d 74%·F100%'
     """
     if not acct:
         return None
@@ -148,18 +224,24 @@ def summarize_account(acct: dict) -> Optional[dict]:
         return None
     provider = acct.get("provider") or "claude"
 
-    view = safe_account_view(acct)
+    from jacked.usage_plans import raw_usage
+
+    raw = raw_usage(acct)  # parsed once for the plan view and the model limit
+    view = safe_account_view(acct, raw)
     five = view.five_hour_reading() if view is not None else u5
-    f5 = None if five is None else round(float(five), 1)
+    f5 = None if five is None else _reading(five)
     if u7 is None and provider == "codex":
         f7 = None
     else:
-        f7 = round(float(u7 or 0.0), 1)
+        f7 = _reading(u7 or 0.0)
     readings = [v for v in (f5, f7) if v is not None]
     if not readings:
         # No window has a reading (a Codex plan without a 5-hour window and
         # no weekly reading): nothing to show.
         return None
+    cap = _model_cap(acct, view, raw)
+    if cap is not None:
+        readings.append(cap["utilization"])
     worst = max(readings)
     blocked = usage_block_of_row(acct) is not None
     return {
@@ -170,6 +252,7 @@ def summarize_account(acct: dict) -> Optional[dict]:
         "organization_name": acct.get("organization_name"),
         "five_hour": f5,
         "seven_day": f7,
+        "model_cap": cap,
         "max_pct": round(worst, 1),
         "color": "red" if blocked else usage_color_class(worst),
         "blocked": blocked,
@@ -208,9 +291,10 @@ def compute_active_account_summary(
 def compute_worst_account_summary(accounts: Iterable[dict]) -> Optional[dict]:
     """Return a summary of the highest-utilization account, or None.
 
-    The "worst" account is the one with the greatest ``max(5h, 7d)`` utilization
-    among enabled, non-deleted accounts that have any usage data. Retained for a
-    fleet-wide "is anything maxed" view; the pill itself uses the active account.
+    The "worst" account is the one with the greatest ``max_pct`` (the 5-hour
+    window, the 7-day window and the model limit) among enabled, non-deleted
+    accounts that have any usage data. Retained for a fleet-wide "is
+    anything maxed" view; the pill itself uses the active account.
 
     >>> s = compute_worst_account_summary([
     ...     {"id": 1, "email": "a@x.com", "cached_usage_5h": 30, "cached_usage_7d": 40},
@@ -231,31 +315,6 @@ def compute_worst_account_summary(accounts: Iterable[dict]) -> Optional[dict]:
         if s is not None and (best is None or s["max_pct"] > best["max_pct"]):
             best = s
     return best
-
-
-def menubar_title(summary: Optional[dict]) -> str:
-    """Render the menu-bar pill text — just the percentages; the "J" icon
-    carries the color. No data → a hyphen placeholder, and a window the
-    provider does not report (None) → a hyphen in its slot. (The agent
-    handles the server-down/degraded state separately; this only ever sees
-    live data.)
-
-    >>> menubar_title(None)
-    '-'
-    >>> menubar_title({"five_hour": 37.0, "seven_day": 87.0, "color": "yellow"})
-    '37%·87%'
-    >>> menubar_title({"five_hour": 40.4, "seven_day": 30.6, "color": "green"})
-    '40%·31%'
-    >>> menubar_title({"five_hour": None, "seven_day": 100.0, "color": "red"})
-    '-·100%'
-    """
-    if not summary:
-        return "-"
-
-    def _slot(value) -> str:
-        return "-" if value is None else f"{round(value)}%"
-
-    return f"{_slot(summary.get('five_hour'))}·{_slot(summary.get('seven_day'))}"
 
 
 # ---------------------------------------------------------------------------

@@ -14,10 +14,10 @@ from fastapi.testclient import TestClient
 from jacked.service.menubar_summary import (
     compute_active_account_summary,
     compute_worst_account_summary,
-    menubar_title,
     summarize_account,
     usage_color_class,
 )
+from jacked.service.pill_text import menubar_title
 
 
 # ---------------------------------------------------------------------------
@@ -100,9 +100,12 @@ class TestPlanAwareFiveHour:
         s = summarize_account(_ultra())
         assert s["five_hour"] is None
         assert s["seven_day"] == 33.0
-        assert s["max_pct"] == 33.0  # from 7d, the stale 67% is not a reading
+        # The worst limit is the weekly Fable limit (61%); the stale 67% in
+        # the 5h cache is not a reading.
+        assert s["model_cap"]["label"] == "Fable"
+        assert s["max_pct"] == 61.0
         assert s["color"] == "green"
-        assert menubar_title(s) == "-·33%"
+        assert menubar_title(s) == "7d 33%·F61%"
 
     def test_idle_max_reads_zero(self):
         raw = json.dumps({"five_hour": None, "limits": [
@@ -143,7 +146,9 @@ class TestPlanAwareFiveHour:
         assert (s["five_hour"], s["seven_day"], s["max_pct"]) == (40.0, None, 40.0)
 
     def test_worst_ignores_a_stale_5h_on_a_plan_without_the_window(self):
-        busy = {"id": 1, "email": "busy@x.com", "cached_usage_5h": 50, "cached_usage_7d": 40}
+        # The Ultra row's real worst is its Fable limit (61%); a stale 99% in
+        # its 5h cache would beat busy's 70% if it still counted.
+        busy = {"id": 1, "email": "busy@x.com", "cached_usage_5h": 70, "cached_usage_7d": 40}
         worst = compute_worst_account_summary([_ultra(cached_usage_5h=99.0), busy])
         assert worst["email"] == "busy@x.com"
 
@@ -449,7 +454,7 @@ def test_endpoint_worst_codex_keeps_unreported_window_null(db):
         assert worst["five_hour"] is None
         assert worst["blocked"] is True
         assert worst["color"] == "red"
-        assert menubar_title(worst) == "-·100%"
+        assert menubar_title(worst) == "7d 100%"
     finally:
         app.state.db = None
 
