@@ -25,11 +25,8 @@ where they're absent; the GUI class is only defined when they're present.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
-import urllib.error
-import urllib.request
 import webbrowser
 
 from jacked import __version__
@@ -97,28 +94,22 @@ except Exception:  # pragma: no cover - non-darwin / frameworks absent
     RUMPS_AVAILABLE = False
 
 
-# --- HTTP helpers (stdlib; loopback to our own uvicorn — fast, main-thread-safe) ---
+# --- HTTP helpers: loopback to our own uvicorn, no proxy, no redirects -------
+# (jacked.service.loopback; fast and main-thread-safe).
 
 
 def _http_get_json(url: str, timeout: float = 2.0) -> dict:
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    from jacked.service import loopback
+
+    return loopback.get_json(url, timeout=timeout)
 
 
 def _http_send_json(
     url: str, method: str, payload: dict | None, timeout: float = 3.0
 ) -> dict:
-    data = json.dumps(payload).encode("utf-8") if payload is not None else b""
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-        return json.loads(body) if body else {}
+    from jacked.service import loopback
+
+    return loopback.send_json(url, method, payload, timeout=timeout)
 
 
 # Per-provider accent dot drawn on the pill when the active account isn't Claude.

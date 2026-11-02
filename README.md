@@ -256,7 +256,7 @@ jacked install --force                  # wires up hooks AND starts the tray (au
 ### On Windows and Linux
 
 - **System tray icon** (the jacked arm, colored by service state) with the same right-click menu essentials: Open Dashboard, Restart, Stop, Start on Login, version line, and Check for updates.
-- **Usage on hover.** The icon tooltip shows the limits of the resolved account with full names, for example `Jacked · Claude · 7d 74% · Fable 100%`. It changes within about one second of a usage refresh or an account switch, with a 30-second heartbeat.
+- **Usage at a glance.** The first line of the tray menu shows the limits of the resolved account with full names, for example `Claude · 7d 74% · Fable 100%`. On Windows, the icon tooltip shows the same line when you hover over the icon. Linux tray icons have no hover tooltip, so use the menu line there. Both change within about one second of a usage refresh or an account switch, with a 30-second heartbeat.
 - **The full update flow**: the icon badge, native tray notifications, the clickable one-click update, and the browser progress page all work the same as on macOS. The usage pill, dropdown panel, and side panel are macOS-only today.
 
 ### Service behavior

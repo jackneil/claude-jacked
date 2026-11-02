@@ -158,6 +158,7 @@ def build_menu(
     last_check_text_fn=None,
     check_in_progress_fn=None,
     started_at_text_fn=None,
+    usage_text_fn=None,
 ) -> "pystray.Menu":
     """Build the tray right-click menu.
 
@@ -179,6 +180,9 @@ def build_menu(
         check_in_progress_fn: Optional callable returning bool — True
             while a manual PyPI check is in flight. Disables "Check for
             updates..." during the check so double-clicks don't pile up.
+        usage_text_fn: Optional callable returning the usage line of the
+            active account. Shown under the header, because the Linux
+            backends have no hover tooltip.
     """
     if version_text_fn is not None:
         version_item = pystray.MenuItem(
@@ -189,10 +193,10 @@ def build_menu(
     else:
         version_item = pystray.MenuItem(f"v{version}", None, enabled=False)
 
-    items = [
-        pystray.MenuItem("JACKED", None, enabled=False),
-        pystray.MenuItem(f"Running on :{port}", None, enabled=False),
-    ]
+    items = [pystray.MenuItem("JACKED", None, enabled=False)]
+    if usage_text_fn is not None:
+        items.append(pystray.MenuItem(lambda _: usage_text_fn(), None, enabled=False))
+    items.append(pystray.MenuItem(f"Running on :{port}", None, enabled=False))
     if started_at_text_fn is not None:
         items.append(
             pystray.MenuItem(
@@ -333,6 +337,13 @@ class ServiceRunner:
         self._service_state = "starting"
         self._lifecycle_failure: str | None = None
         self._win_ctrl_handler = None
+        # Usage of the active account in the pystray tooltip and menu
+        # (jacked.service.usage_tooltip); its loop starts in _setup.
+        from jacked.service.usage_tooltip import UsageTooltip
+
+        self._usage_tooltip = UsageTooltip(
+            self._usage_base_url, self._stop_event, lambda: self._icon
+        )
 
     @staticmethod
     def _resolve_active_legacy_service_pid() -> int | None:
@@ -796,6 +807,21 @@ class ServiceRunner:
         else:
             rel = f"{elapsed // 86400}d {(elapsed % 86400) // 3600}h ago"
         return f"Started {clock} ({rel})"
+
+    def _usage_base_url(self) -> str | None:
+        """Where the tray reads its OWN server, or None while it is not ready.
+
+        The host is the live bind plan's probe host: loopback for every plan
+        except a cli plan pinned to one address, where 127.0.0.1 may belong to
+        another process. A wildcard address maps to loopback.
+        """
+        if not self._server_ready:
+            return None
+        plan = self.bind_plan
+        host = plan.probe_host if plan is not None else "127.0.0.1"
+        if host in ("", "0.0.0.0"):
+            host = "127.0.0.1"
+        return f"http://{host}:{self.port}"
 
     def _apply_icon(self, state: str) -> None:
         """Render the tray icon for *state*, adding the update badge when an
@@ -1387,14 +1413,11 @@ class ServiceRunner:
         threading.Thread(
             target=self._check_version, name="jacked-version-check", daemon=True
         ).start()
+        threading.Thread(
+            target=self._usage_tooltip.run, name="jacked-usage-tooltip", daemon=True
+        ).start()
         if self._started_at is not None:
             self._apply_icon("running")
-            from jacked.service.usage_tooltip import UsageTooltip
-
-            tooltip = UsageTooltip(self.port, self._stop_event, lambda: self._icon)
-            threading.Thread(
-                target=tooltip.run, name="jacked-usage-tooltip", daemon=True
-            ).start()
             # Force a menu rebuild so the dynamic "Started ..." item
             # picks up the just-set timestamp on first open. Without
             # this, pystray's macOS backend can show "Started: —"
@@ -1738,6 +1761,7 @@ class ServiceRunner:
             last_check_text_fn=self._last_check_menu_text,
             check_in_progress_fn=lambda: self._version_check_in_progress,
             started_at_text_fn=self._started_text,
+            usage_text_fn=self._usage_tooltip.menu_text,
         )
 
         self._icon = pystray.Icon(
