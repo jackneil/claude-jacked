@@ -413,6 +413,55 @@ class TestCheckVersionCached:
         assert result["outdated"] is False
         assert result["ahead"] is True
 
+    def _cache(self, tmp_path, latest, current, age=0.0):
+        cache_file = tmp_path / "version-cache.json"
+        cache_file.write_text(json.dumps({
+            "checked_at": time.time() - age, "latest": latest,
+            "installable_latest": latest, "pypi_latest": latest,
+            "simple_latest": latest, "current": current,
+        }))
+        return cache_file
+
+    def test_a_check_for_another_installed_version_is_stale(self, tmp_path):
+        """After `jacked upgrade` the cache still compares the old version:
+        read the index again instead of showing the new build as "dev"."""
+        cache_file = self._cache(tmp_path, "0.110.0", current="0.110.0")
+        with patch.object(vc, "VERSION_CACHE", cache_file), patch.object(
+            vc, "get_latest_pypi_version", return_value="0.110.1"
+        ) as pypi, patch.object(vc, "get_latest_from_simple_index", return_value="0.110.1"):
+            result = vc.check_version_cached("0.110.1")
+        pypi.assert_called_once()
+        assert (result["latest"], result["ahead"], result["outdated"]) == ("0.110.1", False, False)
+        assert json.loads(cache_file.read_text())["current"] == "0.110.1"
+
+    def test_a_check_for_this_version_is_still_used(self, tmp_path):
+        cache_file = self._cache(tmp_path, "0.110.1", current="0.110.1")
+        with patch.object(vc, "VERSION_CACHE", cache_file), patch.object(
+            vc, "get_latest_pypi_version"
+        ) as pypi, patch.object(vc, "get_latest_from_simple_index"):
+            result = vc.check_version_cached("0.110.1")
+        pypi.assert_not_called()
+        assert result["ahead"] is False
+
+    def test_an_ahead_answer_retries_within_an_hour(self, tmp_path):
+        """Right after a release the index CDN can still serve the previous
+        version: an "ahead" answer stays fresh for one hour, not twelve."""
+        cache_file = tmp_path / "version-cache.json"
+        with patch.object(vc, "VERSION_CACHE", cache_file), patch.object(
+            vc, "get_latest_pypi_version", return_value="0.110.0"
+        ), patch.object(vc, "get_latest_from_simple_index", return_value="0.110.0"):
+            first = vc.check_version_cached("0.110.1")
+        assert first["ahead"] is True
+        assert first["next_check_at"] - first["checked_at"] == vc.CACHE_TTL_PROBE_FAILURE
+        cache_file = self._cache(tmp_path, "0.110.0", current="0.110.1",
+                                 age=vc.CACHE_TTL_PROBE_FAILURE + 1)
+        with patch.object(vc, "VERSION_CACHE", cache_file), patch.object(
+            vc, "get_latest_pypi_version", return_value="0.110.1"
+        ) as pypi, patch.object(vc, "get_latest_from_simple_index", return_value="0.110.1"):
+            second = vc.check_version_cached("0.110.1")
+        pypi.assert_called_once()
+        assert second["ahead"] is False
+
     def test_stale_cache_hits_pypi(self, tmp_path):
         """Stale cache (>24h) triggers PyPI + /simple/ re-probe.
 
