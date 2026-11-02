@@ -1417,13 +1417,30 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> str:
         return "deferred"
 
 
-def _token_sync_loop(proc, config_dir: Path, db_path: str) -> None:
+def _sleep_tick(stop: threading.Event, seconds: int = 30) -> bool:
+    """Sleep one poll tick, a second at a time. True when ``stop`` was set.
+
+    The launch sets ``stop`` when Claude Code exits, so the loop ends within
+    a second and the exit-time sync runs alone.
+    """
+    for _ in range(seconds):
+        if stop.is_set():
+            return True
+        _time.sleep(1)
+    return stop.is_set()
+
+
+def _token_sync_loop(
+    proc, config_dir: Path, db_path: str, stop: threading.Event | None = None
+) -> None:
     """Daemon thread: poll credential file and sync changes to DB.
 
     A sync runs after each change of the file mtime. A "deferred" sync (the
     profile request failed, or an error stopped it) keeps the old mtime, so
-    the next tick tries again when the file does not change.
+    the next tick tries again when the file does not change. The loop ends
+    when the process exits or when ``stop`` is set.
     """
+    stop = stop if stop is not None else threading.Event()
     cred_path = config_dir / ".credentials.json"
     last_mtime = None
     try:
@@ -1438,7 +1455,8 @@ def _token_sync_loop(proc, config_dir: Path, db_path: str) -> None:
             last_mtime = initial_mtime
 
     while proc.poll() is None:
-        _time.sleep(30)
+        if _sleep_tick(stop):
+            break
         try:
             mtime = cred_path.stat().st_mtime if cred_path.exists() else None
         except OSError:
@@ -1527,9 +1545,12 @@ def launch_claude(
     claude_bin = find_bin("claude") or "claude"
     proc = subprocess.Popen([claude_bin, *claude_args], env=env)
 
+    stop_sync = threading.Event()
     if db_path:
         sync_thread = threading.Thread(
-            target=_token_sync_loop, args=(proc, config_dir, db_path), daemon=True
+            target=_token_sync_loop,
+            args=(proc, config_dir, db_path, stop_sync),
+            daemon=True,
         )
         sync_thread.start()
 
@@ -1542,6 +1563,14 @@ def launch_claude(
             proc.terminate()
 
     if db_path:
+        # The loop's own sync must not run beside the exit-time sync (two
+        # profile requests, two writers on the row): stop the loop and wait
+        # for a sync in flight. A loop stuck past the wait is a daemon thread
+        # and dies with the process.
+        stop_sync.set()
+        sync_thread.join(timeout=15)
+        if sync_thread.is_alive():
+            logger.debug("Token sync loop did not stop before the exit sync")
         # The loop can hold a cached "profile request failed" verdict for up
         # to 5 minutes. The last sync must not reuse it: with the cache
         # clear, a token that needs a profile request gets one fresh request.

@@ -14,12 +14,17 @@ from jacked.api import credential_helpers
 from tests.conftest import REAL_HOME
 
 
-def test_import_time_constants_are_off_the_real_home():
+def test_import_time_constants_are_off_the_real_claude_dir():
+    """The isolated HOME may itself sit under the real home (on Windows the
+    temp directory is under the user profile), so the guard is the real
+    ``~/.claude``, which no constant may resolve under."""
     import jacked.launch
     import jacked.service
 
+    real_claude = REAL_HOME / ".claude"
     for value in (jacked.launch.ACCOUNTS_DIR, jacked.service.CLAUDE_DIR):
-        assert REAL_HOME not in Path(value).parents, value
+        assert real_claude not in Path(value).parents, value
+        assert Path(value) != real_claude
 
 
 def test_the_launch_accounts_dir_is_under_this_tests_home():
