@@ -1,7 +1,9 @@
 """Shared fixtures for jacked tests."""
 
+import inspect
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,22 @@ from jacked.credentials.models import (
     SwitchResult,
 )
 
+# The real subprocess.run, captured before any test module or fixture can
+# rebind the module attribute. The Keychain tripwire compares against THIS
+# object: comparing against ``subprocess.run`` at call time went silent the
+# moment anything patched it, and tests then ran the real ``security`` tool.
+_REAL_SUBPROCESS_RUN = subprocess.run
+
+# Import the Keychain backend NOW, so its ``run=subprocess.run`` default binds
+# to the real callable. A first import from inside a test would bind it to
+# that test's rebound ``subprocess.run`` for the rest of the process, and both
+# Keychain guards below would go silent again.
+from jacked.credentials import macos_store as _macos_store  # noqa: E402
+
+assert (
+    inspect.signature(_macos_store.SecurityCliBackend.__init__).parameters["run"].default
+    is _REAL_SUBPROCESS_RUN
+), "the Keychain backend default bound to a patched subprocess.run"
 
 
 # The developer's real home, captured before any test can move HOME.
@@ -214,20 +232,64 @@ def _tripwire_real_identity_watcher(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _tripwire_real_keychain(monkeypatch):
-    """Tripwire: no test may run the real ``security`` tool against the Keychain."""
-    import subprocess
+    """Tripwire: no test may run the real ``security`` tool against the Keychain.
 
+    The breach is recorded AND raised. Raising alone is not enough: the store
+    runs its backend on a worker thread behind ``except Exception`` and the
+    credential helpers catch ``RuntimeError``, so a swallowed tripwire would
+    let the test pass on the file fallback. The teardown assertion fails the
+    test no matter which layer swallowed the exception.
+    """
     from jacked.credentials import macos_store
 
     cls = macos_store.SecurityCliBackend
     real_invoke = cls._invoke
+    breaches: list[str] = []
 
     def guarded_invoke(self, args, *, is_interactive, stdin=None):
-        if self._run is subprocess.run and self._tool == macos_store.SECURITY_TOOL:
+        if self._run is _REAL_SUBPROCESS_RUN and self._tool == macos_store.SECURITY_TOOL:
+            # Record the verb only (never the arguments: they can name the
+            # Keychain item and its account).
+            breaches.append(str(args[0]) if args else "<no-args>")
             raise RuntimeError("test tripwire: real Keychain access via security")
         return real_invoke(self, args, is_interactive=is_interactive, stdin=stdin)
 
     monkeypatch.setattr(cls, "_invoke", guarded_invoke)
+    yield
+    assert not breaches, (
+        f"test reached the real Keychain through the security tool: {breaches}"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_keychain_reads(monkeypatch):
+    """A store wired to the real ``security`` tool answers MISSING in tests.
+
+    That is what a CI runner's empty Keychain answers, so every test sees the
+    same thing on every machine, and no test can read the developer's real
+    Claude Code credentials (13 tests did, unnoticed, while the tripwire was
+    dead). A store built on an injected fake backend keeps its behavior, so
+    the store's own tests still run. Writes are not stubbed: a write through
+    the real backend still trips ``_tripwire_real_keychain``.
+    """
+    from jacked.credentials import macos_store
+    from jacked.credentials.models import StoreReadResult, StoreStatus
+
+    cls = macos_store.MacOSCredentialStore
+    real_read = cls.read
+
+    def isolated_read(self):
+        backend = getattr(self, "_backend", None)
+        if (
+            isinstance(backend, macos_store.SecurityCliBackend)
+            and getattr(backend, "_run", None) is _REAL_SUBPROCESS_RUN
+        ):
+            return StoreReadResult(
+                StoreStatus.MISSING, reason="test isolation: Keychain not consulted"
+            )
+        return real_read(self)
+
+    monkeypatch.setattr(cls, "read", isolated_read)
 
 
 @pytest.fixture(autouse=True)
@@ -373,6 +435,11 @@ def _no_real_service_processes(request, monkeypatch):
         first = head.replace("\\", "/").rsplit("/", 1)[-1].lower()
         if first in supervisors:
             raise RuntimeError("test tried to drive a real supervisor: " + text)
+        # The macOS Keychain tool, reached around the backend's identity
+        # guard (a wrapper around the real callable, or a direct call). Only
+        # the head is reported: argv can carry the Keychain account name.
+        if first == "security":
+            raise RuntimeError("test tried to run the real security tool: " + head)
         # The Task Scheduler is also read through its COM API from PowerShell
         # (jacked.service.supervisors._task_xml.task_query_command, #165i).
         if first in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"} and (

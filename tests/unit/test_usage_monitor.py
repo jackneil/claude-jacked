@@ -28,27 +28,24 @@ from jacked.credentials.transaction import CredentialTransactionEngine
 
 
 class _TestCertifiedEngine(CredentialTransactionEngine):
-    """Nominal test double for an exact-capability transaction engine."""
+    """Self-recording test double for an exact-capability transaction engine.
 
-    def __init__(self, db, active_id=None, target=None):
+    ``activations`` lists the account id of every ``activate`` request, in
+    call order. ``outcome`` is the result every activation reports.
+    """
+
+    def __init__(
+        self, db, active_id=None, target=None, *, outcome=SwitchOutcome.COMMITTED
+    ):
         self.db = db
         self.active_id = active_id
         self.target = target
+        self.outcome = outcome
+        self.activations: list[int] = []
 
     def activate(self, request):
-        from jacked.api.credential_helpers import sync_credential_to_all_stores
-
-        observed = sync_credential_to_all_stores(
-            request.account_id,
-            {"id": request.account_id, "email": request.email},
-            email=request.email,
-        )
-        observed = observed is not False
-        return MagicMock(
-            outcome=(
-                SwitchOutcome.COMMITTED if observed else SwitchOutcome.FAILED_PRESERVED
-            )
-        )
+        self.activations.append(request.account_id)
+        return MagicMock(outcome=self.outcome)
 
 
 def _iso(dt):
@@ -330,17 +327,13 @@ class TestAutoSwapTriggers:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="fresh_tok",
                 ),
-                patch(
-                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
-                ) as mock_sync,
             ):
                 with pytest.raises(asyncio.CancelledError):
                     await active_account_poll_loop(app)
 
-                # sync_credential_to_all_stores called with target account
-                assert mock_sync.call_count >= 1
-                call_args = mock_sync.call_args
-                assert call_args[0][0] == 2  # target account id
+                # The certified engine activated the target account
+                engine = db._certified_auto_swap_engine
+                assert engine.activations and engine.activations[-1] == 2
 
                 # The certified transaction repository owns swap journaling;
                 # this wrapper must not create a duplicate legacy row.
@@ -401,9 +394,6 @@ class TestNoTarget:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="tok",
                 ),
-                patch(
-                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
-                ) as mock_sync,
             ):
                 with caplog.at_level(
                     logging.WARNING, logger="jacked.api.usage_monitor"
@@ -412,7 +402,8 @@ class TestNoTarget:
                         await active_account_poll_loop(app)
 
                 # No swap should happen
-                mock_sync.assert_not_called()
+                engine = db._certified_auto_swap_engine
+                assert engine.activations == []
 
                 # Warning should be logged
                 assert any("no eligible target" in r.message for r in caplog.records), (
@@ -844,15 +835,13 @@ class TestTOCTOU:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="fresh_tok",
                 ),
-                patch(
-                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
-                ) as mock_sync,
             ):
                 with pytest.raises(asyncio.CancelledError):
                     await active_account_poll_loop(app)
 
                 # Swap should NOT have been executed
-                mock_sync.assert_not_called()
+                engine = db._certified_auto_swap_engine
+                assert engine.activations == []
                 db.record_swap.assert_not_called()
 
         asyncio.run(_run())
@@ -980,9 +969,6 @@ class TestBurnRateReseedAfterSwap:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="fresh_tok",
                 ),
-                patch(
-                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
-                ),
             ):
                 with pytest.raises(asyncio.CancelledError):
                     await active_account_poll_loop(app)
@@ -1003,7 +989,7 @@ class TestBurnRateReseedAfterSwap:
 
 class TestSwapCooldown:
     def test_swap_blocked_during_cooldown(self):
-        """Swap cooldown active -> sync_credential_to_all_stores NOT called."""
+        """Swap cooldown active -> the transaction engine is NOT activated."""
         import jacked.api.usage_monitor as mod
 
         mod._burn_rates.clear()
@@ -1043,15 +1029,13 @@ class TestSwapCooldown:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="fresh_tok",
                 ),
-                patch(
-                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
-                ) as mock_sync,
             ):
                 with pytest.raises(asyncio.CancelledError):
                     await active_account_poll_loop(app)
 
                 # No swap should happen while cooldown is active
-                mock_sync.assert_not_called()
+                engine = db._certified_auto_swap_engine
+                assert engine.activations == []
                 db.record_swap.assert_not_called()
 
         asyncio.run(_run())
@@ -1098,17 +1082,13 @@ class TestSwapCooldown:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="fresh_tok",
                 ),
-                patch(
-                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
-                ) as mock_sync,
             ):
                 with pytest.raises(asyncio.CancelledError):
                     await active_account_poll_loop(app)
 
-                # Cooldown expired — swap should proceed
-                assert mock_sync.call_count >= 1
-                call_args = mock_sync.call_args
-                assert call_args[0][0] == 2  # target account id
+                # Cooldown expired — swap should proceed to the target account
+                engine = db._certified_auto_swap_engine
+                assert engine.activations and engine.activations[-1] == 2
 
         asyncio.run(_run())
 
@@ -1161,16 +1141,14 @@ class TestPauseMechanism:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="tok",
                 ),
-                patch(
-                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
-                ) as mock_sync,
             ):
                 with pytest.raises(asyncio.CancelledError):
                     await active_account_poll_loop(app)
 
                 # Pause check happens before usage fetch — fetch should NOT be called
                 mock_fetch.assert_not_called()
-                mock_sync.assert_not_called()
+                engine = db._certified_auto_swap_engine
+                assert engine.activations == []
 
         asyncio.run(_run())
 
@@ -1218,17 +1196,13 @@ class TestPauseMechanism:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="fresh_tok",
                 ),
-                patch(
-                    "jacked.api.credential_helpers.sync_credential_to_all_stores",
-                ) as mock_sync,
             ):
                 with pytest.raises(asyncio.CancelledError):
                     await active_account_poll_loop(app)
 
-                # Pause expired — swap should proceed
-                assert mock_sync.call_count >= 1
-                call_args = mock_sync.call_args
-                assert call_args[0][0] == 2  # target account id
+                # Pause expired — swap should proceed to the target account
+                engine = db._certified_auto_swap_engine
+                assert engine.activations and engine.activations[-1] == 2
 
         asyncio.run(_run())
 
@@ -1698,25 +1672,7 @@ class _SwapFakeDB:
         self.captured["pending_calls"] = self.captured.get("pending_calls", 0) + 1
 
 
-def _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=True):
-    from contextlib import contextmanager
-
-    @contextmanager
-    def fake_lock():
-        yield lock_acquired
-
-    def fake_sync(account_id, target, email=None):
-        captured["sync_called_with"] = account_id
-        return lock_acquired
-
-    monkeypatch.setattr(
-        "jacked.api.credential_helpers.acquire_claude_lock",
-        fake_lock,
-    )
-    monkeypatch.setattr(
-        "jacked.api.credential_helpers.sync_credential_to_all_stores",
-        fake_sync,
-    )
+def _patch_swap_credential_helpers(monkeypatch):
     monkeypatch.setattr(
         "jacked.api.credential_helpers.invalidate_live_cred_cache",
         lambda: None,
@@ -1733,20 +1689,26 @@ def _run_execute_swap(
     trigger="higher_tier_emerged",
     *,
     certified=True,
+    outcome=SwitchOutcome.COMMITTED,
 ):
+    """Run ``_execute_swap`` for account 99 -> 7 against ``_SwapFakeDB``.
+
+    With ``certified=True`` the engine is a ``_TestCertifiedEngine`` that
+    reports ``outcome``; it is stored as ``captured["engine"]``.
+    """
     from jacked.api import usage_monitor as um
 
     async def _run():
         db = _SwapFakeDB(captured)
-        engine = (
-            _TestCertifiedEngine(
+        engine = None
+        if certified:
+            engine = _TestCertifiedEngine(
                 db,
                 active_id=99,
                 target={"id": 7, "email": "new@test"},
+                outcome=outcome,
             )
-            if certified
-            else None
-        )
+            captured["engine"] = engine
         return await um._execute_swap(
             db,
             active_acct_id=99,
@@ -1787,11 +1749,12 @@ class TestExecuteSwapAtomicity:
         from jacked.api import usage_monitor as um
 
         captured = {}
-        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=True)
+        _patch_swap_credential_helpers(monkeypatch)
         monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
 
         ok = _run_execute_swap(captured)
         assert ok is True
+        assert captured["engine"].activations == [7]
         assert "settings" not in captured
         assert "record_swap" not in captured
         assert "status_updates" not in captured
@@ -1800,7 +1763,7 @@ class TestExecuteSwapAtomicity:
         from jacked.api import usage_monitor as um
 
         captured = {}
-        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=True)
+        _patch_swap_credential_helpers(monkeypatch)
         monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
         um._swap_failure_count = 3
         um._last_swap_failure_at = time.time()
@@ -1814,7 +1777,7 @@ class TestExecuteSwapAtomicity:
         from jacked.api import usage_monitor as um
 
         captured = {}
-        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=True)
+        _patch_swap_credential_helpers(monkeypatch)
         monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
         um._last_committed_swap_time = time.time() - 1234
 
@@ -1826,35 +1789,37 @@ class TestExecuteSwapAtomicity:
         from jacked.api import usage_monitor as um
 
         captured = {}
-        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=True)
+        _patch_swap_credential_helpers(monkeypatch)
         monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
 
         ok = _run_execute_swap(captured)
         assert ok is True
         assert "record_swap" not in captured
 
-    def test_swap_skips_db_setting_on_lock_fail(self, monkeypatch):
+    def test_swap_skips_db_setting_on_failed_activation(self, monkeypatch):
         from jacked.api import usage_monitor as um
 
         captured = {}
-        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=False)
+        _patch_swap_credential_helpers(monkeypatch)
         monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
 
-        ok = _run_execute_swap(captured)
+        ok = _run_execute_swap(captured, outcome=SwitchOutcome.FAILED_PRESERVED)
         assert ok is False
+        assert captured["engine"].activations == [7]
         assert "settings" not in captured
         assert "record_swap" not in captured
         assert "status_updates" not in captured
 
-    def test_lock_fail_arms_failure_backoff(self, monkeypatch):
+    def test_failed_activation_arms_failure_backoff(self, monkeypatch):
         from jacked.api import usage_monitor as um
 
         captured = {}
-        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=False)
+        _patch_swap_credential_helpers(monkeypatch)
         monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
 
-        ok = _run_execute_swap(captured)
+        ok = _run_execute_swap(captured, outcome=SwitchOutcome.FAILED_PRESERVED)
         assert ok is False
+        assert captured["engine"].activations == [7]
         assert um._swap_failure_count == 1
         assert um._last_swap_failure_at > 0
         # Cooldown un-armed: failed-attempt retry pacing is governed by
@@ -1862,18 +1827,19 @@ class TestExecuteSwapAtomicity:
         assert um._last_swap_time == 0.0
         assert um._swap_backoff_remaining() > 0
 
-    def test_lock_fail_preserves_burn_rate_state(self, monkeypatch):
+    def test_failed_activation_preserves_burn_rate_state(self, monkeypatch):
         from jacked.api import usage_monitor as um
         from jacked.web.auto_swap import BurnRate
 
         captured = {}
-        _patch_swap_credential_helpers(monkeypatch, captured, lock_acquired=False)
+        _patch_swap_credential_helpers(monkeypatch)
         monkeypatch.setattr(um, "_read_active_account_id", lambda: 99)
         um._burn_rates[99] = BurnRate(rate_5h_per_min=0.5, last_check_5h=20.0)
         um._burn_rate_unchanged_ticks[99] = 3
 
-        ok = _run_execute_swap(captured)
+        ok = _run_execute_swap(captured, outcome=SwitchOutcome.FAILED_PRESERVED)
         assert ok is False
+        assert captured["engine"].activations == [7]
         assert 99 in um._burn_rates, (
             "failed swap must not destroy the active account's burn-rate state"
         )
@@ -2236,7 +2202,7 @@ class TestActivePollWatchdogLifespanWiring:
 
 def _run_one_tick(app, max_sleeps=0, read_active=1, fetch_side_effect=None):
     """Run the active poll loop until the sleep-canceller fires; returns
-    the sync_credential_to_all_stores mock for call assertions."""
+    the certified engine's ``activations`` list (target account ids)."""
 
     async def _run():
         fetch_kwargs = {"return_value": {"_cached": True}}
@@ -2260,13 +2226,10 @@ def _run_one_tick(app, max_sleeps=0, read_active=1, fetch_side_effect=None):
                 "jacked.api.credential_helpers.read_fresh_active_token",
                 return_value="tok",
             ),
-            patch(
-                "jacked.api.credential_helpers.sync_credential_to_all_stores",
-            ) as mock_sync,
         ):
             with pytest.raises(asyncio.CancelledError):
                 await active_account_poll_loop(app)
-            return mock_sync
+            return app.state.db._certified_auto_swap_engine.activations
 
     return asyncio.run(_run())
 
@@ -2312,8 +2275,8 @@ class TestResidencyGate:
         db = _make_db(settings=_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
-        mock_sync.assert_not_called()
+        activations = _run_one_tick(app)
+        assert activations == []
         db.record_swap.assert_not_called()
         assert "residency_blocked" in _decision_triggers(db)
         assert "swap" not in _decision_actions(db)
@@ -2333,9 +2296,8 @@ class TestResidencyGate:
         db = _make_db(settings=_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
-        assert mock_sync.call_count >= 1
-        assert mock_sync.call_args[0][0] == 2
+        activations = _run_one_tick(app)
+        assert activations and activations[-1] == 2
 
     def test_proactive_swap_allowed_after_residency_elapsed(self):
         import jacked.api.usage_monitor as mod
@@ -2351,10 +2313,9 @@ class TestResidencyGate:
         db = _make_db(settings=_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
+        activations = _run_one_tick(app)
         # Fast-path emergence (T0 vs T3) + residency elapsed → swap fires.
-        assert mock_sync.call_count >= 1
-        assert mock_sync.call_args[0][0] == 2
+        assert activations and activations[-1] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2401,8 +2362,8 @@ class TestFailureBackoff:
         db = _make_db(settings=_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
-        mock_sync.assert_not_called()
+        activations = _run_one_tick(app)
+        assert activations == []
         db.record_swap.assert_not_called()
         assert "swap_aborted" in _decision_triggers(db)
         assert any("backoff" in (r or "") for r in _decision_reasons(db))
@@ -2420,9 +2381,8 @@ class TestFailureBackoff:
         db = _make_db(settings=_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
-        assert mock_sync.call_count >= 1
-        assert mock_sync.call_args[0][0] == 2
+        activations = _run_one_tick(app)
+        assert activations and activations[-1] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2452,8 +2412,8 @@ class TestTriggerTaxonomyBranches:
         db = _make_db(settings=_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
-        mock_sync.assert_not_called()
+        activations = _run_one_tick(app)
+        assert activations == []
         assert "cooldown_blocked" in _decision_triggers(db)
 
     def test_no_target_trigger(self):
@@ -2487,8 +2447,8 @@ class TestTriggerTaxonomyBranches:
         db = _make_db(settings=_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
-        mock_sync.assert_not_called()
+        activations = _run_one_tick(app)
+        assert activations == []
         assert "emergence_pending" in _decision_triggers(db)
         assert mod._emerged_tier_streak == {"tier": 1, "count": 1}
 
@@ -2500,8 +2460,8 @@ class TestTriggerTaxonomyBranches:
         db = _make_db(settings=_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
-        assert mock_sync.call_count >= 1
+        activations = _run_one_tick(app)
+        assert len(activations) >= 1
         triggers = _decision_triggers(db)
         actions = _decision_actions(db)
         assert "forced_critical" in triggers
@@ -2526,9 +2486,8 @@ class TestFastPathEmergence:
         db = _make_db(settings=_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
-        assert mock_sync.call_count >= 1
-        assert mock_sync.call_args[0][0] == 2
+        activations = _run_one_tick(app)
+        assert activations and activations[-1] == 2
         db.record_swap.assert_not_called()
         assert "higher_tier_emerged" in _decision_triggers(db)
 
@@ -2551,8 +2510,8 @@ class TestFastPathEmergence:
         db = _make_db(settings=_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
-        mock_sync.assert_not_called()
+        activations = _run_one_tick(app)
+        assert activations == []
         db.record_swap.assert_not_called()
 
 
@@ -3306,7 +3265,7 @@ def _db_with_rows(accounts, settings=None):
 
 
 def _tick_with_fetch(app):
-    """One active-poll tick; returns (sync mock, fetch_usage mock)."""
+    """One active-poll tick; returns (engine activations, fetch_usage mock)."""
 
     async def _run():
         with (
@@ -3324,13 +3283,10 @@ def _tick_with_fetch(app):
                 "jacked.api.credential_helpers.read_fresh_active_token",
                 return_value="tok",
             ),
-            patch(
-                "jacked.api.credential_helpers.sync_credential_to_all_stores",
-            ) as mock_sync,
         ):
             with pytest.raises(asyncio.CancelledError):
                 await active_account_poll_loop(app)
-            return mock_sync, mock_fetch
+            return app.state.db._certified_auto_swap_engine.activations, mock_fetch
 
     return asyncio.run(_run())
 
@@ -3367,9 +3323,9 @@ class TestNoSessionProjection:
         db = _db_with_rows(accounts)
         app = _make_app(db=db)
 
-        mock_sync = _run_one_tick(app)
+        activations = _run_one_tick(app)
 
-        mock_sync.assert_not_called()
+        assert activations == []
         assert "forced_critical" not in _decision_triggers(db)
         assert _decision_actions(db) == ["stay"]
         assert app.state.active_poll_tier == "idle"
@@ -3387,10 +3343,9 @@ class TestNoSessionProjection:
         ultra = _ultra(2, usage_5h=100.0, resets_5h=self._future(hours=2), usage_7d=10.0)
         db = _db_with_rows([active, ultra])
 
-        mock_sync = _run_one_tick(_make_app(db=db))
+        activations = _run_one_tick(_make_app(db=db))
 
-        assert mock_sync.call_count >= 1
-        assert mock_sync.call_args[0][0] == 2
+        assert activations and activations[-1] == 2
         assert "forced_critical" in _decision_triggers(db)
 
     def test_a_stale_saturated_5h_forces_no_candidate_refetch(self):
@@ -3403,7 +3358,7 @@ class TestNoSessionProjection:
         )
         db = _db_with_rows([active, ultra])
 
-        _sync, mock_fetch = _tick_with_fetch(_make_app(db=db))
+        _activations, mock_fetch = _tick_with_fetch(_make_app(db=db))
 
         assert [c.args[0] for c in mock_fetch.call_args_list] == [1]
 
