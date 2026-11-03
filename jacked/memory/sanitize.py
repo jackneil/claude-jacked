@@ -16,7 +16,14 @@ import re
 # bidi marks, embeddings, overrides and isolates (U+200E, U+200F, U+202A to
 # U+202E, U+2066 to U+2069), which can show text in an order that is not its
 # real order. This is the one sanitizer for that text.
-_CONTROL_CHARS_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+# The set is built from code points, not from regex ranges, so a reader (and a
+# static analyser) sees each block by name: C0 without tab and newline, DEL and
+# C1, the two bidi marks, the bidi embeddings and overrides, the bidi isolates.
+_CONTROL_CODEPOINTS = (
+    *range(0x00, 0x09), *range(0x0B, 0x20), *range(0x7F, 0xA0),
+    0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A),
+)
+_CONTROL_CHARS_RE = re.compile("[" + "".join(re.escape(chr(c)) for c in _CONTROL_CODEPOINTS) + "]")
 
 
 def strip_control(s: str) -> str:
