@@ -70,7 +70,7 @@ ECHO_X_LINE = (
     "jacked integrity: settings.json changed outside jacked; Stop hook added: "
     f"program echo, command sha256:{_short('echo x')}"
 )
-FENCE_CMD = "bash '/tmp/`whoami` ```.sh'"
+FENCE_CMD = "bash '/tmp/`whoami````.sh'"
 
 
 # --------------------------------------------------------------------------- #
@@ -427,7 +427,7 @@ class TestSessionStartBlock:
         assert lines[2] == "```" and lines[-1] == "```"
         assert lines[3] == (
             "jacked integrity: settings.json changed outside jacked; "
-            f"UserPromptSubmit hook added: program bash, script /tmp/'whoami' '''.sh, command sha256:{_short(FENCE_CMD)}"
+            f"UserPromptSubmit hook added: program bash, script /tmp/'whoami''''.sh, command sha256:{_short(FENCE_CMD)}"
         )
 
     def test_many_findings_end_with_an_exact_trimmed_marker(self, home, tmp_path):

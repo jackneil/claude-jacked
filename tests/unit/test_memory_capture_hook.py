@@ -1148,3 +1148,10 @@ def test_current_branch_decodes_git_output_as_utf8(env):
     with patch("subprocess.run", side_effect=_utf8_run(calls, "feature/漢\n")):
         assert capture.current_branch("/repo") == "feature/漢"
     assert calls[0].get("encoding") == "utf-8" and calls[0].get("errors") == "replace"
+
+
+def test_checkpoint_field_definitions_name_both_fields():
+    """M13 L2: each pair of fields reads as a pair, not as a field and its value."""
+    text = _CHECKPOINT.read_text(encoding="utf-8")
+    assert "- `plans_in_progress`, `research_files`: **file paths** resolved against project root" in text
+    assert "- `head_sha`, `dirty_files`: repo fingerprint at save time" in text

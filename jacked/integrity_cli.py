@@ -15,9 +15,10 @@ console = Console()
 
 
 def _settings_file():
-    from jacked.memory import settings_io, vault
+    from jacked.memory import claude_paths, vault
 
-    return settings_io.settings_path(vault.jacked_home())
+    # The file that Claude Code loads, the same one that the SessionStart check reads.
+    return claude_paths.config_dir(vault.jacked_home()) / "settings.json"
 
 
 def print_doctor_lines(out: Console | None = None) -> None:

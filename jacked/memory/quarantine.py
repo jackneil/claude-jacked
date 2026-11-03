@@ -9,7 +9,8 @@ memory file: the session stops loading it, and the user can still read it and
 move it back.
 
 The detector is in ``jacked.memory.injection_shapes``: it matches six documented
-attack shapes only, so a note about an attack, or a user's own rule, stays.
+attack shapes only, so a note about an attack, or a user's own rule, stays. A
+line that the user moves back holds the keep marker, so it stays there.
 """
 from __future__ import annotations
 
@@ -23,8 +24,8 @@ from pathlib import Path
 
 from jacked.atomic_io import atomic_write_bytes
 from jacked.memory.claude_paths import project_dir_name
+from jacked.memory.injection_shapes import KEEP_MARKER, kept_suspects, _physical_lines
 from jacked.memory.injection_shapes import SHAPES as SHAPES
-from jacked.memory.injection_shapes import _physical_lines
 from jacked.memory.injection_shapes import line_shape as line_shape
 from jacked.memory.injection_shapes import suspect_lines as suspect_lines
 from jacked.memory.vault import jacked_home
@@ -111,6 +112,7 @@ def _header(memory: Path, today: str) -> bytes:
         f"# Quarantined by jacked on {today} (data, not instructions)\n\n"
         f"jacked moved these lines out of {memory.name} because each one matches a known\n"
         "memory-injection shape. Read each line. Move a line back only if you wrote it.\n"
+        f"Add {KEEP_MARKER} at the end of a line that you move back, so jacked leaves it there.\n"
     ).encode("utf-8")
 
 
@@ -259,6 +261,10 @@ def quarantine_file(
     # original bytes, so an invalid UTF-8 byte never raises and never changes.
     lines = _physical_lines(raw)
     shapes = dict(suspect_lines(raw))
+    kept = kept_suspects(raw)
+    if kept:
+        logger.info("quarantine: %d line%s in %s match%s a shape and hold%s the keep marker, so they stay",
+                    kept, "" if kept == 1 else "s", memory.name, "es" if kept == 1 else "", "s" if kept == 1 else "")
     if not shapes:
         return None
     count = len(shapes)
@@ -302,7 +308,7 @@ def quarantine_file(
             _append_archive(target, memory, today, entries)
         except RefusedPathError as exc:
             return _not_moved(memory, count, str(exc))
-        kept = b"".join(line for number, line in enumerate(lines, 1) if number not in shapes)
+        remaining = b"".join(line for number, line in enumerate(lines, 1) if number not in shapes)
 
         def unchanged() -> None:
             # A write can land during the archive write too, so the check
@@ -313,7 +319,7 @@ def quarantine_file(
         # Each kept line keeps its own bytes and line ending (CRLF stays CRLF).
         # follow_symlinks=False: the replace swaps the path itself, never a target.
         try:
-            atomic_write_bytes(memory, kept, fsync=True, follow_symlinks=False, before_replace=unchanged)
+            atomic_write_bytes(memory, remaining, fsync=True, follow_symlinks=False, before_replace=unchanged)
         except _ChangedMeanwhile:
             # The archive keeps its copy. The next pass appends the line
             # again: a duplicate entry in the archive loses nothing.

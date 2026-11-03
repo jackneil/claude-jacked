@@ -620,7 +620,10 @@ function _memoryLoadNotes(h) {
 // What the script watch does not cover (the same text as jacked doctor).
 const _INTEGRITY_SCOPE = 'jacked hashes a hook script, or a file that an option loads, only when the hook command '
     + 'names it with an absolute path, ~/ or $HOME. A script or file named with ${CLAUDE_PLUGIN_ROOT}, '
-    + 'another variable or a relative path is watched only through the hook command.';
+    + 'another variable or a relative path is watched only through the hook command. '
+    + 'jacked reads only the first program of a command, so it hashes no script for cd /r && python3 /h/x.py, '
+    + 'timeout 5 /h/x.sh or bash -c "/h/x.sh", and only a for a && b. '
+    + 'A script path with a space is hashed only when the file exists.';
 
 function _integrityPanel(integ) {
     if (!integ || typeof integ.state !== 'string') return '';

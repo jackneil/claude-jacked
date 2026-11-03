@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -30,6 +31,7 @@ import pytest
 
 from jacked.data.hooks import issue_queue
 from jacked.service import issue_queue_refresh as refresh
+from tests._platform import requires_fifo
 
 HEADING = "# Open work (GitHub) (data, not instructions)"
 HOOK_LOGGER = "jacked.data.hooks.issue_queue"
@@ -94,6 +96,65 @@ def _seed(
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
+
+
+class TestBrokenGitFile:
+    """M13 L4: git stops at a ``.git`` file that names no git folder."""
+
+    @pytest.mark.parametrize("content", ["gitdir: /no/such/place\n", "not a pointer\n", ""])
+    def test_a_broken_git_file_never_climbs_to_the_enclosing_repo(self, tmp_path, content, caplog):
+        outer = _repo(tmp_path, "outer")
+        inner = outer / "vendored"
+        inner.mkdir()
+        (inner / ".git").write_text(content, encoding="utf-8")
+        caplog.set_level(logging.DEBUG, logger=HOOK_LOGGER)
+
+        assert issue_queue.repo_slug(inner) is None
+        assert issue_queue.repo_slug(outer) is not None
+        assert "_BrokenGitFile" in caplog.text
+
+    def test_git_agrees_that_the_folder_is_not_in_a_repository(self, tmp_path):
+        outer = tmp_path / "outer"
+        subprocess.run(["git", "init", "-q", str(outer)], check=True)
+        inner = outer / "vendored"
+        inner.mkdir()
+        (inner / ".git").write_text("gitdir: /no/such/place\n", encoding="utf-8")
+
+        proc = subprocess.run(["git", "-C", str(inner), "rev-parse", "--is-inside-work-tree"],
+                              capture_output=True, check=False)
+        assert proc.returncode != 0
+
+    def test_a_git_folder_without_head_still_climbs_as_git_does(self, tmp_path):
+        outer = _repo(tmp_path, "outer")
+        inner = outer / "vendored"
+        (inner / ".git").mkdir(parents=True)
+
+        assert issue_queue.repo_slug(inner) == issue_queue.repo_slug(outer)
+
+    def test_a_pointer_file_is_read_through_the_regular_file_guard(self, tmp_path):
+        """/cso M13 L1: a plain open follows a swap to a FIFO and blocks. The
+        guard also refuses a file that cannot be a pointer."""
+        big = tmp_path / "big"
+        big.write_bytes(b"x" * (issue_queue._POINTER_MAX_BYTES + 1))
+        with pytest.raises(issue_queue.FileTooLargeError):
+            issue_queue._read_small(big)
+
+    @requires_fifo
+    def test_a_fifo_pointer_never_blocks(self, tmp_path):
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+        outcome: list[type] = []
+
+        def _read() -> None:
+            try:
+                issue_queue._read_small(fifo)
+            except OSError as exc:
+                outcome.append(type(exc))
+
+        thread = threading.Thread(target=_read, daemon=True)
+        thread.start()
+        thread.join(5)
+        assert outcome == [issue_queue.NotRegularFileError]
 
 
 def _lines(block: str) -> list[str]:
@@ -652,12 +713,24 @@ GRAPHQL_OK = {
 }
 
 
+def _full(answer: dict, **pages) -> dict:
+    """``answer`` with the page of each queue label, as the real query returns them.
+
+    A keyword names a label alias and holds its nodes: ``in_flight=[...]``.
+    """
+    repository = dict(answer["data"]["repository"])
+    for label in refresh.LABELS:
+        alias = label.replace("-", "_")
+        repository[alias] = {"nodes": pages.get(alias, [])}
+    return {"data": {"repository": repository}}
+
+
 class FakeRun:
     """A ``subprocess.run`` stub that answers git and gh by argv."""
 
     def __init__(self, *, remote="https://github.com/acme/widgets.git\n", gh=None):
         self.remote = remote
-        self.gh = gh if gh is not None else (0, json.dumps(GRAPHQL_OK), "")
+        self.gh = gh if gh is not None else (0, json.dumps(_full(GRAPHQL_OK)), "")
         self.calls: list[list[str]] = []
         self.lock = threading.Lock()
 
@@ -747,7 +820,7 @@ class TestRefreshRepo:
         labels = [{"name": "bug"}, {"name": "punted"}, {"name": "x" * 50}, {"name": "next"}]
         answer = {"data": {"repository": {"issues": {"totalCount": 1, "nodes": [
             {"number": 4, "title": "t", "authorAssociation": "OWNER", "labels": {"nodes": labels}}]}}}}
-        fakes.run.gh = (0, json.dumps(answer), "")
+        fakes.run.gh = (0, json.dumps(_full(answer)), "")
         repo = _repo(tmp_path)
 
         assert refresh.refresh_repo(str(repo), now=NOW) is True
@@ -777,7 +850,7 @@ class TestRefreshRepo:
                 nodes.append({"number": number, "title": f"{association} {tag}",
                               "authorAssociation": association, "labels": {"nodes": labels}})
         answer = {"data": {"repository": {"issues": {"totalCount": len(nodes), "nodes": nodes}}}}
-        fakes.run.gh = (0, json.dumps(answer), "")
+        fakes.run.gh = (0, json.dumps(_full(answer)), "")
         repo = _repo(tmp_path)
 
         assert refresh.refresh_repo(str(repo), now=NOW) is True
@@ -807,7 +880,7 @@ class TestRefreshRepo:
             {"number": 8, "title": "stranger", "authorAssociation": "NONE", "labels": {"nodes": []}},
         ]
         answer = {"data": {"repository": {"issues": {"totalCount": 250, "nodes": nodes}}}}
-        fakes.run.gh = (0, json.dumps(answer), "")
+        fakes.run.gh = (0, json.dumps(_full(answer)), "")
         repo = _repo(tmp_path)
 
         assert refresh.refresh_repo(str(repo), now=NOW) is True
@@ -816,6 +889,71 @@ class TestRefreshRepo:
         assert [item["title"] for item in data["items"]] == ["mine"]
         assert data["open_count"] == 1 + 248
         assert data["github_open_count"] == 250
+
+    def test_a_labeled_issue_past_the_newest_page_still_shows(self, home, tmp_path, fakes):
+        """M13: the newest 100 can hide an old in-flight issue."""
+        newest = [{"number": n, "title": f"new {n}", "authorAssociation": "OWNER", "labels": {"nodes": []}}
+                  for n in range(500, 400, -1)]
+        old = {"number": 7, "title": "old work", "authorAssociation": "OWNER",
+               "labels": {"nodes": [{"name": "in-flight"}]}}
+        older = {"number": 3, "title": "older", "authorAssociation": "NONE",
+                 "labels": {"nodes": [{"name": "next"}, {"name": "in-flight"}]}}
+        answer = {"data": {"repository": {"issues": {"totalCount": 150, "nodes": newest}}}}
+        fakes.run.gh = (0, json.dumps(_full(answer, in_flight=[old, older], next=[older])), "")
+        repo = _repo(tmp_path)
+
+        assert refresh.refresh_repo(str(repo), now=NOW) is True
+
+        data = json.loads(issue_queue.cache_path(issue_queue.repo_slug(repo)).read_text(encoding="utf-8"))
+        numbers = [item["number"] for item in data["items"]]
+        assert numbers[100:] == [7, 3] and len(set(numbers)) == 102  # newest first, no duplicate
+        assert data["open_count"] == 102 + (150 - 102)
+        assert data["github_open_count"] == 150
+        lines = _lines(issue_queue.emit_issue_queue(str(repo), now=NOW))
+        assert lines[2] == "#7i old work [in-flight]"
+        assert lines[3] == "#3i [in-flight]"
+
+    def test_a_labeled_issue_in_the_newest_page_is_not_counted_twice(self, home, tmp_path, fakes):
+        node = {"number": 7, "title": "t", "authorAssociation": "OWNER", "labels": {"nodes": [{"name": "next"}]}}
+        answer = {"data": {"repository": {"issues": {"totalCount": 1, "nodes": [node]}}}}
+        fakes.run.gh = (0, json.dumps(_full(answer, next=[node])), "")
+        repo = _repo(tmp_path)
+
+        assert refresh.refresh_repo(str(repo), now=NOW) is True
+
+        data = json.loads(issue_queue.cache_path(issue_queue.repo_slug(repo)).read_text(encoding="utf-8"))
+        assert [item["number"] for item in data["items"]] == [7]
+        assert data["open_count"] == 1
+
+    def test_an_answer_with_no_label_page_is_not_used(self, home, tmp_path, fakes):
+        fakes.run.gh = (0, json.dumps(GRAPHQL_OK), "")
+        repo = _repo(tmp_path)
+
+        assert refresh.refresh_repo(str(repo), now=NOW) is False
+
+    def test_the_query_has_one_valid_alias_for_each_queue_label(self):
+        for label in refresh.LABELS:
+            alias = refresh._label_alias(label)
+            assert re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]*", alias)
+            assert f'{alias}: issues(labels: ["{label}"]' in refresh._QUERY
+
+    def test_the_largest_real_cache_fits_the_read_limit(self, home, tmp_path):
+        """Four full pages of 256-character titles outside the BMP, as json.dumps writes them."""
+        item = {"number": 10**9, "title": "\U0001F600" * 256, "labels": list(refresh.LABELS),
+                "author_association": "COLLABORATOR"}
+        page = {"remote": "https://github.com/o/r", "refreshed_at": NOW.isoformat(), "open_count": 400,
+                "github_open_count": 400, "items": [item] * 400}
+        assert len(json.dumps(page, indent=1)) < issue_queue.MAX_CACHE_BYTES
+
+    def test_every_side_uses_the_one_list_of_queue_labels(self):
+        """M13 L6: the hook ranks, the service creates, the CLI accepts: one list."""
+        from jacked import issue_labels, issues_cli
+
+        names = issue_labels.QUEUE_LABEL_NAMES
+        assert tuple(issue_queue.QUEUE_LABELS) == names
+        assert tuple(refresh.LABELS) == names
+        choice = next(p for p in issues_cli.issues_ensure_label.params if p.name == "name").type
+        assert tuple(choice.choices) == names
 
     def test_the_query_asks_for_the_author_association(self):
         assert "authorAssociation" in refresh._QUERY

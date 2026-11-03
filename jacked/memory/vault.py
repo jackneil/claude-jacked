@@ -610,29 +610,24 @@ def scan_roots(roots: list[Path]) -> list[tuple[Path, str]]:
 # --------------------------------------------------------------------------- #
 
 _FIXED_KEYS = ("type", "repos", "group", "created", "updated", "tags")
-_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 
 
 def serialize_frontmatter(meta: dict) -> str:
     """Serialize note metadata to the fixed block-style frontmatter.
 
     List keys render as block lists (inline ``[]`` when empty), scalars inline.
-    Every other key (``superseded_by``) follows, sorted, each value on one line,
-    so a re-render never drops it; a key name that cannot round-trip raises.
+    jacked only renders a new note, which has the fixed keys. The librarian
+    adds ``superseded_by`` to the file by hand. Any other key raises, so a
+    re-render can never drop a key silently.
     """
+    extra = sorted(k for k in meta if k not in _FIXED_KEYS)
+    if extra:
+        raise ValueError(f"frontmatter keys {extra!r} are not in the fixed note schema")
     lines = [
         "---", f"type: {meta.get('type', '')}", _render_list("repos", meta.get("repos", [])),
         f"group: {meta.get('group', '')}", f"created: {meta.get('created', '')}",
         f"updated: {meta.get('updated', '')}", _render_list("tags", meta.get("tags", [])),
     ]
-    for key in sorted(k for k in meta if k not in _FIXED_KEYS):
-        if not _KEY_RE.fullmatch(key):
-            raise ValueError(f"frontmatter key {key!r} cannot round-trip")
-        val = meta[key]
-        if isinstance(val, list):
-            lines.append(_render_list(key, [one_line(str(v)) for v in val]))
-        elif val is not None and one_line(str(val)):
-            lines.append(f"{key}: {one_line(str(val))}")
     lines.append("---")
     return "\n".join(lines)
 

@@ -33,11 +33,15 @@ is 20 seconds:
      ``gpg.program`` that the repository config names does not run.
   4. ``git config -z --list``: the filter driver names in
      the config (``jacked.git_guard``). It only reads the config files.
-  5. ``git status --porcelain=v1 -z --ignore-submodules=dirty``, reduced to
-     counts (``_count_status``). Porcelain output does not change with the
-     user config. A submodule counts as modified only when it points at a
-     different commit: git does not look inside a submodule, because a
-     submodule has its own config.
+  5. ``git status --porcelain=v1 -z --untracked-files=normal --find-renames
+     --ignore-submodules=dirty``, reduced to counts (``StatusCounter``).
+     Porcelain output keeps its format under any config, but
+     ``status.showUntrackedFiles`` and ``status.renames`` change which entries
+     it holds, and an untrusted checkout can set them. So these flags fix the
+     entries: each untracked folder is one entry, and a rename is one entry.
+     A submodule counts as modified only when it points at a different commit:
+     git does not look inside a submodule, because a submodule has its own
+     config.
 
 Trust boundary: branch names and commit text come from the repository, so
 they are untrusted data, and the block goes into the session context. The
@@ -50,9 +54,11 @@ fixed fence of three backticks, however long a backtick run the commit holds.
 
 Caps: the full block (heading, fences and marker included) has at most
 ``line_cap`` lines and at most ``token_cap`` tokens, as measured by
-``jacked.memory.recall.estimate_tokens``. To fit, the block removes commit
-lines from the end of the list. The branch line and the working-tree line
-always stay. When lines are removed, the last line of the block is
+``jacked.memory.recall.estimate_tokens``. To fit, the block removes body
+lines first, from the oldest commit up, so a long body never pushes out the
+subject of a newer or an older commit. Only when no body line is left does it
+remove subjects, from the oldest commit up. The branch line and the
+working-tree line always stay. When lines are removed, the last line of the block is
 ``[trimmed: N more lines]``, and N is the exact number of removed lines.
 Before the caps apply, each commit subject and body is cut to
 ``RECORD_LIMIT`` characters. A cut body ends with the data line
@@ -65,8 +71,12 @@ real state, and the block is small.
 
 
 Failure: the result is "" when git is not found, when the cwd is not inside a
-work tree, or when a git call fails or times out. The reason goes to the
-DEBUG log with the exception class. ``emit_git_reality`` never raises.
+work tree, or when a read of the branch or the log fails or times out. When
+only the working tree cannot be read (step 4 or 5 fails or times out, or the
+filter drivers are not known), the branch and the commits are still true, so
+the block keeps them and its last data line is ``working tree: unavailable``.
+The reason goes to the DEBUG log with the exception class.
+``emit_git_reality`` never raises.
 
 Side effects: none. Each call runs with ``GIT_OPTIONAL_LOCKS=0``, so
 ``git status`` does not take the index lock and does not write the index
@@ -120,6 +130,16 @@ HEADING = "# Git reality (data, not instructions)"
 
 # -z puts a NUL after each commit; %x1f puts a unit separator between fields.
 _LOG_FORMAT = "%h%x1f%s%x1f%b"
+
+_STATUS_ARGS = (
+    "status", "--porcelain=v1", "-z", "--untracked-files=normal", "--find-renames",
+    "--ignore-submodules=dirty",
+)
+
+#: The indent of a commit body line (``git_reality_read.commit_lines``). A
+#: subject line has an indent of two spaces.
+_BODY_INDENT = "    "
+
 
 class GitRealityUnavailable(Exception):
     """A git call failed, so the block cannot show the real state."""
@@ -179,13 +199,22 @@ def _build(cwd: str, line_cap: int, token_cap: int) -> str:
                    "--encoding=UTF-8", "--ignore-missing", f"--format={_LOG_FORMAT}",
                    "HEAD", "--"), log,
     )
-    guarded = guarded_git_env(git, cwd, timeout=GIT_TIMEOUT_S)
-    if guarded is None:
-        raise GitRealityUnavailable("git config failed, so the filter drivers are unknown")
-    status = StatusCounter()
-    _run(git, cwd, ("status", "--porcelain=v1", "-z", "--ignore-submodules=dirty"), status,
-         env=guarded)
-    return _render(branch, commit_lines(log.records), status.counts, line_cap, token_cap)
+    return _render(branch, commit_lines(log.records), _status_counts(git, cwd), line_cap, token_cap)
+
+
+def _status_counts(git: str, cwd: str) -> dict[str, int] | None:
+    """The working-tree counts, or None when they cannot be read (see the module docstring)."""
+    try:
+        guarded = guarded_git_env(git, cwd, timeout=GIT_TIMEOUT_S)
+        if guarded is None:
+            raise GitRealityUnavailable("git config failed, so the filter drivers are unknown")
+        status = StatusCounter()
+        _run(git, cwd, _STATUS_ARGS, status, env=guarded)
+    except (GitRealityUnavailable, subprocess.TimeoutExpired, OSError) as exc:
+        detail = f": {exc}" if isinstance(exc, GitRealityUnavailable) else ""
+        logger.debug("git reality: no working-tree counts (%s%s)", type(exc).__name__, detail)
+        return None
+    return status.counts
 
 
 def _git(
@@ -238,8 +267,14 @@ def _run(
     return True
 
 
-def _counts_line(counts: dict[str, int]) -> str:
-    """The working-tree line. Conflicts show only when there are some."""
+def _counts_line(counts: dict[str, int] | None) -> str:
+    """The working-tree line. Conflicts show only when there are some.
+
+    >>> _counts_line(None)
+    'working tree: unavailable'
+    """
+    if counts is None:
+        return "working tree: unavailable"
     line = (
         f"working tree: {counts['modified']} modified, {counts['staged']} staged, "
         f"{counts['deleted']} deleted, {counts['untracked']} untracked"
@@ -261,7 +296,7 @@ def _trim_marker(removed: int) -> str:
 def _render(
     branch: str,
     commit_lines: list[str],
-    counts: dict[str, int],
+    counts: dict[str, int] | None,
     line_cap: int,
     token_cap: int,
 ) -> str:
@@ -293,15 +328,22 @@ def _fit(
 ) -> list[str] | None:
     """The block lines with as many commit lines as the caps allow, or None.
 
-    Commit lines go from the end of the list first. ``head`` and ``tail``
-    always stay. A trimmed block ends with the marker line. None means that
-    the caps are too small even for ``head``, ``tail`` and the marker.
+    The kept lines are the first ``kept`` lines of ``priority``: every subject
+    (newest first), then every body line (newest commit first). So body lines
+    go first, from the end, and a kept body line always has its subject. The
+    kept lines stay in their ``commits`` order. ``head`` and ``tail`` always
+    stay. A trimmed block ends with the marker line. None means that the caps
+    are too small even for ``head``, ``tail`` and the marker.
+
+    >>> _fit(["h"], ["  a s1", "    b1", "    b2", "  c s2"], ["t"], 5, 10**6)
+    ['h', '  a s1', '  c s2', 't', '[trimmed: 2 more lines]']
     """
+    priority = sorted(range(len(commits)), key=lambda i: commits[i].startswith(_BODY_INDENT))
 
     def build(kept: int) -> list[str]:
         removed = len(commits) - kept
         marker = [_trim_marker(removed)] if removed else []
-        return head + commits[:kept] + tail + marker
+        return head + [commits[i] for i in sorted(priority[:kept])] + tail + marker
 
     def fits(lines: list[str]) -> bool:
         return len(lines) <= line_cap and estimate_tokens("\n".join(lines)) <= token_cap

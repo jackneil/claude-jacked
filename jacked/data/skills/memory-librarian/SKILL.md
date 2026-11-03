@@ -18,6 +18,17 @@ This is judgment, not a checklist to run mechanically. When you are unsure wheth
 
 If drift is low and nothing looks stale, it is fine to do almost nothing and still mark the vault groomed at the end. A quiet pass is a valid pass.
 
+## When the vault is off
+
+A load budget line can name MEMORY.md on a machine with no memory vault. When the first line of `jacked memory status` says `not initialized` or `disabled`, there is no group to groom, and you do not run `jacked memory mark-groomed`. Only do this:
+
+1. Read the MEMORY.md at the path that the load budget line names. It is an index: Claude Code loads the start of it at session start, and it reads the topic files beside it when they are relevant.
+2. Keep each index line to one short line with a link. Move long text into a topic file in the same folder, and link that file from the index line.
+3. Merge lines that say the same fact. Keep the newest wording. When you are unsure, keep the line.
+4. Do not delete a fact the user wrote. If the file is still over the size after these steps, tell the user which lines you would remove, and let the user choose.
+
+Then stop. The sections below apply only to a vault.
+
 ## Orient first
 
 Work one group at a time (default to the group for the current repo). Before changing anything, read enough to hold the group in your head:

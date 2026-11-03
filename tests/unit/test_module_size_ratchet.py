@@ -61,7 +61,7 @@ BASELINE: dict[str, int] = {
     "jacked/memory/capture.py": 785,
     "jacked/memory/migrate.py": 657,
     "jacked/memory/recall.py": 603,
-    "jacked/memory/vault.py": 1254,
+    "jacked/memory/vault.py": 1249,
     "jacked/packs.py": 807,
     "jacked/recover.py": 554,
     "jacked/service/menubar_mac.py": 846,
