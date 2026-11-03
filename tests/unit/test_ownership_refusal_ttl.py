@@ -2,8 +2,9 @@
 owner does not.
 
 The profile endpoint answers about the TOKEN with 401 or 403. That is a
-refusal: the launch sync stops deferring the file. An edge or policy 403
-can still be transient, so the refusal is asked again after
+refusal that names no owner: the import stops, and the launch sync keeps the
+file (``ownership_refusal_is_status``). An edge or policy 403 can be
+transient, so the refusal is asked again after
 ``_OWNERSHIP_REFUSAL_RETRY_SECONDS`` instead of being kept for the life of
 the service. A 200 whose profile names another account is final for the
 token's life. A failed request (None, 5xx) is unknown and is asked again

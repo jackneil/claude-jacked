@@ -7,7 +7,7 @@ Two rules keep a repair from damaging the authority:
   example, the Claude Code breaker kept a rotated refresh token out of the
   row), the re-stamp does not run, on the stamped and the unstamped path.
 - After a committed repair, the guard keeps a fingerprint of the tokens
-  that it published (``last_authority_write_fp``). A payload with these
+  that it published (``_last_authority_write_fp``). A payload with these
   tokens is jacked's own write, so the guard does not examine it again.
 
 The fixtures come from tests/unit/test_authority_guard_stamped.py.
@@ -181,3 +181,48 @@ def test_an_unstamped_restamp_republishes_the_authority_pair(caplog):
     _assert_values_free(caplog)
 
 
+
+
+def test_the_write_fingerprint_is_not_in_the_settings_list(tmp_path):
+    """The value is derived from token values: an internal marker, which the
+    settings API (``list_settings``) does not show."""
+    from jacked.api.stamped_evidence import last_published_fingerprint, record_publication
+    from jacked.web.database import Database
+
+    db = Database(str(tmp_path / "settings.db"))
+    record_publication(db, "a" * 16)
+
+    assert last_published_fingerprint(db) == "a" * 16
+    assert db.list_settings() == []
+
+
+def test_a_condemnation_during_an_adoption_makes_the_write_miss(tmp_path):
+    """A refresh token condemned while the guard decides must not land: the
+    fingerprints are in the compare-and-swap, and the next decision reads them."""
+    from unittest import mock
+
+    from jacked.api.authority_guard import _import_rotated_tokens
+    from jacked.web.database import Database
+
+    db = Database(str(tmp_path / "guard.db"))
+    row = db.create_account("erin@test.com", "primary-at", 9_999_999_999, organization_uuid="org-5")
+    db.update_account(row["id"], cc_access_token="db-at", cc_refresh_token="db-rt", cc_expires_at=1000)
+    real = db.update_account_if_unchanged
+    raced = []
+
+    def racing(account_id, expected, **updates):
+        if not raced:
+            raced.append(True)
+            db.update_account(
+                account_id, cc_refresh_failed_token_fp=verdict_fingerprint("new-rt")
+            )
+        return real(account_id, expected, **updates)
+
+    payload = _foreign_payload(access="new-at", refresh="new-rt")
+    profile = {"account": {"email": "erin@test.com"}, "organization": {"uuid": "org-5"}}
+    with mock.patch.object(db, "update_account_if_unchanged", side_effect=racing):
+        _import_rotated_tokens(db, db.get_account(row["id"]), payload, profile=profile)
+
+    after = db.get_account(row["id"])
+    assert after["cc_refresh_token"] == "db-rt"
+    assert after["cc_access_token"] == "new-at"

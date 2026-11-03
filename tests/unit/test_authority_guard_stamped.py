@@ -25,6 +25,7 @@ import logging
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -48,7 +49,7 @@ from tests.unit.test_authority_guard import (
 
 GUARD = "jacked.api.authority_guard"
 STAMPED = "jacked.api.stamped_rotation"
-FP_SETTING = "last_authority_write_fp"
+FP_SETTING = "_last_authority_write_fp"
 OWNER_CONFIG = {
     "accountUuid": "uuid-5",
     "emailAddress": "erin@test.com",
@@ -192,6 +193,34 @@ def test_a_login_to_the_owner_makes_it_active_and_restamps_for_it(caplog):
     assert activate.calls[0][2].startswith("restamp-")
     assert lookup.calls == ["live_at_5"]
     assert _messages(caplog, "adopted as the active account") == [ADOPTION_LINE]
+    _assert_values_free(caplog)
+
+
+def test_a_raise_in_the_follow_keeps_the_repair_owed(caplog):
+    """The tokens are adopted, then a read raises. The next pass must still
+    follow the block, with no second profile request."""
+    db = _db()
+    _config(OWNER_CONFIG)
+    lookup = _profile("erin@test.com", "org-5")
+    activate = _Sequence(SwitchOutcome.COMMITTED)
+
+    with (
+        mock.patch(f"{STAMPED}.read_config_identity", side_effect=OSError("disk")),
+        _logs(caplog),
+    ):
+        first = _heal(db, activate, now=100.0, lookup=lookup)
+
+    assert first.action == "skipped"
+    assert db.accounts[5]["cc_refresh_token"] == "live_rt_5"
+    assert activate.calls == []
+    assert _pointers(db) == ("1", "1")
+
+    with _logs(caplog):
+        second = _heal(db, activate, now=161.0, lookup=lookup)
+
+    assert second == HealResult("adopted", foreign_account_id=5, desired_account_id=5)
+    assert _pointers(db) == ("5", "5")
+    assert lookup.calls == ["live_at_5"]
     _assert_values_free(caplog)
 
 

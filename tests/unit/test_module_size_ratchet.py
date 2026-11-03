@@ -34,11 +34,11 @@ LIMIT = 500
 # The line count of each module over LIMIT, sorted by path. Lower an entry
 # after each split, and remove it when the module is at or under LIMIT.
 BASELINE: dict[str, int] = {
-    "jacked/api/authority_guard.py": 1039,
+    "jacked/api/authority_guard.py": 1038,
     "jacked/api/claude_config_store.py": 554,
     "jacked/api/claude_identity.py": 601,
-    "jacked/api/credential_helpers.py": 1370,
-    "jacked/api/identity_watcher.py": 819,
+    "jacked/api/credential_helpers.py": 1364,
+    "jacked/api/identity_watcher.py": 799,
     "jacked/api/main.py": 797,
     "jacked/api/routes/auth.py": 2421,
     "jacked/api/routes/features.py": 1464,
@@ -52,7 +52,7 @@ BASELINE: dict[str, int] = {
     "jacked/credentials/transaction.py": 924,
     "jacked/dcr_settings.py": 755,
     "jacked/install_manifest.py": 602,
-    "jacked/launch.py": 1586,
+    "jacked/launch.py": 1568,
     "jacked/memory/capture.py": 785,
     "jacked/memory/migrate.py": 657,
     "jacked/memory/recall.py": 603,

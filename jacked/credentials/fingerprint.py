@@ -2,7 +2,7 @@
 
 The engine reports it for every committed activation
 (``SwitchResult.published_fingerprint``), and the authority guard keeps the
-last one it published (the ``last_authority_write_fp`` setting), so a later
+last one it published (the ``_last_authority_write_fp`` setting), so a later
 pass recognizes jacked's own write without a token value anywhere.
 """
 

@@ -135,11 +135,12 @@ class TestOwnershipDecidesTheImport:
         assert "BLOCKED" not in caplog.text
 
     @pytest.mark.parametrize("status_code", [401, 403])
-    def test_a_token_the_endpoint_refuses_is_refused_and_settles(
+    def test_a_token_the_endpoint_refuses_is_deferred_and_asked_once(
         self, tmp_path, caplog, status_code
     ):
-        """A revoked token never becomes provable, so the result settles and
-        the loop does not ask again every tick."""
+        """A 401 or a 403 names no owner, and an edge or a proxy can give it.
+        The file keeps the rotation, and the loop reuses the cached verdict
+        instead of asking again every tick."""
         db = _make_row(tmp_path, status="invalid")
         config_dir = _account_dir(tmp_path)
         _write_credentials(config_dir, "rot-at-2", "rot-rt-2")
@@ -147,12 +148,13 @@ class TestOwnershipDecidesTheImport:
         caplog.set_level(logging.INFO)
 
         with _patched(lookup):
-            assert _sync(config_dir, tmp_path) == "refused"
-            assert _sync(config_dir, tmp_path) == "refused"  # the cached verdict
+            assert _sync(config_dir, tmp_path) == "deferred"
+            assert _sync(config_dir, tmp_path) == "deferred"  # the cached verdict
 
         assert _cc(db) == ("row-at-1", "row-rt-1", "invalid")
         assert lookup.calls == 1
-        assert "Token sync BLOCKED for account 1: ownership not proven" in caplog.text
+        assert "without naming an owner" in caplog.text
+        assert "BLOCKED" not in caplog.text
 
     def test_an_expired_rotation_is_deferred_with_zero_lookups(
         self, tmp_path, caplog, monkeypatch
