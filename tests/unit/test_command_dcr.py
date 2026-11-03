@@ -422,19 +422,20 @@ def test_repo_wrapper_carries_tier_contract():
         assert anchor in wrapper, f"repo dcr wrapper missing tier anchor: {anchor}"
 
 
-def test_repo_wrapper_embeds_engine_body_verbatim():
+@pytest.mark.parametrize("name", ["dcr", "whats-next", "release", "qa", "ux", "docs-sync"])
+def test_repo_wrapper_embeds_engine_body_verbatim(name: str):
     """The wrapper contract is 'repo-config header + the shipped engine body
-    verbatim' — the engine being everything below the data skill's
-    `<!-- ENGINE -->` marker (frontmatter and repo-dispatch preamble dropped).
-    Anchor checks alone let the two drift on any non-anchor line; containment
-    makes desync impossible to miss."""
-    shipped = CMD.read_text(encoding="utf-8")
+    verbatim' for all six repo wrappers: the engine being everything below the
+    data skill's `<!-- ENGINE -->` marker (frontmatter and repo-dispatch
+    preamble dropped). Anchor checks alone let the two drift on any non-anchor
+    line; containment makes desync impossible to miss."""
+    shipped = (REPO_ROOT / "jacked" / "data" / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
     assert shipped.startswith("---\n")
     body = _engine_body(shipped)
-    wrapper = REPO_WRAPPER.read_text(encoding="utf-8")
+    wrapper = (REPO_ROOT / ".claude" / "skills" / name / "SKILL.md").read_text(encoding="utf-8")
     assert body in wrapper, (
-        "repo .claude/skills/dcr/SKILL.md no longer embeds the shipped engine body "
-        "verbatim — rebuild the wrapper (or re-run /jacked-setup dcr)"
+        f"repo .claude/skills/{name}/SKILL.md no longer embeds the shipped engine body "
+        f"verbatim: rebuild the wrapper (or re-run /jacked-setup {name})"
     )
 
 
