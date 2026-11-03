@@ -65,6 +65,8 @@ class TestUpgradeRefusal:
         result = CliRunner().invoke(main, ["upgrade"])
         assert result.exit_code == 2
         assert "pip" in result.output.lower()
+        # The reason is printed as it is: Rich must not drop "[tray]".
+        assert 'uv tool install "claude-jacked[tray]"' in " ".join(result.output.split())
         mock_run.assert_not_called()
         mock_popen.assert_not_called()
 
@@ -422,6 +424,22 @@ class TestUpgradeIsATransaction:
         assert "rolling back" in result.output.lower()
         assert "0.95.0" in result.output
         popen.assert_not_called()
+
+    def test_the_printed_commands_keep_the_tray_extra(self, tmp_path):
+        """Rich reads "[tray]" as a style tag. Unescaped, the echoed install
+        and rollback commands lost it, and the printed command was not the
+        command that ran."""
+        result, _run, _popen = self._invoke(
+            [_ok(), _fail(1, stderr="[FAIL] ValueError: nope"), _ok(), _ok(), _ok()],
+            tmp_path=tmp_path,
+        )
+
+        output = " ".join(result.output.split())
+        assert '$ uv tool install "claude-jacked[tray]" --force --refresh' in output
+        assert (
+            '$ uv tool install "claude-jacked[tray]==0.95.0" --force --refresh'
+            in output
+        )
 
     def test_refused_preflight_writes_the_recovery_file(self, tmp_path):
         recovery = tmp_path / "jacked-update-failed.txt"
@@ -1358,17 +1376,51 @@ class TestTargetLookup:
         does not serve it yet instead of "Upgrade complete"."""
         assert self._lookup("0.111.0", "0.110.2") == "0.111.0"
 
-    def test_a_failed_simple_index_does_not_hide_the_json_api_answer(self):
+    @staticmethod
+    def _probe_failures(caplog):
+        """The DEBUG lines that the probe guard wrote, then clear the capture.
+
+        A line names the probe and the error class only. The message of an
+        error can hold the index URL, so the line and the record carry no
+        message and no traceback.
+        """
+        import logging
+
+        lines = []
+        for record in caplog.records:
+            if record.name == "jacked.cli" and record.levelno == logging.DEBUG:
+                assert record.exc_info is None, record.getMessage()
+                lines.append(record.getMessage())
+        caplog.clear()
+        return sorted(lines)
+
+    def test_a_failed_simple_index_does_not_hide_the_json_api_answer(self, caplog):
+        caplog.set_level("DEBUG", logger="jacked.cli")
         assert self._lookup("0.110.2", None) == "0.110.2"
+        assert self._probe_failures(caplog) == []  # no answer is not a failure
         assert self._lookup("0.110.2", OSError("offline")) == "0.110.2"
+        assert self._probe_failures(caplog) == [
+            "Upgrade target probe get_latest_from_simple_index failed: OSError"
+        ]
 
-    def test_a_failed_json_api_does_not_hide_the_simple_index_answer(self):
+    def test_a_failed_json_api_does_not_hide_the_simple_index_answer(self, caplog):
+        caplog.set_level("DEBUG", logger="jacked.cli")
         assert self._lookup(OSError("offline"), "0.110.2") == "0.110.2"
+        assert self._probe_failures(caplog) == [
+            "Upgrade target probe get_latest_pypi_version failed: OSError"
+        ]
         assert self._lookup(None, "0.110.2") == "0.110.2"
+        assert self._probe_failures(caplog) == []
 
-    def test_both_probes_failing_is_none(self):
+    def test_both_probes_failing_is_none(self, caplog):
+        caplog.set_level("DEBUG", logger="jacked.cli")
         assert self._lookup(None, None) is None
+        assert self._probe_failures(caplog) == []
         assert self._lookup(OSError("offline"), OSError("offline")) is None
+        assert self._probe_failures(caplog) == [
+            "Upgrade target probe get_latest_from_simple_index failed: OSError",
+            "Upgrade target probe get_latest_pypi_version failed: OSError",
+        ]
 
     def test_an_answer_that_is_not_a_version_counts_as_no_answer(self):
         assert self._lookup("0.110.2", "garbage-version-string") == "0.110.2"

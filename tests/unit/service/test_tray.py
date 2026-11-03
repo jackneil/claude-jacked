@@ -1049,6 +1049,171 @@ class TestCheckDeps:
             tray.check_tray_deps()  # should not raise
 
 
+class TestPystrayLoadFailure:
+    """pystray 0.19.5 selects its backend at import, and its selector
+    catches only ImportError. On Linux, when PyGObject loads but neither
+    AppIndicator typelib is installed, the AppIndicator backend raises
+    ValueError. Then ``import pystray`` fails and the service does not start.
+    The import guard keeps the error, and ``check_tray_deps`` logs it at
+    WARNING before the start stops, so the tray log tells the reason. The
+    abort text names the error too, because a reinstall of the empty
+    ``[tray]`` extra cannot fix a missing typelib or a missing display."""
+
+    TYPELIB_ERROR = "Namespace AyatanaAppIndicator3 not available"
+    WARNING = (
+        "Tray: pystray could not load (ValueError: Namespace "
+        "AyatanaAppIndicator3 not available), so the service does not start. "
+        "See the README Linux tray notes."
+    )
+    BACKEND_ABORT = (
+        "The jacked service cannot start: pystray could not load (ValueError: "
+        "Namespace AyatanaAppIndicator3 not available).\n"
+        'See "Linux tray notes" in the jacked README: '
+        "https://github.com/jackneil/claude-jacked#linux-tray-notes"
+    )
+    INSTALL_ABORT = (
+        "Service mode requires the [tray] extra.\n"
+        'Install it with: uv tool install "claude-jacked[tray]" --force'
+    )
+
+    @classmethod
+    def _fake_site(cls, root):
+        """A directory with a pystray package whose import raises ValueError,
+        as the real one does when the AppIndicator typelibs are missing."""
+        package = root / "fake_site" / "pystray"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            f"raise ValueError({cls.TYPELIB_ERROR!r})\n", encoding="utf-8"
+        )
+        return package.parent
+
+    def test_a_backend_error_is_kept_with_its_class_and_message(
+        self, tmp_path, monkeypatch
+    ):
+        import sys
+
+        from jacked.service import tray
+
+        monkeypatch.syspath_prepend(str(self._fake_site(tmp_path)))
+        monkeypatch.delitem(sys.modules, "pystray", raising=False)
+
+        assert tray._import_pystray() == (None, f"ValueError: {self.TYPELIB_ERROR}")
+
+    def test_a_missing_package_gives_no_failure_text(self, monkeypatch):
+        import sys
+
+        from jacked.service import tray
+
+        monkeypatch.setitem(sys.modules, "pystray", None)  # import raises ImportError
+        assert tray._import_pystray() == (None, None)
+
+    def test_a_loaded_pystray_is_returned(self, monkeypatch):
+        import sys
+        import types
+
+        from jacked.service import tray
+
+        module = types.ModuleType("pystray")
+        monkeypatch.setitem(sys.modules, "pystray", module)
+        assert tray._import_pystray() == (module, None)
+
+    def test_a_backend_error_is_logged_and_named_in_the_abort(
+        self, monkeypatch, caplog
+    ):
+        from jacked.service import tray
+
+        monkeypatch.setattr(tray, "_TRAY_AVAILABLE", False)
+        monkeypatch.setattr(
+            tray, "_PYSTRAY_LOAD_FAILURE", f"ValueError: {self.TYPELIB_ERROR}"
+        )
+        with caplog.at_level(logging.WARNING), pytest.raises(SystemExit) as stopped:
+            tray.check_tray_deps()
+
+        assert stopped.value.code == self.BACKEND_ABORT
+        warnings = [
+            (record.name, record.getMessage())
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        ]
+        assert warnings == [("jacked.service.tray", self.WARNING)]
+
+    def test_a_missing_package_keeps_the_install_abort_with_no_warning(
+        self, monkeypatch, caplog
+    ):
+        from jacked.service import tray
+
+        monkeypatch.setattr(tray, "_TRAY_AVAILABLE", False)
+        monkeypatch.setattr(tray, "_PYSTRAY_LOAD_FAILURE", None)
+        with caplog.at_level(logging.WARNING), pytest.raises(SystemExit) as stopped:
+            tray.check_tray_deps()
+
+        assert stopped.value.code == self.INSTALL_ABORT
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_the_tray_log_names_the_error_when_the_start_stops(self, tmp_path):
+        """The real artifact, in a fresh interpreter: the tray module imports
+        a pystray that raises ValueError, the tray log is installed as
+        ``ServiceRunner.run`` installs it first, and the check stops the
+        start. A line logged at import time cannot reach the tray log,
+        because the module is imported before ``run`` installs the log."""
+        import os
+        import subprocess
+        import sys
+
+        home = tmp_path / "home"
+        home.mkdir()
+        script = tmp_path / "stops_on_import_error.py"
+        script.write_text(
+            "from jacked.service import tray\n"
+            "assert tray._TRAY_AVAILABLE is False\n"
+            "tray.ServiceRunner(host='127.0.0.1', port=9999)._install_tray_file_logger()\n"
+            "tray.check_tray_deps()\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env.update(HOME=str(home), USERPROFILE=str(home), PYTHONDONTWRITEBYTECODE="1")
+        env["PYTHONPATH"] = os.pathsep.join(
+            path for path in (str(self._fake_site(tmp_path)), env.get("PYTHONPATH")) if path
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            env=env, capture_output=True, text=True, timeout=120,
+        )
+
+        assert result.returncode == 1, result.stderr
+        assert self.BACKEND_ABORT in result.stderr, result.stderr
+        assert "[tray] extra" not in result.stderr, result.stderr
+        log = (home / ".claude" / "jacked-tray.log").read_text(encoding="utf-8")
+        assert f"jacked.service.tray WARNING {self.WARNING}" in log, log
+
+
+class TestSetupFunctionLength:
+    """JACKED_GUARDRAILS: 50 lines max per function. ``_setup`` grew to 75
+    lines, so its capability report and its failed-start notice are named
+    steps. The measure is the one ``test_updater.TestUpdaterFunctionLength``
+    uses."""
+
+    FUNCTIONS = {"_setup", "_report_tray_capabilities", "_notify_failed_start"}
+
+    def test_setup_and_its_steps_are_at_most_50_lines(self):
+        import ast
+        import inspect
+
+        from jacked.service import tray
+
+        tree = ast.parse(inspect.getsource(tray.ServiceRunner))
+        lengths = {
+            node.name: node.end_lineno - node.lineno + 1
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in self.FUNCTIONS
+        }
+        assert set(lengths) == self.FUNCTIONS, f"missing: {self.FUNCTIONS - set(lengths)}"
+        too_long = {name: n for name, n in lengths.items() if n > 50}
+        assert too_long == {}, f"functions over 50 lines: {too_long}"
+
+
 class TestVersionMenu:
     def test_version_text_when_current(self):
         """Not outdated: show the running __version__ (not cached latest)."""

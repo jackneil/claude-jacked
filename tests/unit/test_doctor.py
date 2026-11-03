@@ -150,12 +150,16 @@ def test_doctor_editable_install_recovery(monkeypatch):
     assert "git pull" in result.output or "uv sync" in result.output
 
 
-def test_doctor_pip_install_recovery(monkeypatch):
+@pytest.mark.parametrize("method", ["pip", "unknown (no metadata)"])
+def test_doctor_install_recovery_prints_the_tray_extra(monkeypatch, method):
+    """Rich reads "[tray]" as a style tag. The literal must be escaped, or the
+    printed recovery command loses the extra."""
     from jacked import install_method
-    monkeypatch.setattr(install_method, "detect_install_method", lambda: "pip")
+    monkeypatch.setattr(install_method, "detect_install_method", lambda: method)
     from jacked.cli import main
     result = CliRunner().invoke(main, ["doctor"])
-    assert "uv tool install" in result.output
+    output = " ".join(result.output.split())
+    assert 'uv tool install "claude-jacked[tray]" --force' in output
 
 
 # #178i: doctor's recovery and the launchd job that never ran
