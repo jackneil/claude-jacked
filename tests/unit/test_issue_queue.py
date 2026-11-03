@@ -1026,7 +1026,10 @@ class TestRefreshPass:
         (broken / ".git").chmod(0o000)
         healthy = _repo(tmp_path, "healthy")
         db = FakeDb([str(broken), str(healthy)])
-        caplog.set_level(logging.DEBUG)
+        # Name the loggers: another test can leave the "jacked" logger above
+        # DEBUG, and a root-level set_level does not lower a child's own level.
+        caplog.set_level(logging.DEBUG, logger=HOOK_LOGGER)
+        caplog.set_level(logging.DEBUG, logger=REFRESH_LOGGER)
         try:
             written = asyncio.run(
                 refresh.refresh_pass(SimpleNamespace(state=SimpleNamespace(db=db)))
