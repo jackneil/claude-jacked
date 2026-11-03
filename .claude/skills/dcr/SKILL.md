@@ -67,7 +67,7 @@ Touching any of these forces the LARGE risk tier (full reviewer fan-out):
 - `.github/workflows/` (supply chain: pinned action SHAs, harden-runner, OIDC publish)
 
 <!-- Staleness fingerprint - the engine compares these against the live repo on each run -->
-- **Generated at commit**: 41cb42178e096b671876f5989033a577963504e2
+- **Generated at commit**: 34ceb47d71d4af6a20ae85389a16a0a0b07bdf04
 - **Detected stack**: pyproject.toml
 
 ## Config Staleness Check
