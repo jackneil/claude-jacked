@@ -183,7 +183,7 @@ def normalize_rate_limits(result: Mapping) -> dict:
             key = f"percent:{slot}:{type(value).__name__}"
             (logger.debug if key in _warned_shapes else logger.warning)(
                 "codex rate-limit %s window has no finite usedPercent (a %s "
-                "value); it is stored as no reading",
+                "value); the cache keeps the last reading and reset of the window",
                 slot, type(value).__name__,
             )
             _warned_shapes.add(key)

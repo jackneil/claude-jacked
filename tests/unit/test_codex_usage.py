@@ -13,11 +13,12 @@ import base64
 import json
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from jacked.codex import usage as cu
+from jacked.web.auto_swap.walls import walled_reason
 from jacked.web.database import Database
 from tests._platform import write_python_shim
 
@@ -957,6 +958,43 @@ def test_fetch_never_caches_a_used_percent_that_is_not_a_finite_number(
     assert row["cached_usage_7d"] == 26
 
 
+@pytest.mark.parametrize(
+    "value", [json.loads("1e999"), float("nan"), "Infinity", float("-inf"), None]
+)
+def test_fetch_never_pairs_the_last_weekly_percent_with_the_next_reset(
+    db, tmp_path, monkeypatch, value
+):
+    """M6 W1, Codex side: a weekly rollover read whose usedPercent is null or
+    not a finite number keeps the last weekly pair, so the walls see no wall.
+    A reset travels only with its percent."""
+    cu._warned_shapes.clear()
+    now = datetime.now(timezone.utc)
+    expired = (now - timedelta(hours=1)).isoformat()
+    next_week = int((now + timedelta(days=7)).timestamp())
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    db.update_account_usage_cache(acct["id"], seven_day=100.0, seven_day_resets_at=expired)
+
+    async def fake_read(**kwargs):
+        return {"rateLimits": {
+            "primary": {"usedPercent": 4, "windowDurationMins": 300,
+                        "resetsAt": int(now.timestamp()) + 3600},
+            "secondary": {"usedPercent": value, "windowDurationMins": 10080,
+                          "resetsAt": next_week},
+            "planType": "pro",
+        }}
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    assert asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    row = db.get_account(acct["id"])
+    assert (row["cached_usage_7d"], row["cached_7d_resets_at"]) == (100.0, expired)
+    assert walled_reason(row, now) is None
+    # Not vacuous: the last weekly percent beside the next reset is a wall.
+    next_iso = datetime.fromtimestamp(next_week, timezone.utc).isoformat()
+    assert walled_reason({**row, "cached_7d_resets_at": next_iso}, now).startswith(
+        "weekly critical"
+    )
+
+
 def test_an_unreadable_used_percent_warns_once_without_its_value(caplog):
     import logging
 
@@ -967,4 +1005,5 @@ def test_an_unreadable_used_percent_warns_once_without_its_value(caplog):
     ours = [r for r in caplog.records if "usedPercent" in r.getMessage()]
     assert [r.levelno for r in ours] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
     assert "five_hour" in ours[0].getMessage() and "str" in ours[0].getMessage()
+    assert "the cache keeps the last reading and reset" in ours[0].getMessage()
     assert all("Infinity" not in r.getMessage() for r in ours)

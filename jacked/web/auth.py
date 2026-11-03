@@ -1162,18 +1162,21 @@ _UNREADABLE_LOGGED: set = set()
 
 def _note_unreadable(window: str, field: str, value) -> None:
     """Log, once per window, field and value type, a provider value that the
-    cache stores as no value. *field* is "reset" or "utilization". The line
-    names the type, never the value."""
+    cache cannot read. *field* is "reset" (the cache stores no reset) or
+    "utilization" (the cache keeps the last reading and reset of the window).
+    The line names the type, never the value."""
     key = (window, field, type(value).__name__)
     if key in _UNREADABLE_LOGGED:
         return
     _UNREADABLE_LOGGED.add(key)
-    must_be, stored_as = (
-        ("a timestamp", "no reset") if field == "reset" else ("a finite number", "no reading")
+    must_be, outcome = (
+        ("a timestamp", "it is stored as no reset")
+        if field == "reset"
+        else ("a finite number", "the cache keeps the last reading and reset of the window")
     )
     logger.warning(
-        "Usage payload: the %s %s is not %s (a %s value); it is stored as %s",
-        window, field, must_be, type(value).__name__, stored_as,
+        "Usage payload: the %s %s is not %s (a %s value); %s",
+        window, field, must_be, type(value).__name__, outcome,
     )
 
 
@@ -1182,21 +1185,35 @@ def usage_cache_updates(data: dict) -> dict:
 
     A window key that is missing keeps the old cache. A window that is null
     (no active window) clears that window. A window object with a null
-    ``resets_at`` keeps its utilization and clears the stale reset time. A
-    ``resets_at`` that is not a timestamp (an empty string, junk) is stored
-    as no reset (:func:`jacked.web.window_keeper.cache_reset_value`). A
-    ``utilization`` that is not a finite number (NaN, an infinity, junk) is
-    no reading (:func:`jacked.service.pill_text.percent_reading`, the reader
-    of every usage percent): the rules of a null utilization apply to it.
+    ``utilization`` and no reset is also no active window: it clears that
+    window. A window object with a null ``resets_at`` keeps its utilization
+    and clears the stale reset time. A ``resets_at`` that is not a timestamp
+    (an empty string, junk) is stored as no reset
+    (:func:`jacked.web.window_keeper.cache_reset_value`).
+
+    A reset travels only with its percent. A new reset beside the old
+    percent pairs two different windows. For example, after a rollover, 100%
+    of the expired week beside the reset of the next week reads as a wall.
+    Thus a window object with a reset but no percent writes nothing: the
+    cache keeps the last percent and the last reset of that window together.
+
+    A window has no percent when its ``utilization`` is null (the provider
+    reports no reading) or is not a finite number (NaN, an infinity, junk).
+    The one reader of every usage percent
+    (:func:`jacked.service.pill_text.percent_reading`) rejects the second
+    kind. A rejected value makes the window unreadable: this function writes
+    nothing for that window, also when it has no reset. A WARNING names the
+    window and the value type once, never the value.
 
     One exception to "a missing key keeps the cache": an authoritative Claude
     ``limits`` list (a list in which every entry has a kind in
     ``jacked.usage_plans.KNOWN_CLAUDE_LIMIT_KINDS``) names every limit the
-    account has. When that list has no ``session`` entry and ``five_hour``
-    is not an object with a reading or a reset, the account has no 5-hour
-    window (a verified Ultra): the 5-hour columns are cleared even when the
-    ``five_hour`` key is missing. A list with an unknown kind is not
-    authoritative, so a renamed session kind can never clear a live window.
+    account has. When that list has no ``session`` entry, the account has no
+    5-hour window (a verified Ultra): a missing ``five_hour`` key then clears
+    the 5-hour columns too. A ``five_hour`` object is not missing: the rules
+    above apply to it, whatever the list says. A list with an unknown kind is
+    not authoritative, so a renamed session kind can never clear a live
+    window.
 
     >>> usage_cache_updates({"five_hour": None, "seven_day": {"utilization": 3}})
     {'clear_five_hour': True, 'seven_day': 3.0, 'clear_seven_day_reset': True}
@@ -1206,7 +1223,12 @@ def usage_cache_updates(data: dict) -> dict:
     {'seven_day': 3.0, 'clear_seven_day_reset': True}
     >>> usage_cache_updates({"seven_day": {"utilization": float("inf"),
     ...                                    "resets_at": "2026-11-08T00:00:00Z"}})
-    {'seven_day_resets_at': '2026-11-08T00:00:00Z'}
+    {}
+    >>> usage_cache_updates({"seven_day": {"utilization": None,
+    ...                                    "resets_at": "2026-11-08T00:00:00Z"}})
+    {}
+    >>> usage_cache_updates({"seven_day": {"utilization": None, "resets_at": None}})
+    {'clear_seven_day': True}
     >>> usage_cache_updates({})
     {}
     >>> usage_cache_updates({"limits": [{"kind": "weekly_all"}],
@@ -1242,17 +1264,24 @@ def usage_cache_updates(data: dict) -> dict:
         if not isinstance(window, dict):
             updates[f"clear_{short}"] = True
             continue
-        utilization = percent_reading(window.get("utilization"))
-        if utilization is None and window.get("utilization") is not None:
-            _note_unreadable(short, "utilization", window.get("utilization"))
+        raw_utilization = window.get("utilization")
+        utilization = percent_reading(raw_utilization)
+        if utilization is None and raw_utilization is not None:
+            # Unreadable. A reset travels only with its percent, so the old
+            # percent and its reset stay together: a new reset alone would
+            # join the old percent to the next window.
+            _note_unreadable(short, "utilization", raw_utilization)
+            continue
         resets_at = cache_reset_value(window.get("resets_at"))
         if resets_at is None and window.get("resets_at") is not None:
             _note_unreadable(short, "reset", window.get("resets_at"))
-        if utilization is None and resets_at is None:
-            updates[f"clear_{short}"] = True
+        if utilization is None:
+            if resets_at is None:
+                # No reading and no reset: no window is open.
+                updates[f"clear_{short}"] = True
+            # No reading: the same rule keeps a new reset out of the cache.
             continue
-        if utilization is not None:
-            updates[short] = utilization
+        updates[short] = utilization
         if resets_at is None:
             updates[f"clear_{short}_reset"] = True
         else:

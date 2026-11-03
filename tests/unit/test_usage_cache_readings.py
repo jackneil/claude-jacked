@@ -1,37 +1,61 @@
-"""A provider utilization that is not a finite number is stored as no reading.
+"""A usage reset travels only with its percent.
 
 #231i: Python's json reads 1e999 as infinity, and NaN as NaN. The Claude usage
 mapping stored them in ``cached_usage_5h`` and ``cached_usage_7d``. There an
 infinite weekly reading read as a wall, ``jacked usage --json`` printed
 ``Infinity``, and the usage poll could not send its WebSocket message. The
-mapping now reads the utilization with the one reader of every usage percent
-(:func:`jacked.service.pill_text.percent_reading`). A value that is not a
-finite number then follows the rules of a null utilization.
+mapping reads the utilization with the one reader of every usage percent
+(:func:`jacked.service.pill_text.percent_reading`).
+
+M6 review wave 1 (W1): the first fix gave a rejected percent the rules of a
+null utilization. A payload with a rejected percent and a valid reset then
+wrote the new reset beside the old percent. After a weekly rollover the cache
+paired 100% of the expired week with the reset of the next week, and the
+walls read "weekly critical". A null utilization (the provider reports no
+reading) with a valid reset did the same before M6. Now a reset travels only
+with its percent: a window with a reset but no percent writes nothing, and
+the cache keeps the last percent and the last reset of that window together.
+A rejected percent makes the window unreadable, also when it has no reset. A
+null percent with no reset still clears the window: no window is open.
 """
 
+import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from jacked.web import auth
+from jacked.web.auto_swap.walls import walled_reason
 from jacked.web.database import Database
 
-RESET = "2026-11-08T00:00:00+00:00"
+OLD_RESET = "2026-11-01T00:00:00+00:00"
+NEW_RESET = "2026-11-08T00:00:00+00:00"
 
-VALUES = [
-    pytest.param(json.loads("1e999"), None, id="1e999"),
-    pytest.param(float("nan"), None, id="nan"),
-    pytest.param("Infinity", None, id="Infinity-string"),
-    pytest.param(float("-inf"), None, id="-inf"),
-    pytest.param("92", 92.0, id="numeric-string"),
+REJECTED = [
+    pytest.param(json.loads("1e999"), id="1e999"),
+    pytest.param(float("nan"), id="nan"),
+    pytest.param("Infinity", id="Infinity-string"),
+    pytest.param(float("-inf"), id="-inf"),
+]
+
+# No percent: a rejected value, or a null (the provider reports no reading).
+NO_PERCENT = [*REJECTED, pytest.param(None, id="null")]
+
+WINDOWS = [
+    pytest.param("five_hour", "cached_usage_5h", "cached_5h_resets_at", id="5h"),
+    pytest.param("seven_day", "cached_usage_7d", "cached_7d_resets_at", id="7d"),
 ]
 
 
 @pytest.fixture(autouse=True)
-def _fresh_log_state(monkeypatch):
+def _fresh_module_state(monkeypatch):
     monkeypatch.setattr(auth, "_UNREADABLE_LOGGED", set())
+    monkeypatch.setattr(auth, "_account_usage_state", {})
+    monkeypatch.setattr(auth, "_profile_refreshed_at", {})
 
 
 @pytest.fixture
@@ -41,39 +65,138 @@ def db(tmp_path):
     d.close()
 
 
-@pytest.mark.parametrize("value,expected", VALUES)
-@pytest.mark.parametrize(
-    "window,column", [("five_hour", "cached_usage_5h"), ("seven_day", "cached_usage_7d")]
-)
-def test_a_utilization_that_is_not_a_finite_number_is_no_reading(
-    db, window, column, value, expected
-):
-    updates = auth.usage_cache_updates({window: {"utilization": value, "resets_at": RESET}})
-    assert updates.get(window) == expected
-    assert updates[f"{window}_resets_at"] == RESET  # the reset is still real
-    json.dumps(updates, allow_nan=False)
-    # Through the real cache writer: the column keeps its last finite reading.
+def _account(db, **cache) -> int:
+    """A Claude account whose usage cache holds *cache*."""
     acct = db.create_account("u@x.com", "tok", int(time.time()) + 3600)
-    db.update_account_usage_cache(acct["id"], **{window: 40.0})
-    db.update_account_usage_cache(acct["id"], **updates)
-    assert db.get_account(acct["id"])[column] == (40.0 if expected is None else expected)
+    db.update_account_usage_cache(acct["id"], **cache)
+    return acct["id"]
 
 
-def test_an_unreadable_utilization_with_no_reset_clears_the_window():
-    # The rule of a null utilization with no reset: no window is open.
-    assert auth.usage_cache_updates(
-        {"seven_day": {"utilization": float("nan"), "resets_at": None}}
-    ) == {"clear_seven_day": True}
+def _store_read(db, account_id: int, payload: dict) -> dict:
+    """Store *payload* the way production does, and return the account row.
+
+    One real ``fetch_usage`` call gets a 200 reply that carries *payload*,
+    and the real cache writer stores it. The test first moves the last read
+    one hour back, so that the pacing floor lets the call through.
+    """
+    db.update_account(account_id, usage_cached_at=int(time.time()) - 3600)
+    auth._account_usage_state.pop(account_id, None)
+    reply = MagicMock(status_code=200, headers={})
+    reply.json.return_value = payload
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=reply)
+    with patch.object(auth.httpx, "AsyncClient", return_value=client), patch.object(
+        auth, "fetch_profile", new=AsyncMock()
+    ):
+        assert asyncio.run(auth.fetch_usage(account_id, db)) is payload
+    client.get.assert_awaited_once()
+    return db.get_account(account_id)
 
 
-def test_an_unreadable_utilization_is_logged_once_without_its_value(caplog):
+@pytest.mark.parametrize("value", NO_PERCENT)
+def test_a_weekly_read_with_no_percent_never_pairs_the_old_week_with_the_next_reset(
+    db, value
+):
+    """The W1 regression: a rollover read with no percent is no wall."""
+    now = datetime.now(timezone.utc)
+    expired = (now - timedelta(hours=1)).isoformat()
+    next_week = (now + timedelta(days=7)).isoformat()
+    aid = _account(db, seven_day=100.0, seven_day_resets_at=expired)
+    assert walled_reason(db.get_account(aid), now) is None  # that week is over
+
+    row = _store_read(db, aid, {"seven_day": {"utilization": value, "resets_at": next_week}})
+
+    assert (row["cached_usage_7d"], row["cached_7d_resets_at"]) == (100.0, expired)
+    assert walled_reason(row, now) is None
+    # Not vacuous: the old percent beside the next reset is a wall.
+    assert walled_reason({**row, "cached_7d_resets_at": next_week}, now).startswith(
+        "weekly critical"
+    )
+
+
+@pytest.mark.parametrize("value", NO_PERCENT)
+@pytest.mark.parametrize("window,column,reset_column", WINDOWS)
+def test_a_reset_with_no_percent_writes_nothing_for_its_window(
+    db, window, column, reset_column, value
+):
+    payload = {window: {"utilization": value, "resets_at": NEW_RESET}}
+    assert auth.usage_cache_updates(payload) == {}
+    aid = _account(db, **{window: 40.0, f"{window}_resets_at": OLD_RESET})
+
+    row = _store_read(db, aid, payload)
+
+    assert (row[column], row[reset_column]) == (40.0, OLD_RESET)
+
+
+@pytest.mark.parametrize("reset", [None, "", "soon"])
+def test_a_rejected_percent_keeps_its_window_whatever_the_reset(reset):
+    # A null percent with no reset clears the window: no window is open. A
+    # rejected percent says nothing about the window, so nothing is written.
+    payload = {"seven_day": {"utilization": float("nan"), "resets_at": reset}}
+    assert auth.usage_cache_updates(payload) == {}
+
+
+@pytest.mark.parametrize("reset", [None, "", "soon"])
+def test_a_null_percent_with_no_reset_is_no_active_window(db, reset):
+    """A null percent with no usable reset clears the window, and so does a
+    null window object: in both, no window is open."""
+    payload = {"seven_day": {"utilization": None, "resets_at": reset}}
+    assert auth.usage_cache_updates(payload) == {"clear_seven_day": True}
+    assert auth.usage_cache_updates({"seven_day": None}) == {"clear_seven_day": True}
+    aid = _account(db, seven_day=40.0, seven_day_resets_at=OLD_RESET)
+
+    row = _store_read(db, aid, payload)
+
+    assert (row["cached_usage_7d"], row["cached_7d_resets_at"]) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "value", [pytest.param(float("nan"), id="nan"), pytest.param(None, id="null")]
+)
+def test_a_five_hour_read_with_no_percent_beside_a_good_weekly_window(db, value):
+    aid = _account(
+        db,
+        five_hour=100.0,
+        five_hour_resets_at=OLD_RESET,
+        seven_day=40.0,
+        seven_day_resets_at=OLD_RESET,
+    )
+
+    row = _store_read(
+        db,
+        aid,
+        {
+            "five_hour": {"utilization": value, "resets_at": NEW_RESET},
+            "seven_day": {"utilization": 41.0, "resets_at": NEW_RESET},
+        },
+    )
+
+    assert (row["cached_usage_5h"], row["cached_5h_resets_at"]) == (100.0, OLD_RESET)
+    assert (row["cached_usage_7d"], row["cached_7d_resets_at"]) == (41.0, NEW_RESET)
+
+
+def test_a_numeric_string_percent_is_a_reading():
+    updates = auth.usage_cache_updates(
+        {"seven_day": {"utilization": "92", "resets_at": NEW_RESET}}
+    )
+    assert updates == {"seven_day": 92.0, "seven_day_resets_at": NEW_RESET}
+
+
+def test_a_rejected_percent_is_logged_once_without_its_value(caplog):
     with caplog.at_level(logging.WARNING, logger="jacked.auth"):
         for _ in range(3):
             auth.usage_cache_updates(
-                {"seven_day": {"utilization": "Infinity", "resets_at": RESET}}
+                {"seven_day": {"utilization": "Infinity", "resets_at": "soon"}}
             )
-            auth.usage_cache_updates({"seven_day": {"utilization": None, "resets_at": RESET}})
-    messages = [r.getMessage() for r in caplog.records if "not a finite number" in r.getMessage()]
-    assert len(messages) == 1  # once, and a null utilization is no anomaly
-    assert "seven_day" in messages[0] and "str" in messages[0]
-    assert "Infinity" not in messages[0]
+            auth.usage_cache_updates({"seven_day": {"utilization": None, "resets_at": NEW_RESET}})
+    lines = [r.getMessage() for r in caplog.records]
+    percent_lines = [m for m in lines if "not a finite number" in m]
+    assert len(percent_lines) == 1  # once, and a null utilization is no anomaly
+    assert "seven_day" in percent_lines[0] and "str" in percent_lines[0]
+    assert "Infinity" not in percent_lines[0]
+    assert "keeps the last reading and reset" in percent_lines[0]
+    # The reset of an unreadable window is not read, so no line says that
+    # the cache stores it as no reset.
+    assert not [m for m in lines if "not a timestamp" in m]

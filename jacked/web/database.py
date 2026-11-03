@@ -1874,7 +1874,48 @@ class Database:
         >>> st["pending_windows"], st["pending_until"], st["pending_reason"]
         (['5h'], 1800000900, 'read_no_window')
         """
-        unknown = set(fields) - self.KEEPER_STATE_FIELDS
+        merged = self._merge_keeper_state(account_id, None, fields)
+        return {} if merged is None else merged
+
+    def set_keeper_state_if(self, account_id: int, expected: dict, **fields: Any) -> bool:
+        """Compare-and-swap form of :meth:`set_keeper_state`.
+
+        Merges *fields* only while every ``expected`` key still holds its
+        expected value. A key that the state does not have holds None. The
+        check and the write run in one writer transaction, the same shape as
+        :meth:`update_account_if_unchanged`. Values compare in their JSON
+        form: NaN never equals itself, so a plain comparison would refuse
+        every write to a state that holds a NaN. Returns True when it wrote,
+        and False when a key changed or the account does not exist.
+
+        >>> db = Database(":memory:")
+        >>> acct = db.create_account("c@test.com", "tok", 9999999999)
+        >>> _ = db.set_keeper_state(acct["id"], last_status="ping_pending", last_ping_at=100)
+        >>> gen = {"last_status": "ping_pending", "last_ping_at": 100}
+        >>> db.set_keeper_state_if(acct["id"], gen, last_status="ok")
+        True
+        >>> db.set_keeper_state_if(acct["id"], gen, last_status="ping_ok_no_window")
+        False
+        >>> Database.parse_keeper_state(db.get_account(acct["id"])["keeper_state"])["last_status"]
+        'ok'
+        >>> _ = db.set_keeper_state(acct["id"], last_ping_at=float("nan"))
+        >>> db.set_keeper_state_if(acct["id"], {"last_ping_at": float("nan")}, skip_reason=None)
+        True
+        >>> db.set_keeper_state_if(999, {}, last_status="ok")
+        False
+        """
+        return self._merge_keeper_state(account_id, expected, fields) is not None
+
+    def _merge_keeper_state(
+        self, account_id: int, expected: Optional[dict], fields: dict
+    ) -> Optional[dict]:
+        """The read-merge-write of the keeper state, in one writer transaction.
+
+        Returns the merged state. Returns None when the account does not
+        exist, or when a key of *expected* does not hold its value (see
+        :meth:`set_keeper_state_if`); nothing is written then.
+        """
+        unknown = (set(fields) | set(expected or ())) - self.KEEPER_STATE_FIELDS
         if unknown:
             raise ValueError(f"Unknown keeper_state fields: {sorted(unknown)}")
         with self._writer() as conn:
@@ -1883,8 +1924,13 @@ class Database:
                 (account_id,),
             ).fetchone()
             if row is None:
-                return {}
+                return None
             state = self.parse_keeper_state(row[0])
+            if expected and any(
+                json.dumps(state.get(key), sort_keys=True) != json.dumps(value, sort_keys=True)
+                for key, value in expected.items()
+            ):
+                return None
             state.update(fields)
             state["updated_at"] = int(time.time())
             conn.execute(
