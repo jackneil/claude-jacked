@@ -419,9 +419,9 @@ def _assert_json_safe(models):
 
 @pytest.fixture
 def _fresh_skip_log(monkeypatch):
-    from jacked.service import menubar_summary
+    from jacked.service import per_model_sources
 
-    monkeypatch.setattr(menubar_summary, "_SKIPPED_LIMITS_LOGGED", set())
+    monkeypatch.setattr(per_model_sources, "_SKIPPED_LIMITS_LOGGED", set())
 
 
 @pytest.mark.parametrize("percent", BAD_PERCENTS)
@@ -491,10 +491,10 @@ def test_a_percent_that_is_not_a_number_is_no_reading(percent):
 def test_a_skipped_limit_warns_once_and_never_logs_the_value(caplog):
     import logging
 
-    with caplog.at_level(logging.DEBUG, logger="jacked.service.menubar_summary"):
+    with caplog.at_level(logging.DEBUG, logger="jacked.service.per_model_sources"):
         for _ in range(3):
             parse_per_model(_claude_payload(percent=INF_FROM_JSON))
-    ours = [r for r in caplog.records if r.name == "jacked.service.menubar_summary"]
+    ours = [r for r in caplog.records if r.name == "jacked.service.per_model_sources"]
     warnings = [r.getMessage() for r in ours if r.levelno == logging.WARNING]
     debugs = [r.getMessage() for r in ours if r.levelno == logging.DEBUG]
     assert len(warnings) == 1 and "entry fable from limits" in warnings[0]
