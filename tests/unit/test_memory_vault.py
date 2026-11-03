@@ -983,10 +983,15 @@ def test_a_traversing_group_argument_cannot_hide_the_mark(env, group):
 # status: the session-start load caps (#98i), printed after everything else
 # --------------------------------------------------------------------------- #
 
-STATUS_MEMORY_230_LINE = (
-    "MEMORY.md is 230 lines / 27.0 KB; Claude Code loads only the first "
+STATUS_MEMORY_230_TAIL = (
+    "is 230 lines / 27.0 KB; Claude Code loads only the first "
     "200 lines / 25 KB; run memory-librarian"
 )
+
+
+def _status_230_line(memory) -> str:
+    """The status line for a 230-line index: its folder, with home as ``~``."""
+    return f"MEMORY.md (~/.claude/projects/{memory.parent.parent.name}/memory) {STATUS_MEMORY_230_TAIL}"
 
 
 def _budget_memory(env):
@@ -1016,17 +1021,19 @@ def _status_lines(env):
 
 
 def test_status_prints_the_budget_line_last_before_init(env):
-    _seed_over_cap(_budget_memory(env))
+    memory = _budget_memory(env)
+    _seed_over_cap(memory)
     lines = _status_lines(env)
-    assert lines[-1] == STATUS_MEMORY_230_LINE
+    assert lines[-1] == _status_230_line(memory)
     assert any("jacked memory init" in line for line in lines[:-1])
 
 
 def test_status_prints_the_budget_line_after_the_no_groups_note(env):
     _init_empty(env)
-    _seed_over_cap(_budget_memory(env))
+    memory = _budget_memory(env)
+    _seed_over_cap(memory)
     lines = _status_lines(env)
-    assert lines[-1] == STATUS_MEMORY_230_LINE
+    assert lines[-1] == _status_230_line(memory)
     assert lines[-2] == "No groups yet."
 
 
@@ -1036,9 +1043,10 @@ def test_status_prints_the_budget_line_after_the_groups_table(env):
         "memory", "add", "--type", "decision", "--title", "One",
         "--group", "hank", "--body", "Body.",
     ])
-    _seed_over_cap(_budget_memory(env))
+    memory = _budget_memory(env)
+    _seed_over_cap(memory)
     lines = _status_lines(env)
-    assert lines[-1] == STATUS_MEMORY_230_LINE
+    assert lines[-1] == _status_230_line(memory)
     assert any("hank" in line for line in lines[:-1])
 
 
@@ -1059,10 +1067,24 @@ def test_status_keeps_each_budget_line_whole_on_a_narrow_console(env):
     """A pipe or a narrow terminal must still get one line per warning."""
     narrow = StringIO()
     env.monkeypatch.setattr(cli, "console", Console(file=narrow, width=60, highlight=False))
-    _seed_over_cap(_budget_memory(env))
+    memory = _budget_memory(env)
+    _seed_over_cap(memory)
     r = CliRunner().invoke(main, ["memory", "status"])
     assert r.exit_code == 0, r.output
-    assert STATUS_MEMORY_230_LINE in narrow.getvalue().splitlines()
+    assert _status_230_line(memory) in narrow.getvalue().splitlines()
+
+
+@pytest.mark.parametrize("ch", [
+    "\x80", "\x85", "\x9b", "\x9f",  # C1 controls (U+009B is CSI)
+    "\u200e", "\u200f", "\u202a", "\u202e", "\u2066", "\u2069",  # bidi marks and overrides
+])
+def test_strip_control_removes_c1_controls_and_bidi_overrides(ch):
+    assert vault_mod.strip_control(f"a{ch}b") == "ab"
+
+
+def test_one_line_reads_a_line_break_control_as_a_space():
+    """NEL and CR end a line; one_line keeps the words apart, then strips."""
+    assert vault_mod.one_line("a\x85b\rc\u2028d\x9be") == "a b c de"
 
 
 def test_strip_control_keeps_tab_and_newline_and_strips_cr():

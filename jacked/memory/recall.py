@@ -32,6 +32,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from jacked.findbin import require_bin
 from jacked.memory import vault as vault_mod
 
 logger = logging.getLogger(__name__)
@@ -546,7 +547,7 @@ def _maybe_sync(vault: Path, home: Path, state: dict) -> None:
 def _has_remote(vault: Path) -> bool:
     try:
         proc = subprocess.run(
-            ["git", "-C", str(vault), "remote", "get-url", "origin"],
+            [require_bin("git"), "-C", str(vault), "remote", "get-url", "origin"],
             capture_output=True, text=True, timeout=_SYNC_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )
@@ -561,7 +562,7 @@ def _is_dirty(vault: Path) -> bool:
     GIT_OPTIONAL_LOCKS=0 keeps the status read off the index.lock a capture commit needs."""
     try:
         proc = subprocess.run(
-            ["git", "-C", str(vault), "status", "--porcelain"],
+            [require_bin("git"), "-C", str(vault), "status", "--porcelain"],
             capture_output=True, text=True, timeout=_SYNC_TIMEOUT,
             stdin=subprocess.DEVNULL, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
@@ -576,7 +577,7 @@ def _pull_ff_only(vault: Path) -> tuple[bool, str | None]:
     """``git pull --ff-only``. Returns (ok, one_line_error_or_None)."""
     try:
         proc = subprocess.run(
-            ["git", "-C", str(vault), "pull", "--ff-only"],
+            [require_bin("git"), "-C", str(vault), "pull", "--ff-only"],
             capture_output=True, text=True, timeout=_SYNC_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )
@@ -599,5 +600,4 @@ def _within_minutes(iso: str, minutes: int) -> bool:
 
 
 def _one_line(s: str) -> str:
-    collapsed = " ".join(vault_mod._CONTROL_CHARS_RE.sub("", s or "").split())
-    return collapsed[:_ERR_MAXLEN]
+    return vault_mod.one_line(s)[:_ERR_MAXLEN]

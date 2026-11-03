@@ -311,9 +311,9 @@ def _ensure_shared_symlinks(config_dir: Path) -> None:
         except OSError:
             if is_dir and os.name == "nt":
                 try:
-                    from jacked.winproc import NO_WINDOW
+                    from jacked.winproc import NO_WINDOW, system_program
                     subprocess.run(
-                        ["cmd", "/c", "mklink", "/J", str(target), str(source)],
+                        [system_program("cmd"), "/c", "mklink", "/J", str(target), str(source)],
                         capture_output=True, timeout=5,
                         creationflags=NO_WINDOW,
                     )

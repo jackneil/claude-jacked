@@ -22,6 +22,8 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
+from jacked.winproc import system_program
+
 TASK_XML_DECLARATION = '<?xml version="1.0" encoding="UTF-16"?>\r\n'
 
 _DECLARATION = re.compile(r"\A\s*<\?xml[^>]*\?>\s*")
@@ -132,8 +134,10 @@ def task_query_command(service_id: str) -> list[str]:
     does not exist, ``TASK_QUERY_FAILED_EXIT`` on any other failure.
 
     >>> command = task_query_command("ai.hank.jacked")
-    >>> command[0], "UTF8Encoding" in command[-1], "GetTask('ai.hank.jacked')" in command[-1]
-    ('powershell.exe', True, True)
+    >>> command[0].endswith("powershell.exe"), "UTF8Encoding" in command[-1]
+    (True, True)
+    >>> "GetTask('ai.hank.jacked')" in command[-1]
+    True
     >>> "GetTask('it''s')" in task_query_command("it's")[-1]
     True
     """
@@ -148,7 +152,7 @@ def task_query_command(service_id: str) -> list[str]:
         f"{{exit {TASK_ABSENT_EXIT}}}else{{exit {TASK_QUERY_FAILED_EXIT}}}}};"
         "[Console]::Out.Write($task.Xml)"
     )
-    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]
+    return [system_program("powershell"), "-NoProfile", "-NonInteractive", "-Command", script]
 
 
 def query_task_xml(run: Any, service_id: str, *, timeout: float) -> TaskQuery:

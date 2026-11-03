@@ -31,6 +31,13 @@ from pathlib import Path
 # because vault state, vault config, rollups, settings_io and the route
 # handlers import it from this module.
 from jacked.atomic_io import atomic_write_text
+from jacked.findbin import require_bin
+from jacked.memory.sanitize import (  # noqa: F401 -- re-exported for callers
+    _CONTROL_CHARS_RE,
+    fence_safe,
+    one_line,
+    strip_control,
+)
 
 # Cross-process advisory file locking: POSIX flock or Windows msvcrt. Either may
 # be unavailable (imported None); the lock helper then degrades to fail-open.
@@ -82,10 +89,6 @@ _GIT_FALLBACK_NAME = "jacked-memory"
 _GIT_FALLBACK_EMAIL = "memory@jacked.local"
 _GIT_TIMEOUT = 30
 
-# Control chars except tab and newline (CR goes too), stripped from any text we
-# print through Rich (search excerpts, git error tails): a note body or a
-# remote-derived string could carry a terminal escape/OSC sequence.
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 # --------------------------------------------------------------------------- #
@@ -392,21 +395,6 @@ def today() -> str:
 # Text sanitizing (shared by every capture/recall surface)
 # --------------------------------------------------------------------------- #
 
-def strip_control(s: str) -> str:
-    """Strip control chars (keeps tab and newline; strips CR) via the single vault regex.
-
-    Vault content is echoed to terminals and injected into session context, so
-    a note body or a remote-derived string could carry a terminal escape/OSC
-    sequence; this is the one place that regex is applied.
-    """
-    return _CONTROL_CHARS_RE.sub("", s or "")
-
-
-def one_line(s: str) -> str:
-    """Control-stripped, whitespace-collapsed single line."""
-    return " ".join(strip_control(s).split())
-
-
 # --------------------------------------------------------------------------- #
 # Durable failure logging (rotating file handler on the jacked.memory logger)
 # --------------------------------------------------------------------------- #
@@ -511,7 +499,7 @@ def _git_remote_url(repo: Path) -> str:
     """The origin remote URL for ``repo``, or "" if none / not a repo."""
     try:
         proc = subprocess.run(
-            ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+            [require_bin("git"), "-C", str(repo), "config", "--get", "remote.origin.url"],
             capture_output=True, text=True, timeout=_GIT_TIMEOUT, stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
@@ -832,7 +820,7 @@ def ensure_group(vault: Path, group: str) -> Path:
 
 def _run_git(vault: Path, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
     proc = subprocess.run(
-        ["git", "-C", str(vault), *args],
+        [require_bin("git"), "-C", str(vault), *args],
         capture_output=True, text=True, timeout=_GIT_TIMEOUT, stdin=subprocess.DEVNULL,
     )
     if check and proc.returncode != 0:

@@ -23,6 +23,7 @@ from jacked.service.supervisors._artifacts import (
     reconcile_artifact,
 )
 from jacked.service.supervisors._helpers import systemd_quote, windows_quote
+from jacked.winproc import system_program
 from jacked.service.supervisors._task_xml import encode_task_xml, query_task_xml
 from jacked.service.supervisors._transition import (
     SupervisorTransitionLease,
@@ -306,7 +307,7 @@ def _restart_command(spec, path, expected, run, common, uid):
             or task_action(registered) != task_action(expected.content)
         ):
             return SupervisorAction(False, "refused", "registered task identity differs")
-        return ["schtasks.exe", "/Run", "/TN", spec.service_id]
+        return [system_program("schtasks"), "/Run", "/TN", spec.service_id]
     return SupervisorAction(False, "refused", "manual service has no native manager")
 
 

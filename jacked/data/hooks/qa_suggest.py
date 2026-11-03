@@ -19,6 +19,9 @@ import sys
 import threading
 from pathlib import Path
 
+from jacked.findbin import require_bin
+from jacked.git_guard import GIT_CONFIG_OVERRIDE_ARGS, guarded_git_env
+
 DEDUP_DIR = "/tmp"
 
 UI_EXTENSIONS = frozenset(
@@ -77,31 +80,37 @@ def _get_changed_files(cwd: str) -> list[str]:
 
     Falls back to --cached when HEAD doesn't exist (zero-commit repos).
 
+    The checkout can be untrusted, so the reads go through ``jacked.git_guard``:
+    its ``-c`` overrides, ``GIT_OPTIONAL_LOCKS=0``, every filter driver turned
+    off, and no look inside a submodule. When the filter drivers cannot be
+    read, no diff runs and the list is empty.
+
     >>> # Returns empty list on error
     >>> _get_changed_files("/nonexistent")
     []
     """
     try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            timeout=5,
-        )
+        git = require_bin("git")
+        env = guarded_git_env(git, cwd, timeout=5)
+        if env is None:
+            return []
+
+        def diff(*rev: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [git, *GIT_CONFIG_OVERRIDE_ARGS, "diff", "--name-only", "--no-ext-diff",
+                 "--ignore-submodules=dirty", *rev],
+                capture_output=True, text=True, cwd=cwd, env=env, timeout=5,
+                stdin=subprocess.DEVNULL,
+            )
+
+        result = diff("HEAD")
         if result.returncode != 0:
             # HEAD may not exist (fresh repo, no commits) — try staged files
-            result = subprocess.run(
-                ["git", "diff", "--name-only", "--cached"],
-                capture_output=True,
-                text=True,
-                cwd=cwd,
-                timeout=5,
-            )
+            result = diff("--cached")
             if result.returncode != 0:
                 return []
         return [f for f in result.stdout.strip().splitlines() if f]
-    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+    except (subprocess.TimeoutExpired, OSError):
         return []
 
 

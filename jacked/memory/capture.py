@@ -31,7 +31,8 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from jacked.findbin import find_bin
+from jacked.findbin import find_bin, require_bin
+from jacked.git_guard import GIT_CONFIG_OVERRIDE_ARGS
 from jacked.memory import vault as vault_mod
 from jacked.transcript import parse_jsonl_file
 
@@ -761,11 +762,10 @@ def resolve_group_and_repo(vault: Path, cwd: str) -> tuple[str, str, str]:
 
 
 def current_branch(cwd: str) -> str:
-    """Current git branch of ``cwd`` (local), or ``-`` when unavailable. Public:
-    merge_capture reuses it."""
+    """Current git branch of ``cwd``, or ``-`` when unavailable (merge_capture reuses it)."""
     try:
         proc = subprocess.run(
-            ["git", "-C", str(cwd), "branch", "--show-current"],
+            [require_bin("git"), "-C", str(cwd), *GIT_CONFIG_OVERRIDE_ARGS, "branch", "--show-current"],
             capture_output=True, text=True, timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )

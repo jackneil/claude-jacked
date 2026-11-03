@@ -20,7 +20,18 @@ before returning.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
+
+from jacked.regular_file import FileTooLargeError, read_regular
+
+logger = logging.getLogger(__name__)
+
+#: The largest settings file that a read accepts. A real settings.json is a
+#: few KB. The limit only stops a huge or growing file from taking the memory
+#: of a session start or of the service; a larger file is an error, never
+#: silently cut.
+SETTINGS_MAX_BYTES = 4 * 1024 * 1024
 
 
 class SettingsUnreadableError(Exception):
@@ -42,14 +53,16 @@ def read_settings(path: Path | str) -> dict:
     A ``FileNotFoundError`` is the benign fresh-install case. A JSON parse error,
     any other OSError, or a top-level value that is not a JSON object all raise
     ``SettingsUnreadableError`` -- the caller must abort rather than clobber.
+
+    Only a regular file is read (``jacked.regular_file``): a FIFO, a symlink to
+    a FIFO, a device or a folder raises at once and never blocks. A file over
+    ``SETTINGS_MAX_BYTES`` raises too, and its size goes to the log.
     """
     path = Path(path)
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = _read_text(path)
     except FileNotFoundError:
         return {}
-    except OSError as e:
-        raise SettingsUnreadableError(f"cannot read {path}: {e}") from e
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -57,6 +70,30 @@ def read_settings(path: Path | str) -> dict:
     if not isinstance(data, dict):
         raise SettingsUnreadableError(f"{path} is not a JSON object")
     return data
+
+
+def _read_text(path: Path) -> str:
+    """Return the UTF-8 text of the settings file at ``path``.
+
+    A missing file raises ``FileNotFoundError``. Every other failure raises
+    ``SettingsUnreadableError``.
+    """
+    try:
+        raw = read_regular(path, SETTINGS_MAX_BYTES)
+    except FileNotFoundError:
+        raise
+    except FileTooLargeError as e:
+        logger.warning(
+            "settings: %s is %d bytes, larger than the limit of %d bytes, so it is not read",
+            path.name, e.size, SETTINGS_MAX_BYTES,
+        )
+        raise SettingsUnreadableError(f"{path} is larger than {SETTINGS_MAX_BYTES} bytes") from e
+    except OSError as e:
+        raise SettingsUnreadableError(f"cannot read {path}: {e}") from e
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise SettingsUnreadableError(f"{path} is not valid UTF-8: {e}") from e
 
 
 def write_settings(path: Path | str, data: dict) -> None:
@@ -75,8 +112,8 @@ def write_settings(path: Path | str, data: dict) -> None:
     vault_mod.atomic_write_text(path, json.dumps(data, indent=2))
 
     try:
-        verify = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
+        verify = json.loads(_read_text(path))
+    except (OSError, SettingsUnreadableError, json.JSONDecodeError) as e:
         raise SettingsUnreadableError(f"post-write verification failed for {path}: {e}") from e
     if not isinstance(verify, dict):
         raise SettingsUnreadableError(f"post-write verification failed for {path}: not a JSON object")

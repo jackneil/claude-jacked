@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from jacked import git_guard
 from jacked.data.hooks import git_reality
 from jacked.memory.recall import estimate_tokens
 from jacked.winproc import NO_WINDOW
@@ -106,6 +107,51 @@ def _spy_on_git(monkeypatch) -> list[str]:
 
     monkeypatch.setattr(git_reality.subprocess, "run", _spy)
     return calls
+
+
+def _clean_shim(root: Path, marker: Path) -> Path:
+    """A fake filter program: it records that it ran, then passes the data through."""
+    return write_python_shim(
+        root, f"fake-filter-{marker.stem}",
+        "import pathlib, shutil, sys\n"
+        f"pathlib.Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+        "shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)\n",
+    )
+
+
+def _exit_shim(root: Path, marker: Path) -> Path:
+    """A fake long-running filter program: it records that it ran, then exits.
+
+    A real ``filter.<driver>.process`` program first answers a handshake; this
+    one exits at once, so git gives up instead of waiting for the answer.
+    """
+    return write_python_shim(
+        root, f"fake-process-{marker.stem}",
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+        "sys.exit(1)\n",
+    )
+
+
+def _make_stat_dirty(path: Path) -> None:
+    """Same content, new mtime: git must read the file to know it is unchanged."""
+    stamp = os.stat(path).st_mtime + 120
+    os.utime(path, (stamp, stamp))
+
+
+def _assert_plain_status_runs(repo: Path, marker: Path) -> None:
+    """Precondition: a plain ``git status`` in ``repo`` runs the fake filter.
+
+    ``GIT_OPTIONAL_LOCKS=0`` keeps this run from refreshing the index, so the
+    hook later sees the same index.
+    """
+    subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True, stdin=subprocess.DEVNULL,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}, check=False, timeout=60,
+    )
+    assert marker.exists(), "git did not run the filter; the test cannot prove anything"
+    marker.unlink()
 
 
 # --------------------------------------------------------------------------- #
@@ -343,7 +389,25 @@ class TestUntrustedText:
         assert any("red" in line and "text" in line for line in lines)
         assert any("after the title" in line for line in lines)
 
-    def test_backticks_in_commit_text_cannot_close_the_fence(self, root):
+    def test_c1_controls_and_bidi_overrides_in_commit_text_are_stripped(self, root):
+        """U+009B is a one-character CSI; U+202E and U+2066 reorder the text."""
+        repo = _repo(root)
+        sha = _commit(
+            repo,
+            "evil\x9b2J subject\u202e reversed\u2066 isolate\u200e mark\n\n"
+            "body\x9b31m red\u202e flipped\u2069 end\n"
+            "first\x85second\n",
+        )
+
+        block = _emit(repo)
+        for ch in ("\x9b", "\u202e", "\u2066", "\u2069", "\u200e", "\x85"):
+            assert ch not in block, repr(ch)
+        lines = block.split("\n")
+        assert f"  {sha} evil2J subject reversed isolate mark" in lines
+        assert "    body31m red flipped end" in lines
+        assert "    first" in lines and "    second" in lines  # NEL still ends a line
+
+    def test_backticks_in_commit_text_become_apostrophes_in_a_fixed_fence(self, root):
         repo = _repo(root)
         _commit(
             repo,
@@ -352,12 +416,52 @@ class TestUntrustedText:
         )
 
         lines = _emit(repo).split("\n")
-        fence = lines[1]
-        assert set(fence) == {"`"} and lines[-1] == fence
-        inner = lines[2:-1]
-        longest = max(len(run) for line in inner for run in re.findall(r"`+", line))
-        assert longest == 4
-        assert len(fence) == 5  # longer than any run, so data cannot close it
+        assert lines[1] == "```" and lines[-1] == "```"
+        assert not any("`" in line for line in lines[2:-1])
+        assert any(line.endswith("subject with ''' inside") for line in lines)
+        assert "    ''''" in lines
+
+    def test_a_backtick_flood_cannot_make_the_block_vanish(self, root):
+        """A long backtick run once grew the fence past the token cap."""
+        repo = _repo(root)
+        sha = _commit(repo, f"flood\n\n{'`' * 3000}\n")
+
+        block = _emit(repo)
+
+        assert block, "the block vanished"
+        lines = block.split("\n")
+        assert lines[1] == "```" and lines[-2:] == ["```", "[trimmed: 1 more line]"]
+        assert f"  {sha} flood" in lines
+        assert not any("`" in line for line in lines[2:-2])
+
+    def test_a_huge_commit_body_is_clipped_before_it_is_split(self, root):
+        """A 30 MB body is cut to RECORD_LIMIT characters first, and the cut is shown."""
+        import time
+
+        repo = _repo(root)
+        body = ("long body line\n" * 2_000_000)[:30_000_000]
+        sha = _commit(repo, f"huge\n\n{body}")
+
+        start = time.monotonic()
+        block = _emit(repo)
+        elapsed = time.monotonic() - start
+
+        lines = block.split("\n")
+        assert f"  {sha} huge" in lines
+        assert len(lines) == 40 and TRIM_RE.match(lines[-1])
+        assert elapsed < 0.5, f"{elapsed:.2f}s"
+
+        full = _emit(repo, **NO_CAPS).split("\n")
+        limit = git_reality.RECORD_LIMIT
+        expected_body = [f"    {line}" for line in body[:limit].splitlines() if line.strip()]
+        clip = f"    [clipped: {len(body) - limit} more characters]"
+        start_at = full.index(f"  {sha} huge") + 1
+        assert full[start_at : start_at + len(expected_body) + 1] == [*expected_body, clip]
+
+    def test_the_record_limit_is_far_above_what_the_caps_can_show(self):
+        """600 tokens is about 2,400 characters; 16,384 is well above it."""
+        assert git_reality.RECORD_LIMIT == 16_384
+        assert git_reality.RECORD_LIMIT > 4 * git_reality.TOKEN_CAP * 4
 
     def test_every_line_is_one_line_of_data(self, root):
         """A Unicode line separator in a body is split, then indented like any line."""
@@ -480,7 +584,27 @@ class TestFailures:
         assert _emit(repo) == ""
         assert any("TimeoutExpired" in r.getMessage() for r in caplog.records)
 
-    @pytest.mark.parametrize("failing", ["branch", "log", "status"])
+    @pytest.mark.parametrize("slow", ["rev-parse", "branch", "log", "config", "status"])
+    def test_a_timeout_logs_the_subcommand_and_never_the_argv(self, root, monkeypatch, caplog, slow):
+        repo = _repo(root)
+        _commit(repo, "one\n")
+        real_run = subprocess.run
+
+        def _run(argv, **kwargs):
+            if _subcommand(argv) == slow:
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"), b"out", b"err")
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(git_reality.subprocess, "run", _run)
+        caplog.set_level(logging.DEBUG, logger=LOGGER)
+        caplog.set_level(logging.DEBUG, logger="jacked.git_guard")  # it runs git config
+
+        assert _emit(repo) == ""
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(f"git {slow} timed out" in m and "TimeoutExpired" in m for m in messages), messages
+        assert not any(str(repo) in m or "-c" in m.split() for m in messages), messages
+
+    @pytest.mark.parametrize("failing", ["branch", "log", "config", "status"])
     def test_a_failing_git_call_prints_nothing(self, root, monkeypatch, caplog, failing):
         repo = _repo(root)
         _commit(repo, "one\n")
@@ -529,6 +653,41 @@ class TestFailures:
 # How git is called
 # --------------------------------------------------------------------------- #
 
+class TestFilterOverrides:
+    def test_the_drivers_come_from_every_filter_key(self):
+        out = (
+            "filter.a=b.c.clean\n/x/clean\0filter.Evil.process\n/x/p\0"
+            "filter.evil.required\ntrue\0filter.a=b.c.smudge\ncat\0"
+        )
+        assert git_guard.filter_drivers(out) == ["a=b.c", "Evil", "evil"]
+
+    def test_no_filter_keys_give_no_drivers(self):
+        assert git_guard.filter_drivers("") == []
+
+    def test_each_driver_gets_no_command_and_is_not_required(self):
+        assert git_guard.filter_overrides({}, ["e=v.il"]) == {
+            "GIT_CONFIG_COUNT": "4",
+            "GIT_CONFIG_KEY_0": "filter.e=v.il.clean", "GIT_CONFIG_VALUE_0": "",
+            "GIT_CONFIG_KEY_1": "filter.e=v.il.smudge", "GIT_CONFIG_VALUE_1": "",
+            "GIT_CONFIG_KEY_2": "filter.e=v.il.process", "GIT_CONFIG_VALUE_2": "",
+            "GIT_CONFIG_KEY_3": "filter.e=v.il.required", "GIT_CONFIG_VALUE_3": "false",
+        }
+
+    def test_inherited_config_variables_keep_their_slots(self):
+        inherited = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.x", "GIT_CONFIG_VALUE_0": "y"}
+        overrides = git_guard.filter_overrides(inherited, ["evil"])
+        assert overrides["GIT_CONFIG_COUNT"] == "5"
+        assert overrides["GIT_CONFIG_KEY_1"] == "filter.evil.clean"
+        assert "GIT_CONFIG_KEY_0" not in overrides
+
+    def test_no_drivers_give_no_overrides(self):
+        assert git_guard.filter_overrides({"GIT_CONFIG_COUNT": "2"}, []) == {}
+
+    def test_a_bad_inherited_count_gives_no_block(self):
+        with pytest.raises(git_guard.GitGuardError):
+            git_guard.filter_overrides({"GIT_CONFIG_COUNT": "lots"}, ["evil"])
+
+
 class TestGitCalls:
     def test_each_call_is_bounded_and_takes_no_optional_locks(self, root, monkeypatch):
         repo = _repo(root)
@@ -543,7 +702,9 @@ class TestGitCalls:
         monkeypatch.setattr(git_reality.subprocess, "run", _spy)
         assert _emit(repo)
 
-        assert [_subcommand(argv) for argv, _ in calls] == ["rev-parse", "branch", "log", "status"]
+        assert [_subcommand(argv) for argv, _ in calls] == [
+            "rev-parse", "branch", "log", "config", "status",
+        ]
         for argv, kwargs in calls:
             assert argv[1:3] == ["-C", str(repo)]
             assert kwargs["timeout"] == git_reality.GIT_TIMEOUT_S == 3
@@ -553,6 +714,7 @@ class TestGitCalls:
         log_argv = calls[2][0]
         assert "--no-show-signature" in log_argv
         assert log_argv[-2:] == ["HEAD", "--"]
+        assert "--ignore-submodules=dirty" in calls[4][0]
 
     @pytest.mark.skipif(
         not shebang_exec_supported(), reason="the fake gpg program is a shebang script"
@@ -580,6 +742,88 @@ class TestGitCalls:
 
         assert "working tree:" in block
         assert not marker.exists(), "the hook ran the repository's fsmonitor program"
+
+    @pytest.mark.skipif(
+        not shebang_exec_supported(), reason="the fake clean filter is a shebang script"
+    )
+    def test_a_repo_config_cannot_make_the_counts_run_a_clean_filter(self, root):
+        """``git status`` reads a stat-dirty file to compare its content, and
+        that read runs the ``filter.<driver>.clean`` command of the repo config."""
+        repo = _repo(root)
+        _write(repo, "tracked.txt", "same content\n")
+        _git(repo, "add", "tracked.txt")
+        _commit(repo, "base\n")
+        marker = root / "clean-ran.txt"
+        _git(repo, "config", "filter.evil.clean", str(_clean_shim(root, marker)))
+        _git(repo, "config", "filter.evil.required", "true")
+        _write(repo, ".git/info/attributes", "* filter=evil\n")
+        _make_stat_dirty(repo / "tracked.txt")
+        _assert_plain_status_runs(repo, marker)
+
+        block = git_reality.emit_git_reality(str(repo))
+
+        assert "working tree: 0 modified, 0 staged, 0 deleted, 0 untracked" in block
+        assert not marker.exists(), "the hook ran the repository's clean filter"
+
+    @pytest.mark.skipif(
+        not shebang_exec_supported(), reason="the fake clean filter is a shebang script"
+    )
+    def test_a_racy_index_entry_cannot_make_the_counts_run_a_filter(self, root):
+        """A stat-clean entry that is newer than the index file is "racy": git
+        reads its content even when no stat field changed. The driver names
+        hold "=" and ".", which a ``-c key=value`` override cannot carry."""
+        repo = _repo(root)
+        _write(repo, "a.md", "same content\n")
+        _write(repo, "b.txt", "other content\n")
+        _git(repo, "add", ".")
+        _commit(repo, "base\n")
+        _git(repo, "update-index", "--refresh")
+        marker = root / "filter-ran.txt"
+        _git(repo, "config", "filter.e=v.il.clean", str(_clean_shim(root, marker)))
+        _git(repo, "config", "filter.e=v.il.required", "true")
+        _git(repo, "config", "filter.Proc.process", str(_exit_shim(root, marker)))
+        _write(repo, ".git/info/attributes", "*.md filter=e=v.il\n*.txt filter=Proc\n")
+        index = repo / ".git" / "index"
+        os.utime(index, (1_000_000_000, 1_000_000_000))  # older than every file
+        _assert_plain_status_runs(repo, marker)
+        os.utime(index, (1_000_000_000, 1_000_000_000))
+
+        block = git_reality.emit_git_reality(str(repo))
+
+        assert "working tree: 0 modified, 0 staged, 0 deleted, 0 untracked" in block
+        assert not marker.exists(), "the hook ran the repository's filter"
+
+    @pytest.mark.skipif(
+        not shebang_exec_supported(), reason="the fake clean filter is a shebang script"
+    )
+    def test_a_submodule_config_cannot_make_the_counts_run_a_clean_filter(self, root):
+        """``git status`` runs ``git status`` inside each submodule, and the
+        submodule has its own config. The hook does not look inside one."""
+        sub_src = _repo(root, "sub-src")
+        _write(sub_src, "inner.txt", "inner\n")
+        _git(sub_src, "add", "inner.txt")
+        _commit(sub_src, "inner\n")
+        repo = _repo(root)
+        _commit(repo, "base\n")
+        _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+             str(sub_src), "sub")
+        _commit(repo, "add the submodule\n")
+        sub = repo / "sub"
+        marker = root / "sub-clean-ran.txt"
+        _git(sub, "config", "filter.subevil.clean", str(_clean_shim(root, marker)))
+        _git(sub, "config", "filter.subevil.required", "true")
+        sub_info = Path(_git(sub, "rev-parse", "--git-path", "info").stdout.strip())
+        if not sub_info.is_absolute():
+            sub_info = sub / sub_info
+        sub_info.mkdir(parents=True, exist_ok=True)
+        (sub_info / "attributes").write_text("* filter=subevil\n", encoding="utf-8")
+        _make_stat_dirty(sub / "inner.txt")
+        _assert_plain_status_runs(repo, marker)
+
+        block = git_reality.emit_git_reality(str(repo))
+
+        assert "working tree: 0 modified, 0 staged, 0 deleted, 0 untracked" in block
+        assert not marker.exists(), "the hook ran the submodule's clean filter"
 
     def test_every_git_call_carries_the_config_overrides(self, root, monkeypatch):
         repo = _repo(root)

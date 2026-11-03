@@ -2330,8 +2330,7 @@ def _spawn_windows_upgrade_helper(
     # launching terminal closing (modern terminals kill their job on close).
     # Fall back to CREATE_NO_WINDOW alone if the job forbids breakaway — never
     # back to DETACHED_PROCESS, or the windows come right back.
-    NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    from jacked.winproc import run_batch_detached
     # Capture the batch's stdout/stderr into the update log by handing cmd.exe
     # an inherited handle on it — the same pattern the tray updater uses. This
     # is what makes the batch's bare `echo`/command output land in the log, and
@@ -2347,18 +2346,7 @@ def _spawn_windows_upgrade_helper(
         close_fds=True,
     )
     try:
-        try:
-            subprocess.Popen(
-                ["cmd.exe", "/c", batch_path],
-                creationflags=NO_WINDOW | BREAKAWAY,
-                **_helper_kwargs,
-            )
-        except OSError:
-            subprocess.Popen(
-                ["cmd.exe", "/c", batch_path],
-                creationflags=NO_WINDOW,
-                **_helper_kwargs,
-            )
+        run_batch_detached(batch_path, **_helper_kwargs)
     finally:
         # cmd.exe holds its own inherited copy of the handle; close ours.
         if _lf is not subprocess.DEVNULL:

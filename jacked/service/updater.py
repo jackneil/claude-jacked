@@ -21,7 +21,7 @@ from typing import NamedTuple
 from jacked.findbin import find_bin
 from jacked.service import CLAUDE_DIR
 from jacked.service.process import is_process_alive, is_port_listening
-from jacked.winproc import NO_WINDOW
+from jacked.winproc import NO_WINDOW, run_batch_detached
 
 UPDATE_LOG = CLAUDE_DIR / "jacked-update.log"
 RECOVERY_FILE = CLAUDE_DIR / "jacked-update-failed.txt"
@@ -2139,8 +2139,6 @@ def _spawn_windows_tray_updater(
     # the whole batch shares, so nothing pops. CREATE_BREAKAWAY_FROM_JOB lets the
     # helper outlive the tray/job dying; fall back to CREATE_NO_WINDOW alone if
     # the job forbids breakaway.
-    NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
     # Capture the batch's stdout/stderr into the update log. Previously these
     # were DEVNULL, so if the batch — or any `jacked` subcommand it calls —
     # crashed or exited non-zero OUTSIDE a `>> %LOGFILE%`-redirected step, it
@@ -2158,18 +2156,7 @@ def _spawn_windows_tray_updater(
         close_fds=True,
     )
     try:
-        try:
-            subprocess.Popen(
-                ["cmd.exe", "/c", batch_path],
-                creationflags=NO_WINDOW | BREAKAWAY,
-                **_kwargs,
-            )
-        except OSError:
-            subprocess.Popen(
-                ["cmd.exe", "/c", batch_path],
-                creationflags=NO_WINDOW,
-                **_kwargs,
-            )
+        run_batch_detached(batch_path, **_kwargs)
     finally:
         # cmd.exe holds its own inherited copy of the handle; close ours.
         if _lf is not subprocess.DEVNULL:

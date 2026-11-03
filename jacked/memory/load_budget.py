@@ -10,8 +10,9 @@ for each file, because a longer file costs context and adherence.
 Sources (read 2026-11-03): https://code.claude.com/docs/en/memory and the
 Claude Code 2.1.317 binary, which holds the MEMORY.md caps as ``uL=200`` and
 ``KJ=25000`` and counts the characters of the trimmed text. This module counts
-the bytes on disk and every line. Those counts are never less than the Claude
-Code counts, so a warning can come early but never late.
+the bytes on disk and every line of the first ``SCAN_LIMIT`` bytes. Those
+counts are never less than the Claude Code counts, so a warning can come early
+but never late.
 
 ``jacked.memory.claude_paths`` finds the files, the way Claude Code does. This
 module measures them and writes the warning lines for SessionStart, ``jacked
@@ -32,17 +33,17 @@ from jacked.memory.claude_paths import (
     auto_memory_directory,
     auto_memory_enabled,
     config_dir,
-    git_root,
     native_memory_path,
     open_regular,
     project_dir_name,
     repo_root,
     session_folder,
 )
-from jacked.memory.vault import _CONTROL_CHARS_RE
+from jacked.memory.sanitize import _CONTROL_CHARS_RE, fence_safe
 
 __all__ = [
-    "BYTE_CAP", "CLAUDE_MD_ADVISED_LINES", "CLAUDE_MD_MAX_BYTES", "LINE_CAP", "WARN_RATIO",
+    "BYTE_CAP", "CLAUDE_MD_ADVISED_LINES", "CLAUDE_MD_MAX_BYTES", "LINE_CAP", "Measurement",
+    "SCAN_LIMIT", "WARN_RATIO",
     "always_loaded_files", "auto_memory_enabled", "config_dir", "machine_warnings", "measure",
     "native_memory_path", "over_cap", "project_dir_name", "render_block", "repo_root",
     "session_folder", "warnings",
@@ -66,20 +67,50 @@ BLOCK_FRAMING = (
     "line. Do not edit a file unless the user asks."
 )
 
+# How many transcript records the dashboard label reads. Claude Code writes
+# the cwd in the first record of a session, so a few records are enough.
+LABEL_RECORDS = 20
+
 # The instruction files Claude Code reads in each folder, in its read order.
 _INSTRUCTION_FILES = (("CLAUDE.md",), (".claude", "CLAUDE.md"), ("CLAUDE.local.md",))
 _CHUNK = 1 << 20
-# Text that can break a name out of its line, or hide its real order.
+#: The most bytes ``measure`` reads from one file. The size of a file comes
+#: from ``fstat``, so no scan is needed for it. Claude Code skips a CLAUDE.md
+#: over CLAUDE_MD_MAX_BYTES and reads at most 25 KB of MEMORY.md, so the line
+#: count of a larger file changes no warning: a scan to this limit is exact for
+#: every file Claude Code loads whole, and a lower bound for the rest.
+SCAN_LIMIT = CLAUDE_MD_MAX_BYTES + 1
+# Text that can break a name out of its line. The control and bidi characters
+# that can hide its real order go through the vault sanitizer.
 _LINE_BREAKS_RE = re.compile("[\t\n\x85\u2028\u2029]")
-_INVISIBLE_RE = re.compile("[\x80-\x9f\u202a-\u202e\u2066-\u2069]")
 
 
-def measure(path) -> tuple[int, int] | None:
+class Measurement(tuple):
+    """``(lines, bytes)`` of a file, as ``measure`` returns them.
+
+    ``lines_exact`` is False when the scan stopped at ``SCAN_LIMIT``: then
+    ``lines`` is a lower bound. The byte count is always exact.
+
+    >>> m = Measurement(3, 12)
+    >>> m == (3, 12), m.lines_exact
+    (True, True)
+    """
+
+    def __new__(cls, lines: int, nbytes: int, lines_exact: bool = True):
+        self = super().__new__(cls, (lines, nbytes))
+        self.lines_exact = lines_exact
+        return self
+
+
+def measure(path) -> Measurement | None:
     """Return ``(lines, bytes)`` for the file at ``path`` as it is on disk.
 
     A CRLF line end counts 2 bytes and a UTF-8 character counts each of its
-    bytes. A last line without a newline counts as a line. The file is read in
-    chunks. Return None when the path is missing, unreadable or not a file.
+    bytes. A last line without a newline counts as a line. The size comes from
+    ``fstat``. The lines come from a scan in chunks of at most ``SCAN_LIMIT``
+    bytes; when the file is longer, the line count is a lower bound
+    (``lines_exact`` is False). Return None when the path is missing,
+    unreadable or not a file.
 
     >>> measure("/nonexistent-jacked-path/MEMORY.md") is None
     True
@@ -87,19 +118,24 @@ def measure(path) -> tuple[int, int] | None:
     fd = open_regular(path)
     if fd is None:
         return None
-    newlines = size = 0
+    newlines = scanned = 0
     last = b""
     try:
-        while chunk := os.read(fd, _CHUNK):
+        size = os.fstat(fd).st_size
+        while scanned < SCAN_LIMIT and (chunk := os.read(fd, min(_CHUNK, SCAN_LIMIT - scanned))):
             newlines += chunk.count(b"\n")
-            size += len(chunk)
+            scanned += len(chunk)
             last = chunk[-1:]
+        more = scanned >= SCAN_LIMIT and os.read(fd, 1) != b""
     except OSError as exc:
         logger.warning("load budget: cannot read %s (%s)", Path(path).name, type(exc).__name__)
         return None
     finally:
         os.close(fd)
-    return newlines + (1 if size and last != b"\n" else 0), size
+    if more:
+        # The next byte starts or continues a line that the scan did not count.
+        return Measurement(newlines + 1, max(size, scanned + 1), lines_exact=False)
+    return Measurement(newlines + (1 if scanned and last != b"\n" else 0), scanned)
 
 
 def over_cap(lines: int, nbytes: int, *, line_cap: int | None = LINE_CAP,
@@ -119,28 +155,39 @@ def over_cap(lines: int, nbytes: int, *, line_cap: int | None = LINE_CAP,
     )
 
 
+def _key(path) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
 def _candidates(cwd: Path, home: Path, env: Env) -> list[tuple[str, Path]]:
     """Return ``(kind, path)`` for each file that exists and loads for ``cwd``.
 
-    The kinds: ``memory`` (the auto memory index), ``project`` (the instruction
-    files from ``cwd`` up to the repo root, nearest first), ``user`` (the
-    CLAUDE.md in the config folder).
+    The kinds: ``memory`` (the auto memory index), ``project`` (the
+    instruction files in ``cwd`` and in each folder above it, up to the
+    filesystem root, nearest first), ``user`` (the CLAUDE.md in the config
+    folder). Claude Code reads the instruction files "recursively from the
+    cwd up to the root directory", in a repository or not. When a folder
+    above ``cwd`` is the home folder, its ``.claude/CLAUDE.md`` is the user
+    file, and it is listed once, as ``user``.
     """
     found = []
     if auto_memory_enabled(cwd, home, env):
         found.append(("memory", native_memory_path(cwd, home, env)))
-    top = git_root(cwd) or cwd
+    user = config_dir(home, env) / "CLAUDE.md"
     here = cwd
     while True:
         found.extend(("project", here.joinpath(*parts)) for parts in _INSTRUCTION_FILES)
-        if here == top or here.parent == here:
+        if here.parent == here:
             break
         here = here.parent
-    found.append(("user", config_dir(home, env) / "CLAUDE.md"))
+    found.append(("user", user))
+    user_key = _key(user)
     seen: set[str] = set()
     out = []
     for kind, path in found:
-        key = os.path.normcase(os.path.abspath(path))
+        key = _key(path)
+        if kind == "project" and key == user_key:
+            continue
         if key not in seen and os.path.isfile(path):
             seen.add(key)
             out.append((kind, path))
@@ -152,9 +199,9 @@ def always_loaded_files(cwd, home, env: Env | None = None) -> list[Path]:
 
     The list holds the auto memory index (when auto memory is on), each
     CLAUDE.md, ``.claude/CLAUDE.md`` and CLAUDE.local.md from ``cwd`` up to
-    the repo root, and the user CLAUDE.md, for the files that exist. A folder
-    above the repo root is not part of the project, so its files are not in
-    the list. Outside git, only ``cwd`` is read.
+    the filesystem root, and the user CLAUDE.md, for the files that exist.
+    Claude Code reads the folders above the repo root too, and it reads them
+    outside git.
     """
     env = os.environ if env is None else env
     return [path for _kind, path in _candidates(session_folder(cwd), Path(home), env)]
@@ -166,14 +213,44 @@ def _clean(text: str) -> str:
     >>> _clean("a" + chr(10) + "b`c" + chr(27) + "[0m" + chr(0x202E))
     "a b'c[0m"
     """
-    text = _LINE_BREAKS_RE.sub(" ", _CONTROL_CHARS_RE.sub("", text))
-    return _INVISIBLE_RE.sub("", text).replace("`", "'")
+    return fence_safe(_CONTROL_CHARS_RE.sub("", _LINE_BREAKS_RE.sub(" ", text)))
 
 
-def _label(kind: str, path: Path, home: Path, env: Env) -> str:
-    """Name ``path`` by its folder and its name, never by the full home path."""
+def _home_relative(folder: Path, home: Path) -> str:
+    """Return ``folder`` with the home folder written as ``~``.
+
+    >>> _home_relative(Path("/h/.claude/projects/-x/memory"), Path("/h"))
+    '~/.claude/projects/-x/memory'
+    >>> _home_relative(Path("/srv/mem"), Path("/h"))
+    '/srv/mem'
+    """
+    for base in (home, session_folder(home)):
+        try:
+            rel = folder.relative_to(base)
+        except ValueError:
+            continue
+        return "~" if rel == Path(".") else f"~/{rel.as_posix()}"
+    return folder.as_posix()
+
+
+def _memory_label(path: Path, home: Path) -> str:
+    """Name a memory index by its folder, so a worktree or an
+    ``autoMemoryDirectory`` setting shows which index was measured.
+
+    >>> _memory_label(Path("/h/.claude/projects/-x/memory/MEMORY.md"), Path("/h"))
+    'MEMORY.md (~/.claude/projects/-x/memory)'
+    """
+    return f"{MEMORY_INDEX} ({_clean(_home_relative(path.parent, home))})"
+
+
+def _label(kind: str, path: Path, home: Path, env: Env, parts: int = 1) -> str:
+    """Name ``path`` by its folder and its name, never by the full home path.
+
+    ``parts=2`` adds the folder above, for two files whose one-part names
+    are the same. The home folder is always ``~``.
+    """
     if kind == "memory":
-        return MEMORY_INDEX
+        return _memory_label(path, home)
     if kind == "user":
         if config_dir(home, env) == home / ".claude":
             return "~/.claude/CLAUDE.md"
@@ -181,9 +258,19 @@ def _label(kind: str, path: Path, home: Path, env: Env) -> str:
     folder, rel = path.parent, path.name
     if folder.name == ".claude":
         folder, rel = folder.parent, f".claude/{path.name}"
-    if folder == session_folder(home):
+    home_folder = session_folder(home)
+    if folder == home_folder:
         return f"~/{rel}"
-    return f"`{_clean(folder.name) or folder.anchor}/{rel}`"
+    name = _clean(folder.name)
+    if not name:  # the filesystem root
+        return f"`{folder.anchor}{rel}`"
+    if parts == 2 and folder.parent != folder:
+        parent = folder.parent
+        if parent == home_folder:
+            return f"`~/{name}/{rel}`"
+        above = _clean(parent.name) if parent.name else parent.anchor.rstrip("/\\")
+        return f"`{above}/{name}/{rel}`"
+    return f"`{name}/{rel}`"
 
 
 def _size(nbytes: int) -> str:
@@ -225,7 +312,10 @@ def _warn(kind: str, path: Path, label: str | Callable[[], str]) -> str | None:
         return None
     lines, nbytes = size
     name = label() if callable(label) else label
-    return f"{name} is {lines} {'line' if lines == 1 else 'lines'} / {_size(nbytes)}; {tail}"
+    count = f"{lines} {'line' if lines == 1 else 'lines'}"
+    if not size.lines_exact:
+        count = f"at least {count}"
+    return f"{name} is {count} / {_size(nbytes)}; {tail}"
 
 
 def warnings(cwd, home, env: Env | None = None) -> list[str]:
@@ -241,9 +331,13 @@ def warnings(cwd, home, env: Env | None = None) -> list[str]:
         except OSError:
             return []
     home = Path(home)
+    candidates = _candidates(session_folder(cwd), home, env)
+    labels = [_label(kind, path, home, env) for kind, path in candidates]
     out = []
-    for kind, path in _candidates(session_folder(cwd), home, env):
-        line = _warn(kind, path, _label(kind, path, home, env))
+    for (kind, path), label in zip(candidates, labels):
+        if labels.count(label) > 1:
+            label = _label(kind, path, home, env, parts=2)
+        line = _warn(kind, path, label)
         if line:
             out.append(line)
     return out
@@ -279,17 +373,19 @@ def _project_label(folder: Path) -> str:
     """Return a readable name for a ``projects/`` folder.
 
     It is the last part of the folder that the newest session there ran in,
-    else the decoded folder name.
+    else the decoded folder name. Only the first ``LABEL_RECORDS`` records of
+    the transcript are read. A transcript that cannot be read gives the folder
+    name, so one damaged file never stops the other warnings.
     """
     from jacked import recover
     from jacked.web.analytics_paths import decode_project_hash
 
     try:
         for transcript in recover._newest_jsonls(folder, n=1):
-            cwd = recover._read_cwd(transcript)
-            if cwd:
+            cwd = recover._read_cwd(transcript, max_records=LABEL_RECORDS)
+            if isinstance(cwd, str) and cwd:
                 return _clean(cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or cwd)
-    except OSError as exc:
+    except (OSError, UnicodeError, ValueError) as exc:
         logger.debug("load budget: cannot read a transcript (%s)", type(exc).__name__)
     return _clean(decode_project_hash(folder.name)["name"] or folder.name)
 
@@ -312,7 +408,8 @@ def machine_warnings(home=None, env: Env | None = None) -> list[str]:
     if auto_memory_enabled(None, home, env):
         override = auto_memory_directory(None, home, env)
         if override is not None:
-            lines.append(_warn("memory", override / MEMORY_INDEX, "MEMORY.md (autoMemoryDirectory)"))
+            lines.append(_warn("memory", override / MEMORY_INDEX,
+                               _memory_label(override / MEMORY_INDEX, home)))
         else:
             for folder in _project_folders(config):
                 lines.append(_warn("memory", folder / "memory" / MEMORY_INDEX,

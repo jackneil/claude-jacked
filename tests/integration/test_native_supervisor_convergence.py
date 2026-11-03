@@ -9,6 +9,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import ntpath
 
 from jacked.service.spec import ServiceSpec, SupervisorKind
 from jacked.service.supervisors import (
@@ -131,7 +132,7 @@ class StatefulManager:
         return SimpleNamespace(returncode=0, stdout="")
 
     def _task(self, command):
-        if command[0] == "powershell.exe":
+        if ntpath.basename(command[0]).lower() == "powershell.exe":
             # The COM query (task_query_command): UTF-8 text, exit 3 when the
             # task is absent (#165i).
             from jacked.service.supervisors._task_xml import decode_task_xml
