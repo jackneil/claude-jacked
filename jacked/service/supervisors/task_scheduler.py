@@ -138,7 +138,7 @@ def _prepare_transition(
         else None
     )
     if evidence.previous_task and task_backup is None:
-        _restore_legacy_vbs(evidence.legacy_path, legacy_backup)
+        _restore_legacy_vbs(evidence.legacy_path, legacy_backup, evidence.legacy_content)
         return SupervisorAction(False, "refused", "registered task backup failed")
     return _Transition(request, evidence, task_backup, legacy_backup)
 
@@ -151,7 +151,9 @@ def _reconcile_and_activate(transition: _Transition) -> SupervisorAction:
         return _failed_transition(transition, type(exc).__name__, False)
     if reconciled.disposition is ArtifactDisposition.FOREIGN:
         is_restored = _restore_legacy_vbs(
-            transition.evidence.legacy_path, transition.legacy_backup
+            transition.evidence.legacy_path,
+            transition.legacy_backup,
+            transition.evidence.legacy_content,
         )
         _remove_task_backup(
             transition.task_backup, transition.evidence.previous_task
@@ -333,21 +335,29 @@ def _retire_legacy_vbs(path: Path, content: bytes) -> Path | None:
     return backup if backup.read_bytes() == content else None
 
 
-def _restore_legacy_vbs(path: Path, backup: Path | None) -> bool:
+def _restore_legacy_vbs(path: Path, backup: Path | None, content: bytes) -> bool:
+    """Move the retired script ``content`` back from ``backup`` to ``path``.
+
+    Return True when there is no backup to restore, or when ``path`` now
+    holds ``content`` and the backup is gone. Any other result is False.
+    """
     if backup is None:
         return True
 
     def blocked() -> bool:
-        # The script slot must be free and the backup still there.
-        return path.exists() or not backup.exists()
+        # The script slot must be free and the backup must still hold the
+        # retired script.
+        return path.exists() or not backup.exists() or backup.read_bytes() != content
 
-    if blocked():
-        return False
     try:
+        # The first check is inside the try too: the backup can go between
+        # exists() and read_bytes(), and that read then raises OSError.
+        if blocked():
+            return False
         replace_with_retry(backup, path, before_retry=_abort_when(blocked))
+        return path.read_bytes() == content and not backup.exists()
     except (OSError, _LegacyVbsTargetChanged):
         return False
-    return path.exists() and not backup.exists()
 
 
 def _rollback_new_task(transition: _Transition) -> bool:
@@ -429,7 +439,9 @@ def _failed_transition(
         evidence.previous_artifact,
     )
     legacy_ok = (
-        _restore_legacy_vbs(evidence.legacy_path, transition.legacy_backup)
+        _restore_legacy_vbs(
+            evidence.legacy_path, transition.legacy_backup, evidence.legacy_content
+        )
         if manager_ok
         else False
     )

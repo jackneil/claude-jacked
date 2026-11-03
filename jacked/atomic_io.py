@@ -165,17 +165,19 @@ def replace_with_retry(
         return
 
 
-def _remove_temp(tmp_name: str) -> None:
+def _remove_temp(tmp_name: str, retry_budget: float = RETRY_BUDGET_SECONDS) -> None:
     """Remove the temp file of a failed write. This is best effort.
 
     On Windows a scanner or an indexer can hold the new temp file for a
     short time, so a refused unlink is tried again with the pauses of the
-    default replace budget. When the refusal lasts longer, or the unlink
-    fails another way, the temp file stays and this function returns
-    quietly: the cleanup must never replace the error that stopped the
-    write. POSIX gets one attempt.
+    caller's retry budget (the default replace budget when none is given).
+    A budget of 0 gives one attempt on every platform, so a write that must
+    never wait does not wait in its cleanup either. When the refusal lasts
+    longer, or the unlink fails another way, the temp file stays and this
+    function returns quietly: the cleanup must never replace the error that
+    stopped the write. POSIX gets one attempt.
     """
-    pauses = _pause_schedule(RETRY_BUDGET_SECONDS)
+    pauses = _pause_schedule(retry_budget)
     while True:
         try:
             os.unlink(tmp_name)
@@ -189,20 +191,49 @@ def _remove_temp(tmp_name: str) -> None:
             return
 
 
-def _set_mode(fd: int, tmp_name: str, mode: int) -> None:
-    """Give the open temp file the permission bits ``mode``.
+def _set_mode_bits(fd: int, tmp_name: str, mode: int) -> None:
+    """Give the open temp file the POSIX permission bits ``mode``.
 
     ``os.fchmod`` changes the file that ``fd`` (from mkstemp) holds, with no
     path lookup, so a link that another process puts at the temp name cannot
     redirect the change. A build with no ``os.fchmod`` (Windows before Python
-    3.13) uses the path. On Windows a mode bit does not change who can open
-    the file: mkstemp gives the file the ACL of its folder. So on Windows a
-    requested mode also gives the file a private ACL (the current user only).
+    3.13) uses the path.
     """
     if hasattr(os, "fchmod"):
         os.fchmod(fd, mode)
     else:
         os.chmod(tmp_name, mode)
+
+
+def _set_mode(fd: int, tmp_name: str, mode: int, *, strict: bool, name: str) -> None:
+    """Give the open temp file the permission bits ``mode``, and on Windows a
+    private ACL.
+
+    When the mode bits are refused, a ``strict`` write stops: the error
+    propagates. A tolerant write logs the refusal at DEBUG (the file
+    ``name``, the error class and its code) and goes on.
+
+    On Windows a mode bit does not change who can open the file: mkstemp
+    gives the file the ACL of its folder. So on Windows the file also gets a
+    private ACL (the current user only). That step always runs after the
+    mode step, whatever the result of the mode step. On Windows the ACL is
+    the only protection the file has, so a refused ACL stops the write even
+    for a tolerant caller; a storage that cannot carry a private ACL cannot
+    hold a secret. The ACL goes through the temp file's name
+    (``SetNamedSecurityInfoW``), and so does the mode on a build without
+    ``os.fchmod``: a process that can put a link at that name can already
+    read the folder's files, so the name is not a new exposure.
+    """
+    try:
+        _set_mode_bits(fd, tmp_name, mode)
+    except OSError as exc:
+        if strict:
+            raise
+        logger.debug(
+            "Could not set the mode of %s (%s); the write goes on",
+            name,
+            _describe_refusal(exc),
+        )
     if os.name == "nt":
         # Imported here, as the service writers do: this module imports only
         # the standard library at load time, so it has no import cycle.
@@ -241,16 +272,9 @@ def _write_atomically(
             if mode is not None:
                 # Before the bytes land, so a secret never sits in a file
                 # with looser permissions than the caller asked for.
-                try:
-                    _set_mode(handle.fileno(), tmp_name, mode)
-                except OSError as exc:
-                    if mode_strict:
-                        raise
-                    logger.debug(
-                        "Could not set the mode of %s (%s); the write goes on",
-                        target.name,
-                        _describe_refusal(exc),
-                    )
+                _set_mode(
+                    handle.fileno(), tmp_name, mode, strict=mode_strict, name=target.name
+                )
             handle.write(payload)
             if fsync:
                 handle.flush()
@@ -259,7 +283,8 @@ def _write_atomically(
     except BaseException:
         # Any failure (a KeyboardInterrupt mid-write included) removes the
         # temp file, so a crash never leaves a stray temp or a partial target.
-        _remove_temp(tmp_name)
+        # The cleanup follows the caller's wait policy (its retry budget).
+        _remove_temp(tmp_name, retry_budget)
         raise
 
 
@@ -286,11 +311,14 @@ def atomic_write_bytes(
     By default a failure to set the mode (the chmod, or the private ACL on
     Windows) stops the write before the replace, and the error propagates.
     ``mode_strict=False`` is for storage that creates and replaces files but
-    refuses chmod (ENOTSUP): the failure is logged at DEBUG (the file name,
-    the error class and its code) and the write goes on. The temp file is
-    created owner-only (0o600), so a tolerated failure never leaves the
-    result looser than 0o600: with ``mode=0o600`` it is exactly the mode the
-    caller asked for.
+    refuses chmod (ENOTSUP). Its tolerance covers the POSIX mode bits only:
+    a refused chmod is logged at DEBUG (the file name, the error class and
+    its code) and the write goes on. The temp file is created owner-only
+    (0o600), so a tolerated failure never leaves the result looser than
+    0o600: with ``mode=0o600`` it is exactly the mode the caller asked for.
+    On Windows the private ACL is still required: a refused ACL stops a
+    tolerant write too, because the ACL is the only protection the file has
+    there.
     """
     _write_atomically(
         path,
@@ -318,7 +346,9 @@ def atomic_write_text(
 
     The file is written in text mode, so Windows writes its native line
     endings. Use ``atomic_write_bytes`` when the bytes must match exactly.
-    The keyword arguments are the same as for ``atomic_write_bytes``.
+    The keyword arguments are the same as for ``atomic_write_bytes``: for
+    example, ``mode_strict=False`` tolerates a refused chmod only, and on
+    Windows the private ACL is still required.
     """
     _write_atomically(
         path,

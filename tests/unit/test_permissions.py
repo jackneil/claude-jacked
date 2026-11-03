@@ -181,6 +181,36 @@ class TestProjectSettingsStayInTheProject:
         assert written["permissions"]["allow"] == ["Bash(git status:*)"]
 
     @requires_symlinks
+    @pytest.mark.parametrize("route", ["put", "rule"])
+    def test_a_claude_dir_linked_outside_after_the_check_is_refused(
+        self, tmp_path, route, monkeypatch
+    ):
+        """The route checks the link before it takes the lock. A link made
+        between that check and the write (another local process racing the
+        dashboard) is caught by the writer's own check, right before the
+        write, and nothing lands outside the project."""
+        from jacked.api.routes import permissions as p
+
+        repo = _repo(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        read = p._read_project_settings
+
+        def plant_the_link_then_read(repo_path):
+            (repo / ".claude").symlink_to(outside, target_is_directory=True)
+            return read(repo_path)
+
+        monkeypatch.setattr(p, "_read_project_settings", plant_the_link_then_read)
+
+        result = asyncio.run(_project_routes(repo)[route]())
+
+        assert result.status_code == 422
+        error = json.loads(result.body)["error"]
+        assert error["code"] == "LINK_OUTSIDE_PROJECT"
+        assert error["message"].startswith("The .claude path in this project is a link")
+        assert list(outside.iterdir()) == []  # nothing written outside
+
+    @requires_symlinks
     def test_a_claude_dir_linked_inside_the_project_is_allowed(self, tmp_path):
         repo = _repo(tmp_path)
         (repo / "config" / "claude").mkdir(parents=True)

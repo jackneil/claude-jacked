@@ -139,7 +139,9 @@ def _seed_claude_config(config_dir: Path) -> None:
 
     try:
         # mode_strict=False: storage that refuses chmod still gets the file
-        # (owner-only from creation), as every launch writer here does.
+        # (owner-only from creation), as every launch writer here does. The
+        # tolerance covers the POSIX mode bits only: on Windows the private
+        # ACL is still required, and a refused ACL stops the write.
         atomic_write_text(
             claude_json, json.dumps(local, indent=2), mode=0o600, mode_strict=False
         )

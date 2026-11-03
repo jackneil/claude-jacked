@@ -662,22 +662,23 @@ class TestPrepareAccountDir:
         }))
         from jacked import atomic_io
 
-        real_set_mode = atomic_io._set_mode
+        real_set_mode_bits = atomic_io._set_mode_bits
         refused: list = []
 
-        def set_mode(fd, tmp_name, mode):
-            # The shared writer's temp files for the two per-account files.
+        def set_mode_bits(fd, tmp_name, mode):
+            # The chmod of the shared writer's temp files for the two
+            # per-account files is refused; the writer's own tolerance runs.
             name = Path(tmp_name).name
             if name.startswith(("..credentials.json.", "..claude.json.")):
                 refused.append(name.rsplit(".", 2)[0])
                 raise OSError(errno.ENOTSUP, "Operation not supported")
-            return real_set_mode(fd, tmp_name, mode)
+            return real_set_mode_bits(fd, tmp_name, mode)
 
         with (
             mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"),
             mock.patch("jacked.launch.should_refresh", return_value=False),
             mock.patch.object(Path, "home", return_value=home),
-            mock.patch.object(atomic_io, "_set_mode", set_mode),
+            mock.patch.object(atomic_io, "_set_mode_bits", set_mode_bits),
         ):
             from jacked.launch import prepare_account_dir
 

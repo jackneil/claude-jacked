@@ -89,16 +89,18 @@ def test_a_final_refusal_is_remembered_on_storage_that_refuses_chmod(tmp_path, m
     _make_row(tmp_path)
     config_dir = _account_dir(tmp_path)
     _write_credentials(config_dir, "intruder-at", "intruder-rt")
-    real_set_mode = atomic_io._set_mode
+    real_set_mode_bits = atomic_io._set_mode_bits
     refused: list = []
 
-    def set_mode(fd, tmp_name, mode):
+    def set_mode_bits(fd, tmp_name, mode):
+        # The chmod of the marker's temp file is refused; the writer's own
+        # tolerance runs.
         if os.path.basename(tmp_name).startswith(f".{MARKER}."):
             refused.append(tmp_name)
             raise OSError(errno.ENOTSUP, "Operation not supported")
-        return real_set_mode(fd, tmp_name, mode)
+        return real_set_mode_bits(fd, tmp_name, mode)
 
-    monkeypatch.setattr(atomic_io, "_set_mode", set_mode)
+    monkeypatch.setattr(atomic_io, "_set_mode_bits", set_mode_bits)
     with _patched(_Lookup(_intruder())):
         assert _sync(config_dir, tmp_path) == "refused"
 

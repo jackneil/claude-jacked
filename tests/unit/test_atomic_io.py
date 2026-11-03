@@ -499,8 +499,11 @@ def test_a_build_without_fchmod_sets_the_mode_by_path(tmp_path, monkeypatch):
         assert target.stat().st_mode & 0o777 == 0o600
 
 
-def _record_windows_acl(monkeypatch, *, fail: bool = False) -> list:
-    """Run atomic_io as on Windows and record each private-ACL request."""
+def _record_windows_acl(monkeypatch, *, fail: bool = False, **os_replaced) -> list:
+    """Run atomic_io as on Windows and record each private-ACL request.
+
+    ``os_replaced`` replaces more names in atomic_io's view of ``os`` (a
+    refusing ``fchmod``, for example)."""
     from jacked.service import windows_security
 
     secured: list = []
@@ -512,7 +515,7 @@ def _record_windows_acl(monkeypatch, *, fail: bool = False) -> list:
             raise OSError(errno.EACCES, f"Access is denied: {path}")
 
     monkeypatch.setattr(windows_security, "secure_windows_path", secure_windows_path)
-    monkeypatch.setattr(atomic_io, "os", _OsView(name="nt"))
+    monkeypatch.setattr(atomic_io, "os", _OsView(name="nt", **os_replaced))
     return secured
 
 
@@ -565,19 +568,49 @@ def test_a_refused_windows_acl_stops_a_strict_write(tmp_path, monkeypatch):
     assert _stray_temps(tmp_path) == []
 
 
-def test_a_tolerant_write_goes_on_after_a_refused_windows_acl(tmp_path, monkeypatch, caplog):
+def test_a_refused_windows_acl_stops_a_tolerant_write_too(tmp_path, monkeypatch, caplog):
+    """On Windows the ACL is the only protection the file has. The tolerance
+    of ``mode_strict=False`` covers the mode bits only, so a temp file that
+    cannot be made private is not published, and it is removed."""
     secured = _record_windows_acl(monkeypatch, fail=True)
     target = tmp_path / ".claude.json"
 
     with caplog.at_level(logging.DEBUG, logger="jacked.atomic_io"):
-        atomic_io.atomic_write_text(target, "{}", mode=0o600, mode_strict=False)
+        with pytest.raises(OSError) as excinfo:
+            atomic_io.atomic_write_text(target, "{}", mode=0o600, mode_strict=False)
 
-    assert len(secured) == 1
-    assert target.read_text(encoding="utf-8") == "{}"
+    [(temp, _bytes_then)] = secured
+    # The ACL's own error, for the temp file, reaches the caller.
+    assert excinfo.value.errno == errno.EACCES and str(temp) in str(excinfo.value)
+    assert not target.exists()
+    assert _stray_temps(tmp_path) == []
+    # No log line says that the write went on.
+    assert [r for r in caplog.records if r.name == "jacked.atomic_io"] == []
+
+
+def test_a_refused_chmod_does_not_skip_the_windows_acl(tmp_path, monkeypatch, caplog):
+    """A tolerant write goes on after a refused chmod, but the ACL step still
+    runs: the temp file is private before the bytes land, then published."""
+    refused: list = []
+
+    def refuse(target, mode, *args, **kwargs):
+        refused.append(target)
+        raise OSError(errno.ENOTSUP, f"Operation not supported: {target}")
+
+    secured = _record_windows_acl(monkeypatch, fchmod=refuse, chmod=refuse)
+    target = tmp_path / ".credentials.json"
+
+    with caplog.at_level(logging.DEBUG, logger="jacked.atomic_io"):
+        atomic_io.atomic_write_text(target, "secret", mode=0o600, mode_strict=False)
+
+    assert len(refused) == 1
+    [(temp, bytes_then)] = secured
+    assert temp.parent == tmp_path
+    assert temp.name.startswith("..credentials.json.") and temp.name.endswith(".tmp")
+    assert bytes_then == b""  # private before the secret is written
+    assert target.read_text(encoding="utf-8") == "secret"
     [record] = [r for r in caplog.records if r.name == "jacked.atomic_io"]
-    # OSError(EACCES, ...) is constructed as a PermissionError.
-    assert f"PermissionError errno={errno.EACCES}" in record.getMessage()
-    assert "Access is denied" not in record.getMessage()
+    assert f"OSError errno={errno.ENOTSUP}" in record.getMessage()
 
 
 def test_the_writer_follows_a_symlink_only_when_asked(tmp_path):
@@ -709,6 +742,32 @@ def test_the_temp_cleanup_gives_up_quietly_after_the_pause_schedule(tmp_path, mo
     assert excinfo.value is failure
     assert pauses == list(atomic_io._pause_schedule(atomic_io.RETRY_BUDGET_SECONDS))
     assert len(_stray_temps(tmp_path)) == 1
+
+
+def test_a_zero_budget_write_never_pauses_in_its_cleanup_either(tmp_path, monkeypatch):
+    """``retry_budget=0`` (the statusline cache) is a write that must never
+    wait. When a scanner holds the temp file, the replace and the cleanup
+    unlink are both refused, and the cleanup follows the same budget: one
+    unlink and no pause, on Windows as on POSIX."""
+    _on_windows(monkeypatch)
+    pauses = _record_pauses(monkeypatch)
+    refusals: list = []
+    calls = _flaky_replace(monkeypatch, failures=100, refusals=refusals)
+    unlinks: list = []
+
+    def held(path, *args, **kwargs):
+        unlinks.append(Path(path).name)
+        raise _refusal(32)
+
+    monkeypatch.setattr(atomic_io.os, "unlink", held)
+
+    with pytest.raises(PermissionError) as excinfo:
+        atomic_io.atomic_write_text(tmp_path / "cache.json", "x", retry_budget=0)
+
+    assert excinfo.value is refusals[-1]  # the replace's refusal, not the cleanup's
+    assert pauses == []
+    assert len(calls) == 1
+    assert len(unlinks) == 1
 
 
 def test_posix_removes_the_temp_file_with_one_unlink(tmp_path, monkeypatch):

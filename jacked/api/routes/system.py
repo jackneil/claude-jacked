@@ -609,6 +609,12 @@ def update_project_lessons(body: LessonsUpdateRequest, request: Request):
 
     content = "\n".join(header_lines + lesson_lines) + "\n"
 
+    # The link check runs again right before the write: this handler runs in
+    # the threadpool, and a link made after the check above would move the
+    # write outside the project.
+    if first_outside_project(body.repo_path, "lessons.md"):
+        return outside_project_response("lessons.md")
+
     try:
         # Two tabs can save at once (this handler runs in the threadpool):
         # a whole-file replace keeps either version intact, never a mix.

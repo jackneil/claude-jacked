@@ -459,12 +459,22 @@ also refuses the check, the writer counts one more refused try. The check and
 the replace use the same retry time.
 
 When a caller asks for a mode (0o600 for a credential file), the shared writer
-sets it on the open temp file before the bytes land. It uses the file
-descriptor, so a link put at the temp name cannot redirect the change. On
-Windows a mode bit does not control who can open a file. So the shared writer
-also gives the temp file a private ACL for the current user. If the writer
-cannot set the mode, it does not publish the file. The per-account launch
-files are the exception: they log the failure and continue.
+sets it on the open temp file before the bytes land. The mode goes through the
+file descriptor, so a link put at the temp name cannot redirect it. On Windows
+a mode bit does not control who can open a file. So the shared writer also
+gives the temp file a private ACL for the current user. The ACL goes through
+the temp file's name (and so does the mode on a Windows build without
+`os.fchmod`): a process that can put a link at that name can already read the
+folder's files, so the name is not a new exposure. If the writer cannot set the
+mode, it does not publish the file. The per-account launch files are the
+exception for the mode bits only: they log a refused chmod and continue,
+because some storage cannot carry mode bits. A refused Windows ACL stops every
+writer, because on Windows the ACL is the only protection the file has.
+
+The dashboard routes that write into a project (`.claude/settings.local.json`
+and `lessons.md`) check that the path is not a link to a location outside the
+project. The check runs twice: once in the route, and once more in the worker
+right before the write, so a link made between the two is refused as well.
 
 ### 5.4 Metadata and per-account directories are not authorities
 

@@ -137,6 +137,40 @@ def test_a_lessons_file_linked_outside_the_project_is_refused(tmp_path, route):
     assert private.read_text() == "[default]\naws_secret_access_key = secret\n- a bullet\n"
 
 
+@requires_symlinks
+def test_a_lessons_link_made_after_the_check_is_refused_before_the_write(
+    tmp_path, monkeypatch
+):
+    """The handler checks the link, reads the header lines, then writes. A
+    link made after the check (another local process racing the dashboard)
+    is caught by the second check, right before the write."""
+    from jacked.api.routes import system
+
+    repo = _lessons_repo(tmp_path)
+    private = tmp_path / "credentials"
+    private.write_text("[default]\naws_secret_access_key = secret\n")
+    real_check = system.first_outside_project
+    checks = []
+
+    def late_link(project, *relative):
+        checks.append(relative)
+        if len(checks) == 1:
+            # The first check passes; the link appears right after it.
+            (repo / "lessons.md").symlink_to(private)
+            return None
+        return real_check(project, *relative)
+
+    monkeypatch.setattr(system, "first_outside_project", late_link)
+
+    result = _lessons_routes(repo)["put"]()
+
+    assert result.status_code == 422
+    assert json.loads(result.body)["error"]["code"] == "LINK_OUTSIDE_PROJECT"
+    assert checks == [("lessons.md",), ("lessons.md",)]
+    assert (repo / "lessons.md").is_symlink()  # not replaced by a copy
+    assert private.read_text() == "[default]\naws_secret_access_key = secret\n"
+
+
 def test_a_normal_lessons_file_is_saved_and_read(tmp_path):
     repo = _lessons_repo(tmp_path)
     routes = _lessons_routes(repo)

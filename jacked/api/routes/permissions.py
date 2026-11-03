@@ -14,7 +14,12 @@ from pydantic import BaseModel, Field
 # would snapshot the original Lock at import time and miss every subsequent
 # rebind — silently reintroducing the "bound to a different event loop" bug
 # after the first tray restart. Do NOT auto-tidy this back to a from-import.
-from jacked.api.project_paths import first_outside_project, outside_project_response
+from jacked.api.project_paths import (
+    LinkOutsideProject,
+    first_outside_project,
+    outside_project_response,
+    refuse_outside_project,
+)
 from jacked.api.routes import features as _features_mod
 from jacked.api.routes.features import (
     VALID_PERMISSION_MODES,
@@ -61,8 +66,12 @@ def _write_project_settings(repo_path: str, data: dict):
 
     The shared writer's Windows retry can pause, so a route calls this in a
     worker thread (``await asyncio.to_thread``) with
-    ``_project_settings_lock`` held.
+    ``_project_settings_lock`` held. The link check runs again here, right
+    before the write: a link at ``.claude`` made after the route's check
+    would move the write outside the project. ``LinkOutsideProject`` is the
+    refusal; the route answers it with ``outside_project_response``.
     """
+    refuse_outside_project(repo_path, *_PROJECT_SETTINGS_PATHS)
     claude_dir = Path(repo_path) / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(claude_dir / "settings.local.json", json.dumps(data, indent=2))
@@ -191,7 +200,10 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
             settings["permissions"]["ask"] = body.ask
         if body.defaultMode is not None:
             settings["permissions"]["defaultMode"] = body.defaultMode
-        await asyncio.to_thread(_write_project_settings, str(resolved), settings)
+        try:
+            await asyncio.to_thread(_write_project_settings, str(resolved), settings)
+        except LinkOutsideProject as escaped:
+            return outside_project_response(escaped.relative)
     return {"ok": True}
 
 
@@ -295,7 +307,12 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
             if pattern not in rules:
                 rules.append(pattern)
                 settings["permissions"][body.list_name] = rules
-                await asyncio.to_thread(_write_project_settings, str(resolved), settings)
+                try:
+                    await asyncio.to_thread(
+                        _write_project_settings, str(resolved), settings
+                    )
+                except LinkOutsideProject as escaped:
+                    return outside_project_response(escaped.relative)
         return {"ok": True, "scope": "project"}
     else:
         async with _features_mod._settings_lock:

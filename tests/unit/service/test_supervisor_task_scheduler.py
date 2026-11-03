@@ -405,10 +405,135 @@ def test_restoring_the_legacy_vbs_keeps_a_script_written_in_the_retry_pause(
         monkeypatch, lambda: legacy.write_bytes(b"concurrent")
     )
 
-    assert _restore_legacy_vbs(legacy, backup) is False
+    assert _restore_legacy_vbs(legacy, backup, LEGACY_VBS) is False
     assert legacy.read_bytes() == b"concurrent"
     assert backup.read_bytes() == LEGACY_VBS
     assert tries == ["jacked.vbs"]
+
+
+def test_restoring_the_legacy_vbs_refuses_a_backup_changed_in_the_retry_pause(
+    tmp_path, monkeypatch
+):
+    """The startup slot stays free, but another writer changes the backup in
+    the retry pause. The retry must not publish the changed backup."""
+    from jacked.service.supervisors.task_scheduler import _restore_legacy_vbs
+
+    legacy = tmp_path / "jacked.vbs"
+    backup = tmp_path / "jacked.vbs.pre-v2"
+    backup.write_bytes(LEGACY_VBS)
+    tries = _windows_rename_refused_once(
+        monkeypatch, lambda: backup.write_bytes(b"changed in the pause")
+    )
+
+    assert _restore_legacy_vbs(legacy, backup, LEGACY_VBS) is False
+    assert not legacy.exists()
+    assert backup.read_bytes() == b"changed in the pause"
+    assert tries == ["jacked.vbs"]  # one refused try, no retry rename
+
+
+def test_restoring_the_legacy_vbs_reports_a_script_changed_at_the_rename(
+    tmp_path, monkeypatch
+):
+    """The last check and the rename are two steps. When the backup changes
+    between them, the restore reports a failure, not a restored script."""
+    from jacked import atomic_io
+    from jacked.service.supervisors.task_scheduler import _restore_legacy_vbs
+
+    legacy = tmp_path / "jacked.vbs"
+    backup = tmp_path / "jacked.vbs.pre-v2"
+    backup.write_bytes(LEGACY_VBS)
+    real_replace = os.replace
+
+    def change_then_rename(src, dst):
+        Path(src).write_bytes(b"changed at the rename")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(atomic_io.os, "replace", change_then_rename)
+
+    assert _restore_legacy_vbs(legacy, backup, LEGACY_VBS) is False
+    assert legacy.read_bytes() == b"changed at the rename"
+    assert not backup.exists()
+
+
+def test_restoring_the_legacy_vbs_refuses_a_backup_it_cannot_read(tmp_path):
+    """The first check reads the backup inside the same error handling as the
+    retry: a backup that cannot be read stops the restore, it is no crash."""
+    from jacked.service.supervisors.task_scheduler import _restore_legacy_vbs
+
+    legacy = tmp_path / "jacked.vbs"
+    backup = tmp_path / "jacked.vbs.pre-v2"
+    backup.mkdir()  # it exists, but reading it raises an OSError
+
+    assert _restore_legacy_vbs(legacy, backup, LEGACY_VBS) is False
+    assert not legacy.exists() and backup.is_dir()
+
+
+def _place_legacy_vbs(tmp_path, monkeypatch) -> Path:
+    """A known pre-v2 startup script in a test APPDATA."""
+    appdata = tmp_path / "AppData" / "Roaming"
+    startup = appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    startup.mkdir(parents=True)
+    legacy = startup / "jacked.vbs"
+    legacy.write_bytes(LEGACY_VBS)
+    _secure_test_path(legacy)
+    monkeypatch.setenv("APPDATA", str(appdata))
+    return legacy
+
+
+def test_a_failed_task_backup_puts_the_legacy_vbs_back(tmp_path, monkeypatch):
+    """The prepare step retires the script, then the task backup fails: the
+    retired script goes back to the startup slot."""
+    from jacked.service.supervisors import task_scheduler
+
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.TASK_SCHEDULER
+    )
+    previous = _previous_generation(rendered.content, spec.generation)
+    path.write_bytes(previous)
+    legacy = _place_legacy_vbs(tmp_path, monkeypatch)
+    monkeypatch.setattr(task_scheduler, "_stage_task_backup", lambda _path, _content: None)
+    runner = Mock(
+        return_value=SimpleNamespace(returncode=0, stdout=decode_task_xml(previous))
+    )
+
+    result = install_owned_supervisor(spec, path, environment=environment, run=runner)
+
+    assert result.ok is False
+    assert "registered task backup failed" in result.reason
+    assert legacy.read_bytes() == LEGACY_VBS
+    assert not legacy.with_name("jacked.vbs.pre-v2").exists()
+    assert runner.call_count == 1  # the task query only
+
+
+def test_a_foreign_artifact_at_reconcile_puts_the_legacy_vbs_back(tmp_path, monkeypatch):
+    """The reconcile step finds a foreign task file after the script was
+    retired: the retired script goes back, and the reason says no more."""
+    from jacked.service.supervisors import task_scheduler
+    from jacked.service.supervisors._artifacts import (
+        ArtifactDisposition,
+        ArtifactInspection,
+    )
+
+    spec, environment, _, path = _installed_artifact(
+        tmp_path, SupervisorKind.TASK_SCHEDULER
+    )
+    legacy = _place_legacy_vbs(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        task_scheduler,
+        "reconcile_artifact",
+        lambda _path, _expected: ArtifactInspection(
+            ArtifactDisposition.FOREIGN, "task file is foreign"
+        ),
+    )
+    runner = Mock(return_value=SimpleNamespace(returncode=3, stdout=""))
+
+    result = install_owned_supervisor(spec, path, environment=environment, run=runner)
+
+    assert result.ok is False
+    assert result.reason == "task file is foreign"  # no "legacy backup restore failed"
+    assert legacy.read_bytes() == LEGACY_VBS
+    assert not legacy.with_name("jacked.vbs.pre-v2").exists()
+    assert runner.call_count == 1  # the task query only
 
 
 def test_the_legacy_vbs_renames_land_on_retry_when_nothing_changed(tmp_path, monkeypatch):
@@ -427,5 +552,5 @@ def test_the_legacy_vbs_renames_land_on_retry_when_nothing_changed(tmp_path, mon
     assert tries == ["jacked.vbs.pre-v2", "jacked.vbs.pre-v2"]
 
     tries.clear()
-    assert _restore_legacy_vbs(legacy, backup) is True
+    assert _restore_legacy_vbs(legacy, backup, LEGACY_VBS) is True
     assert legacy.read_bytes() == LEGACY_VBS and not backup.exists()
