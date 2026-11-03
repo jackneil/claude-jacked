@@ -392,10 +392,10 @@ def test_settings_json_is_written_off_the_loop_under_the_settings_lock(
     monkeypatch.setattr(features, "SETTINGS_JSON", tmp_path / "settings.json")
     writes: list = []
 
-    def write(path, text, **kwargs):
+    def write(path, data, **kwargs):
         writes.append((threading.get_ident(), features._settings_lock.locked()))
 
-    monkeypatch.setattr(features, "atomic_write_text", write)
+    monkeypatch.setattr(features, "atomic_write_bytes", write)
 
     result, loop_thread = _run_on_loop(_settings_routes()[route])
 

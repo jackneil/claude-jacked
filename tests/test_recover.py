@@ -433,7 +433,23 @@ def test_a_line_of_exactly_the_limit_is_parsed(tmp_path, monkeypatch):
     record = record[:-2] + "x" * (64 - len(record)) + record[-2:]
     assert len(record) == 64
     path = tmp_path / "s.jsonl"
-    path.write_text(record + "\n", encoding="utf-8")
+    # Bytes with LF: a text-mode write adds a CR on Windows.
+    path.write_bytes((record + "\n").encode("utf-8"))
+    assert pd._read_cwd(path) == "/c"
+
+
+def test_the_cr_of_a_crlf_line_counts_toward_the_limit(tmp_path, monkeypatch):
+    """The limit is the bytes on disk before the LF, so a CR counts."""
+    from jacked import jsonl_lines
+
+    monkeypatch.setattr(jsonl_lines, "LINE_LIMIT", 64)
+    record = json.dumps({"cwd": "/c", "pad": ""})
+    at_limit = record[:-2] + "x" * (64 - len(record)) + record[-2:]
+    below = record[:-2] + "x" * (63 - len(record)) + record[-2:]
+    path = tmp_path / "s.jsonl"
+    path.write_bytes((at_limit + "\r\n").encode("utf-8"))
+    assert pd._read_cwd(path) is None
+    path.write_bytes((below + "\r\n").encode("utf-8"))
     assert pd._read_cwd(path) == "/c"
 
 

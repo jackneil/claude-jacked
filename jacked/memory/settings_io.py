@@ -16,12 +16,16 @@ Callers that mutate settings must let ``SettingsUnreadableError`` propagate and
 abort loudly rather than swallow it. ``write_settings`` is atomic (writer-unique
 tmp + the shared replace) and re-reads the result to prove the write is valid JSON
 before returning.
+
+Every writer writes the UTF-8 bytes of ``settings_text`` with LF line endings,
+on every platform (Claude Code itself writes LF). A text-mode write would add a
+CR to each line on Windows, and the file would then be larger than the size
+that ``settings_text`` checked.
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 
 from jacked.regular_file import FileTooLargeError, read_regular
@@ -55,15 +59,15 @@ def settings_text(data: dict) -> str:
     """Return ``data`` as settings.json text, or raise ``SettingsTooLargeError``.
 
     Every settings.json writer calls this before it writes, so the check
-    happens before the original file changes. The size is the size on disk:
-    the UTF-8 bytes, plus the extra byte of each line ending when a text-mode
-    write uses CRLF (Windows).
+    happens before the original file changes. Each writer writes the UTF-8
+    bytes of this text (``atomic_write_bytes``, LF line endings), so the size
+    on disk is the UTF-8 byte count on every platform.
 
     >>> settings_text({"a": 1})
     '{\\n  "a": 1\\n}'
     """
     text = json.dumps(data, indent=2)
-    size = len(text.encode("utf-8")) + text.count("\n") * (len(os.linesep) - 1)
+    size = len(text.encode("utf-8"))
     if size > SETTINGS_MAX_BYTES:
         logger.warning(
             "settings: the new settings.json would be %d bytes, larger than the limit of %d bytes,"
@@ -134,18 +138,20 @@ def write_settings(path: Path | str, data: dict) -> None:
     """Atomically write settings.json, then verify it re-reads as a JSON object.
 
     The atomic write itself (writer-unique tmp + the shared replace) is delegated
-    to the shared ``vault.atomic_write_text`` (``jacked.atomic_io``) so every
-    atomic write goes through one implementation. On top of that shared write this keeps its own
+    to the shared ``atomic_write_bytes`` (``jacked.atomic_io``) so every atomic
+    write goes through one implementation. The bytes are the UTF-8 of
+    ``settings_text``, with LF line endings on every platform, so the file has
+    exactly the size that the check measured. On top of that shared write this keeps its own
     post-write verification: the file is re-read and parsed, and a verification
     failure raises ``SettingsUnreadableError`` so a corrupt write is surfaced
     loudly instead of being trusted. The size check (``settings_text``) comes
     before the write, so settings over the limit leave the original file as
     it is.
     """
-    from jacked.memory import vault as vault_mod
+    from jacked.atomic_io import atomic_write_bytes
 
     path = Path(path)
-    vault_mod.atomic_write_text(path, settings_text(data))
+    atomic_write_bytes(path, settings_text(data).encode("utf-8"))
 
     try:
         verify = json.loads(_read_text(path))

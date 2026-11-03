@@ -25,9 +25,11 @@ def iter_lines(f):
     """Yield each line of the binary file ``f`` as stripped text.
 
     The line is read in pieces of ``_SKIP_CHUNK`` bytes. A line over
-    ``LINE_LIMIT`` bytes (the newline not counted), or a line that is not
-    UTF-8, yields None: the caller skips it, and the read goes on at the next
-    line. The pieces of a long line are dropped as they are read. Each skip
+    ``LINE_LIMIT`` bytes (the LF not counted), or a line that is not UTF-8,
+    yields None: the caller skips it, and the read goes on at the next line.
+    The limit is the bytes on disk, so the CR of a CRLF line counts toward
+    it. The limit is 32 MiB, so this one byte changes nothing for a real
+    record. The pieces of a long line are dropped as they are read. Each skip
     goes to the DEBUG log with the line number, never with the content.
     """
     number = 0
