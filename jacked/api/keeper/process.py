@@ -269,10 +269,10 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
         )
         return "skipped"
 
+    # The account id only: a log line never carries an email (lessons.md).
     logger.info(
-        "Window keeper: pinging account %d (%s)%s%s",
+        "Window keeper: pinging account %d%s%s",
         account_id,
-        acct.get("email", "?"),
         " [5h expired]" if needs_5h else "",
         " [7d reset]" if needs_7d else "",
     )

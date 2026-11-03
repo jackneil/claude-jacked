@@ -86,6 +86,11 @@ dev = [
     # its DEFAULT rules (0.16 did: ~1,600 new findings on this tree) changes
     # nothing here.
     "ruff>=0.6,<0.18",
+    # The Starlette TestClient uses httpx2 when it is installed. Without it,
+    # TestClient falls back to httpx and gives a StarletteDeprecationWarning
+    # on each import. The service code keeps httpx (see [project].dependencies).
+    # tests/unit/test_testclient_backend.py fails if httpx2 is missing.
+    "httpx2>=2.16,<3",
 ]
 
 [project.scripts]

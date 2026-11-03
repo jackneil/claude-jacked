@@ -139,10 +139,10 @@
   </div>
   <div class="finding">
     <h3><span class="badge info">[scorecard][MEDIUM]</span> SCSC-011: No SAST on commits</h3>
-    <p><b>Status:</b> filed</p>
+    <p><b>Status:</b> fixed</p>
     <p><b>Evidence:</b> Scorecard SAST 0: no CodeQL or other SAST tool runs on commits.</p>
     <p><b>Risk:</b> An attacker benefits from an injection or unsafe-deserialization pattern that a SAST pass would have flagged before merge.</p>
-    <p><b>Fix:</b> Filed as #199i (a CodeQL workflow; free on public repositories).</p>
+    <p><b>Fix:</b> The workflow .github/workflows/codeql.yml runs CodeQL (Python, JavaScript, GitHub Actions) on each pull request, each push to master and each week (#199i).</p>
   </div>
   <div class="finding">
     <h3><span class="badge muted">[scorecard][LOW]</span> SCSC-012: Fuzzing, CII badge, single-organization contributors</h3>
@@ -161,7 +161,7 @@
     <li><input type="checkbox" checked disabled> SCSC-007: anthropic removed</li>
     <li><input type="checkbox" checked disabled> SCSC-008: ruff in CI with a pinned rule set</li>
     <li><input type="checkbox" checked disabled> SCSC-009: SECURITY.md</li>
-    <li><input type="checkbox" disabled> SCSC-011: CodeQL workflow (#199i)</li>
+    <li><input type="checkbox" checked disabled> SCSC-011: CodeQL workflow (#199i)</li>
   </ul>
 
   <h2>Manual Verification</h2>

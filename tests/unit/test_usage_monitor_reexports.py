@@ -195,3 +195,30 @@ def test_the_full_sweep_clears_the_current_wake_after_reset_locks(caplog):
         state.sweep_wake().clear()
     woken = [r for r in caplog.records if r.getMessage() == "Full sweep woken early"]
     assert len(woken) == 1
+
+
+def test_the_keeper_ping_log_never_carries_the_account_email(caplog):
+    """lessons.md: never log tokens or emails. The ping line names the account
+    by id only; the email used to ride along in parentheses."""
+    import ast
+    import inspect
+
+    from jacked.api.keeper import process
+
+    source = inspect.getsource(process._keeper_process_account)
+    tree = ast.parse(source)
+    offenders = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"info", "debug", "warning", "error"}
+        and any(
+            isinstance(arg, ast.Call)
+            and isinstance(arg.func, ast.Attribute)
+            and arg.func.attr == "get"
+            and any(isinstance(a, ast.Constant) and a.value == "email" for a in arg.args)
+            for arg in node.args
+        )
+    ]
+    assert offenders == [], f"a keeper log line reads the email at source lines {offenders}"
