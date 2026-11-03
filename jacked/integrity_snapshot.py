@@ -45,6 +45,30 @@ _INLINE_CODE = frozenset({"-c", "-m", "-e", "--eval", "-command", "/c", "/k"})
 #: Subcommands of a runner (``uv run``, ``npm exec``) that come before the script.
 _SUBCOMMANDS = frozenset({"run", "exec", "x"})
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+#: The options of each interpreter or runner that take the next word as
+#: their operand (``python3 -W ignore``, ``uv run --project /p``). The parser
+#: skips the option and its operand, so the operand is never the script. An
+#: option in the ``--name=value`` form is one word and needs no entry.
+#: PowerShell and cmd options are compared in lowercase (``_NO_CASE``).
+_OPERAND_OPTIONS: dict[str, frozenset[str]] = {
+    "python": frozenset({"-W", "-X", "--check-hash-based-pycs"}),
+    "uv": frozenset({
+        "--project", "--directory", "--with", "-w", "--with-editable", "--with-requirements",
+        "--python", "-p", "--package", "--from", "--extra", "--group", "--env-file",
+        "--index", "--index-url", "--extra-index-url", "--config-file", "--cache-dir",
+    }),
+    "node": frozenset({"-r", "--require", "--import", "--loader", "--experimental-loader"}),
+    "shell": frozenset({"-o", "+o", "-O", "+O"}),
+    "ruby": frozenset({"-I", "-r"}),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    "powershell": frozenset({"-executionpolicy", "-ep", "-windowstyle", "-configurationname", "-workingdirectory"}),
+}
+_NO_CASE = frozenset({"powershell", "cmd"})
+#: The interpreter names of each ``_OPERAND_OPTIONS`` family that is not its own name.
+_FAMILY = {
+    "python3": "python", "pythonw": "python", "uvx": "uv", "bun": "node", "deno": "node",
+    "bash": "shell", "sh": "shell", "zsh": "shell", "fish": "shell", "pwsh": "powershell",
+}
 
 #: Program names that run a script; the script, not the program, is watched.
 _INTERPRETERS = frozenset({
@@ -143,9 +167,18 @@ def _expand_home(token: str, home: Path) -> str:
     return token
 
 
-def _is_interpreter(token: str) -> bool:
+def _interpreter(token: str) -> str | None:
+    """The ``_OPERAND_OPTIONS`` family of ``token`` when it is an interpreter, else None.
+
+    >>> _interpreter("/usr/bin/python3.12"), _interpreter("uvx"), _interpreter("check.py")
+    ('python', 'uv', None)
+    """
     name = Path(token).name.lower().removesuffix(".exe")
-    return name in _INTERPRETERS or name.rstrip("0123456789.") in _INTERPRETERS
+    if name not in _INTERPRETERS:
+        name = name.rstrip("0123456789.")
+        if name not in _INTERPRETERS:
+            return None
+    return _FAMILY.get(name, name)
 
 
 def _script_paths(command: str, home: Path) -> list[Path]:
@@ -153,14 +186,17 @@ def _script_paths(command: str, home: Path) -> list[Path]:
 
     Only the script token is watched: the program when it is not an
     interpreter, else the first operand after the interpreters, their
-    options, ``VAR=value`` words and a runner subcommand (``uv run``). A
-    later argument is data, never a script (``python3 /h/check.py
-    /repo/.git/index`` watches only ``check.py``). Inline code (``-c``,
-    ``-m``) and a relative or ``$VAR`` script are not watched as a file; the
-    digest of the command still watches them.
+    options (with the operand of an option in ``_OPERAND_OPTIONS``),
+    ``VAR=value`` words and a runner subcommand (``uv run``). A later
+    argument is data, never a script (``python3 /h/check.py /repo/.git/index``
+    watches only ``check.py``). Inline code (``-c``, ``-m``) and a relative
+    or ``$VAR`` script are not watched as a file; the digest of the command
+    still watches them.
 
     >>> [p.name for p in _script_paths("python3 -u /h/check.py /repo/.git/index", Path("/home"))]
     ['check.py']
+    >>> [p.name for p in _script_paths("uv run --project /p python3 -W ignore /h/c.py", Path("/home"))]
+    ['c.py']
     >>> _script_paths("python3 -m tool /etc/hosts", Path("/home"))
     []
     """
@@ -168,18 +204,27 @@ def _script_paths(command: str, home: Path) -> list[Path]:
         tokens = shlex.split(command, posix=os.name != "nt")
     except ValueError:
         tokens = command.split()
-    after_interpreter = False
+    family = None
+    operand_next = False
     for raw in tokens:
+        if operand_next:
+            operand_next = False
+            continue
         token = _expand_home(raw, home)
         if _ASSIGNMENT_RE.match(token):
             continue
-        if _is_interpreter(token):
-            after_interpreter = True
+        found = _interpreter(token)
+        if found:
+            family = found
             continue
-        if after_interpreter:
-            if token.lower() in _INLINE_CODE:
+        if family:
+            option = token.lower() if family in _NO_CASE else token
+            if option in _OPERAND_OPTIONS.get(family, ()):
+                operand_next = True
+                continue
+            if option in _INLINE_CODE:
                 return []
-            if token.startswith("-") or token in _SUBCOMMANDS:
+            if token.startswith(("-", "+")) or token in _SUBCOMMANDS:
                 continue
         path = Path(token)
         return [path] if path.is_absolute() else []

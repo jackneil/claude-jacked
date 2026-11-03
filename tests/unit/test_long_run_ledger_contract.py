@@ -181,3 +181,41 @@ def test_every_done_condition_allows_a_blocked_entry_with_a_reason(name: str) ->
         for phrase in _ALL_PASS:
             assert phrase not in lowered, f"{name} DONE line demands {phrase!r}: {line[:120]}"
         assert "blocked with a reason" in lowered, f"{name} DONE line has no blocked rule: {line[:120]}"
+
+
+# --- The Verify checklist agrees with the blocked terminal state (K10) -----
+
+#: The two files that forge a /goal brief with a Verify checklist.
+FORGERS = {"goal-maker": GOAL_MAKER, "whats-next": WHATS_NEXT}
+VERIFY_GLOBAL = (
+    "The global gates (the test command and each applicable review gate) must ALL pass "
+    "before you stop."
+)
+VERIFY_SCOPED = (
+    "Each per-milestone item applies to a worklist entry that is done; a blocked entry "
+    "carries its reason in evidence instead of a proof."
+)
+#: Verify phrases that demand a proof from every milestone, blocked ones included.
+_VERIFY_ALL_MILESTONES = (
+    "every milestone's behavior",
+    "each milestone works when run for real",
+    "all must pass before you stop:",
+)
+
+
+def _verify_section(text: str) -> str:
+    """The Verify checklist of the forged brief: from its heading line to the DONE line."""
+    start = text.index("\nVerify")
+    end = text.index("DONE when", start)
+    return text[start:end]
+
+
+@pytest.mark.parametrize("name", sorted(FORGERS))
+def test_the_verify_checklist_scopes_milestone_proofs_to_done_entries(name: str) -> None:
+    section = _verify_section(_text(FORGERS[name]))
+    assert VERIFY_GLOBAL in section, f"{name} Verify has no global-gate rule"
+    assert VERIFY_SCOPED in section, f"{name} Verify does not scope milestone proofs to done entries"
+    lowered = section.lower()
+    for phrase in _VERIFY_ALL_MILESTONES:
+        assert phrase not in lowered, f"{name} Verify demands {phrase!r} of every milestone"
+    assert "—" not in section

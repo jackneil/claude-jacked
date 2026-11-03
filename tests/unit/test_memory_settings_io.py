@@ -128,6 +128,14 @@ def test_invalid_utf8_raises_the_settings_error(tmp_path):
         settings_io.read_settings(p)
 
 
+def test_json_nested_too_deep_raises_the_settings_error(tmp_path):
+    """K8: json.loads raises RecursionError on deep nesting; that is unreadable too."""
+    p = tmp_path / "settings.local.json"
+    p.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+    with pytest.raises(SettingsUnreadableError):
+        settings_io.read_settings(p)
+
+
 # --------------------------------------------------------------------------- #
 # settings_io.write_settings is the ONE settings.json writer (#99i)
 # --------------------------------------------------------------------------- #

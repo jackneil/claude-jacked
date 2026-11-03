@@ -65,7 +65,7 @@ Claude Code 2.1.50 stopped loading user memory into the system prompt. The files
 - The integrity tripwire (`jacked/integrity.py`) keeps a baseline of `settings.json`: every hook entry, a hash of each hook script that a hook command names, and a hash of each settings key (each `env` entry is a key). The baseline never holds a settings value, and a finding gives only the key name.
 - The single writer updates the baseline with only its own change, so a change from outside jacked stays reported until the user runs `jacked integrity accept`. Each rebaseline goes into a log with the time, the reason and the jacked version.
 - The SessionStart hook prints each change last, as data in a fenced block. `jacked doctor` and the dashboard show the same state. The dashboard cannot accept a change.
-- At session start, the quarantine (`jacked/memory/quarantine.py`) moves each `MEMORY.md` line with a documented injection shape to `MEMORY.md.quarantine-<date>.md` beside it. The shapes are narrow on purpose, because a memory file is full of real instructions from the user. The log records the file name and the line count, never the text.
+- At session start, the quarantine (`jacked/memory/quarantine.py`) moves each `MEMORY.md` line with a documented injection shape (`jacked/memory/injection_shapes.py`) to `MEMORY.md.quarantine-<date>.md` beside it. The shapes are narrow on purpose, because a memory file is full of real instructions from the user. The log records the file name and the line count, never the text.
 - The tripwire only warns. It never blocks a session and never edits `settings.json`.
 
 ### Limit of the threat model

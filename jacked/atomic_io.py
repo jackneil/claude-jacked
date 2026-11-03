@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -242,6 +243,36 @@ def _set_mode(fd: int, tmp_name: str, mode: int, *, strict: bool, name: str) -> 
         secure_windows_path(Path(tmp_name))
 
 
+def _keep_mode(fd: int, tmp_name: str, target: Path) -> None:
+    """Give the temp file the permission bits of the file that it replaces (POSIX).
+
+    mkstemp makes the temp file 0o600, so without this step each rewrite of a
+    0o644 file (a MEMORY.md, a settings file) leaves it 0o600. Only a regular
+    file at ``target`` gives its bits (``lstat``: a symlink that the write
+    replaces gives none), and only the nine permission bits (never setuid,
+    setgid or sticky). A new file stays 0o600. Windows is not changed here:
+    its protection is the ACL, which the ``mode`` argument sets. A refused
+    chmod is logged at DEBUG and the write goes on; the result is then
+    0o600, never looser.
+    """
+    if os.name == "nt":
+        return
+    try:
+        st = os.lstat(target)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.debug("Could not read the mode of %s (%s); it becomes 0o600", target.name, _describe_refusal(exc))
+        return
+    bits = stat.S_IMODE(st.st_mode) & 0o777
+    if not stat.S_ISREG(st.st_mode) or bits == 0o600:
+        return
+    try:
+        _set_mode_bits(fd, tmp_name, bits)
+    except OSError as exc:
+        logger.debug("Could not keep the mode of %s (%s); it becomes 0o600", target.name, _describe_refusal(exc))
+
+
 def _write_atomically(
     path,
     payload,
@@ -252,6 +283,7 @@ def _write_atomically(
     mode: int | None,
     mode_strict: bool,
     retry_budget: float,
+    before_replace: Callable[[], None] | None = None,
 ) -> None:
     # A symlink at ``path`` is replaced by a plain file unless the caller
     # opts in: following it lets a repo-shipped link (lessons.md pointing at
@@ -262,7 +294,8 @@ def _write_atomically(
     # Writer-unique: the CLI, the dashboard service and hook processes can
     # all write the same file, and a shared temp name would let one writer
     # replace the target with another writer's half-written temp file.
-    # mkstemp creates the temp file owner-only (0o600).
+    # mkstemp creates the temp file owner-only (0o600); with no ``mode``, a
+    # rewrite keeps the permission bits of the file it replaces.
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
     )
@@ -275,11 +308,15 @@ def _write_atomically(
                 _set_mode(
                     handle.fileno(), tmp_name, mode, strict=mode_strict, name=target.name
                 )
+            else:
+                _keep_mode(handle.fileno(), tmp_name, target)
             handle.write(payload)
             if fsync:
                 handle.flush()
                 os.fsync(handle.fileno())
-        replace_with_retry(tmp_name, target, retry_budget=retry_budget)
+        if before_replace is not None:
+            before_replace()
+        replace_with_retry(tmp_name, target, retry_budget=retry_budget, before_retry=before_replace)
     except BaseException:
         # Any failure (a KeyboardInterrupt mid-write included) removes the
         # temp file, so a crash never leaves a stray temp or a partial target.
@@ -297,16 +334,25 @@ def atomic_write_bytes(
     mode: int | None = None,
     mode_strict: bool = True,
     retry_budget: float = RETRY_BUDGET_SECONDS,
+    before_replace: Callable[[], None] | None = None,
 ) -> None:
     """Atomically replace ``path`` with ``data``, byte for byte.
 
     The parent directory is created when it is missing. ``fsync`` flushes the
     bytes to disk before the replace. ``mode`` sets the permission bits of the
     result (0o600 for a credential file); on Windows it also gives the result
-    a private ACL (the current user only). ``follow_symlinks`` writes through a
+    a private ACL (the current user only). With no ``mode``, a rewrite on
+    POSIX keeps the permission bits of the regular file that it replaces, and
+    a new file is 0o600. ``follow_symlinks`` writes through a
     link at ``path`` to the file it points at; by default the link itself is
     replaced by a plain file. ``retry_budget`` is passed to
     ``replace_with_retry``.
+
+    ``before_replace`` is a compare-and-swap check. It runs after the temp
+    file is complete, immediately before the replace, and again before each
+    retry of the replace (``before_retry``). It raises to stop the write: the
+    temp file is removed, the target does not change, and the exception
+    propagates.
 
     By default a failure to set the mode (the chmod, or the private ACL on
     Windows) stops the write before the replace, and the error propagates.
@@ -329,6 +375,7 @@ def atomic_write_bytes(
         mode=mode,
         mode_strict=mode_strict,
         retry_budget=retry_budget,
+        before_replace=before_replace,
     )
 
 
@@ -341,6 +388,7 @@ def atomic_write_text(
     mode: int | None = None,
     mode_strict: bool = True,
     retry_budget: float = RETRY_BUDGET_SECONDS,
+    before_replace: Callable[[], None] | None = None,
 ) -> None:
     """Atomically replace ``path`` with ``text`` encoded as UTF-8.
 
@@ -359,4 +407,5 @@ def atomic_write_text(
         mode=mode,
         mode_strict=mode_strict,
         retry_budget=retry_budget,
+        before_replace=before_replace,
     )

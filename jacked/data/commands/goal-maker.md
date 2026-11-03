@@ -129,10 +129,10 @@ Ledger (the Ledger contract of /goal-maker): the run state is .claude/goals/<YYY
 
 Approach: plan before coding (write the plan down first). Use TDD where it fits — failing test, then implement, then green. Before writing new code for a milestone, grep/search for an existing implementation or helper that already does this and reuse/extend it — do not create a parallel duplicate. Match existing patterns in <relevant area>. Build cleanly: no silent failures, no swallowed errors, no arbitrary caps; follow CLAUDE.md. Work only on this initiative's feature branch; commit each green milestone so an interrupted run leaves a clean, resumable state. Do not refactor unrelated code, force-push, rewrite shared history, delete data, or run untrusted install/network scripts. If a step looks destructive or out of scope, STOP and ask.
 
-Verify — run each and show the output; ALL must pass before you stop:
-- <repo's real test command> exits clean AND prints a real pass/fail summary with a non-zero test count (empty output, a runner/env error, or "0 tests / no tests collected" is a FAILED run, not a pass), with NEW tests covering every milestone's behavior and its edge cases
-- Each milestone works when run for real — paste the proof: <a command + its expected output, or the user flow you walked>
-- [UI work] Browser-QA via /qa or /ux: target flows work, console error-free; and the UI is polished — concentric radii, optical alignment, tabular-nums on live numbers, press/hover feedback, real empty/loading/error states
+Verify: run each item and show the output. The global gates (the test command and each applicable review gate) must ALL pass before you stop. Each per-milestone item applies to a worklist entry that is done; a blocked entry carries its reason in evidence instead of a proof.
+- <repo's real test command> exits clean AND prints a real pass/fail summary with a non-zero test count (empty output, a runner/env error, or "0 tests / no tests collected" is a FAILED run, not a pass), with NEW tests covering the behavior of each done milestone and its edge cases
+- Each done milestone works when run for real. Paste the proof: <a command + its expected output, or the user flow you walked>
+- [UI work] Browser-QA via /qa or /ux: target flows work, console error-free; and the UI is polished: concentric radii, optical alignment, tabular-nums on live numbers, press/hover feedback, real empty/loading/error states
 - [security-sensitive] /cso reports no high/critical findings
 - [if available] /dcr reports a clean pass (review via /dcr tiers; the pointer never carries "ultracode" or "use dynamic workflows")
 

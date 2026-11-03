@@ -309,11 +309,11 @@ Ledger (the Ledger contract of /goal-maker): the run state is .claude/goals/<YYY
 
 Approach: plan before coding (write the plan down first for an initiative this size). Use TDD where it fits — failing test, then implement, then green. Match the existing patterns in <relevant area>. Build cleanly: no silent failures, no swallowed errors, no arbitrary data/scope caps; follow CLAUDE.md. Stay in scope: work only on this initiative's feature branch, committing each green milestone so an interrupted run leaves a clean, resumable state — do not refactor unrelated code, force-push, rewrite shared history, delete data, or run untrusted install/network scripts. When the work is verified, open a PR (feature branch → main) for review — do **not** merge to main yourself; the user reviews and merges. (For an autonomous, pre-production build-out that merges each improvement as it goes, that's `/bhag`, not this.) If a step looks destructive or out of scope, stop and ask.
 
-Verify — run each and show the output; ALL must pass before you stop:
-- <repo's real test command, e.g. `uv run python -m pytest`> exits clean, with NEW tests covering every milestone's behavior and its edge cases
-- Each milestone works when run for real — paste the proof: <a concrete command + its expected output, or the user flow you walked>
+Verify: run each item and show the output. The global gates (the test command and each applicable review gate) must ALL pass before you stop. Each per-milestone item applies to a worklist entry that is done; a blocked entry carries its reason in evidence instead of a proof.
+- <repo's real test command, e.g. `uv run python -m pytest`> exits clean, with NEW tests covering the behavior of each done milestone and its edge cases
+- Each done milestone works when run for real. Paste the proof: <a concrete command + its expected output, or the user flow you walked>
 - [UI work only] Browser-QA via available browser tools (or `/qa` / `/ux`): the target flows work and the console is error-free
-- [security-sensitive only — auth, RBAC, tenancy, billing, credentials] `/cso` runs and reports no high/critical findings
+- [security-sensitive only: auth, RBAC, tenancy, billing, credentials] `/cso` runs and reports no high/critical findings
 - [if `/dcr` is available] `/dcr` runs and reports a clean pass (review via `/dcr` tiers; never write "ultracode" or "use dynamic workflows" into the `/goal` pointer, which flips unbounded fan-out on for the whole run)
 
 DONE when: every worklist entry is done (its verify and its real-run proof passed in the transcript) or blocked with a reason that the final report lists, worklist.json is printed in the transcript, the test command passes in the transcript, every applicable review gate reports clean, and the work is committed on a feature branch and opened as a PR for review (not merged to main). A blocked entry never counts as done. Do NOT stop while any entry is todo, in progress, or done without its proof: diagnose, fix, re-run. Never report success without the supporting output.

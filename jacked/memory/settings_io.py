@@ -86,8 +86,9 @@ def read_settings(path: Path | str) -> dict:
     """Read settings.json. ``{}`` ONLY for a missing file; raise otherwise.
 
     A ``FileNotFoundError`` is the benign fresh-install case. A JSON parse error,
-    any other OSError, or a top-level value that is not a JSON object all raise
-    ``SettingsUnreadableError`` -- the caller must abort rather than clobber.
+    JSON nested too deep to decode, any other OSError, or a top-level value
+    that is not a JSON object all raise ``SettingsUnreadableError`` -- the
+    caller must abort rather than clobber.
 
     Only a regular file is read (``jacked.regular_file``): a FIFO, a symlink to
     a FIFO, a device or a folder raises at once and never blocks. A file over
@@ -100,7 +101,9 @@ def read_settings(path: Path | str) -> dict:
         return {}
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as e:
+    except (ValueError, RecursionError) as e:
+        # ValueError: not valid JSON (JSONDecodeError is a ValueError).
+        # RecursionError: valid JSON that is nested too deep to decode.
         raise SettingsUnreadableError(f"{path} is not valid JSON: {e}") from e
     if not isinstance(data, dict):
         raise SettingsUnreadableError(f"{path} is not a JSON object")

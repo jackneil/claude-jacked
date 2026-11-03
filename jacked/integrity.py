@@ -208,13 +208,26 @@ def accept(settings_file: Path | str) -> None:
     rebaseline(settings_file, reason="user accept", replace_unreadable=True)
 
 
+def _baseline_exists(settings_file: Path | str) -> bool:
+    """True when a baseline file is there, readable or not."""
+    try:
+        return load_baseline(settings_file) is not None
+    except BaselineUnreadableError:
+        return True
+
+
 def ensure_baseline(settings_file: Path | str) -> bool:
-    """Make a first baseline when there is none. True when one was made."""
+    """Make a first baseline when there is none. True when one was made.
+
+    Each session start calls this. When the baseline is there, the read does
+    not take the baseline lock, so a stuck lock holder never delays a session
+    start. Only a missing baseline takes the lock, and the check runs again
+    inside it, so two first starts make one baseline.
+    """
+    if _baseline_exists(settings_file):
+        return False
     with baseline_lock(settings_file):
-        try:
-            if load_baseline(settings_file) is not None:
-                return False
-        except BaselineUnreadableError:
+        if _baseline_exists(settings_file):
             return False
         rebaseline(settings_file, reason="first baseline")
         return True
@@ -360,19 +373,22 @@ def session_start_block(cwd, home, env=None) -> str:
     home = Path(home)
     settings_file = settings_io.settings_path(home)
     lines = []
-    memory, source = claude_paths.native_memory_location(cwd, home, env)
-    read_only = ""
-    if source == "local":
-        # A repo can ship or plant .claude/settings.local.json, so jacked only
-        # reads a memory folder that such a file chose.
-        read_only = "set by a repo-local settings file"
-        logger.debug("integrity: a repo-local autoMemoryDirectory chose %s, so jacked only reads it", memory.name)
+    # The memory path comes from settings files that a repo can ship, so its
+    # resolution runs inside the guard too. The failure line names no
+    # resolved path, and the settings check below always runs.
+    memory = Path("MEMORY.md")
     try:
+        memory, source = claude_paths.native_memory_location(cwd, home, env)
+        read_only = ""
+        if source == "local":
+            # A repo can ship or plant .claude/settings.local.json, so jacked
+            # only reads a memory folder that such a file chose.
+            read_only = "set by a repo-local settings file"
+            logger.debug("integrity: a repo-local autoMemoryDirectory chose %s, so jacked only reads it", memory.name)
         found = quarantine.quarantine_file(memory, today=datetime.now().date().isoformat(), read_only=read_only)
     except Exception as exc:  # noqa: BLE001 -- a failed move must never hide the settings check
-        logger.warning("integrity: memory quarantine of %s failed (%s)", memory.name, type(exc).__name__)
-        lines.append(f"jacked integrity: memory quarantine failed ({type(exc).__name__}); "
-                     f"{memory.name} left unchanged")
+        logger.warning("integrity: memory quarantine failed (%s)", type(exc).__name__)
+        lines.append(f"jacked integrity: memory quarantine failed ({type(exc).__name__}); MEMORY.md left unchanged")
         found = None
     moved = found if found and found.moved else None
     if moved:
