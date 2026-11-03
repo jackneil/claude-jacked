@@ -25,7 +25,8 @@ is absent / the memory vault is disabled), so this single entry stays correct
 whatever the user has toggled. Step 4 reads the issue queue cache that the
 jacked service writes; it starts no subprocess and makes no network call, and
 it prints nothing when the cache is missing or 24 hours old, so a machine
-without gh adds zero bytes. Step 5 does not depend on the vault: it prints
+that never had gh adds zero bytes. When gh goes away, the service stops the
+refreshes, and a cache that exists stays in use until it is 24 hours old. Step 5 does not depend on the vault: it prints
 in every git work tree and prints nothing anywhere else, so a session start
 outside a git repo adds zero bytes. Step 6 prints only when a file that Claude
 Code loads at session start (MEMORY.md, a CLAUDE.md) is over 90% of its load

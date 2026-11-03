@@ -53,7 +53,7 @@ BASELINE: dict[str, int] = {
     "jacked/dcr_settings.py": 755,
     "jacked/install_manifest.py": 602,
     "jacked/launch.py": 1586,
-    "jacked/memory/capture.py": 786,
+    "jacked/memory/capture.py": 785,
     "jacked/memory/migrate.py": 657,
     "jacked/memory/recall.py": 603,
     "jacked/memory/vault.py": 1254,
