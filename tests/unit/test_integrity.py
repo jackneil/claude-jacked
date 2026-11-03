@@ -640,14 +640,25 @@ class TestSurfaces:
 
         from jacked import cli
 
+        from io import StringIO
+
+        from rich.console import Console
+
         monkeypatch.setattr(cli, "_setup_tray_autostart", lambda: None)
+        # A narrow console: the FAIL line carries a path and must never wrap
+        # (soft_wrap), whatever width the suite's console happens to have.
+        narrow = StringIO()
+        monkeypatch.setattr(cli, "console", Console(file=narrow, width=60, highlight=False))
         path = _settings_file(home)
         path.write_text('{"hooks": {"Stop": [', encoding="utf-8")
 
         r = CliRunner().invoke(cli.main, ["install", "--no-rules", "--no-packs", "--no-tray"])
 
+        out = narrow.getvalue()
         assert r.exit_code == 1
-        assert "FAIL" in r.output and "settings.json.bak-" in r.output
+        backup = next(path.parent.glob("settings.json.bak-*"))
+        # The whole backup path sits on one line: a wrapped path cannot be copied.
+        assert "FAIL" in out and str(backup) in out
         assert path.read_text(encoding="utf-8") == '{"hooks": {"Stop": ['
 
     def test_the_features_list_carries_the_read_only_integrity_state(self, home, monkeypatch):

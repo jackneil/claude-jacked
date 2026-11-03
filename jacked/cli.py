@@ -3666,7 +3666,7 @@ def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
             backup_path = claude_md_path.with_suffix(".md.pre-jacked")
             if not backup_path.exists():
                 shutil.copy2(claude_md_path, backup_path)
-                console.print(f"[dim]Backup: {backup_path}[/dim]")
+                console.print(f"[dim]Backup: {backup_path}[/dim]", soft_wrap=True)
 
             # Replace the block (symmetric with _remove_behavioral_rules)
             before = existing_content[:start_idx].rstrip("\n")
@@ -3706,7 +3706,7 @@ def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
         backup_path = claude_md_path.with_suffix(".md.pre-jacked")
         if not backup_path.exists():
             shutil.copy2(claude_md_path, backup_path)
-            console.print(f"[dim]Backup: {backup_path}[/dim]")
+            console.print(f"[dim]Backup: {backup_path}[/dim]", soft_wrap=True)
 
     # Ensure parent directory exists
     claude_md_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5063,7 +5063,7 @@ def _run_install(
         try:
             existing = _read_settings_strict(settings_path)
         except _SettingsUnreadable as exc:
-            console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}. Fix it, then run jacked install again. Backup: {backup}")
+            console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}. Fix it, then run jacked install again. Backup: {backup}", soft_wrap=True)
             raise SystemExit(1)
     else:
         existing = {}
