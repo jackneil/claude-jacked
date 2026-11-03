@@ -747,11 +747,13 @@ def _install_skill_sync(skill_name: str, src_dir: Path, skill_dir: Path, manifes
     user dir was put back after a failure.
 
     It runs the CLI's own transaction, `_install_skill_dir_transactional`:
-    move a dir jacked does not own aside, then copy the WHOLE tree (SKILL.md
-    and every sidecar; symlinks in editable mode). When the copy fails, the
-    partial copy is removed and a user dir that was moved aside is moved back,
-    so a failed toggle leaves the skill as it was. Last, the manifest records
-    the dir, so a later upgrade or uninstall knows that jacked owns it.
+    move a dir jacked does not own aside, copy the WHOLE tree (SKILL.md and
+    every sidecar; symlinks in editable mode) into a private staging dir
+    beside the skill, then rename that dir into place. When the copy or the
+    rename fails, only the staging dir is removed and a user dir that was
+    moved aside is moved back, so a failed toggle leaves the skill as it was.
+    Last, the manifest records the dir, so a later upgrade or uninstall knows
+    that jacked owns it.
     """
     from jacked import cli as jacked_cli
     from jacked import install_manifest as mani

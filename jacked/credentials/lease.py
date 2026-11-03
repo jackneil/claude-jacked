@@ -78,10 +78,13 @@ class FileSwitchLease:
             yield acquired
         finally:
             if acquired:
-                _unlock(handle)
+                _unlock(handle, self._path.name)
             handle.close()
 
     def _open(self):
+        # The log lines name the lease file and the exception class only: the
+        # text of an OSError carries the full path, and the update lock uses
+        # this class too, so the message must not say "credential switch".
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             if os.name != "nt":
@@ -89,18 +92,21 @@ class FileSwitchLease:
             flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(self._path, flags, 0o600)
         except OSError as exc:
-            logger.warning("Could not open the credential switch lease: %s", exc)
+            logger.warning(
+                "Could not open the lease %s (%s)", self._path.name, type(exc).__name__
+            )
             return None
         try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise OSError("the credential switch lease is not a regular file")
-            if os.name != "nt":
-                os.fchmod(descriptor, 0o600)
-            return os.fdopen(descriptor, "r+b")
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                if os.name != "nt":
+                    os.fchmod(descriptor, 0o600)
+                return os.fdopen(descriptor, "r+b")
+            reason = "not a regular file"
         except OSError as exc:
-            os.close(descriptor)
-            logger.warning("Could not open the credential switch lease: %s", exc)
-            return None
+            reason = type(exc).__name__
+        os.close(descriptor)
+        logger.warning("Could not open the lease %s (%s)", self._path.name, reason)
+        return None
 
 
 def _lock(handle) -> bool:
@@ -123,7 +129,8 @@ def _lock(handle) -> bool:
     return True
 
 
-def _unlock(handle) -> None:
+def _unlock(handle, name: str) -> None:
+    """Release the lock on ``handle``. ``name`` is the lease file name."""
     try:
         if os.name == "nt":  # pragma: no cover - Windows
             import msvcrt
@@ -135,7 +142,7 @@ def _unlock(handle) -> None:
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     except OSError as exc:
-        logger.warning("Could not release the credential switch lease: %s", exc)
+        logger.warning("Could not release the lease %s (%s)", name, type(exc).__name__)
 
 
 class CompositeSwitchLease:

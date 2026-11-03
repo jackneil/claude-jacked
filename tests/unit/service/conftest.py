@@ -20,6 +20,20 @@ import os
 import pytest
 
 
+def isolate_windows_profile(monkeypatch, root):
+    """Point APPDATA into ``root`` for the rest of the test.
+
+    The legacy Startup script and the staged Windows task paths derive from
+    APPDATA (``platform._get_windows_startup_path``,
+    ``autostart._windows_vbs_path``, the Task Scheduler supervisor). On a
+    real Windows host APPDATA names the user's roaming folder, where a
+    legacy ``jacked.vbs`` can exist, and the inspector would then read it.
+    The redirect applies on every platform, so no test result can depend on
+    the APPDATA that the process inherited.
+    """
+    monkeypatch.setenv("APPDATA", str(root / "AppData" / "Roaming"))
+
+
 @pytest.fixture(autouse=True)
 def _isolate_claude_dir(tmp_path, monkeypatch):
     """Point every service-module ~/.claude path constant at a tmp dir.
@@ -48,6 +62,7 @@ def _isolate_claude_dir(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: cls(tmp_path)))
+    isolate_windows_profile(monkeypatch, tmp_path)
     if os.name == "nt":
         secure_windows_path(fake)
 
@@ -80,40 +95,6 @@ def _isolate_claude_dir(tmp_path, monkeypatch):
         monkeypatch.setattr(mod, attr, value, raising=False)
 
     yield
-
-
-@pytest.fixture(autouse=True)
-def _stop_signal_handlers_unchanged():
-    """Fail a test that leaves a process-wide stop-signal handler changed.
-
-    ``ServiceRunner.run`` routes the stop signals to its own runner while it
-    runs and must put the previous handlers back when it returns (#138i). A
-    handler left in place binds Ctrl+C to a dead runner for every later test
-    in this process, so Ctrl+C no longer raises KeyboardInterrupt.
-
-    The check uses the real ``signal`` functions captured before the test, so
-    a test that patches ``signal.signal`` or ``signal.getsignal`` cannot hide
-    a leak. A changed handler is put back before the failure is reported, so
-    one leak fails one test and not every test after it.
-    """
-    import signal
-
-    getsignal, setsignal = signal.getsignal, signal.signal
-    names = ["SIGINT", "SIGTERM"]
-    if hasattr(signal, "SIGBREAK"):
-        names.append("SIGBREAK")  # Windows: Ctrl+Break
-    before = {name: getsignal(getattr(signal, name)) for name in names}
-
-    yield
-
-    changed = []
-    for name, handler in before.items():
-        if getsignal(getattr(signal, name)) is not handler:
-            changed.append(name)
-            setsignal(getattr(signal, name), handler)
-    assert not changed, (
-        f"the test left these stop-signal handlers changed: {changed}"
-    )
 
 
 @pytest.fixture

@@ -194,15 +194,18 @@ def _install_codex_skill_dir(
     src, target: Path, name: str, prior: Mapping, preserved: list, *,
     expected: str, copy, this_run: Optional[Mapping] = None,
 ) -> SkillInstallOutcome:
-    """Write one ~/.agents/skills dir through the shared move-aside-then-copy
-    transaction, `jacked.cli._install_skill_dir_transactional`.
+    """Write one ~/.agents/skills dir through the shared move-aside, stage
+    and publish transaction, `jacked.cli._install_skill_dir_transactional`.
 
     The Codex `_preserve_user_skill_dir` is wrapped to the shared shape
     ``(target, name, src, prior) -> backup``. ``src`` is also its ``src_dir``
-    (None for a skill that is generated from a command). A dir that it moved
-    aside goes into `preserved` only while the dir is still in jacked-backups:
-    a failed write that put the dir back leaves nothing to report. A preserve
-    or copy OSError is returned in the outcome, never raised.
+    (None for a skill that is generated from a command). ``copy(src,
+    staging)`` writes into a new private staging dir beside `target`, and
+    the transaction renames that dir into place, so the copy step never
+    deletes the old dir itself. A dir that preserve moved aside goes into
+    `preserved` only while the dir is still in jacked-backups: a failed write
+    that put the dir back leaves nothing to report. A preserve, copy or
+    publish OSError is returned in the outcome, never raised.
     """
     from jacked.cli import _install_skill_dir_transactional
 
@@ -249,8 +252,9 @@ def install_codex(
     #    Before overwriting a target, `_preserve_user_skill_dir` moves aside any
     #    NON-jacked dir that collides with a skill name (shared ~/.agents/skills),
     #    so a user's own dir is never silently destroyed. Both writes run in the
-    #    shared transaction (`_install_codex_skill_dir`): a write that fails
-    #    part-way removes its partial copy and moves the user's dir back.
+    #    shared transaction (`_install_codex_skill_dir`): the copy goes into a
+    #    private staging dir that a rename publishes, so a write that fails
+    #    part-way never touches the live dir, and the user's dir moves back.
     #    A skill whose SKILL.md carries the `<!-- ENGINE -->` marker absorbed a
     #    former command body, so it ALSO ships as a ~/.codex/prompts/<name>.md
     #    (frontmatter + engine, dropping the Claude-side repo-dispatch preamble)

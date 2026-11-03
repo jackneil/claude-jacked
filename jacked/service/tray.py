@@ -1465,14 +1465,13 @@ class ServiceRunner:
         """pystray setup callback — runs after icon appears."""
         icon.visible = True
 
-        # Surface a prior failed update if recovery file exists.
+        # Surface a prior failed update if recovery file exists. run() made
+        # the boot checks on the path that both backends share: it wrote the
+        # file for an interrupted update and removed a stale one, so the
+        # toast below shows only for a real failure.
         try:
             from jacked.service.updater import RECOVERY_FILE
 
-            self._record_abandoned_update()
-            # A later install can leave an old failure's file behind. Remove
-            # it first, so the toast below shows only for a real failure.
-            self.clear_stale_recovery()
             if RECOVERY_FILE.exists():
                 icon.notify(
                     "Previous update failed. See "
@@ -1513,7 +1512,13 @@ class ServiceRunner:
         A machine that lost power (or the tray process) mid-update boots with
         an `in_progress` status file nobody will ever close. The status reader
         hides it so no zombie banner appears, which also hid it from the user.
-        Write the recovery file instead, and close the status as failed.
+        Close the status as failed instead, then write the recovery file.
+
+        The close comes first and takes the update lock
+        (``update_status.close_abandoned_update``). Another updater can start,
+        or the attempt can write again, between the first read and the close.
+        Then nothing is closed and no recovery file is written, because the
+        file would describe a failure that did not happen.
 
         An old record is not proof of a failure: the batch or the updater can
         stop after the install completed. The last-install record and this
@@ -1539,6 +1544,11 @@ class ServiceRunner:
             f"This tray is v{__version__}."
         )
         recovery = "jacked upgrade"
+        closed = _us.close_abandoned_update(
+            _us.UPDATE_STATUS_FILE, record, error=error, recovery=recovery
+        )
+        if closed is None:
+            return
         try:
             RECOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
             RECOVERY_FILE.write_text(
@@ -1549,10 +1559,6 @@ class ServiceRunner:
             )
         except OSError:
             logger.exception("Could not write the update recovery file")
-        try:
-            _us.mark_failed(_us.UPDATE_STATUS_FILE, error=error, recovery=recovery)
-        except Exception:
-            logger.exception("Could not mark the abandoned update failed")
 
     def clear_stale_recovery(self) -> bool:
         """Remove the update recovery file when a later install made it stale.
@@ -1560,25 +1566,40 @@ class ServiceRunner:
         The tray toasts "Previous update failed" on every start while the
         recovery file exists. After a later install replaced the build that
         failed to update (a manual ``jacked upgrade``, a second update), that
-        toast repeated forever. The file is stale when the status record
-        closed as failed, the running build is newer than the version that
-        update started from, and an install completed after the update
-        started (``update_status.failed_update_superseded``). A genuine
-        failure keeps its file and its toast. A recovery file that no failed
-        record explains is never removed. Returns True when this call
-        removed the file.
+        toast repeated forever. The file is stale in two cases:
+
+        * The status record closed as failed, the running build is newer
+          than the version that update started from, and an install
+          completed after the update failed
+          (``update_status.failed_update_superseded``).
+        * The status record closed as succeeded, the running build is newer
+          than the version that update started from, and the file was
+          written before that update started
+          (``update_status.recovery_predates_completed_update``). The
+          updater removes the file when its own update succeeds, but an
+          update that ``abandoned_status`` closed as succeeded did not.
+
+        The record is read with no staleness rule (``read_record``): an old
+        record is still evidence. A genuine failure keeps its file and its
+        toast. A recovery file that no record explains is never removed.
+        Returns True when this call removed the file.
         """
         from jacked import __version__
         from jacked.install_summary import read_last_install
         from jacked.service import update_status as _us
         from jacked.service.updater import RECOVERY_FILE
 
-        if not RECOVERY_FILE.exists():
+        try:
+            written = RECOVERY_FILE.stat().st_mtime
+        except FileNotFoundError:
             return False
-        record = _us.read_status(_us.UPDATE_STATUS_FILE)
-        if record is None or not _us.failed_update_superseded(
+        record = _us.read_record(_us.UPDATE_STATUS_FILE)
+        if record is None:
+            return False
+        stale = _us.failed_update_superseded(
             record, read_last_install(), __version__
-        ):
+        ) or _us.recovery_predates_completed_update(record, __version__, written)
+        if not stale:
             return False
         try:
             RECOVERY_FILE.unlink()
@@ -1686,6 +1707,13 @@ class ServiceRunner:
             self._record_abandoned_update()
         except Exception:
             logger.exception("Could not check for an interrupted update")
+        # A later install can leave an old failure's recovery file behind.
+        # The check runs here, on the path that both backends share, so the
+        # macOS menu-bar agent removes a stale file too.
+        try:
+            self.clear_stale_recovery()
+        except Exception:
+            logger.exception("Could not check for a stale update recovery file")
 
         from jacked.service.lifecycle import (
             claim_service_ownership,

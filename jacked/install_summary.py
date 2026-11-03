@@ -11,6 +11,11 @@ from jacked.install_manifest import ManifestDiff
 
 logger = logging.getLogger(__name__)
 
+# The most bytes a last-install record may have before it is read: the same
+# bound the service manifest reader applies (64 KiB). A real record is a few
+# KiB; a larger file is not ours.
+MAX_RECORD_BYTES = 65_536
+
 
 def last_install_path() -> Path:
     """Return the path of the last-install record, resolved at call time.
@@ -109,10 +114,18 @@ def read_last_install(path: Path | str | None = None) -> dict | None:
     """
     target = Path(last_install_path() if path is None else path)
     try:
+        size = target.stat().st_size
+        if size > MAX_RECORD_BYTES:
+            logger.debug(
+                "The last-install record is too large (%d bytes); it is not read", size
+            )
+            return None
         record = json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except (OSError, ValueError) as exc:  # ValueError: bad UTF-8 or bad JSON
+    except (OSError, ValueError, RecursionError) as exc:
+        # ValueError: bad UTF-8 or bad JSON. RecursionError: JSON nested
+        # deeper than the interpreter allows.
         logger.debug("Could not read the last-install record: %s", type(exc).__name__)
         return None
     if not isinstance(record, dict):

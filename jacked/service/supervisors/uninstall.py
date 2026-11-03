@@ -18,6 +18,7 @@ from ._artifacts import (
     inspect_artifact,
 )
 from ._helpers import privately_controlled
+from .launchd import LAUNCHCTL_NOT_FOUND
 from ._transition import SupervisorTransitionLease, TransitionBusy
 from . import render_for_spec
 from ._task_xml import query_task_xml
@@ -116,7 +117,7 @@ def _uninstall_launchd(
     effective_uid = os.getuid() if uid is None else uid
     domain = f"gui/{effective_uid}/{spec.service_id}"
     loaded = run(["launchctl", "print", domain], **common)
-    if loaded.returncode == 113:
+    if loaded.returncode == LAUNCHCTL_NOT_FOUND:
         return SupervisorAction(True, "uninstall", "launchd job was not loaded")
     if loaded.returncode != 0:
         return _refused(path, f"launchctl inspection exit {loaded.returncode}")

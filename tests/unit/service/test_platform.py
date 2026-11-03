@@ -447,11 +447,15 @@ _LOADED_AND_RAN = "gui/501/ai.hank.jacked = {\n\tstate = running\n\truns = 1\n}\
 class _NativeManager:
     """Answer the native manager queries the probe makes; refuse the rest."""
 
-    def __init__(self, *, loaded=True, disabled=False, task_xml=None, print_error=None):
+    def __init__(
+        self, *, loaded=True, disabled=False, task_xml=None, print_error=None, print_exit=None
+    ):
         self.loaded = loaded
         self.disabled = disabled
         self.task_xml = task_xml
         self.print_error = print_error
+        # An exit code for `launchctl print` other than 0 or 113 (not found).
+        self.print_exit = print_exit
         self.calls = []
 
     def __call__(self, argv, **_kwargs):
@@ -467,6 +471,10 @@ class _NativeManager:
         if argv[:2] == ["launchctl", "print"]:
             if self.print_error is not None:
                 raise self.print_error
+            if self.print_exit is not None:
+                return SimpleNamespace(
+                    returncode=self.print_exit, stdout="", stderr="launchctl failed"
+                )
             if self.loaded:
                 return SimpleNamespace(returncode=0, stdout=_LOADED_AND_RAN, stderr="")
             return SimpleNamespace(
@@ -626,9 +634,28 @@ class TestSupervisionDrift:
         assert supervision_drift(run=manager, uid=501, paths=paths) is None
         assert manager.asked_launchd_for_the_job()
 
-    def test_no_manifest_means_no_running_service_and_asks_no_manager(
-        self, tmp_path, monkeypatch
+    @staticmethod
+    def _manifest_state(paths, state, monkeypatch):
+        """Leave the manifest of the running service in ``state``."""
+        from jacked.service.spec import SupervisorKind
+
+        if state == "dead owner":
+            _publish_running(
+                paths, _other_build(SupervisorKind.MANUAL), monkeypatch, alive=False
+            )
+        elif state == "unreadable":
+            paths.root.mkdir(parents=True)
+            paths.manifest.write_text("{not json", encoding="utf-8")
+
+    @pytest.mark.parametrize("manifest", ["missing", "dead owner", "unreadable"])
+    def test_an_unloaded_job_is_reported_when_no_service_runs(
+        self, tmp_path, monkeypatch, manifest
     ):
+        """Pre-mortem 1: an owned, enabled plist whose job launchd does not
+        have loaded, and no running service. The probe returned before it
+        asked launchd, so status printed a plain "Autostart: enabled" while
+        nothing was going to start the service at the next login. Exit 113
+        ("Could not find service") needs no manifest."""
         import sys
 
         from jacked.service.platform import supervision_drift
@@ -636,12 +663,19 @@ class TestSupervisionDrift:
 
         monkeypatch.setattr(sys, "platform", "darwin")
         _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
-        manager = _NativeManager(loaded=False)
+        paths = _service_paths(tmp_path)
+        self._manifest_state(paths, manifest, monkeypatch)
 
-        assert supervision_drift(run=manager, uid=501, paths=_service_paths(tmp_path)) is None
-        assert manager.calls == []
+        assert supervision_drift(
+            run=_NativeManager(loaded=False), uid=501, paths=paths
+        ) == "launchd job not loaded"
 
-    def test_dead_owner_means_no_running_service(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("manifest", ["missing", "dead owner", "unreadable"])
+    def test_a_loaded_job_and_no_running_service_report_nothing(
+        self, tmp_path, monkeypatch, manifest
+    ):
+        """The manual-supervisor and generation checks need a live service:
+        with none, a loaded job leaves nothing to report."""
         import sys
 
         from jacked.service.platform import supervision_drift
@@ -649,30 +683,85 @@ class TestSupervisionDrift:
 
         monkeypatch.setattr(sys, "platform", "darwin")
         _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        self._manifest_state(paths, manifest, monkeypatch)
+        manager = _NativeManager(loaded=True)
+
+        assert supervision_drift(run=manager, uid=501, paths=paths) is None
+        assert manager.asked_launchd_for_the_job()
+
+    @pytest.mark.parametrize(
+        "running,expected",
+        [
+            ("same build", None),
+            ("manual", "the running service is under a manual supervisor"),
+        ],
+    )
+    def test_a_launchctl_failure_other_than_not_found_is_indeterminate(
+        self, tmp_path, monkeypatch, caplog, running, expected
+    ):
+        """Only exit 113 says that launchd does not have the job loaded. Any
+        other exit code is no answer: it is logged at DEBUG, and the checks
+        that read the running service still run."""
+        import logging
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        spec, _ = _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
         paths = _service_paths(tmp_path)
         _publish_running(
-            paths, _other_build(SupervisorKind.MANUAL), monkeypatch, alive=False
+            paths,
+            spec if running == "same build" else _other_build(SupervisorKind.MANUAL),
+            monkeypatch,
         )
-        manager = _NativeManager(loaded=False)
 
-        assert supervision_drift(run=manager, uid=501, paths=paths) is None
-        assert manager.calls == []
+        with caplog.at_level(logging.DEBUG, logger="jacked.service.platform"):
+            assert supervision_drift(
+                run=_NativeManager(print_exit=1), uid=501, paths=paths
+            ) == expected
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "jacked.service.platform"
+            and record.levelno == logging.DEBUG
+        ] == ["launchctl print exited 1; the loaded state of the jacked job is unknown"]
 
-    def test_unreadable_manifest_makes_no_claim(self, tmp_path, monkeypatch):
+    def test_a_launchctl_that_cannot_run_is_logged_as_a_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A probe that cannot ask launchd is a missing check, not a clean
+        result: the WARNING names the exception class and never its text."""
+        import logging
+        import subprocess
         import sys
 
         from jacked.service.platform import supervision_drift
         from jacked.service.spec import SupervisorKind
 
         monkeypatch.setattr(sys, "platform", "darwin")
-        _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        spec, _ = _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
         paths = _service_paths(tmp_path)
-        paths.root.mkdir(parents=True)
-        paths.manifest.write_text("{not json", encoding="utf-8")
-        manager = _NativeManager(loaded=False)
+        _publish_running(paths, spec, monkeypatch)
+        manager = _NativeManager(
+            print_error=subprocess.TimeoutExpired(["launchctl", "print"], 10)
+        )
 
-        assert supervision_drift(run=manager, uid=501, paths=paths) is None
-        assert manager.calls == []
+        with caplog.at_level(logging.WARNING, logger="jacked.service.platform"):
+            assert supervision_drift(run=manager, uid=501, paths=paths) is None
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "jacked.service.platform"
+            and record.levelno == logging.WARNING
+        ]
+        assert warnings == [
+            "launchctl could not be asked about the jacked job (TimeoutExpired); "
+            "autostart supervision was not checked"
+        ]
+        assert "timed out" not in caplog.text
 
     def test_disabled_definition_makes_no_supervision_claim(self, tmp_path, monkeypatch):
         """A login item the user turned off is not expected to supervise."""
@@ -753,6 +842,59 @@ class TestSupervisionDrift:
         ) == "the running service is under a manual supervisor"
         assert manager.calls == [["launchctl", "print", "gui/501/ai.hank.jacked"]]
 
+    @pytest.mark.parametrize(
+        "given,expected",
+        [
+            ("not loaded", "launchd job not loaded"),
+            # None: the caller could not ask launchctl. That proves nothing,
+            # and this call must not ask again (no second WARNING).
+            (None, "the running service is under a manual supervisor"),
+        ],
+    )
+    def test_a_given_probe_replaces_the_launchctl_call(
+        self, tmp_path, monkeypatch, given, expected
+    ):
+        """status and doctor ask launchctl once and give the answer to both
+        launchd checks, so the drift check must not ask again."""
+        import sys
+        from types import SimpleNamespace
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        _publish_running(paths, _other_build(SupervisorKind.MANUAL), monkeypatch)
+        manager = _NativeManager(loaded=True)
+        probe = (
+            SimpleNamespace(returncode=113, stdout="", stderr="Could not find service")
+            if given == "not loaded"
+            else None
+        )
+
+        assert supervision_drift(run=manager, uid=501, paths=paths, probe=probe) == (
+            expected
+        )
+        assert not manager.asked_launchd_for_the_job()
+
+    def test_a_given_probe_serves_the_never_ran_check(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+
+        from jacked.service.platform import launchd_job_never_ran
+
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("the given probe must replace the launchctl call")
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        never_ran = SimpleNamespace(
+            returncode=0, stdout="gui/501/x = {\n\tstate = not running\n\truns = 0\n}\n"
+        )
+
+        assert launchd_job_never_ran(run=refuse, uid=501, probe=never_ran) is True
+        assert launchd_job_never_ran(run=refuse, uid=501, probe=None) is False
+
     def test_never_asks_launchd_off_macos(self, tmp_path, monkeypatch):
         import sys
 
@@ -828,6 +970,48 @@ class TestSupervisionDriftOtherManagers:
         assert supervision_drift(run=_NativeManager(), paths=paths) == _expected_drift(
             case, on_disk, running
         )
+
+
+class TestWindowsProfileIsolation:
+    """Reviewer C: the Windows drift and inspection tests left APPDATA as
+    the process inherited it. On a real Windows host that names the user's
+    roaming folder, and a legacy Startup ``jacked.vbs`` there turned an owned
+    task into a duplicate, so the result depended on the machine."""
+
+    def test_an_inherited_appdata_cannot_change_the_result(self, tmp_path, monkeypatch):
+        import os
+        import sys
+        from pathlib import Path
+
+        from jacked.service.autostart import AutostartState
+        from jacked.service.platform import inspect_autostart
+        from jacked.service.spec import SupervisorKind
+        from tests.unit.service.conftest import isolate_windows_profile
+
+        # The autouse fixture replaced whatever this process inherited.
+        assert Path(os.environ["APPDATA"]) == tmp_path / "AppData" / "Roaming"
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        _spec, task_xml = _owned_definition(tmp_path, SupervisorKind.TASK_SCHEDULER)
+        inherited = tmp_path / "inherited" / "Roaming"
+        legacy = (
+            inherited / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+            / "Startup" / "jacked.vbs"
+        )
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text('WshShell.Run "jacked service start"\n', encoding="utf-8")
+        monkeypatch.setenv("APPDATA", str(inherited))
+
+        # An inherited folder that holds a legacy script changes the result.
+        assert inspect_autostart(
+            run=_NativeManager(task_xml=task_xml)
+        ).state is AutostartState.DUPLICATE
+
+        # The fixture's redirect, applied over that inherited value, removes it.
+        isolate_windows_profile(monkeypatch, tmp_path)
+        assert inspect_autostart(
+            run=_NativeManager(task_xml=task_xml)
+        ).state is AutostartState.OWNED_ENABLED
 
 
 class TestAutostartInspectionGeneration:

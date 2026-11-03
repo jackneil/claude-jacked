@@ -303,6 +303,34 @@ class TestToggleSkillTree:
         assert isinstance(result, JSONResponse) and result.status_code == 500
         assert _body(result)["error"]["code"] == "SKILL_INSTALL_FAILED"
         assert not tree_env["dst"].exists()
+        # The partial copy was staged in a private dir, and that dir is gone too.
+        skills = tree_env["dst"].parent
+        assert [p.name for p in skills.iterdir() if p.name.startswith(".dcr.")] == []
+
+    def test_enable_over_jackeds_own_copy_publishes_the_new_tree_whole(self, tree_env):
+        """A second enable replaces jacked's own copy through the staged
+        publish: a sidecar that the source no longer ships is gone, and no
+        private staging or previous dir is left beside the skill."""
+        tree_env["manifest"].write_text(json.dumps({
+            "version": "0.105.0", "format": 2,
+            "artifacts": {"skills": {}, "skills_dirs": {}},
+        }), encoding="utf-8")
+        _run(_toggle_knowledge("skill_dcr", True))   # recorded as jacked's own
+        (tree_env["src"] / "scripts" / "run.js").unlink()
+        (tree_env["src"] / "scripts").rmdir()
+        (tree_env["src"] / "SKILL.md").write_text("---\nname: dcr\n---\nv2\n", encoding="utf-8")
+
+        result = _run(_toggle_knowledge("skill_dcr", True))
+
+        assert result == {"name": "skill_dcr", "category": "knowledge", "enabled": True}
+        dst = tree_env["dst"]
+        assert sorted(p.relative_to(dst).as_posix() for p in dst.rglob("*")) == [
+            "SKILL.md", "references", "references/lenses.md",
+        ]
+        assert (dst / "SKILL.md").read_text() == "---\nname: dcr\n---\nv2\n"
+        assert [p.name for p in dst.parent.iterdir() if p.name.startswith(".dcr.")] == []
+        backups = tree_env["claude_dir"] / "jacked-backups"
+        assert not backups.exists()
 
     @requires_symlinks
     def test_editable_enable_links_files_and_disable_spares_source(self, tree_env, monkeypatch):
@@ -569,10 +597,12 @@ class TestToggleSkillTree:
         self, tree_env, monkeypatch, caplog,
     ):
         """The partial copy cannot be removed. The old open-coded rollback
-        swallowed that error; the shared helper logs it with the path, and the
-        response names where the user's dir is."""
+        swallowed that error; the shared helper logs it with the path. The
+        partial copy is in the private staging dir, never at the skill path,
+        so the user's dir still goes back and the response says so."""
         import errno
         import logging
+        import os
 
         import jacked.cli as cli
 
@@ -594,11 +624,14 @@ class TestToggleSkillTree:
             result = _run(_toggle_knowledge("skill_dcr", True))
 
         err = _body(result)["error"]
-        backup = Path(err["preserved_backup"])
-        assert (backup / "SKILL.md").read_text() == "# my own dcr\n"
-        assert f"Your earlier copy is at {backup}." in err["message"]
+        assert err["code"] == "SKILL_INSTALL_FAILED"
+        assert "restored" in err["message"]
+        assert "preserved_backup" not in err
+        assert (dst / "SKILL.md").read_text() == "# my own dcr\n"
+        staging = dst.parent / f".dcr.jacked-staging-{os.getpid()}"
+        assert (staging / "SKILL.md").read_text() == "partial"
         warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any(str(dst) in w and "Permission denied" in w for w in warned), warned
+        assert any(str(staging) in w and "Permission denied" in w for w in warned), warned
 
     def test_disable_rechecks_ownership_after_staging(self, tree_env, monkeypatch):
         """A user edit that lands between the ownership check and the delete

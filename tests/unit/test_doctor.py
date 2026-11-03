@@ -6,6 +6,7 @@ import pytest
 from click.testing import CliRunner
 
 from jacked.service.platform import launchd_job_never_ran as _real_launchd_job_never_ran
+from jacked.service.platform import launchd_job_probe as _real_launchd_job_probe
 from jacked.service.platform import supervision_drift as _real_supervision_drift
 
 
@@ -15,11 +16,13 @@ def _no_real_supervisor_probes():
     asks the supervisor for the autostart state. On a CI runner the port is
     free, so both reach the real-supervisor tripwire; on a developer machine
     the live service holds the port and hides that. The supervision-drift
-    probe reads the service manifest and asks launchctl too. Tests that care
-    about an answer patch it again inside the test."""
+    probe reads the service manifest and asks launchctl too, and doctor asks
+    launchctl once for both (launchd_job_probe). Tests that care about an
+    answer patch it again inside the test."""
     from jacked.service.autostart import AutostartInspection, AutostartState
 
-    with patch("jacked.service.platform.launchd_job_never_ran", return_value=False), \
+    with patch("jacked.service.platform.launchd_job_probe", return_value=None), \
+         patch("jacked.service.platform.launchd_job_never_ran", return_value=False), \
          patch("jacked.service.platform.supervision_drift", return_value=None), \
          patch("jacked.service.platform.inspect_autostart",
                return_value=AutostartInspection(AutostartState.ABSENT)):
@@ -191,6 +194,17 @@ def test_doctor_names_a_launchd_job_that_never_ran():
     assert "Recovery: jacked service restart" in result.output
 
 
+def _real_probe():
+    """Undo the autouse stub of the shared probe for one block.
+
+    A ``patch`` context nests inside the autouse fixture's own patch, so the
+    stub comes back at the block's end and the original at the fixture's
+    end. ``monkeypatch.setattr`` would undo last and restore the stub for
+    every later test in the process.
+    """
+    return patch("jacked.service.platform.launchd_job_probe", _real_launchd_job_probe)
+
+
 @pytest.mark.parametrize("stdout, expected", [
     ("gui/501/ai.hank.jacked = {\n\tstate = not running\n\truns = 0\n\t\tstate = active\n}", True),
     ("gui/501/ai.hank.jacked = {\n\tstate = running\n\truns = 1\n\tpid = 66875\n}", False),
@@ -201,19 +215,25 @@ def test_launchd_never_ran_reads_only_the_top_level_fields(monkeypatch, stdout, 
 
     monkeypatch.setattr(platform.sys, "platform", "darwin")
     probe = MagicMock(returncode=0, stdout=stdout)
-    assert _real_launchd_job_never_ran(run=lambda *a, **k: probe, uid=501) is expected
+    with _real_probe():
+        assert _real_launchd_job_never_ran(run=lambda *a, **k: probe, uid=501) is expected
 
 
 def test_launchd_never_ran_is_false_off_macos_and_on_a_probe_failure(monkeypatch):
     from jacked.service import platform
 
-    monkeypatch.setattr(platform.sys, "platform", "linux")
-    assert _real_launchd_job_never_ran(run=lambda *a, **k: 1 / 0) is False
-    monkeypatch.setattr(platform.sys, "platform", "darwin")
-    assert _real_launchd_job_never_ran(run=lambda *a, **k: MagicMock(returncode=113, stdout="")) is False
-    # A platform without os.getuid (Windows) never raises.
-    monkeypatch.delattr(platform.os, "getuid", raising=False)
-    assert _real_launchd_job_never_ran(run=lambda *a, **k: MagicMock(returncode=0, stdout="")) is False
+    with _real_probe():
+        monkeypatch.setattr(platform.sys, "platform", "linux")
+        assert _real_launchd_job_never_ran(run=lambda *a, **k: 1 / 0) is False
+        monkeypatch.setattr(platform.sys, "platform", "darwin")
+        assert _real_launchd_job_never_ran(
+            run=lambda *a, **k: MagicMock(returncode=113, stdout="")
+        ) is False
+        # A platform without os.getuid (Windows) never raises.
+        monkeypatch.delattr(platform.os, "getuid", raising=False)
+        assert _real_launchd_job_never_ran(
+            run=lambda *a, **k: MagicMock(returncode=0, stdout="")
+        ) is False
 
 
 # #128i: doctor names an autostart definition that does not supervise the
@@ -304,6 +324,7 @@ def test_doctor_says_an_unloaded_launchd_job_does_not_supervise_the_service(
 
     text = _doctor(
         *_healthy_service_probes(),
+        patch("jacked.service.platform.launchd_job_probe", _real_launchd_job_probe),
         patch("jacked.service.platform.supervision_drift", _real_supervision_drift),
         patch("jacked.service.platform.inspect_autostart", return_value=owned),
     )
@@ -340,6 +361,12 @@ def test_doctor_is_silent_about_supervision_when_nothing_drifted():
     assert "not supervising" not in text
 
 
+_STOPPED_UNLOADED = (
+    "Autostart: will not start the service until the next login: launchd job "
+    "not loaded Recovery: jacked service restart"
+)
+
+
 def test_doctor_shows_the_drift_reason_instead_of_the_never_ran_hint():
     text = _doctor(
         patch("jacked.service.process.is_port_available", return_value=True),
@@ -354,5 +381,131 @@ def test_doctor_shows_the_drift_reason_instead_of_the_never_ran_hint():
         ),
     )
 
-    assert "not supervising the running service: launchd job not loaded" in text
+    assert "Service: NOT RUNNING" in text
+    assert _STOPPED_UNLOADED in text
     assert "never ran" not in text
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    ["not running", "dashboard without a tray service", "healthy", "alive but unreachable"],
+)
+def test_doctor_words_an_unloaded_job_by_its_verdict(verdict):
+    """A held port and a live PID name a running service; every other
+    verdict gets the words that are true either way: launchd loads the plist
+    again at the next login, and until then nothing starts the service."""
+    import httpx
+
+    from jacked.service.platform import LAUNCHD_JOB_NOT_LOADED
+
+    probes = {
+        "not running": (
+            patch("jacked.service.process.is_port_available", return_value=True),
+        ),
+        "dashboard without a tray service": (
+            patch("jacked.service.process.is_port_available", return_value=False),
+            patch("jacked.service.process.read_pid", return_value=None),
+            patch("httpx.get", return_value=MagicMock(status_code=200)),
+        ),
+        "healthy": _healthy_service_probes(),
+        "alive but unreachable": (
+            patch("jacked.service.process.is_port_available", return_value=False),
+            patch("jacked.service.process.read_pid", return_value={"pid": 4242}),
+            patch("jacked.service.process.is_process_alive", return_value=True),
+            patch("httpx.get", side_effect=httpx.ConnectError("refused")),
+        ),
+    }[verdict]
+
+    text = _doctor(
+        *probes,
+        patch(
+            "jacked.service.platform.supervision_drift",
+            return_value=LAUNCHD_JOB_NOT_LOADED,
+        ),
+    )
+
+    if verdict in {"healthy", "alive but unreachable"}:
+        assert (
+            "Autostart: not supervising the running service: launchd job not "
+            "loaded Recovery: jacked service restart"
+        ) in text
+    else:
+        assert _STOPPED_UNLOADED in text
+
+
+def test_doctor_keeps_the_running_service_words_for_a_manifest_reason():
+    """A manual-supervisor reason comes from a live manifest, so it names the
+    running service even when doctor's port 8321 check missed that service
+    (a quarantine start listens on another port)."""
+    text = _doctor(
+        patch("jacked.service.process.is_port_available", return_value=True),
+        patch(
+            "jacked.service.platform.supervision_drift",
+            return_value="the running service is under a manual supervisor",
+        ),
+    )
+
+    assert "Service: NOT RUNNING" in text
+    assert (
+        "Autostart: not supervising the running service: the running service is "
+        "under a manual supervisor"
+    ) in text
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="launchd is macOS only")
+@pytest.mark.parametrize("answer", ["loaded, never ran", "timed out"])
+def test_doctor_asks_launchctl_once_for_both_launchd_checks(
+    monkeypatch, caplog, answer
+):
+    """The drift check and the never-ran check asked launchctl the same
+    question, so a launchctl that could not answer logged two WARNINGs."""
+    import logging
+    import subprocess
+    from types import SimpleNamespace
+
+    from jacked.service.autostart import AutostartInspection, AutostartState
+
+    calls = []
+
+    def launchctl(argv, **_kwargs):
+        argv = list(argv)
+        calls.append(argv)
+        if argv[:2] != ["launchctl", "print"]:
+            raise AssertionError(f"unexpected command: {argv}")
+        if answer == "timed out":
+            raise subprocess.TimeoutExpired(argv, 10)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="gui/501/ai.hank.jacked = {\n\tstate = not running\n\truns = 0\n}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", launchctl)
+    owned = AutostartInspection(AutostartState.OWNED_ENABLED)
+    with caplog.at_level(logging.WARNING, logger="jacked.service.platform"):
+        text = _doctor(
+            patch("jacked.service.process.is_port_available", return_value=True),
+            patch("jacked.service.platform.inspect_autostart", return_value=owned),
+            patch("jacked.service.platform.launchd_job_probe", _real_launchd_job_probe),
+            patch("jacked.service.platform.supervision_drift", _real_supervision_drift),
+            patch(
+                "jacked.service.platform.launchd_job_never_ran",
+                _real_launchd_job_never_ran,
+            ),
+        )
+
+    assert len(calls) == 1, calls
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "jacked.service.platform" and record.levelno == logging.WARNING
+    ]
+    if answer == "timed out":
+        assert warnings == [
+            "launchctl could not be asked about the jacked job (TimeoutExpired); "
+            "autostart supervision was not checked"
+        ]
+        assert "never ran" not in text
+    else:
+        assert warnings == []
+        assert "The launchd job is loaded but never ran." in text

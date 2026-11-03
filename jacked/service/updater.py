@@ -457,6 +457,76 @@ def _write_recovery(message: str) -> None:
         logger.exception("Could not write recovery file")
 
 
+def _own_service_holds_port(port: int) -> bool:
+    """True when this installation's own service is the process on *port*.
+
+    The instance manifest names the process that the service runs as and the
+    port that it bound. The holder is ours when that process is live and the
+    bind port is *port*. Live means "not proven stale" by `process_is_stale`,
+    the shared rule that `platform.supervision_drift` uses: a probe that
+    proves nothing reads as live. A manifest that is missing, unreadable or
+    invalid, a stale one, or one for another port proves nothing, so the
+    answer is then False.
+    """
+    from jacked.service.instance import process_is_stale, read_manifest
+    from jacked.service.lifecycle import default_service_paths
+
+    try:
+        manifest = read_manifest(default_service_paths().manifest)
+    except (OSError, ValueError):
+        return False
+    if manifest.bind.port != port:
+        return False
+    return not process_is_stale(manifest.process)
+
+
+def _own_service_port_busy_error(port: int, restarted: bool) -> str:
+    """The status record's error when the port holder is this installation's
+    own service and that service did not answer health. It says what the
+    final guard did, as the recovery text does.
+
+    >>> _own_service_port_busy_error(8321, False)
+    "port 8321 is held by this installation's own service that did not answer health; the final guard could not restart it"
+    """
+    done = "restarted it" if restarted else "could not restart it"
+    return (
+        f"port {port} is held by this installation's own service that did not "
+        f"answer health; the final guard {done}"
+    )
+
+
+def _own_service_port_busy_recovery(port: int, restarted: bool) -> str:
+    """The recovery text when the port holder is this installation's own
+    service and that service did not answer health. The final guard
+    kickstarts it, and *restarted* says whether that restart worked.
+
+    It is the hands-off text with the middle changed. The hands-off text says
+    that no port owner was killed. This text names the holder and says what
+    the guard did, and a restart that failed points at the update log.
+
+    >>> "the final guard restarted it." in _own_service_port_busy_recovery(8321, True)
+    True
+    >>> "could not restart it." in _own_service_port_busy_recovery(8321, False)
+    True
+    """
+    if restarted:
+        middle = (
+            "That listener was this installation's own service, which did not "
+            "answer health, and the final guard restarted it."
+        )
+    else:
+        middle = (
+            "That listener is this installation's own service, which did not "
+            "answer health, and the final guard could not restart it. "
+            f"See {UPDATE_LOG} for the reason."
+        )
+    return (
+        f"Jacked auto-update stopped safely because port {port} is occupied by an "
+        f"unverified listener. {middle} Run `jacked service status` for "
+        "ownership and quarantine guidance.\n"
+    )
+
+
 # The states of the final guard in run_update. The guard acts on how the run
 # ended. "pending": the run ended before it made a decision (an early return
 # or a crash), so the guard starts the service again. "restarted": a spawn or
@@ -466,6 +536,10 @@ _GUARD_PENDING = "pending"
 _GUARD_RESTARTED = "restarted"
 _GUARD_HANDS_OFF_PORT_BUSY = "hands_off:port_busy"
 _GUARD_HANDS_OFF_PARENT_ALIVE = "hands_off:parent_alive"
+# "restart_again:own_wedged": the run restarted the service, and then its last
+# tail found this installation's own service on the port with no answer to
+# health. The guard acts as for "pending" and logs that it is a second kick.
+_GUARD_RESTART_AGAIN_OWN_WEDGED = "restart_again:own_wedged"
 
 
 def run_update(
@@ -575,6 +649,24 @@ def run_update(
     # one state, not a "restart attempted" flag: a deliberate hands-off exit
     # must not get the kickstart that an early return or a crash gets.
     _final_guard = [_GUARD_PENDING]
+    # True when the update stopped as port_busy on this installation's own
+    # wedged service. The guard then restarts that service, and it writes
+    # the status record and the recovery text once it knows whether the
+    # restart worked.
+    _own_port_busy = [False]
+
+    def _record_own_port_busy(restarted: bool) -> None:
+        """Write the status record and the recovery file of that exit, after
+        the guard's restart, so both say what the restart did."""
+        try:
+            _us.mark_failed(
+                _us.UPDATE_STATUS_FILE,
+                error=_own_service_port_busy_error(port, restarted),
+                recovery="jacked service status",
+            )
+        except Exception:
+            logger.exception("mark_failed after port_busy")
+        _write_recovery(_own_service_port_busy_recovery(port, restarted))
 
     try:
         # Phase: waiting_for_parent
@@ -703,6 +795,9 @@ def run_update(
         # The restart + verify tail. It runs for the successful path AND for
         # the rolled-back path, so the machine always ends with a service.
         _diagnosed: set = set()
+        # Set by each tail: True when the unverified port holder that stopped
+        # the tail is this installation's own service.
+        _own_holder = [False]
 
         def _log_once(message: str) -> None:
             """Log a diagnosis the first time it is seen.
@@ -891,13 +986,44 @@ def run_update(
             log(f"WARNING: {error}")
             return False
 
+        def _claim_own_wedged_holder() -> bool:
+            """True when the unverified port holder is this installation's
+            own service; the final guard then restarts it.
+
+            The instance manifest names a live process of this installation
+            on this port, so the holder is our own service with a wedged HTTP
+            loop. A hands-off exit would leave it wedged, so a pending guard
+            stays pending and restarts it. After a restart that this run
+            already made, the LAST tail decides: the guard restarts the
+            service again, so the build now on disk gets started.
+            """
+            if not _own_service_holds_port(port):
+                return False
+            _own_holder[0] = True
+            held = (
+                f"Port {port} is held by this installation's own service "
+                "(pid live) that does not answer health; "
+            )
+            if _final_guard[0] == _GUARD_PENDING:
+                log(held + "the final guard restarts it")
+            elif _final_guard[0] == _GUARD_RESTARTED:
+                _final_guard[0] = _GUARD_RESTART_AGAIN_OWN_WEDGED
+                log(
+                    held + "this run restarted the service once already, "
+                    "so the final guard restarts it again"
+                )
+            return True
+
         def _start_and_verify(expected: "str | None") -> str:
             """Start the service and wait for *expected* to answer.
 
             'ok'        - the expected build is serving the port.
             'port_busy' - the port stayed occupied by an unverified listener.
-                          Nothing is started, and the final guard does not
-                          start anything either.
+                          Nothing is started. The final guard does not start
+                          anything either, unless the holder is this
+                          installation's own service (`_own_holder`): the
+                          guard then restarts it, a second time when this run
+                          already restarted the service once.
             'not_ready' - the expected build never answered in time.
 
             `expected` is the build this tail is starting: the target version
@@ -907,11 +1033,12 @@ def run_update(
             # Per tail: the rollback tail must log its own reasons even when
             # they read the same as the upgrade tail's.
             _diagnosed.clear()
+            _own_holder[0] = False
             if not _wait_port_free():
-                # A hands-off exit on every tail: no process was signalled,
-                # so the final guard must not kick the service. A restart
-                # that an earlier tail ran keeps its record.
-                if _final_guard[0] == _GUARD_PENDING:
+                # A stranger gets a hands-off exit on every tail: no process
+                # was signalled, so the final guard must not kick the
+                # service. A restart that an earlier tail ran keeps its record.
+                if not _claim_own_wedged_holder() and _final_guard[0] == _GUARD_PENDING:
                     _final_guard[0] = _GUARD_HANDS_OFF_PORT_BUSY
                 return "port_busy"
             _spawn_service()
@@ -1144,11 +1271,20 @@ def run_update(
             packs_reason = run_refresh_packs(jacked, log_fh)
             log(f"jacked packs update: {packs_reason or 'ok'}")
             _end("refreshing_packs", "ok" if packs_reason is None else "warning")
-            if RECOVERY_FILE.exists():
-                try:
-                    RECOVERY_FILE.unlink()
-                except Exception:
-                    pass
+            # The recovery file of an earlier failure must go, but a refusal
+            # (a locked file, a read-only dir) does not undo this success. The
+            # refusal is logged with the exception class only: the detached
+            # updater's stderr is DEVNULL, so the update log carries it too.
+            try:
+                RECOVERY_FILE.unlink(missing_ok=True)
+            except Exception as exc:
+                logger.warning(
+                    "Could not remove the update recovery file (%s)", type(exc).__name__
+                )
+                log(
+                    "WARNING: Could not remove the update recovery file "
+                    f"({type(exc).__name__})"
+                )
             try:
                 _us.mark_succeeded(_us.UPDATE_STATUS_FILE)
             except Exception:
@@ -1164,21 +1300,28 @@ def run_update(
                     logger.exception("mark_failed fallback also raised")
                     log("ERROR: mark_failed fallback also raised - disk likely full")
         elif outcome == "port_busy":
-            # _start_and_verify set the final guard hands-off, so the text
-            # below stays true: nothing touches the port owner.
-            try:
-                _us.mark_failed(
-                    _us.UPDATE_STATUS_FILE,
-                    error=f"port {port} is held by an unverified listener",
-                    recovery="jacked service status",
+            if _own_holder[0]:
+                # This installation's own wedged service holds the port. The
+                # final guard is still pending and restarts it. It writes the
+                # status record and the recovery text once it knows whether
+                # that restart worked, so the two say the same thing.
+                _own_port_busy[0] = True
+            else:
+                # _start_and_verify set the final guard hands-off, so the
+                # text below stays true: nothing touches the port owner.
+                try:
+                    _us.mark_failed(
+                        _us.UPDATE_STATUS_FILE,
+                        error=f"port {port} is held by an unverified listener",
+                        recovery="jacked service status",
+                    )
+                except Exception:
+                    logger.exception("mark_failed after port_busy")
+                _write_recovery(
+                    f"Jacked auto-update stopped safely because port {port} is occupied by an "
+                    "unverified listener. No port owner was killed. Run `jacked service status` "
+                    "for ownership and quarantine guidance.\n"
                 )
-            except Exception:
-                logger.exception("mark_failed after port_busy")
-            _write_recovery(
-                f"Jacked auto-update stopped safely because port {port} is occupied by an "
-                "unverified listener. No port owner was killed. Run `jacked service status` "
-                "for ownership and quarantine guidance.\n"
-            )
         else:
             # The new service never came up. Put the previous version back and
             # restart it, so the user keeps a working tray.
@@ -1201,18 +1344,34 @@ def run_update(
         # the run left a process alone on purpose, either the unverified
         # port owner or the old service that did not exit. On macOS the
         # kickstart is `launchctl kickstart -k`, which kills the job, and
-        # that job can be exactly the process the run left alone.
-        if _final_guard[0] == _GUARD_PENDING:
+        # that job can be exactly the process the run left alone. A port
+        # owner that the instance manifest proves is this installation's own
+        # service is not left alone: its guard stays pending and restarts it.
+        # Restart again: the run restarted the service, and its last tail
+        # still found this installation's own service wedged on the port, so
+        # the guard kicks a second time.
+        if _final_guard[0] in (_GUARD_PENDING, _GUARD_RESTART_AGAIN_OWN_WEDGED):
+            restarted = False
             try:
                 from jacked.service.platform import native_restart
 
-                log("Final guard: no restart attempted by upgrade flow. Kickstart.")
+                if _final_guard[0] == _GUARD_PENDING:
+                    log("Final guard: no restart attempted by upgrade flow. Kickstart.")
+                else:
+                    log(
+                        "Final guard: this installation's own service still holds "
+                        "the port without answering health after this run's "
+                        "restart. Second kickstart."
+                    )
                 ok, reason = native_restart()
+                restarted = ok
                 log(
                     f"Final guard: native_restart {'OK' if ok else 'FAILED'} ({reason})"
                 )
             except Exception:
                 logger.exception("Final-guard native_restart raised")
+            if _own_port_busy[0]:
+                _record_own_port_busy(restarted)
         elif _final_guard[0] == _GUARD_HANDS_OFF_PORT_BUSY:
             log("Final guard: skipped (port held by an unverified listener; nothing restarted)")
         elif _final_guard[0] == _GUARD_HANDS_OFF_PARENT_ALIVE:

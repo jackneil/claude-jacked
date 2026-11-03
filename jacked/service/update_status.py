@@ -139,6 +139,18 @@ def read_status(path: Path) -> Optional[dict]:
     return data
 
 
+def read_record(path: Path) -> Optional[dict]:
+    """Return the status record as stored, or None when there is none.
+
+    ``read_status`` hides a ``succeeded`` record after
+    STALE_SUCCEEDED_SECONDS and a stale ``in_progress`` one, so that the
+    dashboard shows no old banner. A boot check that compares the record
+    with other evidence (the recovery file, the running build) needs the
+    record whatever its age.
+    """
+    return _read_raw(path)
+
+
 def in_progress_is_stale(path: Path, data: dict) -> bool:
     """True when an ``in_progress`` record is older than the stale window AND
     its updater is not proven alive. One phase can run longer than the window
@@ -182,12 +194,15 @@ def install_completed_after(
     The status record can stay ``in_progress``, or close as failed, after
     the install itself is done: the batch or the updater stopped after the
     new package was in place. The last-install record and the running
-    version are independent proof. All three facts must be true:
+    version are independent proof. All four facts must be true:
 
     * the last install (``last_install["at"]``) is later than the update's
       ``started_at``;
     * it installed ``running_version`` or a newer version;
-    * it installed a version newer than the update's ``from_version``.
+    * it installed a version newer than the update's ``from_version``;
+    * the running build is newer than the update's ``from_version``. While
+      the build that the update started from still runs, the install did
+      not reach this process.
 
     Versions compare by PEP 440 (a dev build sorts before its release).
     Timestamps compare as instants, so the UTC offset does not matter. A
@@ -206,8 +221,30 @@ def install_completed_after(
     >>> install_completed_after(
     ...     start, {**done, "to_version": "0.110.2.dev1"}, "0.110.2")
     False
+    >>> install_completed_after(start, done, "0.110.1")
+    False
     >>> install_completed_after(start, None, "0.110.2")
     False
+    """
+    started = (
+        _parse_instant(data.get("started_at")) if isinstance(data, dict) else None
+    )
+    return _install_completed_since(
+        data, last_install, running_version, "started_at", started
+    )
+
+
+def _install_completed_since(
+    data: dict,
+    last_install: Optional[dict],
+    running_version: str,
+    since_name: str,
+    since: Optional[datetime],
+) -> bool:
+    """The rule of ``install_completed_after``, with the instant to beat.
+
+    ``since`` is the instant that the last install must be later than, and
+    ``since_name`` names the field it came from for the DEBUG line.
     """
     if last_install is None:
         return False
@@ -216,7 +253,6 @@ def install_completed_after(
             "Cannot prove the install completed: a record is not a JSON object"
         )
         return False
-    started = _parse_instant(data.get("started_at"))
     finished = _parse_instant(last_install.get("at"))
     before = _parse_version(data.get("from_version"))
     installed = _parse_version(last_install.get("to_version"))
@@ -224,7 +260,7 @@ def install_completed_after(
     unusable = [
         name
         for name, value in (
-            ("started_at", started),
+            (since_name, since),
             ("at", finished),
             ("from_version", before),
             ("to_version", installed),
@@ -238,7 +274,12 @@ def install_completed_after(
             ", ".join(unusable),
         )
         return False
-    return finished > started and installed >= running and installed > before
+    return (
+        finished > since
+        and installed >= running
+        and installed > before
+        and running > before
+    )
 
 
 def failed_update_superseded(
@@ -248,11 +289,28 @@ def failed_update_superseded(
 
     Three facts must be true: the record closed as failed, the running
     build is newer than the version that update started from, and an
-    install completed after the update started (``install_completed_after``).
-    Then a later install already replaced the build that failed to update,
-    and the recovery steps of the record are stale. While the build that
-    failed to update still runs, the failure still applies. A malformed
-    version proves nothing: the result is False.
+    install completed after the update FAILED (the rule of
+    ``install_completed_after``, measured from the failure instant). Then a
+    later install already replaced the build that failed to update, and the
+    recovery steps of the record are stale. While the build that failed to
+    update still runs, the failure still applies.
+
+    The failed attempt writes its own last-install record (its settings
+    step runs ``jacked install``), so the start of the attempt is the wrong
+    instant: an update that installed the new build and then failed its
+    verification read as repaired. The failure instant comes from the
+    record, in this order (``_failure_instant``):
+
+    * ``failed_at``: ``mark_failed`` and ``end_phase`` with status
+      ``failed`` write it each time they close the record. The last close
+      wins, so the installs of the failed attempt itself (its settings
+      step, a rollback) all come before it.
+    * A record written before ``failed_at`` existed: the latest
+      ``finished_at`` of its phases.
+    * A record with neither (no phases, as the Windows ``jacked upgrade``
+      batch writes): its ``started_at``.
+
+    A malformed version or instant proves nothing: the result is False.
 
     >>> failed = {"overall": "failed", "from_version": "0.103.0",
     ...           "started_at": "2026-10-01T10:00:00+00:00"}
@@ -261,6 +319,9 @@ def failed_update_superseded(
     True
     >>> failed_update_superseded(
     ...     {**failed, "from_version": "0.110.2"}, later, "0.110.2")
+    False
+    >>> failed_update_superseded(
+    ...     {**failed, "failed_at": "2026-11-02T11:00:00+00:00"}, later, "0.110.2")
     False
     """
     if not isinstance(data, dict) or data.get("overall") != "failed":
@@ -273,9 +334,99 @@ def failed_update_superseded(
             "a version is not usable"
         )
         return False
-    return before < running and install_completed_after(
-        data, last_install, running_version
+    if not before < running:
+        return False
+    since_name, since = _failure_instant(data)
+    return _install_completed_since(
+        data, last_install, running_version, since_name, since
     )
+
+
+def _failure_instant(data: dict) -> tuple[str, Optional[datetime]]:
+    """Return the field that dates the failure of ``data``, and its instant.
+
+    The instant is None when the field is present but is not an instant.
+    See ``failed_update_superseded`` for the order of the sources.
+
+    >>> _failure_instant({"failed_at": "2026-11-02T10:02:00+00:00"})[0]
+    'failed_at'
+    >>> name, when = _failure_instant({"phases": [
+    ...     {"finished_at": "2026-11-02T10:01:00+00:00"}, {"finished_at": None}]})
+    >>> name, when.isoformat()
+    ('phases.finished_at', '2026-11-02T10:01:00+00:00')
+    >>> _failure_instant({"started_at": "2026-11-02T10:00:00+00:00"})[0]
+    'started_at'
+    """
+    if "failed_at" in data:
+        return "failed_at", _parse_instant(data.get("failed_at"))
+    phases = data.get("phases")
+    finishes = [
+        instant
+        for instant in (
+            _parse_instant(entry.get("finished_at"))
+            for entry in (phases if isinstance(phases, list) else [])
+            if isinstance(entry, dict)
+        )
+        if instant is not None
+    ]
+    if finishes:
+        return "phases.finished_at", max(finishes)
+    return "started_at", _parse_instant(data.get("started_at"))
+
+
+def recovery_predates_completed_update(
+    data: dict, running_version: str, recovery_mtime: float
+) -> bool:
+    """True when a completed update started after the recovery file was written.
+
+    A recovery file describes an earlier failure. The updater removes it
+    when its own update succeeds, but an update that ``abandoned_status``
+    closes as succeeded (from a completed install) removes nothing, so the
+    old file toasted on every start. Three facts must be true:
+
+    * the record closed as succeeded;
+    * the running build is newer than the update's ``from_version``;
+    * the recovery file was last written before the update started (its
+      mtime, ``recovery_mtime``, is earlier than ``started_at``).
+
+    Then a complete update ran after the failure that the file describes,
+    and its recovery steps are stale. A file written during or after the
+    update is never stale by this rule. A missing or malformed version or
+    timestamp proves nothing: the result is False, with one DEBUG line.
+
+    >>> done = {"overall": "succeeded", "from_version": "0.110.1",
+    ...         "started_at": "2026-11-02T10:00:00+00:00"}
+    >>> earlier = datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp()
+    >>> recovery_predates_completed_update(done, "0.110.2", earlier)
+    True
+    >>> recovery_predates_completed_update(done, "0.110.1", earlier)
+    False
+    >>> later = datetime(2026, 11, 2, 11, tzinfo=timezone.utc).timestamp()
+    >>> recovery_predates_completed_update(done, "0.110.2", later)
+    False
+    """
+    if not isinstance(data, dict) or data.get("overall") != "succeeded":
+        return False
+    started = _parse_instant(data.get("started_at"))
+    before = _parse_version(data.get("from_version"))
+    running = _parse_version(running_version)
+    unusable = [
+        name
+        for name, value in (
+            ("started_at", started),
+            ("from_version", before),
+            ("running_version", running),
+        )
+        if value is None
+    ]
+    if unusable:
+        logger.debug(
+            "Cannot compare the recovery file with the completed update: "
+            "unusable fields %s",
+            ", ".join(unusable),
+        )
+        return False
+    return running > before and recovery_mtime < started.timestamp()
 
 
 def abandoned_status(
@@ -289,8 +440,9 @@ def abandoned_status(
     `read_status` hides an `in_progress` file older than
     STALE_IN_PROGRESS_SECONDS so the dashboard shows no zombie banner. Hiding
     it is not the same as telling the user: the machine may be running a build
-    whose settings never migrated. The tray reads this at boot and turns it
-    into a recovery file.
+    whose settings never migrated. The tray reads this at boot, closes the
+    record as failed with ``close_abandoned_update``, and writes a recovery
+    file when that close happened.
 
     The mtime rule alone is not enough. One phase can legitimately run longer
     than STALE_IN_PROGRESS_SECONDS (a slow package install on a slow link),
@@ -306,6 +458,16 @@ def abandoned_status(
     started (``install_completed_after``), this closes the record as
     succeeded and returns None. Without that evidence, the age rule alone
     decides.
+
+    The close takes the update lock (``acquire_update_lock``), because a
+    new updater can start between the first read and the write. A held
+    lock means that an updater runs now, and a live updater is never
+    abandoned: nothing is written and the result is None. With the lock,
+    the record is read again and closed only when it is still the same
+    attempt (the same ``started_at`` and ``from_version``), still
+    ``in_progress`` and still stale. A Windows batch holds no OS lock, so
+    for a batch the identity check and the second mtime check are the
+    whole protection. ``close_abandoned_update`` uses the same rule.
 
     >>> import json, os, tempfile, time
     >>> from pathlib import Path
@@ -349,17 +511,96 @@ def abandoned_status(
         data, last_install, running_version
     ):
         # The install finished; the batch or the updater stopped after it.
-        try:
-            mark_succeeded(path)
-        except OSError as exc:
-            # The verdict holds without the write: no recovery file is due.
-            # The next start reads the same evidence and tries again.
-            logger.warning(
-                "Could not close the completed update record: %s",
-                type(exc).__name__,
-            )
+        # The verdict holds whether or not the close is written: no recovery
+        # file is due, and the next start reads the same evidence again.
+        _close_under_lock(path, data, _set_succeeded, "completed")
         return None
     return data
+
+
+def close_abandoned_update(
+    path: Path, seen: dict, *, error: str, recovery: Optional[str] = None
+) -> Optional[dict]:
+    """Close the abandoned attempt in ``seen`` as failed, under the update lock.
+
+    ``seen`` is the record that ``abandoned_status`` returned. The close
+    follows the rule of the completed close in ``abandoned_status``: take
+    the update lock, read the record again, and write only when it is still
+    the same stale attempt. Returns the record as written, or None when
+    nothing was written:
+
+    * an updater holds the lock, so an update runs now;
+    * the record is no longer the attempt that was read (another updater
+      started or closed one);
+    * the attempt wrote again, so it still runs (a Windows batch holds no
+      lock);
+    * the write failed (one WARNING with the exception class name).
+
+    The caller writes the recovery file only when this returns a record.
+    """
+
+    def close(data: dict) -> None:
+        _set_failed(data, error, recovery)
+
+    return _close_under_lock(path, seen, close, "abandoned")
+
+
+def _close_under_lock(path: Path, seen: dict, close, what: str) -> Optional[dict]:
+    """Close the attempt in ``seen`` with ``close``, under the update lock.
+
+    ``close`` changes the record in place. ``what`` names the record in the
+    log lines. Returns the record as written, or None when nothing was
+    written (see ``close_abandoned_update`` for the cases).
+    """
+    try:
+        lock = acquire_update_lock(path)
+    except OSError as exc:
+        logger.warning(
+            "Could not close the %s update record: %s", what, type(exc).__name__
+        )
+        return None
+    if lock is None:
+        logger.info(
+            "The update lock is held, so an update runs now; "
+            "the %s update record stays open",
+            what,
+        )
+        return None
+    try:
+        current = _read_raw(path)
+        if not _same_stale_attempt(path, current, seen):
+            logger.info(
+                "The update record changed before the %s update could be "
+                "closed; it is left alone",
+                what,
+            )
+            return None
+        close(current)
+        _atomic_write(path, current)
+        return current
+    except OSError as exc:
+        logger.warning(
+            "Could not close the %s update record: %s", what, type(exc).__name__
+        )
+        return None
+    finally:
+        lock.close()
+
+
+def _same_stale_attempt(path: Path, current: Optional[dict], seen: dict) -> bool:
+    """True when ``current`` is still the stale attempt that ``seen`` read.
+
+    The same ``started_at`` and ``from_version``, still ``in_progress``, and
+    still stale (``in_progress_is_stale``): an attempt that wrote again after
+    the first read still runs. Raises OSError when the file cannot be read.
+    """
+    return (
+        current is not None
+        and current.get("overall") == "in_progress"
+        and current.get("started_at") == seen.get("started_at")
+        and current.get("from_version") == seen.get("from_version")
+        and in_progress_is_stale(path, current)
+    )
 
 
 def _resolve_updater_pid(updater_pid: Optional[int]) -> Optional[int]:
@@ -635,11 +876,12 @@ def end_phase(
     """
     data = _read_raw(path) or {}
     phases = data.get("phases", [])
+    finished = _now_iso()
     matched = False
     for entry in reversed(phases):
         if entry["name"] == phase and entry["status"] == "in_progress":
             entry["status"] = status
-            entry["finished_at"] = _now_iso()
+            entry["finished_at"] = finished
             matched = True
             break
     if not matched:
@@ -649,6 +891,8 @@ def end_phase(
     data["phases"] = phases
     if status == "failed":
         data["overall"] = "failed"
+        # The instant the record closed as failed (failed_update_superseded).
+        data["failed_at"] = finished
         if error:
             data["error"] = error
         if recovery:
@@ -658,9 +902,27 @@ def end_phase(
 
 def mark_succeeded(path: Path) -> None:
     data = _read_raw(path) or {}
+    _set_succeeded(data)
+    _atomic_write(path, data)
+
+
+def _set_succeeded(data: dict) -> None:
+    """Close the record in ``data`` as succeeded (in place, not written)."""
     data["overall"] = "succeeded"
     data["current_phase"] = None
-    _atomic_write(path, data)
+
+
+def _set_failed(data: dict, error: str, recovery: Optional[str]) -> None:
+    """Close the record in ``data`` as failed (in place, not written).
+
+    Writes ``failed_at``, the instant the record closed as failed, on every
+    close, so the last close wins (``failed_update_superseded``).
+    """
+    data["overall"] = "failed"
+    data["failed_at"] = _now_iso()
+    data["error"] = error
+    if recovery:
+        data["recovery"] = recovery
 
 
 def mark_failed(
@@ -671,15 +933,14 @@ def mark_failed(
     """Mark overall=failed with an explicit error/recovery.
 
     Use when a failure happens OUTSIDE any active phase (pre-flight failure,
-    post-phase exception). No-op if the status file doesn't exist.
+    post-phase exception). No-op if the status file doesn't exist. Each call
+    writes ``failed_at``, the instant the record closed as failed, so the
+    last close wins (``failed_update_superseded``).
     """
     data = _read_raw(path)
     if data is None:
         return
-    data["overall"] = "failed"
-    data["error"] = error
-    if recovery:
-        data["recovery"] = recovery
+    _set_failed(data, error, recovery)
     _atomic_write(path, data)
 
 

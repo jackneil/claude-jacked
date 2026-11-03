@@ -2180,6 +2180,7 @@ class TestStartupExposureWarning:
 def test_status_flags_a_launchd_job_that_never_ran(tmp_path, monkeypatch):
     """#178i: "Autostart: enabled" while launchd had the job loaded with
     runs = 0 read as fine; nothing was going to start the service."""
+    import subprocess
     from types import SimpleNamespace
 
     from jacked.cli import main
@@ -2189,7 +2190,12 @@ def test_status_flags_a_launchd_job_that_never_ran(tmp_path, monkeypatch):
         "jacked.service.platform.inspect_autostart",
         lambda: SimpleNamespace(state=AutostartState.OWNED_ENABLED, reason=""),
     )
-    monkeypatch.setattr("jacked.service.platform.launchd_job_never_ran", lambda: True)
+    # The drift probe asks launchd before it reads the manifest: the job is
+    # loaded, so it has nothing to report and the never-ran hint shows.
+    monkeypatch.setattr(subprocess, "run", _Launchctl(loaded=True))  # macOS only
+    monkeypatch.setattr(
+        "jacked.service.platform.launchd_job_never_ran", lambda **_kwargs: True
+    )
     with patch("jacked.service.PID_FILE", tmp_path / "nope.pid"):
         result = CliRunner().invoke(main, ["service", "status"])
     text = " ".join(result.output.split())  # Rich wraps at the console width
@@ -2424,6 +2430,16 @@ def test_status_stays_plain_enabled_when_the_definition_runs_the_service(
     assert "never ran" not in result.output
 
 
+_LIVE_UNLOADED_LABEL = (
+    "Autostart: enabled (not supervising the running service: launchd job "
+    "not loaded; run `jacked service restart`)"
+)
+_STOPPED_UNLOADED_LABEL = (
+    "Autostart: enabled (will not start the service until the next login: "
+    "launchd job not loaded; run `jacked service restart`)"
+)
+
+
 def test_status_shows_the_drift_reason_instead_of_the_never_ran_hint(monkeypatch):
     """The never-ran hint is kept only for the state the probe cannot see."""
     from jacked.cli import main
@@ -2432,18 +2448,121 @@ def test_status_shows_the_drift_reason_instead_of_the_never_ran_hint(monkeypatch
         "jacked.service.platform.inspect_autostart",
         lambda run=None: _owned_enabled(None),
     )
+    monkeypatch.setattr("jacked.service.platform.launchd_job_probe", lambda: None)
     monkeypatch.setattr(
         "jacked.service.platform.supervision_drift",
         lambda **_kwargs: "launchd job not loaded",
     )
-    monkeypatch.setattr("jacked.service.platform.launchd_job_never_ran", lambda: True)
+    monkeypatch.setattr(
+        "jacked.service.platform.launchd_job_never_ran", lambda **_kwargs: True
+    )
 
     result = CliRunner().invoke(main, ["service", "status"])
 
     assert result.exit_code == 0, result.output
     text = _flat(result.output)
-    assert "not supervising the running service: launchd job not loaded" in text
+    assert "Jacked Service: stopped" in text
+    assert _STOPPED_UNLOADED_LABEL in text
     assert "never ran" not in text
+
+
+@pytest.mark.parametrize("verdict", ["stopped", "indeterminate", "running"])
+def test_status_words_an_unloaded_job_by_the_printed_verdict(monkeypatch, verdict):
+    """Only a live service is "the running service". A stopped service, and
+    a manifest whose control call fails (a dead process leaves one too), get
+    the words that are true either way: launchd loads the plist again at the
+    next login, and until then nothing starts the service."""
+    from jacked.cli import main
+    from jacked.service.platform import LAUNCHD_JOB_NOT_LOADED
+    from jacked.service.spec import SupervisorKind
+    from tests.unit.service.supervisor_test_support import make_spec
+
+    monkeypatch.setattr(
+        "jacked.service.platform.inspect_autostart",
+        lambda run=None: _owned_enabled(None),
+    )
+    monkeypatch.setattr("jacked.service.platform.launchd_job_probe", lambda: None)
+    monkeypatch.setattr(
+        "jacked.service.platform.supervision_drift",
+        lambda **_kwargs: LAUNCHD_JOB_NOT_LOADED,
+    )
+    control = {}
+    if verdict != "stopped":
+        manifest = _publish_live_manifest(monkeypatch, make_spec(SupervisorKind.MANUAL))
+        if verdict == "running":
+            control["return_value"] = _running_status(manifest)
+        else:
+            control["side_effect"] = ConnectionRefusedError("no listener")
+
+    with patch("jacked.service.ipc.send_native_control", **control):
+        result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    text = _flat(result.output)
+    heading = {
+        "stopped": "Jacked Service: stopped",
+        "indeterminate": "Jacked Service: ownership indeterminate",
+        "running": "Jacked Service: running",
+    }[verdict]
+    assert heading in text
+    expected = _LIVE_UNLOADED_LABEL if verdict == "running" else _STOPPED_UNLOADED_LABEL
+    assert expected in text
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="launchd is macOS only")
+@pytest.mark.parametrize("answer", ["loaded, never ran", "timed out"])
+def test_status_asks_launchctl_once_for_both_launchd_checks(
+    monkeypatch, caplog, answer
+):
+    """The drift check and the never-ran check asked launchctl the same
+    question, so a launchctl that could not answer logged two WARNINGs. One
+    shared probe now serves both."""
+    import logging
+    import subprocess
+    from types import SimpleNamespace
+
+    from jacked.cli import main
+
+    monkeypatch.setattr(
+        "jacked.service.platform.inspect_autostart",
+        lambda run=None: _owned_enabled(None),
+    )
+    calls = []
+
+    def launchctl(argv, **_kwargs):
+        argv = list(argv)
+        calls.append(argv)
+        if argv[:2] != ["launchctl", "print"]:
+            raise AssertionError(f"unexpected command: {argv}")
+        if answer == "timed out":
+            raise subprocess.TimeoutExpired(argv, 10)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="gui/501/ai.hank.jacked = {\n\tstate = not running\n\truns = 0\n}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", launchctl)
+    with caplog.at_level(logging.WARNING, logger="jacked.service.platform"):
+        result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1, calls
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "jacked.service.platform" and record.levelno == logging.WARNING
+    ]
+    text = _flat(result.output)
+    if answer == "timed out":
+        assert warnings == [
+            "launchctl could not be asked about the jacked job (TimeoutExpired); "
+            "autostart supervision was not checked"
+        ]
+        assert "Autostart: enabled" in text
+    else:
+        assert warnings == []
+        assert "(the launchd job is loaded but never ran; run `jacked service restart`)" in text
 
 
 # ---------------------------------------------------------------------------

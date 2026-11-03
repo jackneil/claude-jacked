@@ -53,7 +53,9 @@ BOOTOUT_DRAIN_POLL_SECONDS = 0.25
 # (2026-09-05). Lifecycle calls get a budget sized to the handoff itself.
 LIFECYCLE_CALL_TIMEOUT_SECONDS = 60.0
 _LIFECYCLE_VERBS = ("kickstart", "bootout")
-_LAUNCHCTL_NOT_FOUND = 113
+# `launchctl print` exits 113 ("Could not find service") when launchd
+# does not have the job loaded. Every not-loaded check uses this name.
+LAUNCHCTL_NOT_FOUND = 113
 _LAUNCHCTL_EIO = 5
 
 
@@ -70,7 +72,7 @@ def _await_unloaded(
             probe = context.run(["launchctl", "print", context.domain], **context.common)
         except (OSError, subprocess.SubprocessError):
             return False
-        if probe.returncode == _LAUNCHCTL_NOT_FOUND:
+        if probe.returncode == LAUNCHCTL_NOT_FOUND:
             return True
         if time.monotonic() >= deadline:
             return False
@@ -118,7 +120,7 @@ def _install_locked(context: LaunchdTransition) -> SupervisorAction:
         return _replace_legacy(context, legacy, loaded)
     if loaded.returncode == 0:
         return _replace_loaded(context, inspection.disposition, loaded.stdout)
-    if loaded.returncode == 113:
+    if loaded.returncode == LAUNCHCTL_NOT_FOUND:
         return _install_unloaded(context, inspection.disposition)
     return SupervisorAction(
         False, "install", f"supervisor inspection exit {loaded.returncode}"
@@ -142,7 +144,7 @@ def _replace_legacy(
         if not _await_unloaded(context):
             return SupervisorAction(False, "install", "previous job did not unload")
         was_loaded = True
-    elif loaded.returncode == 113:
+    elif loaded.returncode == LAUNCHCTL_NOT_FOUND:
         was_loaded = False
     else:
         return SupervisorAction(
@@ -252,7 +254,7 @@ def _resolve_ambiguous_bootstrap(
         return SupervisorAction(
             True, "install", f"activated {context.spec.generation[:12]}"
         )
-    if loaded.returncode == 113:
+    if loaded.returncode == LAUNCHCTL_NOT_FOUND:
         return SupervisorAction(False, "install", failure)
     return SupervisorAction(False, "ambiguous", f"{failure}; loaded state unknown")
 

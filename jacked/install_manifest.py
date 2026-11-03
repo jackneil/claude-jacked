@@ -120,10 +120,9 @@ def skill_content_hash(skill_dir) -> Optional[str]:
 def hash_installed_skill_dirs(home, names) -> dict:
     """Full-dir hashes of the INSTALLED ~/.claude/skills/<name> dirs.
 
-    Hashing what was written (not the source) keeps the value exact: install
-    merges files into an existing dir, so a sidecar an older jacked version
-    shipped can still be there, and a source-derived hash would then read as
-    "the user modified this" on the next run."""
+    Hashing what was written, not the source, keeps the value exact: the
+    record must match the dir that a later run compares, whatever the copy
+    step put there (links in editable mode, copies otherwise)."""
     base = Path(home) / ".claude" / "skills"
     out: dict = {}
     for name in names:
@@ -133,6 +132,31 @@ def hash_installed_skill_dirs(home, names) -> dict:
         if digest:
             out[name] = digest
     return out
+
+
+def keep_prior_skill_records(current: dict, prior: Optional[dict], names) -> None:
+    """Give each skill in `names` the record that `prior` holds for it.
+
+    `names` are the skills that an install skipped. The install did not write
+    them, so the source hashes in `current` describe nothing on disk. The
+    SKILL.md hash and the dir hash of the prior manifest stay instead. Then
+    the diff reports no change for the skill, the prune never takes it for a
+    removed skill, and a later run still knows a copy that jacked owns. A
+    skill with no prior record gets no record. Updates `current` in place.
+
+    >>> cur = {"skills": {"a": "new", "b": "new"}, "skills_dirs": {"c": "x"}}
+    >>> keep_prior_skill_records(cur, {"artifacts": {"skills": {"a": "old"}}}, {"a", "b"})
+    >>> cur
+    {'skills': {'a': 'old'}, 'skills_dirs': {'c': 'x'}}
+    """
+    for name in names:
+        for key in ("skills", SKILLS_DIRS_KEY):
+            bucket = current.setdefault(key, {})
+            recorded = _recorded(prior, key, name)
+            if recorded is None:
+                bucket.pop(name, None)
+            else:
+                bucket[name] = recorded
 
 
 def hash_source(data_root) -> dict:
@@ -219,8 +243,9 @@ def is_source_subset(skill_dir, src_dir) -> bool:
     """True iff EVERY file in `skill_dir` byte-matches the same relative path in
     `src_dir` (extra files in the source are fine, extra files here are not).
 
-    Install merges files into the dir and never deletes, so a dir jacked owns is
-    always file-subset-consistent with some state of the source. Comparing
+    Install replaces the dir as a whole: it copies the source tree into a new
+    staging dir and renames that dir into place. So a dir jacked owns holds
+    exactly the files of one state of the source. Comparing
     against the CURRENT source is the practical test, and it is what stops an
     editable/dev install from backing up jacked's OWN dir after the source moved
     (a `git pull` changes SKILL.md and the file set, so the recorded hashes both

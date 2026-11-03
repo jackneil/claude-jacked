@@ -149,6 +149,30 @@ def test_read_last_install_unreadable_file_is_none_and_logged(tmp_path, caplog):
     assert str(tmp_path) not in lines[0].getMessage()
 
 
+def test_read_last_install_refuses_an_oversized_record_and_logs_it(tmp_path, caplog):
+    p = tmp_path / "last.json"
+    p.write_text('{"pad": "' + "x" * (s.MAX_RECORD_BYTES + 1) + '"}', encoding="utf-8")
+    with caplog.at_level("DEBUG", logger="jacked.install_summary"):
+        assert s.read_last_install(p) is None
+    assert "too large" in caplog.text
+
+
+def test_read_last_install_survives_json_nested_too_deep(tmp_path, caplog, monkeypatch):
+    """The depth at which the JSON decoder gives up differs by interpreter
+    (the C decoder on this one parses thousands of levels), so the decoder's
+    RecursionError is raised directly: the reader must turn it into None."""
+    p = tmp_path / "last.json"
+    p.write_text("[[]]", encoding="utf-8")
+
+    def nested_too_deep(_text):
+        raise RecursionError("maximum recursion depth exceeded while decoding")
+
+    monkeypatch.setattr(s.json, "loads", nested_too_deep)
+    with caplog.at_level("DEBUG", logger="jacked.install_summary"):
+        assert s.read_last_install(p) is None
+    assert "RecursionError" in caplog.text
+
+
 def test_read_last_install_that_is_not_an_object_is_none(tmp_path, caplog):
     import logging
 

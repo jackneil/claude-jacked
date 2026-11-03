@@ -485,14 +485,19 @@ def test_skill_copy_failure_keeps_existing_skill_and_prompt(data_root, homes, mo
     assert skill_dir.exists() and prompt.exists()
 
     real_copy = ins._copy_tree
+    failed: list = []
 
     def _flaky(src, dst):
-        if Path(dst).name == "engined":
+        # Keyed on the source: the copy writes into a private staging dir
+        # (`.engined.jacked-staging-<pid>`), never into the skill dir itself.
+        if Path(src).name == "engined":
+            failed.append(dst)
             raise OSError("locked")
         return real_copy(src, dst)
 
     monkeypatch.setattr(ins, "_copy_tree", _flaky)
     summ = _install(data_root, homes)
+    assert failed, "the failing copy never ran for engined"
     assert skill_dir.exists(), "prune deleted the good skill dir after a write failure"
     assert prompt.exists()
     assert "engined" in _manifest(homes)["skills"]
@@ -1580,6 +1585,29 @@ def _backups_of(skills_base: Path, name: str) -> list:
     return sorted(root.glob(f"{name}-*")) if root.is_dir() else []
 
 
+def _side_dirs(skills_base: Path) -> list:
+    """The shared transaction's private dirs beside the skills: the staging
+    dir ``.<name>.jacked-staging-<pid>`` and the previous dir
+    ``.<name>.jacked-previous-<pid>``."""
+    if not skills_base.is_dir():
+        return []
+    return sorted(
+        p.name for p in skills_base.iterdir()
+        if p.name.startswith(".") and (
+            ".jacked-staging-" in p.name or ".jacked-previous-" in p.name
+        )
+    )
+
+
+def _staged_name(path) -> str:
+    """The skill name of a staging dir ``.<name>.jacked-staging-<pid>``. A
+    copy step that is given any other path fails the test here."""
+    name = Path(path).name
+    prefix, sep, pid = name.rpartition(".jacked-staging-")
+    assert sep and prefix.startswith(".") and pid.isdigit(), name
+    return prefix[1:]
+
+
 def test_user_owned_skill_dir_preserved_in_backups_dir(data_root, homes):
     """A user owns dirs whose names collide with a jacked skill (demo-skill) and a
     command-derived skill (dcr). Neither is jacked-owned yet (no prior manifest),
@@ -1647,10 +1675,11 @@ def test_user_dir_created_after_an_install_is_still_preserved(data_root, homes):
         assert "MINE" not in (skills_base / name / "SKILL.md").read_text()
 
 
-def test_jacked_owned_dir_is_overwritten_in_place(data_root, homes):
+def test_jacked_owned_dir_is_replaced_without_a_backup(data_root, homes):
     """The counterpart: an untouched jacked dir, and a jacked dir whose SOURCE
-    moved (new content + a new sidecar), are both refreshed in place with no
-    backup."""
+    moved (new content, a new sidecar, a sidecar gone), are both replaced
+    with no backup. The staged publish swaps the whole tree, so the dropped
+    sidecar is gone and no private staging or previous dir is left."""
     skills_base = ins.agents_skills_dir(homes["agents_home"])
     _install(data_root, homes)
 
@@ -1659,6 +1688,8 @@ def test_jacked_owned_dir_is_overwritten_in_place(data_root, homes):
         "---\nname: demo-skill\ndescription: a demo skill\n---\nbody v2\n"
     )
     (src / "extra.js").write_text("// added upstream\n")
+    (src / "references" / "notes.md").unlink()
+    (src / "references").rmdir()
 
     summ = _install(data_root, homes)
 
@@ -1666,6 +1697,68 @@ def test_jacked_owned_dir_is_overwritten_in_place(data_root, homes):
     assert _backups_of(skills_base, "demo-skill") == []
     assert "body v2" in (skills_base / "demo-skill" / "SKILL.md").read_text()
     assert (skills_base / "demo-skill" / "extra.js").exists()
+    assert _entries(skills_base / "demo-skill") == ["SKILL.md", "extra.js", "measure.js"]
+    assert _side_dirs(skills_base) == []
+
+
+def test_failed_copy_over_jackeds_own_dir_leaves_it_untouched(data_root, homes, monkeypatch):
+    """#260i on the Codex side: the old `_copy_tree` deleted jacked's dir
+    first and then copied, so a copy that failed part-way left a partial dir
+    or none. The copy now goes into a private staging dir, so a failure
+    leaves jacked's dir exactly as it was, and the prior hash is kept."""
+    import errno
+
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    _install(data_root, homes)
+    skill = skills_base / "demo-skill"
+    before = {p.relative_to(skill).as_posix(): p.read_bytes()
+              for p in sorted(skill.rglob("*")) if p.is_file()}
+    prior_hash = _manifest(homes)["skills"]["demo-skill"]
+    (data_root / "skills" / "demo-skill" / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: a demo skill\n---\nbody v2\n"
+    )
+    real = ins._copy_tree
+    calls: list = []
+
+    def half_copy(src, dst):
+        if Path(src).name != "demo-skill":
+            return real(src, dst)
+        calls.append(dst)
+        Path(dst).mkdir(parents=True, exist_ok=True)
+        (Path(dst) / "measure.js").write_text("// half\n")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ins, "_copy_tree", half_copy)
+    summ = _install(data_root, homes)
+
+    assert calls, "the failing copy never ran for demo-skill"
+    after = {p.relative_to(skill).as_posix(): p.read_bytes()
+             for p in sorted(skill.rglob("*")) if p.is_file()}
+    assert after == before
+    assert _side_dirs(skills_base) == []
+    assert _manifest(homes)["skills"]["demo-skill"] == prior_hash
+    assert summ.preserved == []
+
+
+def test_copy_helpers_never_delete_an_existing_dir(tmp_path):
+    """The Codex copy steps write a NEW dir only: the shared transaction hands
+    them a fresh staging dir, and only its publish rename replaces the old
+    dir. Given a dir that exists, each one refuses and leaves it as it was."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "SKILL.md").write_text("new\n")
+    for write in (
+        lambda dst: ins._copy_tree(src, dst),
+        lambda dst: ins._write_solo_skill(dst, "new\n"),
+    ):
+        dst = tmp_path / "existing"
+        dst.mkdir(exist_ok=True)
+        (dst / "SKILL.md").write_text("old\n")
+        (dst / "keep.md").write_text("keep\n")
+        with pytest.raises(FileExistsError):
+            write(dst)
+        assert (dst / "SKILL.md").read_text() == "old\n"
+        assert (dst / "keep.md").read_text() == "keep\n"
 
 
 def test_install_skips_a_failing_skill_and_continues(data_root, homes, monkeypatch):
@@ -1783,10 +1876,14 @@ def test_failed_command_skill_write_restores_the_users_own_dir(data_root, homes,
     (user / "SKILL.md").write_bytes(own)
     (user / "my-notes.txt").write_text("do not delete\n")
     real = ins._write_solo_skill
+    calls: list = []
 
     def half_write(skill_dir, content):
-        if Path(skill_dir).name != "dcr":
+        # The write goes into the private staging dir for dcr, never into
+        # ~/.agents/skills/dcr itself.
+        if _staged_name(skill_dir) != "dcr":
             return real(skill_dir, content)
+        calls.append(skill_dir)
         Path(skill_dir).mkdir(parents=True)
         (Path(skill_dir) / "SKILL.md").write_text(content[:10])
         raise OSError(errno.ENOSPC, "No space left on device")
@@ -1794,9 +1891,11 @@ def test_failed_command_skill_write_restores_the_users_own_dir(data_root, homes,
     monkeypatch.setattr(ins, "_write_solo_skill", half_write)
     summ = _install(data_root, homes)
 
+    assert calls, "the failing write never ran for dcr"
     assert (user / "SKILL.md").read_bytes() == own
     assert _entries(user) == ["SKILL.md", "my-notes.txt"]
     assert _backups_of(skills_base, "dcr") == []
+    assert _side_dirs(skills_base) == []
     assert "skills/dcr" not in summ.preserved
     assert "dcr" not in summ.skills
 
