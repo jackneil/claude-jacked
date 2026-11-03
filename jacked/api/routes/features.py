@@ -11,9 +11,9 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from jacked.atomic_io import atomic_write_bytes, atomic_write_text
 from jacked.memory import load_budget
 from jacked.memory.settings_io import SettingsTooLargeError, SettingsUnreadableError, settings_text
-from jacked.memory.vault import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -302,7 +302,7 @@ def _settings_unreadable_response() -> JSONResponse:
 
 
 def _write_settings_json(data: dict):
-    """Write ~/.claude/settings.json through the shared atomic writer.
+    """Write the UTF-8 bytes of ~/.claude/settings.json (LF on every platform).
 
     The CLI, the dashboard, and hook processes can all write this same file;
     the shared writer gives each one its own temp file and a Windows-aware
@@ -311,7 +311,7 @@ def _write_settings_json(data: dict):
     Settings over the read limit raise ``SettingsTooLargeError`` before the
     write, so the file stays readable.
     """
-    atomic_write_text(SETTINGS_JSON, settings_text(data))
+    atomic_write_bytes(SETTINGS_JSON, settings_text(data).encode("utf-8"))
 
 
 def _get_valid_agent_names() -> list[str]:
