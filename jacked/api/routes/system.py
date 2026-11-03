@@ -19,6 +19,7 @@ from jacked.findbin import find_bin
 from jacked.install_summary import DEFAULT_LAST_INSTALL_PATH as _LAST_INSTALL_PATH
 from jacked.memory.vault import atomic_write_text
 from jacked.service import update_status as _update_status_mod
+from jacked.web.database import SELECTED_ACCOUNT_KEYS, Database
 
 logger = logging.getLogger(__name__)
 
@@ -1137,21 +1138,85 @@ _PROTECTED_SETTING_KEYS = {
     # endpoint (with its restart flow) may write these, never the generic PUT.
     "remote_access_enabled",
     "remote_access_scope",
+    # The credential-selection pointers: the account that jacked selected for
+    # new sessions, and the active account. The authority guard, the identity
+    # watcher and the OAuth flow act on them, so only the switch path (with
+    # its mutation gate, switch audit and rate limit) may move them.
+    # _is_protected_setting adds the pointer of every other provider.
+    *SELECTED_ACCOUNT_KEYS,
 }
+# The active-account pointer of each provider other than Claude:
+# Database.active_account_setting_key(provider) is the Claude key plus
+# "_<provider>". Matching that shape protects the pointer of a provider that
+# is added later, the day it is added.
+_PROVIDER_POINTER_PREFIX = Database.active_account_setting_key("claude") + "_"
+
+# Reason-keyed copy for a refused remote change through the generic settings
+# endpoint. The two denials have different fixes, so they get different
+# sentences. No em-dashes (user-facing). The codes are the policy reasons.
+_SETTINGS_DENIED_MESSAGES = {
+    REASON_REMOTE_ACCESS_OFF: (
+        "Changing settings from this browser is off. Turn on remote access "
+        "under Settings > Advanced on the host machine."
+    ),
+    REASON_OUTSIDE_SCOPE: (
+        "This browser's address is outside the remote access scope. Widen the "
+        "scope under Settings > Advanced on the host machine."
+    ),
+}
+
+
+def _is_protected_setting(key: str) -> bool:
+    """Return True when only a dedicated endpoint may write or delete ``key``.
+
+    >>> _is_protected_setting("desired_account_id")
+    True
+    >>> _is_protected_setting(Database.active_account_setting_key("codex"))
+    True
+    >>> _is_protected_setting("color_theme"), _is_protected_setting("active_account_ids_note")
+    (False, False)
+    """
+    return key in _PROTECTED_SETTING_KEYS or key.startswith(_PROVIDER_POINTER_PREFIX)
+
+
+def _protected_key_response(key: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={
+            "error": {
+                "message": f"Use the dedicated endpoint for '{key}'",
+                "code": "PROTECTED_KEY",
+            }
+        },
+    )
 
 
 @router.put("/settings/{key}")
 def update_setting(key: str, body: SettingUpdateRequest, request: Request):
-    """Update a setting."""
+    """Update a setting.
+
+    The gate of an account switch runs first: loopback always may; a remote
+    client may only while remote access is on and its address is inside the
+    scope. Then a key that a dedicated endpoint owns, or a retired key, is
+    refused (422).
+    """
     import json
 
-    if key in _PROTECTED_SETTING_KEYS:
+    allowed, reason, _host = mutation_decision(request, audit="setting")
+    if not allowed:
+        return denied_response(reason, _SETTINGS_DENIED_MESSAGES, code=reason.upper())
+    if _is_protected_setting(key):
+        return _protected_key_response(key)
+    # A retired key is deleted when the database opens, and no code reads it,
+    # so a write would only look like a setting that works. DELETE stays open:
+    # it removes a row that an old jacked wrote after the open.
+    if key in Database.RETIRED_SETTING_KEYS:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={
                 "error": {
-                    "message": f"Use the dedicated endpoint for '{key}'",
-                    "code": "PROTECTED_KEY",
+                    "message": f"jacked no longer uses the setting '{key}'.",
+                    "code": "RETIRED_KEY",
                 }
             },
         )
@@ -1172,17 +1237,15 @@ def update_setting(key: str, body: SettingUpdateRequest, request: Request):
 
 @router.delete("/settings/{key}")
 def delete_setting(key: str, request: Request):
-    """Delete a setting by key."""
-    if key in _PROTECTED_SETTING_KEYS:
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={
-                "error": {
-                    "message": f"Use the dedicated endpoint for '{key}'",
-                    "code": "PROTECTED_KEY",
-                }
-            },
-        )
+    """Delete a setting by key.
+
+    The same gate as the PUT runs first, then the protected-key check.
+    """
+    allowed, reason, _host = mutation_decision(request, audit="setting")
+    if not allowed:
+        return denied_response(reason, _SETTINGS_DENIED_MESSAGES, code=reason.upper())
+    if _is_protected_setting(key):
+        return _protected_key_response(key)
 
     db = getattr(request.app.state, "db", None)
     if db is None:

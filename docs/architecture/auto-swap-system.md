@@ -96,7 +96,33 @@ next tick. Thus an account at or above its critical level is not a target
 while its wall holds. The T0 exception to the burn floor (drain to 100%) does not
 override this rule. Each candidate uses the value of its own plan, which is
 the value that rules 2a and 2b use for it after a swap. Thus a swap cannot
-cancel itself at the next tick.
+cancel itself at the next tick. No caller can give a different threshold.
+
+One module, `jacked/web/auto_swap/walls.py`, holds the wall predicate.
+`should_swap_now()`, `pick_best_target()`, the poll clamp, and the decision
+loop all use it, so they agree on which accounts are walled.
+
+Rules 1 and 1b keep their priority over rules 2a and 2b. Thus a walled account
+can leave with a `higher_tier_emerged` reason. For this reason, the decision
+loop gets the wall of the active account separately (`walled_reason()`). The
+wall controls the gates, whichever reason wins:
+
+- Emergence persistence does not hold a walled account.
+- The minimum residency does not hold a walled account.
+- A walled account without a target is exhaustion, not a stall. The stall
+  watchdog does not count it while the usage reading is fresh. A stale reading
+  shows nothing about the wall, so the watchdog counts it.
+
+The decision log records the wall of the active account (`wall`). Each
+candidate row records the wall of that candidate (`wall`) and if it can serve
+the binding model of the active account (`serves_model`).
+
+The `all_accounts_exhausted` banner names the limit that frees an account.
+`next_recovery_window` is `5h`, `7d`, or `model`. For a model limit,
+`next_recovery_label` gives the model name (for example, Fable). A binding
+model limit at or above `weekly_critical_pct` is a constrained limit, with its
+own reset time (`account_recovery()` in `jacked/service/usage_pacing.py`).
+The `pause_until` value of `jacked usage --json` uses the same recovery time.
 
 The 5-hour rules are off by default. Each swap makes the new account process
 the full session context again, and a 5-hour limit resets within hours.
@@ -251,7 +277,7 @@ Credential-related WebSocket events have distinct meanings:
 | `auto_swap_triggered` | A certified transaction returned `committed` or `committed_degraded` |
 | `auto_swap_failed` | An installed transaction engine ran but did not commit |
 | `all_accounts_exhausted` | A departure was needed but no eligible target existed |
-| `auto_swap_stall` | The decision loop met its stale-data/no-candidate watchdog condition |
+| `auto_swap_stall` | The decision loop met its stale-data/no-candidate watchdog condition (a walled account with fresh usage is exhaustion, not a stall) |
 | `decision_log_entry` | Per-tick decision and candidate evidence |
 
 `swap_log.status` must be interpreted, not merely counted. In particular,
@@ -356,6 +382,8 @@ certified transaction engine exists.
 | --- | --- |
 | `jacked/api/usage_monitor.py` | Decision loop, TOCTOU guard, recommendation-only gate, runtime backoff and broadcasts |
 | `jacked/web/auto_swap/selection.py` | Candidate ranking and departure rules |
+| `jacked/web/auto_swap/walls.py` | Wall predicate: walled departure (rules 2a and 2b) and walled-candidate checks |
+| `jacked/service/usage_pacing.py` | Recovery time for the exhaustion banner and `jacked usage` (`account_recovery()`) |
 | `jacked/web/auto_swap/tiers.py` | Urgency tiers, target usage, deficit calculations |
 | `jacked/web/auto_swap/burn.py` | Burn projection and reset suppression helpers |
 | `jacked/web/auto_swap/diagnostics.py` | Decision evidence and advisory calculations |

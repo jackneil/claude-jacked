@@ -90,14 +90,112 @@ class TestRecovery:
         assert pacing.account_recovery_at(_max(), NOW) is None
 
     def test_recovery_names_the_window_that_frees_the_account(self):
-        reset, kind = pacing.account_recovery(_max(cached_usage_5h=95.0), NOW)
-        assert (reset.isoformat(), kind) == ("2026-11-01T19:00:00+00:00", "5h")
-        reset, kind = pacing.account_recovery(_max(cached_usage_5h=95.0, cached_usage_7d=99.0), NOW)
-        assert (reset.isoformat(), kind) == ("2026-11-02T05:00:00+00:00", "7d")
+        rec = pacing.account_recovery(_max(cached_usage_5h=95.0), NOW)
+        assert (rec.at.isoformat(), rec.window, rec.label) == (
+            "2026-11-01T19:00:00+00:00", "5h", None)
+        rec = pacing.account_recovery(_max(cached_usage_5h=95.0, cached_usage_7d=99.0), NOW)
+        assert (rec.at.isoformat(), rec.window, rec.label) == (
+            "2026-11-02T05:00:00+00:00", "7d", None)
         # An Ultra account is freed by its weekly window, never a stale 5h one.
         ultra = _ultra(cached_usage_5h=100.0, cached_5h_resets_at="2026-11-01T20:00:00+00:00",
                        cached_usage_7d=96.0)
-        assert pacing.account_recovery(ultra, NOW)[1] == "7d"
+        assert pacing.account_recovery(ultra, NOW).window == "7d"
+
+
+WEEKLY_RESET = "2026-11-02T23:00:00+00:00"  # the weekly reset of _ultra()
+FABLE_RESET = "2026-11-04T23:00:00+00:00"
+
+
+def _model_raw(pct, resets, *, weekly=40, binding="Fable"):
+    """A no-session payload with a Fable limit at *pct*. *binding* names the
+    limit the provider flags is_active (a Sonnet limit at 20% when it is
+    "Sonnet")."""
+    limits = [{"kind": "weekly_all", "percent": weekly, "resets_at": WEEKLY_RESET},
+              {"kind": "weekly_scoped", "percent": pct, "is_active": binding == "Fable",
+               "resets_at": resets, "scope": {"model": {"display_name": "Fable"}}}]
+    if binding == "Sonnet":
+        limits.append({"kind": "weekly_scoped", "percent": 20, "is_active": True,
+                       "resets_at": resets, "scope": {"model": {"display_name": "Sonnet"}}})
+    return json.dumps({"five_hour": None, "limits": limits})
+
+
+class TestModelRecovery:
+    """F4: a binding model limit at or above the plan's weekly_critical_pct
+    walls the account (auto-swap rule 2b), so it is a constrained window of
+    kind "model" whose label names the model."""
+
+    def test_a_walled_binding_model_decides_the_recovery(self):
+        acct = _ultra(cached_usage_raw=_model_raw(99, FABLE_RESET))
+        rec = pacing.account_recovery(acct, NOW)
+        assert (rec.at.isoformat(), rec.window, rec.label) == (FABLE_RESET, "model", "Fable")
+        assert pacing.account_recovery_at(acct, NOW).isoformat() == FABLE_RESET
+
+    def test_the_model_threshold_is_the_plan_field(self):
+        """97 is above the 90 pacing threshold but under the 98 wall: the
+        account still serves Fable, so the limit holds nothing back."""
+        assert pacing.account_recovery(_ultra(cached_usage_raw=_model_raw(97, FABLE_RESET)), NOW) is None
+        assert pacing.account_recovery(_ultra(cached_usage_raw=_model_raw(98, FABLE_RESET)), NOW).window == "model"
+
+    def test_a_catalog_edit_moves_the_model_threshold(self, tmp_path, monkeypatch):
+        (tmp_path / up.CATALOG_FILE).write_text(json.dumps({
+            "version": 1, "verified_at": "2026-11-01",
+            "providers": {"claude": {"subscriptions": {"max": {"label": "Max", "tiers": {
+                "default_claude_max_20x": {"id": "ultra", "label": "Ultra",
+                                           "weekly_critical_pct": 95},
+            }}}}},
+        }), encoding="utf-8")
+        monkeypatch.setattr(up, "_catalog_cache", up.load_catalog(tmp_path))
+        rec = pacing.account_recovery(_ultra(cached_usage_raw=_model_raw(96, FABLE_RESET)), NOW)
+        assert (rec.window, rec.label) == ("model", "Fable")
+
+    def test_only_the_binding_model_counts(self):
+        """The provider flags Sonnet (20%) as the binding limit: the Fable
+        limit at 99% is not the account's wall (the rule 2b selection)."""
+        acct = _ultra(cached_usage_raw=_model_raw(99, FABLE_RESET, binding="Sonnet"))
+        assert pacing.account_recovery(acct, NOW) is None
+
+    def test_the_latest_constrained_limit_decides(self):
+        walled_week = _ultra(cached_usage_7d=95.0,
+                             cached_usage_raw=_model_raw(99, FABLE_RESET, weekly=95))
+        rec = pacing.account_recovery(walled_week, NOW)
+        assert (rec.at.isoformat(), rec.window, rec.label) == (FABLE_RESET, "model", "Fable")
+        early_model = _ultra(cached_usage_7d=95.0, cached_usage_raw=_model_raw(
+            99, "2026-11-02T06:00:00+00:00", weekly=95))
+        rec = pacing.account_recovery(early_model, NOW)
+        assert (rec.at.isoformat(), rec.window, rec.label) == (WEEKLY_RESET, "7d", None)
+
+    def test_on_a_tie_the_model_is_named(self):
+        """The Fable limit and the weekly window often share a reset; the
+        banner then names the model, the narrower wall."""
+        acct = _ultra(cached_usage_7d=95.0, cached_usage_raw=_model_raw(99, WEEKLY_RESET, weekly=95))
+        rec = pacing.account_recovery(acct, NOW)
+        assert (rec.at.isoformat(), rec.window, rec.label) == (WEEKLY_RESET, "model", "Fable")
+
+    def test_an_unknowable_model_reset_gives_none(self):
+        for resets in (None, "not-a-date", 1793780314):
+            acct = _ultra(cached_usage_raw=_model_raw(99, resets))
+            assert pacing.account_recovery(acct, NOW) is None, resets
+
+    def test_a_model_reading_from_before_its_reset_holds_nothing(self):
+        """The Fable limit reset at 17:30 and the reading is from 17:00, so it
+        predates the turnover (the staleness rule of every window): the
+        weekly window decides. The same reading taken after 17:30 is a
+        constrained limit whose reset passed, so the time is unknowable."""
+        before = int(datetime(2026, 11, 1, 17, 0, tzinfo=timezone.utc).timestamp())
+        raw = _model_raw(99, "2026-11-01T17:30:00+00:00", weekly=95)
+        stale = _ultra(usage_cached_at=before, cached_usage_7d=95.0, cached_usage_raw=raw)
+        rec = pacing.account_recovery(stale, NOW)
+        assert (rec.at.isoformat(), rec.window) == (WEEKLY_RESET, "7d")
+        fresh = _ultra(cached_usage_7d=95.0, cached_usage_raw=raw)  # cached at 17:59
+        assert pacing.account_recovery(fresh, NOW) is None
+
+    def test_pause_until_waits_out_a_model_wall(self):
+        """The pacing summary uses the same recovery: an account walled on its
+        binding model is not workable before that limit resets."""
+        acct = _ultra(cached_usage_7d=95.0, cached_usage_raw=_model_raw(99, FABLE_RESET, weekly=95))
+        summary = pacing.compute_best_account_summary([acct], now=NOW)
+        assert summary["best_account_worst_window_pct"] == 95.0
+        assert summary["pause_until"] == FABLE_RESET
 
 
 class TestSummary:

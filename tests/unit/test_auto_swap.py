@@ -1628,7 +1628,7 @@ class TestSortKeyChronological:
         assert target["id"] == 2
 
     def test_epoch_or_inf_fallback(self):
-        from jacked.web.auto_swap.selection import _epoch_or_inf
+        from jacked.web.auto_swap.walls import _epoch_or_inf
         assert _epoch_or_inf(None) == float("inf")
         assert _epoch_or_inf("") == float("inf")
         assert _epoch_or_inf("not-a-date") == float("inf")
@@ -1964,16 +1964,20 @@ class TestWalledOnlyDeparture:
         assert should_swap_now(active=active, best=t0, now=self.NOW).startswith(
             REASON_PREFIX_HIGHER_TIER)
 
-    def test_an_explicit_threshold_wins_over_the_catalog(self):
+    def test_the_model_rule_reads_the_plan_threshold(self, tmp_path, monkeypatch):
+        """Rule 2b reads the same plan field as rule 2a: no caller passes a
+        threshold of its own (F5)."""
         far = self._far()
-        weekly = _claude_acct(1, usage_7d=92, resets_7d=far)
-        assert should_swap_now(active=weekly, best=None, now=self.NOW) is None
-        assert should_swap_now(active=weekly, best=None, now=self.NOW,
-                               weekly_critical=90) == "weekly critical: 7d usage 92.0% >= 90%"
         model = _claude_acct(1, usage_7d=60, resets_7d=far,
                              models=[("Fable", 92, far, True)])
         assert should_swap_now(active=model, best=None, now=self.NOW) is None
-        assert should_swap_now(active=model, best=None, now=self.NOW, weekly_critical=90) == (
+        monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
+            "claude": {"subscriptions": {"max": {"label": "Max", "tiers": {
+                "default_claude_max_20x": {"id": "ultra", "label": "Ultra",
+                                           "weekly_critical_pct": 90},
+            }}}},
+        }))
+        assert should_swap_now(active=model, best=None, now=self.NOW) == (
             "model weekly critical: Fable 92.0% >= 90%"
         )
 
@@ -2106,10 +2110,15 @@ class TestPickBestTargetWalledAdmission:
         self, tmp_path, monkeypatch,
     ):
         """Pro's field is 95 here and Ultra's 98. A Pro candidate at 96% is
-        walled on its own plan, so it is skipped. The Ultra active's 98
-        would admit it (the explicit override shows it), and rule 2a at
-        Pro's 95 would eject it on the next tick. This is why the monitor
-        never passes the active's threshold to pick_best_target."""
+        walled on its own plan, so it is skipped. At the Ultra active's 98
+        (the default catalog gives Pro 98 too) the same candidate is
+        admitted, and rule 2a at Pro's 95 would eject it on the next tick.
+        This is why no caller passes the active's threshold to
+        pick_best_target."""
+        active = _claude_acct(99, usage_7d=100, resets_7d=self._far())
+        pro = _acct(1, usage_7d=96, resets_7d=self._t0(6), subscription_type="pro")
+        assert weekly_critical_threshold(pro) == 98.0
+        assert pick_best_target([active, pro], current_id=99, now=self.NOW)["id"] == 1
         monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
             "claude": {"subscriptions": {
                 "max": {"label": "Max", "tiers": {
@@ -2118,13 +2127,9 @@ class TestPickBestTargetWalledAdmission:
                 "pro": {"label": "Pro", "session": "always", "weekly_critical_pct": 95},
             }},
         }))
-        active = _claude_acct(99, usage_7d=100, resets_7d=self._far())
-        pro = _acct(1, usage_7d=96, resets_7d=self._t0(6), subscription_type="pro")
         assert weekly_critical_threshold(active) == 98.0
         assert weekly_critical_threshold(pro) == 95.0
         assert pick_best_target([active, pro], current_id=99, now=self.NOW) is None
-        assert pick_best_target([active, pro], current_id=99, now=self.NOW,
-                                weekly_critical=98)["id"] == 1
         assert should_swap_now(active=pro, best=None, now=self.NOW) == (
             "weekly critical: 7d usage 96.0% >= 95%"
         )
@@ -2149,23 +2154,33 @@ class TestPickBestTargetWalledAdmission:
         to price it with. The monitor re-fetches such a candidate on the next
         tick (_candidate_staleness_override)."""
         from jacked.web.auto_swap import TIER_EXCLUDED, tier_for
-        from jacked.web.auto_swap.selection import _cannot_serve
+        from jacked.web.auto_swap.walls import _cannot_serve
 
         past = _iso(self.NOW - timedelta(minutes=5))
         stale = _claude_acct(1, usage_7d=99, resets_7d=past)
-        assert _cannot_serve(stale, None, None, self.NOW) is False
+        assert _cannot_serve(stale, None, self.NOW) is False
         live = _claude_acct(1, usage_7d=99, resets_7d=self._t0(6))
-        assert _cannot_serve(live, None, None, self.NOW) is True
+        assert _cannot_serve(live, None, self.NOW) is True
         assert tier_for(stale, now=self.NOW) == TIER_EXCLUDED
 
-    def test_pick_honors_an_explicit_threshold(self):
+    def test_the_candidate_plan_field_is_an_inclusive_threshold(self, tmp_path, monkeypatch):
+        """The protected-model check reads the candidate's own plan field (no
+        caller override, F5), and the field is inclusive: Fable at 92% is
+        walled at a field of 92, and serves at a field of 93."""
         far = self._far()
         cand = _claude_acct(1, usage_7d=50, resets_7d=self._t0(),
                             models=[("Sonnet", 10, far, True), ("Fable", 92, far, False)])
         active = self._fable_active(pct=50)
         assert pick_best_target([active, cand], current_id=99, now=self.NOW)["id"] == 1
-        assert pick_best_target([active, cand], current_id=99, now=self.NOW,
-                                weekly_critical=90) is None
+        for field, admitted in ((93, True), (92, False)):
+            monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
+                "claude": {"subscriptions": {"max": {"label": "Max", "tiers": {
+                    "default_claude_max_20x": {"id": "ultra", "label": "Ultra",
+                                               "weekly_critical_pct": field},
+                }}}},
+            }))
+            best = pick_best_target([active, cand], current_id=99, now=self.NOW)
+            assert (best is not None) is admitted, field
 
     def test_each_candidate_is_judged_by_its_own_plan(self, tmp_path, monkeypatch):
         """A candidate's wall is its own plan's field: the threshold rule 2b
@@ -2187,6 +2202,117 @@ class TestPickBestTargetWalledAdmission:
                               rate_limit_tier="default_claude_max_5x")
         assert pick_best_target([active, ultra], current_id=99, now=self.NOW) is None
         assert pick_best_target([active, max5], current_id=99, now=self.NOW)["id"] == 2
+
+
+# ---------------------------------------------------------------------------
+# walls.py: the one wall predicate for departure and admission (#224i)
+# ---------------------------------------------------------------------------
+
+
+class TestWallModule:
+    """The wall policy lives in jacked/web/auto_swap/walls.py. Every caller
+    reads the threshold from the account's own plan field."""
+
+    NOW = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    WALL_HELPERS = ("_epoch_or_inf", "_model_limits", "_resets_by", "_walled_on",
+                    "_walled_reason", "walled_reason", "_protected_model_key",
+                    "candidate_walls", "_cannot_serve")
+
+    def _far(self):
+        return _iso(self.NOW + timedelta(hours=72))
+
+    def test_walls_py_owns_every_wall_helper(self):
+        """selection.py keeps no copy of a wall helper. It imports the ones it
+        uses from walls.py, and it re-exports the two reason prefixes that
+        the facade and the monitor read from it."""
+        from jacked.web.auto_swap import selection, walls
+
+        for name in ("REASON_PREFIX_WEEKLY_CRITICAL", "REASON_PREFIX_MODEL_WEEKLY"):
+            assert getattr(selection, name) is getattr(walls, name), name
+        for name in self.WALL_HELPERS:
+            assert getattr(walls, name).__module__ == walls.__name__, name
+            if hasattr(selection, name):
+                assert getattr(selection, name) is getattr(walls, name), name
+
+    def test_the_split_keeps_both_modules_under_their_limits(self):
+        from pathlib import Path
+
+        from jacked.web.auto_swap import selection, walls
+
+        def lines(module):
+            return len(Path(module.__file__).read_text(encoding="utf-8").splitlines())
+
+        assert lines(selection) < 500
+        assert lines(walls) < 300
+
+    def test_no_caller_can_pass_its_own_threshold(self):
+        """F5: the threshold is always the account's own plan field. Another
+        value lets the departure rule and the admission rule disagree (a
+        ping-pong), and only tests ever passed one."""
+        import inspect
+
+        from jacked.web.auto_swap import walls
+
+        for fn in (pick_best_target, should_swap_now, walls._cannot_serve,
+                   walls.walled_reason, walls.candidate_walls):
+            params = inspect.signature(fn).parameters
+            assert "weekly_critical" not in params and "threshold" not in params, fn.__name__
+
+    def test_walled_reason_reads_the_plan_threshold(self, tmp_path, monkeypatch):
+        from jacked.web.auto_swap.walls import walled_reason
+
+        far = self._far()
+        weekly = _claude_acct(1, usage_7d=92, resets_7d=far)
+        model = _claude_acct(1, usage_7d=60, resets_7d=far, models=[("Fable", 92, far, True)])
+        assert walled_reason(weekly, self.NOW) is None
+        assert walled_reason(model, self.NOW) is None
+        monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
+            "claude": {"subscriptions": {"max": {"label": "Max", "tiers": {
+                "default_claude_max_20x": {"id": "ultra", "label": "Ultra",
+                                           "weekly_critical_pct": 90},
+            }}}},
+        }))
+        assert walled_reason(weekly, self.NOW) == "weekly critical: 7d usage 92.0% >= 90%"
+        assert walled_reason(model, self.NOW) == "model weekly critical: Fable 92.0% >= 90%"
+
+    def test_walled_reason_is_the_departure_predicate(self):
+        """With no candidate and below its tier target, should_swap_now gives
+        exactly walled_reason's verdict: the monitor's separate wall and the
+        departure reason cannot disagree."""
+        from jacked.web.auto_swap.walls import walled_reason
+
+        far = self._far()
+        soon = _iso(self.NOW + timedelta(minutes=10))
+        for acct in (
+            _claude_acct(1, usage_7d=100, resets_7d=far),
+            _claude_acct(1, usage_7d=60, resets_7d=far, models=[("Fable", 100, far, True)]),
+            _claude_acct(1, usage_7d=60, resets_7d=far, models=[("Fable", 100, soon, True)]),
+            _claude_acct(1, usage_7d=60, resets_7d=far),
+        ):
+            assert should_swap_now(active=acct, best=None, now=self.NOW) == (
+                walled_reason(acct, self.NOW))
+
+    def test_candidate_walls_names_both_checks(self):
+        """(the candidate's own walled departure reason, whether it serves the
+        model the active account binds on): the two checks pick_best_target
+        applies, which the decision log's candidate rows show."""
+        from jacked.web.auto_swap.walls import _cannot_serve, candidate_walls
+
+        far = self._far()
+        own = _claude_acct(1, usage_7d=50, resets_7d=far, models=[("Fable", 100, far, True)])
+        other = _claude_acct(2, usage_7d=50, resets_7d=far,
+                             models=[("Sonnet", 20, far, True), ("Fable", 99, far, False)])
+        weekly = _claude_acct(3, usage_7d=99, resets_7d=far)
+        healthy = _claude_acct(4, usage_7d=50, resets_7d=far, models=[("Fable", 20, far, True)])
+        assert candidate_walls(own, "fable", self.NOW) == (
+            "model weekly critical: Fable 100.0% >= 98%", False)
+        assert candidate_walls(other, "fable", self.NOW) == (None, False)
+        assert candidate_walls(weekly, "fable", self.NOW) == (
+            "weekly critical: 7d usage 99.0% >= 98%", True)
+        assert candidate_walls(healthy, "fable", self.NOW) == (None, True)
+        assert candidate_walls(other, None, self.NOW) == (None, True)
+        for acct, cannot in ((own, True), (other, True), (weekly, True), (healthy, False)):
+            assert _cannot_serve(acct, "fable", self.NOW) is cannot
 
 
 def test_resets_within_at_reads_only_strings():

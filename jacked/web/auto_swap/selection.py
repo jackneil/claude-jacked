@@ -1,4 +1,9 @@
-"""Selection rule and departure decision (tier-aware unified flow)."""
+"""Selection rule and departure decision (tier-aware unified flow).
+
+The wall policy (rules 2a/2b and the walled-candidate skip) lives in
+:mod:`jacked.web.auto_swap.walls`; this module re-exports its two reason
+prefixes.
+"""
 
 from __future__ import annotations
 
@@ -6,15 +11,12 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from jacked.service.menubar_summary import binding_model, parse_per_model
-from jacked.service.usage_pacing import coerce_pct
-from jacked.usage_plans import has_session, raw_usage
+from jacked.usage_plans import has_session
 from jacked.web.auto_swap.burn import (
     BurnRate,
     RESET_SUPPRESS_MINUTES,
     has_viable_headroom,
 )
-from jacked.web.auto_swap.diagnostics import weekly_critical_threshold
 from jacked.web.auto_swap.tiers import (
     TIER_EXCLUDED,
     TIER_T0,
@@ -24,6 +26,14 @@ from jacked.web.auto_swap.tiers import (
     _resolve_now,
     target_for_tier,
     tier_for,
+)
+from jacked.web.auto_swap.walls import (
+    REASON_PREFIX_MODEL_WEEKLY as REASON_PREFIX_MODEL_WEEKLY,
+    REASON_PREFIX_WEEKLY_CRITICAL as REASON_PREFIX_WEEKLY_CRITICAL,
+    _cannot_serve,
+    _epoch_or_inf,
+    _protected_model_key,
+    walled_reason,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,26 +128,6 @@ class _SortKey:
     neg_deficit: float        # negated deficit so larger raw deficit -> smaller key
 
 
-def _epoch_or_inf(resets_at: str | None) -> float:
-    """Parse an ISO reset timestamp to UTC epoch seconds for chronological
-    sorting. Lexicographic string sort diverges from chronological for mixed
-    formats (Z suffix vs explicit offsets), so the key must be numeric.
-    float('inf') on missing, non-string or unparseable values (sorts last).
-
-    >>> _epoch_or_inf("1970-01-01T00:01:00Z"), _epoch_or_inf(1793780314)
-    (60.0, inf)
-    """
-    if not resets_at or not isinstance(resets_at, str):
-        return float("inf")
-    try:
-        dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except (ValueError, TypeError):
-        return float("inf")
-
-
 def pick_best_target(
     accounts: list[dict],
     current_id: int,
@@ -146,7 +136,6 @@ def pick_best_target(
     active_end: str = "23:00",
     now: datetime | None = None,
     prev_tiers: dict[int, int] | None = None,
-    weekly_critical: float | None = None,
 ) -> dict | None:
     """Return the best swap-target account, or None if nothing qualifies.
 
@@ -158,15 +147,15 @@ def pick_best_target(
        no viable 7d headroom (bypassed for T0 with deficit >= 1.0 —
        drain-to-100 must not strand the final slice below the
        burn-per-window floor), deficit<=0, tier=excluded, and two
-       walled cases (#224i): a candidate whose limit for the active
-       account's binding model is at its weekly threshold (it cannot
-       serve the model the user works on), and a candidate that the
-       walled departure rules 2a/2b of ``should_swap_now`` would eject
-       on the next tick (the swap would undo itself: a ping-pong). The
-       threshold is ``weekly_critical`` when given, else each
-       candidate's own plan field (``weekly_critical_threshold``): the
-       same threshold rules 2a/2b apply to that account once it is
-       active. The T0 burn-floor bypass does not override this skip.
+       walled cases (#224i, ``walls._cannot_serve``): a candidate whose
+       limit for the active account's binding model is at its weekly
+       threshold (it cannot serve the model the user works on), and a
+       candidate that the walled departure rules 2a/2b of
+       ``should_swap_now`` would eject on the next tick (the swap would
+       undo itself: a ping-pong). The threshold is each candidate's own
+       plan field (``weekly_critical_threshold``): the same threshold
+       rules 2a/2b apply to that account once it is active. The T0
+       burn-floor bypass does not override this skip.
     2. Pick the candidate that minimizes (tier_index, resets_at_epoch,
        -deficit). See ``_SortKey`` for the sign convention.
     3. ``active_start``/``active_end`` feed ``has_viable_headroom`` (the
@@ -237,7 +226,7 @@ def pick_best_target(
                 continue
         if not _has_5h_headroom(a, now=now):
             continue
-        if _cannot_serve(a, protected_key, weekly_critical, now):
+        if _cannot_serve(a, protected_key, now):
             continue
 
         key = _SortKey(
@@ -278,194 +267,15 @@ _TIER_NAMES = {
 
 
 # Reason-string prefixes — DO NOT change these without updating
-# usage_monitor's `_trigger_for_reason` mapping.
+# usage_monitor's `_trigger_for_reason` mapping. The two wall prefixes
+# (REASON_PREFIX_WEEKLY_CRITICAL, REASON_PREFIX_MODEL_WEEKLY) live in
+# walls.py and are imported above.
 REASON_PREFIX_HIGHER_TIER = "higher tier emerged"
 REASON_PREFIX_INTRA_TIER = "intra-tier preemption:"
 REASON_PREFIX_DRAINED = "drained:"
 REASON_PREFIX_FIVE_H = "5h critical:"
 REASON_PREFIX_BURN_RATE = "burn-rate projection:"
 REASON_PREFIX_NO_DATA = "active has no 7d data"
-REASON_PREFIX_WEEKLY_CRITICAL = "weekly critical:"
-REASON_PREFIX_MODEL_WEEKLY = "model weekly critical:"
-
-
-def _model_limits(account: dict) -> list[dict]:
-    """The account's per-model weekly limits from its cached payload.
-
-    The parser the pill, the dashboard bar and the poll urgency use
-    (:func:`jacked.service.menubar_summary.parse_per_model`).
-
-    >>> raw = '{"limits": [{"kind": "weekly_scoped", "percent": 99, "is_active": true,'
-    >>> raw += ' "scope": {"model": {"display_name": "Fable"}}}]}'
-    >>> [(m["key"], m["utilization"]) for m in _model_limits({"cached_usage_raw": raw})]
-    [('fable', 99)]
-    >>> _model_limits({})
-    []
-    """
-    return parse_per_model(raw_usage(account))
-
-
-def _resets_by(resets_at, now: datetime, within_seconds: float = 0.0) -> bool:
-    """True when the limit has reset, or resets within *within_seconds*.
-
-    A reading of a limit whose reset has passed is from before the reset, so
-    it is stale. False for a missing, non-string or unparseable reset:
-    nothing then shows that the reading is stale or that the limit lifts.
-
-    >>> now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
-    >>> _resets_by("2026-05-04T11:55:00+00:00", now)
-    True
-    >>> _resets_by("2026-05-04T12:20:00+00:00", now), _resets_by("2026-05-04T12:20:00Z", now, 1800)
-    (False, True)
-    >>> _resets_by(None, now, 1800), _resets_by(1793780314, now, 1800)
-    (False, False)
-    """
-    return _epoch_or_inf(resets_at) <= _resolve_now(now).timestamp() + within_seconds
-
-
-def _walled_on(per_model: list[dict], key: str, threshold: float, now: datetime) -> bool:
-    """True when *per_model* holds the model limit *key* at *threshold* or
-    above, and that limit has not reset yet (a reading from before its
-    reset is stale and holds nothing back).
-
-    >>> now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
-    >>> _walled_on([{"key": "fable", "utilization": 98}], "fable", 98.0, now)
-    True
-    >>> _walled_on([{"key": "sonnet", "utilization": 100}], "fable", 98.0, now)
-    False
-    >>> _walled_on([{"key": "fable", "utilization": 100,
-    ...              "resets_at": "2026-05-04T11:55:00+00:00"}], "fable", 98.0, now)
-    False
-    """
-    for limit in per_model:
-        if limit.get("key") == key:
-            pct = coerce_pct(limit.get("utilization"))
-            return (
-                pct is not None
-                and pct >= threshold
-                and not _resets_by(limit.get("resets_at"), now)
-            )
-    return False
-
-
-def _walled_reason(
-    account: dict,
-    threshold: float,
-    now: datetime,
-    per_model: list[dict] | None = None,
-) -> str | None:
-    """The walled departure (rule 2a, then 2b) that fires on *account* as the
-    active account, or None.
-
-    2a. The weekly limit (``cached_usage_7d``) is at *threshold* or above,
-        and its reset (``cached_7d_resets_at``) is still ahead and not
-        within RESET_SUPPRESS_MINUTES.
-    2b. The binding model limit is at *threshold* or above, and its reset is
-        still ahead and not within RESET_SUPPRESS_MINUTES. The binding model
-        is the limit the provider flags ``is_active``, else the highest: the
-        same selection as the pill and the poll urgency
-        (:func:`binding_model`).
-
-    A reset that has already passed makes the reading stale (it is from
-    before the reset): like a reset within the suppression window, it is
-    neither a departure nor an admission block. A missing or unreadable
-    reset keeps the wall. A missing reading is never a wall.
-    ``pick_best_target`` applies this same predicate to each candidate, so
-    a swap never lands on an account that this rule ejects on the next
-    tick. *per_model* is the account's parsed per-model limits when the
-    caller has them.
-
-    >>> now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
-    >>> _walled_reason({"cached_usage_7d": 100.0}, 98.0, now)
-    'weekly critical: 7d usage 100.0% >= 98%'
-    >>> _walled_reason({"cached_usage_7d": 60.0}, 98.0, now,
-    ...                [{"key": "fable", "label": "Fable", "utilization": 100,
-    ...                  "resets_at": None, "is_active": True}])
-    'model weekly critical: Fable 100.0% >= 98%'
-    >>> _walled_reason({"cached_usage_7d": 99.0,
-    ...                 "cached_7d_resets_at": "2026-05-04T12:10:00+00:00"}, 98.0, now) is None
-    True
-    >>> _walled_reason({"cached_usage_7d": 100.0,
-    ...                 "cached_7d_resets_at": "2026-05-04T11:55:00+00:00"}, 98.0, now) is None
-    True
-    """
-    lift_window = RESET_SUPPRESS_MINUTES * 60
-    weekly = coerce_pct(account.get("cached_usage_7d"))
-    if (
-        weekly is not None
-        and weekly >= threshold
-        and not _resets_by(account.get("cached_7d_resets_at"), now, lift_window)
-    ):
-        return (
-            f"{REASON_PREFIX_WEEKLY_CRITICAL} 7d usage {weekly:.1f}% >= "
-            f"{threshold:g}%"
-        )
-    model = binding_model(per_model if per_model is not None else _model_limits(account))
-    pct = coerce_pct(model.get("utilization")) if model else None
-    if (
-        pct is not None
-        and pct >= threshold
-        and not _resets_by(model.get("resets_at"), now, lift_window)
-    ):
-        return (
-            f"{REASON_PREFIX_MODEL_WEEKLY} {model['label']} {pct:.1f}% >= "
-            f"{threshold:g}%"
-        )
-    return None
-
-
-def _protected_model_key(accounts: list[dict], current_id) -> str | None:
-    """The key of the current account's binding model limit, or None.
-
-    The model the user works on: a swap target must still serve it. None
-    when the current account is not in *accounts* or reports no model limit.
-
-    >>> raw = '{"limits": [{"kind": "weekly_scoped", "percent": 40, "is_active": true,'
-    >>> raw += ' "scope": {"model": {"display_name": "Fable"}}}]}'
-    >>> _protected_model_key([{"id": 1, "cached_usage_raw": raw}], 1)
-    'fable'
-    >>> _protected_model_key([{"id": 1}], 1) is None
-    True
-    """
-    current = next((a for a in accounts if a["id"] == current_id), None)
-    model = binding_model(_model_limits(current)) if current is not None else None
-    return model.get("key") if model else None
-
-
-def _cannot_serve(
-    account: dict,
-    protected_key: str | None,
-    weekly_critical: float | None,
-    now: datetime,
-) -> bool:
-    """True when *account* is walled and so is never a swap target (#224i).
-
-    Two cases. (1) Its limit for the current account's binding model
-    (*protected_key*) is at the threshold and has not reset yet: it cannot
-    serve the model the user works on, even when that model is not its own
-    binding one. (2) The
-    walled departure rules 2a/2b would fire on it once it is active
-    (:func:`_walled_reason`): the swap would undo itself on the next tick,
-    a deterministic ping-pong. The threshold is *weekly_critical* when
-    given, else the account's own plan field, which is the threshold rules
-    2a/2b apply to it as the active account. ``pick_best_target`` and the
-    monitor's poll clamp both use this predicate, so they agree on what a
-    target is.
-
-    >>> now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
-    >>> _cannot_serve({"cached_usage_7d": 98.5}, None, None, now)
-    True
-    >>> _cannot_serve({"cached_usage_7d": 50.0}, "fable", None, now)
-    False
-    """
-    threshold = (
-        weekly_critical if weekly_critical is not None
-        else weekly_critical_threshold(account)
-    )
-    per_model = _model_limits(account)
-    if protected_key is not None and _walled_on(per_model, protected_key, threshold, now):
-        return True
-    return _walled_reason(account, threshold, now, per_model) is not None
 
 
 def _hours_to_expiry(account: dict, now: datetime) -> float | None:
@@ -497,18 +307,27 @@ def should_swap_now(
     prev_tiers: dict[int, int] | None = None,
     active_start: str = "06:00",
     active_end: str = "23:00",
-    weekly_critical: float | None = None,
     five_hour_rules: bool = False,
 ) -> str | None:
     """Return a reason string if the algorithm should swap off ``active``,
     or None to stay.
 
-    Departure rules — DO NOT REORDER. Rules 1/1b are the ONLY rules that
-    override reset suppression (5h, weekly and model weekly), and rule 1
-    is the ONLY rule gated by emergence persistence in the caller.
-    Reordering breaks both invariants. Rules 2a/2b must stay ahead of
-    rules 3/4: a walled account cannot serve, and it must leave even when
-    the 5h rules are off. See spec
+    Departure rules: DO NOT REORDER. The order is the priority, and the
+    caller's gates depend on it. Reset suppression is per rule:
+
+    - Rules 1, 1b and 2 are independent of all suppression: they fire
+      when the 5h window, the weekly window or a model limit resets soon.
+    - Rules 2a and 2b each suppress on the reset of their own limit (the
+      weekly window, the binding model limit) within
+      RESET_SUPPRESS_MINUTES.
+    - Rules 3 and 4 suppress on the 5h reset.
+
+    Emergence persistence in the caller gates rules 1 and 1b only, and the
+    minimum residency holds rules 1, 1b and 4 only. The caller lifts both
+    gates when the active account is walled (rule 2a or 2b holds), whichever
+    reason wins here. Rules 2a/2b must stay ahead of rules 3/4: a walled
+    account cannot serve, and it must leave even when the 5h rules are off.
+    See spec
     docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md.
 
     1. Higher-tier candidate emerged: ``best`` exists with strictly
@@ -526,21 +345,28 @@ def should_swap_now(
     2. Active drained (T0/T1 only): usage_7d >= the active tier's
        target. T2/T3 targets are FLOORS (white_bar baseline), not
        drain-to goals — being above the floor is the desired state.
-    2a. Weekly critical (#224i, any tier): usage_7d >= ``weekly_critical``
-       AND the 7d reset NOT within RESET_SUPPRESS_MINUTES. The account is
+    2a. Weekly critical (#224i, any tier): usage_7d >= the threshold AND
+       the 7d reset NOT within RESET_SUPPRESS_MINUTES. The account is
        walled on its weekly limit and cannot serve.
     2b. Model weekly critical (#224i, any tier): the binding model limit
        (the one the provider flags ``is_active``, else the highest; for
-       example the weekly Fable limit) >= ``weekly_critical`` AND its
-       reset NOT within RESET_SUPPRESS_MINUTES.
-       Rules 2a/2b fire with or without ``best``: the caller turns a
-       reason with no candidate into the ``no_target`` decision, the
-       exhaustion WARNING and the ``all_accounts_exhausted`` banner, which
-       a user walled on the week needs to see.
+       example the weekly Fable limit) >= the threshold AND its reset NOT
+       within RESET_SUPPRESS_MINUTES.
+       The threshold is the active account's plan field
+       (``weekly_critical_threshold``, 98 today), read by
+       :func:`jacked.web.auto_swap.walls.walled_reason`. Rules 2a/2b fire
+       with or without ``best``: the caller turns a reason with no
+       candidate into the ``no_target`` decision, the exhaustion WARNING
+       and the ``all_accounts_exhausted`` banner, which a user walled on
+       the week needs to see.
     3. Active 5h critical: usage_5h >= critical_5h, AND 5h reset NOT
        imminent (within RESET_SUPPRESS_MINUTES). Also evaluated when
-       the active has no 7d data (TIER_EXCLUDED) — exhaustion alerting
-       must not depend on 7d cache presence.
+       the active has no 7d data (TIER_EXCLUDED): exhaustion alerting
+       must not depend on 7d cache presence. With ``five_hour_rules``
+       off (the default), rules 3 and 4 do not run, so this alerting is
+       off too. For an active account with no 7d data, the walls (rules
+       2a and 2b) are then the only exhaustion signal, and rule 2a needs
+       a 7d reading.
     4. Burn-rate projection: usage_5h >= warning_5h AND projected to
        cross critical within 2 * check_interval_min, AND 5h reset
        not imminent.
@@ -549,9 +375,6 @@ def should_swap_now(
        makes the new account re-process the whole session context, and a
        5-hour wall resets within hours, so leaving a 5h-critical account
        usually costs more than it saves.
-
-    ``weekly_critical``: the threshold of rules 2a/2b. None reads the
-    active account's plan field (``weekly_critical_threshold``, 98 today).
 
     ``active_start``/``active_end`` feed the deadline-aware T1 target in
     rule 2 (defaults preserve prior call sites).
@@ -639,9 +462,7 @@ def should_swap_now(
 
     # 2a/2b. Walled on the weekly limit or the binding model limit (each
     # suppressed when that limit resets soon). No ``best`` required.
-    if weekly_critical is None:
-        weekly_critical = weekly_critical_threshold(active)
-    walled = _walled_reason(active, weekly_critical, now)
+    walled = walled_reason(active, now)
     if walled is not None:
         return walled
 

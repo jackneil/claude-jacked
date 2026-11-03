@@ -35,7 +35,9 @@ _SWAP_COOLDOWN_SECONDS = 300  # 5 minutes between swaps to prevent ping-ponging
 _last_committed_swap_time: float = 0.0
 # Proactive reasons (higher-tier / intra-tier / burn-rate) must let the
 # active account settle this long before another departure. Forced
-# departures (drained, 5h critical) are exempt.
+# departures (drained, 5h critical, a weekly or model weekly wall) are
+# exempt, and so is any departure off a walled active account, whichever
+# reason wins (#224i).
 _MIN_RESIDENCY_SECONDS = 900
 
 # Exponential backoff for failed swap attempts (credential write
@@ -357,6 +359,7 @@ def _evaluate_stall(
     usage_cached_at_age_seconds: int,
     has_other_accounts: bool,
     reason: str | None,
+    wall: str | None,
     staleness_threshold: int,
 ) -> bool:
     """Return True if this tick qualifies as a stall pattern.
@@ -365,6 +368,15 @@ def _evaluate_stall(
       (a) Multi-account stale: stay+no-best+stale active+has others
       (b) Single-account forced-out: only one account, departure reason fired
       (c) Drained-no-candidate: any reason fired but no eligible target
+
+    A walled active account (``wall``: rule 2a or 2b holds, whichever
+    reason won) with a fresh usage reading is exhaustion, not a stall:
+    patterns (b) and (c) skip it. The ``no_target`` decision, the
+    exhaustion WARNING and the ``all_accounts_exhausted`` banner report
+    that state already, and a weekly wall can hold for days. A reading
+    older than ``staleness_threshold`` proves nothing about the wall, so
+    every pattern applies to it. A drained account under its wall keeps
+    patterns (b) and (c).
 
     Same-tier-stay-with-deficit (the old pattern d) is NOT a stall — per
     spec, same-tier-never-overrides is intended behavior, so flagging it
@@ -376,7 +388,8 @@ def _evaluate_stall(
     if decision_action != "stay":
         return False
     stale = usage_cached_at_age_seconds > staleness_threshold
-    forced_out = reason is not None
+    exhausted = wall is not None and not stale
+    forced_out = reason is not None and not exhausted
     pattern_a = best is None and stale and has_other_accounts
     pattern_b = not has_other_accounts and forced_out
     pattern_c = best is None and forced_out
@@ -622,11 +635,8 @@ def _clamp_poll_interval(
         target_for_tier,
         tier_for,
     )
-    from jacked.web.auto_swap.selection import (
-        _FIVE_H_HEADROOM_LIMIT,
-        _cannot_serve,
-        _protected_model_key,
-    )
+    from jacked.web.auto_swap.selection import _FIVE_H_HEADROOM_LIMIT
+    from jacked.web.auto_swap.walls import _cannot_serve, _protected_model_key
 
     clamped = interval
     saturated_5h: list[dict] = []
@@ -655,7 +665,7 @@ def _clamp_poll_interval(
             continue
         if target - usage_7d <= 0:
             continue
-        if _cannot_serve(a, protected_key, None, now):
+        if _cannot_serve(a, protected_key, now):
             continue  # walled (#224i): pick_best_target never offers it
         clamped = min(clamped, 90.0)
         if (a.get("cached_usage_5h") or 0) >= _FIVE_H_HEADROOM_LIMIT:
@@ -859,8 +869,14 @@ def _build_tick_detail(
     proactive_target_id: int | None,
     cooldown_active: bool,
     decision: str,
+    wall: str | None,
 ) -> dict:
-    """Build the detail JSON for a decision log entry."""
+    """Build the detail JSON for a decision log entry.
+
+    ``wall`` is the active account's walled departure reason (rule 2a or
+    2b), or None. The tick carries it apart from the departure reason,
+    because rule 1 or 1b can win the reason on a walled account.
+    """
     from jacked.web.auto_swap import format_account_label
 
     detail = {
@@ -875,6 +891,7 @@ def _build_tick_detail(
         "escape_override": escape_override,
         "cooldown_active": cooldown_active,
         "decision": decision,
+        "wall": wall,
     }
     if suppression:
         detail["suppression"] = suppression
@@ -1204,7 +1221,6 @@ async def active_account_poll_loop(app):
                 plan_label,
                 update_burn_rate,
                 tier_critical_threshold,
-                weekly_critical_threshold,
                 tier_for,
                 target_for_tier,
                 deficit_vs_target,
@@ -1216,6 +1232,11 @@ async def active_account_poll_loop(app):
                 TIER_T0,
                 TIER_T2,
                 TIER_EXCLUDED,
+            )
+            from jacked.web.auto_swap.walls import (
+                _protected_model_key,
+                candidate_walls,
+                walled_reason,
             )
 
             # -- Active account ID ---------------------------------------
@@ -1492,11 +1513,10 @@ async def active_account_poll_loop(app):
             )
 
             # Hysteresis: pass last-observed tier per non-active account
-            # to suppress jitter-driven flips across tier boundaries.
-            # No weekly_critical here: pick judges each candidate by its own
-            # plan's field, the threshold rules 2a/2b apply to that account
-            # once it is active. The active plan's value could admit an
-            # account that the next tick ejects (a ping-pong).
+            # to suppress jitter-driven flips across tier boundaries. Pick
+            # judges each candidate's wall by that candidate's own plan
+            # field, the threshold rules 2a/2b apply to it once it is
+            # active (walls.py: no caller passes a threshold).
             best = pick_best_target(
                 accounts,
                 current_id=active_acct_id,
@@ -1517,9 +1537,15 @@ async def active_account_poll_loop(app):
                 prev_tiers=_last_observed_tiers,
                 active_start=active_start,
                 active_end=active_end,
-                weekly_critical=weekly_critical_threshold(active_acct),
                 five_hour_rules=five_hour_rules,
             )
+            # The active account's wall (rule 2a or 2b), by the predicate
+            # should_swap_now applies. Rule 1 or 1b can win the reason on a
+            # walled account; the departure is still forced (#224i): the
+            # wall skips emergence persistence and the minimum residency,
+            # makes a no-target tick exhaustion instead of a stall, and
+            # goes into the decision detail.
+            wall = walled_reason(active_acct, now_utc)
 
             # ---- Anti-jitter persistence on emerged tiers ----
             # Hysteresis-damped tiers — must match what should_swap_now
@@ -1541,14 +1567,14 @@ async def active_account_poll_loop(app):
             _is_emerge_reason = reason is not None and reason.startswith(
                 (REASON_PREFIX_HIGHER_TIER, REASON_PREFIX_INTRA_TIER),
             )
-            if (
-                _is_emerge_reason
-                and best_tier_damped == TIER_T0
-                and active_tier_damped >= TIER_T2
+            if _is_emerge_reason and (
+                wall is not None
+                or (best_tier_damped == TIER_T0 and active_tier_damped >= TIER_T2)
             ):
-                # Fast path: a >=2-tier gap (T0 best vs T2+/unclassified
-                # active) cannot be boundary jitter — skip the persistence
-                # requirement entirely.
+                # Fast paths that skip the persistence requirement entirely:
+                # a walled active cannot serve, so its departure is decisive
+                # whichever rule's reason won; and a >=2-tier gap (T0 best vs
+                # T2+/unclassified active) cannot be boundary jitter.
                 pass
             else:
                 reason = _apply_emergence_persistence(
@@ -1560,8 +1586,12 @@ async def active_account_poll_loop(app):
 
             # Build candidate summaries for decision log. Target/deficit
             # computed against the DAMPED tier (target_for_tier) so the
-            # log matches what selection actually evaluated.
+            # log matches what selection actually evaluated. "wall" and
+            # "serves_model" are the two wall checks pick_best_target
+            # applies (walls.candidate_walls), so the log explains a
+            # candidate the wall filter rejected.
             _candidate_summaries = []
+            _protected_key = _protected_model_key(accounts, active_acct_id)
             for cand in accounts:
                 if cand["id"] == active_acct_id:
                     continue
@@ -1589,6 +1619,7 @@ async def active_account_poll_loop(app):
                     active_start,
                     active_end,
                 )
+                cand_wall, cand_serves = candidate_walls(cand, _protected_key, now_utc)
                 _candidate_summaries.append(
                     {
                         "id": cand["id"],
@@ -1608,6 +1639,8 @@ async def active_account_poll_loop(app):
                             if cand_stranding is not None
                             else None
                         ),
+                        "wall": cand_wall,
+                        "serves_model": cand_serves,
                         "is_best": (best is not None and cand["id"] == best["id"]),
                     }
                 )
@@ -1663,12 +1696,17 @@ async def active_account_poll_loop(app):
             # ones do not: drained, 5h critical, and the weekly and model
             # weekly walls (REASON_PREFIX_WEEKLY_CRITICAL,
             # REASON_PREFIX_MODEL_WEEKLY), where the account cannot serve.
-            # Keep those prefixes out of this tuple.
-            _residency_gated = reason is not None and reason.startswith(
-                (
-                    REASON_PREFIX_HIGHER_TIER,
-                    REASON_PREFIX_INTRA_TIER,
-                    REASON_PREFIX_BURN_RATE,
+            # Keep those prefixes out of this tuple. A walled active is
+            # never held either, even when rule 1 or 1b won the reason.
+            _residency_gated = (
+                wall is None
+                and reason is not None
+                and reason.startswith(
+                    (
+                        REASON_PREFIX_HIGHER_TIER,
+                        REASON_PREFIX_INTRA_TIER,
+                        REASON_PREFIX_BURN_RATE,
+                    )
                 )
             )
 
@@ -1748,15 +1786,16 @@ async def active_account_poll_loop(app):
                 # The earliest time some account becomes workable again:
                 # per account, the latest future reset among its constrained
                 # windows (a plan without a 5-hour window offers its weekly
-                # reset, never a stale 5h one). Accounts with no constrained
-                # window, or none with a knowable reset, offer nothing.
+                # reset, never a stale 5h one; a binding model limit at the
+                # plan's weekly_critical_pct offers its own reset). Accounts
+                # with no constrained window, or none with a knowable reset,
+                # offer nothing.
                 recoveries = [
                     r
                     for r in (account_recovery(a, now_utc) for a in accounts)
                     if r is not None
                 ]
                 next_recovery = min(recoveries) if recoveries else None
-                next_recovery_at = next_recovery[0] if next_recovery else None
 
                 if ws_registry:
                     await ws_registry.broadcast(
@@ -1766,15 +1805,20 @@ async def active_account_poll_loop(app):
                             "usage_5h": usage_5h,
                             "usage_7d": usage_7d,
                             "next_recovery_at": (
-                                next_recovery_at.isoformat()
-                                if next_recovery_at
+                                next_recovery.at.isoformat()
+                                if next_recovery
                                 else None
                             ),
-                            # "5h" or "7d": the window whose reset frees the
-                            # account, so the banner names it instead of
-                            # promising usage in general.
+                            # "5h", "7d" or "model": the limit whose reset
+                            # frees the account, so the banner names it
+                            # instead of promising usage in general.
                             "next_recovery_window": (
-                                next_recovery[1] if next_recovery else None
+                                next_recovery.window if next_recovery else None
+                            ),
+                            # The model's name (for example "Fable") for a
+                            # "model" window; None for "5h" and "7d".
+                            "next_recovery_label": (
+                                next_recovery.label if next_recovery else None
                             ),
                         },
                     )
@@ -1874,6 +1918,7 @@ async def active_account_poll_loop(app):
                 usage_cached_at_age_seconds=age_seconds,
                 has_other_accounts=has_other_accounts,
                 reason=reason,
+                wall=wall,
                 staleness_threshold=_STALL_USAGE_STALENESS_SECONDS,
             )
 
@@ -1976,6 +2021,7 @@ async def active_account_poll_loop(app):
                         cooldown_active=(time.time() - _last_swap_time)
                         < _SWAP_COOLDOWN_SECONDS,
                         decision=_decision_action,
+                        wall=wall,
                     )
                     decision_id = await asyncio.to_thread(
                         db.record_decision,

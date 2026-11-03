@@ -373,11 +373,16 @@ out({
         assert result["counterId"] is True
 
 
+# The toggle controls only the 5-hour rules. The weekly and model walls and
+# the tier departures (a better 7-day position) run whatever it says, so the
+# help text never says that jacked leaves an account "only" at a wall.
 FIVE_H_RULES_HELP = (
-    "Off: jacked leaves an account only when its weekly limit or its model "
-    "limit reaches the plan's critical level (98% by default). Each swap makes "
-    "the new account read the whole session again, and a 5-hour limit resets "
-    "within hours. On: the 5-hour thresholds below also start a swap."
+    "Off: jacked does not leave an account for its 5-hour window. It still "
+    "leaves an account whose weekly limit or model limit reaches the critical "
+    "level of the plan (98% by default). It still moves to an account with a "
+    "better 7-day position. Each swap makes the new account read the whole "
+    "session again, and a 5-hour limit resets within hours. On: the two "
+    "5-hour thresholds below also start a swap."
 )
 DIM = "opacity-60"
 FIVE_H_ROWS = (("rng-warn-5h", "row-warn-5h"), ("rng-crit-5h", "row-crit-5h"))
@@ -534,6 +539,145 @@ process.exit(0);
         assert result["state"]["auto_swap_5h_rules_enabled"] is False
 
 
+# The block of the panel that shows the pause: the notice, the badge, and the
+# pause menu or the Resume button. When the pause changes, the page renders
+# this block again in place, so an open panel stays open.
+PAUSE_SLOT = "swap-pause-state"
+PAUSE_NOTICE = "Auto-swap paused until"
+MANUAL_SUFFIX = "(manual switch)"
+
+_PAUSE_SETUP = r"""
+const slot = __makeEl('div');
+slot.id = 'swap-pause-state';
+__body.appendChild(slot);
+const PAUSE = new Date(Date.now() + 30 * 60000).toISOString();
+const settle = () => new Promise(r => setTimeout(r, 0));
+// The pause control of the page: the pause menu, or the Resume button.
+const pauseControl = (action) => {
+    const el = __makeEl(action === 'pause' ? 'select' : 'button');
+    el.id = action === 'pause' ? 'sel-swap-pause' : 'btn-swap-resume';
+    el.value = '30';
+    __body.appendChild(el);
+    return el;
+};
+const useControl = (action, el) => __fire(el, action === 'pause' ? 'change' : 'click');
+global.api.post = async (path) => (
+    path.includes('swap-pause') ? { paused_until: PAUSE, minutes: 30 } : { resumed: true }
+);
+"""
+
+
+def _inner_div(html, el_id):
+    """The inner HTML of the ``<div>`` with this id (nested divs counted)."""
+    start = _tag(html, el_id, "div").end()
+    depth = 1
+    for m in re.finditer(r"<div\b|</div>", html[start:]):
+        depth += 1 if m.group(0) == "<div" else -1
+        if depth == 0:
+            return html[start:start + m.start()]
+    raise AssertionError(f"no closing tag for <div id={el_id!r}>")
+
+
+class TestThePauseStateFollowsTheServer:
+    """U2: the PUT response is the stored state. The server keeps a pause
+    that a save does not send and reads it back, so the panel merges the
+    response into ``window.jackedState.swapSettings`` and renders its pause
+    block again. A pause that another client set (a manual switch, the menu
+    bar) then shows after a save. A pause or a resume made on this page
+    while a save is in flight wins over the response of that save: the
+    server read that response before the change."""
+
+    def test_the_panel_renders_the_pause_inside_its_slot(self, tmp_path):
+        html = _run_js(tmp_path, """
+window.jackedState.swapSettings = {
+    auto_swap_paused_until: new Date(Date.now() + 30 * 60000).toISOString(),
+};
+out({ html: renderAutoSwapPanel() });
+""")["html"]
+        inner = _inner_div(html, PAUSE_SLOT)
+        assert PAUSE_NOTICE in inner
+        assert 'id="btn-swap-resume"' in inner
+        assert 'id="chk-auto-swap"' not in inner
+        assert 'id="chk-swap-5h-rules"' not in inner
+
+    def test_save_shows_a_pause_that_the_server_kept(self, tmp_path):
+        result = _run_js(tmp_path, _PAUSE_SETUP + """
+(async () => {
+    global.api.put = async (path, body) => ({ ...body, auto_swap_paused_until: PAUSE });
+    window.jackedState.swapSettings = {};
+    await _saveSwapSettings();
+    out({ pause: window.jackedState.swapSettings.auto_swap_paused_until ?? null, expected: PAUSE, html: slot.innerHTML || '' });
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["pause"] == result["expected"]
+        # This page did not make the pause, so it reads as the manual-switch hold.
+        assert PAUSE_NOTICE in result["html"] and MANUAL_SUFFIX in result["html"]
+        assert 'id="btn-swap-resume"' in result["html"]
+
+    def test_save_clears_a_pause_that_the_server_no_longer_has(self, tmp_path):
+        result = _run_js(tmp_path, _PAUSE_SETUP + """
+(async () => {
+    global.api.put = async (path, body) => ({ ...body, auto_swap_paused_until: null });
+    window.jackedState.swapSettings = { auto_swap_paused_until: PAUSE };
+    await _saveSwapSettings();
+    out({ pause: window.jackedState.swapSettings.auto_swap_paused_until ?? null, html: slot.innerHTML || '' });
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["pause"] is None
+        assert PAUSE_NOTICE not in result["html"]
+        assert 'id="sel-swap-pause"' in result["html"]
+
+    @pytest.mark.parametrize("action", ["pause", "resume"])
+    def test_a_pause_change_during_a_save_wins_over_its_response(self, tmp_path, action):
+        result = _run_js(tmp_path, _PAUSE_SETUP + """
+(async () => {
+    const ACTION = __ACTION__;
+    const control = pauseControl(ACTION);
+    window.jackedState.swapSettings = { auto_swap_paused_until: ACTION === 'pause' ? null : PAUSE };
+    // The server reads the pause for this save before the change below.
+    const readBefore = window.jackedState.swapSettings.auto_swap_paused_until;
+    let answer;
+    global.api.put = (path, body) => new Promise(r => {
+        answer = () => r({ ...body, auto_swap_paused_until: readBefore });
+    });
+    bindAutoSwapEvents();
+    const saving = _saveSwapSettings();
+    useControl(ACTION, control);
+    await settle();
+    answer();
+    await saving;
+    out({
+        pause: window.jackedState.swapSettings.auto_swap_paused_until ?? null,
+        expected: ACTION === 'pause' ? PAUSE : null,
+        html: slot.innerHTML || '',
+    });
+})().catch(e => { console.error(e); process.exit(1); });
+""".replace("__ACTION__", json.dumps(action)))
+        assert result["pause"] == result["expected"]
+        assert (PAUSE_NOTICE in result["html"]) is (action == "pause")
+
+    @pytest.mark.parametrize("action", ["pause", "resume"])
+    def test_pause_and_resume_render_the_pause_block_again(self, tmp_path, action):
+        html = _run_js(tmp_path, _PAUSE_SETUP + """
+(async () => {
+    const ACTION = __ACTION__;
+    const control = pauseControl(ACTION);
+    window.jackedState.swapSettings = { auto_swap_paused_until: ACTION === 'pause' ? null : PAUSE };
+    bindAutoSwapEvents();
+    useControl(ACTION, control);
+    await settle();
+    out({ html: slot.innerHTML || '' });
+})().catch(e => { console.error(e); process.exit(1); });
+""".replace("__ACTION__", json.dumps(action)))["html"]
+        if action == "pause":
+            # This page made the pause, so it is not the manual-switch hold.
+            assert PAUSE_NOTICE in html and MANUAL_SUFFIX not in html
+            assert 'id="btn-swap-resume"' in html
+        else:
+            assert PAUSE_NOTICE not in html
+            assert 'id="sel-swap-pause"' in html
+
+
 class TestRetiredSevenDayThreshold:
     """The "7-Day Threshold" slider (``auto_swap_7d_threshold``) changed
     nothing: no decision code read it. The weekly wall is the plan catalog
@@ -576,22 +720,117 @@ out({ html: renderAutoSwapPanel() });
         assert "auto_swap_7d_threshold" not in result["puts"][0]
 
 
+class TestDecisionLogWallColumn:
+    """The candidate table of a decision-log row ends with a "Wall" column
+    (#224i). It shows why the wall filter rejects a candidate: the first word
+    of its walled departure reason (``wall``: "weekly critical: ..." gives
+    "weekly", "model weekly critical: ..." gives "model"), "model" when it
+    cannot serve the model of the active account (``serves_model`` false),
+    else a plain "-". A row logged before these fields shows "-"."""
+
+    WEEKLY = "weekly critical: 7d usage 99.0% >= 98%"
+    MODEL = "model weekly critical: Fable 100.0% >= 98%"
+
+    def _table(self, tmp_path, candidates):
+        html = _run_js(tmp_path, """
+out({ html: buildDecisionDetailHtml(
+    { candidates: __CANDIDATES__, should_swap: false, cooldown_active: false }, 'decision-1') });
+""".replace("__CANDIDATES__", json.dumps(candidates)))["html"]
+        table = html[html.index("<table"):html.index("</table>")]
+        head, body = table.split("<tbody>")
+        heads = re.findall(r"<th\b[^>]*>([^<]*)</th>", head)
+        rows = re.findall(r"<tr\b[^>]*>(.*?)</tr>", body)
+        return heads, [re.findall(r"<td\b[^>]*>(.*?)</td>", row)[-1] for row in rows]
+
+    def test_wall_is_the_last_column(self, tmp_path):
+        heads, _ = self._table(tmp_path, [{"label": "a"}])
+        assert heads[-2:] == ["Best", "Wall"]
+
+    def test_the_three_states_and_an_old_row(self, tmp_path):
+        heads, cells = self._table(tmp_path, [
+            {"label": "weekly", "wall": self.WEEKLY, "serves_model": True},
+            {"label": "model wall", "wall": self.MODEL, "serves_model": False},
+            {"label": "other model", "wall": None, "serves_model": False},
+            {"label": "free", "wall": None, "serves_model": True},
+            {"label": "logged before the fields"},
+        ])
+        texts = [re.sub(r"<[^>]+>", "", cell) for cell in cells]
+        assert texts == ["weekly", "model", "model", "-", "-"]
+        assert all("—" not in cell and "–" not in cell for cell in cells)
+
+    def test_the_full_reason_is_an_escaped_title(self, tmp_path):
+        _, cells = self._table(tmp_path, [
+            {"label": "a", "wall": self.WEEKLY, "serves_model": True},
+            {"label": "b", "wall": '<img src=x onerror="alert(1)">: x', "serves_model": True},
+        ])
+        assert 'title="weekly critical: 7d usage 99.0% &gt;= 98%"' in cells[0]
+        assert "<img" not in cells[1]
+        assert "&lt;img" in cells[1]
+
+
 class TestExhaustionBanner:
     """The all-accounts-exhausted banner names the window whose reset frees
     an account (next_recovery_window), and never promises usage in general:
     a model limit (Fable) can still be full after that reset. Without a
-    window kind (an older server) it keeps the generic text."""
+    window kind (an older server) it keeps the generic text. When a model
+    limit walls the account (window "model"), the banner names that limit
+    (next_recovery_label) and gives its reset time in the format of the
+    account cards (formatResetTime, utils.js)."""
 
-    def _banner(self, tmp_path, minutes, window=None):
+    def _banner(self, tmp_path, minutes, window=None, label=None):
+        # utils.js loads before auto-swap.js on the page. Only its reset
+        # formatter is taken here: its escapeHtml needs a real DOM. The eval
+        # runs first-party repo source only, as the harness eval does.
         return _run_js(tmp_path, """
+global.formatResetTime = (function () {
+    eval(fs.readFileSync(__UTILS__, 'utf8'));
+    return formatResetTime;
+})();
 const el = __makeEl('div');
 el.id = 'swap-exhaustion-banner';
 __body.appendChild(el);
 const at = __MINUTES__ === null ? null : new Date(Date.now() + __MINUTES__ * 60000).toISOString();
-window.jackedState._exhaustionData = { next_recovery_at: at, next_recovery_window: __WINDOW__ };
+window.jackedState._exhaustionData = {
+    next_recovery_at: at, next_recovery_window: __WINDOW__, next_recovery_label: __LABEL__,
+};
 renderExhaustionBanner();
-out({ html: el.innerHTML, hidden: el.classList.contains('hidden') });
-""".replace("__MINUTES__", json.dumps(minutes)).replace("__WINDOW__", json.dumps(window)))
+out({
+    html: el.innerHTML,
+    hidden: el.classList.contains('hidden'),
+    reset: at === null ? null : formatResetTime(at),
+});
+""".replace("__UTILS__", json.dumps(str(UTILS_JS)))
+           .replace("__MINUTES__", json.dumps(minutes))
+           .replace("__WINDOW__", json.dumps(window))
+           .replace("__LABEL__", json.dumps(label)))
+
+    @pytest.mark.parametrize(
+        "minutes, label, name",
+        [
+            (3 * 1440 + 125, "Fable", "The Fable limit"),
+            (11.5, "Fable", "The Fable limit"),
+            (199.5, None, "The model limit"),
+            (199.5, "", "The model limit"),
+        ],
+    )
+    def test_model_window_names_the_limit_and_its_reset_time(self, tmp_path, minutes, label, name):
+        result = self._banner(tmp_path, minutes, "model", label)
+        assert result["hidden"] is False
+        assert result["reset"].startswith("resets ")
+        assert f">{name} {result['reset']}</div>" in result["html"]
+        assert "available again" not in result["html"]
+        assert "—" not in result["html"] and "–" not in result["html"]
+
+    def test_model_window_with_a_passed_reset_says_soon(self, tmp_path):
+        result = self._banner(tmp_path, -1, "model", "Fable")
+        assert ">The Fable limit should reset soon</div>" in result["html"]
+
+    def test_model_label_is_escaped(self, tmp_path):
+        """The label comes from the provider's usage payload: it is text,
+        never markup, in the banner's innerHTML."""
+        result = self._banner(tmp_path, 30, "model", '<img src=x onerror="alert(1)">')
+        assert "<img" not in result["html"]
+        assert "The &lt;img src=x onerror=&quot;alert(1)&quot;&gt; limit resets" in result["html"]
 
     @pytest.mark.parametrize(
         "minutes, window, text",

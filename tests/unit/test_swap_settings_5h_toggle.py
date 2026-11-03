@@ -1,12 +1,12 @@
 """The "Swap on the 5-hour window" toggle on the swap-settings API (#224i).
 
 The setting ``auto_swap_5h_rules_enabled`` is stored as the strings
-"true"/"false"; a missing row means false, the settled default (jacked leaves
-an account only at its weekly or model wall). The monitor reads the setting
+"true"/"false"; a missing row means false, the settled default (jacked does
+not leave an account for its 5-hour window). The monitor reads the setting
 (tests/unit/test_usage_monitor.py); this module covers the route that exposes
-it, the PUT rule that a save without ``auto_swap_paused_until`` keeps an
-active pause, and the retired ``auto_swap_7d_threshold`` field (an old client
-can still send it; the route ignores it).
+it, the PUT rule that a save without ``auto_swap_paused_until`` or without
+the toggle keeps the stored value, and the retired ``auto_swap_7d_threshold``
+field (an old client can still send it; the route ignores it).
 
 Driven through the real FastAPI app with a plain ``TestClient(app)`` that
 never enters the context manager, so the lifespan (background sweeps, real
@@ -14,6 +14,7 @@ home dir) never runs. The PUT wakes the sweep loop; the wake is replaced with
 a recorder so the module's asyncio.Event is never touched.
 """
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ from fastapi.testclient import TestClient
 
 import jacked.api.usage_monitor as usage_monitor
 from jacked.api.main import app
+from jacked.api.routes.settings_swap import MAX_PAUSE_MINUTES
 from jacked.web.database import Database
 
 KEY = "auto_swap_5h_rules_enabled"
@@ -80,8 +82,48 @@ def test_put_false_persists_the_string_false(client, db):
     db.set_setting(KEY, "true")
     resp = client.put(URL, json={KEY: False})
     assert resp.status_code == 200
+    assert resp.json()[KEY] is False
     assert db.get_setting(KEY) == "false"
     assert client.get(URL).json()[KEY] is False
+
+
+# The exact save of the dashboard from before the toggle (ad0ad63): every
+# field but the toggle, plus the retired 7-day slider, and no pause. A tab
+# opened before the upgrade keeps sending this payload until it reloads.
+PRE_TOGGLE_DASHBOARD_SAVE = {
+    "auto_swap_enabled": True,
+    "auto_swap_5h_warning": 80,
+    "auto_swap_5h_critical": 90,
+    "auto_swap_7d_threshold": 85,
+    "usage_check_interval": 300,
+    "window_keeper_enabled": False,
+    "window_keeper_active_start": "06:00",
+    "window_keeper_active_end": "23:00",
+    "window_keeper_prewake": "04:00",
+}
+
+
+def test_put_from_a_page_that_predates_the_toggle_keeps_a_stored_true(client, db):
+    """A save that does not send the toggle keeps the stored value. Before
+    this rule the model default (False) was written, so a stale tab turned
+    the toggle off without a word."""
+    db.set_setting(KEY, "true")
+    resp = client.put(URL, json=PRE_TOGGLE_DASHBOARD_SAVE)
+    assert resp.status_code == 200
+    assert db.get_setting(KEY) == "true"
+    # The response reads the kept value back, so it shows what is in effect.
+    assert resp.json()[KEY] is True
+    assert client.get(URL).json()[KEY] is True
+    # The fields that the old page did send are saved.
+    assert db.get_setting("auto_swap_enabled") == "true"
+
+
+def test_put_from_a_page_that_predates_the_toggle_writes_no_toggle_row(client, db):
+    """With no stored row the toggle stays absent, which reads as off."""
+    resp = client.put(URL, json=PRE_TOGGLE_DASHBOARD_SAVE)
+    assert resp.status_code == 200
+    assert db.get_setting(KEY) is None
+    assert resp.json()[KEY] is False
 
 
 @pytest.mark.parametrize("key", ["auto_swap_enabled", KEY, "window_keeper_enabled"])
@@ -119,11 +161,129 @@ def test_put_that_sends_an_empty_pause_clears_it(client, db, sent):
     assert resp.json()["auto_swap_paused_until"] is None
 
 
+def _in(minutes: float) -> str:
+    """An ISO pause time, ``minutes`` from now (UTC)."""
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+
+
 def test_put_that_sends_a_pause_stores_it(client, db):
-    resp = client.put(URL, json={"auto_swap_paused_until": PAUSE})
+    pause = _in(30)
+    resp = client.put(URL, json={"auto_swap_paused_until": pause})
     assert resp.status_code == 200
-    assert db.get_setting("auto_swap_paused_until") == PAUSE
-    assert resp.json()["auto_swap_paused_until"] == PAUSE
+    assert db.get_setting("auto_swap_paused_until") == pause
+    assert resp.json()["auto_swap_paused_until"] == pause
+
+
+# POST /swap-pause takes at most MAX_PAUSE_MINUTES (24 hours). A PUT that sets
+# the pause itself gets the same cap: a pause that ends later is refused, so
+# no client can turn auto-swap off for days with a "pause".
+PAUSE_TOO_LONG = {
+    "error": {
+        "message": "A pause can end at most 1440 minutes (24 hours) from now.",
+        "code": "PAUSE_TOO_LONG",
+    }
+}
+
+
+@pytest.mark.parametrize("minutes", [MAX_PAUSE_MINUTES - 1, -60])
+def test_put_with_a_pause_inside_the_cap_stores_it(client, db, minutes):
+    """The cap has no lower end: a pause that already ended is no pause."""
+    pause = _in(minutes)
+    resp = client.put(URL, json={"auto_swap_paused_until": pause})
+    assert resp.status_code == 200
+    assert db.get_setting("auto_swap_paused_until") == pause
+
+
+@pytest.mark.parametrize("far", ["just_past_the_cap", "year_2999"])
+def test_put_with_a_pause_past_the_cap_is_422_and_writes_nothing(client, db, woken, far):
+    pause = _in(MAX_PAUSE_MINUTES + 1) if far == "just_past_the_cap" else PAUSE
+    resp = client.put(URL, json={"auto_swap_paused_until": pause, KEY: True})
+    assert resp.status_code == 422
+    assert resp.json() == PAUSE_TOO_LONG
+    assert "—" not in resp.json()["error"]["message"]
+    # The save is refused as a whole: the toggle it sent is not written either.
+    assert db.get_setting(KEY) is None
+    assert db.get_setting("auto_swap_paused_until") is None
+    assert woken == []
+
+
+def test_put_with_a_pause_without_a_time_zone_is_422(client, db):
+    """The auto-swap tick ignores a pause time without a time zone (and logs a
+    warning at each tick), while the dashboard shows it as local time. So the
+    PUT refuses it instead of storing a pause that does nothing."""
+    resp = client.put(URL, json={"auto_swap_paused_until": "2026-11-02T18:00:00"})
+    assert resp.status_code == 422
+    assert resp.json() == {
+        "error": {
+            "message": "The pause time must have a time zone, for example 2026-11-02T18:00:00Z.",
+            "code": "PAUSE_NO_TIME_ZONE",
+        }
+    }
+    assert db.get_setting("auto_swap_paused_until") is None
+
+
+def test_post_swap_pause_takes_the_same_cap(client, db):
+    assert client.post(f"/api/settings/swap-pause?minutes={MAX_PAUSE_MINUTES + 1}").status_code == 422
+    assert db.get_setting("auto_swap_paused_until") is None
+    resp = client.post(f"/api/settings/swap-pause?minutes={MAX_PAUSE_MINUTES}")
+    assert resp.status_code == 200
+    assert resp.json()["minutes"] == MAX_PAUSE_MINUTES
+
+
+# The pause checks apply to a NEW pause only. A pause stored before the checks
+# existed can end more than 24 hours ahead, or have no time zone. The menu bar
+# saves with GET, then PUT of the same body, so the stored pause comes back
+# unchanged, and that save must still work.
+_FAR = 48 * 60
+
+
+@pytest.mark.parametrize(
+    "stored, sent",
+    [
+        ("far", "far"),                      # the same string
+        ("far_offset", "far_z"),             # the same instant, written another way
+        ("naive", "naive"),                  # an old row without a time zone
+    ],
+)
+def test_a_round_trip_keeps_a_stored_pause_that_fails_the_checks(client, db, stored, sent):
+    at = datetime.now(timezone.utc) + timedelta(minutes=_FAR)
+    forms = {
+        "far": at.isoformat(),
+        "far_offset": at.isoformat(),
+        "far_z": at.isoformat().replace("+00:00", "Z"),
+        "naive": at.replace(tzinfo=None).isoformat(),
+    }
+    db.set_setting("auto_swap_paused_until", forms[stored])
+    body = client.get(URL).json()
+    assert body["auto_swap_paused_until"] == forms[stored]
+    body["auto_swap_paused_until"] = forms[sent]
+    body["auto_swap_enabled"] = not body["auto_swap_enabled"]
+    resp = client.put(URL, json=body)
+    assert resp.status_code == 200
+    assert db.get_setting("auto_swap_enabled") == "true"
+    assert db.get_setting("auto_swap_paused_until") == forms[sent]
+
+
+def test_without_a_database_a_pause_past_the_cap_is_still_refused(monkeypatch, woken):
+    """With no database there is no stored pause, so every pause that fails
+    the checks is new. The answer is the same 422, not a silent 200."""
+    monkeypatch.setattr(app.state, "db", None, raising=False)
+    http = TestClient(app)
+    resp = http.put(URL, json={"auto_swap_paused_until": _in(_FAR)})
+    assert resp.status_code == 422
+    assert resp.json() == PAUSE_TOO_LONG
+    assert http.put(URL, json={"auto_swap_paused_until": _in(30)}).status_code == 200
+
+
+def test_a_new_pause_past_the_cap_is_still_refused_when_one_is_stored(client, db):
+    kept = _in(_FAR)
+    db.set_setting("auto_swap_paused_until", kept)
+    body = client.get(URL).json()
+    body["auto_swap_paused_until"] = _in(_FAR + 5)
+    resp = client.put(URL, json=body)
+    assert resp.status_code == 422
+    assert resp.json() == PAUSE_TOO_LONG
+    assert db.get_setting("auto_swap_paused_until") == kept
 
 
 # The retired "7-Day Threshold" slider: no decision code read it, so the
