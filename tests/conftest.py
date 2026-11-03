@@ -165,22 +165,26 @@ def _isolate_accounts_dir(monkeypatch, _isolate_home):
 
 @pytest.fixture(autouse=True)
 def _tripwire_real_credential_files(monkeypatch):
-    """Tripwire: no test may write a credential file under the real ~/.claude.
+    """Tripwire: no test may write a file under the real ~/.claude.
 
-    Covers the two writers the launch and the stores use: the shared
-    ``_safe_replace`` (per-account credential and config files) and
-    ``FileCredentialStore.write`` (the global file authority and mirror).
+    Covers the one replace that every jacked file write goes through
+    (``jacked.atomic_io._replace_once``: the per-account credential and
+    config files, the settings files, the vault) and
+    ``FileCredentialStore.write`` (the global file authority and mirror),
+    which refuses before it stages anything. The guard sits on the private
+    primitive, not on a public name, so a module that binds
+    ``replace_with_retry`` or ``atomic_write_text`` at import is covered too.
     """
-    from jacked.api import credential_helpers
+    from jacked import atomic_io
     from jacked.credentials import file_store
 
-    real_replace = credential_helpers._safe_replace
+    real_replace_once = atomic_io._replace_once
     real_write = file_store.FileCredentialStore.write
 
-    def guarded_replace(src, dst, **kwargs):
-        if _under_real_claude_dir(dst):
-            raise RuntimeError("test tripwire: credential write under the real ~/.claude")
-        return real_replace(src, dst, **kwargs)
+    def guarded_replace_once(src, dst, **kwargs):
+        if _under_real_claude_config(dst):
+            raise RuntimeError("test tripwire: file write under the real ~/.claude")
+        return real_replace_once(src, dst, **kwargs)
 
     def guarded_write(self, *args, **kwargs):
         target = getattr(self, "_path", None) or getattr(self, "path", None)
@@ -188,14 +192,7 @@ def _tripwire_real_credential_files(monkeypatch):
             raise RuntimeError("test tripwire: credential store write under the real ~/.claude")
         return real_write(self, *args, **kwargs)
 
-    monkeypatch.setattr(credential_helpers, "_safe_replace", guarded_replace)
-    # Modules that bind the writer by name at import keep their own alias;
-    # guard each one, or a launch-side write would bypass the tripwire.
-    import jacked.launch
-    from jacked.api import claude_config_store
-
-    monkeypatch.setattr(jacked.launch, "_safe_replace", guarded_replace)
-    monkeypatch.setattr(claude_config_store, "_safe_replace", guarded_replace)
+    monkeypatch.setattr(atomic_io, "_replace_once", guarded_replace_once)
     monkeypatch.setattr(file_store.FileCredentialStore, "write", guarded_write)
 
 

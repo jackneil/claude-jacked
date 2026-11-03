@@ -29,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from jacked.api.credential_helpers import _safe_replace
+from jacked.atomic_io import replace_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +48,8 @@ _LOCK_POLL_SECONDS = 0.05
 _RELEASE_ATTEMPTS = 5
 _RELEASE_BACKOFF_SECONDS = 0.05
 # Windows antivirus and indexers hold new files briefly. The replace gets
-# a longer retry budget there (about 3 s in total).
-_REPLACE_RETRIES = 6
-_REPLACE_DELAY_SECONDS = 0.1
+# a longer retry budget there (3 s in total, the shared default is 1 s).
+_REPLACE_BUDGET_SECONDS = 3.0
 _VERIFY_READS = 3
 _VERIFY_DELAY_SECONDS = 0.05
 TMP_PREFIX = ".claude_json_tmp_"
@@ -313,7 +312,12 @@ def _read_config_for_write(config_path: Path) -> dict | None:
 
 
 def _atomic_write_json(config_path: Path, data: dict) -> None:
-    """Write ``data`` to ``config_path`` through a private, fsynced temp file."""
+    """Write ``data`` to ``config_path`` through a private, fsynced temp file.
+
+    The temp file keeps this module's own ``TMP_PREFIX`` (not the shared
+    writer's name) because ``sweep_stale_temp_files`` finds the leftovers of
+    an interrupted write by that prefix. The replace is the shared one.
+    """
     fd, tmp = tempfile.mkstemp(
         dir=str(config_path.parent), prefix=TMP_PREFIX, suffix=".json"
     )
@@ -326,9 +330,7 @@ def _atomic_write_json(config_path: Path, data: dict) -> None:
             os.chmod(tmp, 0o600)
         except OSError:
             pass
-        _safe_replace(
-            tmp, str(config_path), retries=_REPLACE_RETRIES, delay=_REPLACE_DELAY_SECONDS
-        )
+        replace_with_retry(tmp, config_path, retry_budget=_REPLACE_BUDGET_SECONDS)
     except BaseException:
         try:
             os.unlink(tmp)

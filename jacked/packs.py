@@ -20,17 +20,16 @@ Our own enable-state (independent of what's on disk) lives at
 """
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
 import re
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from jacked.atomic_io import atomic_write_text
 from jacked.findbin import find_bin
 
 logger = logging.getLogger(__name__)
@@ -284,27 +283,16 @@ def _normalize_state(raw: object) -> dict:
 
 
 def save_state(home: Path, state: dict) -> None:
-    """Atomically write enable-state via a writer-unique tmp + os.replace.
+    """Atomically write enable-state through the shared atomic writer.
 
-    The tmp name must be unique per writer: the CLI and the dashboard service
+    The temp name must be unique per writer: the CLI and the dashboard service
     are separate processes that can both call set_enabled against the same
-    home. A shared tmp path lets one writer os.replace the other's half-written
-    file away (FileNotFoundError for the loser, or a torn file that load_state
-    silently degrades to {}, wiping enable-state).
+    home. A shared temp path lets one writer replace the target with the
+    other's half-written file (FileNotFoundError for the loser, or a torn file
+    that load_state silently degrades to {}, wiping enable-state). The shared
+    writer gives each write its own temp file.
     """
-    path = _state_path(home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(state, indent=2))
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    atomic_write_text(_state_path(home), json.dumps(state, indent=2))
 
 
 def set_enabled(home: Path, name: str, enabled: bool) -> None:

@@ -4,9 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Literal
 
@@ -303,22 +301,13 @@ def _settings_unreadable_response() -> JSONResponse:
 
 
 def _write_settings_json(data: dict):
-    """Write ~/.claude/settings.json atomically via a writer-unique temp + replace.
+    """Write ~/.claude/settings.json through the shared atomic writer.
 
-    Writer-unique (mkstemp) rather than a fixed ``.json.tmp``: the CLI, the
-    dashboard, and hook processes can all write this same file, and a shared tmp
-    path lets one process os.replace another's half-written temp away.
+    The CLI, the dashboard, and hook processes can all write this same file;
+    the shared writer gives each one its own temp file and a Windows-aware
+    replace.
     """
-    SETTINGS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{SETTINGS_JSON.name}.", suffix=".tmp", dir=str(SETTINGS_JSON.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, indent=2))
-        os.replace(tmp_name, SETTINGS_JSON)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    atomic_write_text(SETTINGS_JSON, json.dumps(data, indent=2))
 
 
 def _get_valid_agent_names() -> list[str]:

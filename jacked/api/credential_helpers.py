@@ -1,6 +1,7 @@
-"""Credential helpers: atomic file I/O, keychain access, credential builders.
+"""Credential helpers: keychain access, credential builders.
 
-Account switches write the credential stores through
+Atomic file writes live in ``jacked.atomic_io``. Account switches write the
+credential stores through
 ``jacked.credentials.transaction.CredentialTransactionEngine`` (entered via
 ``jacked.credentials.runtime.activate_account``). The ``oauthAccount``
 identity in ``~/.claude.json`` is written only by
@@ -10,7 +11,6 @@ identity in ``~/.claude.json`` is written only by
 import json
 import logging
 import math
-import os
 import sys
 import time
 from pathlib import Path
@@ -42,23 +42,6 @@ def _get_keychain_username() -> str:
     from jacked.credentials.macos_store import system_account_name
 
     return system_account_name()
-
-
-def _safe_replace(src: str, dst: str, *, retries: int = 3, delay: float = 0.1):
-    """os.replace() with retry for Windows PermissionError.
-
-    On Windows, os.replace() can fail if the target file is held open
-    by another process.  Retries with exponential backoff.
-    On macOS/Linux, this is equivalent to a single os.replace() call.
-    """
-    for attempt in range(retries):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if sys.platform != "win32" or attempt == retries - 1:
-                raise
-            time.sleep(delay * (2 ** attempt))
 
 
 # ---------------------------------------------------------------------------

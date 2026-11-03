@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from jacked.atomic_io import atomic_write_text
 from jacked.install_manifest import ManifestDiff
 
 DEFAULT_LAST_INSTALL_PATH = Path.home() / ".claude" / "jacked-last-install.json"
@@ -66,8 +67,9 @@ def render_terminal(record: dict) -> str:
 
 
 def write_last_install(record: dict, path=DEFAULT_LAST_INSTALL_PATH) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    """Persist the record through the shared atomic writer.
+
+    A fixed temp name would let `jacked install` and a dashboard upgrade in
+    another process replace the record with each other's half-written file.
+    """
+    atomic_write_text(Path(path), json.dumps(record, indent=2))

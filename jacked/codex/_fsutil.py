@@ -3,45 +3,31 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Mapping, Optional
 
+from jacked.atomic_io import atomic_write_bytes
 from jacked.findbin import find_bin
 
 from .credentials import codex_home
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Atomically write `data` to `path` via a sibling temp file + os.replace.
+    """Atomically write `data` to `path`, fsynced, through the shared writer.
 
-    Mirrors cli._write_settings_atomic: write to a temp file, flush + os.fsync,
-    then os.replace onto the target so a process killed mid-write can never leave
-    a half-written Codex file (AGENTS.md, config.toml, hooks.json, manifest, or
-    a restore-to-original). Cleans up the temp file if anything fails.
+    A process killed mid-write never leaves a half-written Codex file
+    (AGENTS.md, config.toml, hooks.json, manifest, or a restore-to-original).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    atomic_write_bytes(path, data, fsync=True)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Atomically write `text` to `path` as UTF-8 (see `_atomic_write_bytes`)."""
+    """Atomically write `text` to `path` as UTF-8 bytes (see `_atomic_write_bytes`).
+
+    Bytes, not text mode: the installer compares file hashes with hashes of
+    the text it wrote, so Windows must not translate the line endings.
+    """
     _atomic_write_bytes(path, text.encode("utf-8"))
 
 

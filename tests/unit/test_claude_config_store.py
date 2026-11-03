@@ -161,17 +161,33 @@ def test_a_lock_held_past_the_hold_limit_is_not_replaced(tmp_path, monkeypatch):
 def test_the_write_is_fsynced_before_the_replace(tmp_path, monkeypatch):
     order: list[str] = []
     real_fsync = os.fsync
-    real_replace = store._safe_replace
+    real_replace = store.replace_with_retry
 
     monkeypatch.setattr(store.os, "fsync", lambda fd: order.append("fsync") or real_fsync(fd))
     monkeypatch.setattr(
         store,
-        "_safe_replace",
+        "replace_with_retry",
         lambda src, dst, **kw: order.append("replace") or real_replace(src, dst, **kw),
     )
 
     assert write_identity(tmp_path, build_identity_block(_row())).status == "written"
     assert order == ["fsync", "replace"]
+
+
+def test_the_replace_keeps_its_longer_windows_budget(tmp_path, monkeypatch):
+    """Antivirus and indexers hold the config briefly on Windows, so this
+    replace asks the shared one for 3 s of retries (the default is 1 s)."""
+    budgets: list = []
+    real_replace = store.replace_with_retry
+
+    def spy(src, dst, **kwargs):
+        budgets.append(kwargs.get("retry_budget"))
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(store, "replace_with_retry", spy)
+
+    assert write_identity(tmp_path, build_identity_block(_row())).status == "written"
+    assert budgets == [3.0]
 
 
 # --- lock ownership and verify ----------------------------------------------

@@ -29,10 +29,10 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 from typing import Optional
 
+from jacked.atomic_io import atomic_write_text
 from jacked.memory.settings_io import read_settings, settings_path, write_settings
 
 STATE_PATH_NAME = "jacked-statusline.json"
@@ -173,22 +173,8 @@ def load_state(home: Path) -> dict:
 
 
 def save_state(home: Path, state: dict) -> None:
-    """Atomic write with a writer-unique tmp (CLI/route/hook may race)."""
-    path = state_path(home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        prefix=f".{STATE_PATH_NAME}-", suffix=".tmp", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    """Atomic write through the shared writer (the CLI, a route and a hook may race)."""
+    atomic_write_text(state_path(home), json.dumps(state, indent=2))
 
 
 def is_effectively_enabled(home: Path) -> bool:

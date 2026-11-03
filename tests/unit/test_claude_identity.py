@@ -886,7 +886,7 @@ def test_write_failure_is_reported(tmp_path, monkeypatch) -> None:
     def boom(*_args, **_kwargs):
         raise PermissionError("denied")
 
-    monkeypatch.setattr(claude_identity, "_safe_replace", boom)
+    monkeypatch.setattr(claude_identity, "replace_with_retry", boom)
 
     result = write_identity(tmp_path, build_identity_block(_row()))
 
@@ -932,7 +932,7 @@ def test_strict_raises_for_a_failed_write(tmp_path, monkeypatch) -> None:
     def boom(*_args, **_kwargs):
         raise PermissionError("denied")
 
-    monkeypatch.setattr(claude_identity, "_safe_replace", boom)
+    monkeypatch.setattr(claude_identity, "replace_with_retry", boom)
 
     with pytest.raises(ClaudeConfigUnwritable) as raised:
         write_identity(tmp_path, build_identity_block(_row()), strict=True)

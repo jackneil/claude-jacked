@@ -37,13 +37,12 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 import re
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
+from jacked.atomic_io import atomic_write_text
 from jacked.findbin import find_bin
 
 try:  # POSIX advisory locking. Absent on Windows -- see ``_config_lock``.
@@ -323,11 +322,10 @@ def _sanitize_fields(config: dict) -> tuple[dict, list[str]]:
 def write_config(home: Path | str, config: dict) -> None:
     """Validate, then atomically write the DCR config and verify it re-reads.
 
-    The atomic write is writer-unique (mkstemp + ``os.replace``) because the CLI,
-    the dashboard service, and hook processes are separate processes that can all
-    write the same home; a shared tmp path would let one ``os.replace`` the
-    other's half-written file away. The tmp is unlinked on any ``BaseException``
-    so a crash never leaves a stray tmp or a half-written target. After the
+    The write goes through the shared atomic writer (``jacked.atomic_io``): the
+    CLI, the dashboard service, and hook processes can all write the same home,
+    so each write gets its own temp file and a Windows-aware replace, and a
+    crash never leaves a stray temp file or a half-written target. After the
     replace the file is re-read and parsed: a corrupt write raises
     ``DcrSettingsUnreadableError`` rather than being trusted.
 
@@ -342,27 +340,11 @@ def write_config(home: Path | str, config: dict) -> None:
 
     path = config_path(home)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        atomic_write_text(path, json.dumps(data, indent=2))
     except OSError as e:
         raise DcrSettingsAccessError(
             f"cannot write {path}: {e}. Check the permissions on {path.parent}."
         ) from e
-
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, indent=2))
-        os.replace(tmp_name, path)
-    except BaseException as e:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        if isinstance(e, OSError):
-            raise DcrSettingsAccessError(
-                f"cannot write {path}: {e}. Check the permissions on {path.parent}."
-            ) from e
-        raise
 
     try:
         verify = json.loads(path.read_text(encoding="utf-8"))

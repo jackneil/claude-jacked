@@ -22,11 +22,15 @@ import logging.handlers
 import os
 import re
 import subprocess
-import tempfile
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
+
+# The shared atomic writer lives in jacked.atomic_io. It is re-exported here
+# because vault state, vault config, rollups, settings_io and the route
+# handlers import it from this module.
+from jacked.atomic_io import atomic_write_text
 
 # Cross-process advisory file locking: POSIX flock or Windows msvcrt. Either may
 # be unavailable (imported None); the lock helper then degrades to fail-open.
@@ -213,35 +217,6 @@ def _normalize_state(raw: object) -> dict:
 
     out["version"] = version if newer else STATE_VERSION
     return out
-
-
-def atomic_write_text(path: Path | str, text: str, *, follow_symlinks: bool = False) -> None:
-    """Atomically write ``text`` to ``path`` (writer-unique tmp + ``os.replace``).
-
-    The tmp name is writer-unique (prefix keyed off the target name) because the
-    CLI, the dashboard service, and hook processes are separate processes that can
-    all write the same home; a shared tmp path would let one ``os.replace`` the
-    other's half-written file away. The tmp is unlinked on any ``BaseException``
-    (a ``KeyboardInterrupt`` mid-write included) so a crash never leaves a stray
-    tmp or a half-written target. This is the single shared atomic-text writer
-    behind vault state, vault config, the rollup recent/archive writes, and the
-    settings_io writer.
-    """
-    # A symlink at ``path`` is replaced by a plain file unless the caller
-    # opts in: following it lets a repo-shipped link (lessons.md pointing at
-    # ~/.bashrc) turn a save into a write outside the project. The user's own
-    # global CLAUDE.md, often a link to a dotfiles copy, opts in.
-    path = Path(os.path.realpath(path)) if follow_symlinks else Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
 
 
 def save_state(home: Path | None, state: dict) -> None:

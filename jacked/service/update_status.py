@@ -22,12 +22,12 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from jacked.atomic_io import atomic_write_text
 from jacked.service import CLAUDE_DIR
 
 UPDATE_STATUS_FILE: Path = CLAUDE_DIR / "jacked-update-status.json"
@@ -88,18 +88,7 @@ def _now_iso() -> str:
 
 
 def _atomic_write(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, json.dumps(data, indent=2))
 
 
 def _read_raw(path: Path) -> Optional[dict]:

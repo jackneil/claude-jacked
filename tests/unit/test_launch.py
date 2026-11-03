@@ -676,14 +676,14 @@ class TestPrepareAccountDir:
         db = _make_db(tmp_path)
         account = db.get_account(1)
 
-        def corrupt_replace(src, dst, **kwargs):
-            Path(dst).write_text("{not json", encoding="utf-8")
+        def corrupt_write(path, text, **kwargs):
+            Path(path).write_text("{not json", encoding="utf-8")
 
         with (
             mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"),
             mock.patch("jacked.launch.should_refresh", return_value=False),
             mock.patch("jacked.launch.scoped_launch_needs_global_activation", return_value=False),
-            mock.patch("jacked.launch._safe_replace", corrupt_replace),
+            mock.patch("jacked.launch.atomic_write_text", corrupt_write),
             pytest.raises(click.ClickException, match="read back"),
         ):
             from jacked.launch import prepare_account_dir
@@ -914,6 +914,7 @@ class TestPrepareAccountDir:
 
         assert per_account.read_bytes() == before
         assert not list(acct_dir.glob(".claude_json_tmp_*"))
+        assert not list(acct_dir.glob(".claude.json.*.tmp"))
 
     def test_seed_steps_start_an_absent_per_account_config_from_empty(self, tmp_path):
         db = _make_db(tmp_path)
@@ -979,6 +980,7 @@ class TestSeedClaudeConfigFailClosed:
 
         assert (config_dir / ".claude.json").is_dir()
         assert not list(config_dir.glob(".claude_json_tmp_*"))
+        assert not list(config_dir.glob(".claude.json.*.tmp"))
 
 
 # ---------------------------------------------------------------------------

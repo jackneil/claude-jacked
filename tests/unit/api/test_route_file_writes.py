@@ -4,7 +4,8 @@ Many handlers run in the threadpool (no synchronous jacked.db work on the
 event loop, #162i), so two requests can write the same file at once. A plain
 ``write_text`` truncates first and writes second, so two writers interleave
 into a file that is neither version. ``jacked.memory.vault.atomic_write_text``
-writes a writer-unique temp file and replaces the target in one step.
+(``jacked.atomic_io``) writes a writer-unique temp file and replaces the
+target in one step, retrying a Windows sharing refusal.
 """
 
 import ast
@@ -52,7 +53,10 @@ def test_the_guard_sees_a_raw_write(tmp_path):
 
 
 def test_concurrent_lesson_saves_never_mix_their_contents(tmp_path):
-    """Two saves of different lengths race; the file ends as one of them."""
+    """Two saves of different lengths race; both return and the file ends as
+    one of them. A thread's exception is only a pytest warning, so each one is
+    collected and asserted: on Windows a replace refused while the other
+    writer holds the file (WinError 5) must be retried, not lost (#237i)."""
     import threading
 
     from jacked.memory.vault import atomic_write_text
@@ -60,10 +64,14 @@ def test_concurrent_lesson_saves_never_mix_their_contents(tmp_path):
     target = tmp_path / "lessons.md"
     long_text, short_text = "L" * 200_000 + "\n", "S\n"
     barrier = threading.Barrier(2)
+    errors: list = []
 
     def save(text):
         barrier.wait()
-        atomic_write_text(target, text)
+        try:
+            atomic_write_text(target, text)
+        except BaseException as exc:  # collected: a thread cannot fail the test
+            errors.append(exc)
 
     for _ in range(25):
         threads = [threading.Thread(target=save, args=(t,)) for t in (long_text, short_text)]
@@ -71,6 +79,7 @@ def test_concurrent_lesson_saves_never_mix_their_contents(tmp_path):
             t.start()
         for t in threads:
             t.join()
+        assert not errors, errors
         assert target.read_text() in (long_text, short_text)
 
 

@@ -14,7 +14,7 @@ sharply:
 
 Callers that mutate settings must let ``SettingsUnreadableError`` propagate and
 abort loudly rather than swallow it. ``write_settings`` is atomic (writer-unique
-tmp + ``os.replace``) and re-reads the result to prove the write is valid JSON
+tmp + the shared replace) and re-reads the result to prove the write is valid JSON
 before returning.
 """
 from __future__ import annotations
@@ -62,9 +62,9 @@ def read_settings(path: Path | str) -> dict:
 def write_settings(path: Path | str, data: dict) -> None:
     """Atomically write settings.json, then verify it re-reads as a JSON object.
 
-    The atomic write itself (writer-unique tmp + ``os.replace``) is delegated to
-    the shared ``vault.atomic_write_text`` so every memory-side atomic write goes
-    through one implementation. On top of that shared write this keeps its own
+    The atomic write itself (writer-unique tmp + the shared replace) is delegated
+    to the shared ``vault.atomic_write_text`` (``jacked.atomic_io``) so every
+    atomic write goes through one implementation. On top of that shared write this keeps its own
     post-write verification: the file is re-read and parsed, and a verification
     failure raises ``SettingsUnreadableError`` so a corrupt write is surfaced
     loudly instead of being trusted.

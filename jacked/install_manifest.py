@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from jacked.atomic_io import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MANIFEST_PATH = Path.home() / ".claude" / "jacked-manifest.json"
@@ -356,24 +358,11 @@ def write(path, version: str, current_hashes: dict, now_iso: str) -> None:
 
 
 def _atomic_write_json(path: Path, data) -> None:
-    """Write JSON to `path` through a UNIQUE temp file in the same dir, then
-    `os.replace` it in. A fixed temp name would let `jacked install` and a
-    dashboard toggle in another process overwrite each other's half-written
-    file. The temp file is removed when anything fails."""
-    import os
-    import tempfile
-
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(data, indent=2))
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    """Write JSON to `path` through the shared atomic writer. Each write gets
+    its own temp file, so `jacked install` and a dashboard toggle in another
+    process never overwrite each other's half-written file. The temp file is
+    removed when anything fails."""
+    atomic_write_text(path, json.dumps(data, indent=2))
 
 
 def record_installed_skill(path, name: str, skill_dir) -> bool:

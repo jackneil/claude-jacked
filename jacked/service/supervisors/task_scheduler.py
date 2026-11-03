@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
+from jacked.atomic_io import replace_with_retry
 from jacked.service.spec import ServiceSpec
 from jacked.service.supervisors._artifacts import (
     ArtifactDisposition,
@@ -301,7 +302,7 @@ def _retire_legacy_vbs(path: Path, content: bytes) -> Path | None:
     try:
         if backup.exists() and backup.read_bytes() != content:
             return None
-        os.replace(path, backup)
+        replace_with_retry(path, backup)
     except OSError:
         return None
     return backup if backup.read_bytes() == content else None
@@ -313,7 +314,7 @@ def _restore_legacy_vbs(path: Path, backup: Path | None) -> bool:
     if path.exists() or not backup.exists():
         return False
     try:
-        os.replace(backup, path)
+        replace_with_retry(backup, path)
     except OSError:
         return False
     return path.exists() and not backup.exists()

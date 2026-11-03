@@ -443,6 +443,15 @@ uses private staging, flush and fsync, durable replacement, owner-only modes,
 and link/reparse-point checks. It rejects paths outside the trusted root,
 symlinks, hard links, and non-regular targets.
 
+jacked replaces a file only through the shared atomic writer in
+`jacked/atomic_io.py` (#237i). On Windows, a replace fails while another
+handle holds the target file: a reader, an indexer, or an antivirus scan. The
+shared replace then retries for up to 1 second, and after that it reports the
+error. The Claude config writer (section 5.5) allows 3 seconds. Before each
+retry, `FileCredentialStore` checks the file again. If the file changed, the
+store refuses the write as a concurrent write. A test fails when a module in
+`jacked/` calls `os.replace` directly.
+
 ### 5.4 Metadata and per-account directories are not authorities
 
 `~/.claude.json` contains identity and tier metadata used by Claude Code's UI.
@@ -1148,6 +1157,7 @@ every switch reports `observed_target_unfenced`, so a rule that acted only on
 | `jacked/credentials/capabilities.py` | Topology-keyed capability registry (platform, config mode, build floor) |
 | `jacked/credentials/runtime.py` | Production capability assembly and activation entry points |
 | `jacked/credentials/macos_store.py` | Keychain authority adapter driven by the signed security tool |
+| `jacked/atomic_io.py` | The one atomic file writer and the Windows-aware replace retry (#237i) |
 | `jacked/credentials/file_store.py` | Cross-platform durable JSON file adapter |
 | `jacked/credentials/resolver.py` | Authority/mirror consensus and snapshot publication |
 | `jacked/credentials/transaction.py` | Switch state machine and outcome axes |

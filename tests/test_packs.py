@@ -345,8 +345,10 @@ def test_state_roundtrip_and_atomic(tmp_path):
 
 def test_save_state_tmp_is_writer_unique(tmp_path, monkeypatch):
     """Two concurrent writers must never share a tmp path: a shared name lets
-    one writer os.replace the other's half-written file away. Capture the tmp
-    names two saves generate and assert they differ."""
+    one writer replace the target with the other's half-written file. Capture
+    the tmp names two saves generate and assert they differ."""
+    from jacked import atomic_io
+
     home = tmp_path
     seen = []
     real_mkstemp = tempfile.mkstemp
@@ -356,23 +358,25 @@ def test_save_state_tmp_is_writer_unique(tmp_path, monkeypatch):
         seen.append(name)
         return fd, name
 
-    monkeypatch.setattr(packs.tempfile, "mkstemp", spy_mkstemp)
+    monkeypatch.setattr(atomic_io.tempfile, "mkstemp", spy_mkstemp)
     packs.save_state(home, {"version": 2, "packs": {}})
     packs.save_state(home, {"version": 2, "packs": {"marketing": {"state": "enabled"}}})
     assert len(seen) == 2 and seen[0] != seen[1]
-    # both tmps were consumed by os.replace
+    # both tmps were consumed by the replace
     assert not Path(seen[0]).exists() and not Path(seen[1]).exists()
 
 
 def test_save_state_cleans_tmp_on_write_failure(tmp_path, monkeypatch):
     """A failed write must not leave the unique tmp behind."""
+    from jacked import atomic_io
+
     home = tmp_path
     (home / ".claude").mkdir(parents=True, exist_ok=True)
 
     def boom(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(packs.os, "replace", boom)
+    monkeypatch.setattr(atomic_io.os, "replace", boom)
     with pytest.raises(OSError):
         packs.save_state(home, {"version": 2, "packs": {}})
     leftovers = [p for p in (home / ".claude").iterdir() if p.suffix == ".tmp"]

@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from jacked.atomic_io import atomic_write_text
 from jacked.service import START_FAILURE_WINDOW_SECONDS
 
 
@@ -82,28 +83,10 @@ def _write_atomic(path: Path, text: str) -> None:
     """Replace ``path`` in one step so a crash never leaves a partial file.
 
     A partial file would read as an empty history and re-arm the supervisor's
-    retry loop. The temporary file is created 0600 and renamed over the target.
+    retry loop. The shared writer stages a 0600 temporary file, syncs it to
+    disk and replaces the target.
     """
-    import os
-    import tempfile
-
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
-    )
-    try:
-        if hasattr(os, "fchmod"):  # Windows has no fchmod; mkstemp is already 0600
-            os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, text, fsync=True, mode=0o600)
 
 
 def clear_start_failures(path: Path) -> None:

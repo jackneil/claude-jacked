@@ -7,6 +7,8 @@ import stat
 import tempfile
 from pathlib import Path
 
+from jacked.atomic_io import replace_with_retry
+
 
 def privately_controlled(path: Path, status: os.stat_result) -> bool:
     """True when the current user owns ``path`` and no one else can write it.
@@ -76,7 +78,7 @@ def atomic_write(path: Path, content: bytes) -> None:
             file.write(content)
             file.flush()
             os.fsync(file.fileno())
-        os.replace(temporary, path)
+        replace_with_retry(temporary, path)
         if os.name == "posix":
             path.chmod(0o600)
         elif os.name == "nt":

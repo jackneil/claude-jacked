@@ -36,12 +36,12 @@ import json
 import logging
 import os
 import shutil
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Mapping, Optional
 
+from jacked.atomic_io import atomic_write_text
 from jacked.findbin import find_bin
 from jacked.service.process import process_liveness
 
@@ -99,20 +99,9 @@ def _atomic_write_json(path: Path, data: dict) -> None:
                 os.chmod(d, 0o700)
             except OSError:
                 pass
-    fd, tmp = tempfile.mkstemp(dir=str(parent), prefix=".auth-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.chmod(tmp, 0o600)
-        # Windows-safe replace (retries if Codex holds the file open) — reuse
-        # the platform util the Claude credential path already ships.
-        from jacked.api.credential_helpers import _safe_replace
-
-        _safe_replace(tmp, str(path))
-        tmp = None
-    finally:
-        if tmp is not None and os.path.exists(tmp):
-            os.unlink(tmp)
+    # The shared writer retries the replace while Codex holds the file open
+    # on Windows.
+    atomic_write_text(path, json.dumps(data, indent=2), mode=0o600)
 
 
 def _read_json(path: Path) -> Optional[dict]:

@@ -9,6 +9,8 @@ import stat
 import tempfile
 from pathlib import Path
 
+from jacked.atomic_io import replace_with_retry
+
 from .canonical import CredentialFormatError, CredentialPayload
 from .models import InteractionMode, StoreReadResult, StoreStatus, StoreWriteResult
 
@@ -62,22 +64,6 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _durable_replace(source: Path, target: Path) -> None:
-    if os.name != "nt":
-        os.replace(source, target)
-        return
-    import ctypes
-    from ctypes import wintypes
-
-    move_file = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
-    move_file.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
-    move_file.restype = wintypes.BOOL
-    replace_existing = 0x1
-    write_through = 0x8
-    if not move_file(str(source), str(target), replace_existing | write_through):
-        raise ctypes.WinError(ctypes.get_last_error())
-
-
 def _stamp(status: os.stat_result, raw: bytes) -> tuple:
     """Identify exact file content: metadata plus a digest of the bytes.
 
@@ -85,6 +71,10 @@ def _stamp(status: os.stat_result, raw: bytes) -> tuple:
     an in-place refresh inside one mtime tick keeps size and inode identical.
     """
     return (status.st_size, status.st_mtime_ns, status.st_ino, hashlib.sha256(raw).digest())
+
+
+class _ChangedDuringReplace(Exception):
+    """The credential file changed while the replace waited for a retry."""
 
 
 def _refuse_concurrent_write() -> StoreWriteResult:
@@ -183,7 +173,23 @@ class FileCredentialStore:
             # late as possible before the replace commits.
             if self._changed_since_read():
                 return _refuse_concurrent_write()
-            _durable_replace(stage_path, self.path)
+
+            def recheck_before_retry() -> None:
+                # A Windows retry pauses while another handle holds the file.
+                # Claude Code can write the file in that pause, so check again.
+                _validate_existing(self.path)
+                if self._changed_since_read():
+                    raise _ChangedDuringReplace
+
+            try:
+                replace_with_retry(
+                    stage_path,
+                    self.path,
+                    write_through=True,
+                    before_retry=recheck_before_retry,
+                )
+            except _ChangedDuringReplace:
+                return _refuse_concurrent_write()
             # The bytes are published now, so re-arm the compare-and-swap
             # stamp BEFORE anything that can still raise. A chmod or directory
             # fsync failure below returns UNUSABLE, and a stale stamp would
