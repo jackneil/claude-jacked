@@ -539,6 +539,122 @@ process.exit(0);
         assert result["state"]["auto_swap_5h_rules_enabled"] is False
 
 
+class TestFailedSaveRestoresTheControls:
+    """A save that failed changed nothing on the server (a 403 from the
+    remote-access gate, a dropped connection). No control may stay flipped."""
+
+    _SETUP = r"""
+const STORED = {
+    auto_swap_enabled: true, auto_swap_5h_rules_enabled: false,
+    auto_swap_5h_warning: 70, auto_swap_5h_critical: 95, usage_check_interval: 600,
+    window_keeper_enabled: true, window_keeper_active_start: '07:00',
+    window_keeper_active_end: '22:00', window_keeper_prewake: '05:00',
+};
+window.jackedState.swapSettings = { ...STORED };
+const mk = (tag, id, props) => {
+    const el = Object.assign(__makeEl(tag), props);
+    el.id = id;
+    __body.appendChild(el);
+    return el;
+};
+const chk5h = mk('input', 'chk-swap-5h-rules', { checked: true });
+const warn = mk('input', 'rng-warn-5h', { value: '60', disabled: false });
+const crit = mk('input', 'rng-crit-5h', { value: '61', disabled: false });
+const warnLbl = mk('span', 'lbl-warn-5h', { textContent: '60%' });
+const critLbl = mk('span', 'lbl-crit-5h', { textContent: '61%' });
+const warnRow = mk('div', 'row-warn-5h', {});
+const critRow = mk('div', 'row-crit-5h', {});
+const chkSwap = mk('input', 'chk-auto-swap', { checked: false });
+const interval = mk('select', 'sel-check-interval', { value: '60' });
+const keeper = mk('input', 'chk-window-keeper', { checked: false });
+const start = mk('input', 'inp-active-start', { value: '01:00' });
+const end = mk('input', 'inp-active-end', { value: '02:00' });
+const preWake = mk('input', 'inp-pre-wake', { value: '03:00' });
+const refused = () => { throw new Error('This action is not allowed from this device.'); };
+const snapshot = () => ({
+    chk5h: chk5h.checked, warn: warn.value, crit: crit.value, warnDisabled: warn.disabled,
+    critDisabled: crit.disabled, warnLbl: warnLbl.textContent, critLbl: critLbl.textContent,
+    warnDim: warnRow._classes.size > 0,
+    critDim: critRow._classes.size > 0,
+    chkSwap: chkSwap.checked, interval: interval.value, keeper: keeper.checked,
+    start: start.value, end: end.value, preWake: preWake.value,
+});
+"""
+
+    def test_a_refused_save_puts_every_control_back(self, tmp_path):
+        result = _run_js(tmp_path, self._SETUP + """
+(async () => {
+    global.api.put = async () => refused();
+    await _saveSwapSettings();
+    out({ controls: snapshot(), toasts: __getToasts(), state: window.jackedState.swapSettings });
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["controls"] == {
+            "chk5h": False, "warn": "70", "crit": "95", "warnDisabled": True, "critDisabled": True,
+            "warnLbl": "70%", "critLbl": "95%", "warnDim": True, "critDim": True,
+            "chkSwap": True, "interval": "600", "keeper": True,
+            "start": "07:00", "end": "22:00", "preWake": "05:00",
+        }
+        assert result["toasts"][-1]["type"] == "error"
+        assert "not allowed" in result["toasts"][-1]["message"]
+        assert result["state"]["auto_swap_5h_rules_enabled"] is False
+
+    def test_flipping_the_5h_toggle_and_a_refused_save_turns_it_back(self, tmp_path):
+        """The real path, through the change listener and the debounce."""
+        result = _run_js(tmp_path, self._SETUP + """
+(async () => {
+    global.api.put = async () => refused();
+    bindAutoSwapEvents();
+    chk5h.checked = true;
+    __fire(chk5h, 'change');
+    const flipped = warn.disabled;
+    await new Promise(r => setTimeout(r, 600));  // the save is debounced 400 ms
+    out({ flipped, after: snapshot() });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["flipped"] is False  # the toggle enabled the sliders at once
+        assert result["after"]["chk5h"] is False
+        assert result["after"]["warnDisabled"] is True and result["after"]["warnDim"] is True
+
+    def test_an_edit_during_a_failed_save_is_kept_for_its_own_save(self, tmp_path):
+        result = _run_js(tmp_path, self._SETUP + """
+(async () => {
+    const bodies = [];
+    let fail = true;
+    global.api.put = async (_path, body) => {
+        bodies.push(body);
+        await new Promise(r => setTimeout(r, 50));
+        if (fail) { fail = false; refused(); }
+        return body;
+    };
+    bindAutoSwapEvents();
+    __fire(chk5h, 'change');
+    await new Promise(r => setTimeout(r, 420));  // the first save is in flight
+    warn.value = '77';
+    __fire(warn, 'change');
+    await new Promise(r => setTimeout(r, 100));  // the first save failed
+    const during = warn.value;
+    await new Promise(r => setTimeout(r, 500));  // the second save landed
+    out({ during, sent: bodies.map(b => b.auto_swap_5h_warning) });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["during"] == "77"
+        assert result["sent"] == [60, 77]
+
+    def test_a_save_that_lands_keeps_the_controls(self, tmp_path):
+        result = _run_js(tmp_path, self._SETUP + """
+(async () => {
+    global.api.put = async (_path, body) => body;
+    await _saveSwapSettings();
+    out({ controls: snapshot() });
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["controls"]["chk5h"] is True
+        assert result["controls"]["warn"] == "60"
+
+
 # The block of the panel that shows the pause: the notice, the badge, and the
 # pause menu or the Resume button. When the pause changes, the page renders
 # this block again in place, so an open panel stays open.
