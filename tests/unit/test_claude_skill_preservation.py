@@ -1256,6 +1256,27 @@ def test_failed_copy_never_removes_what_another_writer_put_at_the_skill_path(
         assert out.backup is None and out.rollback_error is None
 
 
+def test_publish_never_replaces_an_empty_dir_that_appeared_during_the_copy(tmp_path):
+    """rename(2) replaces an EMPTY directory on POSIX, so the publish checks
+    the path itself before the rename: an empty dir another writer made
+    during the copy stays, and the staging dir is removed."""
+    from jacked import cli as _cli
+
+    src = _with_sidecar(tmp_path / "src", "dcr", "# jacked dcr\n", "// js\n")
+    skills = _skills_base(tmp_path)
+    dst = skills / "dcr"
+
+    def copy_while_another_writer_makes_the_dir(s, staging):
+        dst.mkdir(parents=True, exist_ok=True)
+        return _cli._copy_skill_tree(s, staging)
+
+    out = _transaction(src, dst, None, copy=copy_while_another_writer_makes_the_dir)
+
+    assert isinstance(out.error, FileExistsError)
+    assert dst.is_dir() and _tree(dst) == []
+    assert _side_dirs(skills, "dcr") == []
+
+
 @pytest.mark.parametrize("start", ["new", "user"])
 def test_publish_never_replaces_a_dir_that_appeared_during_the_copy(tmp_path, start):
     """The copy works, but another writer made the skill path while it ran.
@@ -1286,6 +1307,145 @@ def test_publish_never_replaces_a_dir_that_appeared_during_the_copy(tmp_path, st
         assert (out.backup / "SKILL.md").read_text() == "# my own dcr\n"
     else:
         assert out.backup is None and out.rollback_error is None
+
+
+# --- Wave 2 W2: a change to jacked's own copy during the copy ----------------
+#
+# `occupied` is decided once, after preserve, while the copy into the staging
+# dir has not started. The publish used to set aside whatever was at the path
+# then and delete it, so a file that a user added to jacked's own copy during
+# the copy, or a dir of theirs that replaced it, was deleted with no backup.
+# The occupant is fingerprinted when `occupied` is decided and checked again
+# right before the move-aside: a change refuses BEFORE any rename. A change
+# that lands between that check and the rename is caught on the previous dir,
+# which the rollback then renames back.
+
+_CHANGED = "The skill path changed during the install"
+
+
+def _record_renames(monkeypatch, before=None) -> list:
+    """Record each rename of the transaction as a (src, dst) pair.
+
+    ``before(src, dst)`` runs just before each rename, so a test can make
+    another writer act at that exact moment."""
+    from jacked import atomic_io
+
+    real = atomic_io.replace_with_retry
+    renames: list = []
+
+    def recording(src, dst, *a, **kw):
+        if before is not None:
+            before(Path(src), Path(dst))
+        renames.append((Path(src), Path(dst)))
+        return real(src, dst, *a, **kw)
+
+    monkeypatch.setattr(atomic_io, "replace_with_retry", recording)
+    return renames
+
+
+def test_publish_keeps_a_file_another_writer_added_to_jackeds_own_copy(
+    tmp_path, monkeypatch,
+):
+    """The install owns dcr (the prior manifest matches jacked's copy). While
+    the new copy runs, another writer adds notes.md to the live dcr. The
+    install skips dcr with the FileExistsError and changes nothing there:
+    notes.md and the old copy survive as they are, no private dir is left,
+    no backup is made, and the manifest keeps the prior dcr record."""
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    from jacked import cli as _cli
+
+    runner = CliRunner()
+    assert _install(runner).exit_code == 0
+    manifest_path = tmp_path / ".claude" / "jacked-manifest.json"
+    prior = json.loads(manifest_path.read_text(encoding="utf-8"))
+    skills = tmp_path / ".claude" / "skills"
+    dcr = skills / "dcr"
+    before = _snapshot(dcr)
+    real_copy = _cli._copy_skill_tree
+
+    def copy_while_another_writer_adds_a_file(src_root, staging):
+        if Path(src_root).name == "dcr":
+            (dcr / "notes.md").write_text("my notes\n", encoding="utf-8")
+        return real_copy(src_root, staging)
+
+    monkeypatch.setattr(_cli, "_copy_skill_tree", copy_while_another_writer_adds_a_file)
+    renames = _record_renames(monkeypatch)
+
+    res = _install_wide(runner, monkeypatch)
+
+    assert res.exit_code == 0, res.output
+    expected = FileExistsError(errno.EEXIST, _CHANGED, str(dcr))
+    assert f"Skipped skill dcr: {expected}\n" in res.output
+    assert (dcr / "notes.md").read_text(encoding="utf-8") == "my notes\n"
+    assert _snapshot(dcr) == {**before, "notes.md": b"my notes\n"}
+    assert [r for r in renames if r[0] == dcr] == []      # never set aside
+    assert _side_dirs(skills, "dcr") == []
+    assert _backups_of(skills, "dcr") == []
+    after = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for key in ("skills", m.SKILLS_DIRS_KEY):
+        assert after["artifacts"][key]["dcr"] == prior["artifacts"][key]["dcr"]
+    last = json.loads(
+        (tmp_path / ".claude" / "jacked-last-install.json").read_text(encoding="utf-8")
+    )
+    assert last["skipped"] == [{"name": "dcr", "error": "FileExistsError"}]
+
+
+def test_publish_keeps_a_dir_that_replaced_jackeds_own_copy(tmp_path, monkeypatch):
+    """During the copy, another writer replaces jacked's own copy with a dir
+    of its own. The transaction refuses before any rename: that dir stays
+    exactly as it is, and only the staging dir is removed."""
+    from jacked import cli as _cli
+
+    src = _with_sidecar(tmp_path / "src", "dcr", "# jacked dcr v2\n", "// v2\n")
+    skills = _skills_base(tmp_path)
+    dst = _with_sidecar(skills, "dcr", "# jacked dcr v1\n", "// v1\n")
+    owning = _owning_manifest(dst, "dcr")
+
+    def copy_while_another_writer_replaces_the_dir(s, staging):
+        shutil.rmtree(dst)
+        _skill(skills, "dcr", "# someone else's dcr\n")
+        return _cli._copy_skill_tree(s, staging)
+
+    renames = _record_renames(monkeypatch)
+    out = _transaction(src, dst, owning, copy=copy_while_another_writer_replaces_the_dir)
+
+    assert isinstance(out.error, FileExistsError)
+    assert out.error.strerror == _CHANGED and out.error.filename == str(dst)
+    assert out.backup is None and out.restored is False and out.rollback_error is None
+    assert _snapshot(dst) == {"SKILL.md": b"# someone else's dcr\n"}
+    assert [r for r in renames if r[0] == dst] == []      # never set aside
+    assert _side_dirs(skills, "dcr") == []
+    assert _backups_of(skills, "dcr") == []
+
+
+def test_a_change_between_the_check_and_the_move_aside_is_put_back(
+    tmp_path, monkeypatch,
+):
+    """The last window: another writer adds notes.md after the check and
+    before the move-aside rename. The check of the previous dir sees it, the
+    rollback renames that dir back to the skill path, and nothing is
+    deleted."""
+    from jacked import cli as _cli
+
+    src = _with_sidecar(tmp_path / "src", "dcr", "# jacked dcr v2\n", "// v2\n")
+    skills = _skills_base(tmp_path)
+    dst = _with_sidecar(skills, "dcr", "# jacked dcr v1\n", "// v1\n")
+    owning = _owning_manifest(dst, "dcr")
+    before = _snapshot(dst)
+
+    def another_writer_at_the_move_aside(s, d):
+        if s == dst:
+            (dst / "notes.md").write_text("my notes\n", encoding="utf-8")
+
+    _record_renames(monkeypatch, before=another_writer_at_the_move_aside)
+    out = _transaction(src, dst, owning, copy=_cli._copy_skill_tree)
+
+    assert isinstance(out.error, FileExistsError)
+    assert out.error.strerror == _CHANGED
+    assert out.backup is None and out.restored is False and out.rollback_error is None
+    assert _snapshot(dst) == {**before, "notes.md": b"my notes\n"}
+    assert _side_dirs(skills, "dcr") == []
+    assert _backups_of(skills, "dcr") == []
 
 
 def test_install_over_jackeds_own_copy_publishes_it_whole(tmp_path):

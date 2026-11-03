@@ -527,6 +527,50 @@ def _own_service_port_busy_recovery(port: int, restarted: bool) -> str:
     )
 
 
+def _own_service_guard_error(port: int, restarted: bool) -> str:
+    """The clause that a rollback failure's status error gets when the
+    rollback tail found this installation's own service on *port* with no
+    answer to health. It comes after the failure and says what the final
+    guard did. A restart that worked is not called a verified restore.
+
+    >>> _own_service_guard_error(8321, True)
+    "the final guard then restarted this installation's own service on port 8321 (not verified)"
+    >>> _own_service_guard_error(8321, False)
+    "the final guard could not restart this installation's own service on port 8321"
+    """
+    if restarted:
+        return (
+            "the final guard then restarted this installation's own service "
+            f"on port {port} (not verified)"
+        )
+    return (
+        "the final guard could not restart this installation's own service "
+        f"on port {port}"
+    )
+
+
+def _own_service_guard_note(port: int, restarted: bool) -> str:
+    """The paragraph that a rollback failure's recovery text gets in the same
+    case. It comes after the failure, and it never says that the service
+    answers health: nothing checks the service after the guard's restart.
+
+    >>> _own_service_guard_note(8321, False)
+    "This installation's own service held port 8321 and did not answer health. The final guard could not restart it."
+    >>> "Nothing checked the service" in _own_service_guard_note(8321, True)
+    True
+    """
+    held = (
+        f"This installation's own service held port {port} and did not "
+        "answer health."
+    )
+    if restarted:
+        return (
+            f"{held} The final guard then restarted it. Nothing checked the "
+            "service after that restart: run `jacked service status`."
+        )
+    return f"{held} The final guard could not restart it."
+
+
 # The states of the final guard in run_update. The guard acts on how the run
 # ended. "pending": the run ended before it made a decision (an early return
 # or a crash), so the guard starts the service again. "restarted": a spawn or
@@ -649,15 +693,58 @@ def run_update(
     # one state, not a "restart attempted" flag: a deliberate hands-off exit
     # must not get the kickstart that an early return or a crash gets.
     _final_guard = [_GUARD_PENDING]
-    # True when the update stopped as port_busy on this installation's own
-    # wedged service. The guard then restarts that service, and it writes
-    # the status record and the recovery text once it knows whether the
-    # restart worked.
+    # True when a tail stopped as port_busy on this installation's own wedged
+    # service: the update tail (the port_busy exit) or a rollback tail
+    # (`_claim_own_wedged_holder` sets it). The guard then restarts that
+    # service, and it writes the status record and the recovery text once it
+    # knows whether the restart worked.
     _own_port_busy = [False]
+    # The failure that `_fail_and_recover` recorded, as (error, recovery), or
+    # None. When the rollback tail found this installation's own wedged
+    # service, the guard records that failure again with what it did.
+    _rollback_failure = [None]
+
+    def _record_failure(
+        error: str, recovery: str, *, status_error: "str | None" = None, note: str = ""
+    ) -> None:
+        """Write the status record and the recovery file of a failed update.
+
+        ``status_error`` is the status record's error when it is not
+        ``error``. ``note`` is a paragraph that goes after the failure in the
+        recovery file, or "" for none.
+        """
+        try:
+            _us.mark_failed(
+                _us.UPDATE_STATUS_FILE, error=status_error or error, recovery=recovery
+            )
+        except Exception:
+            logger.exception("mark_failed after a failed update")
+        _write_recovery(
+            f"Jacked auto-update failed: {error}\n\n"
+            + (f"{note}\n\n" if note else "")
+            + f"See {UPDATE_LOG} for details.\n\n"
+            "Recovery:\n"
+            f"  {recovery}\n"
+        )
 
     def _record_own_port_busy(restarted: bool) -> None:
         """Write the status record and the recovery file of that exit, after
-        the guard's restart, so both say what the restart did."""
+        the guard's restart, so both say what the restart did.
+
+        After a rollback, the record is the rollback failure: it stays first,
+        and the guard's outcome comes after it (a clause in the status error,
+        a paragraph in the recovery file). Otherwise the record is the
+        port_busy exit of the update tail.
+        """
+        if _rollback_failure[0] is not None:
+            error, recovery = _rollback_failure[0]
+            _record_failure(
+                error,
+                recovery,
+                status_error=f"{error}; {_own_service_guard_error(port, restarted)}",
+                note=_own_service_guard_note(port, restarted),
+            )
+            return
         try:
             _us.mark_failed(
                 _us.UPDATE_STATUS_FILE,
@@ -995,11 +1082,14 @@ def run_update(
             loop. A hands-off exit would leave it wedged, so a pending guard
             stays pending and restarts it. After a restart that this run
             already made, the LAST tail decides: the guard restarts the
-            service again, so the build now on disk gets started.
+            service again, so the build now on disk gets started. On every
+            tail, the claim sets `_own_port_busy`, so the guard records what
+            its restart did.
             """
             if not _own_service_holds_port(port):
                 return False
             _own_holder[0] = True
+            _own_port_busy[0] = True
             held = (
                 f"Port {port} is held by this installation's own service "
                 "(pid live) that does not answer health; "
@@ -1141,6 +1231,11 @@ def run_update(
             `rolled` is True ONLY when the package rollback, the settings
             migration AND the restarted service all succeeded. Anything less
             names the step that failed and the command that repairs it.
+
+            The record is written at once. When the rollback tail found this
+            installation's own wedged service, the final guard writes it
+            again after its restart, with the restart outcome after the
+            failure (`_record_own_port_busy`).
             """
             if rolled:
                 error = f"{what}; rolled back to v{_current_version}"
@@ -1158,18 +1253,8 @@ def run_update(
                     f'uv tool install "claude-jacked[{extras}]=={_current_version}" '
                     "--force --refresh && jacked install --force && jacked service start"
                 )
-            try:
-                _us.mark_failed(
-                    _us.UPDATE_STATUS_FILE, error=error, recovery=recovery
-                )
-            except Exception:
-                logger.exception("mark_failed after %s", what)
-            _write_recovery(
-                f"Jacked auto-update failed: {error}\n\n"
-                f"See {UPDATE_LOG} for details.\n\n"
-                "Recovery:\n"
-                f"  {recovery}\n"
-            )
+            _rollback_failure[0] = (error, recovery)
+            _record_failure(error, recovery)
             log(f"UPDATE FAILED: {error}")
 
         # Phase: preflight - the transaction gate. The new build must prove it
@@ -1300,13 +1385,12 @@ def run_update(
                     logger.exception("mark_failed fallback also raised")
                     log("ERROR: mark_failed fallback also raised - disk likely full")
         elif outcome == "port_busy":
-            if _own_holder[0]:
-                # This installation's own wedged service holds the port. The
-                # final guard is still pending and restarts it. It writes the
-                # status record and the recovery text once it knows whether
-                # that restart worked, so the two say the same thing.
-                _own_port_busy[0] = True
-            else:
+            # When this installation's own wedged service holds the port,
+            # `_claim_own_wedged_holder` set `_own_port_busy`: the final guard
+            # is still pending and restarts it, and it writes the status
+            # record and the recovery text once it knows whether that restart
+            # worked, so the two say the same thing.
+            if not _own_holder[0]:
                 # _start_and_verify set the final guard hands-off, so the
                 # text below stays true: nothing touches the port owner.
                 try:

@@ -2762,3 +2762,121 @@ class TestFinalGuardFollowsTheOutcome:
         assert "stopped at the service restart step" in recovery.read_text(
             encoding="utf-8"
         )
+
+    # Wave 2 W4: only the update tail's port_busy exit recorded what the
+    # guard's restart did. A rollback tail that found this installation's
+    # own wedged service left the record saying the rollback stopped at the
+    # restart step, and the guard's kick after it was never recorded.
+
+    NEVER_READY_ROLLBACK = (
+        "v0.100.0 never became ready on :8321; the rollback to v0.95.0 "
+        "stopped at the service restart step"
+    )
+    REFUSED_ROLLBACK = (
+        "v0.100.0 refused to start: [FAIL] ValueError: nope; the rollback to "
+        "v0.95.0 stopped at the service restart step"
+    )
+    ROLLBACK_RECOVERY = (
+        'uv tool install "claude-jacked[tray]==0.95.0" --force --refresh '
+        "&& jacked install --force && jacked service start"
+    )
+    GUARD_RESTARTED_NOTE = (
+        "This installation's own service held port 8321 and did not answer "
+        "health. The final guard then restarted it. Nothing checked the "
+        "service after that restart: run `jacked service status`."
+    )
+    GUARD_NOT_RESTARTED_NOTE = (
+        "This installation's own service held port 8321 and did not answer "
+        "health. The final guard could not restart it."
+    )
+    GUARD_RESTARTED_CLAUSE = (
+        "the final guard then restarted this installation's own service on "
+        "port 8321 (not verified)"
+    )
+    GUARD_NOT_RESTARTED_CLAUSE = (
+        "the final guard could not restart this installation's own service "
+        "on port 8321"
+    )
+
+    def _rollback_record(self, tmp_path, failure, note):
+        """The recovery file of a rollback failure, with the guard's note
+        after the failure."""
+        return (
+            f"Jacked auto-update failed: {failure}\n\n"
+            f"{note}\n\n"
+            f"See {tmp_path / 'update.log'} for details.\n\n"
+            "Recovery:\n"
+            f"  {self.ROLLBACK_RECOVERY}\n"
+        )
+
+    @pytest.mark.parametrize(
+        ("kick_result", "note", "clause"),
+        [
+            ((True, "test-kickstart"), GUARD_RESTARTED_NOTE, GUARD_RESTARTED_CLAUSE),
+            ((False, "test-refused"), GUARD_NOT_RESTARTED_NOTE, GUARD_NOT_RESTARTED_CLAUSE),
+        ],
+        ids=["restarted", "could-not-restart"],
+    )
+    def test_a_rollback_tail_records_what_the_second_kick_did(
+        self, kick_result, note, clause, tmp_path, monkeypatch
+    ):
+        """The new build never became ready, the rollback ran, and its tail
+        found this installation's own service wedged on the port. The guard
+        kicks a second time, and the record keeps the update failure first,
+        then says what that kick did. A kick that worked is never called a
+        verified restore."""
+        self._publish_own_service(monkeypatch)
+
+        kick, _popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            kick_result=kick_result,
+            run_results=_healthy_runs() + [_ok(), _ok()],  # + the rollback pair
+            listen_results=lambda run: run.call_count >= 4,
+            health_answer=None,
+            clock_step=0.1,
+        )
+
+        kick.assert_called_once_with()     # the manual spawn ran, then the guard
+        assert self.OWN_HELD_AFTER_A_RESTART in log
+        assert self.SECOND_KICK in log
+        body = recovery.read_text(encoding="utf-8")
+        assert body == self._rollback_record(tmp_path, self.NEVER_READY_ROLLBACK, note)
+        assert "rolled back to" not in body
+        assert status["overall"] == "failed"
+        assert status["error"] == f"{self.NEVER_READY_ROLLBACK}; {clause}"
+        assert status["recovery"] == self.ROLLBACK_RECOVERY
+
+    def test_a_refused_preflight_tail_records_the_guard_restart(
+        self, tmp_path, monkeypatch
+    ):
+        """The same record when the guard is still pending: the preflight
+        refused, nothing was started, and the rollback tail found this
+        installation's own wedged service. The guard's first kick is the
+        restart that the record names."""
+        self._publish_own_service(monkeypatch)
+
+        kick, popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            run_results=[
+                _ok(),                                        # uv install
+                _fail(1, stderr="[FAIL] ValueError: nope"),   # preflight refuses
+                _ok(),                                        # rollback install
+                _ok(),                                        # jacked install --force
+            ],
+            listen_results=True,
+            health_answer=None,
+            clock_step=0.1,
+        )
+
+        popen.assert_not_called()
+        kick.assert_called_once_with()
+        assert self.OWN_HELD in log
+        assert self.KICKSTART in log
+        body = recovery.read_text(encoding="utf-8")
+        assert body == self._rollback_record(
+            tmp_path, self.REFUSED_ROLLBACK, self.GUARD_RESTARTED_NOTE
+        )
+        assert status["error"] == (
+            f"{self.REFUSED_ROLLBACK}; {self.GUARD_RESTARTED_CLAUSE}"
+        )
+        assert status["recovery"] == self.ROLLBACK_RECOVERY

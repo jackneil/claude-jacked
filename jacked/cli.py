@@ -2394,20 +2394,29 @@ def _update_status_init_shim(from_version, to_version, method, log_path):
     written, no phases opened yet — the tray creates it moments before
     spawning us). Exit 2 only when a REAL updater is in flight (has a phase
     open). The Windows batch checks errorlevel and aborts on 2.
+
+    The claim is a read-check-write, so it runs under the update lock
+    (``update_status.with_update_lock``), like every other batch step.
     """
     from jacked.service import update_status as us_mod
-    try:
+
+    path = us_mod.UPDATE_STATUS_FILE
+
+    def claim():
         # This shim exits immediately while the batch that called it keeps
         # running, so its own pid would read as "updater dead" within seconds.
         # Record no pid: the batch's liveness then follows the mtime rule.
-        outcome = us_mod.init_or_adopt_status(
-            us_mod.UPDATE_STATUS_FILE,
+        return us_mod.init_or_adopt_status(
+            path,
             from_version=from_version,
             to_version=to_version,
             method=method,
             log_path=log_path,
             updater_pid=us_mod.NO_UPDATER_PID,
         )
+
+    try:
+        outcome = us_mod.with_update_lock(path, claim)
     except us_mod.LockBusy as exc:
         click.echo(f"[update-status] lock busy: {exc}", err=True)
         sys.exit(2)
@@ -2427,14 +2436,21 @@ def _update_status_init_shim(from_version, to_version, method, log_path):
 @click.option("--error", default=None)
 @click.option("--recovery", default=None)
 def _update_status_shim(phase, status, error, recovery):
-    """Internal: write one status transition. `status` is in_progress|ok|warning|failed."""
+    """Internal: write one status transition. `status` is in_progress|ok|warning|failed.
+
+    The write runs under the update lock (``update_status.with_update_lock``).
+    """
     from jacked.service import update_status as us_mod
     path = us_mod.UPDATE_STATUS_FILE
-    try:
+
+    def write():
         if status == "in_progress":
             us_mod.begin_phase(path, phase)
         else:
             us_mod.end_phase(path, phase, status=status, error=error, recovery=recovery)
+
+    try:
+        us_mod.with_update_lock(path, write)
     except ValueError as exc:
         # Exit non-zero so the Windows batch's `if errorlevel 1` check fires
         # on phase-name drift between the batch and update_phases.PHASES.
@@ -2468,21 +2484,26 @@ def _update_status_succeed_shim(target, previous):
 
     With ``--target``, a build older than the target (the package index did
     not serve it yet, #166i) closes the record as failed with the lag message
-    and exits 4, instead of succeeded.
+    and exits 4, instead of succeeded. The close runs under the update lock
+    (``update_status.with_update_lock``).
     """
     from jacked.service import update_status as us_mod
 
+    path = us_mod.UPDATE_STATUS_FILE
     installed = _installed_package_version()
     if _index_lag(installed, target):
         message = _index_lag_message(installed, target, changed=installed != previous)
-        us_mod.mark_failed(
-            us_mod.UPDATE_STATUS_FILE,
-            error=f"the package index does not serve v{target} yet",
-            recovery="jacked upgrade (in a few minutes)",
+        us_mod.with_update_lock(
+            path,
+            lambda: us_mod.mark_failed(
+                path,
+                error=f"the package index does not serve v{target} yet",
+                recovery="jacked upgrade (in a few minutes)",
+            ),
         )
         click.echo(message)
         sys.exit(EXIT_INDEX_LAG)
-    us_mod.mark_succeeded(us_mod.UPDATE_STATUS_FILE)
+    us_mod.with_update_lock(path, lambda: us_mod.mark_succeeded(path))
 
 
 @main.command(name="_update_status_fail", hidden=True)
@@ -2493,12 +2514,16 @@ def _update_status_fail_shim(error, recovery):
 
     The Windows `jacked upgrade` batch runs this command at each failure
     exit. It opens no phase, so it uses mark_failed, not end_phase. When the
-    status file does not exist, the command does nothing.
+    status file does not exist, the command does nothing. The write runs
+    under the update lock (``update_status.with_update_lock``).
     """
     from jacked.service import update_status as us_mod
 
+    path = us_mod.UPDATE_STATUS_FILE
     try:
-        us_mod.mark_failed(us_mod.UPDATE_STATUS_FILE, error=error, recovery=recovery)
+        us_mod.with_update_lock(
+            path, lambda: us_mod.mark_failed(path, error=error, recovery=recovery)
+        )
     except Exception as exc:  # noqa: BLE001 - the batch exits 1 next anyway
         click.echo(
             f"[update-status] cannot mark the update failed: {type(exc).__name__}",
@@ -3050,6 +3075,18 @@ def _install_skill_dir_transactional(
     it is jacked's own old copy. It removes a staging dir that a crash left
     in the same way.
 
+    Only jacked's own copy, as it was when the transaction saw it, is set
+    aside and removed. Its fingerprint (the full-dir hash of the install
+    manifest, `install_manifest.skill_content_hash`) is taken when the
+    transaction decides that the path holds jacked's copy, and compared
+    again right before the move-aside. A file that another writer added
+    during the copy, an edit, or a dir that replaced jacked's copy changes
+    the fingerprint, and the install raises FileExistsError ("The skill path
+    changed during the install") BEFORE any rename, so the rollback removes
+    only the staging dir. The previous dir is compared once more after the
+    move-aside: a change that landed between the check and the rename is
+    there, and the rollback renames that dir back.
+
     When the copy or the publish raises OSError, the rollback removes ONLY
     the staging dir, which this transaction made. Then it renames a previous
     dir back and moves the user's backup back, each only when the skill path
@@ -3067,6 +3104,7 @@ def _install_skill_dir_transactional(
     """
     import errno
 
+    from jacked import install_manifest as _m
     from jacked.atomic_io import replace_with_retry
 
     if _is_packaged_source(skill_dir, src):
@@ -3082,11 +3120,23 @@ def _install_skill_dir_transactional(
     staging = _skill_side_dir(skill_dir, name, _SKILL_STAGING_TAG)
     staged = False
     previous = None
+
+    def refuse_if_changed(path: Path) -> None:
+        # `path` is the occupant, at the skill path or just set aside.
+        if _m.skill_content_hash(path) != seen:
+            raise FileExistsError(
+                errno.EEXIST, "The skill path changed during the install", str(skill_dir),
+            )
+
     try:
         # Only jacked's own copy, seen at this point, is ever set aside by the
         # publish. A dir that appears at a free path during the copy is
         # another writer's: the rename onto it fails, and it stays as it is.
         occupied = backup is None and (skill_dir.exists() or skill_dir.is_symlink())
+        # The fingerprint of jacked's copy as it is now. A change during the
+        # copy (a file added, an edit, a dir that replaced it) is not
+        # jacked's, so the publish must not set it aside and delete it.
+        seen = _m.skill_content_hash(skill_dir) if occupied else None
         _clear_skill_leftovers(skill_dir, name)
         if staging.exists() or staging.is_symlink():
             raise FileExistsError(
@@ -3095,9 +3145,19 @@ def _install_skill_dir_transactional(
         staged = True
         written = copy(src, staging)
         if occupied and (skill_dir.exists() or skill_dir.is_symlink()):
+            refuse_if_changed(skill_dir)  # before any rename
             aside = _skill_side_dir(skill_dir, name, _SKILL_PREVIOUS_TAG)
             replace_with_retry(skill_dir, aside)
             previous = aside
+            # A change that landed between that check and the rename is in
+            # the previous dir now. The rollback renames the dir back.
+            refuse_if_changed(aside)
+        if skill_dir.exists() or skill_dir.is_symlink():
+            # Another writer made the path during the copy. A rename onto a
+            # file, a link or a non-empty dir fails on its own, but rename(2)
+            # does replace an EMPTY dir on POSIX: refuse before the rename,
+            # so nothing another writer created is ever replaced.
+            raise FileExistsError(errno.EEXIST, "The skill path is in use", str(skill_dir))
         replace_with_retry(staging, skill_dir)
         staged = False  # the staging dir is the live skill dir now
     except OSError as e:

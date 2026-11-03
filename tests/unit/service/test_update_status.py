@@ -695,6 +695,274 @@ class TestExclusiveUpdateLock:
         handle.close()
 
 
+def _update_status_warnings(caplog) -> list:
+    """The WARNING messages that the update_status module logged."""
+    import logging
+
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == "jacked.service.update_status" and r.levelno >= logging.WARNING
+    ]
+
+
+def _waited_too_long(message: str) -> bool:
+    """True for the one WARNING of a lock that stayed held past the wait."""
+    import re
+
+    return re.fullmatch(
+        r"the update lock stayed held for \d+\.\d s; writing the status without it",
+        message,
+    ) is not None
+
+
+class TestBatchStepsTakeTheUpdateLock:
+    """Wave 2 W1: the abandoned-update close takes the update lock, reads
+    the record again, checks it and writes. The Windows batch steps
+    (``jacked _update_status*``) held no lock, so a step that wrote between
+    that check and the write was overwritten by the close. Each step is its
+    own short process, so it takes the same lock for its own read-modify-
+    write (``with_update_lock``). The batch cannot hold the lock across its
+    steps, and a step never fails because of the lock."""
+
+    @staticmethod
+    def _hold_then_release(path, after):
+        """Hold the real update lock and release it ``after`` seconds later.
+
+        Returns the thread and a dict. Its ``released`` entry is the
+        monotonic time just before the release."""
+        import threading
+
+        from jacked.service.update_status import acquire_update_lock
+
+        handle = acquire_update_lock(path)
+        assert handle is not None
+        mark = {}
+
+        def release():
+            time.sleep(after)
+            mark["released"] = time.monotonic()
+            handle.close()
+
+        thread = threading.Thread(target=release)
+        thread.start()
+        return thread, mark
+
+    def test_the_action_runs_under_the_lock_and_the_lock_is_released(
+        self, tmp_path, monkeypatch
+    ):
+        """The release is an explicit ``close()``. Garbage collection would
+        release a dropped handle in CPython too, so the spy counts the
+        close itself."""
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        real_try = us._try_update_lock
+        closes = []
+
+        class _CountedHandle:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def close(self):
+                closes.append(1)
+                self._handle.close()
+
+        def counted(target):
+            handle, refusal = real_try(target)
+            return (None if handle is None else _CountedHandle(handle)), refusal
+
+        monkeypatch.setattr(us, "_try_update_lock", counted)
+        seen = []
+
+        def action():
+            seen.append(us.acquire_update_lock(path))
+            return "written"
+
+        assert us.with_update_lock(path, action) == "written"
+        assert seen == [None]                 # the helper held the lock
+        assert closes == [1]                  # and released it once
+        again = us.acquire_update_lock(path)
+        assert again is not None
+        again.close()
+
+    def test_a_held_lock_is_waited_for(self, tmp_path, caplog):
+        import logging
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        thread, mark = self._hold_then_release(path, 0.5)
+        ran = []
+        try:
+            with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+                us.with_update_lock(path, lambda: ran.append(time.monotonic()))
+        finally:
+            thread.join()
+
+        assert len(ran) == 1
+        assert ran[0] >= mark["released"]
+        assert _update_status_warnings(caplog) == []
+
+    def test_a_lock_held_past_the_wait_still_runs_the_action(self, tmp_path, caplog):
+        """The status record is observability, not the update itself: a
+        holder that never lets go must not stop the batch step."""
+        import logging
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        handle = us.acquire_update_lock(path)
+        try:
+            with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+                start = time.monotonic()
+                result = us.with_update_lock(path, lambda: "written", wait_seconds=0.3)
+                waited = time.monotonic() - start
+        finally:
+            handle.close()
+
+        assert result == "written"
+        assert waited >= 0.3
+        warnings = _update_status_warnings(caplog)
+        assert len(warnings) == 1 and _waited_too_long(warnings[0]), warnings
+
+    def test_an_unusable_lock_file_runs_the_action_at_once(self, tmp_path, caplog):
+        """A lock file that cannot be opened is never held by anyone, so a
+        wait cannot help: the step writes at once, with one WARNING that
+        says the lock file cannot be used (not that it stayed held)."""
+        import logging
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        (tmp_path / "status.json.lock").mkdir()   # a dir is not a lock file
+        with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+            start = time.monotonic()
+            result = us.with_update_lock(path, lambda: "written", wait_seconds=5.0)
+            elapsed = time.monotonic() - start
+
+        assert result == "written"
+        assert elapsed < 1.0
+        assert _update_status_warnings(caplog) == [
+            "the update lock file cannot be used; writing the status without it"
+        ]
+
+    def test_the_lock_is_released_when_the_action_raises(self, tmp_path):
+        """The shim handles the exception while its traceback is alive, and
+        the traceback keeps the helper's frame alive. So the lock must be
+        released by the helper itself, not by garbage collection."""
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+
+        def drift():
+            raise ValueError("no in_progress entry")
+
+        with pytest.raises(ValueError, match="no in_progress entry") as raised:
+            us.with_update_lock(path, drift)
+        again = us.acquire_update_lock(path)
+        assert raised.tb is not None          # the frame is still referenced
+        assert again is not None
+        again.close()
+
+    @staticmethod
+    def _step(name, path):
+        """Write the record that batch step ``name`` expects. Returns its
+        argv and a check of the record that the step leaves."""
+        from jacked.service import update_status as us
+
+        if name != "init":
+            us.init_status(path, from_version="a", to_version="b", method="uv")
+        if name == "end":
+            us.begin_phase(path, "installing_package")
+        steps = {
+            "init": (
+                ["_update_status_init", "a", "b", "uv"],
+                lambda d: d["from_version"] == "a" and d["overall"] == "in_progress",
+            ),
+            "begin": (
+                ["_update_status", "installing_package", "in_progress"],
+                lambda d: d["current_phase"] == "installing_package",
+            ),
+            "end": (
+                ["_update_status", "installing_package", "ok"],
+                lambda d: d["phases"][0]["status"] == "ok",
+            ),
+            "succeed": (
+                ["_update_status_succeed"],
+                lambda d: d["overall"] == "succeeded",
+            ),
+            "fail": (
+                ["_update_status_fail", "--error", "the install is in use"],
+                lambda d: d["overall"] == "failed" and d["error"] == "the install is in use",
+            ),
+        }
+        return steps[name]
+
+    @pytest.mark.parametrize("name", ["init", "begin", "end", "succeed", "fail"])
+    def test_every_batch_step_writes_after_a_held_lock_is_released(
+        self, tmp_path, monkeypatch, name
+    ):
+        """The test holds the update lock for 0.5 s, as the abandoned-update
+        close holds it for its check and write. The step waits, and its
+        write lands only after the release."""
+        from click.testing import CliRunner
+
+        from jacked.cli import main
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        argv, check = self._step(name, path)
+        monkeypatch.setattr(us, "UPDATE_STATUS_FILE", path)
+        real_write = us._atomic_write
+        writes = []
+
+        def timed_write(target, data):
+            writes.append(time.monotonic())
+            real_write(target, data)
+
+        monkeypatch.setattr(us, "_atomic_write", timed_write)
+        thread, mark = self._hold_then_release(path, 0.5)
+        try:
+            result = CliRunner().invoke(main, argv)
+        finally:
+            thread.join()
+
+        assert result.exit_code == 0, result.output
+        assert writes, "the step wrote nothing"
+        assert min(writes) >= mark["released"]
+        assert check(us.read_record(path))
+
+    def test_a_batch_step_writes_without_the_lock_after_the_wait(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Through the shim: a lock that stays held past the wait still
+        gets the write, and the step exits 0 with one WARNING."""
+        import logging
+
+        from click.testing import CliRunner
+
+        from jacked.cli import main
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        us.init_status(path, from_version="a", to_version="b", method="uv")
+        monkeypatch.setattr(us, "UPDATE_STATUS_FILE", path)
+        monkeypatch.setattr(us, "BATCH_STEP_LOCK_WAIT_SECONDS", 0.3)
+        handle = us.acquire_update_lock(path)
+        try:
+            with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+                result = CliRunner().invoke(
+                    main, ["_update_status", "installing_package", "in_progress"]
+                )
+        finally:
+            handle.close()
+
+        assert result.exit_code == 0, result.output
+        assert us.read_record(path)["current_phase"] == "installing_package"
+        warnings = _update_status_warnings(caplog)
+        assert len(warnings) == 1 and _waited_too_long(warnings[0]), warnings
+
+
 @pytest.mark.parametrize("pid", [2**31, 2**40, 2**70, True])
 def test_an_oversized_or_bogus_updater_pid_never_raises(tmp_path, pid):
     """os.kill raises OverflowError (not OSError) above pid_t; a probe must not."""
@@ -1216,15 +1484,15 @@ class TestAbandonedStatusHoldsTheUpdateLock:
         assert lock.closed == 1
 
     @pytest.mark.parametrize(
-        "change",
+        ("change", "fresh"),
         [
-            {"started_at": "2026-11-03T08:00:00+00:00"},
-            {"from_version": "0.110.2"},
-            {"overall": "failed"},
+            ({"started_at": "2026-11-03T08:00:00+00:00"}, False),
+            ({"from_version": "0.110.2"}, False),
+            ({"overall": "failed"}, False),
             # The same attempt wrote again (a fresh mtime): it still runs. A
-            # Windows batch holds no OS lock, so this second mtime check is
-            # what protects it.
-            {},
+            # Windows batch step that wrote between the first read and the
+            # lock is protected by this second mtime check.
+            ({}, True),
         ],
         ids=[
             "a-new-attempt-started", "a-new-from-version", "closed-meanwhile",
@@ -1232,10 +1500,15 @@ class TestAbandonedStatusHoldsTheUpdateLock:
         ],
     )
     def test_a_record_that_changed_before_the_lock_is_left_alone(
-        self, tmp_path, monkeypatch, change
+        self, tmp_path, monkeypatch, change, fresh
     ):
         """Between the first read and the lock, another updater replaced or
-        closed the record. Only the attempt that was read may be closed."""
+        closed the record. Only the attempt that was read may be closed.
+
+        A changed identity keeps a STALE mtime, so the identity check alone
+        must refuse it: a fresh mtime would hide a missing identity check
+        behind the staleness check. The unchanged record is the one case
+        with a fresh mtime, and only the staleness check refuses it."""
         import json
 
         from jacked.service import update_status as us
@@ -1248,6 +1521,9 @@ class TestAbandonedStatusHoldsTheUpdateLock:
             current = json.loads(path.read_text(encoding="utf-8"))
             current.update(change)
             path.write_text(json.dumps(current), encoding="utf-8")
+            if not fresh:
+                stamp = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+                os.utime(path, (stamp, stamp))
             return lock
 
         monkeypatch.setattr(us, "acquire_update_lock", replaced_then_granted)
@@ -1345,13 +1621,24 @@ class TestCloseAbandonedUpdate:
         assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
 
     @pytest.mark.parametrize(
-        "change",
-        [{"started_at": "2026-11-03T08:00:00+00:00"}, {"overall": "succeeded"}, {}],
-        ids=["a-new-attempt-started", "closed-meanwhile", "the-attempt-wrote-again"],
+        ("change", "fresh"),
+        [
+            ({"started_at": "2026-11-03T08:00:00+00:00"}, False),
+            ({"from_version": "0.110.2"}, False),
+            ({"overall": "succeeded"}, False),
+            ({}, True),
+        ],
+        ids=[
+            "a-new-attempt-started", "a-new-from-version", "closed-meanwhile",
+            "the-attempt-wrote-again",
+        ],
     )
     def test_a_record_that_changed_before_the_lock_is_left_alone(
-        self, tmp_path, monkeypatch, change
+        self, tmp_path, monkeypatch, change, fresh
     ):
+        """A changed identity keeps a STALE mtime, so only the identity check
+        can refuse it. The unchanged record has a fresh mtime, so only the
+        staleness check can refuse it."""
         import json
 
         from jacked.service import update_status as us
@@ -1364,6 +1651,9 @@ class TestCloseAbandonedUpdate:
             current = json.loads(path.read_text(encoding="utf-8"))
             current.update(change)
             path.write_text(json.dumps(current), encoding="utf-8")
+            if not fresh:
+                stamp = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+                os.utime(path, (stamp, stamp))
             return lock
 
         monkeypatch.setattr(us, "acquire_update_lock", replaced_then_granted)

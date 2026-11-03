@@ -82,6 +82,10 @@ _TEXT_FIELDS = (
     "signature",
 )
 _INT_FIELDS = ("schema_version", "protocol_version")
+# The largest pid a manifest may name: the same bound process_liveness
+# applies (jacked.service.process._PID_MAX), kept here without an import so
+# this module stays free of the process module (a test pins the equality).
+_PID_MAX = 2**31 - 1
 
 
 def _is_int(value: Any) -> bool:
@@ -105,6 +109,7 @@ def _check_field_types(payload: dict[str, Any]) -> None:
     if (
         not isinstance(process, dict)
         or not _is_int(process.get("pid"))
+        or not 1 <= process["pid"] <= _PID_MAX
         or not isinstance(process.get("creation_id"), str)
         or not isinstance(process.get("executable"), str)
     ):

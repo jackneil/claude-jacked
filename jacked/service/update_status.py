@@ -43,6 +43,13 @@ STALE_IN_PROGRESS_SECONDS: int = 300  # 5 minutes
 # whose Python shim exits at once): the record then carries no pid and the
 # abandoned-update check uses the mtime rule alone.
 NO_UPDATER_PID: int = 0
+# How long one Windows batch step waits for the update lock before it writes
+# the status record without the lock (``with_update_lock``). Each holder of
+# the lock in a Windows update (a batch step, the abandoned-update close)
+# keeps it for milliseconds, so a longer hold is a stuck holder.
+BATCH_STEP_LOCK_WAIT_SECONDS: float = 3.0
+# How often ``with_update_lock`` asks for the lock again while it waits.
+_LOCK_POLL_SECONDS: float = 0.1
 
 
 class LockBusy(Exception):
@@ -60,27 +67,97 @@ def acquire_update_lock(path: Path):
     held for the whole update.
 
     Returns a handle whose ``close()`` releases the lock (it is also a
-    context manager), or None when another process already holds it.
-    
+    context manager), or None when another process already holds it. A lock
+    file that cannot be opened also gives None.
 
     Scope: the lock serializes updaters that run as Python processes (the
-    POSIX CLI upgrade and the tray updater). A Windows batch cannot hold an
-    OS lock across its steps, so the Windows helpers rely on the status
-    record's in-flight check (``jacked _update_status_init``, exit 2).
+    POSIX CLI upgrade and the tray updater), and it holds them for the whole
+    update. A Windows batch cannot hold an OS lock across its steps, so the
+    Windows helpers rely on the status record's in-flight check (``jacked
+    _update_status_init``, exit 2) to refuse a second updater. But each batch
+    step (``jacked _update_status_init``, ``_update_status``,
+    ``_update_status_succeed``, ``_update_status_fail``) is its own short
+    process, and it takes this lock for its own read-modify-write through
+    ``with_update_lock``. So a batch step does not write between the check
+    and the write of a close that holds the lock (``_close_under_lock``),
+    unless the lock stays held past the wait of ``with_update_lock``.
+    """
+    return _try_update_lock(path)[0]
+
+
+def _try_update_lock(path: Path):
+    """Return ``(handle, None)`` with the update lock, else ``(None, refusal)``.
+
+    ``refusal`` is the reason of the lease (``jacked.credentials.lease``):
+    REFUSAL_HELD when another holder has the lock, or REFUSAL_UNUSABLE when
+    the lock file cannot be opened at all.
     """
     from contextlib import ExitStack
 
     from jacked.credentials.lease import FileSwitchLease
 
+    lease = FileSwitchLease(_lock_path(path))
     stack = ExitStack()
     try:
-        if not stack.enter_context(FileSwitchLease(_lock_path(path)).acquire()):
+        if not stack.enter_context(lease.acquire()):
             stack.close()
-            return None
+            return None, lease.refusal
     except Exception:
         stack.close()
         raise
-    return stack
+    return stack, None
+
+
+def with_update_lock(path: Path, action, *, wait_seconds: Optional[float] = None):
+    """Run ``action()`` under the update lock and return its result.
+
+    A Windows batch step uses this for its read-modify-write of the status
+    record (see ``acquire_update_lock``). The helper asks for the lock every
+    0.1 s, for up to ``wait_seconds`` (BATCH_STEP_LOCK_WAIT_SECONDS, 3 s,
+    when it is None). With the lock, it runs ``action()`` and releases the
+    lock when ``action()`` returns or raises. An exception from ``action()``
+    goes to the caller unchanged.
+
+    The status record is observability, not the update itself, so a batch
+    step never fails because of the lock. The fallback is the earlier
+    behavior, a write without the lock:
+
+    * the lock stays held past the wait: one WARNING, then ``action()``;
+    * the lock file cannot be opened, so nobody can hold the lock and a
+      wait cannot help: one WARNING at once, then ``action()``.
+
+    >>> import tempfile
+    >>> from pathlib import Path
+    >>> with tempfile.TemporaryDirectory() as d:
+    ...     p = Path(d) / "status.json"
+    ...     with_update_lock(p, lambda: acquire_update_lock(p) is None)
+    True
+    """
+    from jacked.credentials.lease import REFUSAL_UNUSABLE
+
+    limit = BATCH_STEP_LOCK_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    start = time.monotonic()
+    while True:
+        lock, refusal = _try_update_lock(path)
+        if lock is not None:
+            break
+        if refusal == REFUSAL_UNUSABLE:
+            logger.warning(
+                "the update lock file cannot be used; writing the status without it"
+            )
+            return action()
+        waited = time.monotonic() - start
+        if waited >= limit:
+            logger.warning(
+                "the update lock stayed held for %.1f s; writing the status without it",
+                waited,
+            )
+            return action()
+        time.sleep(min(_LOCK_POLL_SECONDS, limit - waited))
+    try:
+        return action()
+    finally:
+        lock.close()
 
 
 def _lock_path(path: Path) -> Path:
@@ -465,9 +542,12 @@ def abandoned_status(
     abandoned: nothing is written and the result is None. With the lock,
     the record is read again and closed only when it is still the same
     attempt (the same ``started_at`` and ``from_version``), still
-    ``in_progress`` and still stale. A Windows batch holds no OS lock, so
-    for a batch the identity check and the second mtime check are the
-    whole protection. ``close_abandoned_update`` uses the same rule.
+    ``in_progress`` and still stale. A Windows batch cannot hold the lock
+    across its steps, but each step takes it for its own write
+    (``with_update_lock``), so no step writes between the second read and
+    the write. A step that wrote between the first read and the lock fails
+    the identity check or the second mtime check. ``close_abandoned_update``
+    uses the same rule.
 
     >>> import json, os, tempfile, time
     >>> from pathlib import Path
@@ -532,8 +612,8 @@ def close_abandoned_update(
     * an updater holds the lock, so an update runs now;
     * the record is no longer the attempt that was read (another updater
       started or closed one);
-    * the attempt wrote again, so it still runs (a Windows batch holds no
-      lock);
+    * the attempt wrote again, so it still runs (a Windows batch step can
+      write between the first read and the lock);
     * the write failed (one WARNING with the exception class name).
 
     The caller writes the recovery file only when this returns a record.

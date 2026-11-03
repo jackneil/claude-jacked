@@ -151,6 +151,25 @@ def test_a_signed_manifest_with_a_mistyped_field_is_unreadable(field, value, mat
         InstanceManifest.from_dict(signed.to_dict())
 
 
+@pytest.mark.parametrize("pid", [0, -1, 2**31])
+def test_a_signed_manifest_with_an_out_of_range_pid_is_unreadable(pid):
+    """The pid bound is the one process_liveness applies, so a manifest can
+    never name a pid that the liveness probe would refuse."""
+    from dataclasses import replace
+
+    manifest = _manifest(_spec())
+    tampered = replace(manifest, process=replace(manifest.process, pid=pid), signature="")
+    signed = replace(tampered, signature=tampered._calculate_signature())
+    with pytest.raises(ValueError, match="process identity"):
+        InstanceManifest.from_dict(signed.to_dict())
+
+
+def test_the_manifest_pid_bound_is_the_liveness_bound():
+    from jacked.service import instance_models, process
+
+    assert instance_models._PID_MAX == process._PID_MAX
+
+
 def test_a_signed_manifest_with_a_mistyped_pid_is_unreadable():
     from dataclasses import replace
 
