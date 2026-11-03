@@ -24,7 +24,7 @@ from rich.console import Console
 import jacked.cli as cli
 from jacked import memory
 from jacked.cli import main
-from jacked.memory import capture, githook, merge_capture, trailers
+from jacked.memory import capture, githook, merge_capture, merge_git, trailers
 from jacked.memory import vault as vault_mod
 
 
@@ -882,6 +882,36 @@ def test_a_unicode_line_separator_keeps_the_whole_trailer_value(sep):
     ]
 
 
+def test_a_carriage_return_inside_a_trailer_value_keeps_the_whole_value(tmp_path):
+    """git ends a trailer record at LF only. A CR inside a value is not a record end."""
+    repo = _merge_repo(tmp_path / "widget")
+    _git(repo, "checkout", "-q", "feature/x")
+    (repo / "cr.txt").write_text("cr\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    msg_file = tmp_path / "cr-msg.txt"
+    msg_file.write_bytes(b"add cr\n\nWhy: use cache\rbecause otherwise stale\nNext: ship\n")
+    _git(repo, "commit", "-q", "-F", str(msg_file))
+    _git(repo, "checkout", "-q", "master")
+    _do_merge(repo)
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    assert merge_git.commit_trailers(repo, head) == [
+        "Why: use cache because otherwise stale", "Next: ship",
+    ]
+
+
+def test_a_carriage_return_inside_a_merge_subject_keeps_the_whole_subject(tmp_path):
+    """The merge list splits records at LF only, so a CR stays inside the subject."""
+    repo = _merge_repo(tmp_path / "widget")
+    orig = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _do_merge(repo, message="Merge branch 'feature/x'\rinto master")
+    _git(repo, "update-ref", "ORIG_HEAD", orig)
+
+    ((_sha, subject),) = merge_git.merge_commits(repo)
+
+    assert subject == "Merge branch 'feature/x'\rinto master"
+
+
 def test_trailer_lines_and_values_are_capped_with_a_marker(caplog):
     out = "".join(f"Why: reason {n:02d} " + "x" * 10_000 + "\n" for n in range(60))
     caplog.set_level(logging.DEBUG, logger="jacked.memory.trailers")
@@ -897,6 +927,27 @@ def test_trailer_lines_and_values_are_capped_with_a_marker(caplog):
         assert value.endswith(trailers.TRAILER_CUT_MARK)
         assert len(value) <= trailers.TRAILER_VALUE_MAX + len(trailers.TRAILER_CUT_MARK)
     assert any("trailer" in r.getMessage() and "30 of 60" in r.getMessage() for r in caplog.records)
+
+
+def test_distinct_trailers_that_share_a_long_prefix_are_counted_not_merged(caplog):
+    """The dedupe reads the whole value, so a shared 300-character start hides nothing."""
+    prefix = "z" * trailers.TRAILER_VALUE_MAX
+    lines = [f"Why: {prefix} tail {n:02d}" for n in range(60)]
+    caplog.set_level(logging.DEBUG, logger="jacked.memory.trailers")
+
+    capped = trailers.cap_trailers(lines)
+
+    cap = trailers.MAX_TRAILER_LINES
+    assert len(capped) == cap + 1
+    assert capped[-1] == f"(+{60 - cap} more trailers)"
+    for line in capped[:-1]:
+        assert line == f"Why: {prefix}{trailers.TRAILER_CUT_MARK}"
+    assert any("30 of 60" in r.getMessage() for r in caplog.records)
+
+
+def test_the_cap_drops_exact_duplicates_before_it_counts():
+    lines = ["Why: a", "Why: a", "Next: b"]
+    assert trailers.cap_trailers(lines) == ["Why: a", "Next: b"]
 
 
 def test_short_trailers_pass_the_cap_unchanged():

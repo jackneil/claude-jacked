@@ -52,26 +52,30 @@ def parse_trailers(out: str) -> list[str]:
 def cap_trailers(lines: list[str]) -> list[str]:
     """At most ``MAX_TRAILER_LINES`` lines, each value cut to ``TRAILER_VALUE_MAX``.
 
+    The dedupe reads the complete lines, before any cut, so two different
+    values with the same first ``TRAILER_VALUE_MAX`` characters both count.
     The oldest lines stay. A cut value ends with ``TRAILER_CUT_MARK``, and a
-    last line ``(+N more trailers)`` counts the lines that go.
+    last line ``(+N more trailers)`` counts the distinct lines that go.
 
-    >>> cap_trailers(["Why: a", "Next: b"])
+    >>> cap_trailers(["Why: a", "Next: b", "Why: a"])
     ['Why: a', 'Next: b']
     >>> cap_trailers(["Why: " + "x" * 400])[0].endswith("x [trimmed]")
     True
     """
+    distinct = list(dict.fromkeys(lines))
+    kept = distinct[:MAX_TRAILER_LINES]
     out: list[str] = []
     cut = 0
-    for line in lines:
+    for line in kept:
         key, sep, value = line.partition(": ")
         if len(value) > TRAILER_VALUE_MAX:
             line = f"{key}{sep}{value[:TRAILER_VALUE_MAX]}{TRAILER_CUT_MARK}"
             cut += 1
         out.append(line)
-    out = list(dict.fromkeys(out))
     if cut:
         logger.debug("commit trailers: %d value(s) cut to %d characters", cut, TRAILER_VALUE_MAX)
-    if len(out) <= MAX_TRAILER_LINES:
+    omitted = len(distinct) - len(kept)
+    if not omitted:
         return out
-    logger.debug("commit trailers: trailer list trimmed to %d of %d", MAX_TRAILER_LINES, len(out))
-    return [*out[:MAX_TRAILER_LINES], f"(+{len(out) - MAX_TRAILER_LINES} more trailers)"]
+    logger.debug("commit trailers: trailer list trimmed to %d of %d", len(kept), len(distinct))
+    return [*out, f"(+{omitted} more trailers)"]

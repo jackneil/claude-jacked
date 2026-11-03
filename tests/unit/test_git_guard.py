@@ -91,7 +91,8 @@ def _argv_spy(monkeypatch, module):
 
     def spy(argv, **kwargs):
         seen.append(list(argv))
-        return subprocess.CompletedProcess(argv, 0, "main\n", "")
+        out = "main\n" if kwargs.get("text") else b"main\n"
+        return subprocess.CompletedProcess(argv, 0, out, out[:0])
 
     monkeypatch.setattr(module.subprocess, "run", spy)
     return seen
@@ -109,9 +110,9 @@ def test_the_capture_branch_read_carries_the_overrides(monkeypatch, tmp_path):
 def test_the_merge_capture_git_reads_carry_the_overrides(monkeypatch, tmp_path):
     """merge_capture runs git log in the user's repo, where log.showSignature
     and gpg.program in the repo config would run a program."""
-    from jacked.memory import merge_capture
+    from jacked.memory import merge_git
 
-    seen = _argv_spy(monkeypatch, merge_capture)
-    merge_capture._git(tmp_path, ["log", "--merges", "--format=%H", "ORIG_HEAD..HEAD"])
+    seen = _argv_spy(monkeypatch, merge_git)
+    merge_git.git(tmp_path, ["log", "--merges", "--format=%H", "ORIG_HEAD..HEAD"])
     ((argv),) = seen
     assert tuple(argv[3:3 + len(git_guard.GIT_CONFIG_OVERRIDE_ARGS)]) == git_guard.GIT_CONFIG_OVERRIDE_ARGS

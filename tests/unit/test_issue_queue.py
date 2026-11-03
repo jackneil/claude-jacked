@@ -188,6 +188,22 @@ class TestRepoSlug:
         assert any(name in record.getMessage() for name in ("RuntimeError", "OSError"))
         assert str(tmp_path) not in record.getMessage()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need a privilege on Windows")
+    def test_a_looped_dot_git_stops_the_search_and_logs_the_class(self, tmp_path, caplog):
+        """A ``.git`` that is a symlink to itself must not give the parent repo's slug."""
+        parent = _repo(tmp_path, "parent")
+        nested = parent / "nested"
+        nested.mkdir()
+        (nested / ".git").symlink_to(nested / ".git")
+        caplog.set_level(logging.DEBUG, logger=HOOK_LOGGER)
+
+        assert issue_queue.repo_slug(nested) is None
+        assert issue_queue.repo_slug(parent) is not None
+        (record,) = [r for r in caplog.records if r.name == HOOK_LOGGER]
+        assert record.levelno == logging.DEBUG
+        assert "OSError" in record.getMessage()
+        assert str(tmp_path) not in record.getMessage()
+
     def test_an_empty_or_missing_path_has_no_slug(self, tmp_path):
         assert issue_queue.repo_slug("") is None
         assert issue_queue.repo_slug(tmp_path / "gone") is None
@@ -920,6 +936,22 @@ class TestRefreshPass:
         assert written == 2
         assert len(fakes.run.gh_calls()) == 2
         assert db.limits == [refresh.PROJECT_LIMIT]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need a privilege on Windows")
+    def test_a_looped_nested_checkout_listed_first_does_not_hide_its_parent(
+        self, home, tmp_path, fakes
+    ):
+        parent = _repo(tmp_path, "parent")
+        nested = parent / "nested"
+        nested.mkdir()
+        (nested / ".git").symlink_to(nested / ".git")
+        db = FakeDb([str(nested), str(parent)])
+
+        written = asyncio.run(refresh.refresh_pass(SimpleNamespace(state=SimpleNamespace(db=db))))
+
+        assert written == 1
+        git_paths = [c[2] for c in fakes.run.calls if c[0] == "/fake/git"]
+        assert git_paths == [str(parent)]
 
     def test_the_work_runs_off_the_event_loop_thread(self, home, tmp_path, fakes, monkeypatch):
         repo = _repo(tmp_path)
