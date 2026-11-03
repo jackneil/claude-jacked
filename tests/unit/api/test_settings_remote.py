@@ -207,12 +207,16 @@ def test_generic_delete_removes_a_stale_retired_7d_row(client, db):
 
 
 @pytest.mark.parametrize("method", ["put", "delete"])
-def test_the_pointer_of_a_new_provider_is_protected_too(client, db, method):
-    """Each provider has its own active-account pointer
-    (``Database.active_account_setting_key``). The guard follows the shape of
-    that key, so the pointer of a provider added later is protected the day
-    the provider is added."""
-    key = Database.active_account_setting_key("nextprovider")
+@pytest.mark.parametrize(
+    "key",
+    [Database.active_account_setting_key("nextprovider"), "desired_account_id_nextprovider"],
+    ids=["active", "desired"],
+)
+def test_the_pointer_of_a_new_provider_is_protected_too(client, db, method, key):
+    """Each provider has its own pointers (``Database.active_account_setting_key``
+    for the active one; a desired pointer would follow the same shape). The
+    guard follows the shape of both stems, so the pointers of a provider added
+    later are protected the day the provider is added."""
     db.set_setting(key, "7")
     if method == "put":
         resp = client.put(f"/api/settings/{key}", json={"value": "9"})

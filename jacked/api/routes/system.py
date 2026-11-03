@@ -1145,11 +1145,12 @@ _PROTECTED_SETTING_KEYS = {
     # _is_protected_setting adds the pointer of every other provider.
     *SELECTED_ACCOUNT_KEYS,
 }
-# The active-account pointer of each provider other than Claude:
+# The pointers of each provider other than Claude:
 # Database.active_account_setting_key(provider) is the Claude key plus
-# "_<provider>". Matching that shape protects the pointer of a provider that
-# is added later, the day it is added.
-_PROVIDER_POINTER_PREFIX = Database.active_account_setting_key("claude") + "_"
+# "_<provider>", and a desired pointer of another provider follows the same
+# shape. Matching both stems protects the pointers of a provider that is
+# added later, the day it is added.
+_PROVIDER_POINTER_PREFIXES = tuple(key + "_" for key in SELECTED_ACCOUNT_KEYS)
 
 # Reason-keyed copy for a refused remote change through the generic settings
 # endpoint. The two denials have different fixes, so they get different
@@ -1173,10 +1174,12 @@ def _is_protected_setting(key: str) -> bool:
     True
     >>> _is_protected_setting(Database.active_account_setting_key("codex"))
     True
+    >>> _is_protected_setting("desired_account_id_codex")
+    True
     >>> _is_protected_setting("color_theme"), _is_protected_setting("active_account_ids_note")
     (False, False)
     """
-    return key in _PROTECTED_SETTING_KEYS or key.startswith(_PROVIDER_POINTER_PREFIX)
+    return key in _PROTECTED_SETTING_KEYS or key.startswith(_PROVIDER_POINTER_PREFIXES)
 
 
 def _protected_key_response(key: str) -> JSONResponse:
