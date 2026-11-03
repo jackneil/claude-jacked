@@ -197,7 +197,7 @@ class TestFindings:
 
         (f,) = integrity.check(path)
         assert (f.kind, f.path) == ("script_changed", script.as_posix())
-        assert f.line() == f"jacked integrity: hook script changed outside jacked; {script}"
+        assert f.line() == f"jacked integrity: hook script changed outside jacked; {script.as_posix()}"
 
     def test_a_deleted_hook_script_is_script_changed(self, home, tmp_path):
         script = tmp_path / "guard.py"
@@ -208,7 +208,7 @@ class TestFindings:
 
         (f,) = integrity.check(path)
         assert (f.kind, f.path) == ("script_changed", script.as_posix())
-        assert f.line().endswith(f"{script} is missing")
+        assert f.line().endswith(f"{script.as_posix()} is missing")
 
     def test_a_tilde_script_path_resolves_under_home(self, home):
         script = home / ".claude" / "hooks" / "x.sh"

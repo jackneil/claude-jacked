@@ -87,7 +87,7 @@ class TestMissingScriptsAreWatched:
 
         (f,) = integrity.check(path)
         assert (f.kind, f.path, f.change) == ("script_changed", script.as_posix(), "created")
-        assert f.line() == f"jacked integrity: hook script changed outside jacked; {script} now exists"
+        assert f.line() == f"jacked integrity: hook script changed outside jacked; {script.as_posix()} now exists"
 
     def test_the_baseline_records_the_missing_state(self, home, tmp_path):
         script = tmp_path / "absent.py"
