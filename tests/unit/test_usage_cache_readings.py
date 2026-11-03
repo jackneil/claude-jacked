@@ -200,3 +200,80 @@ def test_a_rejected_percent_is_logged_once_without_its_value(caplog):
     # The reset of an unreadable window is not read, so no line says that
     # the cache stores it as no reset.
     assert not [m for m in lines if "not a timestamp" in m]
+
+
+# ---------------------------------------------------------------------------
+# M6 review wave 2 (X3): each window has its own read stamp. A rejected or
+# kept window still advanced usage_cached_at (one stamp per row), and the
+# window keeper read that stamp as evidence that a reset-less weekly window
+# was open. cached_5h_read_at and cached_7d_read_at move only when the write
+# ACCEPTED that window's reading: its percent was written, or the window was
+# cleared. usage_cached_at stays the row's display age.
+# ---------------------------------------------------------------------------
+
+OLD_STAMP = 1_000.0
+
+
+def _stamps(row: dict) -> tuple:
+    return row["cached_5h_read_at"], row["cached_7d_read_at"]
+
+
+@pytest.mark.parametrize("value", NO_PERCENT)
+def test_a_weekly_reading_that_was_not_accepted_keeps_its_read_stamp(db, value):
+    """X3: a rejected weekly percent (or none, beside a reset) beside a good
+    5h reading moves the row stamp and the 5h stamp, never the 7d stamp."""
+    aid = _account(db, five_hour=10.0, seven_day=40.0, seven_day_resets_at=OLD_RESET)
+    db.update_account(aid, cached_5h_read_at=OLD_STAMP, cached_7d_read_at=OLD_STAMP)
+    before = time.time()
+
+    row = _store_read(
+        db,
+        aid,
+        {
+            "five_hour": {"utilization": 12.0, "resets_at": NEW_RESET},
+            "seven_day": {"utilization": value, "resets_at": NEW_RESET},
+        },
+    )
+
+    assert row["usage_cached_at"] >= int(before)  # the display age moves
+    assert row["cached_5h_read_at"] >= before
+    assert row["cached_7d_read_at"] == OLD_STAMP
+    assert (row["cached_usage_7d"], row["cached_7d_resets_at"]) == (40.0, OLD_RESET)
+
+
+@pytest.mark.parametrize(
+    "seven_day",
+    [
+        pytest.param(None, id="null-window"),
+        pytest.param({"utilization": None, "resets_at": None}, id="null-percent-no-reset"),
+    ],
+)
+def test_a_cleared_window_is_an_accepted_read(db, seven_day):
+    """X3 (c): a null window, or a null percent with no reset, clears the
+    window: no window is open. That is a reading, so the stamp moves."""
+    aid = _account(db, seven_day=40.0, seven_day_resets_at=OLD_RESET)
+    db.update_account(aid, cached_5h_read_at=OLD_STAMP, cached_7d_read_at=OLD_STAMP)
+    before = time.time()
+
+    row = _store_read(db, aid, {"seven_day": seven_day})
+
+    assert (row["cached_usage_7d"], row["cached_7d_resets_at"]) == (None, None)
+    assert row["cached_7d_read_at"] >= before
+    assert row["cached_5h_read_at"] == OLD_STAMP  # a missing key keeps the 5h window
+
+
+def test_the_cache_writer_stamps_only_the_windows_it_accepted(db):
+    """X3 (e): the writer itself, without the payload mapping."""
+    aid = _account(db)
+    db.update_account(aid, cached_5h_read_at=OLD_STAMP, cached_7d_read_at=OLD_STAMP)
+    before = time.time()
+
+    db.update_account_usage_cache(aid, raw={"pad": 1})
+    assert _stamps(db.get_account(aid)) == (OLD_STAMP, OLD_STAMP)
+    db.update_account_usage_cache(aid, five_hour=3.0, five_hour_resets_at=NEW_RESET)
+    five, seven = _stamps(db.get_account(aid))
+    assert five >= before and seven == OLD_STAMP
+    db.update_account(aid, cached_5h_read_at=OLD_STAMP)
+    db.update_account_usage_cache(aid, clear_seven_day=True)
+    five, seven = _stamps(db.get_account(aid))
+    assert five == OLD_STAMP and seven >= before

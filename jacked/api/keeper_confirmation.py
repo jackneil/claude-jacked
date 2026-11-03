@@ -23,8 +23,10 @@ lines keep the name that log filters already use.
 
 import asyncio
 import logging
+import math
 
 from jacked.service.pill_text import finite_number
+from jacked.web.database import Database
 
 logger = logging.getLogger("jacked.api.usage_monitor")
 
@@ -54,12 +56,17 @@ def _read_landed(read) -> bool:
     return isinstance(read, dict) and not (read.get("_cached") or read.get("_backed_off"))
 
 
-def _read_since_ping(row: dict, state: dict) -> bool:
+def _read_since_ping(row: dict, state: dict, window: str | None = None) -> bool:
     """True when *row* holds a usage read stored after the keeper's ping.
 
-    Every stored usage read stamps ``usage_cached_at``; the ping time is the
-    state's ``last_ping_at``. A ping time or a stamp that is not a finite
-    number proves nothing.
+    Without *window*, any stored read counts: every usage write stamps
+    ``usage_cached_at``. With *window* ("5h" or "7d"), the read must have
+    ACCEPTED the reading of that window: only then does the window's own
+    stamp move (``Database.WINDOW_READ_STAMPS``). A rejected reading moves
+    the row stamp, never the window's. The ping time is the state's
+    ``last_ping_at`` in whole seconds, so only a stamp from a later whole
+    second proves a read after the ping. A ping time or a stamp that is not
+    a finite number proves nothing.
 
     >>> _read_since_ping({"usage_cached_at": 101}, {"last_ping_at": 100})
     True
@@ -69,10 +76,34 @@ def _read_since_ping(row: dict, state: dict) -> bool:
     False
     >>> _read_since_ping({"usage_cached_at": 101}, {"last_ping_at": 10**400})
     False
+    >>> row = {"usage_cached_at": 130, "cached_5h_read_at": 130.2, "cached_7d_read_at": 90.5}
+    >>> _read_since_ping(row, {"last_ping_at": 100}, "5h"), _read_since_ping(row, {"last_ping_at": 100}, "7d")
+    (True, False)
+    >>> _read_since_ping({"cached_7d_read_at": 100.9}, {"last_ping_at": 100}, "7d")  # the ping's own second
+    False
     """
     ping = finite_number(state.get("last_ping_at"))
-    stamp = finite_number(row.get("usage_cached_at"))
-    return ping is not None and stamp is not None and stamp > ping
+    column = Database.WINDOW_READ_STAMPS[window] if window else "usage_cached_at"
+    stamp = finite_number(row.get(column))
+    return ping is not None and stamp is not None and math.floor(stamp) > ping
+
+
+def _window_read_after(row: dict, window: str, instant: float) -> bool:
+    """True when a usage write after *instant* accepted the *window* reading.
+
+    *instant* is an exact time in epoch seconds. The keeper's read-back runs
+    within a second of its ping, so it compares the window's own stamp with
+    the time after the ping, not with the whole-second ``last_ping_at``.
+
+    >>> _window_read_after({"cached_7d_read_at": 100.6}, "7d", 100.5)
+    True
+    >>> _window_read_after({"cached_7d_read_at": 100.4, "usage_cached_at": 101}, "7d", 100.5)
+    False
+    >>> _window_read_after({}, "5h", 100.5)
+    False
+    """
+    stamp = finite_number(row.get(Database.WINDOW_READ_STAMPS[window]))
+    return stamp is not None and stamp > instant
 
 
 def _window_phrase(windows: list[str]) -> str:
@@ -127,29 +158,36 @@ def _pending_windows(state: dict) -> list[str]:
     return [name for name in ("5h", "7d") if name in raw]
 
 
-def _pending_confirmed(
-    row: dict, state: dict, windows: list[str], *, landed: bool = False
-) -> bool:
+def _pending_confirmed(row: dict, state: dict, windows: list[str]) -> bool:
     """True when *row* shows every pending window open (``_window_confirmed``).
 
     The evidence for a weekly window without a reset is a usage read stored
-    after the ping, or *landed* (the keeper's own read at the deadline). A
-    missing row confirms nothing.
+    after the ping that ACCEPTED the weekly reading
+    (:func:`_read_since_ping` with the window). A read that rejected the
+    weekly reading, or kept it, is no evidence for it, also when it stored
+    the other window. The keeper's own read at the deadline counts the same
+    way: the deadline is at least 15 minutes after the ping. A missing row
+    confirms nothing.
 
     >>> st = {"last_ping_at": 100}
-    >>> _pending_confirmed({"cached_7d_resets_at": None, "usage_cached_at": 90}, st, ["7d"])
+    >>> _pending_confirmed({"cached_7d_resets_at": None, "cached_7d_read_at": 90}, st, ["7d"])
     False
-    >>> _pending_confirmed({"cached_7d_resets_at": None, "usage_cached_at": 130}, st, ["7d"])
+    >>> _pending_confirmed({"cached_7d_resets_at": None, "cached_7d_read_at": 130}, st, ["7d"])
     True
-    >>> _pending_confirmed({}, st, ["7d"], landed=True)
+    >>> _pending_confirmed({"cached_7d_resets_at": None, "usage_cached_at": 130,
+    ...                     "cached_7d_read_at": 90}, st, ["7d"])
+    False
+    >>> _pending_confirmed({}, st, ["7d"])
     False
     """
     from jacked.api import usage_monitor as um
 
     if not row:
         return False
-    evidence = landed or _read_since_ping(row, state)
-    return all(um._window_confirmed(row, name, evidence=evidence) for name in windows)
+    return all(
+        um._window_confirmed(row, name, evidence=_read_since_ping(row, state, name))
+        for name in windows
+    )
 
 
 def _pending_deadline(state: dict, now: float) -> float:
@@ -258,7 +296,7 @@ async def _confirm_pending(
     Returns None when the account is not pending. Otherwise:
 
     a. Every pending window shows open on the row (:func:`_pending_confirmed`;
-       the regular poll stamps ``usage_cached_at``): ``ok``, returns
+       a poll read that accepts a window stamps that window): ``ok``, returns
        "confirmed". A confirmation is not a ping.
     b. Before the deadline (:func:`_pending_deadline`): :func:`_hold`.
     c. At or after the deadline: :func:`_settle_at_deadline`.
@@ -344,7 +382,7 @@ async def _settle_at_deadline(
         db, account_id, cc_token or primary_token, post_ping=False
     )
     fresh = await asyncio.to_thread(db.get_account, account_id) or {}
-    if _pending_confirmed(fresh, state, windows, landed=landed):
+    if _pending_confirmed(fresh, state, windows):
         finished = await _finish_pending(db, account_id, state, windows)
         return "confirmed" if finished else "lost"
     return await _record_unconfirmed(
@@ -358,14 +396,17 @@ async def _record_unconfirmed(
 ) -> str:
     """Record that the deadline passed with a pending window not visible.
 
-    The verdict is ``ping_ok_no_window``, ONE WARNING names the reason that
-    applied, and the backoff escalates one step. The retry delay counts from
-    the deadline, not from this sweep: a machine that slept through the
-    grace window and the window itself must not get a fresh delay in front
-    of the ping it needs now. The write is a swap on the pending ping, so
-    the step is computed for the write (``_backoff_step``), and the backoff
-    is armed in memory, and the WARNING logged, only when the write lands.
-    Returns "failed", or "lost" when the write did not land.
+    The verdict is ``ping_ok_no_window``, ONE WARNING names the windows that
+    are still not visible and the reason that applied, and the backoff
+    escalates one step. A pending window that *fresh* shows open is not
+    named: per-window evidence can confirm one window of two. The retry
+    delay counts from the deadline, not from this sweep: a machine that
+    slept through the grace window and the window itself must not get a
+    fresh delay in front of the ping it needs now. The write is a swap on
+    the pending ping, so the step is computed for the write
+    (``_backoff_step``), and the backoff is armed in memory, and the WARNING
+    logged, only when the write lands. Returns "failed", or "lost" when the
+    write did not land.
     """
     from jacked.api import usage_monitor as um
 
@@ -386,12 +427,14 @@ async def _record_unconfirmed(
         token_fp=fresh_fp,
     ):
         return "lost"
+    # Not empty: _settle_at_deadline came here because a window is missing.
+    still = [name for name in windows if not _pending_confirmed(fresh, state, [name])]
     logger.warning(
         "Window keeper: the %s of account %d %s still not visible after the "
         "confirmation wait (%s)",
-        _window_phrase(windows),
+        _window_phrase(still),
         account_id,
-        "are" if len(windows) > 1 else "is",
+        "are" if len(still) > 1 else "is",
         "the usage read landed with no window"
         if landed or _read_since_ping(fresh, state)
         else "the usage read did not land",

@@ -1,5 +1,7 @@
 """Database contracts for credential transactions and session observations."""
 
+import sqlite3
+
 from jacked.web.database import Database
 from jacked.web.credential_repository import DatabaseCredentialSwitchRepository
 from jacked.credentials.models import (
@@ -242,3 +244,61 @@ def test_a_row_written_before_the_identity_columns_still_recovers(tmp_path):
     assert restored.email is None
     assert restored.display_name is None
     assert restored.organization_name is None
+
+
+READ_STAMPS = ("cached_5h_read_at", "cached_7d_read_at")
+
+
+def _accounts_columns(path) -> list:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("PRAGMA table_info(accounts)").fetchall()
+    finally:
+        conn.close()
+
+
+def test_the_window_read_stamps_are_added_to_an_old_database(tmp_path):
+    """X3 (d): an old database gets both per-window read stamps, NULL, and
+    its rows keep every other value. A second open changes nothing."""
+    path = tmp_path / "old.db"
+    db = Database(str(path))
+    aid = db.create_account("old@test.com", "tok", 9_999_999_999)["id"]
+    db.update_account_usage_cache(aid, seven_day=40.0, seven_day_resets_at="2026-11-08T00:00:00+00:00")
+    db.close()
+    conn = sqlite3.connect(path)
+    for column in READ_STAMPS:
+        conn.execute(f"ALTER TABLE accounts DROP COLUMN {column}")  # the old schema
+    conn.commit()
+    before = conn.execute(
+        "SELECT id, cached_usage_7d, cached_7d_resets_at, usage_cached_at FROM accounts"
+    ).fetchall()
+    conn.close()
+
+    Database(str(path)).close()  # migrates
+    migrated = _accounts_columns(path)
+    Database(str(path)).close()  # and is idempotent
+
+    assert _accounts_columns(path) == migrated
+    types = {row[1]: row[2] for row in migrated}
+    assert {column: types.get(column) for column in READ_STAMPS} == {
+        "cached_5h_read_at": "REAL", "cached_7d_read_at": "REAL",
+    }
+    conn = sqlite3.connect(path)
+    try:
+        after = conn.execute(
+            "SELECT id, cached_usage_7d, cached_7d_resets_at, usage_cached_at FROM accounts"
+        ).fetchall()
+        stamps = conn.execute(f"SELECT {', '.join(READ_STAMPS)} FROM accounts").fetchall()
+    finally:
+        conn.close()
+    assert after == before
+    assert stamps == [(None, None)]  # no backfill: the row stamp proves no window
+
+
+def test_a_fresh_database_already_has_the_read_stamps(tmp_path):
+    path = tmp_path / "fresh.db"
+    Database(str(path)).close()
+    first = _accounts_columns(path)
+    Database(str(path)).close()
+    assert _accounts_columns(path) == first
+    assert set(READ_STAMPS) <= {row[1] for row in first}

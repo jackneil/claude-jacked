@@ -304,8 +304,10 @@ plan has none (keeper skip reason `no_session_window`); it can still ping such
 an account when its weekly window turned over. A ping is a success only when
 each window that caused it is open after the ping. A reset time in the future
 shows that a window is open. The API can omit the weekly reset time. A weekly
-window without a reset time is open when the usage read after the ping
-succeeds, or when the ping reply has window headers.
+window without a reset time is open when a usage read after the ping accepted
+the weekly reading, or when the ping reply has window headers. The
+confirmation evidence for a window is a usage read that accepted the reading
+of that window, stored per window (`cached_5h_read_at`, `cached_7d_read_at`).
 
 When a window is not open after the ping, the keeper records the ping as
 pending (`ping_pending`), not as a failure. The provider accepted the ping, but

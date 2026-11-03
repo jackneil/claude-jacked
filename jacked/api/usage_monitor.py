@@ -25,6 +25,7 @@ from jacked.api.keeper_confirmation import (
     _pending_reason,
     _read_landed,
     _window_phrase,
+    _window_read_after,
 )
 from jacked.service.pill_text import finite_number
 
@@ -2361,11 +2362,13 @@ def _note_keeper_skip(
     ``paused_until`` (the next active start) is display state kept apart
     from ``next_attempt_at``: the latter is a retry DEADLINE that the
     restart recovery honors, and a pause must never overwrite it. With
-    *expected* the write is a compare-and-swap (:func:`_write_keeper_state`).
-    Returns False when a needed write did not land; *state* then stays as
-    it was.
+    *expected* the write is a compare-and-swap (:func:`_write_keeper_state`)
+    that always runs, also when *state* already holds the note: *state* can
+    be an old read, and a lost swap is how the caller learns that the
+    account moved on. Returns False when a needed write did not land;
+    *state* then stays as it was.
     """
-    if state.get("skip_reason") == reason and (
+    if expected is None and state.get("skip_reason") == reason and (
         (reason != "backoff" and next_attempt_at is None and paused_until is None)
         or (next_attempt_at is not None and state.get("next_attempt_at") == next_attempt_at)
         or (paused_until is not None and state.get("paused_until") == paused_until)
@@ -2841,10 +2844,12 @@ def _window_confirmed(fresh: dict, kind: str, *, evidence: bool) -> bool:
 
     1. A future reset confirms either window.
     2. A 7d window with NO reset at all (``None``) is confirmed only by
-       *evidence* from after the ping: a usage read that landed (the API
-       omits the weekly reset for days at a time), or this ping's own window
-       headers (a counted request starts the weekly window). A row that
-       nothing new wrote proves nothing.
+       *evidence* from after the ping: a usage read that ACCEPTED the weekly
+       reading (the API omits the weekly reset for days at a time; the
+       window's own stamp, ``cached_7d_read_at``, shows the accepted read),
+       or this ping's own window headers (a counted request starts the
+       weekly window). A row that nothing new wrote proves nothing, and a
+       read that rejected the weekly reading proves nothing about it.
     3. A lapsed or unreadable reset never confirms a window, an empty string
        included: scheduling may read a fresh row as "running", confirmation
        may not.
@@ -2887,10 +2892,12 @@ async def _keeper_record_success(
     reset; for a weekly window with no reset at all, evidence from after this
     ping; never a lapsed or unreadable reset). The API omits the weekly reset for days at a
     time (one account here read ``resets_at: null`` for 9 days), so a weekly
-    window with no reset is confirmed by a read that landed, or by this
+    window with no reset is confirmed by a read-back that landed and
+    ACCEPTED the weekly reading after the ping (the window's own stamp,
+    :func:`jacked.api.keeper_confirmation._window_read_after`), or by this
     ping's own window headers (a counted request starts the weekly window).
     A 200 with no window headers and a read that never lands confirms
-    nothing.
+    nothing; nor does a read-back that rejected the weekly reading.
 
     The verdict is ``ok`` when every needed window is confirmed. Otherwise
     the provider accepted the ping and the window is not visible yet: the
@@ -2926,12 +2933,19 @@ async def _keeper_record_success(
             )
     landed = await _keeper_usage_read(db, account_id, good_token, post_ping=True)
     fresh = await asyncio.to_thread(db.get_account, account_id) or {}
-    # A deleted row (gone mid-sweep) confirms nothing.
+    # A deleted row (gone mid-sweep) confirms nothing. The evidence is per
+    # window: the ping's own headers, or a read-back that landed and
+    # accepted that window's reading after the ping (*now*).
     missing = [
         name
         for name, needed_before in (("5h", needs_5h), ("7d", needs_7d))
         if needed_before and not (
-            fresh and _window_confirmed(fresh, name, evidence=landed or bool(cache_fields))
+            fresh and _window_confirmed(
+                fresh,
+                name,
+                evidence=bool(cache_fields)
+                or (landed and _window_read_after(fresh, name, now)),
+            )
         )
     ]
     # The row may hold a rotated token now: key the state on the CURRENT

@@ -19,7 +19,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import jacked.api.keeper_confirmation as kc
 import jacked.api.usage_monitor as um
+import jacked.web.auth as auth_mod
 from jacked.web.auth import CCRefreshOutcome, CCRefreshResult
 from jacked.web.database import Database
 from jacked.web.window_keeper import PingResult
@@ -1878,14 +1880,17 @@ class TestPendingConfirmation:
 
     def test_a_weekly_window_without_a_reset_needs_a_read_after_the_ping(self, db):
         """The API omits the weekly reset for days at a time: a pending 7d
-        window with no reset is confirmed by a read stored after the ping,
-        never by the read the row held before it."""
+        window with no reset is confirmed by a read stored after the ping
+        that accepted the weekly reading, never by the read the row held
+        before it, and never by the row stamp alone (X3)."""
         aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 3 * 86400)
         _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))
         st = _state(db, aid)
         assert st["pending_windows"] == ["7d"]
         assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is False
-        db.update_account(aid, usage_cached_at=int(st["last_ping_at"]) + 30)  # a read after the ping
+        db.update_account(aid, usage_cached_at=int(st["last_ping_at"]) + 30)  # a row write only
+        assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is False
+        db.update_account(aid, cached_7d_read_at=st["last_ping_at"] + 30)  # an accepted weekly read
         assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is True
         assert _state(db, aid)["last_status"] == "ok"
 
@@ -1897,7 +1902,12 @@ class TestPendingConfirmation:
         pings = _Pings({"cc-tok": NO_HEADERS})
         _run_pass(db, pings)
         st = _state(db, aid)
-        db.update_account(aid, usage_cached_at=int(st["last_ping_at"]) + 30)  # the poll read
+        # The poll read: it accepted the weekly reading after the ping.
+        db.update_account(
+            aid,
+            usage_cached_at=int(st["last_ping_at"]) + 30,
+            cached_7d_read_at=st["last_ping_at"] + 30,
+        )
         assert _run_pass(db, pings) == 0
         assert pings.calls == ["cc-tok"]
         assert _state(db, aid)["last_status"] == "ok"
@@ -2053,6 +2063,84 @@ class TestKeeperStateCompareAndSwap:
         with pytest.raises(ValueError):
             db.set_keeper_state_if(aid, {}, nonsense=1)
 
+    def test_two_databases_on_one_file_never_both_win_one_generation(self, tmp_path, monkeypatch):
+        """X2: the instance write lock does not reach a second Database object
+        (or a second process) on the same file. The poll's swap reads the
+        pending ping first; the sweep's swap on the same generation runs
+        while the poll is between its read and its write. The swap that read
+        first holds the database write lock from its read to its commit, so
+        the sweep waits, then reads the confirmation and writes nothing."""
+        path = str(tmp_path / "shared.db")
+        poll_db, sweep_db = Database(path), Database(path)
+        aid = _mk(poll_db)
+        poll_db.set_keeper_state(aid, last_status="ping_pending", last_ping_at=100, pending_until=900)
+        gens = [
+            {
+                "last_status": "ping_pending",
+                "last_ping_at": _state(each, aid)["last_ping_at"],
+            }
+            for each in (poll_db, sweep_db)
+        ]
+        assert gens == [self.GEN, self.GEN]  # both writers read the same generation
+        poll_read, sweep_done = threading.Event(), threading.Event()
+        real_parse = Database.parse_keeper_state
+
+        def _parse_then_wait(raw):
+            state = real_parse(raw)
+            if threading.current_thread().name == "poll" and not poll_read.is_set():
+                poll_read.set()
+                # Without the write lock the sweep commits here. With it the
+                # sweep cannot commit before this swap does: the wait ends.
+                sweep_done.wait(timeout=0.5)
+            return state
+
+        monkeypatch.setattr(Database, "parse_keeper_state", staticmethod(_parse_then_wait))
+        results: dict = {}
+
+        def _poll():
+            results["poll"] = poll_db.set_keeper_state_if(
+                aid, gens[0], last_status="ok", pending_until=None
+            )
+
+        def _sweep():
+            assert poll_read.wait(timeout=10)
+            results["sweep"] = sweep_db.set_keeper_state_if(
+                aid, gens[1], last_status="ping_ok_no_window", pending_until=None
+            )
+            sweep_done.set()
+
+        threads = [threading.Thread(target=_poll, name="poll"), threading.Thread(target=_sweep, name="sweep")]
+        for each in threads:
+            each.start()
+        for each in threads:
+            each.join(timeout=60)
+        monkeypatch.undo()
+        assert results == {"poll": True, "sweep": False}
+        st = _state(Database(path), aid)
+        assert (st["last_status"], st["pending_until"]) == ("ok", None)
+
+    def test_the_write_applies_only_to_the_state_text_that_it_read(self, db, monkeypatch):
+        """The UPDATE is conditional on the keeper_state text that the SELECT
+        read, beside the write lock: a state that changed under the read is
+        never overwritten, and the swap reports the loss (rowcount 0)."""
+        aid = _mk(db)
+        db.set_keeper_state(aid, last_status="ping_pending", last_ping_at=100)
+        newer = json.dumps({"last_status": "ok", "last_ping_at": 100}, sort_keys=True)
+        real_parse = Database.parse_keeper_state
+
+        def _parse_then_change(raw):
+            if raw != newer:
+                # The same connection, so the write lock does not stop it.
+                db._get_connection().execute(
+                    "UPDATE accounts SET keeper_state = ? WHERE id = ?", (newer, aid)
+                )
+            return real_parse(raw)
+
+        monkeypatch.setattr(Database, "parse_keeper_state", staticmethod(_parse_then_change))
+        assert db.set_keeper_state_if(aid, self.GEN, last_status="ping_ok_no_window") is False
+        monkeypatch.undo()
+        assert db.get_account(aid)["keeper_state"] == newer
+
 
 def _poll_confirms(db, aid) -> bool:
     """A usage poll stores the open 5h window and confirms the pending ping.
@@ -2119,6 +2207,52 @@ class TestPendingTransitionsAreSwaps:
         # The count that the old read restored does not outlive the lost swap.
         assert aid not in um._ping_backoff
         assert pings.calls == ["cc-tok"]
+
+    def test_a_stale_read_that_already_holds_the_confirming_note_still_runs_the_swap(self, db):
+        """X1: the pass read the account after an earlier hold wrote its
+        "confirming" note, and a poll then confirmed the ping and cleared the
+        backoff. The note in the old read equals the note the hold would
+        write, but the hold must still run its swap: the lost swap is the only
+        signal that drops the count that the old read restored. Otherwise the
+        next failed ping escalates from that obsolete count."""
+        aid = _mk_5h_lapsed(db)
+        um._ping_backoff[aid] = {"fails": 2, "skip_until": 0.0, "token_fp": _fp(db, aid)}
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)  # pending until the deadline, count 2
+        _run_pass(db, pings)  # the hold writes the confirming note
+        stale = db.get_account(aid)  # the next pass read the account here
+        st = Database.parse_keeper_state(stale["keeper_state"])
+        assert (st["skip_reason"], st["next_attempt_at"]) == ("confirming", st["pending_until"])
+        assert _poll_confirms(db, aid) is True
+        assert aid not in um._ping_backoff  # the poll cleared the backoff
+        confirmed = db.get_account(aid)["keeper_state"]
+        with patch.object(db, "list_accounts", return_value=[stale]):
+            assert _run_pass(db, pings) == 0
+        assert db.get_account(aid)["keeper_state"] == confirmed
+        assert aid not in um._ping_backoff
+        # The next failed ping escalates from the first step, not from 2.
+        db.update_account(aid, cached_5h_resets_at=_iso_in(-60))
+        failing = _Pings({"cc-tok": _err(400, "invalid_request_error")})
+        started = time.time()
+        _run_pass(db, failing)
+        assert failing.calls == ["cc-tok"]
+        st = _state(db, aid)
+        assert (st["last_status"], st["backoff_fails"]) == ("error", 1)
+        assert um._ping_backoff[aid]["fails"] == 1
+        assert st["next_attempt_at"] - started == pytest.approx(600, abs=2)
+
+    def test_an_unconditional_note_that_changes_nothing_writes_nothing(self, db):
+        """The "only on change" rule stays for the writers without a swap:
+        the same reason again does not rewrite the state (updated_at
+        included)."""
+        aid = _mk(db)
+        acct = db.get_account(aid)
+        state = {}
+        assert um._note_keeper_skip(db, acct, state, "keeper_disabled") is True
+        before = db.get_account(aid)["keeper_state"]
+        with patch.object(db, "set_keeper_state", side_effect=AssertionError("no write")):
+            assert um._note_keeper_skip(db, acct, state, "keeper_disabled") is True
+        assert db.get_account(aid)["keeper_state"] == before
 
     def test_a_deadline_confirmation_after_a_poll_confirmation_changes_nothing(self, db):
         """The deadline twin of the stale note: the pass read the account
@@ -2191,6 +2325,136 @@ class TestPendingTransitionsAreSwaps:
             "poll_finish": ("ok", None),
         }[path]
         assert (st["last_status"], st["skip_reason"]) == expected_status
+
+
+# ---------------------------------------------------------------------------
+# M6 review wave 2 (X3): the evidence for a weekly window without a reset is
+# a usage read that ACCEPTED the weekly reading, stored after the ping. Each
+# window has its own read stamp (cached_5h_read_at, cached_7d_read_at): a
+# rejected reading moves the row stamp (usage_cached_at), never the window's.
+# ---------------------------------------------------------------------------
+
+
+def _real_poll(db, aid, payload) -> bool:
+    """A real usage poll: fetch_usage gets a 200 that carries *payload* (only
+    the HTTP client is mocked) and stores it with the real cache writer, then
+    the poll's confirmation runs. Returns what the confirmation did."""
+    db.update_account(aid, usage_cached_at=int(time.time()) - 3600)  # past the pacing ceiling
+    auth_mod._account_usage_state.pop(aid, None)
+    reply = MagicMock(status_code=200, headers={})
+    reply.json.return_value = payload
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=reply)
+    with (
+        patch.object(auth_mod.httpx, "AsyncClient", return_value=client),
+        patch.object(auth_mod, "fetch_profile", new=AsyncMock()),
+    ):
+        assert asyncio.run(auth_mod.fetch_usage(aid, db)) is payload
+    client.get.assert_awaited_once()
+    return asyncio.run(um._confirm_pending_from_poll(db, aid))
+
+
+def _pending_reset_less_week(db, *, both: bool) -> tuple[int, dict]:
+    """A ping the provider accepted for a weekly window without a reset (and
+    for a lapsed 5h window too when *both*), whose read-back did not land:
+    pending. The ping time moves one minute back, so that a read in the test
+    is from a later whole second; the last read that accepted the weekly
+    reading is one hour before the ping."""
+    if both:
+        aid = _mk(db)
+        db.update_account(
+            aid,
+            cached_5h_resets_at=_iso_in(-60),
+            cached_7d_resets_at=None,
+            usage_cached_at=int(time.time()) - 3 * 86400,
+        )
+    else:
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 3 * 86400)
+    _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))  # the read-back does not land
+    ping = _state(db, aid)["last_ping_at"] - 60
+    db.set_keeper_state(aid, last_ping_at=ping)
+    db.update_account(aid, cached_7d_read_at=ping - 3600)
+    return aid, _state(db, aid)
+
+
+NAN_WEEK = {"utilization": float("nan"), "resets_at": None}
+
+
+class TestWindowReadEvidence:
+    @pytest.mark.parametrize("both", [False, True], ids=["weekly-only", "5h-and-7d"])
+    def test_a_rejected_weekly_reading_never_confirms_a_reset_less_week(self, db, both):
+        """X3 (a), the reviewer's trigger: a later 200 whose weekly
+        utilization is NaN (beside a valid 5h reading) moved usage_cached_at
+        past the ping, and that stamp confirmed a weekly window that the
+        provider never showed open."""
+        aid, st = _pending_reset_less_week(db, both=both)
+        windows = ["5h", "7d"] if both else ["7d"]
+        assert st["pending_windows"] == windows
+        payload = {"seven_day": dict(NAN_WEEK)}
+        if both:
+            payload["five_hour"] = {"utilization": 12.0, "resets_at": _iso_in(4 * 3600)}
+        assert _real_poll(db, aid, payload) is False
+        row = db.get_account(aid)
+        assert row["usage_cached_at"] > st["last_ping_at"]  # the row stamp moved
+        assert row["cached_7d_read_at"] == st["last_ping_at"] - 3600  # the weekly one did not
+        after = _state(db, aid)
+        assert (after["last_status"], after["pending_windows"]) == ("ping_pending", windows)
+        assert kc._pending_confirmed(row, after, ["7d"]) is False
+        if both:
+            # The 5h reading was accepted: that window shows open.
+            assert row["cached_5h_read_at"] > st["last_ping_at"]
+            assert kc._pending_confirmed(row, after, ["5h"]) is True
+
+    def test_an_accepted_weekly_reading_after_the_ping_confirms_a_reset_less_week(self, db):
+        """X3 (b): a 200 whose weekly reading has a percent and no reset (the
+        API omits the weekly reset for days at a time) is accepted, and it
+        confirms the week."""
+        aid, st = _pending_reset_less_week(db, both=False)
+        payload = {**_ultra_payload(), "seven_day": {"utilization": 41.0, "resets_at": None}}
+        assert _real_poll(db, aid, payload) is True
+        row = db.get_account(aid)
+        assert row["cached_7d_read_at"] > st["last_ping_at"]
+        assert (row["cached_usage_7d"], row["cached_7d_resets_at"]) == (41.0, None)
+        assert _state(db, aid)["last_status"] == "ok"
+
+    def test_a_read_back_that_rejected_the_weekly_reading_is_no_evidence(self, db):
+        """X3 at the keeper's own read-back: the read landed, but it rejected
+        the weekly reading, and the ping carried no window headers. The week
+        is pending, not ok."""
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 7200)
+        payload = {**_ultra_payload(), "seven_day": dict(NAN_WEEK)}
+
+        async def _read_back(account_id, db_, **_kw):
+            db_.update_account_usage_cache(
+                account_id, raw=payload, **auth_mod.usage_cache_updates(payload)
+            )
+            return payload
+
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_read_back))
+        st = _state(db, aid)
+        assert (st["last_status"], st["pending_windows"], st["pending_reason"]) == (
+            "ping_pending", ["7d"], "read_no_window",
+        )
+
+    def test_the_deadline_warning_names_only_the_window_still_not_visible(self, db, caplog):
+        """Per-window evidence can confirm one window of two: the 5h reading
+        shows open, the weekly reading was rejected. The WARNING at the
+        deadline names the weekly window only."""
+        aid, _st = _pending_reset_less_week(db, both=True)
+        payload = {
+            "five_hour": {"utilization": 12.0, "resets_at": _iso_in(4 * 3600)},
+            "seven_day": dict(NAN_WEEK),
+        }
+        assert _real_poll(db, aid, payload) is False
+        _expire_pending(db, aid)
+        with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
+            _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))
+        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+        warnings = _keeper_logs(caplog, logging.WARNING)
+        assert len(warnings) == 1, warnings
+        assert f"the 7d window of account {aid} is still not visible" in warnings[0]
 
 
 @pytest.mark.parametrize(
