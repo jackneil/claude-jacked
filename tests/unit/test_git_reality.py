@@ -49,6 +49,15 @@ def root(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _subcommand(argv) -> str:
+    """The git subcommand in a hook argv: the first word after ``-C <cwd>``
+    and the ``-c key=value`` config overrides the hook puts on every call."""
+    rest = list(argv[3:])
+    while rest and rest[0] == "-c":
+        rest = rest[2:]
+    return rest[0]
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     proc = subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -92,7 +101,7 @@ def _spy_on_git(monkeypatch) -> list[str]:
     calls: list[str] = []
 
     def _spy(argv, **kwargs):
-        calls.append(argv[3])
+        calls.append(_subcommand(argv))
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(git_reality.subprocess, "run", _spy)
@@ -478,7 +487,7 @@ class TestFailures:
         real_run = subprocess.run
 
         def _run(argv, **kwargs):
-            if argv[3] == failing:
+            if _subcommand(argv) == failing:
                 return subprocess.CompletedProcess(argv, 128, b"", b"fatal: boom")
             return real_run(argv, **kwargs)
 
@@ -507,7 +516,7 @@ class TestFailures:
         real_run = subprocess.run
 
         def _run(argv, **kwargs):
-            if argv[3] == "log":
+            if _subcommand(argv) == "log":
                 return subprocess.CompletedProcess(argv, 0, b"abc1234\x1fbad \xff\xfe bytes\x1f\x00", b"")
             return real_run(argv, **kwargs)
 
@@ -534,7 +543,7 @@ class TestGitCalls:
         monkeypatch.setattr(git_reality.subprocess, "run", _spy)
         assert _emit(repo)
 
-        assert [argv[3] for argv, _ in calls] == ["rev-parse", "branch", "log", "status"]
+        assert [_subcommand(argv) for argv, _ in calls] == ["rev-parse", "branch", "log", "status"]
         for argv, kwargs in calls:
             assert argv[1:3] == ["-C", str(repo)]
             assert kwargs["timeout"] == git_reality.GIT_TIMEOUT_S == 3
@@ -548,6 +557,47 @@ class TestGitCalls:
     @pytest.mark.skipif(
         not shebang_exec_supported(), reason="the fake gpg program is a shebang script"
     )
+    def test_a_repo_config_cannot_make_status_run_a_fsmonitor_program(self, root):
+        """A repo can set core.fsmonitor to a program in .git/config; git
+        status then runs it to learn which files changed. The hook reads an
+        untrusted checkout, so it overrides that key on the command line."""
+        repo = _repo(root)
+        _commit(repo, "base\n")
+        marker = root / "fsmonitor-ran.txt"
+        fake_monitor = write_python_shim(
+            root, "fake-fsmonitor",
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+            "sys.exit(1)\n",
+        )
+        _git(repo, "config", "core.fsmonitor", str(fake_monitor))
+        # Precondition: a plain git status in this repo does run the program.
+        _git(repo, "status", "--porcelain", check=False)
+        assert marker.exists(), "git did not consult core.fsmonitor; the test cannot prove anything"
+        marker.unlink()
+
+        block = git_reality.emit_git_reality(str(repo))
+
+        assert "working tree:" in block
+        assert not marker.exists(), "the hook ran the repository's fsmonitor program"
+
+    def test_every_git_call_carries_the_config_overrides(self, root, monkeypatch):
+        repo = _repo(root)
+        _commit(repo, "base\n")
+        seen = []
+        real_run = subprocess.run
+
+        def record(argv, *a, **k):
+            seen.append(list(argv))
+            return real_run(argv, *a, **k)
+
+        monkeypatch.setattr(git_reality.subprocess, "run", record)
+        git_reality.emit_git_reality(str(repo))
+        assert seen, "no git call recorded"
+        for argv in seen:
+            joined = " ".join(argv)
+            assert "core.fsmonitor=false" in joined and "core.hooksPath=" in joined, argv
+
     def test_a_repo_config_cannot_make_the_log_run_gpg(self, root):
         """A repo can set log.showSignature and gpg.program in .git/config.
         ``git log`` then runs that program for each signed commit."""

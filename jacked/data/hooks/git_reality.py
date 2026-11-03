@@ -163,6 +163,20 @@ def _build(cwd: str, line_cap: int, token_cap: int) -> str:
     return _render(branch, _commit_lines(log), _count_status(status), line_cap, token_cap)
 
 
+# Repository config can name programs that git runs during a read: a
+# ``core.fsmonitor`` command on ``git status``, hooks under ``core.hooksPath``.
+# The hook reads an untrusted checkout, so each call overrides those keys on
+# the command line (``-c`` beats the repository config) and the untracked
+# cache, which the fsmonitor feeds. ``protocol.allow=never`` closes remote
+# access, which none of the four reads needs.
+_CONFIG_OVERRIDES = (
+    "-c", "core.fsmonitor=false",
+    "-c", "core.untrackedCache=false",
+    "-c", f"core.hooksPath={os.devnull}",
+    "-c", "protocol.allow=never",
+)
+
+
 def _git(git: str, cwd: str, *args: str, required: bool = True) -> str | None:
     """Run ``git -C <cwd> <args>`` and return its stdout as text.
 
@@ -173,7 +187,7 @@ def _git(git: str, cwd: str, *args: str, required: bool = True) -> str | None:
     env = dict(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
     proc = subprocess.run(
-        [git, "-C", cwd, *args],
+        [git, "-C", cwd, *_CONFIG_OVERRIDES, *args],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=GIT_TIMEOUT_S,
