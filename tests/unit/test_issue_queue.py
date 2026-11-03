@@ -74,11 +74,18 @@ def _items(count: int) -> list[dict]:
     return [{"number": n, "title": f"Issue number {n}", "labels": []} for n in range(1, count + 1)]
 
 
-def _seed(repo: Path, items: list[dict], *, refreshed_at: datetime = NOW, **extra) -> Path:
+def _seed(
+    repo: Path, items: list[dict], *, refreshed_at: datetime = NOW,
+    fill_association: bool = True, **extra,
+) -> Path:
+    """Write a cache file. Items without an author association get OWNER,
+    the way the refresher writes them, unless ``fill_association`` is False."""
     slug = issue_queue.repo_slug(repo)
     assert slug
     path = issue_queue.cache_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if fill_association:
+        items = [{"author_association": "OWNER", **item} for item in items]
     payload = {
         "remote": "https://github.com/acme/widgets",
         "refreshed_at": refreshed_at.isoformat(),
@@ -427,6 +434,40 @@ class TestEmitIssueQueue:
 
         assert issue_queue.emit_issue_queue(str(repo), now=NOW) == ""
 
+    def test_a_cache_item_without_an_author_association_prints_nothing(self, home, tmp_path, caplog):
+        repo = _repo(tmp_path)
+        _seed(repo, [{"number": 7, "title": "Old cache item", "labels": []}], fill_association=False)
+        caplog.set_level(logging.DEBUG, logger=HOOK_LOGGER)
+
+        assert issue_queue.emit_issue_queue(str(repo), now=NOW) == ""
+        assert any("author association" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("association", [None, 3, "CONTRIBUTOR", "NONE", "FIRST_TIME_CONTRIBUTOR", "owner"])
+    def test_an_untrusted_unlabeled_cache_item_prints_nothing(self, home, tmp_path, caplog, association):
+        """A hostile cache cannot widen the set that the refresher keeps."""
+        repo = _repo(tmp_path)
+        _seed(repo, [
+            {"number": 8, "title": "Trusted", "labels": [], "author_association": "OWNER"},
+            {"number": 7, "title": "Stranger", "labels": ["bug"], "author_association": association},
+        ])
+        caplog.set_level(logging.DEBUG, logger=HOOK_LOGGER)
+
+        assert issue_queue.emit_issue_queue(str(repo), now=NOW) == ""
+        assert any("author association" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("association", ["OWNER", "MEMBER", "COLLABORATOR"])
+    def test_a_trusted_author_prints_without_a_queue_label(self, home, tmp_path, association):
+        repo = _repo(tmp_path)
+        _seed(repo, [{"number": 7, "title": "Mine", "labels": [], "author_association": association}])
+
+        assert _lines(issue_queue.emit_issue_queue(str(repo), now=NOW))[2] == "#7i Mine"
+
+    def test_a_queue_label_lets_any_author_print(self, home, tmp_path):
+        repo = _repo(tmp_path)
+        _seed(repo, [{"number": 7, "title": "Triaged", "labels": ["next"], "author_association": "NONE"}])
+
+        assert _lines(issue_queue.emit_issue_queue(str(repo), now=NOW))[2] == "#7i Triaged [next]"
+
     @pytest.mark.parametrize("bad", [
         "not json at all",
         json.dumps(["a", "list"]),
@@ -593,8 +634,10 @@ GRAPHQL_OK = {
             "issues": {
                 "totalCount": 2,
                 "nodes": [
-                    {"number": 12, "title": "Fix the gate", "labels": {"nodes": [{"name": "next"}]}},
-                    {"number": 9, "title": "Old thing", "labels": {"nodes": []}},
+                    {"number": 12, "title": "Fix the gate", "authorAssociation": "OWNER",
+                     "labels": {"nodes": [{"name": "next"}]}},
+                    {"number": 9, "title": "Old thing", "authorAssociation": "MEMBER",
+                     "labels": {"nodes": []}},
                 ],
             }
         }
@@ -686,23 +729,25 @@ class TestRefreshRepo:
             "remote": "https://github.com/acme/widgets",
             "refreshed_at": "2026-11-03T12:00:00+00:00",
             "open_count": 2,
+            "github_open_count": 2,
             "items": [
-                {"number": 12, "title": "Fix the gate", "labels": ["next"]},
-                {"number": 9, "title": "Old thing", "labels": []},
+                {"number": 12, "title": "Fix the gate", "labels": ["next"], "author_association": "OWNER"},
+                {"number": 9, "title": "Old thing", "labels": [], "author_association": "MEMBER"},
             ],
         }
 
     def test_the_cache_keeps_only_the_queue_labels(self, home, tmp_path, fakes):
         labels = [{"name": "bug"}, {"name": "punted"}, {"name": "x" * 50}, {"name": "next"}]
         answer = {"data": {"repository": {"issues": {"totalCount": 1, "nodes": [
-            {"number": 4, "title": "t", "labels": {"nodes": labels}}]}}}}
+            {"number": 4, "title": "t", "authorAssociation": "OWNER", "labels": {"nodes": labels}}]}}}}
         fakes.run.gh = (0, json.dumps(answer), "")
         repo = _repo(tmp_path)
 
         assert refresh.refresh_repo(str(repo), now=NOW) is True
 
         data = json.loads(issue_queue.cache_path(issue_queue.repo_slug(repo)).read_text(encoding="utf-8"))
-        assert data["items"] == [{"number": 4, "title": "t", "labels": ["punted", "next"]}]
+        assert data["items"] == [
+            {"number": 4, "title": "t", "labels": ["punted", "next"], "author_association": "OWNER"}]
         assert set(refresh.LABELS) == set(issue_queue.QUEUE_LABELS)
 
     def test_the_hook_reads_what_the_refresher_wrote(self, home, tmp_path, fakes):
@@ -712,6 +757,64 @@ class TestRefreshRepo:
         block = issue_queue.emit_issue_queue(str(repo), now=NOW + timedelta(minutes=5))
 
         assert _lines(block)[2:4] == ["#12i Fix the gate [next]", "#9i Old thing"]
+
+    def test_only_trusted_authors_or_queue_labels_are_cached(self, home, tmp_path, fakes):
+        """R1: on a public repo anyone can open an issue, so a stranger's title
+        must not reach every session start. Labels need triage rights."""
+        associations = ["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR", "NONE", "FIRST_TIME_CONTRIBUTOR"]
+        nodes, number = [], 100
+        for association in associations:
+            for labels in ([], [{"name": "next"}]):
+                number -= 1
+                tag = "labeled" if labels else "plain"
+                nodes.append({"number": number, "title": f"{association} {tag}",
+                              "authorAssociation": association, "labels": {"nodes": labels}})
+        answer = {"data": {"repository": {"issues": {"totalCount": len(nodes), "nodes": nodes}}}}
+        fakes.run.gh = (0, json.dumps(answer), "")
+        repo = _repo(tmp_path)
+
+        assert refresh.refresh_repo(str(repo), now=NOW) is True
+
+        data = json.loads(issue_queue.cache_path(issue_queue.repo_slug(repo)).read_text(encoding="utf-8"))
+        titles = [item["title"] for item in data["items"]]
+        assert titles == [
+            "OWNER plain", "OWNER labeled", "MEMBER plain", "MEMBER labeled",
+            "COLLABORATOR plain", "COLLABORATOR labeled", "CONTRIBUTOR labeled",
+            "NONE labeled", "FIRST_TIME_CONTRIBUTOR labeled",
+        ]
+        assert data["open_count"] == 9
+        assert data["github_open_count"] == 12
+        block = issue_queue.emit_issue_queue(str(repo), now=NOW)
+        for association in ("CONTRIBUTOR", "NONE", "FIRST_TIME_CONTRIBUTOR"):
+            assert f"{association} plain" not in block
+            assert f"{association} labeled" in block
+        assert "[trimmed:" not in block
+
+    def test_issues_past_the_page_still_count_in_open_count(self, home, tmp_path, fakes):
+        """The refresher reads one page. An issue past the page has an author
+        that the refresher did not read, so it counts, and the marker never
+        loses an issue."""
+        nodes = [
+            {"number": 9, "title": "mine", "authorAssociation": "OWNER", "labels": {"nodes": []}},
+            {"number": 8, "title": "stranger", "authorAssociation": "NONE", "labels": {"nodes": []}},
+        ]
+        answer = {"data": {"repository": {"issues": {"totalCount": 250, "nodes": nodes}}}}
+        fakes.run.gh = (0, json.dumps(answer), "")
+        repo = _repo(tmp_path)
+
+        assert refresh.refresh_repo(str(repo), now=NOW) is True
+
+        data = json.loads(issue_queue.cache_path(issue_queue.repo_slug(repo)).read_text(encoding="utf-8"))
+        assert [item["title"] for item in data["items"]] == ["mine"]
+        assert data["open_count"] == 1 + 248
+        assert data["github_open_count"] == 250
+
+    def test_the_query_asks_for_the_author_association(self):
+        assert "authorAssociation" in refresh._QUERY
+
+    def test_the_refresher_and_the_hook_share_one_keep_rule(self):
+        assert refresh.kept_issue is issue_queue.kept_issue
+        assert issue_queue.TRUSTED_ASSOCIATIONS == frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
     def test_the_git_call_carries_the_shared_config_overrides(
         self, home, tmp_path, fakes, monkeypatch
@@ -842,7 +945,11 @@ class TestRefreshRepo:
         json.dumps({"data": {"repository": None}}),
         json.dumps({"data": {"repository": {"issues": {"totalCount": "x", "nodes": []}}}}),
         json.dumps({"data": {"repository": {"issues": {"totalCount": 1, "nodes": [{"number": 1}]}}}}),
-    ])
+        json.dumps({"data": {"repository": {"issues": {"totalCount": 1, "nodes": [
+            {"number": 1, "title": "t", "labels": {"nodes": []}}]}}}}),
+        json.dumps({"data": {"repository": {"issues": {"totalCount": 1, "nodes": [
+            {"number": 1, "title": "t", "authorAssociation": None, "labels": {"nodes": []}}]}}}}),
+    ], ids=["not-json", "errors", "no-repo", "bad-total", "bad-node", "no-association", "null-association"])
     def test_an_unusable_gh_answer_writes_nothing(self, home, tmp_path, fakes, caplog, body):
         fakes.run.gh = (0, body, "")
         repo = _repo(tmp_path)
@@ -1310,6 +1417,18 @@ class TestRuleText:
 
         assert "# Open work (GitHub)" in readme
         assert "docs/architecture/work-ledger.html" in readme
+
+    def test_the_docs_say_who_appears_in_the_block(self):
+        """R1: every doc that describes the block names the author filter."""
+        phrase = "opened by the owner, a member or a collaborator of the repo"
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        page = (ROOT / "docs" / "architecture" / "work-ledger.html").read_text(encoding="utf-8")
+        hook_doc = issue_queue.__doc__ or ""
+
+        assert readme.count(phrase) == 2  # the open work section and the Unreleased row
+        assert phrase in " ".join(page.split())
+        assert phrase in " ".join(hook_doc.split())
+        assert "github_open_count" in page
 
     def test_the_docs_say_that_a_cache_outlives_gh_for_24_hours(self):
         """A fresh cache still prints when gh is gone: no doc may promise silence."""

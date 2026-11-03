@@ -947,7 +947,8 @@ def _seed_queue(repo: Path, count: int) -> Path:
     path.write_text(json.dumps({
         "remote": "https://github.com/acme/widgets",
         "refreshed_at": datetime.now(timezone.utc).isoformat(),
-        "items": [{"number": n, "title": f"Queued item {n}", "labels": []} for n in range(1, count + 1)],
+        "items": [{"number": n, "title": f"Queued item {n}", "labels": [], "author_association": "OWNER"}
+                  for n in range(1, count + 1)],
     }), encoding="utf-8")
     return path
 
