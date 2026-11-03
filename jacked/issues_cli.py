@@ -13,6 +13,8 @@ import click
 from rich.console import Console
 from rich.markup import escape
 
+from jacked.issue_labels import QUEUE_LABEL_NAMES
+
 console = Console()
 
 
@@ -22,7 +24,7 @@ def issues_group():
 
 
 @issues_group.command(name="ensure-label")
-@click.argument("name", type=click.Choice(["in-flight", "next", "punted"]))
+@click.argument("name", type=click.Choice(QUEUE_LABEL_NAMES))
 def issues_ensure_label(name: str):
     """Create the queue label NAME in this repo if it does not exist.
 

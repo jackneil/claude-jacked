@@ -30,10 +30,10 @@ with no ``author_association``, or with an author outside
 ``TRUSTED_ASSOCIATIONS`` and no queue label, gives no block. Thus an edited
 cache file cannot add a stranger's issue.
 
-``open_count`` is the number of kept issues, plus each open issue past the
-page that the refresher reads (the refresher cannot see the author of those
-issues, so it counts them). The trim marker counts every issue in
-``open_count`` that the block does not show. ``github_open_count`` is the
+``open_count`` is the number of kept issues, plus each open issue that the
+refresher did not read (it reads the newest page and one page for each queue
+label, so it cannot see the author of the others, and it counts them). The
+trim marker counts every issue in ``open_count`` that the block does not show. ``github_open_count`` is the
 number of open issues on GitHub, for reference only; the step does not
 read it.
 
@@ -41,7 +41,9 @@ The slug: ``repo_slug`` finds the repository on the file system only (a
 ``.git`` folder, or a ``.git`` file of a linked worktree), and names it by
 its COMMON git folder. So a subfolder, the main checkout and each linked
 worktree of one repository share one cache file. The refresher calls the
-same function, so the two sides cannot name a repository differently.
+same function, so the two sides cannot name a repository differently. A
+``.git`` file that names no git folder stops the search, as it stops git: the
+folder is not a part of the repository above it.
 
 The step prints nothing when:
 
@@ -83,6 +85,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from jacked.data.hooks.git_reality import payload_cwd
+from jacked.issue_labels import QUEUE_LABEL_NAMES
 from jacked.memory.sanitize import FENCE, fence_safe, one_line
 from jacked.memory.vault import jacked_home
 from jacked.regular_file import FileTooLargeError, NotRegularFileError, path_kind, read_regular
@@ -105,11 +108,13 @@ TITLE_MAX_CHARS = 256
 
 #: The refresher keeps only the queue labels. A full page of 100 issues is
 #: about 12 KB with typical titles and 37 KB with 256 ASCII characters in
-#: each title. The largest real file is about 320 KB: JSON writes each
-#: character outside the Basic Multilingual Plane as 12 bytes. A cache file
-#: larger than this limit was not written by the refresher, and reading it
-#: would slow down the session start, so the step does not read it (DEBUG log).
-MAX_CACHE_BYTES = 1024 * 1024
+#: each title. The refresher reads at most 4 pages (the newest issues and one
+#: page for each queue label), and the largest real page is about 320 KB: JSON
+#: writes each character outside the Basic Multilingual Plane as 12 bytes. So
+#: the largest real file is about 1.3 MB. A cache file larger than this limit
+#: was not written by the refresher, and reading it would slow down the
+#: session start, so the step does not read it (DEBUG log).
+MAX_CACHE_BYTES = 2 * 1024 * 1024
 
 #: The most bytes of the full block (heading, fences and marker included).
 #: Each byte goes into the context of every session in the repository, so the
@@ -128,7 +133,7 @@ MAX_ISSUE_NUMBER = 10**9
 #: The queue labels and their display groups. An issue with no queue label
 #: is in group 2. Any other label does not change the group, and the block
 #: never shows it.
-QUEUE_LABELS = {"in-flight": 0, "next": 1, "punted": 3}
+QUEUE_LABELS = dict(zip(QUEUE_LABEL_NAMES, (0, 1, 3), strict=True))
 _OTHER_RANK = 2
 
 #: The GitHub author associations whose issues show without a queue label.
@@ -141,10 +146,23 @@ _UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # The shared slugger: the refresher imports these
 # --------------------------------------------------------------------------- #
 
+#: The most bytes of a git pointer file (a ``.git`` file, a ``commondir`` file).
+#: It holds one path, so a larger file is not a real pointer.
+_POINTER_MAX_BYTES = 64 * 1024
+
+
+class _BrokenGitFile(OSError):
+    """A ``.git`` file names no git folder. Like an OS error, it stops the search."""
+
+
 def _read_small(path: Path) -> str:
-    """The first 4 KB of a small git pointer file, as text."""
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        return fh.read(4096)
+    """A small git pointer file, as text. Only a regular file is read.
+
+    The file is checked at the open (``jacked.regular_file``), so a FIFO that
+    takes the place of the file after a ``path_kind`` check cannot block a
+    session start. A file over ``_POINTER_MAX_BYTES`` raises.
+    """
+    return read_regular(path, _POINTER_MAX_BYTES).decode("utf-8", errors="replace")
 
 
 def _git_dir_at(folder: Path) -> Path | None:
@@ -152,8 +170,10 @@ def _git_dir_at(folder: Path) -> Path | None:
 
     A ``.git`` folder must hold a ``HEAD`` file. A ``.git`` file is the
     ``gitdir: <path>`` pointer of a linked worktree or a submodule. A relative
-    path in it is relative to ``folder``. An OS error other than "absent"
-    raises (see ``jacked.regular_file.path_kind``).
+    path in it is relative to ``folder``. A ``.git`` file that names no git
+    folder raises ``_BrokenGitFile``: git stops there too, and does not take
+    the repository above as the repository of ``folder``. An OS error other
+    than "absent" raises (see ``jacked.regular_file.path_kind``).
     """
     dot_git = folder / ".git"
     kind = path_kind(dot_git)
@@ -163,10 +183,12 @@ def _git_dir_at(folder: Path) -> Path | None:
         return None
     first = _read_small(dot_git).splitlines()[:1]
     if not first or not first[0].startswith("gitdir:"):
-        return None
+        raise _BrokenGitFile("a .git file with no gitdir line")
     target = Path(first[0][len("gitdir:"):].strip())
     git_dir = target if target.is_absolute() else folder / target
-    return git_dir if path_kind(git_dir / "HEAD") == "file" else None
+    if path_kind(git_dir / "HEAD") != "file":
+        raise _BrokenGitFile("a .git file that names no git folder")
+    return git_dir
 
 
 def find_common_git_dir(start: str | os.PathLike) -> Path | None:
@@ -177,9 +199,9 @@ def find_common_git_dir(start: str | os.PathLike) -> Path | None:
     linked worktree names its main repository in a ``commondir`` file, so
     every worktree of one repository gives the same folder.
 
-    An OS error (for example a ``.git`` file that the user cannot read) or a
-    symlink loop stops the search and gives None, with the error class at
-    DEBUG. The search does not go on to a parent folder, because a parent
+    An OS error (for example a ``.git`` file that the user cannot read), a
+    ``.git`` file that names no git folder or a symlink loop stops the search
+    and gives None, with the error class at DEBUG. The search does not go on to a parent folder, because a parent
     repository is not the repository of ``start``.
 
     >>> find_common_git_dir("") is None

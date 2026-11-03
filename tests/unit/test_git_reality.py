@@ -95,6 +95,12 @@ def _marker(n: int) -> str:
     return f"[trimmed: {n} more line{'' if n == 1 else 's'}]"
 
 
+def _kept_in_priority_order(commit_lines: list[str], kept: int) -> list[str]:
+    """The ``kept`` lines that a cut leaves: all subjects first, then body lines, in place."""
+    order = sorted(range(len(commit_lines)), key=lambda i: commit_lines[i].startswith("    "))
+    return [commit_lines[i] for i in sorted(order[:kept])]
+
+
 def _spy_on_git(monkeypatch) -> list[str]:
     """Record the git subcommand of each call the block makes."""
     real_run = git_guard.run_git
@@ -326,6 +332,29 @@ class TestCounts:
             in _emit(repo).split("\n")
         )
 
+    @pytest.mark.parametrize("value", ["no", "all", "normal"])
+    def test_the_untracked_count_does_not_follow_the_repo_config(self, root, value):
+        """F1: a checkout's status.showUntrackedFiles must not change the count."""
+        repo = _repo(root)
+        _commit(repo, "one\n")
+        (repo / "folder").mkdir()
+        _write(repo, "folder/a.txt", "a\n")
+        _write(repo, "folder/b.txt", "b\n")
+        _git(repo, "config", "status.showUntrackedFiles", value)
+
+        assert "working tree: 0 modified, 0 staged, 0 deleted, 1 untracked" in _emit(repo).split("\n")
+
+    @pytest.mark.parametrize("value", ["false", "true", "copies"])
+    def test_a_rename_count_does_not_follow_the_repo_config(self, root, value):
+        repo = _repo(root)
+        _write(repo, "a.txt", "line\n" * 20)
+        _git(repo, "add", "a.txt")
+        _git(repo, "commit", "-m", "one")
+        _git(repo, "mv", "a.txt", "b.txt")
+        _git(repo, "config", "status.renames", value)
+
+        assert "working tree: 0 modified, 1 staged, 0 deleted, 0 untracked" in _emit(repo).split("\n")
+
     def test_a_merge_conflict_adds_a_conflicted_count(self, root):
         repo = _repo(root)
         _write(repo, "x.txt", "base\n")
@@ -500,11 +529,39 @@ class TestCaps:
         n = int(match.group(1))
         assert n == len(full) - (len(lines) - 1)  # every removed line is counted
 
-        # The cut removes the LAST commit lines; the fixed lines all stay.
+        # The cut removes body lines from the end, and every subject stays.
         full_commits = full[4:-2]
-        assert lines[4:-3] == full_commits[: len(full_commits) - n]
+        kept = lines[4:-3]
+        assert kept == _kept_in_priority_order(full_commits, len(kept))
+        assert sum(line.startswith("  ") and not line.startswith("    ") for line in kept) == 5
         assert lines[:4] == full[:4]
         assert lines[-3:-1] == full[-2:]
+
+    def test_a_long_body_never_pushes_out_a_subject(self, root):
+        """F3: the newest commit's long body must not hide the older subjects."""
+        repo = _repo(root)
+        for n in range(1, 5):
+            _commit(repo, f"subject {n}\n")
+        body = "\n".join(f"Why: line {i}" for i in range(60))
+        _commit(repo, f"subject 5\n\n{body}\n")
+
+        lines = _emit(repo).split("\n")
+
+        assert [line.split()[-1] for line in lines if "subject" in line] == ["5", "4", "3", "2", "1"]
+        assert TRIM_RE.match(lines[-1])
+        assert "    Why: line 0" in lines  # the room left over goes to the body
+        assert lines.index("    Why: line 0") == [i for i, x in enumerate(lines) if "subject 5" in x][0] + 1
+
+    def test_subjects_go_from_the_oldest_when_only_subjects_are_left(self, root):
+        repo = _repo(root)
+        for n in range(1, 6):
+            _commit(repo, f"subject {n}\n\nWhy: {n}\n")
+
+        lines = _emit(repo, line_cap=9, token_cap=10**9).split("\n")
+
+        # 6 fixed lines + the marker leave room for 2 lines: the 2 newest subjects.
+        assert [line.split()[-1] for line in lines[4:6]] == ["5", "4"]
+        assert lines[-1] == "[trimmed: 8 more lines]"
 
     def test_the_token_cap_trims_commit_lines_with_an_exact_marker(self, root):
         repo = _repo(root)
@@ -521,13 +578,13 @@ class TestCaps:
         n = int(match.group(1))
         full_commits = full[4:-2]
         kept = lines[4:-3]
-        assert kept == full_commits[: len(full_commits) - n]
+        assert kept == _kept_in_priority_order(full_commits, len(kept))
         assert n == len(full_commits) - len(kept)
 
         # The cut is the smallest one: one more kept line breaks the cap.
         one_more = (
             lines[:4]
-            + full_commits[: len(kept) + 1]
+            + _kept_in_priority_order(full_commits, len(kept) + 1)
             + lines[-3:-1]
             + ([_marker(n - 1)] if n > 1 else [])
         )
@@ -585,6 +642,7 @@ class TestFailures:
 
     @pytest.mark.parametrize("slow", ["rev-parse", "branch", "log", "config", "status"])
     def test_a_timeout_logs_the_subcommand_and_never_the_argv(self, root, monkeypatch, caplog, slow):
+        """Each timeout logs its subcommand. See the two tests below for what each prints."""
         repo = _repo(root)
         _commit(repo, "one\n")
         real_run = git_guard.run_git
@@ -598,13 +656,47 @@ class TestFailures:
         caplog.set_level(logging.DEBUG, logger=LOGGER)
         caplog.set_level(logging.DEBUG, logger="jacked.git_guard")  # it runs git config
 
-        assert _emit(repo) == ""
+        block = _emit(repo)
+        if slow in ("config", "status"):
+            assert "working tree: unavailable" in block.split("\n")
+        else:
+            assert block == ""
         messages = [r.getMessage() for r in caplog.records]
         assert any(f"git {slow} timed out" in m and "TimeoutExpired" in m for m in messages), messages
         assert not any(str(repo) in m or "-c" in m.split() for m in messages), messages
 
+    @pytest.mark.parametrize("slow", ["config", "status"])
+    def test_a_working_tree_timeout_keeps_the_branch_and_the_commits(self, root, monkeypatch, slow):
+        """F4: what git already answered is still true."""
+        repo = _repo(root)
+        _commit(repo, "one\n\nWhy: x\n")
+        real_run = git_guard.run_git
+
+        def _run(argv, **kwargs):
+            if _subcommand(argv) == slow:
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(git_guard, "run_git", _run)
+
+        lines = _emit(repo).split("\n")
+
+        assert lines[2].startswith("branch: ")
+        assert any(line.endswith(" one") for line in lines) and "    Why: x" in lines
+        assert lines[-2:] == ["working tree: unavailable", "```"]
+
+    def test_an_unknown_filter_driver_never_runs_status(self, root, monkeypatch):
+        """The guard fails closed: no status runs, and the block says unavailable."""
+        repo = _repo(root)
+        _commit(repo, "one\n")
+        calls = _spy_on_git(monkeypatch)
+        monkeypatch.setattr(git_reality, "guarded_git_env", lambda *a, **k: None)
+
+        assert "working tree: unavailable" in _emit(repo).split("\n")
+        assert "status" not in calls
+
     @pytest.mark.parametrize("failing", ["branch", "log", "config", "status"])
-    def test_a_failing_git_call_prints_nothing(self, root, monkeypatch, caplog, failing):
+    def test_a_failing_git_call_is_reported(self, root, monkeypatch, caplog, failing):
         repo = _repo(root)
         _commit(repo, "one\n")
         real_run = git_guard.run_git
@@ -617,7 +709,11 @@ class TestFailures:
         monkeypatch.setattr(git_guard, "run_git", _run)
         caplog.set_level(logging.DEBUG, logger=LOGGER)
 
-        assert _emit(repo) == ""
+        block = _emit(repo)
+        if failing in ("config", "status"):
+            assert "working tree: unavailable" in block.split("\n")
+        else:
+            assert block == ""
         assert any(failing in r.getMessage() for r in caplog.records)
 
     def test_an_os_error_prints_nothing(self, root, monkeypatch, caplog):

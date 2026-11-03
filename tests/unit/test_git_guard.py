@@ -92,6 +92,37 @@ def test_a_driver_name_that_cannot_pass_through_the_environment_gives_none(monke
     assert any("cannot pass through the environment" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize("config", [
+    b"user.name\nJos\xe9\0filter.ok.clean\n/x\0",
+    b"filter.ok.clean\n/caf\xe9\0",
+])
+def test_a_bad_byte_outside_a_filter_key_keeps_the_guard(monkeypatch, caplog, config):
+    """F2: on Windows fsdecode is strict UTF-8. A Latin-1 user.name or a filter
+    command never goes into the environment, so it must not fail the guard."""
+    monkeypatch.setattr(git_guard, "run_git", _fake_run(stdout=config))
+    monkeypatch.setattr(git_guard.os, "fsdecode", lambda raw: raw.decode("utf-8"))
+    monkeypatch.setattr(git_guard.os, "fsencode", lambda text: text.encode("utf-8"))
+
+    env = git_guard.guarded_git_env("git", "/repo", {})
+
+    assert env is not None
+    assert env["GIT_CONFIG_KEY_0"] == "filter.ok.clean"
+    assert env["GIT_CONFIG_KEY_3"] == "filter.ok.required"
+
+
+def test_a_real_config_with_a_bad_user_name_still_lists_the_drivers(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    with (repo / ".git" / "config").open("ab") as fh:
+        fh.write(b'[user]\n\tname = Jos\xe9\n[filter "evil"]\n\tclean = /x\n')
+    monkeypatch.setattr(git_guard.os, "fsdecode", lambda raw: raw if isinstance(raw, str) else raw.decode("utf-8"))
+    monkeypatch.setattr(git_guard.os, "fsencode", lambda text: text if isinstance(text, bytes) else text.encode("utf-8"))
+
+    env = git_guard.guarded_git_env("git", str(repo), dict(os.environ))
+
+    assert env is not None and "filter.evil.clean" in env.values()
+
+
 def test_config_text_refuses_text_that_does_not_give_back_the_bytes(monkeypatch):
     monkeypatch.setattr(git_guard.os, "fsdecode", lambda raw: raw.decode("utf-8", errors="replace"))
     assert git_guard.config_text(b"filter.e\xffvil.clean\n/x\0") is None

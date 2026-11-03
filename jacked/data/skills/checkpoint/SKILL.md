@@ -361,9 +361,9 @@ CHECKPOINTS
 
 ## Frontmatter Field Semantics
 
-- `plans_in_progress`: `research_files`, **file paths** resolved against project root
+- `plans_in_progress`, `research_files`: **file paths** resolved against project root
 - `active_lenses`: **lens filename stems** (e.g., `accessibility`, `api-ergonomics`). NOT frontmatter name field, NOT file paths.
-- `head_sha`: `dirty_files`, repo fingerprint at save time, consumed by the Resume Step 3 freshness check. Optional; absent on legacy checkpoints (freshness check skips silently when missing).
+- `head_sha`, `dirty_files`: repo fingerprint at save time, consumed by the Resume Step 3 freshness check. Optional; absent on legacy checkpoints (freshness check skips silently when missing).
 - All list fields are optional. Missing fields = empty lists (backward compatible with older checkpoints).
 - Older checkpoints may have deprecated fields (e.g., `files_modified`). Ignore on read.
 

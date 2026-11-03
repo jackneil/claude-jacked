@@ -378,6 +378,8 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
     Unreviewed auto-captures (session triage, merge distillation: content of
     external origin such as a PR body) stay out of the brief until a librarian
     or human promotes them; a note with ``superseded_by`` (#95i) stays out too.
+    Only the line's own note (its first link) is judged for ``superseded_by``:
+    a current decision can name the note that it replaces.
     A line whose note can't be read or parsed is KEPT: only a positively-
     identified candidate tag or supersession excludes it, so a broken note never
     silently vanishes from recall. A line with no link the gate can check, or
@@ -388,7 +390,7 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
     ``_INDEX_EXCERPT`` reviewed lines; ``decision_lines`` is the last
     ``_TOP_DECISIONS`` reviewed ``decision/`` lines.
     """
-    candidate_memo: dict[Path, bool] = {}
+    candidate_memo: dict[tuple[Path, bool], bool] = {}
 
     def _reviewed(line: str) -> bool:
         links = _entry_links(line)
@@ -402,13 +404,11 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
         # the line's own note is always among its links.
         if not all(_inside_group(link) for link in links):
             return False  # a link out of the group is never read, so unvetted
-        for link in links:
-            path = gdir / link
-            cand = candidate_memo.get(path)
-            if cand is None:
-                cand = _is_candidate_note(path, superseded=True)
-                candidate_memo[path] = cand
-            if cand:
+        for position, link in enumerate(links):
+            key = (gdir / link, position == 0)
+            if key not in candidate_memo:
+                candidate_memo[key] = _is_candidate_note(key[0], superseded=key[1])
+            if candidate_memo[key]:
                 return False
         return True
 
