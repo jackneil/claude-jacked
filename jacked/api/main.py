@@ -35,6 +35,7 @@ from jacked.api.security import (
 )
 from jacked.api.websocket import WebSocketRegistry
 from jacked.credentials.startup_recovery import recover_pending_switches
+from jacked.service.issue_queue_refresh import issue_queue_refresh_loop
 
 logger = logging.getLogger(__name__)
 
@@ -118,10 +119,7 @@ async def _heal_sweep_loop(app=None):
 
             await asyncio.wait_for(heal_invalid_accounts(), timeout=SWEEP_PASS_TIMEOUT)
         except asyncio.TimeoutError:
-            # wait_for cancels the pass; an in-flight token exchange is
-            # shielded inside _refresh_token_flow and finishes in the
-            # background (persisting any rotated token and releasing its
-            # per-account lock) — the loop self-heals from a wedged pass.
+            # Self-heals the same way as the token refresh pass above.
             logger.error(
                 "Heal sweep exceeded %ds and was cancelled",
                 SWEEP_PASS_TIMEOUT,
@@ -403,6 +401,7 @@ async def lifespan(app: FastAPI):
     all_accounts_refresh_task = asyncio.create_task(all_accounts_refresh_loop(app))
     stuck_checking_task = asyncio.create_task(_stuck_checking_watchdog_loop(app))
     profile_backfill_task = asyncio.create_task(_profile_backfill_loop(app))
+    issue_queue_task = asyncio.create_task(issue_queue_refresh_loop(app))
     logger.info("Started background token refresh (every 30min)")
     logger.info("Started session-accounts watcher (every 3s)")
     logger.info("Started session observation resolver (every 10s)")
@@ -470,6 +469,7 @@ async def lifespan(app: FastAPI):
         all_accounts_refresh_task,
         stuck_checking_task,
         profile_backfill_task,
+        issue_queue_task,
     ]
     if analytics_scan_task is not None:
         tasks_to_cancel.append(analytics_scan_task)

@@ -1,0 +1,334 @@
+"""The service side of the issue queue (#96i): refresh the per-repo cache.
+
+The SessionStart hook prints the open GitHub issues of the session repo
+(``jacked.data.hooks.issue_queue``), but it must never call the network. So
+the jacked service does the network work here, on its own schedule:
+
+- ``issue_queue_refresh_loop`` sleeps ``REFRESH_INTERVAL_S`` (10 minutes)
+  FIRST, then runs one pass, and repeats. There is no pass at service start;
+  a cache from before a restart stays good for 24 hours.
+- ``refresh_pass`` reads the repositories that jacked knows (the projects in
+  ``Database.get_project_activity_summary``), keeps one path for each
+  repository slug (a worktree and its main checkout share one), and runs
+  ``refresh_repo`` for each in a worker thread, never on the event loop. At
+  most ``MAX_CONCURRENT`` repositories refresh at the same time.
+- ``refresh_repo`` reads the ``origin`` remote with git, and stops when it is
+  not a GitHub remote. Then it asks gh for one page of open issues and the
+  total count (one GraphQL call), and writes the cache file through the
+  shared atomic writer (``jacked.atomic_io``).
+
+Each git or gh call has a hard timeout of ``CALL_TIMEOUT_S`` (10 seconds).
+gh and git are found through the shared lookup (``jacked.findbin``).
+
+Quiet failure: gh not found, gh not signed in (a non-zero exit), a timeout,
+a remote that is not GitHub, no ``origin`` remote, or an answer that is not
+usable gives a DEBUG line with the reason class, and the pass writes
+nothing. The last good cache file stays, and the hook stops showing it after
+24 hours. A log line never holds the remote URL, because a URL can hold a
+credential. The cache holds a remote URL that the refresher builds from the
+owner and the repository name only.
+
+Labels: ``ensure_label`` creates one of the queue labels (``in-flight``,
+``next``, ``punted``) when the repository does not have it. A skill calls it
+through ``jacked issues ensure-label <name>`` just before it files the first
+issue with that label. Nothing creates a label at session start or at
+service start.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import subprocess
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
+
+from jacked.atomic_io import atomic_write_text
+from jacked.data.hooks.issue_queue import cache_path, repo_slug
+from jacked.findbin import find_bin
+from jacked.memory.vault import one_line
+from jacked.winproc import NO_WINDOW
+
+logger = logging.getLogger(__name__)
+
+#: Seconds between two refresh passes.
+REFRESH_INTERVAL_S = 600
+
+#: The hard timeout of one git or gh call, in seconds.
+CALL_TIMEOUT_S = 10
+
+#: The most repositories that refresh at the same time.
+MAX_CONCURRENT = 4
+
+#: How many known projects one pass reads. The routes that list the known
+#: projects (``routes/system.py``, ``routes/permissions.py``) read the same
+#: number, so the queue covers the projects the dashboard shows.
+PROJECT_LIMIT = 100
+
+#: Issues per repository in one call. 100 is the GitHub GraphQL page limit.
+#: The cache also stores the total count, so the hook's trim marker counts
+#: the issues past this page; no issue is lost from the count.
+ISSUE_PAGE = 100
+
+#: The queue labels and how a new one looks: (color, description).
+LABELS = {
+    "in-flight": ("1d76db", "Work in progress on a branch or a PR"),
+    "next": ("0e8a16", "Queued as the next work to do"),
+    "punted": ("cfd3d7", "Found and kept for later; not in the current work"),
+}
+
+_GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_SCP_RE = re.compile(r"^(?:[^@/\s]+@)?([^:/\s]+):(?!//)(.+)$")
+
+_QUERY = (
+    "query($owner: String!, $name: String!) {"
+    " repository(owner: $owner, name: $name) {"
+    f" issues(states: OPEN, first: {ISSUE_PAGE},"
+    " orderBy: {field: CREATED_AT, direction: DESC}) {"
+    " totalCount nodes { number title labels(first: 100) { nodes { name } } } } } }"
+)
+
+
+class _Skip(Exception):
+    """One repository is skipped. The message is the DEBUG reason class."""
+
+
+class LabelError(Exception):
+    """gh could not create a label, and the label does not exist."""
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
+
+def github_repo(url: str) -> tuple[str, str] | None:
+    """The (owner, name) of a GitHub remote URL, or None for any other remote.
+
+    Accepts the https, ssh, git and scp-like ("git@github.com:o/r.git")
+    forms. Credentials and ports in the URL are ignored.
+
+    >>> github_repo("git@github.com:acme/widgets.git")
+    ('acme', 'widgets')
+    >>> github_repo("https://gitlab.com/acme/widgets") is None
+    True
+    """
+    url = (url or "").strip()
+    if not url:
+        return None
+    if "://" in url:
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            return None
+        if parts.scheme not in ("https", "http", "ssh", "git"):
+            return None
+        path = parts.path
+    else:
+        match = _SCP_RE.match(url)
+        if not match:
+            return None
+        host, path = match.group(1).lower(), match.group(2)
+    if host not in _GITHUB_HOSTS:
+        return None
+    segments = path.strip("/").split("/")
+    if len(segments) != 2:
+        return None
+    owner, name = segments
+    if name.endswith(".git"):
+        name = name[: -len(".git")]
+    for part in (owner, name):
+        if not _NAME_RE.match(part) or part in (".", ".."):
+            return None
+    return owner, name
+
+
+def _run(argv: list[str], cwd: str | None = None, env: dict | None = None):
+    """Run one bounded call. A timeout raises ``_Skip("timed out")``."""
+    try:
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=CALL_TIMEOUT_S,
+            creationflags=NO_WINDOW,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise _Skip(f"{os.path.basename(argv[0])} timed out after {CALL_TIMEOUT_S} s") from None
+
+
+def _gh_env() -> dict:
+    """The environment for a gh call: never a prompt, never an update check."""
+    env = dict(os.environ)
+    env.update({"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"})
+    return env
+
+
+def _origin_url(git: str, path: str) -> str:
+    env = dict(os.environ)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    proc = _run([git, "-C", path, "remote", "get-url", "origin"], env=env)
+    if proc.returncode != 0:
+        raise _Skip("no origin remote")
+    return proc.stdout.decode("utf-8", errors="replace").strip()
+
+
+def _fetch(gh: str, owner: str, name: str) -> tuple[list[dict], int]:
+    """One page of open issues and the total count, from one gh call."""
+    proc = _run(
+        [gh, "api", "graphql", "-f", f"query={_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}"],
+        env=_gh_env(),
+    )
+    if proc.returncode != 0:
+        raise _Skip(f"gh exited {proc.returncode}")
+    try:
+        answer = json.loads(proc.stdout.decode("utf-8", errors="replace"))
+        if answer.get("errors"):
+            raise ValueError("graphql errors")
+        issues = answer["data"]["repository"]["issues"]
+        total = issues["totalCount"]
+        if not isinstance(total, int) or isinstance(total, bool):
+            raise ValueError("totalCount")
+        items = [
+            {
+                "number": int(node["number"]),
+                "title": str(node["title"]),
+                "labels": [str(label["name"]) for label in node["labels"]["nodes"]],
+            }
+            for node in issues["nodes"]
+        ]
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise _Skip(f"gh gave an unusable answer ({type(exc).__name__})") from None
+    return items, max(total, len(items))
+
+
+# --------------------------------------------------------------------------- #
+# One repository, one pass, the loop
+# --------------------------------------------------------------------------- #
+
+def refresh_repo(path: str, *, now: datetime | None = None) -> bool:
+    """Refresh the cache of the repository at ``path``. True when it wrote it.
+
+    Never raises: an expected skip is a DEBUG line, and any other error is a
+    WARNING with the error class.
+    """
+    slug = repo_slug(path)
+    if slug is None:
+        logger.debug("issue queue refresh: skip (not a git repository)")
+        return False
+    try:
+        git = find_bin("git")
+        if not git:
+            raise _Skip("git not found")
+        repo = github_repo(_origin_url(git, path))
+        if repo is None:
+            raise _Skip("not a GitHub remote")
+        gh = find_bin("gh")
+        if not gh:
+            raise _Skip("gh not found")
+        items, open_count = _fetch(gh, *repo)
+        stamp = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+        payload = {
+            "remote": f"https://github.com/{repo[0]}/{repo[1]}",
+            "refreshed_at": stamp,
+            "open_count": open_count,
+            "items": items,
+        }
+        atomic_write_text(cache_path(slug), json.dumps(payload, indent=1) + "\n", mode=0o600)
+        return True
+    except _Skip as reason:
+        logger.debug("issue queue refresh: skip %s (%s)", slug, reason)
+        return False
+    except Exception as exc:  # noqa: BLE001 -- one repository must not stop the pass
+        logger.warning("issue queue refresh: %s failed (%s)", slug, type(exc).__name__)
+        return False
+
+
+def _known_repos(db) -> list[str]:
+    """One path for each repository slug, in the order of last activity."""
+    rows = db.get_project_activity_summary(limit=PROJECT_LIMIT)
+    chosen: dict[str, str] = {}
+    for row in rows:
+        path = (row or {}).get("repo_path")
+        if not path:
+            continue
+        slug = repo_slug(path)
+        if slug is not None and slug not in chosen:
+            chosen[slug] = path
+    return list(chosen.values())
+
+
+async def refresh_pass(app) -> int:
+    """Refresh every known repository once. Returns how many caches it wrote."""
+    db = getattr(app.state, "db", None)
+    if db is None:
+        return 0
+    if not await asyncio.to_thread(find_bin, "gh"):
+        logger.debug("issue queue refresh: skip the pass (gh not found)")
+        return 0
+    paths = await asyncio.to_thread(_known_repos, db)
+    gate = asyncio.Semaphore(MAX_CONCURRENT)  # local to this pass, so no reset_locks
+
+    async def _one(path: str) -> bool:
+        async with gate:
+            return await asyncio.to_thread(refresh_repo, path)
+
+    results = await asyncio.gather(*(_one(p) for p in paths))
+    return sum(1 for written in results if written)
+
+
+async def issue_queue_refresh_loop(app) -> None:
+    """Sleep the interval first, then refresh, forever. Never crashes."""
+    logger.info(
+        "Started the issue queue refresh (every %ds, first pass after one interval)",
+        REFRESH_INTERVAL_S,
+    )
+    while True:
+        await asyncio.sleep(REFRESH_INTERVAL_S)
+        try:
+            written = await refresh_pass(app)
+            if written:
+                logger.debug("issue queue refresh: wrote %d cache file(s)", written)
+        except Exception as exc:  # noqa: BLE001 -- the loop must keep running
+            logger.warning("issue queue refresh pass failed (%s)", type(exc).__name__)
+
+
+# --------------------------------------------------------------------------- #
+# Labels
+# --------------------------------------------------------------------------- #
+
+def ensure_label(name: str, *, cwd: str | None = None) -> str:
+    """Create the queue label ``name`` in the repo at ``cwd`` when it is missing.
+
+    Returns "created" or "exists". It never changes a label that exists (no
+    ``--force``), so a color or a description that the user set stays.
+    Raises ``ValueError`` for a name that is not a queue label, and
+    ``LabelError`` when gh is not found, times out, or fails in another way.
+    """
+    if name not in LABELS:
+        raise ValueError(f"not a queue label: use one of {', '.join(LABELS)}")
+    gh = find_bin("gh")
+    if not gh:
+        raise LabelError("gh not found: install the GitHub CLI and run `gh auth login`")
+    color, description = LABELS[name]
+    try:
+        proc = _run(
+            [gh, "label", "create", name, "--color", color, "--description", description],
+            cwd=cwd,
+            env=_gh_env(),
+        )
+    except _Skip as reason:
+        raise LabelError(str(reason)) from None
+    if proc.returncode == 0:
+        return "created"
+    detail = one_line(proc.stderr.decode("utf-8", errors="replace"))
+    if "already exists" in detail.lower():
+        return "exists"
+    raise LabelError(f"gh label create exited {proc.returncode}: {detail[:300]}")

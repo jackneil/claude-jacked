@@ -374,11 +374,11 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
     exhausted. This bounds SessionStart note reads by what the brief needs, never
     by the group's lifetime note count.
 
-    Unreviewed auto-captures (session triage, merge distillation -- the paths
-    where content of external origin such as a contributor's PR body can enter
-    the vault) stay out of the injected brief until a librarian or human pass
-    promotes them. A line whose note can't be read or parsed is KEPT: only a
-    positively-identified candidate tag excludes it, so a broken note never
+    Unreviewed auto-captures (session triage, merge distillation: content of
+    external origin such as a PR body) stay out of the brief until a librarian
+    or human promotes them; a note with ``superseded_by`` (#95i) stays out too.
+    A line whose note can't be read or parsed is KEPT: only a positively-
+    identified candidate tag or supersession excludes it, so a broken note never
     silently vanishes from recall. A line with no link the gate can check, or
     with a link out of the group folder, is excluded: it cannot be vetted.
 
@@ -405,7 +405,7 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
             path = gdir / link
             cand = candidate_memo.get(path)
             if cand is None:
-                cand = _is_candidate_note(path)
+                cand = _is_candidate_note(path, superseded=True)
                 candidate_memo[path] = cand
             if cand:
                 return False
@@ -432,10 +432,10 @@ def _reviewed_tail(gdir: Path) -> tuple[list[str], list[str]]:
     return list(reversed(excerpt_rev)), list(reversed(decisions_rev))
 
 
-def _is_candidate_note(path: Path) -> bool:
-    """True when the note at ``path`` is tagged ``candidate``. Something that
-    exists but is not a regular file (a FIFO would block SessionStart) counts
-    as one and is never opened; a missing or unreadable note does not."""
+def _is_candidate_note(path: Path, superseded: bool = False) -> bool:
+    """True when the note at ``path`` is tagged ``candidate`` or, with ``superseded``,
+    has ``superseded_by``. A non-regular file (a FIFO would block SessionStart)
+    counts as one and is never opened; a missing or unreadable note does not."""
     try:
         if not stat.S_ISREG(path.stat().st_mode):
             return True
@@ -446,7 +446,7 @@ def _is_candidate_note(path: Path) -> bool:
     except (OSError, UnicodeDecodeError):
         return False
     tags = meta.get("tags")
-    return isinstance(tags, list) and "candidate" in tags
+    return (isinstance(tags, list) and "candidate" in tags) or (superseded and bool(meta.get("superseded_by")))
 
 
 def _drift_section(state: dict) -> str:

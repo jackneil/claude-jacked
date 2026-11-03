@@ -709,10 +709,12 @@ def test_a_link_out_of_the_group_is_never_read(env, outside, monkeypatch):
     opened = []
     real = recall._is_candidate_note
     monkeypatch.setattr(
-        recall, "_is_candidate_note", lambda path: opened.append(str(path)) or real(path)
+        recall, "_is_candidate_note",
+        lambda path, **kw: opened.append(str(path)) or real(path, **kw),
     )
     brief = recall.build_brief(str(_cwd_dir(env, "myrepo")))
     assert "Outside linker" not in brief
+    assert opened  # the spy saw the gate's reads, so the next check is not vacuous
     assert not any("outside" in path for path in opened)
 
 
@@ -1032,3 +1034,92 @@ def test_dirty_check_still_reads_a_real_tree(tmp_path, monkeypatch):
     (repo / "note.md").write_text("two\n", encoding="utf-8")
     assert recall._is_dirty(repo) is True
     assert not (repo / ".git" / "index.lock").exists()
+
+
+# --------------------------------------------------------------------------- #
+# A superseded decision stays in the vault but leaves the brief (#95i)
+# --------------------------------------------------------------------------- #
+
+def _supersede(env, res, winner):
+    """Mark the note ``res`` as superseded the way the librarian does: the
+    ``superseded_by`` key in the frontmatter plus a SUPERSEDED line."""
+    path = env.vault / res["path"]
+    text = path.read_text(encoding="utf-8")
+    head, rest = text.split("\n---\n", 1)
+    path.write_text(
+        f"{head}\nsuperseded_by: {winner}\n---\n{rest}SUPERSEDED by {winner}\n",
+        encoding="utf-8",
+    )
+    meta, _body = vault_mod.read_note(path)
+    assert meta["superseded_by"] == winner  # the parser keeps the key
+
+
+def _section(brief, heading):
+    if heading not in brief:
+        return ""
+    return brief.split(heading, 1)[1].split("\n# ", 1)[0]
+
+
+def test_a_superseded_decision_leaves_key_decisions(env):
+    _seed_group(env)
+    old = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="Poll the usage API",
+        group="myrepo", repos=["myrepo"], tags=[], body="We poll every minute.",
+    )
+    new = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="Push usage over WebSockets",
+        group="myrepo", repos=["myrepo"], tags=[], body="The server pushes usage.",
+    )
+    cwd = str(_cwd_dir(env, "myrepo"))
+    assert "Poll the usage API" in _section(recall.build_brief(cwd), "# Key decisions")
+
+    _supersede(env, old, new["path"].split("groups/myrepo/", 1)[1])
+    brief = recall.build_brief(cwd)
+
+    decisions = _section(brief, "# Key decisions")
+    assert "Push usage over WebSockets" in decisions
+    assert "Use ff-only sync" in decisions
+    assert "Poll the usage API" not in decisions
+    # Not moved down into the index excerpt either: a superseded decision is
+    # history, and the brief must not show it as a current note.
+    assert "Poll the usage API" not in brief
+    # The note itself is kept (never deleted).
+    assert (env.vault / old["path"]).is_file()
+
+
+def test_superseded_is_not_a_candidate_mark_in_search(env):
+    """The search marker means "unreviewed"; a superseded note is reviewed."""
+    _seed_group(env)
+    res = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="Old way",
+        group="myrepo", repos=["myrepo"], tags=[], body="Old.",
+    )
+    _supersede(env, res, "decision/new-way.md")
+    path = env.vault / res["path"]
+    assert recall._is_candidate_note(path) is False
+    assert recall._is_candidate_note(path, superseded=True) is True
+
+
+# --------------------------------------------------------------------------- #
+# The memory librarian never deletes a decision note (#95i)
+# --------------------------------------------------------------------------- #
+
+_LIBRARIAN = (
+    Path(__file__).resolve().parents[2] / "jacked" / "data" / "skills" / "memory-librarian" / "SKILL.md"
+)
+
+
+def test_librarian_never_deletes_a_decision_note():
+    text = _LIBRARIAN.read_text(encoding="utf-8")
+    reconcile = text.split("**Reconcile contradictions", 1)[1].split("\n\n", 1)[0]
+    assert "Never delete a decision note" in reconcile
+    assert "`superseded_by: <note>`" in reconcile
+    assert "`SUPERSEDED by <note>`" in reconcile
+    assert "Delete the stale note" not in text
+    # Dedupe must not delete decisions either, and frontmatter validation must
+    # keep the key.
+    dedupe = text.split("**Dedupe.**", 1)[1].split("\n\n", 1)[0]
+    assert "decision" in dedupe and "superseded_by" in dedupe
+    validate = text.split("**Validate frontmatter.**", 1)[1].split("\n\n", 1)[0]
+    assert "superseded_by" in validate
+    assert "—" not in reconcile

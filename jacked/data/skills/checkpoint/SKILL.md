@@ -54,21 +54,24 @@ If yes, update its `status:` line to `completed`. If no, proceed (multiple in-pr
 Using gathered state PLUS your conversation history, produce:
 
 1. **What We're Working On** — the high-level goal (1-3 sentences)
-2. **Accomplished This Session** — commits made, features shipped, releases cut
+2. **Accomplished This Session** — commits made, features shipped, releases cut. Each item carries its verification: the command you ran or the evidence you saw. An item without verification is a claim, not a result.
 3. **Decisions Made** — architectural choices, trade-offs, approaches chosen and WHY
-4. **Session Context** — non-obvious knowledge from conversation: user intent, constraints, domain facts shared verbally, "build it like X" references, things tried and failed. This is the most important section — it preserves interactive knowledge that would otherwise die with the context window.
+4. **Session Context** — non-obvious knowledge from conversation: user intent, constraints, domain facts shared verbally, "build it like X" references. This is the most important section — it preserves interactive knowledge that would otherwise die with the context window.
 5. **Research & References** — summary of any web fetches, API docs, or reference material gathered. Sources cited. For small topics, inline here. For substantial research (multiple sources, detailed analysis), write separate research files (see Step 4).
 6. **Remaining Work** — concrete next steps in priority order. Reference plan files.
-7. **Current State** — where exactly we stopped (mid-plan? mid-DCR? waiting for user input?)
-8. **Gotchas & Notes** — things tried and didn't work, open questions, known issues
-9. **Key Files** — most important files to read to get up to speed. Format each line as: `- path/to/file — brief description`
+7. **Punted / Rejected (with why)**: this section is required in every checkpoint. List each approach you tried and abandoned, each option you considered and did not choose, and each piece of scope you cut on purpose. Give the reason for each one. When there is nothing to list, write the literal `Nothing punted`. Do not omit the section.
+8. **Current State** — where exactly we stopped (mid-plan? mid-DCR? waiting for user input?)
+9. **Gotchas & Notes** — open questions, known issues, traps for the next session
+10. **Key Files** — most important files to read to get up to speed. Format each line as: `- path/to/file — brief description`
+
+Remaining or punted work that nobody does in this session follows the discovered-work rule in jacked-behaviors: file it with `gh issue create` (the /dcr evidence body and a `Discovered from:` line), and write the issue number next to the item.
 
 Also determine:
 - **Active lenses** — which specialist lenses (by filename stem, e.g., `accessibility`) were relevant during this session. Populated from: lenses selected by DCR, lenses whose triggers matched files modified, or lenses explicitly referenced in conversation.
 
 If the user provided a title, use it. Otherwise infer one from the work.
 
-**Secrets hygiene (do this before writing anything in Step 4 or 5):** scan the drafted **Session Context**, **Gotchas & Notes**, and **Key Files** content — the free-form sections most likely to have slurped up a pasted value — for likely credentials: API keys (`sk-…`, `ghp_…`, `AKIA…`, `xox[bap]-…`), bearer/access tokens, passwords, `.env` values, and DB/connection strings (`postgres://user:pass@…`). Redact each to a descriptive placeholder, e.g. `{REDACTED: openai key}`, `{REDACTED: postgres connection string}`. Keep the surrounding prose so the context still reads — redact the secret, not the sentence. **Never write a credential or secret into a checkpoint or research file** (these HTML files may be committed to git — see the git-hygiene note in Step 5).
+**Secrets hygiene (do this before writing anything in Step 4 or 5):** scan the drafted **Session Context**, **Punted / Rejected**, **Gotchas & Notes**, and **Key Files** content — the free-form sections most likely to have slurped up a pasted value — for likely credentials: API keys (`sk-…`, `ghp_…`, `AKIA…`, `xox[bap]-…`), bearer/access tokens, passwords, `.env` values, and DB/connection strings (`postgres://user:pass@…`). Redact each to a descriptive placeholder, e.g. `{REDACTED: openai key}`, `{REDACTED: postgres connection string}`. Keep the surrounding prose so the context still reads — redact the secret, not the sentence. **Never write a credential or secret into a checkpoint or research file** (these HTML files may be committed to git — see the git-hygiene note in Step 5).
 
 ### Step 4: Write research files (if needed)
 
@@ -144,7 +147,7 @@ Then edit the temp file. The metadata that used to live in YAML frontmatter goes
 <p>{content}</p>
 
 <h2 id="accomplished">Accomplished This Session</h2>
-<ul><li>{content}</li></ul>
+<ul><li>{item}: verified by {the command run, or the evidence}</li></ul>
 
 <h2 id="decisions">Decisions Made</h2>
 <ul><li>{content — include the WHY for each decision}</li></ul>
@@ -159,6 +162,10 @@ Then edit the temp file. The metadata that used to live in YAML frontmatter goes
 <ul class="tasks">
   <li><input type="checkbox" disabled> {task}</li>
 </ul>
+
+<h2 id="punted">Punted / Rejected (with why)</h2>
+<ul><li>{what was tried and abandoned, considered and not chosen, or cut from scope}: {why}</li></ul>
+<!-- When there is nothing to list, write: <p>Nothing punted</p> -->
 
 <h2 id="state">Current State</h2>
 <p>{content}</p>
@@ -281,8 +288,10 @@ Status:   {status}
 Loaded:   {N} referenced files ({total_lines} lines)
 ════════════════════════════════
 
-{Checkpoint summary — What We're Working On + Remaining Work + Current State + Gotchas}
+{Checkpoint summary: What We're Working On + Remaining Work + Punted / Rejected + Current State + Gotchas}
 ```
+
+Print the Punted / Rejected items directly after Remaining Work, so nobody picks up a rejected approach again by accident. An older checkpoint has no such section: say "No Punted / Rejected section (older checkpoint)" and do not invent one.
 
 If a **project journal** exists (`.claude/PROJECT-NOTES.md` — see Complete Flow), read it and fold its durable learnings into how you resume. It outlives any single checkpoint, so it's authoritative for recurring gotchas, user preferences, and non-obvious patterns.
 
@@ -293,7 +302,7 @@ If a **project journal** exists (`.claude/PROJECT-NOTES.md` — see Complete Flo
 **Goal-directed resume** (`--goal "<next task>"` was passed, or the user supplied a free-text goal on resume): don't replay the full snapshot — launch the *next focused task* with exactly the context it needs. Synthesize a **next-task brief**:
 
 1. **Goal** — restate the stated next task in one line.
-2. **Relevant context** — only the decisions, session-context facts, and gotchas from the checkpoint that bear on this goal (drop the rest).
+2. **Relevant context** — only the decisions, session-context facts, punted or rejected items, and gotchas from the checkpoint that bear on this goal (drop the rest).
 3. **Relevant files** — the subset of loaded files (ranked in Step 4) that matter for this goal.
 4. **Proposed first steps** — the Remaining-Work items that advance this goal, in order.
 
@@ -312,7 +321,7 @@ Find the most recent in-progress checkpoint on the current branch (HTML or legac
 
 Update the checkpoint file's status. For HTML: change `<meta name="jacked:status" content="in-progress">` to `content="completed"`. For legacy MD: change the YAML `status: in-progress` to `status: completed`.
 
-**Promote durable learnings to the project journal.** A completed checkpoint's hard-won project knowledge would otherwise die with it. Before finishing, scan this checkpoint's **Decisions**, **Session Context**, and **Gotchas** for learnings that are *durable and checkpoint-independent* — recurring gotchas, user preferences, non-obvious patterns that will matter on the next task too (not one-off state like "stopped mid-DCR"). If any exist, offer:
+**Promote durable learnings to the project journal.** A completed checkpoint's hard-won project knowledge would otherwise die with it. Before finishing, scan this checkpoint's **Decisions**, **Session Context**, **Punted / Rejected**, and **Gotchas** for learnings that are *durable and checkpoint-independent* — recurring gotchas, user preferences, non-obvious patterns that will matter on the next task too (not one-off state like "stopped mid-DCR"). If any exist, offer:
 
 > "Promote N durable learning(s) to the project journal so they survive this checkpoint? (Y/n)"
 
