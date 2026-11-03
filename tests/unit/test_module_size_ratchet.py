@@ -43,7 +43,7 @@ BASELINE: dict[str, int] = {
     "jacked/api/routes/auth.py": 2421,
     "jacked/api/routes/features.py": 1466,
     "jacked/api/routes/system.py": 1285,
-    "jacked/api/usage_monitor.py": 3441,
+    "jacked/api/usage_monitor.py": 2277,
     "jacked/cli.py": 9333,
     "jacked/codex/installer.py": 570,
     "jacked/codex/usage.py": 516,
