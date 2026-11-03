@@ -143,7 +143,7 @@
     <p><b>Evidence:</b> Scorecard SAST 0: no CodeQL or other SAST tool runs on commits.</p>
     <p><b>Risk:</b> An attacker benefits from an injection or unsafe-deserialization pattern that a SAST pass would have flagged before merge.</p>
     <p><b>Fix:</b> The workflow .github/workflows/codeql.yml runs CodeQL (Python, JavaScript, GitHub Actions) on each pull request, each push to master and each week (#199i).</p>
-    <p><b>Note (2026-11-03):</b> The test client now runs on httpx2 (#200i). PyPI holds no PEP 740 attestation for httpx2 2.16.0 or httpcore2 2.16.0, although the publisher (pydantic/httpx2) uses trusted publishing. The lock's hash pins are the only control for those two packages. truststore and idna carry attestations. The next lockdown pass does not need to re-discover this.</p>
+    <p><b>Note (2026-11-03):</b> The test client now runs on httpx2 (#200i). PyPI holds no PEP 740 attestation for httpx2 2.16.0, httpcore2 2.16.0 or httpx2-jsfetch 1.0, although the publisher (pydantic/httpx2) uses trusted publishing. The lock's hash pins are the only control for those three packages. httpx2-jsfetch installs only on the emscripten platform, so it does not run on a normal install. truststore and idna carry attestations. The next lockdown pass does not need to re-discover this.</p>
   </div>
   <div class="finding">
     <h3><span class="badge muted">[scorecard][LOW]</span> SCSC-012: Fuzzing, CII badge, single-organization contributors</h3>

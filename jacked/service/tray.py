@@ -1642,10 +1642,10 @@ class ServiceRunner:
         if not self._tray_menu_available:
             logger.warning(
                 "Tray: this desktop has no tray menu (pystray Xorg backend). "
-                "Left-click the icon to open the dashboard. Use `jacked "
-                "service restart` / `jacked service stop` for the other "
-                "actions. The full menu needs PyGObject in the jacked tool "
-                "environment; see the README Linux tray notes."
+                "Left-click the icon to open the dashboard. For the other actions, "
+                "use `jacked service restart`, `jacked service stop` and `jacked "
+                "upgrade`; `jacked service install` / `uninstall` set start on login. "
+                "The full menu needs PyGObject; see the README Linux tray notes."
             )
 
     def _notify_failed_start(self, icon: "pystray.Icon") -> None:

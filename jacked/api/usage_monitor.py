@@ -31,11 +31,11 @@ from jacked.api.keeper_confirmation import (
 )
 
 # The window keeper (loop 2, the full sweep) lives in jacked.api.keeper. The
-# names below stay importable from this module, and each one is the keeper
-# module's own object. A patch on this module does not reach the keeper code:
-# patch the keeper module that reads the name. There is no copy of the sweep
-# wake Event here. keeper.state.reset_locks rebinds it, so a copy would go
-# stale: read it through jacked.api.keeper.state.sweep_wake().
+# names below stay importable from this module, each the keeper module's own
+# object. A patch here reaches jacked.api.keeper_confirmation (it reads names
+# through this module at call time) but no jacked.api.keeper module: patch the
+# one that reads the name. There is no copy of the sweep wake Event here: its
+# reset_locks rebinds it, so read it through keeper.state.sweep_wake().
 from jacked.api.keeper.auth_ladder import (
     _KEEPER_MAX_7D_RESET_SECONDS as _KEEPER_MAX_7D_RESET_SECONDS,
     _KEEPER_MAX_RETRY_SECONDS as _KEEPER_MAX_RETRY_SECONDS,
@@ -157,10 +157,10 @@ _STALL_WARNING_COOLDOWN_SECONDS = 1800
 
 
 def reset_locks() -> None:
-    """Rebind module-level asyncio primitives + clear per-account state.
+    """Clear the module-level tick and per-account state of this monitor.
 
-    See jacked.api.routes.auth.reset_locks for the full explanation of
-    why in-process tray restarts require this. The keeper state (the
+    This module holds no asyncio primitive. See jacked.api.routes.auth.reset_locks
+    for why in-process tray restarts need a reset. The keeper state (the
     sweep wake Event and the ping backoff) is not reset here: it has its
     own owner, jacked.api.keeper.state, whose ``reset_locks`` the
     lifespan calls separately.

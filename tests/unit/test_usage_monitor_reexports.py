@@ -222,3 +222,28 @@ def test_the_keeper_ping_log_never_carries_the_account_email(caplog):
         )
     ]
     assert offenders == [], f"a keeper log line reads the email at source lines {offenders}"
+
+
+def test_a_patch_on_usage_monitor_reaches_keeper_confirmation_only():
+    """The comment over the re-exports says which keeper code a patch on this
+    module reaches. keeper_confirmation reads names through usage_monitor at
+    call time, so a patch reaches it; the comment once said no keeper code."""
+    from jacked.api import keeper_confirmation
+
+    calls = []
+    with patch.object(
+        usage_monitor,
+        "_window_confirmed",
+        side_effect=lambda _row, name, **_kwargs: calls.append(name) or False,
+    ):
+        keeper_confirmation._pending_confirmed({"id": 1}, {}, ["5h"])
+    assert calls == ["5h"]
+    with open(usage_monitor.__file__, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "A patch on this module does not reach the keeper code" not in text
+    assert "A patch here reaches jacked.api.keeper_confirmation" in text
+
+
+def test_reset_locks_docstring_does_not_claim_to_rebind_primitives():
+    assert "Rebind" not in usage_monitor.reset_locks.__doc__
+    assert "holds no asyncio primitive" in usage_monitor.reset_locks.__doc__

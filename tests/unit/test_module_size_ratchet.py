@@ -20,6 +20,11 @@ When the module is at or under 500 lines, remove the entry. Do not raise an
 entry: split the module. Do not add a module only to make this test pass.
 If a split cannot happen now, add the entry with a comment that gives the
 reason and the issue that tracks the split.
+
+A small fix to a listed module follows the same rule. Make the fix in the
+same number of lines, or remove dead code in that module, or move one block
+to a sibling module in the same change (the module re-exports the moved
+names). Then set the entry to the new count if the count is lower.
 """
 
 from __future__ import annotations
@@ -60,7 +65,6 @@ BASELINE: dict[str, int] = {
     "jacked/packs.py": 807,
     "jacked/recover.py": 554,
     "jacked/service/menubar_mac.py": 846,
-    "jacked/service/platform.py": 525,
     "jacked/service/spec.py": 585,
     "jacked/service/tray.py": 2083,
     "jacked/service/update_status.py": 1034,
@@ -128,6 +132,13 @@ def ratchet_problems(
 def test_every_module_fits_the_ratchet():
     problems = ratchet_problems(module_sizes(PACKAGE), BASELINE)
     assert not problems, "\n".join(problems)
+
+
+def test_the_docstring_gives_a_path_for_a_small_fix_to_a_listed_module():
+    """A fix of three lines in a listed module must not read as "raise the
+    entry" or as "split the whole module first"."""
+    assert "A small fix to a listed module follows the same rule." in __doc__
+    assert "move one block" in __doc__
 
 
 def test_the_baseline_is_sorted_by_path():

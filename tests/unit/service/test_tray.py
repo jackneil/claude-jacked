@@ -217,9 +217,10 @@ class _RefusingIcon(_MenuIcon):
 
 _NO_MENU_WARNING = (
     "Tray: this desktop has no tray menu (pystray Xorg backend). Left-click "
-    "the icon to open the dashboard. Use `jacked service restart` / `jacked "
-    "service stop` for the other actions. The full menu needs PyGObject in "
-    "the jacked tool environment; see the README Linux tray notes."
+    "the icon to open the dashboard. For the other actions, use `jacked "
+    "service restart`, `jacked service stop` and `jacked upgrade`; `jacked "
+    "service install` / `uninstall` set start on login. The full menu needs "
+    "PyGObject; see the README Linux tray notes."
 )
 
 
@@ -3124,3 +3125,22 @@ def test_a_status_file_that_is_not_an_object_reads_as_missing(payload, caplog):
     loud = [r for r in caplog.records if r.levelno > logging.DEBUG]
     assert not loud, [r.getMessage() for r in loud]
     assert us.UPDATE_STATUS_FILE.read_text(encoding="utf-8") == payload
+
+
+def test_the_readme_names_the_same_commands_as_the_no_menu_warning():
+    """The Xorg tray has no Update item and no Start on Login item, so the
+    warning and the README both give the commands that replace them."""
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parents[3] / "README.md").read_text(encoding="utf-8")
+    line = next(row for row in readme.splitlines() if "**The Xorg tray has no menu.**" in row)
+    for command in (
+        "jacked service restart",
+        "jacked service stop",
+        "jacked upgrade",
+        "jacked service install",
+        "jacked service uninstall",
+    ):
+        assert command in line, command
+    for command in ("jacked upgrade", "jacked service install"):
+        assert command in " ".join(_NO_MENU_WARNING.split()), command
