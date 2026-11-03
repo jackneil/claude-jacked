@@ -17,7 +17,7 @@ from jacked.api.project_paths import first_outside_project, outside_project_resp
 from jacked.api.remote_access import REASON_OUTSIDE_SCOPE, REASON_REMOTE_ACCESS_OFF
 from jacked.api.routes.settings_swap import SWAP_SETTING_KEYS
 from jacked.findbin import find_bin
-from jacked.install_summary import DEFAULT_LAST_INSTALL_PATH as _LAST_INSTALL_PATH
+from jacked.install_summary import last_install_path
 from jacked.memory.vault import atomic_write_text
 from jacked.service import update_status as _update_status_mod
 from jacked.web.database import SELECTED_ACCOUNT_KEYS, Database
@@ -335,10 +335,11 @@ async def get_install_summary():
     """Return the last-install change record + its mtime.
 
     Used by the dashboard "what changed" panel. The record is written by
-    ``jacked install`` to ``~/.claude/jacked-last-install.json``. Never raises:
+    ``jacked install`` to ``.claude/jacked-last-install.json`` under jacked's
+    home (``$JACKED_HOME``-aware, see ``last_install_path``). Never raises:
     a missing or corrupt file yields {"summary": None, "mtime_iso": None}.
     """
-    p = _LAST_INSTALL_PATH
+    p = last_install_path()
     try:
         if not p.exists():
             return {"summary": None, "mtime_iso": None}

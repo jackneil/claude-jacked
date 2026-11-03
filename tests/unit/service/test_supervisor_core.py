@@ -344,3 +344,57 @@ def test_task_restart_recognizes_its_own_task_read_back_as_utf8(tmp_path, bom):
 
     assert result.ok is True, result.reason
     assert calls[-1] == ["schtasks.exe", "/Run", "/TN", spec.service_id]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b'<plist version="1.0"><dict><key>JackedOwner</key>',
+            id="truncated-xml",
+        ),
+        pytest.param(
+            b'<plist version="1.0"><dict><key>JackedOwner</key>'
+            b"<date>bad</date></dict></plist>",
+            id="malformed-date",
+        ),
+        pytest.param(
+            b'<plist version="1.0"><dict><key>JackedOwner</key>'
+            b"<integer>x</integer></dict></plist>",
+            id="malformed-integer",
+        ),
+        pytest.param(
+            b'<plist version="1.0"><array><string>JackedOwner</string></array></plist>',
+            id="array-root",
+        ),
+    ],
+)
+def test_a_corrupt_launchd_plist_has_no_marker_and_reads_as_foreign(tmp_path, content):
+    """plistlib raises expat's ExpatError for malformed XML (a truncated
+    file) and AttributeError for a malformed date, not only ValueError."""
+    from jacked.service.supervisors import extract_marker
+
+    _spec_unused, _environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    path.write_bytes(content)
+
+    assert extract_marker(content, SupervisorKind.LAUNCHD) is None
+    inspection = inspect_artifact(path, rendered)
+    assert inspection.disposition is ArtifactDisposition.FOREIGN
+    assert inspection.reason == "artifact has no valid jacked ownership marker"
+
+
+def test_a_task_marker_that_is_not_an_object_is_no_marker():
+    """A "JACKED-MARKER:[1]" description parsed to a list, and the owner
+    checks then called .get on it."""
+    from jacked.service.supervisors import extract_marker
+
+    task = (
+        b'<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        b"<RegistrationInfo><Description>JACKED-MARKER:[1]</Description>"
+        b"</RegistrationInfo></Task>"
+    )
+
+    assert extract_marker(task, SupervisorKind.TASK_SCHEDULER) is None

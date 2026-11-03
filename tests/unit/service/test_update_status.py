@@ -846,3 +846,300 @@ def test_a_reused_pid_does_not_keep_an_update_alive(tmp_path, monkeypatch):
     assert us.updater_liveness(data) is None  # cannot tell: the mtime rule applies
     legacy = {k: v for k, v in data.items() if k != "updater_creation_id"}
     assert us.updater_liveness(legacy) is True  # a record from before the field
+
+
+# ---------------------------------------------------------------------------
+# #151i: a completed install is proof the update finished
+# ---------------------------------------------------------------------------
+
+
+def _iso(when):
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(when, tz=timezone.utc).isoformat()
+
+
+_STARTED = "2026-11-02T10:00:00.000000+00:00"
+_LATER = "2026-11-02T10:00:25.000000+00:00"
+
+
+def _record(**overrides):
+    record = {
+        "overall": "in_progress",
+        "started_at": _STARTED,
+        "from_version": "0.110.1",
+        "to_version": "0.110.2",
+    }
+    record.update(overrides)
+    return record
+
+
+def _last(at=_LATER, to_version="0.110.2"):
+    return {"at": at, "from_version": "0.110.1", "to_version": to_version}
+
+
+class TestInstallCompletedAfter:
+    """The last-install record and the running version are independent proof
+    that an update's install finished, whatever its status record says."""
+
+    def test_an_install_after_the_start_at_the_running_version_completed(self):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(_record(), _last(), "0.110.2") is True
+
+    def test_an_install_newer_than_the_running_build_also_counts(self):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(
+            _record(), _last(to_version="0.110.3"), "0.110.2"
+        ) is True
+
+    @pytest.mark.parametrize(
+        "at", ["2026-11-02T09:59:59.000000+00:00", _STARTED],
+        ids=["before-the-start", "at-the-start"],
+    )
+    def test_an_install_that_is_not_later_than_the_start_proves_nothing(self, at):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(_record(), _last(at=at), "0.110.2") is False
+
+    def test_no_last_install_proves_nothing(self):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(_record(), None, "0.110.2") is False
+
+    def test_an_install_older_than_the_running_build_proves_nothing(self):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(
+            _record(from_version="0.110.0"), _last(to_version="0.110.1"), "0.110.2"
+        ) is False
+
+    def test_an_install_that_is_not_newer_than_the_from_version_proves_nothing(self):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(
+            _record(from_version="0.110.2"), _last(to_version="0.110.2"), "0.110.2"
+        ) is False
+
+    def test_versions_compare_by_pep_440_not_as_text(self):
+        from jacked.service import update_status as us
+
+        # 0.99.0 sorts after 0.110.2 as text, before it by PEP 440.
+        assert us.install_completed_after(
+            _record(from_version="0.99.0"), _last(), "0.110.2"
+        ) is True
+        # A dev build sorts before its release.
+        assert us.install_completed_after(
+            _record(), _last(to_version="0.110.2.dev3"), "0.110.2"
+        ) is False
+        # A release candidate sorts before its release.
+        assert us.install_completed_after(
+            _record(from_version="0.110.2rc1"), _last(), "0.110.2"
+        ) is True
+
+    def test_timestamps_compare_as_instants_across_offsets(self):
+        from jacked.service import update_status as us
+
+        # 06:00:25-04:00 is 10:00:25 UTC: 25 s after the start.
+        assert us.install_completed_after(
+            _record(), _last(at="2026-11-02T06:00:25-04:00"), "0.110.2"
+        ) is True
+
+    @pytest.mark.parametrize(
+        "record,last,running",
+        [
+            (_record(from_version="not a version"), _last(), "0.110.2"),
+            (_record(from_version=None), _last(), "0.110.2"),
+            (_record(), _last(to_version=None), "0.110.2"),
+            (_record(), _last(to_version="0.110"), "garbage!"),
+            (_record(started_at="yesterday"), _last(), "0.110.2"),
+            (_record(started_at=None), _last(), "0.110.2"),
+            (_record(), _last(at=12345), "0.110.2"),
+            (_record(), _last(at="2026-11-02T10:00:25"), "0.110.2"),
+            (_record(), {"to_version": "0.110.2"}, "0.110.2"),
+            (_record(), ["not", "a", "record"], "0.110.2"),
+            (["not", "a", "record"], _last(), "0.110.2"),
+            (_record(), _last(), None),
+        ],
+        ids=[
+            "bad-from-version",
+            "no-from-version",
+            "no-to-version",
+            "bad-running-version",
+            "bad-started-at",
+            "no-started-at",
+            "numeric-at",
+            "naive-at",
+            "no-at",
+            "last-install-not-an-object",
+            "record-not-an-object",
+            "no-running-version",
+        ],
+    )
+    def test_malformed_input_proves_nothing_with_one_debug_line(
+        self, caplog, record, last, running
+    ):
+        import logging
+
+        from jacked.service import update_status as us
+
+        with caplog.at_level(logging.DEBUG, logger="jacked.service.update_status"):
+            assert us.install_completed_after(record, last, running) is False
+        lines = [
+            r for r in caplog.records
+            if r.name == "jacked.service.update_status" and r.levelno == logging.DEBUG
+        ]
+        assert len(lines) == 1, [r.getMessage() for r in lines]
+
+
+class TestAbandonedStatusSeesACompletedInstall:
+    """A stale in_progress record whose install completed is closed as
+    succeeded: the batch or the updater died after the install, not during it.
+    """
+
+    @staticmethod
+    def _write(path, started, age_seconds):
+        import json
+
+        path.write_text(
+            json.dumps(_record(started_at=_iso(started), current_phase="restarting_service",
+                               phases=[])),
+            encoding="utf-8",
+        )
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+
+    def test_a_completed_install_closes_the_record_as_succeeded(self, tmp_path):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        self._write(path, started, us.STALE_IN_PROGRESS_SECONDS + 60)
+        last = _last(at=_iso(started + 25))
+
+        assert us.abandoned_status(
+            path, last_install=last, running_version="0.110.2"
+        ) is None
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "succeeded"
+
+    @pytest.mark.parametrize("offset", [None, -60], ids=["no-install", "older-install"])
+    def test_without_a_later_install_the_record_is_still_abandoned(self, tmp_path, offset):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        self._write(path, started, us.STALE_IN_PROGRESS_SECONDS + 60)
+        last = None if offset is None else _last(at=_iso(started + offset))
+
+        record = us.abandoned_status(path, last_install=last, running_version="0.110.2")
+
+        assert record is not None
+        assert record["current_phase"] == "restarting_service"
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+    def test_a_fresh_record_stays_open_even_after_a_completed_install(self, tmp_path):
+        """The updater may still run its last phases; it closes its own record."""
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - 30
+        self._write(path, started, 5)
+
+        assert us.abandoned_status(
+            path, last_install=_last(at=_iso(started + 25)), running_version="0.110.2"
+        ) is None
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+    def test_a_record_that_cannot_be_closed_is_still_not_abandoned(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The verdict holds without the write: no recovery file is due, and
+        the next start reads the same evidence and tries the close again."""
+        import json
+        import logging
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        self._write(path, started, us.STALE_IN_PROGRESS_SECONDS + 60)
+
+        def refuse(*_args, **_kwargs):
+            raise PermissionError("read-only")
+
+        monkeypatch.setattr(us, "_atomic_write", refuse)
+        with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+            assert us.abandoned_status(
+                path, last_install=_last(at=_iso(started + 25)), running_version="0.110.2"
+            ) is None
+        assert "PermissionError" in caplog.text
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+    def test_without_a_running_version_the_age_rule_alone_decides(self, tmp_path):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        self._write(path, started, us.STALE_IN_PROGRESS_SECONDS + 60)
+
+        assert us.abandoned_status(
+            path, last_install=_last(at=_iso(started + 25))
+        ) is not None
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+
+class TestFailedUpdateSuperseded:
+    """A failed record no longer applies once a later install replaced the
+    build it started from."""
+
+    def test_a_later_install_past_the_failed_build_supersedes_it(self):
+        from jacked.service import update_status as us
+
+        failed = _record(overall="failed", from_version="0.103.0")
+        assert us.failed_update_superseded(failed, _last(), "0.110.2") is True
+
+    def test_a_record_that_did_not_fail_is_never_superseded(self):
+        from jacked.service import update_status as us
+
+        for overall in ("in_progress", "succeeded", None):
+            record = _record(overall=overall, from_version="0.103.0")
+            assert us.failed_update_superseded(record, _last(), "0.110.2") is False
+
+    def test_the_failed_build_still_running_is_not_superseded(self):
+        from jacked.service import update_status as us
+
+        failed = _record(overall="failed", from_version="0.110.2")
+        assert us.failed_update_superseded(
+            failed, _last(to_version="0.110.3"), "0.110.2"
+        ) is False
+
+    def test_no_install_after_the_failure_is_not_superseded(self):
+        from jacked.service import update_status as us
+
+        failed = _record(overall="failed", from_version="0.103.0")
+        early = _last(at="2026-11-01T10:00:00.000000+00:00")
+        assert us.failed_update_superseded(failed, early, "0.110.2") is False
+        assert us.failed_update_superseded(failed, None, "0.110.2") is False
+
+    @pytest.mark.parametrize(
+        "record,running",
+        [
+            (_record(overall="failed", from_version="garbage!"), "0.110.2"),
+            (_record(overall="failed", from_version="0.103.0"), "garbage!"),
+            (["not", "a", "record"], "0.110.2"),
+        ],
+        ids=["bad-from-version", "bad-running-version", "record-not-an-object"],
+    )
+    def test_malformed_input_is_not_superseded_and_never_raises(self, record, running):
+        from jacked.service import update_status as us
+
+        assert us.failed_update_superseded(record, _last(), running) is False

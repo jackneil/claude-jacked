@@ -486,6 +486,120 @@ class TestToggleSkillTree:
         backups = tree_env["claude_dir"] / "jacked-backups" / "skills"
         assert not backups.exists() or list(backups.iterdir()) == []
 
+    def test_install_skill_sync_restores_the_users_own_dir(self, tree_env, monkeypatch):
+        """Acceptance (2), #145i: the dashboard helper runs the same transaction
+        as `jacked install`. The copy writes one source file and then hits a
+        full disk: the partial copy is removed, the user's dir is moved back
+        byte for byte, and the result keeps its (backup, error, restored) shape."""
+        import errno
+
+        import jacked.cli as cli
+        from jacked.api.routes.features import _install_skill_sync
+
+        dst = tree_env["dst"]
+        dst.mkdir(parents=True)
+        own = "# my own dcr\nnotes: café\n".encode("utf-8")
+        (dst / "SKILL.md").write_bytes(own)
+        tree_env["manifest"].write_text(json.dumps({
+            "version": "0.105.0", "format": 2,
+            "artifacts": {"skills": {"qa": "sha256:abc"}, "skills_dirs": {}},
+        }), encoding="utf-8")
+
+        def half_copy(src_root, skill_dir):
+            (skill_dir / "references").mkdir(parents=True)
+            (skill_dir / "references" / "lenses.md").write_bytes(
+                (src_root / "references" / "lenses.md").read_bytes()
+            )
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(cli, "_copy_skill_tree", half_copy)
+        backup, err, restored = _install_skill_sync(
+            "dcr", tree_env["src"], dst, tree_env["manifest"],
+        )
+
+        assert (backup, restored) == (None, True)
+        assert isinstance(err, OSError) and err.errno == errno.ENOSPC
+        assert (dst / "SKILL.md").read_bytes() == own
+        assert sorted(p.relative_to(dst).as_posix() for p in dst.rglob("*")) == ["SKILL.md"]
+        backups = tree_env["claude_dir"] / "jacked-backups" / "skills"
+        assert not backups.exists() or list(backups.iterdir()) == []
+        # A failed install records nothing: the restored dir is the user's.
+        recorded = json.loads(tree_env["manifest"].read_text(encoding="utf-8"))
+        assert "dcr" not in recorded["artifacts"]["skills"]
+        assert "dcr" not in recorded["artifacts"]["skills_dirs"]
+
+    def test_enable_failure_names_the_backup_it_could_not_restore(self, tree_env, monkeypatch):
+        """The move back fails: the response names the backup, the backup keeps
+        the user's bytes, and no half-copy is left for Claude Code to load."""
+        import errno
+        import shutil
+
+        import jacked.cli as cli
+
+        dst = tree_env["dst"]
+        dst.mkdir(parents=True)
+        (dst / "SKILL.md").write_text("# my own dcr\n", encoding="utf-8")
+
+        def half_copy(src_root, skill_dir):
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text("partial", encoding="utf-8")
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        real_move = shutil.move
+
+        def no_move_back(src, to, *a, **kw):
+            if Path(to) == dst:
+                raise OSError(errno.EACCES, "Permission denied")
+            return real_move(src, to, *a, **kw)
+
+        monkeypatch.setattr(cli, "_copy_skill_tree", half_copy)
+        monkeypatch.setattr(shutil, "move", no_move_back)
+        result = _run(_toggle_knowledge("skill_dcr", True))
+
+        assert isinstance(result, JSONResponse) and result.status_code == 500
+        err = _body(result)["error"]
+        assert err["code"] == "SKILL_INSTALL_FAILED"
+        backup = Path(err["preserved_backup"])
+        assert (backup / "SKILL.md").read_text() == "# my own dcr\n"
+        assert f"Your earlier copy is at {backup}." in err["message"]
+        assert "restored" not in err["message"]
+        assert not dst.exists()
+
+    def test_enable_failure_logs_a_partial_copy_it_cannot_remove(
+        self, tree_env, monkeypatch, caplog,
+    ):
+        """The partial copy cannot be removed. The old open-coded rollback
+        swallowed that error; the shared helper logs it with the path, and the
+        response names where the user's dir is."""
+        import errno
+        import logging
+
+        import jacked.cli as cli
+
+        dst = tree_env["dst"]
+        dst.mkdir(parents=True)
+        (dst / "SKILL.md").write_text("# my own dcr\n", encoding="utf-8")
+
+        def half_copy(src_root, skill_dir):
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text("partial", encoding="utf-8")
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        def cannot_remove(skill_dir):
+            raise OSError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(cli, "_copy_skill_tree", half_copy)
+        monkeypatch.setattr(cli, "_remove_skill_dir", cannot_remove)
+        with caplog.at_level(logging.WARNING):
+            result = _run(_toggle_knowledge("skill_dcr", True))
+
+        err = _body(result)["error"]
+        backup = Path(err["preserved_backup"])
+        assert (backup / "SKILL.md").read_text() == "# my own dcr\n"
+        assert f"Your earlier copy is at {backup}." in err["message"]
+        warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(str(dst) in w and "Permission denied" in w for w in warned), warned
+
     def test_disable_rechecks_ownership_after_staging(self, tree_env, monkeypatch):
         """A user edit that lands between the ownership check and the delete
         must survive: the dir is staged first, then checked again."""

@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 class TestGenerateLaunchdPlist:
     def test_contains_label(self):
@@ -432,3 +434,442 @@ class TestInstallAutostartFailure:
                 install_autostart(8321)
         content = plist.read_text()
         assert "/Users/test/.local/bin/jacked" in content
+
+
+# ---------------------------------------------------------------------------
+# supervision_drift (#128i): an owned, enabled definition is not proof that
+# the native manager supervises the running service.
+# ---------------------------------------------------------------------------
+
+_LOADED_AND_RAN = "gui/501/ai.hank.jacked = {\n\tstate = running\n\truns = 1\n}\n"
+
+
+class _NativeManager:
+    """Answer the native manager queries the probe makes; refuse the rest."""
+
+    def __init__(self, *, loaded=True, disabled=False, task_xml=None, print_error=None):
+        self.loaded = loaded
+        self.disabled = disabled
+        self.task_xml = task_xml
+        self.print_error = print_error
+        self.calls = []
+
+    def __call__(self, argv, **_kwargs):
+        from types import SimpleNamespace
+
+        argv = list(argv)
+        self.calls.append(argv)
+        if argv[:2] == ["launchctl", "print-disabled"]:
+            listed = '\t"ai.hank.jacked" => true\n' if self.disabled else ""
+            return SimpleNamespace(
+                returncode=0, stdout="disabled services = {\n" + listed + "}\n", stderr=""
+            )
+        if argv[:2] == ["launchctl", "print"]:
+            if self.print_error is not None:
+                raise self.print_error
+            if self.loaded:
+                return SimpleNamespace(returncode=0, stdout=_LOADED_AND_RAN, stderr="")
+            return SimpleNamespace(
+                returncode=113, stdout="", stderr="Could not find service"
+            )
+        if argv[:3] == ["systemctl", "--user", "is-enabled"]:
+            return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
+        if argv and argv[0] == "powershell.exe" and self.task_xml is not None:
+            return SimpleNamespace(returncode=0, stdout=self.task_xml, stderr=b"")
+        raise AssertionError(f"unexpected native manager call: {argv}")
+
+    def asked_launchd_for_the_job(self):
+        return any(call[:2] == ["launchctl", "print"] for call in self.calls)
+
+
+_PROCESS_ARGS = {"pid": 4242, "creation_id": "test-creation", "executable": "/opt/jacked/python"}
+
+
+def _service_paths(tmp_path):
+    from jacked.service.instance import ServicePaths
+
+    return ServicePaths.in_directory(tmp_path / "jacked-service-v2")
+
+
+def _publish_running(paths, spec, monkeypatch, *, alive=True):
+    """Publish a signed manifest for a service started from ``spec``."""
+    from jacked.service import instance_storage
+    from jacked.service.instance import (
+        BindIdentity,
+        InstanceManifest,
+        ProcessIdentity,
+        current_user_identity,
+        publish_manifest,
+    )
+
+    process = ProcessIdentity(**_PROCESS_ARGS)
+    manifest = InstanceManifest.create(
+        spec=spec,
+        process=process,
+        user_id=current_user_identity(),
+        machine_id="machine-test",
+        bind=BindIdentity(host="127.0.0.1", port=8321),
+        control_address=str(paths.root / "control.sock"),
+    )
+    publish_manifest(paths.manifest, manifest)
+
+    def identity(pid):
+        if not alive:
+            raise ProcessLookupError(pid)
+        return process
+
+    monkeypatch.setattr(instance_storage, "process_identity", identity)
+    return manifest
+
+
+def _owned_definition(tmp_path, kind):
+    """Install a real owned definition where the inspector looks for it.
+
+    Returns the spec it was rendered from and the bytes the Task Scheduler
+    query prints (None for the file-based managers).
+    """
+    from pathlib import Path
+
+    from jacked.service.spec import SupervisorKind
+    from jacked.service.supervisors._task_xml import decode_task_xml
+    from tests.unit.service.supervisor_test_support import installed_artifact
+
+    render_dir = tmp_path / "render"
+    render_dir.mkdir()
+    spec, _environment, rendered, _path = installed_artifact(render_dir, kind)
+    if kind is SupervisorKind.TASK_SCHEDULER:
+        return spec, decode_task_xml(rendered.content).encode("utf-8")
+    if kind is SupervisorKind.LAUNCHD:
+        target = Path.home() / "Library" / "LaunchAgents" / "ai.hank.jacked.plist"
+    else:
+        target = Path.home() / ".config" / "systemd" / "user" / "jacked.service"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(rendered.content)
+    return spec, None
+
+
+def _other_build(kind):
+    from tests.unit.service.supervisor_test_support import make_spec
+
+    return make_spec(kind, launcher_hash="d" * 64)
+
+
+class TestSupervisionDrift:
+    def test_unloaded_launchd_job_under_a_manual_service_is_not_loaded(
+        self, tmp_path, monkeypatch
+    ):
+        """The #128i state: owned plist, job not loaded, manual replacement."""
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        _publish_running(paths, _other_build(SupervisorKind.MANUAL), monkeypatch)
+        manager = _NativeManager(loaded=False)
+
+        assert supervision_drift(run=manager, uid=501, paths=paths) == (
+            "launchd job not loaded"
+        )
+        assert ["launchctl", "print", "gui/501/ai.hank.jacked"] in manager.calls
+
+    def test_loaded_job_beside_a_manual_service_names_the_manual_supervisor(
+        self, tmp_path, monkeypatch
+    ):
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        _publish_running(paths, _other_build(SupervisorKind.MANUAL), monkeypatch)
+
+        assert supervision_drift(run=_NativeManager(), uid=501, paths=paths) == (
+            "the running service is under a manual supervisor"
+        )
+
+    def test_generation_mismatch_names_both_generations(self, tmp_path, monkeypatch):
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        on_disk, _ = _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        running = _publish_running(paths, _other_build(SupervisorKind.LAUNCHD), monkeypatch)
+        assert running.generation != on_disk.generation
+
+        assert supervision_drift(run=_NativeManager(), uid=501, paths=paths) == (
+            f"generation {on_disk.generation[:12]} on disk, "
+            f"{running.generation[:12]} running"
+        )
+
+    def test_definition_that_supervises_the_running_service_reports_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        spec, _ = _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        _publish_running(paths, spec, monkeypatch)
+        manager = _NativeManager()
+
+        assert supervision_drift(run=manager, uid=501, paths=paths) is None
+        assert manager.asked_launchd_for_the_job()
+
+    def test_no_manifest_means_no_running_service_and_asks_no_manager(
+        self, tmp_path, monkeypatch
+    ):
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        manager = _NativeManager(loaded=False)
+
+        assert supervision_drift(run=manager, uid=501, paths=_service_paths(tmp_path)) is None
+        assert manager.calls == []
+
+    def test_dead_owner_means_no_running_service(self, tmp_path, monkeypatch):
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        _publish_running(
+            paths, _other_build(SupervisorKind.MANUAL), monkeypatch, alive=False
+        )
+        manager = _NativeManager(loaded=False)
+
+        assert supervision_drift(run=manager, uid=501, paths=paths) is None
+        assert manager.calls == []
+
+    def test_unreadable_manifest_makes_no_claim(self, tmp_path, monkeypatch):
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        paths.root.mkdir(parents=True)
+        paths.manifest.write_text("{not json", encoding="utf-8")
+        manager = _NativeManager(loaded=False)
+
+        assert supervision_drift(run=manager, uid=501, paths=paths) is None
+        assert manager.calls == []
+
+    def test_disabled_definition_makes_no_supervision_claim(self, tmp_path, monkeypatch):
+        """A login item the user turned off is not expected to supervise."""
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        _publish_running(paths, _other_build(SupervisorKind.MANUAL), monkeypatch)
+        manager = _NativeManager(loaded=False, disabled=True)
+
+        assert supervision_drift(run=manager, uid=501, paths=paths) is None
+        assert not manager.asked_launchd_for_the_job()
+
+    def test_launchd_that_cannot_answer_is_not_evidence_of_an_unloaded_job(
+        self, tmp_path, monkeypatch
+    ):
+        """A timed-out launchctl proves nothing; the other checks still run."""
+        import subprocess
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        _publish_running(paths, _other_build(SupervisorKind.MANUAL), monkeypatch)
+        manager = _NativeManager(
+            print_error=subprocess.TimeoutExpired(["launchctl", "print"], 10)
+        )
+
+        assert supervision_drift(run=manager, uid=501, paths=paths) == (
+            "the running service is under a manual supervisor"
+        )
+
+    def test_default_run_is_resolved_when_the_probe_runs(self, tmp_path, monkeypatch):
+        """The test tripwire replaces subprocess.run per test. A default bound
+        at import would bypass it and ask the developer's real launchd."""
+        import subprocess
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        _owned_definition(tmp_path, SupervisorKind.LAUNCHD)
+        paths = _service_paths(tmp_path)
+        _publish_running(paths, _other_build(SupervisorKind.MANUAL), monkeypatch)
+        manager = _NativeManager(loaded=False)
+        monkeypatch.setattr(subprocess, "run", manager)
+
+        assert supervision_drift(uid=501, paths=paths) == "launchd job not loaded"
+        assert manager.asked_launchd_for_the_job()
+
+    def test_a_caller_inspection_is_not_asked_for_again(self, tmp_path, monkeypatch):
+        """status already holds the inspection; a second native manager
+        query is a second PowerShell COM call on Windows."""
+        import sys
+
+        from jacked.service.autostart import AutostartInspection, AutostartState
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        paths = _service_paths(tmp_path)
+        running = _publish_running(paths, _other_build(SupervisorKind.MANUAL), monkeypatch)
+        manager = _NativeManager()
+        inspection = AutostartInspection(
+            AutostartState.OWNED_ENABLED, generation=running.generation
+        )
+
+        assert supervision_drift(
+            run=manager, uid=501, paths=paths, inspection=inspection
+        ) == "the running service is under a manual supervisor"
+        assert manager.calls == [["launchctl", "print", "gui/501/ai.hank.jacked"]]
+
+    def test_never_asks_launchd_off_macos(self, tmp_path, monkeypatch):
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "linux")
+        _owned_definition(tmp_path, SupervisorKind.SYSTEMD_USER)
+        paths = _service_paths(tmp_path)
+        _publish_running(paths, _other_build(SupervisorKind.MANUAL), monkeypatch)
+        manager = _NativeManager(loaded=False)
+
+        assert supervision_drift(run=manager, uid=501, paths=paths) == (
+            "the running service is under a manual supervisor"
+        )
+        assert not any(call[0] == "launchctl" for call in manager.calls)
+
+
+def _expected_drift(case, on_disk, running):
+    if case == "manual":
+        return "the running service is under a manual supervisor"
+    if case == "other build":
+        return (
+            f"generation {on_disk.generation[:12]} on disk, "
+            f"{running.generation[:12]} running"
+        )
+    return None
+
+
+class TestSupervisionDriftOtherManagers:
+    """The Task Scheduler and systemd shapes, run here through fakes."""
+
+    @pytest.mark.parametrize("case", ["manual", "other build", "same build"])
+    def test_task_scheduler_definition(self, tmp_path, monkeypatch, case):
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        on_disk, task_xml = _owned_definition(tmp_path, SupervisorKind.TASK_SCHEDULER)
+        running_spec = {
+            "manual": _other_build(SupervisorKind.MANUAL),
+            "other build": _other_build(SupervisorKind.TASK_SCHEDULER),
+            "same build": on_disk,
+        }[case]
+        paths = _service_paths(tmp_path)
+        running = _publish_running(paths, running_spec, monkeypatch)
+        manager = _NativeManager(task_xml=task_xml)
+
+        assert supervision_drift(run=manager, paths=paths) == _expected_drift(
+            case, on_disk, running
+        )
+        assert not any(call[0] == "launchctl" for call in manager.calls)
+
+    @pytest.mark.parametrize("case", ["manual", "other build", "same build"])
+    def test_systemd_user_definition(self, tmp_path, monkeypatch, case):
+        import sys
+
+        from jacked.service.platform import supervision_drift
+        from jacked.service.spec import SupervisorKind
+
+        monkeypatch.setattr(sys, "platform", "linux")
+        on_disk, _ = _owned_definition(tmp_path, SupervisorKind.SYSTEMD_USER)
+        running_spec = {
+            "manual": _other_build(SupervisorKind.MANUAL),
+            "other build": _other_build(SupervisorKind.SYSTEMD_USER),
+            "same build": on_disk,
+        }[case]
+        paths = _service_paths(tmp_path)
+        running = _publish_running(paths, running_spec, monkeypatch)
+
+        assert supervision_drift(run=_NativeManager(), paths=paths) == _expected_drift(
+            case, on_disk, running
+        )
+
+
+class TestAutostartInspectionGeneration:
+    """inspect_autostart keeps the generation it already read from the marker."""
+
+    @pytest.mark.parametrize("kind_name", ["LAUNCHD", "SYSTEMD_USER", "TASK_SCHEDULER"])
+    def test_owned_enabled_definition_carries_its_marker_generation(
+        self, tmp_path, monkeypatch, kind_name
+    ):
+        import sys
+
+        from jacked.service.autostart import AutostartState
+        from jacked.service.platform import inspect_autostart
+        from jacked.service.spec import SupervisorKind
+
+        kind = SupervisorKind[kind_name]
+        platform_name = {
+            SupervisorKind.LAUNCHD: "darwin",
+            SupervisorKind.SYSTEMD_USER: "linux",
+            SupervisorKind.TASK_SCHEDULER: "win32",
+        }[kind]
+        monkeypatch.setattr(sys, "platform", platform_name)
+        spec, task_xml = _owned_definition(tmp_path, kind)
+
+        inspection = inspect_autostart(run=_NativeManager(task_xml=task_xml))
+
+        assert inspection.state is AutostartState.OWNED_ENABLED
+        assert inspection.generation == spec.generation
+
+    def test_unowned_definition_carries_no_generation(self, tmp_path, monkeypatch):
+        import sys
+        from pathlib import Path
+
+        from jacked.service.autostart import AutostartState
+        from jacked.service.platform import inspect_autostart
+
+        monkeypatch.setattr(sys, "platform", "darwin")
+        target = Path.home() / "Library" / "LaunchAgents" / "ai.hank.jacked.plist"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"not a plist")
+
+        inspection = inspect_autostart(run=_NativeManager())
+
+        assert inspection.state is AutostartState.FOREIGN
+        assert inspection.generation is None

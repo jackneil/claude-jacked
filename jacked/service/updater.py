@@ -457,6 +457,17 @@ def _write_recovery(message: str) -> None:
         logger.exception("Could not write recovery file")
 
 
+# The states of the final guard in run_update. The guard acts on how the run
+# ended. "pending": the run ended before it made a decision (an early return
+# or a crash), so the guard starts the service again. "restarted": a spawn or
+# a native restart ran, so the guard does nothing. "hands_off:<reason>": the
+# run decided not to touch the service, so the guard only logs that decision.
+_GUARD_PENDING = "pending"
+_GUARD_RESTARTED = "restarted"
+_GUARD_HANDS_OFF_PORT_BUSY = "hands_off:port_busy"
+_GUARD_HANDS_OFF_PARENT_ALIVE = "hands_off:parent_alive"
+
+
 def run_update(
     parent_pid: int,
     extras: str = "tray",
@@ -560,15 +571,20 @@ def run_update(
         except Exception:
             logger.exception("end_phase failed: %s", phase)
 
-    # Set to True by any restart path (success or fallback) so the
-    # finally-guard skips a duplicate restart.
-    _restart_attempted = [False]
+    # How the run ended, for the final guard in the `finally` below. It is
+    # one state, not a "restart attempted" flag: a deliberate hands-off exit
+    # must not get the kickstart that an early return or a crash gets.
+    _final_guard = [_GUARD_PENDING]
 
     try:
         # Phase: waiting_for_parent
         _begin("waiting_for_parent")
         log(f"Waiting for parent PID {parent_pid} to exit")
         if not wait_for_exit(parent_pid, timeout=15.0):
+            # A hands-off exit: the old service is still alive and nothing
+            # may kill it, so the final guard must not kick the job either.
+            # Nothing has run yet, so no restart record can be lost here.
+            _final_guard[0] = _GUARD_HANDS_OFF_PARENT_ALIVE
             log(
                 f"Parent {parent_pid} still alive after 15s; refusing PID-only termination"
             )
@@ -758,11 +774,11 @@ def run_update(
                     log(
                         f"Native lifecycle freshly installed (RunAtLoad booted service): {ens_reason}"
                     )
-                    _restart_attempted[0] = True
+                    _final_guard[0] = _GUARD_RESTARTED
                 else:
                     # already_installed -> atomic kickstart
                     native_ok, native_reason = native_restart()
-                    _restart_attempted[0] = True
+                    _final_guard[0] = _GUARD_RESTARTED
                     if native_ok:
                         log(f"Native lifecycle restart: {native_reason}")
                     else:
@@ -773,7 +789,7 @@ def run_update(
             else:
                 log(f"Native lifecycle unavailable ({ens_reason}); manual spawn")
                 _spawn_detached([jacked, "service", "start"], log_fh=log_fh)
-                _restart_attempted[0] = True
+                _final_guard[0] = _GUARD_RESTARTED
             _end("starting_service", "ok")
 
         def _verified_build(
@@ -880,6 +896,8 @@ def run_update(
 
             'ok'        - the expected build is serving the port.
             'port_busy' - the port stayed occupied by an unverified listener.
+                          Nothing is started, and the final guard does not
+                          start anything either.
             'not_ready' - the expected build never answered in time.
 
             `expected` is the build this tail is starting: the target version
@@ -890,6 +908,11 @@ def run_update(
             # they read the same as the upgrade tail's.
             _diagnosed.clear()
             if not _wait_port_free():
+                # A hands-off exit on every tail: no process was signalled,
+                # so the final guard must not kick the service. A restart
+                # that an earlier tail ran keeps its record.
+                if _final_guard[0] == _GUARD_PENDING:
+                    _final_guard[0] = _GUARD_HANDS_OFF_PORT_BUSY
                 return "port_busy"
             _spawn_service()
             return "ok" if _verify_service(expected) else "not_ready"
@@ -1141,6 +1164,16 @@ def run_update(
                     logger.exception("mark_failed fallback also raised")
                     log("ERROR: mark_failed fallback also raised - disk likely full")
         elif outcome == "port_busy":
+            # _start_and_verify set the final guard hands-off, so the text
+            # below stays true: nothing touches the port owner.
+            try:
+                _us.mark_failed(
+                    _us.UPDATE_STATUS_FILE,
+                    error=f"port {port} is held by an unverified listener",
+                    recovery="jacked service status",
+                )
+            except Exception:
+                logger.exception("mark_failed after port_busy")
             _write_recovery(
                 f"Jacked auto-update stopped safely because port {port} is occupied by an "
                 "unverified listener. No port owner was killed. Run `jacked service status` "
@@ -1159,13 +1192,17 @@ def run_update(
                 rollback.step or (None if restored_ready else ROLLBACK_STEP_RESTART),
             )
     finally:
-        # Best-effort recovery: ensure the service comes back up even when an
-        # upgrade phase bailed early via `return`. Previously a SameFileError
-        # in `jacked install --force` (or any other failure path) left the
-        # tray permanently dead — the parent process had already exited and
-        # nothing kicked launchd back into life. Skip when the success path
-        # already attempted a restart (avoids duplicate launchctl calls).
-        if not _restart_attempted[0]:
+        # The final guard acts on how the run ended (see _GUARD_PENDING).
+        # Pending: an early `return` or a crash. A SameFileError in `jacked
+        # install --force` once left the tray dead for good this way, because
+        # the parent had exited and nothing kicked launchd, so this state
+        # gets a best-effort kickstart. Restarted: the run already restarted
+        # the service, and a second launchctl call adds nothing. Hands off:
+        # the run left a process alone on purpose, either the unverified
+        # port owner or the old service that did not exit. On macOS the
+        # kickstart is `launchctl kickstart -k`, which kills the job, and
+        # that job can be exactly the process the run left alone.
+        if _final_guard[0] == _GUARD_PENDING:
             try:
                 from jacked.service.platform import native_restart
 
@@ -1176,6 +1213,10 @@ def run_update(
                 )
             except Exception:
                 logger.exception("Final-guard native_restart raised")
+        elif _final_guard[0] == _GUARD_HANDS_OFF_PORT_BUSY:
+            log("Final guard: skipped (port held by an unverified listener; nothing restarted)")
+        elif _final_guard[0] == _GUARD_HANDS_OFF_PARENT_ALIVE:
+            log("Final guard: skipped (the old service did not exit; nothing restarted)")
         _release_update_lock(_update_lock)
         log_fh.close()
 

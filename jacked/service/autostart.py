@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import plistlib
 import re
 import subprocess
 import sys
@@ -16,6 +15,7 @@ from xml.etree import ElementTree
 from jacked.service import CLAUDE_DIR, LAUNCHD_LABEL
 from jacked.service.spec import SupervisorKind
 from jacked.service.supervisors import extract_marker
+from jacked.service.supervisors._artifacts import load_plist_dict
 from jacked.service.supervisors._task_xml import query_task_xml
 
 
@@ -33,6 +33,9 @@ class AutostartState(str, Enum):
 class AutostartInspection:
     state: AutostartState
     reason: str = ""
+    # The generation that an owned definition records in its marker. None
+    # when the definition is not ours or its marker has no generation.
+    generation: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -100,19 +103,19 @@ def _inspect_launchd(path: Path, run: Any) -> AutostartInspection:
         return AutostartInspection(
             AutostartState.OWNED_DISABLED
             if disabled
-            else AutostartState.OWNED_ENABLED
+            else AutostartState.OWNED_ENABLED,
+            generation=_marker_generation(marker),
         )
-    try:
-        payload = plistlib.loads(content)
-        if not isinstance(payload, dict):
-            raise TypeError("launchd plist root must be a dictionary")
-        arguments = payload.get("ProgramArguments", [])
-        if payload.get("Label") == LAUNCHD_LABEL and _legacy_command(arguments):
-            return AutostartInspection(
-                AutostartState.LEGACY, "legacy launchd definition requires recovery"
-            )
-    except (plistlib.InvalidFileException, ValueError, TypeError):
-        pass
+    # A plist that does not parse (a truncated write) is not ours either.
+    payload = load_plist_dict(content)
+    if (
+        payload is not None
+        and payload.get("Label") == LAUNCHD_LABEL
+        and _legacy_command(payload.get("ProgramArguments", []))
+    ):
+        return AutostartInspection(
+            AutostartState.LEGACY, "legacy launchd definition requires recovery"
+        )
     return AutostartInspection(AutostartState.FOREIGN, "unowned launchd definition")
 
 
@@ -139,14 +142,18 @@ def _inspect_windows(path: Path, legacy: Path, run: Any) -> AutostartInspection:
         return AutostartInspection(
             AutostartState.OWNED_ENABLED if enabled else AutostartState.OWNED_DISABLED,
             "registered task is disabled" if not enabled else "",
+            generation=_marker_generation(marker),
         )
     if legacy_present:
         return AutostartInspection(AutostartState.LEGACY, "legacy Startup VBS exists")
     content = _read(path)
     if content is not None:
-        if _owned(extract_marker(content, SupervisorKind.TASK_SCHEDULER)):
+        staged = extract_marker(content, SupervisorKind.TASK_SCHEDULER)
+        if _owned(staged):
             return AutostartInspection(
-                AutostartState.OWNED_DISABLED, "task is staged only"
+                AutostartState.OWNED_DISABLED,
+                "task is staged only",
+                generation=_marker_generation(staged),
             )
         return AutostartInspection(AutostartState.FOREIGN, "staged task is unowned")
     return AutostartInspection(AutostartState.ABSENT)
@@ -189,7 +196,8 @@ def _inspect_systemd(path: Path, run: Any) -> AutostartInspection:
             return AutostartInspection(AutostartState.LEGACY, "legacy systemd unit")
         return AutostartInspection(AutostartState.FOREIGN, "unowned systemd unit")
     return AutostartInspection(
-        AutostartState.OWNED_ENABLED if enabled else AutostartState.OWNED_DISABLED
+        AutostartState.OWNED_ENABLED if enabled else AutostartState.OWNED_DISABLED,
+        generation=_marker_generation(marker),
     )
 
 
@@ -199,6 +207,18 @@ def _owned(marker: dict | None) -> bool:
         and marker.get("owner") == "claude-jacked"
         and marker.get("service_id") == LAUNCHD_LABEL
     )
+
+
+def _marker_generation(marker: dict) -> str | None:
+    """Return the generation that an owned marker records, or None.
+
+    >>> _marker_generation({"generation": "ab12"})
+    'ab12'
+    >>> _marker_generation({"generation": 7}) is None
+    True
+    """
+    generation = marker.get("generation")
+    return generation if isinstance(generation, str) and generation else None
 
 
 def _legacy_command(arguments: object) -> bool:

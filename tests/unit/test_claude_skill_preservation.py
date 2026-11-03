@@ -7,11 +7,15 @@ Ports the Codex installer's guards to ~/.claude/skills:
   2. uninstall deletes only a dir jacked owns (manifest hash, or every file
      still matching the packaged source) and keeps the rest with an honest note;
   3. a full-dir hash (`skills_dirs`, manifest format 2) catches sidecar edits
-     that the SKILL.md hash alone cannot see.
+     that the SKILL.md hash alone cannot see;
+  4. a copy that fails part-way removes its partial copy and puts the user's
+     own dir back at its path (#145i), through one shared transaction helper.
 """
 
+import errno
 import json
 import logging
+import shutil
 from pathlib import Path
 
 import pytest
@@ -411,6 +415,29 @@ def test_link_or_copy_never_unlinks_the_source_it_would_link(tmp_path, monkeypat
     assert per_file.is_symlink() and src.read_text() == "keep"
 
 
+@pytest.mark.parametrize("git_entry", ["file", "dir"])
+def test_is_editable_install_accepts_a_git_file_or_dir(tmp_path, monkeypatch, git_entry):
+    """A normal clone has a `.git` DIR. A git worktree or a submodule checkout
+    has a `.git` FILE (a `gitdir:` pointer). Both are source checkouts, so both
+    install in editable mode, the mode CI runs in. A package with no `.git`
+    beside it is not editable."""
+    from jacked import cli as _cli
+
+    repo = tmp_path / "repo"
+    data = repo / "jacked" / "data"
+    data.mkdir(parents=True)
+    monkeypatch.setattr(_cli, "_get_data_root", lambda: data)
+    assert _cli._is_editable_install() is False
+
+    if git_entry == "file":
+        (repo / ".git").write_text(
+            "gitdir: /elsewhere/claude-jacked/.git/worktrees/repo\n", encoding="utf-8",
+        )
+    else:
+        (repo / ".git").mkdir()
+    assert _cli._is_editable_install() is True
+
+
 def test_uninstall_rechecks_ownership_after_staging(tmp_path, monkeypatch):
     """The shared removal helper stages the dir, then re-decides on the staged
     copy, so an edit racing the first check is never deleted."""
@@ -744,3 +771,361 @@ def test_second_install_overwrites_jacked_dir_without_new_backup(tmp_path, monke
     backups_root = tmp_path / ".claude" / "jacked-backups"
     assert not backups_root.exists()
     assert list((tmp_path / ".claude" / "skills").glob("*.pre-jacked*")) == []
+
+
+# --- #145i: a failed copy puts the user's own skill back ---------------------
+
+_ENOSPC = OSError(errno.ENOSPC, "No space left on device")
+
+
+def _tree(d: Path) -> list:
+    """Every entry under `d` (files AND dirs), as sorted posix paths."""
+    return sorted(p.relative_to(d).as_posix() for p in d.rglob("*"))
+
+
+def _fail_copy_after_one_file(monkeypatch, name: str = "dcr") -> list:
+    """Make the CLI copy of skill `name` write ONE source sidecar and then fail
+    with ENOSPC, the way a full disk stops a copy part-way. Other skills copy
+    as usual. Returns the list the fake appends each written path to."""
+    from jacked import cli as _cli
+
+    real = _cli._copy_skill_tree
+    written: list = []
+
+    def half_copy(src_root, skill_dir):
+        if Path(src_root).name != name:
+            return real(src_root, skill_dir)
+        sidecar = next(
+            p for p in sorted(Path(src_root).rglob("*"))
+            if p.is_file() and p.name != "SKILL.md"
+        )
+        dst = Path(skill_dir) / sidecar.relative_to(src_root)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        # An editable install links each file to the repo source: unlink the
+        # link first, as `_link_or_copy` does, so this never writes through it.
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+        dst.write_bytes(sidecar.read_bytes())
+        written.append(dst)
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(_cli, "_copy_skill_tree", half_copy)
+    return written
+
+
+def _install_wide(runner, monkeypatch):
+    """`_install` with a console wide enough that rich never wraps a line, so
+    the tests can match each printed line exactly."""
+    monkeypatch.setenv("COLUMNS", "1000")
+    return _install(runner)
+
+
+def test_failed_copy_restores_the_users_own_skill(tmp_path, monkeypatch):
+    """Acceptance (1): the copy writes one file and then hits a full disk. The
+    partial copy is removed and the user's own dir is moved back from
+    jacked-backups, byte for byte. Claude Code must never load a broken
+    half-copy while the user's working skill sits in a backup dir."""
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    skills = _skills_base(tmp_path)
+    user_dir = skills / "dcr"
+    user_dir.mkdir()
+    own = "# my own dcr\nnotes: café\n".encode("utf-8")
+    (user_dir / "SKILL.md").write_bytes(own)
+    written = _fail_copy_after_one_file(monkeypatch)
+
+    res = _install_wide(CliRunner(), monkeypatch)
+
+    assert res.exit_code == 0, res.output
+    assert written, "the failing copy never ran for dcr"
+    assert (user_dir / "SKILL.md").read_bytes() == own
+    assert _tree(user_dir) == ["SKILL.md"]          # nothing of jacked's is left
+    assert _backups_of(skills, "dcr") == []          # the backup entry is gone
+    assert "Preserved your existing skill dcr" in res.output
+    assert "Skipped skill dcr: " in res.output
+    assert f"Skipped skill dcr: {_ENOSPC}; your own skill was restored" in res.output
+    # The other skills still installed.
+    assert (skills / "qa" / "SKILL.md").exists()
+
+
+def test_failed_copy_over_jackeds_own_skill_attempts_no_restore(tmp_path, monkeypatch):
+    """Acceptance (4): the dir is jacked's own copy (the manifest owns it), so
+    nothing was moved aside and there is nothing of the user's to put back.
+    The CLI prints the plain skip line and leaves the dir as the copy left it."""
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    runner = CliRunner()
+    assert _install(runner).exit_code == 0           # dcr is jacked's own now
+    skills = tmp_path / ".claude" / "skills"
+    moves: list = []
+    real_move = shutil.move
+
+    def spy_move(src, dst, *a, **kw):
+        moves.append((Path(src), Path(dst)))
+        return real_move(src, dst, *a, **kw)
+
+    monkeypatch.setattr(shutil, "move", spy_move)
+    written = _fail_copy_after_one_file(monkeypatch)
+
+    res = _install_wide(runner, monkeypatch)
+
+    assert res.exit_code == 0, res.output
+    assert written
+    assert f"Skipped skill dcr: {_ENOSPC}\n" in res.output
+    assert "your own skill" not in res.output
+    assert "Preserved your existing skill dcr" not in res.output
+    assert [m_ for m_ in moves if "dcr" in (m_[0].name, m_[1].name)] == []
+    assert (skills / "dcr" / "SKILL.md").exists()    # left as the copy left it
+    assert _backups_of(skills, "dcr") == []
+
+
+def test_failed_restore_names_where_the_users_skill_is(tmp_path, monkeypatch, caplog):
+    """Acceptance (5): the backup cannot be moved back. The CLI names the
+    backup path, the backup keeps the user's bytes, the partial copy is gone,
+    and the failure is logged at WARNING with both paths."""
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    skills = _skills_base(tmp_path)
+    user_dir = skills / "dcr"
+    user_dir.mkdir()
+    (user_dir / "SKILL.md").write_bytes(b"# my own dcr\n")
+    _fail_copy_after_one_file(monkeypatch)
+    real_move = shutil.move
+
+    def no_move_back(src, dst, *a, **kw):
+        if "jacked-backups" in Path(src).parts and Path(dst).name == "dcr":
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_move(src, dst, *a, **kw)
+
+    monkeypatch.setattr(shutil, "move", no_move_back)
+
+    with caplog.at_level(logging.WARNING, logger="jacked.cli"):
+        res = _install_wide(CliRunner(), monkeypatch)
+
+    assert res.exit_code == 0, res.output
+    backups = _backups_of(skills, "dcr")
+    assert len(backups) == 1
+    assert (backups[0] / "SKILL.md").read_bytes() == b"# my own dcr\n"
+    assert (
+        f"Skipped skill dcr: {_ENOSPC}; your own skill is at {backups[0]}" in res.output
+    )
+    assert not user_dir.exists()                     # no broken half-copy is left
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(str(backups[0]) in w and str(user_dir) in w for w in warned), warned
+
+
+def test_skip_line_is_plain_when_a_new_skill_fails(tmp_path, monkeypatch):
+    """A skill dir that did not exist before: the partial copy is removed, and
+    with no user dir to restore the CLI prints the plain skip line."""
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    skills = _skills_base(tmp_path)
+    _fail_copy_after_one_file(monkeypatch)
+
+    res = _install_wide(CliRunner(), monkeypatch)
+
+    assert res.exit_code == 0, res.output
+    assert f"Skipped skill dcr: {_ENOSPC}\n" in res.output
+    assert "your own skill" not in res.output
+    assert not (skills / "dcr").exists()             # partial copy removed
+
+
+# --- the shared transaction helper, called directly --------------------------
+
+def _transaction(src, dst, manifest, *, copy, preserve=None):
+    from jacked import cli as _cli
+
+    return _cli._install_skill_dir_transactional(
+        src, dst, dst.name, manifest,
+        preserve=preserve or m.preserve_user_skill_dir, copy=copy,
+    )
+
+
+def _half_copy(name: str = "partial.md"):
+    def copy(src, dst):
+        Path(dst).mkdir(parents=True, exist_ok=True)
+        (Path(dst) / name).write_text("half\n", encoding="utf-8")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    return copy
+
+
+def test_transaction_success_reports_backup_and_file_count(tmp_path):
+    from jacked import cli as _cli
+
+    src = _with_sidecar(tmp_path / "src", "dcr", "# jacked dcr\n", "// js\n")
+    dst = _skill(_skills_base(tmp_path), "dcr", "# my own dcr\n")
+
+    out = _transaction(src, dst, None, copy=_cli._copy_skill_tree)
+
+    assert out.error is None and out.rollback_error is None
+    assert out.restored is False
+    assert out.copied == 2
+    assert out.backup is not None and (out.backup / "SKILL.md").read_text() == "# my own dcr\n"
+    assert (dst / "measure.js").read_text() == "// js\n"
+
+
+def test_transaction_restores_the_moved_aside_dir(tmp_path):
+    src = _skill(tmp_path / "src", "dcr", "# jacked dcr\n")
+    skills = _skills_base(tmp_path)
+    dst = _with_sidecar(skills, "dcr", "# my own dcr\n", "// mine\n")
+
+    out = _transaction(src, dst, None, copy=_half_copy())
+
+    assert isinstance(out.error, OSError) and out.error.errno == errno.ENOSPC
+    assert out.restored is True
+    assert out.backup is None                        # it is back at its own path
+    assert out.rollback_error is None
+    assert _tree(dst) == ["SKILL.md", "measure.js"]
+    assert (dst / "SKILL.md").read_text() == "# my own dcr\n"
+    assert _backups_of(skills, "dcr") == []
+
+
+def test_transaction_over_jackeds_own_copy_attempts_no_restore(tmp_path, monkeypatch):
+    """Acceptance (4), at the helper: backup None, restored False, and the dir
+    is left as the copy left it (no remove, no move)."""
+    from jacked import cli as _cli
+
+    src = _skill(tmp_path / "src", "dcr", "# jacked dcr\n")
+    dst = _skill(_skills_base(tmp_path), "dcr", "# jacked dcr\n")
+    owning = _owning_manifest(dst, "dcr")
+    touched: list = []
+    monkeypatch.setattr(_cli, "_remove_skill_dir", lambda d: touched.append(("rm", d)))
+    monkeypatch.setattr(shutil, "move", lambda s, d, *a, **kw: touched.append(("mv", s, d)))
+
+    out = _transaction(src, dst, owning, copy=_half_copy())
+
+    assert out.error is not None and out.error.errno == errno.ENOSPC
+    assert out.backup is None and out.restored is False
+    assert out.rollback_error is None
+    assert touched == []
+    assert _tree(dst) == ["SKILL.md", "partial.md"]
+
+
+def test_transaction_removes_the_partial_copy_of_a_new_skill(tmp_path):
+    src = _skill(tmp_path / "src", "dcr", "# jacked dcr\n")
+    dst = _skills_base(tmp_path) / "dcr"
+
+    out = _transaction(src, dst, None, copy=_half_copy())
+
+    assert out.error is not None
+    assert out.backup is None and out.restored is False and out.rollback_error is None
+    assert not dst.exists() and not dst.is_symlink()
+
+
+def test_transaction_reports_a_move_back_that_fails(tmp_path, monkeypatch, caplog):
+    src = _skill(tmp_path / "src", "dcr", "# jacked dcr\n")
+    skills = _skills_base(tmp_path)
+    dst = _skill(skills, "dcr", "# my own dcr\n")
+    real_move = shutil.move
+    refused = OSError(errno.EACCES, "Permission denied")
+
+    def no_move_back(s, d, *a, **kw):
+        if Path(d) == dst:
+            raise refused
+        return real_move(s, d, *a, **kw)
+
+    monkeypatch.setattr(shutil, "move", no_move_back)
+    with caplog.at_level(logging.WARNING, logger="jacked.cli"):
+        out = _transaction(src, dst, None, copy=_half_copy())
+
+    assert out.restored is False
+    assert out.rollback_error is refused
+    assert out.backup is not None and (out.backup / "SKILL.md").read_text() == "# my own dcr\n"
+    assert not dst.exists()                          # the partial copy is gone
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(str(out.backup) in w and str(dst) in w for w in msgs), msgs
+
+
+def test_transaction_reports_a_partial_copy_it_cannot_remove(tmp_path, monkeypatch, caplog):
+    """The partial copy cannot be removed, so the path is not free: the backup
+    stays where it is (never moved INTO the partial dir) and both failures are
+    visible."""
+    from jacked import cli as _cli
+
+    src = _skill(tmp_path / "src", "dcr", "# jacked dcr\n")
+    skills = _skills_base(tmp_path)
+    dst = _skill(skills, "dcr", "# my own dcr\n")
+    locked = OSError(errno.EACCES, "Permission denied")
+
+    def cannot_remove(d):
+        raise locked
+
+    monkeypatch.setattr(_cli, "_remove_skill_dir", cannot_remove)
+    with caplog.at_level(logging.WARNING, logger="jacked.cli"):
+        out = _transaction(src, dst, None, copy=_half_copy())
+
+    assert out.error is not None and out.error.errno == errno.ENOSPC
+    assert out.rollback_error is locked
+    assert out.restored is False
+    assert out.backup is not None and (out.backup / "SKILL.md").read_text() == "# my own dcr\n"
+    assert _tree(dst) == ["partial.md"]              # the backup was not nested in it
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(str(dst) in w for w in msgs), msgs
+
+
+def test_transaction_never_moves_a_backup_into_a_path_that_is_in_use(tmp_path, caplog):
+    """Something else takes the path between the move-aside and the copy. The
+    helper did not make that dir, so it does not remove it, and the backup is
+    not moved into it (shutil.move would nest it there)."""
+    src = _skill(tmp_path / "src", "dcr", "# jacked dcr\n")
+    skills = _skills_base(tmp_path)
+    dst = _skill(skills, "dcr", "# my own dcr\n")
+
+    def preserve_then_reoccupy(skill_dir, name, src_dir, manifest):
+        backup = m.preserve_user_skill_dir(skill_dir, name, src_dir, manifest)
+        _skill(skills, "dcr", "# someone else\n")
+        return backup
+
+    def failing_copy(s, d):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with caplog.at_level(logging.WARNING, logger="jacked.cli"):
+        out = _transaction(src, dst, None, copy=failing_copy, preserve=preserve_then_reoccupy)
+
+    assert out.restored is False
+    assert isinstance(out.rollback_error, FileExistsError)
+    assert (dst / "SKILL.md").read_text() == "# someone else\n"
+    assert _tree(dst) == ["SKILL.md"]
+    assert out.backup is not None and (out.backup / "SKILL.md").read_text() == "# my own dcr\n"
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(str(out.backup) in w and str(dst) in w for w in msgs), msgs
+
+
+def test_transaction_never_raises_when_a_path_check_fails(tmp_path, monkeypatch, caplog):
+    """One unreadable path must never stop a whole install: a failing path
+    check goes into the outcome, the backup is left alone, and the rollback
+    failure is logged with the backup path."""
+    src = _skill(tmp_path / "src", "dcr", "# jacked dcr\n")
+    dst = _skills_base(tmp_path) / "dcr"
+    kept = _skill(tmp_path / "kept", "dcr", "# my own dcr\n")
+    real_exists = Path.exists
+
+    def broken_exists(self, *a, **kw):
+        if self == dst:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_exists(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "exists", broken_exists)
+    with caplog.at_level(logging.WARNING, logger="jacked.cli"):
+        out = _transaction(src, dst, None, copy=_half_copy(), preserve=lambda *a: kept)
+
+    assert isinstance(out.error, PermissionError)
+    assert isinstance(out.rollback_error, PermissionError)
+    assert out.restored is False and out.backup == kept
+    assert (kept / "SKILL.md").read_text() == "# my own dcr\n"
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(str(kept) in w for w in msgs), msgs
+
+
+def test_transaction_preserve_failure_never_starts_the_copy(tmp_path):
+    src = _skill(tmp_path / "src", "dcr", "# jacked dcr\n")
+    dst = _skill(_skills_base(tmp_path), "dcr", "# my own dcr\n")
+    denied = OSError(errno.EACCES, "Permission denied")
+    copied: list = []
+
+    def preserve(*a):
+        raise denied
+
+    out = _transaction(src, dst, None, copy=lambda s, d: copied.append(d), preserve=preserve)
+
+    assert out.error is denied
+    assert out.backup is None and out.restored is False and out.rollback_error is None
+    assert copied == []
+    assert (dst / "SKILL.md").read_text() == "# my own dcr\n"

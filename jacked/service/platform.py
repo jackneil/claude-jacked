@@ -151,12 +151,16 @@ def detect_autostart() -> bool:
     return inspect_autostart().enabled
 
 
-def inspect_autostart():
-    """Return typed native autostart state for safe UI and CLI decisions."""
+def inspect_autostart(run=None):
+    """Return typed native autostart state for safe UI and CLI decisions.
+
+    ``run`` replaces ``subprocess.run`` for the native manager queries.
+    """
     from jacked.service.autostart import inspect_autostart as inspect
 
     task = CLAUDE_DIR / "jacked-service-v2" / "supervisors" / "jacked-task.xml"
     return inspect(
+        run=run,
         launchd_path=_get_launchd_plist_path(),
         task_path=task,
         legacy_vbs_path=_get_windows_startup_path(),
@@ -331,7 +335,33 @@ def uninstall_autostart() -> str:
         return "Auto-start not supported on this platform."
 
 
-def launchd_job_never_ran(run=subprocess.run, uid: "int | None" = None) -> bool:
+def _launchd_job_print(run, uid: "int | None"):
+    """Ask launchd for the jacked job in the GUI domain of the user.
+
+    Returns the completed ``launchctl print`` call, or None when launchd
+    cannot be asked: there is no ``os.getuid`` (Windows), launchctl does not
+    start, or it times out. A non-zero exit code is an answer: launchd does
+    not have the job loaded (113, "Could not find service"). The never-ran
+    and the supervision-drift probes share this call, so both ask launchd
+    the same question. ``run`` replaces ``subprocess.run`` and is resolved
+    at call time, so the test tripwire on ``subprocess.run`` still applies.
+    """
+    if uid is None:
+        getuid = getattr(os, "getuid", None)  # absent on Windows
+        if getuid is None:
+            return None
+        uid = getuid()
+    runner = subprocess.run if run is None else run
+    try:
+        return runner(
+            ["launchctl", "print", f"gui/{uid}/{LAUNCHD_LABEL}"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def launchd_job_never_ran(run=None, uid: "int | None" = None) -> bool:
     """True when the launchd job is loaded but launchd never spawned it.
 
     Seen 2026-10-22 after an interrupted upgrade: `launchctl print` showed
@@ -351,20 +381,66 @@ def launchd_job_never_ran(run=subprocess.run, uid: "int | None" = None) -> bool:
         return False
     import re
 
-    if uid is None:
-        getuid = getattr(os, "getuid", None)  # absent on Windows
-        if getuid is None:
-            return False
-        uid = getuid()
-    domain = f"gui/{uid}/{LAUNCHD_LABEL}"
-    try:
-        probe = run(
-            ["launchctl", "print", domain],
-            capture_output=True, text=True, timeout=10, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if probe.returncode != 0:
+    probe = _launchd_job_print(run, uid)
+    if probe is None or probe.returncode != 0:
         return False
     fields = dict(re.findall(r"^\t(state|runs) = (.+)$", probe.stdout or "", re.MULTILINE))
     return fields.get("runs", "").strip() == "0" and fields.get("state", "").strip() != "running"
+
+
+def supervision_drift(
+    run=None, uid: "int | None" = None, paths=None, *, inspection=None
+) -> "str | None":
+    """Return why the enabled autostart does not supervise the running service.
+
+    `jacked service status` said "Autostart: enabled" when an owned
+    definition existed. After one upgrade, launchd did not have the job
+    loaded, the plist named the previous generation, and a manual service
+    ran in its place. Nothing restarts that service after a crash or a
+    reboot (#128i). This probe compares the definition with the running
+    service and returns the first mismatch as a short reason:
+
+    1. macOS only: launchd does not have the owned job loaded.
+    2. A manual supervisor started the running service.
+    3. The definition on disk records a different generation.
+
+    Returns None when there is nothing to report: no service runs (the
+    manifest is missing, unreadable or names a dead process), the
+    definition is not owned and enabled, or the definition supervises the
+    running service. A launchctl call that cannot run proves nothing, so
+    check 1 then gives no reason. ``paths`` is the ``ServicePaths`` of the
+    running service (default: ``default_service_paths()``). ``inspection``
+    is the ``inspect_autostart()`` result of the caller, if it has one: on
+    Windows each query of the native manager is a PowerShell COM call.
+    ``run`` replaces ``subprocess.run`` and is resolved at call time.
+    """
+    from jacked.service.autostart import AutostartState
+    from jacked.service.instance import process_is_stale, read_manifest
+    from jacked.service.spec import SupervisorKind
+
+    if paths is None:
+        from jacked.service.lifecycle import default_service_paths
+
+        paths = default_service_paths()
+    try:
+        running = read_manifest(paths.manifest)
+    except (OSError, ValueError):
+        return None
+    # The shared staleness rule (manifest_is_proven_stale), applied to the
+    # manifest that was just read instead of to a second read of the file.
+    if process_is_stale(running.process):
+        return None
+    if inspection is None:
+        inspection = inspect_autostart(run=run)
+    if inspection.state is not AutostartState.OWNED_ENABLED:
+        return None
+    if sys.platform == "darwin":
+        probe = _launchd_job_print(run, uid)
+        if probe is not None and probe.returncode != 0:
+            return "launchd job not loaded"
+    if running.supervisor == SupervisorKind.MANUAL.value:
+        return "the running service is under a manual supervisor"
+    on_disk = inspection.generation
+    if on_disk is not None and on_disk != running.generation:
+        return f"generation {on_disk[:12]} on disk, {running.generation[:12]} running"
+    return None

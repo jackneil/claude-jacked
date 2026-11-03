@@ -525,6 +525,43 @@ def test_command_copy_failure_keeps_derived_skill(data_root, homes, monkeypatch)
     assert "skills/dcr" not in summ.removed and "prompts/dcr.md" not in summ.removed
 
 
+def test_command_hash_failure_keeps_the_prompt_it_just_wrote(data_root, homes, monkeypatch):
+    """The prompt copy lands, then the command cannot be read for its hash. Both
+    prior hashes are carried forward, so the prune cannot unlink the prompt
+    that this run just wrote, or the command-derived skill dir."""
+    import errno
+
+    _install(data_root, homes)
+    skill_dir = _skill_dir(homes, "dcr")
+    prompt = ins.codex_prompts_dir(homes["home"]) / "dcr.md"
+    assert skill_dir.exists() and prompt.exists()
+    cmd = data_root / "commands" / "dcr.md"
+    copied: list = []
+    real_copy = shutil.copy
+    real_sha = ins._sha_file
+
+    def spy_copy(src, dst, *a, **kw):
+        copied.append(Path(src))
+        return real_copy(src, dst, *a, **kw)
+
+    def unreadable(path):
+        if Path(path) == cmd:
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_sha(path)
+
+    monkeypatch.setattr(ins.shutil, "copy", spy_copy)
+    monkeypatch.setattr(ins, "_sha_file", unreadable)
+    summ = _install(data_root, homes)
+
+    assert cmd in copied                       # the copy ran before the hash failed
+    assert prompt.exists(), "the prune unlinked the prompt this run just wrote"
+    assert prompt.read_text() == cmd.read_text()
+    assert "prompts/dcr.md" not in summ.removed
+    assert "dcr.md" in _manifest(homes)["prompts"]
+    assert skill_dir.exists() and "dcr" in _manifest(homes)["skills"]
+    assert "skills/dcr" not in summ.removed
+
+
 def test_engine_prompt_handles_crlf_and_refuses_no_frontmatter(tmp_path):
     """CRLF checkouts (autocrlf=true) must still emit prompts — a parse miss
     here would cascade into pruning every installed prompt — and a SKILL.md
@@ -1646,6 +1683,177 @@ def test_install_skips_a_failing_skill_and_continues(data_root, homes, monkeypat
     assert "demo-skill" not in summ.skills     # skipped, and not recorded
     assert "dcr" in summ.skills                # the command-derived skill landed
     assert summ.rules and summ.prompts         # the rest of the pass completed
+
+
+# #145i: a failed copy puts the user's own dir back (the shared transaction).
+
+def _entries(d: Path) -> list:
+    """Every entry under `d` (files AND dirs), as sorted posix paths."""
+    return sorted(p.relative_to(d).as_posix() for p in d.rglob("*"))
+
+
+def test_failed_skill_copy_restores_the_users_own_dir(data_root, homes, monkeypatch):
+    """Acceptance (3): the skills pass moves a user's own ~/.agents/skills dir
+    aside, then the copy writes one file and hits a full disk. The partial copy
+    is removed and the user's dir goes back, byte for byte. It is not reported
+    as preserved: it is back at its own path."""
+    import errno
+
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    user = skills_base / "demo-skill"
+    user.mkdir(parents=True)
+    own = "---\nname: demo-skill\ndescription: MINE\n---\ncafé\n".encode("utf-8")
+    (user / "SKILL.md").write_bytes(own)
+    real = ins._copy_tree
+    calls: list = []
+
+    def half_copy(src, dst):
+        if Path(src).name != "demo-skill":
+            return real(src, dst)
+        calls.append(dst)
+        Path(dst).mkdir(parents=True)
+        (Path(dst) / "measure.js").write_bytes((Path(src) / "measure.js").read_bytes())
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ins, "_copy_tree", half_copy)
+    summ = _install(data_root, homes)
+
+    assert calls, "the failing copy never ran for demo-skill"
+    assert (user / "SKILL.md").read_bytes() == own
+    assert _entries(user) == ["SKILL.md"]          # nothing of jacked's is left
+    assert _backups_of(skills_base, "demo-skill") == []
+    assert "skills/demo-skill" not in summ.preserved
+    assert "demo-skill" not in summ.skills         # no prior hash to carry forward
+    assert "dcr" in summ.skills                    # the rest of the pass ran
+
+
+def test_failed_skill_restore_keeps_and_reports_the_backup(
+    data_root, homes, monkeypatch, caplog,
+):
+    """The move back fails: the backup keeps the user's bytes and stays in
+    summary.preserved, the partial copy is gone, and the warning names the
+    backup path."""
+    import errno
+
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    user = skills_base / "demo-skill"
+    user.mkdir(parents=True)
+    (user / "SKILL.md").write_text("---\nname: demo-skill\ndescription: MINE\n---\nmine\n")
+    real_copy = ins._copy_tree
+
+    def half_copy(src, dst):
+        if Path(src).name != "demo-skill":
+            return real_copy(src, dst)
+        Path(dst).mkdir(parents=True)
+        (Path(dst) / "measure.js").write_text("half\n")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    real_move = shutil.move
+
+    def no_move_back(src, dst, *a, **kw):
+        if Path(dst) == user:
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_move(src, dst, *a, **kw)
+
+    monkeypatch.setattr(ins, "_copy_tree", half_copy)
+    monkeypatch.setattr(shutil, "move", no_move_back)
+    with caplog.at_level(logging.WARNING):
+        summ = _install(data_root, homes)
+
+    backups = _backups_of(skills_base, "demo-skill")
+    assert len(backups) == 1
+    assert "MINE" in (backups[0] / "SKILL.md").read_text()
+    assert "skills/demo-skill" in summ.preserved
+    assert not user.exists()                       # no half-copy is left
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "skipping Codex skill demo-skill" in w and str(backups[0]) in w for w in warned
+    ), warned
+
+
+def test_failed_command_skill_write_restores_the_users_own_dir(data_root, homes, monkeypatch):
+    """The second preserve-then-copy site (command-derived skills) runs the
+    same transaction: a failed write puts the user's dir back."""
+    import errno
+
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    user = skills_base / "dcr"
+    user.mkdir(parents=True)
+    own = b"---\nname: dcr\ndescription: MINE\n---\nmine\n"
+    (user / "SKILL.md").write_bytes(own)
+    (user / "my-notes.txt").write_text("do not delete\n")
+    real = ins._write_solo_skill
+
+    def half_write(skill_dir, content):
+        if Path(skill_dir).name != "dcr":
+            return real(skill_dir, content)
+        Path(skill_dir).mkdir(parents=True)
+        (Path(skill_dir) / "SKILL.md").write_text(content[:10])
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ins, "_write_solo_skill", half_write)
+    summ = _install(data_root, homes)
+
+    assert (user / "SKILL.md").read_bytes() == own
+    assert _entries(user) == ["SKILL.md", "my-notes.txt"]
+    assert _backups_of(skills_base, "dcr") == []
+    assert "skills/dcr" not in summ.preserved
+    assert "dcr" not in summ.skills
+
+
+def test_restored_user_dir_is_not_taken_for_this_runs_output(data_root, homes, monkeypatch):
+    """Step 1 fails on a user's own dir and puts it back, and carries the prior
+    manifest hash forward into the skills dict. Step 2 (the command-derived
+    skill of the same name) must still see the dir as the USER's: only a dir
+    this run WROTE is jacked's own. Otherwise _write_solo_skill deletes the
+    restored user dir with no backup."""
+    import errno
+
+    wrapper = data_root / "skills" / "dcr"
+    wrapper.mkdir(parents=True)
+    (wrapper / "SKILL.md").write_text(
+        "---\nname: dcr\ndescription: pointer wrapper\n---\nread the command\n"
+    )
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    _install(data_root, homes)                     # records dcr in the manifest
+    shutil.rmtree(skills_base / "dcr")
+    user = skills_base / "dcr"
+    user.mkdir()
+    (user / "SKILL.md").write_text("---\nname: dcr\ndescription: MINE\n---\nmine\n")
+    (user / "my-notes.txt").write_text("do not delete\n")
+    real = ins._copy_tree
+
+    def boom(src, dst):
+        if Path(src).name == "dcr":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(src, dst)
+
+    monkeypatch.setattr(ins, "_copy_tree", boom)
+    summ = _install(data_root, homes)
+
+    backups = _backups_of(skills_base, "dcr")
+    assert len(backups) == 1, "step 2 must move the user's dir aside, not delete it"
+    assert (backups[0] / "my-notes.txt").read_text() == "do not delete\n"
+    assert summ.preserved.count("skills/dcr") == 1
+    assert _body_after_frontmatter(
+        (skills_base / "dcr" / "SKILL.md").read_text()
+    ) == "run dcr\n"
+
+
+def test_preserve_returns_the_backup_path(homes):
+    """The Codex preserve step returns where it moved the dir (None when it
+    moved nothing), so the shared transaction can move it back."""
+    skills_base = ins.agents_skills_dir(homes["agents_home"])
+    d = skills_base / "demo-skill"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text("mine\n")
+    preserved: list = []
+
+    backup = ins._preserve_user_skill_dir(d, "sha256:other", "demo-skill", {}, preserved)
+
+    assert backup is not None and (backup / "SKILL.md").read_text() == "mine\n"
+    assert _backups_of(skills_base, "demo-skill") == [backup]
+    assert ins._preserve_user_skill_dir(d, "sha256:other", "demo-skill", {}, []) is None
 
 
 def test_wrapper_skill_overwritten_by_command_not_self_preserved(data_root, homes):

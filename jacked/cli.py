@@ -2685,12 +2685,16 @@ def _get_data_root() -> Path:
 def _is_editable_install() -> bool:
     """Check if package is installed in editable (dev) mode.
 
+    The package is editable when it sits in a source checkout. A normal clone
+    has a ``.git`` dir. A git worktree or a submodule checkout has a ``.git``
+    file (a ``gitdir:`` pointer) instead, so any ``.git`` entry counts.
+
     >>> # In a git repo with editable install, returns True
     >>> isinstance(_is_editable_install(), bool)
     True
     """
     repo_root = _get_data_root().parent.parent
-    return (repo_root / ".git").is_dir()
+    return (repo_root / ".git").exists()
 
 
 def _jacked_home() -> Path:
@@ -2920,6 +2924,123 @@ def _remove_skill_dir(skill_dir: Path) -> None:
         skill_dir.unlink()
     else:
         shutil.rmtree(skill_dir)
+
+
+@dataclass
+class SkillInstallOutcome:
+    """The result of one `_install_skill_dir_transactional` call.
+
+    ``backup`` is where the user's own same-named dir is now, or None. It is
+    None after a restore, because the dir is back at its own path. ``error``
+    is the OSError that stopped the install, or None when the install worked.
+    ``restored`` is True when a failed install put the user's dir back.
+    ``copied`` is the file count that the copy step returned, or 0 when the
+    copy step returns no count. ``rollback_error`` is the OSError that stopped
+    the rollback, or None.
+
+    >>> SkillInstallOutcome().restore_note()
+    ''
+    >>> SkillInstallOutcome(restored=True).restore_note()
+    '; your own skill was restored'
+    >>> SkillInstallOutcome(backup=Path("kept")).restore_note()
+    '; your own skill is at kept'
+    """
+
+    backup: Path | None = None
+    error: OSError | None = None
+    restored: bool = False
+    copied: int = 0
+    rollback_error: OSError | None = None
+
+    def restore_note(self) -> str:
+        """After a failed install, the clause that tells the user where their
+        own skill is: back at its path, in a backup dir, or "" when there was
+        no user dir."""
+        if self.restored:
+            return "; your own skill was restored"
+        if self.backup is not None:
+            return f"; your own skill is at {self.backup}"
+        return ""
+
+
+def _install_skill_dir_transactional(
+    src, skill_dir: Path, name: str, prior_manifest, *, preserve, copy,
+) -> SkillInstallOutcome:
+    """Install one skill dir as one move-aside-then-copy transaction.
+
+    `jacked install`, the dashboard skill toggle and the Codex installer all
+    call this, so the rollback lives in one place. ``preserve(skill_dir, name,
+    src, prior_manifest)`` moves a dir that jacked does not own out of the
+    way and returns the backup path, or None. ``copy(src, skill_dir)`` writes
+    jacked's copy. It can return a file count.
+
+    When the copy raises OSError, the helper removes what the copy wrote if
+    the path was empty when the copy started: the dir did not exist, or
+    ``preserve`` moved it aside. Then it moves the backup back if the path is
+    free. A path that held jacked's own copy stays as the copy left it,
+    because nothing of the user's was moved. A rollback step that fails goes
+    in ``rollback_error`` and is logged at WARNING with the paths. An OSError
+    from ``preserve`` stops the install before the copy starts. The helper
+    never raises OSError: every failure is in the outcome, so one skill can
+    never stop a whole install.
+
+    >>> callable(_install_skill_dir_transactional)
+    True
+    """
+    try:
+        backup = preserve(skill_dir, name, src, prior_manifest)
+    except OSError as e:
+        return SkillInstallOutcome(error=e)
+    fresh = False
+    try:
+        # Checked after the move-aside, at the moment the copy starts: an
+        # empty path means that anything there after a failed copy is the
+        # copy's own output.
+        fresh = not (skill_dir.exists() or skill_dir.is_symlink())
+        written = copy(src, skill_dir)
+    except OSError as e:
+        outcome = SkillInstallOutcome(backup=backup, error=e)
+        _roll_back_skill_dir(skill_dir, name, fresh, outcome)
+        return outcome
+    return SkillInstallOutcome(
+        backup=backup, copied=written if isinstance(written, int) else 0,
+    )
+
+
+def _roll_back_skill_dir(
+    skill_dir: Path, name: str, fresh: bool, outcome: SkillInstallOutcome,
+) -> None:
+    """Undo one failed copy of `_install_skill_dir_transactional`. Updates
+    `outcome` in place: ``restored``, ``backup`` and ``rollback_error``. The
+    first rollback failure is the one that ``rollback_error`` keeps."""
+    import errno
+
+    try:
+        if fresh and (skill_dir.exists() or skill_dir.is_symlink()):
+            _remove_skill_dir(skill_dir)
+    except OSError as e:
+        outcome.rollback_error = e
+        logger.warning(
+            "Could not remove the partial copy of skill %s at %s: %s", name, skill_dir, e,
+        )
+    backup = outcome.backup
+    if backup is None:
+        return
+    try:
+        if skill_dir.exists() or skill_dir.is_symlink():
+            # Never move the backup onto a path that is in use: shutil.move
+            # puts it INSIDE an existing dir.
+            raise FileExistsError(errno.EEXIST, "The skill path is in use", str(skill_dir))
+        shutil.move(str(backup), str(skill_dir))
+    except OSError as e:
+        if outcome.rollback_error is None:
+            outcome.rollback_error = e
+        logger.warning(
+            "Could not restore skill %s from %s to %s: %s", name, backup, skill_dir, e,
+        )
+        return
+    outcome.backup = None
+    outcome.restored = True
 
 
 def _stage_for_removal(skill_dir: Path, name: str) -> Path:
@@ -4763,27 +4884,34 @@ def _run_install(
         from jacked import install_manifest as _skill_mani
 
         _prior_skills = _skill_mani.load(home / ".claude" / "jacked-manifest.json")
+
+        def _preserve_and_report(skill_dir, name, src_dir, manifest):
+            # The move is REPORTED immediately: a Ctrl-C later in the loop
+            # must not leave the user's dir relocated without them ever seeing
+            # where it went.
+            backup = _skill_mani.preserve_user_skill_dir(skill_dir, name, src_dir, manifest)
+            if backup:
+                console.print(
+                    f"[yellow][!][/yellow] Preserved your existing skill "
+                    f"{name} (not installed by jacked) at {_rich_escape(str(backup))}"
+                )
+            return backup
+
         for skill_md in skills_src_dir.glob("*/SKILL.md"):
             skill_name = skill_md.parent.name
             skill_dir = home / ".claude" / "skills" / skill_name
             # Never destroy a dir that isn't ours: a user's own same-named skill
-            # (or one they edited) is moved aside first, and the move is REPORTED
-            # immediately — a Ctrl-C later in the loop must not leave the user's
-            # dir relocated without them ever seeing where it went. One
-            # unwritable skill is skipped, not fatal to the whole install.
-            try:
-                _backup = _skill_mani.preserve_user_skill_dir(
-                    skill_dir, skill_name, skill_md.parent, _prior_skills,
-                )
-                if _backup:
-                    console.print(
-                        f"[yellow][!][/yellow] Preserved your existing skill "
-                        f"{skill_name} (not installed by jacked) at {_backup}"
-                    )
-                _copy_skill_tree(skill_md.parent, skill_dir)
-            except OSError as _skill_err:
+            # (or one they edited) is moved aside first. One unwritable skill is
+            # skipped, not fatal to the whole install, and a copy that fails
+            # part-way puts the user's own dir back (#145i).
+            _outcome = _install_skill_dir_transactional(
+                skill_md.parent, skill_dir, skill_name, _prior_skills,
+                preserve=_preserve_and_report, copy=_copy_skill_tree,
+            )
+            if _outcome.error is not None:
                 console.print(
-                    f"[yellow][!][/yellow] Skipped skill {skill_name}: {_skill_err}"
+                    f"[yellow][!][/yellow] Skipped skill {skill_name}: "
+                    f"{_rich_escape(str(_outcome.error) + _outcome.restore_note())}"
                 )
                 continue
             skill_count += 1
@@ -5222,7 +5350,13 @@ def _live_manifest(paths):
         manifest = read_manifest(paths.manifest)
     except (OSError, ValueError):
         return None
-    if _manifest_is_proven_stale(paths.manifest):
+    try:
+        stale = _manifest_is_proven_stale(paths.manifest)
+    except (OSError, ValueError):
+        # The staleness rule reads the manifest again. An owner that exits
+        # between the two reads removes it: that is no live owner either.
+        return None
+    if stale:
         return None
     return manifest
 
@@ -5261,6 +5395,19 @@ def _release_manual_owner(paths, *, timeout: float = 10.0) -> tuple[bool, str]:
 
     try:
         response = send_native_control(paths.manifest, ControlAction.SHUTDOWN)
+    except (FileNotFoundError, ConnectionRefusedError) as exc:
+        refused = f"manual service refused handoff ({type(exc).__name__})"
+        # No control endpoint answers. That is a refusal only while the
+        # owner still runs: a crashed or killed owner leaves its manifest
+        # behind with no pipe or socket (#161i). Re-check with the shared
+        # staleness rule.
+        try:
+            gone = _manifest_is_proven_stale(paths.manifest)
+        except FileNotFoundError:
+            gone = True  # the owner removed its manifest when it exited
+        except (OSError, ValueError):
+            return False, refused  # liveness unreadable: this proves nothing
+        return (True, "previous service is gone") if gone else (False, refused)
     except (OSError, ValueError) as exc:
         return False, f"manual service refused handoff ({type(exc).__name__})"
     if not response.get("ok"):
@@ -5294,14 +5441,12 @@ def _ensure_autostart_and_running(
     """
     from jacked.service.lifecycle import (
         default_service_paths,
-        discover_service,
         inspect_native_artifact,
         install_native_owned,
         native_artifact_path,
         provision_service_contract,
         spawn_exact_service,
     )
-    from jacked.service.instance import read_manifest
     from jacked.service.spec import SupervisorKind
     from jacked.service.supervisors import (
         ArtifactDisposition,
@@ -5311,34 +5456,35 @@ def _ensure_autostart_and_running(
     paths = default_service_paths()
     try:
         spec, environment = provision_service_contract(paths=paths)
-        endpoint = discover_service(paths)
-        if endpoint.source == "manifest":
-            existing = read_manifest(paths.manifest)
-            if existing.supervisor == SupervisorKind.MANUAL.value:
-                artifact_path = native_artifact_path(spec, paths=paths)
-                inspected = inspect_native_artifact(
-                    spec,
-                    artifact_path,
-                    environment=environment,
+        # The shared liveness rule, as `service restart` and `service recover`
+        # apply it. A manifest whose owner died is not a live owner: the
+        # ownership claim of the new service retires it (#161i).
+        existing = _live_manifest(paths)
+        if existing is not None and existing.supervisor == SupervisorKind.MANUAL.value:
+            artifact_path = native_artifact_path(spec, paths=paths)
+            inspected = inspect_native_artifact(
+                spec,
+                artifact_path,
+                environment=environment,
+            )
+            # A pre-v2 definition jacked itself wrote is NOT foreign: the
+            # supervisor install backs it up and replaces it. Only refuse
+            # an artifact nobody here recognises.
+            if (
+                inspected.artifact.disposition is ArtifactDisposition.FOREIGN
+                and not is_known_legacy_artifact(
+                    artifact_path, spec.service_id, spec.supervisor
                 )
-                # A pre-v2 definition jacked itself wrote is NOT foreign: the
-                # supervisor install backs it up and replaces it. Only refuse
-                # an artifact nobody here recognises.
-                if (
-                    inspected.artifact.disposition is ArtifactDisposition.FOREIGN
-                    and not is_known_legacy_artifact(
-                        artifact_path, spec.service_id, spec.supervisor
-                    )
-                ):
-                    console.print(
-                        "[red]Error:[/red] supervisor artifact is foreign; "
-                        "run `jacked service recover`"
-                    )
-                    return False
-                released, detail = _release_manual_owner(paths)
-                if not released:
-                    console.print(f"[red]Error:[/red] {detail}")
-                    return False
+            ):
+                console.print(
+                    "[red]Error:[/red] supervisor artifact is foreign; "
+                    "run `jacked service recover`"
+                )
+                return False
+            released, detail = _release_manual_owner(paths)
+            if not released:
+                console.print(f"[red]Error:[/red] {detail}")
+                return False
         result = (
             spawn_exact_service(spec, environment=environment)
             if spec.supervisor is SupervisorKind.MANUAL
@@ -5618,7 +5764,7 @@ def doctor():
     from jacked import __version__
     from jacked.install_method import detect_install_method
     from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
-    from jacked.service.platform import launchd_job_never_ran
+    from jacked.service.platform import launchd_job_never_ran, supervision_drift
     from jacked.service.process import (
         is_port_available, is_process_alive, read_pid,
     )
@@ -5659,13 +5805,16 @@ def doctor():
         pid_info is not None
         and is_process_alive(pid_info.get("pid", 0))
     )
+    # An owned definition is not proof that it supervises the running
+    # service (#128i). The same probe as `jacked service status`.
+    drift = supervision_drift()
 
     if port_free:
         console.print(
             f"[bold]Service:[/bold] [yellow]NOT RUNNING[/yellow] "
             f"(port {DEFAULT_PORT} free)"
         )
-        if launchd_job_never_ran():
+        if drift is None and launchd_job_never_ran():
             console.print(
                 "  [yellow]The launchd job is loaded but never ran.[/yellow]"
             )
@@ -5742,6 +5891,14 @@ def doctor():
                     "to see the owner."
                 )
             console.print("  Recovery: [cyan]jacked service restart[/cyan]")
+
+    if drift is not None:
+        # Nothing restarts the running service after a crash or a reboot.
+        console.print(
+            "[bold]Autostart:[/bold] [yellow]not supervising the running "
+            f"service: {drift}[/yellow]"
+        )
+        console.print("  Recovery: [cyan]jacked service restart[/cyan]")
 
     # Install-method-specific recovery
     if method == "editable":
@@ -7769,9 +7926,18 @@ def service_status():
         detail = f" ({autostart.reason})" if autostart.reason else ""
         autostart_label = f"[yellow]{autostart.state.value}{detail}[/yellow]"
     if autostart.state is AutostartState.OWNED_ENABLED:
-        from jacked.service.platform import launchd_job_never_ran
+        from jacked.service.platform import launchd_job_never_ran, supervision_drift
 
-        if launchd_job_never_ran():
+        # An owned definition is not proof that it supervises the running
+        # service (#128i): launchd can have the job unloaded while a manual
+        # service from another generation runs in its place.
+        drift = supervision_drift(paths=paths, inspection=autostart)
+        if drift is not None:
+            autostart_label += (
+                f" [yellow](not supervising the running service: {drift}; "
+                "run `jacked service restart`)[/yellow]"
+            )
+        elif launchd_job_never_ran():
             # Loaded with RunAtLoad but never spawned (#178i): "enabled" alone
             # read as fine while nothing was going to start the service.
             autostart_label += (

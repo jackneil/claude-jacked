@@ -82,6 +82,40 @@ def _isolate_claude_dir(tmp_path, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _stop_signal_handlers_unchanged():
+    """Fail a test that leaves a process-wide stop-signal handler changed.
+
+    ``ServiceRunner.run`` routes the stop signals to its own runner while it
+    runs and must put the previous handlers back when it returns (#138i). A
+    handler left in place binds Ctrl+C to a dead runner for every later test
+    in this process, so Ctrl+C no longer raises KeyboardInterrupt.
+
+    The check uses the real ``signal`` functions captured before the test, so
+    a test that patches ``signal.signal`` or ``signal.getsignal`` cannot hide
+    a leak. A changed handler is put back before the failure is reported, so
+    one leak fails one test and not every test after it.
+    """
+    import signal
+
+    getsignal, setsignal = signal.getsignal, signal.signal
+    names = ["SIGINT", "SIGTERM"]
+    if hasattr(signal, "SIGBREAK"):
+        names.append("SIGBREAK")  # Windows: Ctrl+Break
+    before = {name: getsignal(getattr(signal, name)) for name in names}
+
+    yield
+
+    changed = []
+    for name, handler in before.items():
+        if getsignal(getattr(signal, name)) is not handler:
+            changed.append(name)
+            setsignal(getattr(signal, name), handler)
+    assert not changed, (
+        f"the test left these stop-signal handlers changed: {changed}"
+    )
+
+
 @pytest.fixture
 def absent_autostart():
     """Report "no autostart artifact" without asking the real supervisor.

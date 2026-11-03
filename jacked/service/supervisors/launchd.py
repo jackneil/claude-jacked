@@ -18,6 +18,7 @@ from jacked.service.supervisors._artifacts import (
     SupervisorArtifact,
     extract_marker,
     inspect_artifact,
+    load_plist_dict,
     reconcile_artifact,
 )
 from jacked.service.supervisors._helpers import atomic_write, privately_controlled
@@ -377,11 +378,11 @@ def _legacy_arguments(path: Path, service_id: str) -> tuple[str, ...] | None:
     content = _read_artifact(path)
     if content is None or extract_marker(content, SupervisorKind.LAUNCHD) is not None:
         return None
-    try:
-        payload = plistlib.loads(content)
-        arguments = payload["ProgramArguments"]
-    except (KeyError, TypeError, plistlib.InvalidFileException):
+    # A plist that does not parse (a truncated write) is no legacy definition.
+    payload = load_plist_dict(content)
+    if payload is None:
         return None
+    arguments = payload.get("ProgramArguments")
     if payload.get("Label") != service_id or not _known_legacy_argv(arguments):
         return None
     return tuple(arguments)

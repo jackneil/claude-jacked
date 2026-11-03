@@ -20,6 +20,7 @@ Lifecycle contract:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
@@ -27,8 +28,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from packaging.version import InvalidVersion, Version
+
 from jacked.atomic_io import atomic_write_text
 from jacked.service import CLAUDE_DIR
+
+logger = logging.getLogger(__name__)
 
 UPDATE_STATUS_FILE: Path = CLAUDE_DIR / "jacked-update-status.json"
 
@@ -92,12 +97,19 @@ def _atomic_write(path: Path, data: dict) -> None:
 
 
 def _read_raw(path: Path) -> Optional[dict]:
+    """Return the status record, or None when the file holds no JSON object.
+
+    Every reader calls ``.get`` on the result. Valid JSON that is not an
+    object (a ``[]`` or a string) reads as missing, so a damaged file
+    cannot raise AttributeError in a reader.
+    """
     try:
         if not path.exists():
             return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 def read_status(path: Path) -> Optional[dict]:
@@ -137,7 +149,141 @@ def in_progress_is_stale(path: Path, data: dict) -> bool:
     return age > STALE_IN_PROGRESS_SECONDS and updater_liveness(data) is not True
 
 
-def abandoned_status(path: Path) -> Optional[dict]:
+def _parse_version(value: object) -> Optional[Version]:
+    """Return ``value`` as a PEP 440 version, or None when it is not one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return Version(value)
+    except InvalidVersion:
+        return None
+
+
+def _parse_instant(value: object) -> Optional[datetime]:
+    """Return an ISO 8601 timestamp as an aware datetime, or None.
+
+    A timestamp without a UTC offset is not an instant (its zone is not
+    known), so it also gives None.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.utcoffset() is not None else None
+
+
+def install_completed_after(
+    data: dict, last_install: Optional[dict], running_version: str
+) -> bool:
+    """True when an install completed after the update in ``data`` started.
+
+    The status record can stay ``in_progress``, or close as failed, after
+    the install itself is done: the batch or the updater stopped after the
+    new package was in place. The last-install record and the running
+    version are independent proof. All three facts must be true:
+
+    * the last install (``last_install["at"]``) is later than the update's
+      ``started_at``;
+    * it installed ``running_version`` or a newer version;
+    * it installed a version newer than the update's ``from_version``.
+
+    Versions compare by PEP 440 (a dev build sorts before its release).
+    Timestamps compare as instants, so the UTC offset does not matter. A
+    missing or malformed version or timestamp proves nothing: the result is
+    False, with one DEBUG line that names the unusable fields. No
+    last-install record also gives False.
+
+    >>> start = {"started_at": "2026-11-02T10:00:00+00:00",
+    ...          "from_version": "0.110.1"}
+    >>> done = {"at": "2026-11-02T10:00:25+00:00", "to_version": "0.110.2"}
+    >>> install_completed_after(start, done, "0.110.2")
+    True
+    >>> install_completed_after(
+    ...     start, {**done, "at": "2026-11-02T09:59:00+00:00"}, "0.110.2")
+    False
+    >>> install_completed_after(
+    ...     start, {**done, "to_version": "0.110.2.dev1"}, "0.110.2")
+    False
+    >>> install_completed_after(start, None, "0.110.2")
+    False
+    """
+    if last_install is None:
+        return False
+    if not isinstance(data, dict) or not isinstance(last_install, dict):
+        logger.debug(
+            "Cannot prove the install completed: a record is not a JSON object"
+        )
+        return False
+    started = _parse_instant(data.get("started_at"))
+    finished = _parse_instant(last_install.get("at"))
+    before = _parse_version(data.get("from_version"))
+    installed = _parse_version(last_install.get("to_version"))
+    running = _parse_version(running_version)
+    unusable = [
+        name
+        for name, value in (
+            ("started_at", started),
+            ("at", finished),
+            ("from_version", before),
+            ("to_version", installed),
+            ("running_version", running),
+        )
+        if value is None
+    ]
+    if unusable:
+        logger.debug(
+            "Cannot prove the install completed: unusable fields %s",
+            ", ".join(unusable),
+        )
+        return False
+    return finished > started and installed >= running and installed > before
+
+
+def failed_update_superseded(
+    data: dict, last_install: Optional[dict], running_version: str
+) -> bool:
+    """True when a failed update no longer applies to the running build.
+
+    Three facts must be true: the record closed as failed, the running
+    build is newer than the version that update started from, and an
+    install completed after the update started (``install_completed_after``).
+    Then a later install already replaced the build that failed to update,
+    and the recovery steps of the record are stale. While the build that
+    failed to update still runs, the failure still applies. A malformed
+    version proves nothing: the result is False.
+
+    >>> failed = {"overall": "failed", "from_version": "0.103.0",
+    ...           "started_at": "2026-10-01T10:00:00+00:00"}
+    >>> later = {"at": "2026-11-02T10:00:00+00:00", "to_version": "0.110.2"}
+    >>> failed_update_superseded(failed, later, "0.110.2")
+    True
+    >>> failed_update_superseded(
+    ...     {**failed, "from_version": "0.110.2"}, later, "0.110.2")
+    False
+    """
+    if not isinstance(data, dict) or data.get("overall") != "failed":
+        return False
+    before = _parse_version(data.get("from_version"))
+    running = _parse_version(running_version)
+    if before is None or running is None:
+        logger.debug(
+            "Cannot compare the failed update with the running build: "
+            "a version is not usable"
+        )
+        return False
+    return before < running and install_completed_after(
+        data, last_install, running_version
+    )
+
+
+def abandoned_status(
+    path: Path,
+    *,
+    last_install: Optional[dict] = None,
+    running_version: Optional[str] = None,
+) -> Optional[dict]:
     """Return the raw record of an update that was interrupted, else None.
 
     `read_status` hides an `in_progress` file older than
@@ -153,6 +299,14 @@ def abandoned_status(path: Path) -> Optional[dict]:
     So a record that names its updater's pid is abandoned only when that
     process is gone. A record with no pid keeps the mtime rule.
 
+    Age is also not proof that the install failed. The batch or the updater
+    can stop after the new package is in place and before it closes the
+    record. When the caller gives the last-install record and the running
+    version, and they prove that the install completed after the update
+    started (``install_completed_after``), this closes the record as
+    succeeded and returns None. Without that evidence, the age rule alone
+    decides.
+
     >>> import json, os, tempfile, time
     >>> from pathlib import Path
     >>> with tempfile.TemporaryDirectory() as d:
@@ -163,6 +317,22 @@ def abandoned_status(path: Path) -> Optional[dict]:
     ...     os.utime(p, (old, old))
     ...     abandoned_status(p)["current_phase"]
     'migrating_settings'
+
+    The same stale record, after an install that completed 25 s after the
+    update started, at the running version:
+
+    >>> with tempfile.TemporaryDirectory() as d:
+    ...     p = Path(d) / "status.json"
+    ...     _ = p.write_text(json.dumps({"overall": "in_progress",
+    ...                                  "started_at": "2026-11-02T10:00:00+00:00",
+    ...                                  "from_version": "0.110.1"}))
+    ...     old = time.time() - STALE_IN_PROGRESS_SECONDS - 60
+    ...     os.utime(p, (old, old))
+    ...     done = {"at": "2026-11-02T10:00:25+00:00", "to_version": "0.110.2"}
+    ...     verdict = abandoned_status(p, last_install=done,
+    ...                                running_version="0.110.2")
+    ...     verdict, json.loads(p.read_text())["overall"]
+    (None, 'succeeded')
     """
     data = _read_raw(path)
     if data is None or data.get("overall") != "in_progress":
@@ -173,7 +343,23 @@ def abandoned_status(path: Path) -> Optional[dict]:
         return None
     # A proven-live updater is never abandoned. Proven-dead or indeterminate
     # (no pid, probe failed) falls back to the mtime rule.
-    return data if stale else None
+    if not stale:
+        return None
+    if running_version is not None and install_completed_after(
+        data, last_install, running_version
+    ):
+        # The install finished; the batch or the updater stopped after it.
+        try:
+            mark_succeeded(path)
+        except OSError as exc:
+            # The verdict holds without the write: no recovery file is due.
+            # The next start reads the same evidence and tries again.
+            logger.warning(
+                "Could not close the completed update record: %s",
+                type(exc).__name__,
+            )
+        return None
+    return data
 
 
 def _resolve_updater_pid(updater_pid: Optional[int]) -> Optional[int]:
