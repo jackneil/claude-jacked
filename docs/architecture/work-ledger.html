@@ -363,6 +363,12 @@ The block comes after the memory brief and before the git reality block:</p>
     so no title can close the fence.</li>
   <li>A line shows the issue number, the title and the queue label (<code>in-flight</code>,
     <code>next</code> or <code>punted</code>). The hook never shows other label text.</li>
+  <li>The block shows only the issues opened by the owner, a member or a collaborator of the repo,
+    and each issue with a queue label. On a public repo, anyone can open an issue, but only a user
+    with triage rights can add a label. So an issue from a stranger shows only after a maintainer
+    labels it. The refresher keeps only these issues, and the hook does the same check again: a cache
+    item with no author association, or with an author outside these three and no queue label,
+    gives no block.</li>
   <li>The full block has a limit of 8 KiB, because each byte goes into the context of each
     session. Lines that do not fit go, and the marker counts them.</li>
   <li>The hook reads a cache file only. It starts no process and makes no network call.</li>
@@ -378,8 +384,9 @@ The block comes after the memory brief and before the git reality block:</p>
  "remote": "https://github.com/acme/widgets",
  "refreshed_at": "2026-11-03T12:00:00+00:00",
  "open_count": 18,
+ "github_open_count": 31,
  "items": [
-  {"number": 12, "title": "Fix the gate", "labels": ["in-flight"]}
+  {"number": 12, "title": "Fix the gate", "labels": ["in-flight"], "author_association": "OWNER"}
  ]
 }</code></pre>
 <ul>
@@ -388,7 +395,13 @@ The block comes after the memory brief and before the git reality block:</p>
     refresher use one function to make the slug, and that function reads files only.</li>
   <li><strong>remote</strong> is made from the owner and the repo name only. It never holds a credential
     from the git remote URL.</li>
-  <li><strong>open_count</strong> is the total number of open issues. <strong>items</strong> holds the newest 100.</li>
+  <li><strong>items</strong> holds the kept issues of the newest 100 open issues: the issues from the owner,
+    the members and the collaborators, and each issue with a queue label.</li>
+  <li><strong>open_count</strong> is the number of kept issues, plus each open issue after the newest 100.
+    The refresher cannot see the author of those issues, so it counts them, and the marker loses no issue.</li>
+  <li><strong>github_open_count</strong> is the total number of open issues on GitHub. The hook does not read it.</li>
+  <li><strong>author_association</strong> is the GitHub relation of the issue author to the repo
+    (for example <code>OWNER</code>, <code>MEMBER</code>, <code>COLLABORATOR</code> or <code>NONE</code>).</li>
   <li><strong>labels</strong> holds only the queue labels of an issue. The refresher does not keep other labels.</li>
   <li>The file is written through the shared atomic writer with mode 0600.</li>
 </ul>
@@ -400,7 +413,8 @@ after the service starts. A cache file from before a restart stays good for 24 h
   <li>The service reads the repos that jacked knows: the 100 projects with the most recent activity.
     It keeps one path for each slug.</li>
   <li>For each repo, git reads the <code>origin</code> remote. A remote that is not GitHub stops the refresh for that repo.</li>
-  <li>gh reads the open issues and the total count in one GraphQL call.</li>
+  <li>gh reads the open issues, the author association of each issue, and the total count in one GraphQL call.</li>
+  <li>The service removes each issue from a stranger that has no queue label.</li>
   <li>The service writes the cache file.</li>
 </ol>
 <ul>

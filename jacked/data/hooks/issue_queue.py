@@ -17,11 +17,25 @@ The cache file is ``<jacked home>/.claude/jacked/issue-queue/<slug>.json``::
     {"remote": "https://github.com/<owner>/<repo>",
      "refreshed_at": "2026-11-03T12:00:00+00:00",
      "open_count": 18,
-     "items": [{"number": 12, "title": "Fix the gate", "labels": ["next"]}]}
+     "github_open_count": 31,
+     "items": [{"number": 12, "title": "Fix the gate", "labels": ["next"],
+                "author_association": "OWNER"}]}
 
-``open_count`` is the number of open issues on GitHub. It can be larger than
-the number of items, because the refresher keeps one page of issues. The
-trim marker counts every open issue that the block does not show.
+Who appears: the block shows only the issues opened by the owner, a member
+or a collaborator of the repo, and each issue with a queue label. On a
+public repo, anyone can open an issue, but only a user with triage rights
+can add a label. The refresher keeps only these issues
+(``kept_issue``), and this step does the same check again: a cache item
+with no ``author_association``, or with an author outside
+``TRUSTED_ASSOCIATIONS`` and no queue label, gives no block. Thus an edited
+cache file cannot add a stranger's issue.
+
+``open_count`` is the number of kept issues, plus each open issue past the
+page that the refresher reads (the refresher cannot see the author of those
+issues, so it counts them). The trim marker counts every issue in
+``open_count`` that the block does not show. ``github_open_count`` is the
+number of open issues on GitHub, for reference only; the step does not
+read it.
 
 The slug: ``repo_slug`` finds the repository on the file system only (a
 ``.git`` folder, or a ``.git`` file of a linked worktree), and names it by
@@ -33,8 +47,8 @@ The step prints nothing when:
 
 - the cwd is not inside a git work tree;
 - the cache file is missing, is not a regular file (a FIFO, a device, a
-  folder, or a symlink to one), is too large, is not valid JSON, or has a
-  wrong shape. The file is read through ``jacked.regular_file.read_regular``:
+  folder, or a symlink to one), is too large, is not valid JSON, has a
+  wrong shape, or has an item that the refresher does not keep. The file is read through ``jacked.regular_file.read_regular``:
   the type is checked before and after the open, the open does not block,
   and the read stops after ``MAX_CACHE_BYTES`` + 1 bytes;
 - the cache is 24 hours old or older (``STALE_AFTER``), its timestamp has
@@ -116,6 +130,9 @@ MAX_ISSUE_NUMBER = 10**9
 #: never shows it.
 QUEUE_LABELS = {"in-flight": 0, "next": 1, "punted": 3}
 _OTHER_RANK = 2
+
+#: The GitHub author associations whose issues show without a queue label.
+TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
 _UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -231,6 +248,18 @@ def cache_path(slug: str) -> Path:
     return cache_dir() / f"{slug}.json"
 
 
+def kept_issue(association: object, labels: list[str]) -> bool:
+    """True when the block can show an issue: the one rule for both sides.
+
+    The author is the owner, a member or a collaborator of the repo, or the
+    issue has a queue label (only a user with triage rights can add one).
+
+    >>> kept_issue("MEMBER", []), kept_issue("NONE", ["next"]), kept_issue("NONE", ["bug"])
+    (True, True, False)
+    """
+    return association in TRUSTED_ASSOCIATIONS or any(label in QUEUE_LABELS for label in labels)
+
+
 # --------------------------------------------------------------------------- #
 # The hook side
 # --------------------------------------------------------------------------- #
@@ -274,6 +303,9 @@ def _load(path: Path) -> dict:
             and all(isinstance(label, str) for label in item["labels"])
         ):
             raise _NoBlock("the cache has an item with a wrong shape")
+        if not (isinstance(item.get("author_association"), str)
+                and kept_issue(item["author_association"], item["labels"])):
+            raise _NoBlock("the cache has an item with no trusted author association and no queue label")
     open_count = data.get("open_count", len(items))
     if not _is_int(open_count) or not len(items) <= open_count <= MAX_OPEN_COUNT:
         raise _NoBlock("the cache has a wrong open_count")

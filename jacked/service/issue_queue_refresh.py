@@ -13,9 +13,20 @@ the jacked service does the network work here, on its own schedule:
   ``refresh_repo`` for each in a worker thread, never on the event loop. At
   most ``MAX_CONCURRENT`` repositories refresh at the same time.
 - ``refresh_repo`` reads the ``origin`` remote with git, and stops when it is
-  not a GitHub remote. Then it asks gh for one page of open issues and the
-  total count (one GraphQL call), and writes the cache file through the
-  shared atomic writer (``jacked.atomic_io``).
+  not a GitHub remote. Then it asks gh for one page of open issues, their
+  authors' association with the repository, and the total count (one
+  GraphQL call), and writes the cache file through the shared atomic
+  writer (``jacked.atomic_io``).
+
+Who is kept: an issue stays in the cache only when it was opened by the
+owner, a member or a collaborator of the repo, or when it has a queue label
+(``kept_issue``, the one rule that the hook also uses). On a public repo,
+anyone can open an issue, and the hook puts each title in the context of
+every session. A label needs triage rights, so a labeled issue stays.
+``open_count`` is the number of kept issues, plus each open issue past the
+page (the refresher does not see the author of those issues, so it counts
+them and the trim marker loses none). ``github_open_count`` is the total
+from GitHub.
 
 Each git or gh call has a hard timeout of ``CALL_TIMEOUT_S`` (10 seconds).
 gh and git are found through the shared lookup (``jacked.findbin``).
@@ -47,7 +58,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from jacked.atomic_io import atomic_write_text
-from jacked.data.hooks.issue_queue import cache_path, repo_slug
+from jacked.data.hooks.issue_queue import cache_path, kept_issue, repo_slug
 from jacked.findbin import find_bin
 from jacked.git_guard import GIT_CONFIG_OVERRIDE_ARGS
 from jacked.memory.vault import one_line
@@ -70,8 +81,8 @@ MAX_CONCURRENT = 4
 PROJECT_LIMIT = 100
 
 #: Issues per repository in one call. 100 is the GitHub GraphQL page limit.
-#: The cache also stores the total count, so the hook's trim marker counts
-#: the issues past this page; no issue is lost from the count.
+#: ``open_count`` also counts each issue past this page, so the hook's trim
+#: marker loses no issue.
 ISSUE_PAGE = 100
 
 #: The queue labels and how a new one looks: (color, description). The cache
@@ -91,7 +102,8 @@ _QUERY = (
     " repository(owner: $owner, name: $name) {"
     f" issues(states: OPEN, first: {ISSUE_PAGE},"
     " orderBy: {field: CREATED_AT, direction: DESC}) {"
-    " totalCount nodes { number title labels(first: 100) { nodes { name } } } } } }"
+    " totalCount nodes { number title authorAssociation"
+    " labels(first: 100) { nodes { name } } } } } }"
 )
 
 
@@ -188,8 +200,28 @@ def _origin_url(git: str, path: str) -> str:
     return proc.stdout.decode("utf-8", errors="replace").strip()
 
 
-def _fetch(gh: str, owner: str, name: str) -> tuple[list[dict], int]:
-    """One page of open issues and the total count, from one gh call."""
+def _node_item(node: dict) -> dict:
+    """One cache item from one GraphQL issue node. Raises on a wrong shape."""
+    association = node["authorAssociation"]
+    if not isinstance(association, str):
+        raise TypeError("authorAssociation")
+    return {
+        "number": int(node["number"]),
+        "title": str(node["title"]),
+        "labels": [
+            name for name in (str(label["name"]) for label in node["labels"]["nodes"])
+            if name in LABELS
+        ],
+        "author_association": association,
+    }
+
+
+def _fetch(gh: str, owner: str, name: str) -> tuple[list[dict], int, int]:
+    """The kept issues of one page, ``open_count`` and GitHub's total count.
+
+    One gh call. ``open_count`` counts the kept issues and each issue past
+    the page. An issue that ``kept_issue`` refuses is not stored.
+    """
     proc = _run(
         [gh, "api", "graphql", "-f", f"query={_QUERY}", "-f", f"owner={owner}", "-f", f"name={name}"],
         env=_gh_env(),
@@ -204,20 +236,12 @@ def _fetch(gh: str, owner: str, name: str) -> tuple[list[dict], int]:
         total = issues["totalCount"]
         if not isinstance(total, int) or isinstance(total, bool):
             raise ValueError("totalCount")
-        items = [
-            {
-                "number": int(node["number"]),
-                "title": str(node["title"]),
-                "labels": [
-                    name for name in (str(label["name"]) for label in node["labels"]["nodes"])
-                    if name in LABELS
-                ],
-            }
-            for node in issues["nodes"]
-        ]
+        page = [_node_item(node) for node in issues["nodes"]]
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise _Skip(f"gh gave an unusable answer ({type(exc).__name__})") from None
-    return items, max(total, len(items))
+    items = [item for item in page if kept_issue(item["author_association"], item["labels"])]
+    past_page = max(total - len(page), 0)
+    return items, len(items) + past_page, max(total, len(page))
 
 
 # --------------------------------------------------------------------------- #
@@ -244,12 +268,13 @@ def refresh_repo(path: str, *, now: datetime | None = None) -> bool:
         gh = find_bin("gh")
         if not gh:
             raise _Skip("gh not found")
-        items, open_count = _fetch(gh, *repo)
+        items, open_count, github_open_count = _fetch(gh, *repo)
         stamp = (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
         payload = {
             "remote": f"https://github.com/{repo[0]}/{repo[1]}",
             "refreshed_at": stamp,
             "open_count": open_count,
+            "github_open_count": github_open_count,
             "items": items,
         }
         atomic_write_text(cache_path(slug), json.dumps(payload, indent=1) + "\n", mode=0o600)
