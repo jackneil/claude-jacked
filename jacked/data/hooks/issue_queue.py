@@ -59,13 +59,11 @@ Order: ``in-flight`` issues first, then ``next``, then the others, then
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import logging
 import os
 import re
-import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -73,7 +71,7 @@ from pathlib import Path
 from jacked.data.hooks.git_reality import payload_cwd
 from jacked.memory.sanitize import FENCE, fence_safe, one_line
 from jacked.memory.vault import jacked_home
-from jacked.regular_file import FileTooLargeError, NotRegularFileError, read_regular
+from jacked.regular_file import FileTooLargeError, NotRegularFileError, path_kind, read_regular
 
 logger = logging.getLogger(__name__)
 
@@ -132,47 +130,18 @@ def _read_small(path: Path) -> str:
         return fh.read(4096)
 
 
-_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR})
-# Windows: "the device is not ready" and "the name is not valid" mean absent,
-# the same way ``pathlib`` reads them. A symlink loop (1921) still raises.
-_ABSENT_WINERRORS = frozenset({21, 123})
-
-
-def _kind(path: Path) -> str | None:
-    """``"dir"``, ``"file"`` or ``"other"`` for ``path``, or None when it is absent.
-
-    The check follows symlinks. Only "no such file" and "not a folder" mean
-    absent. Every other OS error, for example a symlink loop (ELOOP) or no
-    permission (EACCES), raises to the caller. ``Path.is_dir`` and
-    ``Path.is_file`` give False for a symlink loop, and the search then goes
-    on to a parent repository that is not the repository of the path.
-
-    >>> _kind(Path("/no/such/path/at/all")) is None
-    True
-    """
-    try:
-        mode = os.stat(path).st_mode
-    except OSError as exc:
-        if exc.errno in _ABSENT_ERRNOS or getattr(exc, "winerror", None) in _ABSENT_WINERRORS:
-            return None
-        raise
-    if stat.S_ISDIR(mode):
-        return "dir"
-    return "file" if stat.S_ISREG(mode) else "other"
-
-
 def _git_dir_at(folder: Path) -> Path | None:
     """The git folder that ``folder/.git`` names, or None.
 
     A ``.git`` folder must hold a ``HEAD`` file. A ``.git`` file is the
     ``gitdir: <path>`` pointer of a linked worktree or a submodule. A relative
     path in it is relative to ``folder``. An OS error other than "absent"
-    raises (see ``_kind``).
+    raises (see ``jacked.regular_file.path_kind``).
     """
     dot_git = folder / ".git"
-    kind = _kind(dot_git)
+    kind = path_kind(dot_git)
     if kind == "dir":
-        return dot_git if _kind(dot_git / "HEAD") == "file" else None
+        return dot_git if path_kind(dot_git / "HEAD") == "file" else None
     if kind != "file":
         return None
     first = _read_small(dot_git).splitlines()[:1]
@@ -180,7 +149,7 @@ def _git_dir_at(folder: Path) -> Path | None:
         return None
     target = Path(first[0][len("gitdir:"):].strip())
     git_dir = target if target.is_absolute() else folder / target
-    return git_dir if _kind(git_dir / "HEAD") == "file" else None
+    return git_dir if path_kind(git_dir / "HEAD") == "file" else None
 
 
 def find_common_git_dir(start: str | os.PathLike) -> Path | None:
@@ -203,14 +172,14 @@ def find_common_git_dir(start: str | os.PathLike) -> Path | None:
         return None
     try:
         folder = Path(start).resolve()  # a symlink loop raises here
-        if _kind(folder) != "dir":
+        if path_kind(folder) != "dir":
             return None
         for candidate in (folder, *folder.parents):
             git_dir = _git_dir_at(candidate)
             if git_dir is None:
                 continue
             common_file = git_dir / "commondir"
-            if _kind(common_file) == "file":
+            if path_kind(common_file) == "file":
                 pointer = Path(_read_small(common_file).strip())
                 git_dir = pointer if pointer.is_absolute() else git_dir / pointer
             return git_dir.resolve()

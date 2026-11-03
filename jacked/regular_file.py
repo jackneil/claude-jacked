@@ -8,9 +8,12 @@ before the open and again on the open handle, and they open with
 
 ``jacked.memory.claude_paths.open_regular`` (returns None) and
 ``jacked.memory.settings_io.read_settings`` (raises) are built on these.
+``path_kind`` gives the type of a path for a walk that must stop, not go on,
+when a path cannot be read.
 """
 from __future__ import annotations
 
+import errno
 import os
 import stat
 
@@ -76,3 +79,33 @@ def read_regular(path, limit: int) -> bytes:
         return b"".join(parts)
     finally:
         os.close(fd)
+
+
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR})
+# Windows: "the device is not ready" and "the name is not valid" mean absent,
+# the same way ``pathlib`` reads them. A symlink loop (1921) still raises.
+_ABSENT_WINERRORS = frozenset({21, 123})
+
+
+def path_kind(path) -> str | None:
+    """``"dir"``, ``"file"`` or ``"other"`` for ``path``, or None when it is absent.
+
+    The check follows symlinks. Only "no such file" and "not a folder" mean
+    absent. Every other OS error, for example a symlink loop (ELOOP) or no
+    permission (EACCES), raises to the caller. ``Path.is_dir``,
+    ``Path.is_file`` and ``Path.exists`` give False for a symlink loop, so a
+    walk up to the first ``.git`` goes on to a parent repository that is not
+    the repository of the path. A walk that uses this function stops there.
+
+    >>> path_kind("/no/such/path/at/all") is None
+    True
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except OSError as exc:
+        if exc.errno in _ABSENT_ERRNOS or getattr(exc, "winerror", None) in _ABSENT_WINERRORS:
+            return None
+        raise
+    if stat.S_ISDIR(mode):
+        return "dir"
+    return "file" if stat.S_ISREG(mode) else "other"

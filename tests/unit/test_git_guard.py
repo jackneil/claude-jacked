@@ -143,8 +143,7 @@ def _argv_spy(monkeypatch, module):
 
     def spy(argv, **kwargs):
         seen.append(list(argv))
-        out = "main\n" if kwargs.get("text") else b"main\n"
-        return subprocess.CompletedProcess(argv, 0, out, out[:0])
+        return subprocess.CompletedProcess(argv, 0, "main\n", "")
 
     monkeypatch.setattr(module.subprocess, "run", spy)
     return seen
@@ -164,7 +163,13 @@ def test_the_merge_capture_git_reads_carry_the_overrides(monkeypatch, tmp_path):
     and gpg.program in the repo config would run a program."""
     from jacked.memory import merge_git
 
-    seen = _argv_spy(monkeypatch, merge_git)
+    seen = []
+
+    def spy(argv, **kwargs):
+        seen.append(list(argv))
+        return 0
+
+    monkeypatch.setattr(git_guard, "run_git", spy)
     merge_git.git(tmp_path, ["log", "--merges", "--format=%H", "ORIG_HEAD..HEAD"])
     ((argv),) = seen
     assert tuple(argv[3:3 + len(git_guard.GIT_CONFIG_OVERRIDE_ARGS)]) == git_guard.GIT_CONFIG_OVERRIDE_ARGS

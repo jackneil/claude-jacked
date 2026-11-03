@@ -855,13 +855,13 @@ def test_every_merge_capture_log_call_turns_off_signatures(env, no_gh, monkeypat
     repo = _trailer_repo(env.tmp / "widget")
     _mock_distill(monkeypatch, None)
     calls: list[list[str]] = []
-    real_run = merge_capture.subprocess.run
+    real_popen = subprocess.Popen
 
     def _spy(argv, *args, **kwargs):
         calls.append(list(argv))
-        return real_run(argv, *args, **kwargs)
+        return real_popen(argv, *args, **kwargs)
 
-    monkeypatch.setattr(merge_capture.subprocess, "run", _spy)
+    monkeypatch.setattr(subprocess, "Popen", _spy)  # run_git and subprocess.run both start here
 
     merge_capture.capture_merge(str(repo))
 
@@ -910,6 +910,56 @@ def test_a_carriage_return_inside_a_merge_subject_keeps_the_whole_subject(tmp_pa
     ((_sha, subject),) = merge_git.merge_commits(repo)
 
     assert subject == "Merge branch 'feature/x'\rinto master"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a shebang script is not a program on Windows")
+def test_a_flood_of_git_output_is_cut_at_a_line_and_the_memory_stays_small(
+    tmp_path, monkeypatch, caplog
+):
+    """A fake git writes 30 MB of trailer lines, then sleeps. The read stops at
+    the git_guard limit, git is ended, only complete lines stay, and the cut is
+    logged at DEBUG without the content."""
+    import time
+    import tracemalloc
+
+    from jacked import git_guard
+
+    fake = tmp_path / "git"
+    fake.write_text(
+        f"#!{sys.executable}\n"
+        "import sys, time\n"
+        "sys.stdout.buffer.write(b'Why: flood value\\n' * 2_000_000)\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr(merge_git, "require_bin", lambda name: str(fake))
+    caplog.set_level(logging.DEBUG, logger="jacked.memory.merge_git")
+    tracemalloc.start()
+    start = time.monotonic()
+    try:
+        out = merge_git.git(tmp_path, ["log", "--format=%B"])
+        elapsed = time.monotonic() - start
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    # The child sleeps 30 s after the flood: a return well under that proves the kill.
+    assert elapsed < 10, f"{elapsed:.2f}s"
+    assert out is not None
+    assert 0 < len(out.encode("utf-8")) <= git_guard.OUTPUT_LIMIT
+    assert set(merge_git.records(out)) == {"Why: flood value"}
+    assert out.endswith("\n")  # the cut line is gone, only whole lines stay
+    assert peak < 16 * 1024 * 1024, f"peak {peak >> 20} MiB"
+    (record,) = [r for r in caplog.records if r.name == "jacked.memory.merge_git"]
+    assert record.levelno == logging.DEBUG
+    assert "flood" not in record.getMessage()
+
+
+def test_a_failed_git_read_gives_none(tmp_path):
+    """A path that is not a repository: git exits non-zero, and the read gives None."""
+    assert merge_git.git(tmp_path, ["rev-parse", "-q", "--verify", "ORIG_HEAD"]) is None
 
 
 def test_trailer_lines_and_values_are_capped_with_a_marker(caplog):

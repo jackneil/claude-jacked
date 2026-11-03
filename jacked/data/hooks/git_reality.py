@@ -102,7 +102,7 @@ from jacked.git_reality_read import (  # RECORD_LIMIT: the docstring above names
     commit_lines,
 )
 from jacked.memory.recall import estimate_tokens
-from jacked.memory.sanitize import FENCE, fence_safe, one_line, strip_control
+from jacked.memory.sanitize import FENCE, fence_safe, one_line
 
 logger = logging.getLogger(__name__)
 
