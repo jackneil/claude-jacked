@@ -317,6 +317,23 @@ _HOSTILE = {
 }
 
 
+class TestBaselineScriptKeys:
+    def test_a_windows_form_key_in_a_stored_baseline_matches_its_posix_form(self, home):
+        """A baseline written with host separators still watches its script:
+        the loader normalises every script key to the POSIX form."""
+        from jacked import integrity_baseline
+
+        settings = settings_io.settings_path(home)
+        doc = _doc(scripts={"C:\\hooks\\x.py": "sha256:a", "/h/y.py": "sha256:b"})
+        path = integrity_baseline.baseline_path(settings)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc), encoding="utf-8")
+
+        loaded = integrity_baseline.load_baseline(settings)
+
+        assert loaded["baseline"]["scripts"] == {"C:/hooks/x.py": "sha256:a", "/h/y.py": "sha256:b"}
+
+
 class TestMalformedBaseline:
     def test_every_hostile_shape_is_unreadable_on_every_surface(self, home, tmp_path):
         path = _seed(home, {"hooks": {"Stop": [_hook("echo hi")]}})

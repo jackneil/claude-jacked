@@ -88,7 +88,23 @@ def load_baseline(settings_file: Path | str) -> dict | None:
         raise BaselineUnreadableError(f"{path.name} is not valid JSON") from exc
     if not _valid_document(doc):
         raise BaselineUnreadableError(f"{path.name} has an unknown shape")
+    scripts = doc["baseline"].get("scripts")
+    if isinstance(scripts, dict):
+        # One key form on every platform: a baseline written before the POSIX
+        # key rule (a Windows path with backslashes) still matches its script.
+        doc["baseline"]["scripts"] = {_posix_key(k): v for k, v in scripts.items()}
     return doc
+
+
+def _posix_key(key: str) -> str:
+    """A script key in POSIX form, whatever platform wrote it.
+
+    >>> _posix_key("C:\\\\hooks\\\\x.py"), _posix_key("/h/x.py")
+    ('C:/hooks/x.py', '/h/x.py')
+    """
+    from pathlib import PureWindowsPath
+
+    return PureWindowsPath(key).as_posix() if "\\" in key else key
 
 
 def _str_map(value) -> bool:
