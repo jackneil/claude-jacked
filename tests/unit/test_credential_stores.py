@@ -544,6 +544,68 @@ def test_file_store_checks_again_right_before_replace(tmp_path: Path, monkeypatc
     assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 2
 
 
+class _WindowsOsView:
+    """file_store's own view of ``os``, with the Windows name. The real module
+    is never changed, so pathlib and the rest of the process keep it."""
+
+    name = "nt"
+
+    def __getattr__(self, attribute):
+        return getattr(os, attribute)
+
+
+def _record_stage_acl(monkeypatch, *, fail: bool = False) -> list:
+    from jacked.credentials import file_store
+    from jacked.service import windows_security
+
+    secured: list = []
+
+    def secure_windows_path(path):
+        # The bytes written so far tell when the ACL was set.
+        secured.append((Path(path), Path(path).read_bytes()))
+        if fail:
+            raise OSError(13, "Access is denied")
+
+    monkeypatch.setattr(windows_security, "secure_windows_path", secure_windows_path)
+    monkeypatch.setattr(file_store, "os", _WindowsOsView())
+    return secured
+
+
+def test_file_store_makes_the_windows_stage_private_before_the_tokens_land(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """mkstemp gives a Windows file the ACL of its folder, and the replace
+    keeps the ACL of the stage. A mode bit changes neither."""
+    secured = _record_stage_acl(monkeypatch)
+    path = tmp_path / ".credentials.json"
+
+    result = FileCredentialStore(path).write(_payload(), InteractionMode.BACKGROUND)
+
+    assert result.status is StoreStatus.OK
+    [(stage, bytes_then)] = secured
+    assert stage.parent == tmp_path and stage.name.startswith(".credentials-stage-")
+    assert bytes_then == b""
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 1
+
+
+def test_file_store_refuses_a_write_when_the_windows_acl_is_refused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A store that cannot carry a private ACL cannot hold tokens: the target
+    stays as it was and no stage file stays behind."""
+    path = tmp_path / ".credentials.json"
+    store = FileCredentialStore(path)
+    assert store.write(_payload(1), InteractionMode.BACKGROUND).status is StoreStatus.OK
+    secured = _record_stage_acl(monkeypatch, fail=True)
+
+    result = store.write(_payload(2), InteractionMode.BACKGROUND)
+
+    assert result.status is StoreStatus.UNUSABLE
+    assert len(secured) == 1
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 1
+    assert list(tmp_path.glob(".credentials-stage-*")) == []
+
+
 def _windows_replace_held_once(monkeypatch, path: Path, *, rewrite: bool) -> list:
     """Run the store's replace as Windows does: the first try is refused
     while another handle holds the file, optionally after that holder

@@ -13,6 +13,7 @@ reader that takes the wrong pointer reads a stale account.
 
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 
@@ -172,21 +173,26 @@ def test_existing_only_skips_a_soft_deleted_row_in_a_real_database(tmp_path):
 
     assert selected_account_id(db, existing_only=True) == 3
     assert selected_account_id(db) == 5
-    assert db.get_selected_account_id(existing_only=True) == 3
     assert db.get_selected_account_id() == 5
     db.close()
 
 
-def test_the_codex_selection_honors_existing_only(tmp_path):
+def test_the_codex_selection_is_the_codex_active_id(tmp_path):
     db = Database(str(tmp_path / "jacked.db"))
     _insert_account(db, 4, "codex@example.com", provider="codex")
     db.set_active_account_id(4, provider="codex")
 
-    assert db.get_selected_account_id("codex", existing_only=True) == 4
+    assert db.get_selected_account_id("codex") == 4
     db.set_active_account_id(99, provider="codex")
     assert db.get_selected_account_id("codex") == 99
-    assert db.get_selected_account_id("codex", existing_only=True) is None
     db.close()
+
+
+def test_the_database_method_has_no_existing_only_keyword():
+    """Callers that need a row use the module rule ``selected_account_id``.
+    The method kept a keyword that only tests passed."""
+    parameters = inspect.signature(Database.get_selected_account_id).parameters
+    assert list(parameters) == ["self", "provider"]
 
 
 # --- the session observer ----------------------------------------------------

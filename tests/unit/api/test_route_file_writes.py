@@ -17,6 +17,7 @@ across the worker hop.
 import ast
 import asyncio
 import json
+import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,6 +115,16 @@ def _lessons_routes(repo):
         "get": lambda: system.get_project_lessons(str(repo), _request()),
         "put": lambda: system.update_project_lessons(body, _request()),
     }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_a_new_lessons_file_is_readable_by_others(tmp_path):
+    """lessons.md is a repository document, not a private file."""
+    repo = _lessons_repo(tmp_path)
+
+    assert _lessons_routes(repo)["put"]()["saved"] is True
+
+    assert (repo / "lessons.md").stat().st_mode & 0o777 == 0o644
 
 
 @requires_symlinks

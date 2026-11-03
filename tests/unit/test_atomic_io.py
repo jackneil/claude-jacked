@@ -409,6 +409,56 @@ def test_an_explicit_mode_wins_over_the_old_mode(tmp_path):
     assert target.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+@pytest.mark.parametrize("writer", [atomic_io.atomic_write_text, atomic_io.atomic_write_bytes])
+def test_new_file_mode_applies_to_a_new_file_only(tmp_path, writer):
+    """A repository document is read by others: it is not owner-only when new,
+    and a rewrite keeps the bits that its owner chose."""
+    payload = "x" if writer is atomic_io.atomic_write_text else b"x"
+    new = tmp_path / "new.md"
+    writer(new, payload, new_file_mode=0o644)
+    assert new.stat().st_mode & 0o7777 == 0o644
+
+    kept = tmp_path / "kept.md"
+    kept.write_text("old", encoding="utf-8")
+    kept.chmod(0o640)
+    writer(kept, payload, new_file_mode=0o644)
+    assert kept.stat().st_mode & 0o7777 == 0o640
+
+    private = tmp_path / "private.md"
+    private.write_text("old", encoding="utf-8")
+    private.chmod(0o600)
+    writer(private, payload, new_file_mode=0o644)
+    assert private.stat().st_mode & 0o7777 == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_new_file_mode_applies_when_a_link_is_replaced_by_a_plain_file(tmp_path):
+    pointed = tmp_path / "pointed.md"
+    pointed.write_text("old", encoding="utf-8")
+    pointed.chmod(0o600)
+    link = tmp_path / "link.md"
+    link.symlink_to(pointed)
+
+    atomic_io.atomic_write_text(link, "new", new_file_mode=0o644)
+
+    assert not link.is_symlink()
+    assert link.stat().st_mode & 0o7777 == 0o644
+    assert pointed.stat().st_mode & 0o7777 == 0o600
+    assert pointed.read_text(encoding="utf-8") == "old"
+
+
+def test_new_file_mode_sets_no_private_acl_on_windows(tmp_path, monkeypatch):
+    """The ACL is for a file that holds a secret, not for a shared document."""
+    secured = _record_windows_acl(monkeypatch)
+    target = tmp_path / "JACKED_GUARDRAILS.md"
+
+    atomic_io.atomic_write_text(target, "doc", new_file_mode=0o644)
+
+    assert secured == []
+    assert target.read_text(encoding="utf-8") == "doc"
+
+
 @pytest.mark.parametrize("writer", ["text", "bytes"])
 def test_before_replace_runs_once_before_the_replace(tmp_path, writer):
     target = tmp_path / "MEMORY.md"

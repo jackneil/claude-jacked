@@ -145,7 +145,8 @@ def create_guardrails(
     # The shared writer replaces a link at the target with a plain file: a
     # repository can ship JACKED_GUARDRAILS.md as a link to a file of the user
     # (~/.bashrc), and write_text would overwrite that file through the link.
-    atomic_write_text(target, content)
+    # The file is a repository document, so a new one is not owner-only.
+    atomic_write_text(target, content, new_file_mode=0o644)
     return {
         "created": True,
         "path": str(target),

@@ -784,9 +784,6 @@ def _block_keychain_writes():
         )
 
     with patch(
-        "jacked.api.credential_helpers.write_platform_credentials",
-        return_value=True,
-    ), patch(
         "jacked.launch._activate_launch_credentials",
         side_effect=launch_result,
     ), patch(

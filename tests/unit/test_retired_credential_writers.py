@@ -20,6 +20,7 @@ _RETIRED_CREDENTIAL_WRITERS = (
     "_ClaudeConfigAccount",
     "_RATE_LIMIT_TIER_UNSET",
     "_write_credential_file",
+    "write_platform_credentials",
 )
 
 

@@ -51,8 +51,13 @@ def _prepare(db, pending_count: int) -> TransactionDependencies | None:
     return dependencies
 
 
-def _sweep(repository, dependencies: TransactionDependencies, pending) -> list[tuple[str, str]]:
-    """Classify each pending row under the switch lease; returns what settled."""
+def _sweep(repository, dependencies: TransactionDependencies) -> list[tuple[str, str]]:
+    """Classify each pending row under the switch lease; returns what settled.
+
+    The rows are listed after the lease is held: a switch can finish its own
+    row between the first listing and the lease, and the row is not this
+    sweep's to settle then.
+    """
     settled: list[tuple[str, str]] = []
     with dependencies.switch_lease.acquire() as held:
         if not held:
@@ -65,7 +70,7 @@ def _sweep(repository, dependencies: TransactionDependencies, pending) -> list[t
             dependencies.machine_install_id,
             dependencies.identity_publisher,
         )
-        for record in pending:
+        for record in repository.list_interrupted():
             try:
                 result = recovery.recover(record.operation_id)
             except Exception as exc:  # noqa: BLE001 - one row must not stop the rest
@@ -91,21 +96,21 @@ def recover_pending_switches(db) -> list[tuple[str, str]]:
     """
     repository = DatabaseCredentialSwitchRepository(db)
     try:
-        pending = repository.list_interrupted()
+        pending_count = repository.count_interrupted()
     except Exception as exc:  # noqa: BLE001 - startup must continue
         logger.warning(
             "Pending credential switch recovery skipped: %s while listing",
             type(exc).__name__,
         )
         return []
-    if not pending:
+    if not pending_count:
         return []
     settled: list[tuple[str, str]] = []
     try:
-        dependencies = _prepare(db, len(pending))
+        dependencies = _prepare(db, pending_count)
         if dependencies is None:
             return settled
-        settled = _sweep(repository, dependencies, pending)
+        settled = _sweep(repository, dependencies)
     except Exception as exc:  # noqa: BLE001 - startup must continue
         logger.warning(
             "Pending credential switch recovery stopped after %d row(s): %s",

@@ -902,23 +902,12 @@ def _upgrade_target_version() -> str | None:
         newest_listed_version,
     )
 
-    def answer(name: str, probe) -> str | None:
-        # Each probe has its own guard: a failure of one probe never hides
-        # the answer of the other.
-        try:
-            return probe(timeout=5.0)
-        except Exception as exc:  # noqa: BLE001 - a lookup failure never blocks an upgrade
-            # The error class only: the message of a network error can hold
-            # the index URL.
-            logger.debug("Upgrade target probe %s failed: %s", name, type(exc).__name__)
-            return None
-
-    # The two probes are independent network reads. Run them at the same
-    # time, so an unreachable index costs one timeout, not two.
+    # Two independent network reads at the same time: an unreachable index
+    # costs one timeout, not two. Each probe logs its own failure and returns
+    # None, so one failure never hides the other answer or blocks an upgrade.
     with ThreadPoolExecutor(max_workers=2) as pool:
         pypi_latest, simple_latest = pool.map(
-            answer,
-            ("get_latest_pypi_version", "get_latest_from_simple_index"),
+            lambda probe: probe(timeout=5.0),
             (get_latest_pypi_version, get_latest_from_simple_index),
         )
     target = newest_listed_version(pypi_latest, simple_latest)
@@ -5784,7 +5773,7 @@ def _tray_service_can_start_here() -> bool:
     loads, and the service does not start without the tray. So the display
     check comes first. With no display (CI, servers, Docker, SSH), this names
     `jacked webux --no-browser`, the foreground dashboard with no tray. When
-    pystray cannot load on a box with a display, this tells why (see
+    the service needs pystray and it cannot load, this tells why (see
     _tray_import_failure_notice). `jacked install` and `jacked service
     install` both ask this before they register autostart, so neither
     installs a service that cannot start.
@@ -5796,10 +5785,20 @@ def _tray_service_can_start_here() -> bool:
             "To use the dashboard here, run `jacked webux --no-browser`."
         )
         return False
-    if not _tray_extra_installed():
+    if _service_uses_pystray() and not _tray_extra_installed():
         console.print(_tray_import_failure_notice())
         return False
     return True
+
+
+def _service_uses_pystray() -> bool:
+    """False only when the service here runs the macOS agent (``ServiceRunner._run``)."""
+    try:
+        from jacked.service.tray import _mac_menubar_available, select_menubar_backend
+    except Exception as exc:  # noqa: BLE001 - install never dies over the tray
+        logger.debug("Could not read the tray backend: %s", type(exc).__name__)
+        return True
+    return select_menubar_backend(sys.platform, _mac_menubar_available()) == "pystray"
 
 
 def _tray_import_failure_notice() -> str:

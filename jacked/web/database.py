@@ -2635,17 +2635,13 @@ class Database:
         except (TypeError, ValueError):
             return None
 
-    def get_selected_account_id(
-        self, provider: str = "claude", *, existing_only: bool = False
-    ) -> Optional[int]:
+    def get_selected_account_id(self, provider: str = "claude") -> Optional[int]:
         """The account jacked last selected for new sessions of ``provider``.
 
         Claude: the module rule ``selected_account_id`` (the desired id, else
         the active id). A switch writes the desired id on every successful
         outcome, including ``observed_target_unfenced``, which leaves the
-        active id behind. Codex: its active account id. With
-        ``existing_only``, an id with no account row gives None for Codex, and
-        the next key for Claude.
+        active id behind. Codex: its active account id.
 
         >>> db = Database(":memory:")
         >>> db.set_setting("active_account_id", "3")
@@ -2654,17 +2650,12 @@ class Database:
         >>> db.set_setting("desired_account_id", "5")
         >>> db.get_selected_account_id()
         5
-        >>> db.get_selected_account_id(existing_only=True) is None
-        True
         >>> db.get_selected_account_id("codex") is None
         True
         """
         if provider == "claude":
-            return selected_account_id(self, existing_only=existing_only)
-        account_id = self.get_active_account_id(provider)
-        if existing_only and account_id is not None and self.get_account(account_id) is None:
-            return None
-        return account_id
+            return selected_account_id(self)
+        return self.get_active_account_id(provider)
 
     def find_open_sessions(self, pids) -> dict:
         """The newest open tracked session of each Claude Code process id in
