@@ -136,7 +136,7 @@ def test_chain_of_command_scopes_reviews_and_converges():
     assert "A review loop converges" in text
     assert "split the PR instead of reviewing again" in text
     assert "Exhaustive on the FIRST pass of any task; convergent after that." in text
-    assert "The full-suite gate is per PUSH, not per fix batch" in text
+    assert "The full-suite gate is per GOAL, at the very end" in text
     assert "LOW findings go to the main loop unverified" in text
 
 
@@ -165,3 +165,25 @@ def test_dc_classifies_the_tier_first_and_runs_small_inline():
     assert "same VERDICT format" in text
     # Grill mode stays interactive and agent-free.
     assert "GRILL MODE has no tier: it is always inline." in text
+
+
+def test_full_suite_runs_once_per_goal_never_per_milestone():
+    """Jack, 2026-11-03: a 16-milestone goal ran a full local gate plus a hosted
+    CI round per milestone. The full suite and hosted CI run ONCE per goal, at
+    the very end; milestones get targeted tests only. Every brief forger and the
+    behaviors block say so, so no forged brief can bring the per-milestone gate
+    back."""
+    for relative in (
+        "rules/jacked_behaviors.md",
+        "commands/goal-maker.md",
+        "skills/whats-next/SKILL.md",
+        "skills/chain-of-command/SKILL.md",
+    ):
+        text = _read(relative)
+        assert "ONCE per goal, at the very end" in text, relative
+        assert "never per milestone" in text, relative
+    assert "never per milestone" in _read("skills/dcr/SKILL.md")
+    assert "targeted tests while building the cell" in _read("commands/bhag.md")
+    for relative in ("commands/goal-maker.md", "skills/whats-next/SKILL.md", "commands/bhag.md"):
+        assert "per PUSH" not in _read(relative), relative
+

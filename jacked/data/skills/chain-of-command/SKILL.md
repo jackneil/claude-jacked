@@ -50,7 +50,7 @@ The tier decides how many agents run, on every fan-out mechanism: the Agent tool
 9. **Research fan-out.** Default 4 lanes by 5 searches; expand only when the first pass shows a gap. The completeness critic is main-loop inline unless a claim is load-bearing.
 10. **Scope and provenance on every review dispatch.** The prompt states the branch's scope in one sentence and requires `introduced_by_branch: true|false` on every finding. Branch-introduced defects are fixed in the PR, always. Pre-existing ones are fixed in the PR only when security-, data-integrity-, or billing-critical, or a one-line change; otherwise filed as an issue with the file:line evidence and linked from the PR. A user's CLAUDE.md that says otherwise wins.
 11. **Reviewer engine.** When `jacked dcr engine --json` reports the Codex engine usable, review stages run on it by default; the main loop keeps lens selection, finding validation, fixes, and the verdict. Security and UI-design lenses stay on Fable.
-12. **Test cadence.** Targeted tests per fix round; ONE full suite on a frozen tree as the final gate (plus one mid-way pass on a branch over ~600 lines). The full-suite gate is per PUSH, not per fix batch.
+12. **Test cadence.** Targeted tests per fix round and per milestone; the full suite runs ONCE per goal, at the very end, over the combined tree, never per milestone or per PR of a stack. The full-suite gate is per GOAL, at the very end: fix with targeted tests, re-run only the failing stage, one more full run, then push and let hosted CI run once.
 
 ## Scope and revocation
 
