@@ -31,9 +31,11 @@ in every git work tree and prints nothing anywhere else, so a session start
 outside a git repo adds zero bytes. Step 6 prints only when a file that Claude
 Code loads at session start (MEMORY.md, a CLAUDE.md) is over 90% of its load
 cap, so a healthy machine gets zero bytes from it. Step 7 prints only when
-settings.json or a hook script changed outside jacked, or when it moved a
-suspected injected line out of MEMORY.md (``jacked.integrity``), so a healthy
-machine gets zero bytes from it too. It goes last because its text changes
+settings.json or a hook script changed outside jacked, or when it found a
+suspected injected line in MEMORY.md (``jacked.integrity``; the line moves to a
+quarantine file, or stays and is reported when the file is a link or a
+repo-local setting chose its folder), so a healthy machine gets zero bytes
+from it too. It goes last because its text changes
 whenever something outside jacked changes.
 """
 

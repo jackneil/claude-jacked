@@ -223,7 +223,7 @@ At session start, Claude Code loads only the first 200 lines or the first 25 KB 
 
 jacked measures these files and warns when a file is over 90% of its cap. It never edits a file. The warning shows in three places:
 
-- At session start, as the last block of the SessionStart output. A session with no warning gets no extra text.
+- At session start, after the git reality block and before the integrity block, which is the last block of the SessionStart output. A session with no warning gets no extra text.
 - In `jacked memory status`, after the other output.
 - On the dashboard, on the Memory Vault card (Settings > Features). The card shows the warning when the vault is off too.
 

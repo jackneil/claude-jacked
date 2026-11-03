@@ -52,3 +52,12 @@ def test_the_hooks_section_renders_the_panel():
     source = SETTINGS_JS.read_text(encoding="utf-8")
 
     assert "${_integrityPanel(features.integrity)}" in source
+
+
+def test_the_panel_states_the_watch_coverage_gap(tmp_path):
+    for integ in ({"state": "ok", "baseline_time": "t", "lines": []},
+                  {"state": "drift", "baseline_time": "t", "lines": ["x"]}):
+        html = _panel(tmp_path, integ)
+
+        assert "${CLAUDE_PLUGIN_ROOT}" in html
+        assert "watched only through the hook command" in html

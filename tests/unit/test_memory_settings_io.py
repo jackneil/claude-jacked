@@ -147,6 +147,32 @@ _WRITE_CALLS = {
 _DEST_LAST = {"copy", "copy2", "copyfile", "move", "replace", "rename"}
 
 
+#: Modules whose ``open`` takes the path first and a mode string second.
+_OPEN_MODULES = {"io", "builtins", "codecs"}
+_WRITE_FLAGS = ("O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC")
+
+
+def _open_write(node: ast.Call, source: str) -> tuple[bool, ast.expr | None]:
+    """``(writes, target)`` for an ``open`` call, in its three forms.
+
+    ``open(path, mode)`` and ``io.open(path, mode)``; ``os.open(path, flags)``;
+    ``path.open(mode)`` (``pathlib.Path.open``), where the receiver is the target.
+    """
+    fn = node.func
+    receiver = fn.value if isinstance(fn, ast.Attribute) else None
+    receiver_name = receiver.id if isinstance(receiver, ast.Name) else None
+    if receiver_name == "os":
+        flags = ast.get_source_segment(source, node.args[1]) if len(node.args) > 1 else ""
+        return any(f in (flags or "") for f in _WRITE_FLAGS), node.args[0] if node.args else None
+    if receiver is None or receiver_name in _OPEN_MODULES:
+        modes, target = node.args[1:2], node.args[0] if node.args else None
+    else:
+        modes, target = node.args[0:1], receiver
+    modes = [*modes, *(k.value for k in node.keywords if k.arg == "mode")]
+    writes = any(isinstance(m, ast.Constant) and set(str(m.value)) & set("wax+") for m in modes)
+    return writes, target
+
+
 def _settings_writes(source: str) -> list[str]:
     """Each call in ``source`` that writes to a settings.json target, as text."""
     tree = ast.parse(source)
@@ -158,17 +184,19 @@ def _settings_writes(source: str) -> list[str]:
         name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
         if name not in _WRITE_CALLS:
             continue
-        if name == "open":
-            modes = [*node.args[1:2], *(k.value for k in node.keywords if k.arg == "mode")]
-            if not any(isinstance(m, ast.Constant) and set(str(m.value)) & set("wax+") for m in modes):
-                continue
         parts = []
-        if isinstance(fn, ast.Attribute) and name in ("write_text", "write_bytes", "replace", "rename"):
-            parts.append(ast.get_source_segment(source, fn.value) or "")
-        if node.args:
-            target = node.args[-1] if name in _DEST_LAST else node.args[0]
-            parts.append(ast.get_source_segment(source, target) or "")
-        text = " ".join(parts)
+        if name == "open":
+            writes, target = _open_write(node, source)
+            if not writes:
+                continue
+            parts.append(ast.get_source_segment(source, target) if target is not None else "")
+        else:
+            if isinstance(fn, ast.Attribute) and name in ("write_text", "write_bytes", "replace", "rename"):
+                parts.append(ast.get_source_segment(source, fn.value) or "")
+            if node.args:
+                target = node.args[-1] if name in _DEST_LAST else node.args[0]
+                parts.append(ast.get_source_segment(source, target) or "")
+        text = " ".join(p or "" for p in parts)
         if _SETTINGS_TARGET.search(text) and "local" not in text and "baseline_path" not in text:
             found.append(f"{name}({text})")
     return found
@@ -180,9 +208,17 @@ def test_the_scanner_finds_each_writer_shape():
         "atomic_write_text(SETTINGS_JSON, '{}')\n"
         "with open(home / '.claude' / 'settings.json', 'w') as fh:\n    json.dump(x, fh)\n"
         "shutil.copy2(tmp, settings_file)\n"
+        "with settings_path.open('w') as fh:\n    fh.write('{}')\n"
+        "settings_file.open(mode='a').write('x')\n"
+        "io.open(SETTINGS_JSON, 'w')\n"
+        "os.open(settings_path, os.O_WRONLY | os.O_CREAT)\n"
     )
-    assert len(_settings_writes(planted)) == 4
-    assert _settings_writes("settings_path.read_text()\nopen(settings_path)\n") == []
+    assert len(_settings_writes(planted)) == 8
+    assert _settings_writes(
+        "settings_path.read_text()\nopen(settings_path)\nsettings_path.open()\n"
+        "settings_file.open('r', encoding='utf-8')\nsettings_path.open(mode='rb')\n"
+        "os.open(settings_path, os.O_RDONLY)\n"
+    ) == []
 
 
 def test_no_module_other_than_settings_io_writes_settings_json():
@@ -206,3 +242,74 @@ def test_write_settings_rebaselines_with_its_reason(tmp_path):
 
     assert integrity.check(p) == []
     assert integrity.load_baseline(p)["log"][-1]["reason"] == "unit test"
+
+
+# --------------------------------------------------------------------------- #
+# A symlinked settings.json stays a symlink (H1)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.skipif(not symlinks_supported(), reason="needs symlinks")
+def test_a_symlinked_settings_file_stays_a_symlink_after_a_write(tmp_path):
+    """A dotfiles-managed settings.json is a link: the write goes to its target."""
+    dotfiles = tmp_path / "dotfiles" / "claude-settings.json"
+    dotfiles.parent.mkdir()
+    dotfiles.write_text('{"model": "opus"}', encoding="utf-8")
+    link = tmp_path / ".claude" / "settings.json"
+    link.parent.mkdir()
+    link.symlink_to(dotfiles)
+    pointer = os.readlink(link)
+
+    settings_io.write_settings(link, {"model": "sonnet"})
+
+    assert link.is_symlink()
+    assert os.readlink(link) == pointer
+    assert json.loads(dotfiles.read_text(encoding="utf-8")) == {"model": "sonnet"}
+    assert sorted(p.name for p in dotfiles.parent.iterdir()) == ["claude-settings.json"]
+
+
+@pytest.mark.skipif(not symlinks_supported(), reason="needs symlinks")
+def test_a_dangling_settings_symlink_is_refused_and_nothing_is_created(tmp_path, caplog):
+    target = tmp_path / "dotfiles" / "gone.json"
+    link = tmp_path / ".claude" / "settings.json"
+    link.parent.mkdir()
+    link.symlink_to(target)
+
+    with caplog.at_level(logging.WARNING), pytest.raises(SettingsUnreadableError):
+        settings_io.write_settings(link, {"model": "sonnet"})
+
+    assert link.is_symlink() and not target.exists()
+    assert not target.parent.exists()
+    assert "symlink" in caplog.text and "gone.json" not in caplog.text
+    assert sorted(p.name for p in link.parent.iterdir()) == ["settings.json"]
+
+
+@pytest.mark.skipif(not symlinks_supported(), reason="needs symlinks")
+def test_a_settings_symlink_to_a_directory_is_refused(tmp_path, caplog):
+    folder = tmp_path / "a-folder"
+    folder.mkdir()
+    link = tmp_path / ".claude" / "settings.json"
+    link.parent.mkdir()
+    link.symlink_to(folder)
+
+    with caplog.at_level(logging.WARNING), pytest.raises(SettingsUnreadableError):
+        settings_io.write_settings(link, {})
+
+    assert link.is_symlink() and list(folder.iterdir()) == []
+    assert "not a regular file" in caplog.text and "a-folder" not in caplog.text
+
+
+@requires_fifo
+@pytest.mark.skipif(not symlinks_supported(), reason="needs symlinks")
+def test_a_settings_symlink_to_a_fifo_is_refused_without_blocking(tmp_path):
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    link = tmp_path / ".claude" / "settings.json"
+    link.parent.mkdir()
+    link.symlink_to(fifo)
+
+    finished, _ = returns_without_blocking(
+        lambda: pytest.raises(SettingsUnreadableError, settings_io.write_settings, link, {}), [fifo]
+    )
+
+    assert finished, "write_settings blocked on a symlink to a FIFO"
+    assert link.is_symlink()

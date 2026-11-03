@@ -1133,7 +1133,7 @@ class TestDeveloperEnvironmentIsolation:
 
 FOREIGN_LINE = (
     "jacked integrity: settings.json changed outside jacked; "
-    "UserPromptSubmit hook added: python3 /tmp/payload.py"
+    "UserPromptSubmit hook added: program python3, script /tmp/payload.py, command sha256:36da742e"
 )
 
 

@@ -617,12 +617,18 @@ function _memoryLoadNotes(h) {
 // that GET /api/features reports and never changes it. Accepting a change is a
 // terminal command, so a click in the dashboard can never approve a hook that
 // something else added.
+// What the script watch does not cover (the same text as jacked doctor).
+const _INTEGRITY_SCOPE = 'jacked hashes a hook script only when the hook command names it with an absolute path, '
+    + '~/ or $HOME. A script named with ${CLAUDE_PLUGIN_ROOT}, another variable or a relative path '
+    + 'is watched only through the hook command.';
+
 function _integrityPanel(integ) {
     if (!integ || typeof integ.state !== 'string') return '';
     const wrap = (body, tone) => `
         <div class="mt-3 p-3 rounded border ${tone}" data-integrity-panel>${body}</div>`;
+    const scope = `<div class="text-xs text-slate-500 mt-2">${escapeHtml(_INTEGRITY_SCOPE)}</div>`;
     if (integ.state === 'ok') {
-        return wrap(`<div class="text-xs text-slate-400">Hook and settings integrity: OK (baseline ${escapeHtml(integ.baseline_time || 'unknown')})</div>`,
+        return wrap(`<div class="text-xs text-slate-400">Hook and settings integrity: OK (baseline ${escapeHtml(integ.baseline_time || 'unknown')})</div>${scope}`,
             'border-slate-700/50 bg-slate-900/50');
     }
     if (integ.state === 'drift') {
@@ -634,7 +640,8 @@ function _integrityPanel(integ) {
         return wrap(`
             <div class="text-sm text-yellow-300">Hook and settings integrity: ${count} change${count === 1 ? '' : 's'} outside jacked</div>
             <ul class="mt-2 space-y-1">${items}</ul>
-            <div class="text-xs text-slate-400 mt-2">Review each change. If you made it, run <code class="text-slate-300">jacked integrity accept</code> in a terminal.</div>`,
+            <div class="text-xs text-slate-400 mt-2">Review each change. If you made it, run <code class="text-slate-300">jacked integrity accept</code> in a terminal.</div>
+            ${scope}`,
             'border-yellow-600/50 bg-yellow-900/20');
     }
     if (integ.state === 'no_baseline') {

@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
 from pathlib import Path
 
 from jacked.regular_file import FileTooLargeError, read_regular
@@ -111,20 +113,61 @@ def write_settings(path: Path | str, data: dict, *, reason: str = "jacked settin
     post-write verification: the file is re-read and parsed, and a verification
     failure raises ``SettingsUnreadableError`` so a corrupt write is surfaced
     loudly instead of being trusted.
+
+    A settings.json that is a symlink (a dotfiles setup) stays a symlink: the
+    write goes to the regular file that the link points at
+    (``_write_target``). The integrity baseline keeps the path of the link.
     """
     from jacked.memory import vault as vault_mod
 
-    path = Path(path)
-    before = _integrity_snapshot(path)
-    vault_mod.atomic_write_text(path, json.dumps(data, indent=2))
+    from jacked import integrity
 
+    path = Path(path)
+    target = _write_target(path)
+    # One lock over the snapshot, the write and the rebaseline: two jacked
+    # writers that interleave would lose a log entry and report each other.
+    with integrity.baseline_lock(path):
+        before = _integrity_snapshot(path)
+        vault_mod.atomic_write_text(target, json.dumps(data, indent=2))
+
+        try:
+            verify = json.loads(_read_text(path))
+        except (OSError, SettingsUnreadableError, json.JSONDecodeError) as e:
+            raise SettingsUnreadableError(f"post-write verification failed for {path}: {e}") from e
+        if not isinstance(verify, dict):
+            raise SettingsUnreadableError(f"post-write verification failed for {path}: not a JSON object")
+        _rebaseline(path, reason, before)
+
+
+def _write_target(path: Path) -> Path:
+    """Return the file that a write of ``path`` replaces.
+
+    That is ``path``, or the final target when ``path`` is a symlink to a
+    regular file, so the link stays and its target gets the new content. A
+    link to a missing file, to a FIFO, to a device or to a folder raises
+    ``SettingsUnreadableError`` and nothing is written. The log names the
+    reason and the settings file, never the target of the link.
+    """
     try:
-        verify = json.loads(_read_text(path))
-    except (OSError, SettingsUnreadableError, json.JSONDecodeError) as e:
-        raise SettingsUnreadableError(f"post-write verification failed for {path}: {e}") from e
-    if not isinstance(verify, dict):
-        raise SettingsUnreadableError(f"post-write verification failed for {path}: not a JSON object")
-    _rebaseline(path, reason, before)
+        if not stat.S_ISLNK(os.lstat(path).st_mode):
+            return path
+    except FileNotFoundError:
+        return path
+    except OSError as e:
+        raise SettingsUnreadableError(f"cannot read {path}: {e}") from e
+    try:
+        mode = os.stat(path).st_mode
+    except OSError as e:
+        reason = "a missing file" if isinstance(e, FileNotFoundError) else type(e).__name__
+        logger.warning("settings: %s is a symlink to %s, so jacked does not write it", path.name, reason)
+        raise SettingsUnreadableError(f"{path} is a symlink that cannot be followed") from e
+    if not stat.S_ISREG(mode):
+        logger.warning(
+            "settings: %s is a symlink to a path that is not a regular file, so jacked does not write it",
+            path.name,
+        )
+        raise SettingsUnreadableError(f"{path} is a symlink to a path that is not a regular file")
+    return Path(os.path.realpath(path))
 
 
 def _integrity_snapshot(path: Path) -> dict | None:

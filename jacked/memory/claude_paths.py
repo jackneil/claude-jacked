@@ -259,17 +259,30 @@ def auto_memory_directory(cwd, home, env: Env | None = None) -> Path | None:
     Claude Code reads the setting from local settings, then user settings, and
     ignores it in checked-in project settings. With ``cwd`` None only the user
     settings count. The first setting decides, and a value that is not valid
-    keeps the default.
+    keeps the default. ``auto_memory_setting`` also names the source.
+    """
+    return auto_memory_setting(cwd, home, env)[0]
+
+
+def auto_memory_setting(cwd, home, env: Env | None = None) -> tuple[Path | None, str]:
+    """Return ``(folder, source)`` for the ``autoMemoryDirectory`` setting.
+
+    ``source`` is ``"local"`` when the repo's ``.claude/settings.local.json``
+    sets the folder, ``"user"`` when the user settings set it, and ``""``
+    when no valid setting does (the folder is then None). A repo can ship or
+    plant a local settings file, so a jacked write treats a ``"local"``
+    folder as read-only.
     """
     env = os.environ if env is None else env
-    files = [config_dir(home, env) / "settings.json"]
+    files = [(config_dir(home, env) / "settings.json", "user")]
     if cwd is not None:
-        files.insert(0, Path(cwd) / ".claude" / "settings.local.json")
-    for path in files:
+        files.insert(0, (Path(cwd) / ".claude" / "settings.local.json", "local"))
+    for path, source in files:
         value = _settings(path).get("autoMemoryDirectory")
         if value is not None:
-            return _memory_dir_value(value, Path(home))
-    return None
+            folder = _memory_dir_value(value, Path(home))
+            return (folder, source) if folder is not None else (None, "")
+    return None, ""
 
 
 def _memory_dir_value(value: object, home: Path) -> Path | None:
@@ -295,14 +308,24 @@ def native_memory_path(cwd, home, env: Env | None = None) -> Path:
     then ``CLAUDE_CODE_PROJECT_DIR_NAME`` (only with ``CLAUDE_CONFIG_DIR``
     set), then the name of the main checkout of the repo, or of ``cwd``.
     """
+    return native_memory_location(cwd, home, env)[0]
+
+
+def native_memory_location(cwd, home, env: Env | None = None) -> tuple[Path, str]:
+    """Return ``(MEMORY.md path, source)`` for a session in ``cwd``.
+
+    ``source`` is ``"local"`` or ``"user"`` when an ``autoMemoryDirectory``
+    setting chose the folder (see ``auto_memory_setting``), else
+    ``"default"`` (a folder under ``<config dir>/projects/``).
+    """
     env = os.environ if env is None else env
     folder = session_folder(cwd)
-    override = auto_memory_directory(folder, home, env)
+    override, source = auto_memory_setting(folder, home, env)
     if override is not None:
-        return override / MEMORY_INDEX
+        return override / MEMORY_INDEX, source
     pinned = env.get("CLAUDE_CODE_PROJECT_DIR_NAME") if env.get("CLAUDE_CONFIG_DIR") else None
     if pinned and _PINNED_NAME_RE.match(pinned) and not _DEVICE_NAME_RE.match(pinned):
         name = pinned
     else:
         name = project_dir_name(str(repo_root(folder) or folder))
-    return config_dir(home, env) / "projects" / name / "memory" / MEMORY_INDEX
+    return config_dir(home, env) / "projects" / name / "memory" / MEMORY_INDEX, "default"

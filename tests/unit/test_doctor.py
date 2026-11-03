@@ -559,7 +559,8 @@ def test_doctor_prints_each_integrity_finding_unwrapped(integrity_home):
     assert result.exit_code == 0, result.output
     assert "Hook/settings integrity: 1 change outside jacked" in result.output
     assert ("  jacked integrity: settings.json changed outside jacked; "
-            "UserPromptSubmit hook added: python3 /tmp/payload.py") in result.output
+            "UserPromptSubmit hook added: program python3, script /tmp/payload.py, "
+            "command sha256:36da742e") in result.output
     assert "  Review each change. If you made it, run: jacked integrity accept" in result.output
 
 
