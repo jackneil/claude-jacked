@@ -360,22 +360,58 @@ def test_settings_over_the_limit_are_refused_before_the_file_changes(tmp_path, m
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_settings_text_counts_the_text_mode_line_endings(monkeypatch):
-    data = {"k": "x" * 100}
-    size = len(json.dumps(data, indent=2).encode("utf-8"))
-    monkeypatch.setattr(settings_io, "SETTINGS_MAX_BYTES", size)
-    assert settings_io.settings_text(data) == json.dumps(data, indent=2)
-    monkeypatch.setattr(settings_io.os, "linesep", "\r\n")
+@pytest.mark.parametrize("linesep", ["\n", "\r\n"])
+def test_the_settings_size_is_the_utf8_byte_count_on_every_platform(monkeypatch, linesep):
+    """The size is the UTF-8 bytes of the text, whatever ``os.linesep`` is.
+
+    The writers write those bytes with LF, so no platform adds a byte.
+    """
+    data = {"k": "é" * 10 + "x" * 90}
+    text = json.dumps(data, indent=2)
+    monkeypatch.setattr(os, "linesep", linesep)
+    monkeypatch.setattr(settings_io, "SETTINGS_MAX_BYTES", len(text.encode("utf-8")))
+    assert settings_io.settings_text(data) == text
+    monkeypatch.setattr(settings_io, "SETTINGS_MAX_BYTES", len(text.encode("utf-8")) - 1)
     with pytest.raises(settings_io.SettingsTooLargeError):
         settings_io.settings_text(data)
 
 
+def _windows_text_mode(path, text, **kwargs):
+    """Write ``text`` the way a text-mode write does on Windows: CRLF."""
+    from pathlib import Path
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+
+
+@pytest.mark.parametrize("writer", ["settings_io", "cli", "features"])
+def test_every_writer_writes_the_checked_bytes_with_lf(tmp_path, monkeypatch, writer):
+    """Each writer writes exactly the UTF-8 bytes that ``settings_text`` checked.
+
+    A text-mode write stands in for Windows here: it adds a CR to each line.
+    A writer that uses it makes a file larger than the checked size.
+    """
+    from jacked import atomic_io
+    from jacked.api.routes import features
+    from jacked.memory import vault
+
+    for module in (atomic_io, vault, features):
+        monkeypatch.setattr(module, "atomic_write_text", _windows_text_mode)
+    data = {"hooks": {"Stop": []}, "k": "é"}
+    _writers(tmp_path, monkeypatch)[writer](data)
+
+    on_disk = (tmp_path / "settings.json").read_bytes()
+    assert on_disk == settings_io.settings_text(data).encode("utf-8")
+    assert b"\r" not in on_disk
+
+
 def test_settings_at_the_limit_are_written_and_read_back(tmp_path, monkeypatch):
     data = {"k": "x" * 100}
-    monkeypatch.setattr(settings_io, "SETTINGS_MAX_BYTES",
-                        len(json.dumps(data, indent=2).encode("utf-8")))
+    assert len(json.dumps(data, indent=2).encode("utf-8")) == 113
+    monkeypatch.setattr(settings_io, "SETTINGS_MAX_BYTES", 113)
     path = tmp_path / "settings.json"
     settings_io.write_settings(path, data)
+    assert path.stat().st_size == 113
     assert settings_io.read_settings(path) == data
 
 

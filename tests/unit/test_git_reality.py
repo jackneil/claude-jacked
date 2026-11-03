@@ -881,18 +881,21 @@ class TestGitCalls:
         _commit(repo, "base\n")
         tree = _git(repo, "write-tree").stdout.strip()
         parent = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        commit = (
+            f"tree {tree}\nparent {parent}\n"
+            "author test <test@example.com> 1700000000 +0000\n"
+            "committer test <test@example.com> 1700000000 +0000\n"
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n \n ZmFrZQ==\n"
+            " -----END PGP SIGNATURE-----\n"
+            "\nsigned subject\n"
+        )
+        # Bytes with LF: a text-mode pipe on Windows writes CRLF, and git
+        # refuses a commit object with CR in its headers.
         signed = subprocess.run(
             ["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"],
-            input=(
-                f"tree {tree}\nparent {parent}\n"
-                "author test <test@example.com> 1700000000 +0000\n"
-                "committer test <test@example.com> 1700000000 +0000\n"
-                "gpgsig -----BEGIN PGP SIGNATURE-----\n \n ZmFrZQ==\n"
-                " -----END PGP SIGNATURE-----\n"
-                "\nsigned subject\n"
-            ),
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
+            input=commit.encode("utf-8"),
+            capture_output=True, check=True,
+        ).stdout.decode("utf-8").strip()
         _git(repo, "update-ref", "HEAD", signed)
         marker = root / "gpg-ran.txt"
         fake_gpg = write_python_shim(

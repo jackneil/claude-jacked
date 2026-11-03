@@ -12,7 +12,7 @@ import os
 import subprocess
 from datetime import datetime, timedelta, timezone
 from io import StringIO
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1073,7 +1073,10 @@ def test_a_superseded_decision_leaves_key_decisions(env):
     cwd = str(_cwd_dir(env, "myrepo"))
     assert "Poll the usage API" in _section(recall.build_brief(cwd), "# Key decisions")
 
-    _supersede(env, old, new["path"].split("groups/myrepo/", 1)[1])
+    # The vault returns a native path (backslashes on Windows); the link is
+    # the note path inside the group, with forward slashes.
+    winner = PurePath(new["path"]).relative_to(PurePath("groups", "myrepo")).as_posix()
+    _supersede(env, old, winner)
     brief = recall.build_brief(cwd)
 
     decisions = _section(brief, "# Key decisions")

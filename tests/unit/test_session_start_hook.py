@@ -969,7 +969,7 @@ def queue_home(tmp_path, monkeypatch):
 
 
 def _count_subprocesses(monkeypatch) -> list:
-    """Count every process start, and still run it (git reality needs git)."""
+    """Count every process start, and still run it."""
     calls: list = []
     real_popen = subprocess.Popen
 
@@ -982,7 +982,28 @@ def _count_subprocesses(monkeypatch) -> list:
     return calls
 
 
+GIT_REALITY_SENTINEL = "=== GIT REALITY SENTINEL ==="
+
+
 class TestOpenWorkStep:
+    """The open-work step, with the git reality step fixed to a sentinel.
+
+    The real git reality step runs git with a 3 s timeout on each call, so
+    on a slow CI runner one run prints the block and the next run prints
+    nothing (macOS leg of run 41657691384). These tests compare two runs or
+    count the processes of two runs, and their subject is the open-work
+    step, so the git step must give the same bytes every time.
+    TestGitRealityStep tests the real git step.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fixed_git_reality(self, monkeypatch):
+        from jacked.data.hooks import git_reality
+
+        monkeypatch.setattr(
+            git_reality, "emit_git_reality", lambda cwd, **kwargs: GIT_REALITY_SENTINEL
+        )
+
     def test_open_work_comes_after_the_memory_brief_and_before_git_reality(self):
         from jacked.data.hooks import session_start
 
@@ -1003,9 +1024,9 @@ class TestOpenWorkStep:
         assert out.startswith(
             f"{CHAIN_SENTINEL}\n{RECALL_SENTINEL}\n{OPEN_WORK_HEADING}\n```\n#1i Queued item 1\n"
         )
-        assert "#15i Queued item 15\n```\n[trimmed: 2 more]\n" + GIT_HEADING + "\n" in out
+        assert "#15i Queued item 15\n```\n[trimmed: 2 more]\n" + GIT_REALITY_SENTINEL + "\n" in out
         assert "#16i" not in out
-        assert out.index(RECALL_SENTINEL) < out.index(OPEN_WORK_HEADING) < out.index(GIT_HEADING)
+        assert out.index(RECALL_SENTINEL) < out.index(OPEN_WORK_HEADING) < out.index(GIT_REALITY_SENTINEL)
 
     @requires_git
     def test_no_cache_and_no_gh_leaves_stdout_byte_identical_to_head(
@@ -1029,6 +1050,7 @@ class TestOpenWorkStep:
         head_out, head_calls = capsys.readouterr().out, list(calls)
 
         assert with_step_out.encode("utf-8") == head_out.encode("utf-8")
+        assert GIT_REALITY_SENTINEL + "\n" in head_out  # both runs reached the later steps
         assert OPEN_WORK_HEADING not in with_step_out
         assert len(with_step_calls) == len(head_calls)
 

@@ -77,7 +77,17 @@ if mode == "hang":
     time.sleep(30)
     sys.exit(0)
 if mode == "exit_nonzero":
-    sys.stderr.write(scenario.get("stderr", "fake npx error"))
+    # Write BYTES, as a real npx does. The text console of a Windows runner
+    # is cp1252: it cannot encode U+009B or U+2028 and writes the escape
+    # text instead. "stderr_hex" sends raw bytes, including bytes that are
+    # not UTF-8.
+    if "stderr_hex" in scenario:
+        err = bytes.fromhex(scenario["stderr_hex"])
+    else:
+        err = scenario.get("stderr", "fake npx error").encode("utf-8")
+    sys.stderr.flush()
+    sys.stderr.buffer.write(err)
+    sys.stderr.buffer.flush()
     sys.exit(int(scenario.get("exit_code", 1)))
 if mode == "read_stdin":
     # DEVNULL -> read() returns "" immediately; an inherited TTY/pipe could
@@ -217,6 +227,12 @@ def skills_env(tmp_path, monkeypatch):
         scenario_path.write_text(json.dumps(kw), encoding="utf-8")
         monkeypatch.setenv("SKILLS_SCENARIO", str(scenario_path))
         monkeypatch.setenv("SKILLS_TEST_HOME", str(home))
+
+    # The fake npx runs with the text console of a Windows runner (cp1252),
+    # on every platform. A real npx writes UTF-8 bytes whatever the console
+    # is, so the shim must too, and a shim that writes through the text
+    # console fails here on macOS and Linux, not only on Windows.
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
 
     set_scenario(mode="normal")
     return SimpleNamespace(
@@ -1145,6 +1161,25 @@ def test_run_skills_strips_c1_controls_and_bidi_overrides_from_tail(skills_env, 
     assert ch not in res.message and "npm ERR!2J boom" in res.message
     for rec in caplog.records:
         assert ch not in rec.getMessage()
+
+
+def test_run_skills_decodes_npx_bytes_as_utf8_with_replacement(skills_env, caplog):
+    """jacked decodes npx output as UTF-8, whatever the locale code page is.
+
+    The bytes hold a UTF-8 C1 control (U+009B) and one byte that is not
+    UTF-8. The C1 control is stripped, and the bad byte becomes U+FFFD: the
+    read does not fail and the rest of the text stays.
+    """
+    env = skills_env
+    raw = b"npm ERR!\xc2\x9b2J boom \xff end"
+    env.set_scenario(mode="exit_nonzero", exit_code=1, stderr_hex=raw.hex())
+    with caplog.at_level("WARNING"):
+        res = packs.install_pack(_pack(), env.home, include_codex=False)
+    assert res.ok is False
+    assert "npm ERR!2J boom \ufffd end" in res.message
+    assert "\x9b" not in res.message and "\\x" not in res.message
+    for rec in caplog.records:
+        assert "\x9b" not in rec.getMessage()
 
 
 def test_packs_has_no_private_sanitizer():
