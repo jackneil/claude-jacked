@@ -120,3 +120,28 @@ def absent_autostart():
         return_value=AutostartInspection(AutostartState.ABSENT),
     ):
         yield
+
+
+@pytest.fixture
+def tray_module(monkeypatch):
+    """Give ``jacked.service.tray``, with a fake pystray when pystray cannot load.
+
+    pystray selects its GUI backend when it is imported. On a Linux runner
+    with no display that import fails, so the tray module sets
+    ``_TRAY_AVAILABLE = False`` and does not bind ``tray.pystray``. Then this
+    fixture binds ``tray.pystray`` to ``tests.unit.service._fake_pystray``
+    for the test, and the menu and runner tests run instead of skipping.
+    When pystray loads, the fixture changes nothing, so the test uses the
+    real pystray. The fake needs no Pillow.
+
+    The fixture does not change ``_TRAY_AVAILABLE``. Only
+    ``check_tray_deps`` reads it, and a test that runs the pystray tray must
+    set it on purpose.
+    """
+    from jacked.service import tray
+
+    if not tray._TRAY_AVAILABLE:
+        from tests.unit.service import _fake_pystray
+
+        monkeypatch.setattr(tray, "pystray", _fake_pystray, raising=False)
+    return tray

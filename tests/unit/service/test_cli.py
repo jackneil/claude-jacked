@@ -210,6 +210,52 @@ class TestServiceStatus:
         assert "starting" in result.output.lower()
         assert "Dashboard:" not in result.output
 
+    @pytest.mark.parametrize(
+        "extra, shown",
+        [
+            ({"tray_menu_available": False}, True),
+            ({"tray_menu_available": True}, False),
+            ({"tray_menu_available": None}, False),
+            ({}, False),  # a service from before the field existed
+        ],
+        ids=["no-menu", "menu", "unknown", "older-service"],
+    )
+    def test_status_names_a_tray_without_a_menu(self, absent_autostart, extra, shown):
+        """#232i: on the pystray Xorg backend the tray has no menu. Status
+        says so and names the left click. Only an explicit False prints it."""
+        from types import SimpleNamespace
+
+        from jacked.cli import main
+
+        state = {
+            "state": "running",
+            "quarantine": False,
+            "build_version": "test",
+            "protocol_version": 2,
+            "generation": "abc",
+            "port": 8321,
+            **extra,
+        }
+        with (
+            patch(
+                "jacked.service.lifecycle.discover_service",
+                return_value=SimpleNamespace(source="manifest", reason=""),
+            ),
+            patch(
+                "jacked.service.ipc.send_native_control",
+                return_value={"ok": True, "result": state},
+            ),
+        ):
+            result = CliRunner().invoke(main, ["service", "status"])
+
+        assert result.exit_code == 0, result.output
+        line = (
+            "Tray menu: unavailable (pystray Xorg backend); left-click the "
+            "icon opens the dashboard"
+        )
+        assert (line in _flat(result.output)) is shown
+        assert ("Tray menu" in result.output) is shown
+
     def test_status_preserves_unknown_autostart_truth(self):
         from types import SimpleNamespace
 

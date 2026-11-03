@@ -256,8 +256,15 @@ jacked install --force                  # wires up hooks AND starts the tray (au
 ### On Windows and Linux
 
 - **System tray icon** (the jacked arm, colored by service state) with the same right-click menu essentials: Open Dashboard, Restart, Stop, Start on Login, version line, and Check for updates.
-- **Usage at a glance.** The first line of the tray menu shows the limits of the resolved account with full names, for example `Claude · 7d 74% · Fable 100%`. On Windows, the icon tooltip shows the same line when you hover over the icon. Linux tray icons have no hover tooltip, so use the menu line there. The Xorg fallback tray (used only when neither AppIndicator nor GTK is available) has no menu at all, so it shows no usage; the dashboard always does. Both change within about one second of a usage refresh or an account switch, with a 30-second heartbeat.
+- **Left-click opens the dashboard.** Open Dashboard is the default action of the tray icon. On Windows, a left click on the icon opens the dashboard, and a right click opens the menu. On Linux, the GTK tray and the Xorg tray also open the dashboard on a left click. A double-click opens the dashboard one time. The AppIndicator tray opens its menu on a left click, and Open Dashboard is in that menu.
+- **Usage at a glance.** The first line of the tray menu shows the limits of the resolved account with full names, for example `Claude · 7d 74% · Fable 100%`. On Windows, the icon tooltip shows the same line when you hover over the icon. Linux tray icons have no hover tooltip, so use the menu line there. The Xorg tray (the tray that a plain uv install gets on Linux, see [Linux tray notes](#linux-tray-notes)) has no menu at all, so it shows no usage; the dashboard always does. Both change within about one second of a usage refresh or an account switch, with a 30-second heartbeat.
 - **The full update flow**: the icon badge, native tray notifications, the clickable one-click update, and the browser progress page all work the same as on macOS. The usage pill, dropdown panel, and side panel are macOS-only today.
+
+#### Linux tray notes
+
+- **A plain uv install gets the Xorg tray.** jacked shows its tray icon through pystray. pystray uses the AppIndicator or GTK tray only when PyGObject loads in the jacked tool environment (the Python environment that `uv tool install` makes for jacked). `uv tool install claude-jacked` does not install PyGObject, so pystray uses the Xorg tray. pystray selects the tray when the service starts.
+- **The Xorg tray has no menu.** A left click on the icon opens the dashboard. For the other actions, use `jacked service restart` and `jacked service stop`. When the service starts on this tray, it writes a warning to `~/.claude/jacked-tray.log`, and `jacked service status` shows `Tray menu: unavailable`.
+- **The full menu needs PyGObject.** PyGObject has no prebuilt package (wheel) on PyPI, so you must build it on your computer. The pystray FAQ, [How do I use pystray in a virtualenv on Linux?](https://pystray.readthedocs.io/en/latest/faq.html#how-do-i-use-pystray-in-a-virtualenv-on-linux), describes the build. `jacked upgrade` reinstalls the jacked tool environment. The reinstall removes a PyGObject that you added with `--with`.
 
 ### Service behavior
 
@@ -419,7 +426,7 @@ Notes:
 
 #### After install (all platforms)
 
-Run `jacked service status` for the dashboard's actual URL. It normally uses `http://localhost:8321`; a safe quarantine start uses a reported dynamic loopback port instead. The tray icon's right-click menu has Open Dashboard, Restart, Stop, Start on Login, version + "Check for updates...", and the clickable "Update to vX.Y.Z ->" item when a newer version hits PyPI.
+Run `jacked service status` for the dashboard's actual URL. It normally uses `http://localhost:8321`; a safe quarantine start uses a reported dynamic loopback port instead. On Windows and on the GTK and AppIndicator trays of Linux, the tray icon's right-click menu has Open Dashboard, Restart, Stop, Start on Login, version + "Check for updates...", and the clickable "Update to vX.Y.Z ->" item when a newer version hits PyPI. The Xorg tray has no menu (see [Linux tray notes](#linux-tray-notes)).
 
 Upgrading later is one command: `jacked upgrade` (from the terminal) or click the Update line in the tray menu. Both auto-detect that you installed via uv and re-use it. Don't have uv anymore? Reinstall it first: same curl/powershell commands as step 1.
 

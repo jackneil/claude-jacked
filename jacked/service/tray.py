@@ -97,6 +97,13 @@ _ICON_COLORS = {
     "stopped": (130, 130, 130, 255),
 }
 
+# A Windows double-click sends down, up, double-click, up, and pystray runs
+# the default item (Open Dashboard) on each button-up (#232i). The tray
+# ignores a second activation within this many seconds of an open, so a
+# double-click opens one browser tab. 0.5 s is the default Windows
+# double-click time.
+_DASHBOARD_REPEAT_GUARD_S = 0.5
+
 # If Win32 refuses to unregister a console callback, Windows still owns its
 # raw address. Root it for the rest of the process so GC can never free it.
 _FAILED_WIN_CTRL_HANDLERS: list[object] = []
@@ -226,6 +233,11 @@ def build_menu(
 ) -> "pystray.Menu":
     """Build the tray right-click menu.
 
+    Open Dashboard is the default item (#232i). On a left click, the
+    backends with a click action (Windows, GTK and the Xorg fallback) run
+    the default item. Windows and GTK show the default item in bold. The
+    AppIndicator backend opens the menu on a left click instead.
+
     Args:
         autostart_check: Callable returning bool — evaluated each time
             the menu is shown, so toggle changes are reflected live.
@@ -272,7 +284,7 @@ def build_menu(
     items.extend(
         [
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Open Dashboard", on_open_dashboard),
+            pystray.MenuItem("Open Dashboard", on_open_dashboard, default=True),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Restart", on_restart),
             pystray.MenuItem("Stop", on_stop),
@@ -366,6 +378,13 @@ class ServiceRunner:
         self._uvicorn_thread: threading.Thread | None = None
         self._uvicorn_server = None
         self._icon: "pystray.Icon | None" = None
+        # False when the pystray backend has no menu (Xorg). _setup probes
+        # the icon once and the native STATUS payload reports the value.
+        # The macOS menu-bar agent does not run _setup, so it stays True.
+        self._tray_menu_available = True
+        # Monotonic time when the last Open Dashboard launch returned. None
+        # until the first one, so the first activation always opens.
+        self._dashboard_opened_at: float | None = None
         # Last state passed to _apply_icon, so a version-check refresh can
         # re-render the current state with the update badge without knowing
         # whether we're running/starting/stopped.
@@ -849,7 +868,26 @@ class ServiceRunner:
         # binds (or, for 0.0.0.0, covers) loopback, so 127.0.0.1 always reaches
         # it. Opening the resolved primary_host (a 100.x or 0.0.0.0) would be
         # wrong or unreachable, so always open loopback.
-        webbrowser.open(f"http://127.0.0.1:{self.port}")
+        #
+        # One double-click activates the default item twice (see
+        # _DASHBOARD_REPEAT_GUARD_S). The tray thread runs the activations
+        # one after the other, so the second one can wait in the queue while
+        # the browser starts. The interval therefore starts when the launch
+        # returns, also when the launch raises.
+        last = self._dashboard_opened_at
+        if last is not None:
+            elapsed = time.monotonic() - last
+            if elapsed < _DASHBOARD_REPEAT_GUARD_S:
+                logger.debug(
+                    "Tray: ignored a second Open Dashboard activation %.2f s "
+                    "after the last one opened the dashboard",
+                    elapsed,
+                )
+                return
+        try:
+            webbrowser.open(f"http://127.0.0.1:{self.port}")
+        finally:
+            self._dashboard_opened_at = time.monotonic()
 
     def _started_text(self) -> str:
         """Format the "Started ..." menu label.
@@ -896,6 +934,26 @@ class ServiceRunner:
             self._icon.icon = create_icon_image(
                 state, update_available=self._version_is_clickable()
             )
+
+    def _notify(self, icon, title: str, message: str) -> None:
+        """Show a tray notification, or log it when the backend cannot.
+
+        Every tray notification goes through here (#232i). pystray's Xorg
+        backend declares HAS_NOTIFICATION False, and its notify raises
+        NotImplementedError. There the title and the message go to the tray
+        log at WARNING, so the message is not lost. An error from a backend
+        that declares notifications goes to the caller.
+        """
+        from jacked.service.usage_tooltip import tray_backend_can_notify
+
+        if tray_backend_can_notify(icon):
+            icon.notify(message, title)
+            return
+        logger.warning(
+            "Tray notification (this tray cannot show notifications): %s: %s",
+            title,
+            message,
+        )
 
     def _on_restart(self):
         if not self._lifecycle_lock.acquire(blocking=False):
@@ -1115,7 +1173,7 @@ class ServiceRunner:
                 )
                 logger.warning(message)
                 if self._icon is not None:
-                    self._icon.notify(message, "Jacked")
+                    self._notify(self._icon, "Jacked", message)
                 return
             was_enabled = before.state is AutostartState.OWNED_ENABLED
             if was_enabled:
@@ -1133,12 +1191,12 @@ class ServiceRunner:
             )
             logger.warning(message)
             if self._icon is not None:
-                self._icon.notify(message, "Jacked")
+                self._notify(self._icon, "Jacked", message)
             return
         if not result.ok:
             logger.warning("Start-on-Login toggle refused: %s", result.reason)
             if self._icon is not None:
-                self._icon.notify(result.reason, "Jacked")
+                self._notify(self._icon, "Jacked", result.reason)
             return
         after = inspect_autostart()
         self._autostart_enabled = after.enabled
@@ -1154,7 +1212,7 @@ class ServiceRunner:
             )
             logger.warning(message)
             if self._icon is not None:
-                self._icon.notify(message, "Jacked")
+                self._notify(self._icon, "Jacked", message)
 
     def _check_version(self, force: bool = False) -> None:
         """Poll PyPI for latest version and refresh the menu.
@@ -1208,7 +1266,7 @@ class ServiceRunner:
             except Exception:
                 pass
             try:
-                self._icon.notify("Checking PyPI for updates...", "Jacked")
+                self._notify(self._icon, "Jacked", "Checking PyPI for updates...")
             except Exception:
                 pass
 
@@ -1237,20 +1295,23 @@ class ServiceRunner:
                     pass
                 try:
                     if info is None:
-                        self._icon.notify(
-                            "Couldn't reach PyPI. Try again later.",
+                        self._notify(
+                            self._icon,
                             "Jacked Update Check",
+                            "Couldn't reach PyPI. Try again later.",
                         )
                     elif info.get("outdated"):
                         latest = info.get("latest", "?")
-                        self._icon.notify(
-                            f"Update available: v{latest}",
+                        self._notify(
+                            self._icon,
                             "Jacked",
+                            f"Update available: v{latest}",
                         )
                     else:
-                        self._icon.notify(
-                            f"You're up to date (v{__version__})",
+                        self._notify(
+                            self._icon,
                             "Jacked",
+                            f"You're up to date (v{__version__})",
                         )
                 except Exception:
                     pass
@@ -1311,7 +1372,7 @@ class ServiceRunner:
         if not _ok:
             if self._icon:
                 try:
-                    self._icon.notify(_reason, "Jacked auto-update disabled")
+                    self._notify(self._icon, "Jacked auto-update disabled", _reason)
                 except Exception:
                     logger.exception("Failed to notify on update refusal")
             try:
@@ -1354,10 +1415,11 @@ class ServiceRunner:
             if self._icon:
                 try:
                     self._apply_icon("starting")
-                    self._icon.notify(
+                    self._notify(
+                        self._icon,
+                        "Jacked Update",
                         f"Updating jacked to v{latest}. If this fails, "
                         f"see ~/.claude/jacked-update-failed.txt",
-                        "Jacked Update",
                     )
                 except Exception:
                     logger.exception("Icon update during update-click failed")
@@ -1441,9 +1503,10 @@ class ServiceRunner:
                 logger.exception("Failed to spawn updater")
                 if self._icon:
                     try:
-                        self._icon.notify(
-                            "Could not start update. See jacked-update.log",
+                        self._notify(
+                            self._icon,
                             "Jacked Update Failed",
+                            "Could not start update. See jacked-update.log",
                         )
                     except Exception:
                         pass
@@ -1463,6 +1526,20 @@ class ServiceRunner:
 
     def _setup(self, icon: "pystray.Icon"):
         """pystray setup callback — runs after icon appears."""
+        # Probe the backend before any step that can fail, so the result is
+        # always logged and reported. With no menu (pystray Xorg), only the
+        # left click works: it runs the default item, Open Dashboard (#232i).
+        from jacked.service.usage_tooltip import tray_backend_has_menu
+
+        self._tray_menu_available = tray_backend_has_menu(icon)
+        if not self._tray_menu_available:
+            logger.warning(
+                "Tray: this desktop has no tray menu (pystray Xorg backend). "
+                "Left-click the icon to open the dashboard. Use `jacked "
+                "service restart` / `jacked service stop` for the other "
+                "actions. The full menu needs PyGObject in the jacked tool "
+                "environment; see the README Linux tray notes."
+            )
         icon.visible = True
 
         # Surface a prior failed update if recovery file exists. run() made
@@ -1473,13 +1550,16 @@ class ServiceRunner:
             from jacked.service.updater import RECOVERY_FILE
 
             if RECOVERY_FILE.exists():
-                icon.notify(
+                self._notify(
+                    icon,
+                    "Jacked Update Failed Earlier",
                     "Previous update failed. See "
                     "~/.claude/jacked-update-failed.txt for recovery steps.",
-                    "Jacked Update Failed Earlier",
                 )
         except Exception:
-            logger.exception("Could not check update recovery file")
+            logger.exception(
+                "Could not check the update recovery file or show its notification"
+            )
 
         # Monitor thread bridges signal-safe _request_stop to full _on_stop
         threading.Thread(
@@ -1504,7 +1584,21 @@ class ServiceRunner:
                 logger.debug("update_menu after start failed", exc_info=True)
         else:
             self._apply_icon("stopped")
-            icon.notify("Jacked failed to start", "Jacked Service")
+            # A backend that declares notifications can still refuse one (GTK
+            # with no notification service). The refusal must not end the
+            # setup thread with a traceback on stderr, and the notice stays
+            # in the tray log.
+            title, message = "Jacked Service", "Jacked failed to start"
+            try:
+                self._notify(icon, title, message)
+            except Exception as exc:  # noqa: BLE001 - the setup thread must not die here
+                logger.warning(
+                    "Tray notification refused (%s): %s: %s",
+                    type(exc).__name__,
+                    title,
+                    message,
+                )
+                logger.debug("Tray notification refusal", exc_info=True)
 
     def _record_abandoned_update(self) -> None:
         """Tell the user when an update was interrupted before it finished.
@@ -1822,6 +1916,8 @@ class ServiceRunner:
                 "protocol_version": manifest.protocol_version if manifest else None,
                 "port": manifest.bind.port if manifest else None,
                 "quarantine": manifest.bind.quarantine if manifest else None,
+                # `jacked service status` names a tray with no menu (#232i).
+                "tray_menu_available": self._tray_menu_available,
             }
         if action is ControlAction.SHUTDOWN:
             self._request_stop()

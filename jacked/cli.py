@@ -840,9 +840,11 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
         f"[dim](install method: {method})[/dim]\n"
     )
 
-    # The version this upgrade should reach, read from the same PyPI JSON API
-    # the version check uses. The install resolves through the simple index,
-    # which can lag the JSON API for minutes after a release (#166i); knowing
+    # The version this upgrade should reach: the newest release that PyPI's
+    # JSON API or its simple index names. The install resolves through the
+    # simple index, and either source can lag the other for minutes after a
+    # release. When the JSON API lags (G3), the simple index's answer is the
+    # target and uv installs it. When the simple index lags (#166i), knowing
     # the target is how a reinstall of the old build gets reported truthfully.
     target_version = _upgrade_target_version()
     if target_version:
@@ -875,23 +877,42 @@ EXIT_INDEX_LAG = 4
 
 
 def _upgrade_target_version() -> str | None:
-    """The newest claude-jacked on PyPI's JSON API, or None when unknown.
+    """The claude-jacked version that this upgrade aims for, or None when unknown.
 
-    Best effort with a short timeout: offline, the upgrade proceeds exactly as
-    before and reports what it installed.
+    The target is the newest release that PyPI's JSON API or its simple index
+    names (see version_check.newest_listed_version, which also says why the
+    target differs from the version that uv installs now). Best effort with a
+    short timeout: offline, the upgrade proceeds exactly as before and
+    reports what it installed.
     """
-    from jacked.install_method import safe_version_label
-    from jacked.version_check import get_latest_pypi_version
+    from concurrent.futures import ThreadPoolExecutor
 
-    try:
-        latest = get_latest_pypi_version(timeout=5.0)
-    except Exception:  # noqa: BLE001 - a lookup failure never blocks an upgrade
-        return None
-    if not latest:
+    from jacked.install_method import safe_version_label
+    from jacked.version_check import (
+        get_latest_from_simple_index,
+        get_latest_pypi_version,
+        newest_listed_version,
+    )
+
+    def answer(probe) -> str | None:
+        # Each probe has its own guard: a failure of one probe never hides
+        # the answer of the other.
+        try:
+            return probe(timeout=5.0)
+        except Exception:  # noqa: BLE001 - a lookup failure never blocks an upgrade
+            return None
+
+    # The two probes are independent network reads. Run them at the same
+    # time, so an unreachable index costs one timeout, not two.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pypi_latest, simple_latest = pool.map(
+            answer, (get_latest_pypi_version, get_latest_from_simple_index)
+        )
+    target = newest_listed_version(pypi_latest, simple_latest)
+    if not target:
         return None
     # The label reaches a generated Windows batch: allow a version shape only.
-    safe = safe_version_label(latest, fallback="")
-    return safe or None
+    return safe_version_label(target, fallback="") or None
 
 
 # The real lookup, for tests: tests/conftest.py replaces _upgrade_target_version
@@ -8242,6 +8263,13 @@ def service_status():
             console.print(f"  Generation:{state.get('generation')}")
             console.print(f"  Port:      {state.get('port')}")
             console.print(f"  Autostart: {autostart_label(True)}")
+            # #232i: only an explicit False prints. A service from before
+            # this field sends no value, and that says nothing about the menu.
+            if state.get("tray_menu_available") is False:
+                console.print(
+                    "  Tray menu: unavailable (pystray Xorg backend); "
+                    "left-click the icon opens the dashboard"
+                )
             if reported == "degraded":
                 console.print(f"  Failure:   {state.get('failure') or 'unknown'}")
                 console.print(
