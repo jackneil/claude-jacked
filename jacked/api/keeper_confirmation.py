@@ -93,9 +93,14 @@ def _window_read_after(row: dict, window: str, instant: float) -> bool:
 
     *instant* is an exact time in epoch seconds. The keeper's read-back runs
     within a second of its ping, so it compares the window's own stamp with
-    the time after the ping, not with the whole-second ``last_ping_at``.
+    the time after the ping, not with the whole-second ``last_ping_at``. A
+    stamp EQUAL to *instant* counts: the read-back runs after the ping in
+    program order, and a coarse clock (Windows ticks about every 15 ms) can
+    give both the same reading.
 
     >>> _window_read_after({"cached_7d_read_at": 100.6}, "7d", 100.5)
+    True
+    >>> _window_read_after({"cached_7d_read_at": 100.5}, "7d", 100.5)
     True
     >>> _window_read_after({"cached_7d_read_at": 100.4, "usage_cached_at": 101}, "7d", 100.5)
     False
@@ -103,7 +108,7 @@ def _window_read_after(row: dict, window: str, instant: float) -> bool:
     False
     """
     stamp = finite_number(row.get(Database.WINDOW_READ_STAMPS[window]))
-    return stamp is not None and stamp > instant
+    return stamp is not None and stamp >= instant
 
 
 def _window_phrase(windows: list[str]) -> str:
