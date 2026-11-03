@@ -10,10 +10,11 @@ identity in ``~/.claude.json`` is written only by
 
 import json
 import logging
-import math
 import sys
 import time
 from pathlib import Path
+
+from jacked.api.token_expiry import _malformed_expiry, expiry_seconds  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,27 @@ def ownership_refusal_is_final(account: dict, live_access) -> bool:
     return cached is not None and cached[0] is False and bool(cached[2])
 
 
+def ownership_refusal_is_status(account: dict, live_access) -> bool:
+    """True when the cached verdict for this token and row is a 401 or 403
+    refusal. That answer is about the token and names no owner, and an edge
+    or a proxy can give it, so a caller keeps what such a refusal would lose.
+
+    >>> _ownership_cache.clear()
+    >>> row = {"id": 2, "email": "a@x.com"}
+    >>> _ownership_cache[_verdict_key(row, "t")] = (False, 0.0, False)
+    >>> ownership_refusal_is_status(row, "t"), ownership_refusal_is_status(row, None)
+    (True, False)
+    >>> _ownership_cache[_verdict_key(row, "t")] = (False, 0.0, True)
+    >>> ownership_refusal_is_status(row, "t")
+    False
+    >>> _ownership_cache.clear()
+    """
+    if not isinstance(live_access, str) or not live_access:
+        return False
+    cached = _ownership_cache.get(_verdict_key(account, live_access))
+    return cached is not None and cached[0] is False and not cached[2]
+
+
 def clear_ownership_cache() -> None:
     """Forget every cached ownership verdict (tests and account changes)."""
     _ownership_cache.clear()
@@ -282,37 +304,6 @@ def forget_ownership_verdicts(account_id: int) -> None:
     """
     for key in [k for k in _ownership_cache if k[0] == account_id]:
         _ownership_cache.pop(key, None)
-
-
-def expiry_seconds(raw) -> int | None:
-    """A Claude Code ``expiresAt`` as epoch seconds, or None when absent or
-    not a real time. Claude Code writes milliseconds; older payloads and
-    jacked's own rows use seconds.
-
-    >>> expiry_seconds(1_900_000_000_000), expiry_seconds(1_900_000_000)
-    (1900000000, 1900000000)
-    >>> [expiry_seconds(x) for x in (None, 0, -5, True, "1900000000", float("inf"), float("nan"))]
-    [None, None, None, None, None, None, None]
-    """
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return None
-    if not math.isfinite(raw) or raw <= 0:
-        return None
-    return int(raw / 1000) if raw > 1e12 else int(raw)
-
-
-def _malformed_expiry(raw) -> bool:
-    """True when ``expiresAt`` is present but is not a real time: such a
-    payload is not a Claude Code rotation, so nothing in it is imported.
-
-    >>> [_malformed_expiry(x) for x in (None, 0, 1_900_000_000_000)]
-    [False, False, False]
-    >>> [_malformed_expiry(x) for x in ("soon", float("nan"), True, False, -1)]
-    [True, True, True, True, True]
-    """
-    if raw is None or (raw == 0 and not isinstance(raw, bool)):
-        return False  # absent: nothing claims a time
-    return expiry_seconds(raw) is None
 
 
 def _live_tokens_belong_to(
@@ -401,9 +392,9 @@ def _live_tokens_ownership(
                 field,
             )
     elif result.status_code in _OWNERSHIP_TERMINAL_STATUSES:
-        # The endpoint refused the token itself (revoked, expired upstream):
-        # that will not change on a retry, so the verdict settles as "not
-        # proven" instead of deferring a caller forever.
+        # The endpoint refused the token itself, or an edge refused the
+        # request: "not proven", asked again after the refusal window. It
+        # names no owner (ownership_refusal_is_status).
         verdict = False
         logger.warning(
             "Account %s: live token refused by the profile endpoint (HTTP %s)",
@@ -882,6 +873,9 @@ CC_IMPORT_GUARD_COLS = (
     "cc_refresh_failure_type",
     # Read to decide whether the pass-through fields changed (#174i).
     "cc_oauth_extra",
+    # Read by the dead-chain rule and refresh_token_importable: a condemnation
+    # that lands during the decision must make the write miss.
+    "cc_refresh_failed_token_fp",
 )
 # Added when a dead-token verdict (cc_token_known_dead) decided the import:
 # the keeper verdict and the primary token its fingerprint includes.

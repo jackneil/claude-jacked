@@ -34,6 +34,7 @@ from jacked.api.credential_helpers import (
     clear_ownership_cache,
     forget_ownership_verdicts,
     ownership_refusal_is_final,
+    ownership_refusal_is_status,
     expiry_seconds,
     is_primary_publication,
     live_payload_ownership,
@@ -45,6 +46,13 @@ from jacked.credentials.refresh_guard import (
     refuses_refresh_downgrade,
 )
 from jacked.credentials.runtime import scoped_launch_needs_global_activation
+from jacked.launch_foreign_pair import (
+    _FOREIGN_PAIR_MARKER,  # noqa: F401 - the tests read the name here
+    _forget_foreign_pair,
+    _known_foreign_pair,
+    _pair_digests,  # noqa: F401 - the tests read the name here
+    _remember_foreign_pair,
+)
 from jacked.launch_sync_writes import sync_held_access, write_rotation
 from jacked.web.auth import should_refresh, should_refresh_cc
 from jacked.web.database import Database
@@ -528,14 +536,17 @@ def _refuse_foreign_primary(account: dict) -> None:
         )
 
 
-def _keeps_scoped_lineage(account: dict, existing: dict, db=None) -> bool:
+def _keeps_scoped_lineage(
+    account: dict, existing: dict, db=None, config_dir: Path | None = None
+) -> bool:
     """True when the row's pair would put a null refresh token over the
     per-account file's live one of this account (refresh_guard, #149i).
 
     The file is unstamped, so the shared ownership rule does not require a
-    stamp. With ``db``, the row that stores the file's refresh token names
-    its owner first, which spares the profile request. A refusal is logged
-    once with the row id and no token.
+    stamp, and the directory names the row: a pair nobody can prove stays.
+    With ``db``, the row that stores the file's refresh token names its owner
+    first, which spares the profile request. A refusal is logged once with
+    the row id and no token.
 
     >>> row = {"id": 4, "cc_access_token": "at", "cc_refresh_token": None,
     ...        "cc_expires_at": 9999999999, "cc_refresh_failure_type": "invalid_grant"}
@@ -544,8 +555,19 @@ def _keeps_scoped_lineage(account: dict, existing: dict, db=None) -> bool:
     >>> _keeps_scoped_lineage(row, {})
     False
     """
+    oauth = existing.get("claudeAiOauth")
+    if (
+        config_dir is not None
+        and isinstance(oauth, dict)
+        and _known_foreign_pair(config_dir, oauth, account)
+    ):
+        return False  # an earlier session proved another owner
     reason = refuses_refresh_downgrade(
-        build_oauth_data(account), existing, account, lineage_known=lineage_finder(db)
+        build_oauth_data(account),
+        existing,
+        account,
+        lineage_known=lineage_finder(db),
+        directory_names_target=True,
     )
     if reason is None:
         return False
@@ -562,21 +584,22 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     left in the per-account .credentials.json into the row, when the launch
     token sync proves it (#158i). A refresh would spend the refresh token of
     the row, which Claude Code already spent when it rotated, and the write
-    below would replace the rotated pair. A refused or deferred sync changes
-    nothing, and the write below replaces the file, as before.
+    below would replace the rotated pair. A refused sync changes nothing, and
+    the write below replaces the file. A deferred sync changes nothing, and
+    the write keeps the file when it holds a pair that is not the row's.
 
-    Limit: the profile request can prove only an access token that is not
-    expired. A rotation whose access token expired before this launch stays
-    unproven: the sync defers, the file keeps it, and the pre-launch Claude
-    Code refresh is skipped, because that rotation may have spent the row's
-    refresh token. A pair an earlier session proved to belong to another
-    account is remembered beside the file by its digests and is replaced
-    without a request, expired or not.
+    A pair stays unproven when its access token expired before this launch,
+    when the profile request failed, or when the endpoint answered 401 or
+    403 (an answer that names no owner). The sync defers, the file keeps the
+    pair, and the pre-launch Claude Code refresh is skipped, because that
+    rotation may have spent the row's refresh token. A pair is replaced only
+    on a final refusal: a 200 that names another owner, the digests an earlier
+    session remembered beside the file for such a pair, or a local rule.
 
     The write never puts a null refresh token over a live one of this
     account (#149i). When the row publishes no refresh token (a dead chain)
-    and the file holds the account's own working one, the launch keeps the
-    file's tokens, logs why, and starts.
+    and the file holds a live one that no evidence gives to another account,
+    the launch keeps the file's tokens, logs why, and starts.
 
     >>> # Tested via test_launch.py, test_launch_token_sync.py and test_refresh_downgrade_guard.py
     """
@@ -759,24 +782,32 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     # The row as re-read above may be bound to another account's tokens
     # since the resolver checked it: the publish below must never carry them.
     _refuse_foreign_primary(account)
-    kept_rotation = rescue == "deferred" and isinstance(existing.get("claudeAiOauth"), dict)
+    # Only a pair the row does not hold can be the file's own rotation. A
+    # deferred sync over the row's own pair (a locked database) let the
+    # pre-launch refresh run above: the row's new pair must reach the file.
+    kept_rotation = (
+        rescue == "deferred"
+        and file_pair_differs
+        and isinstance(existing.get("claudeAiOauth"), dict)
+    )
     if kept_rotation:
-        # The file's tokens could not be checked (the profile request failed):
-        # a refused token is overwritten, an unchecked one is kept. The row's
-        # spent lineage over the only live rotation would be the real loss.
+        # The file's tokens could not be checked: a refused token is
+        # overwritten, an unchecked one is kept. The row's spent lineage over
+        # the only live rotation would be the real loss.
         logger.warning(
             "Account %d: the per-account file holds tokens whose ownership could "
-            "not be checked (lookup failed); keeping them for this launch",
+            "not be checked; keeping them for this launch",
             account_id,
         )
-    elif _keeps_scoped_lineage(account, existing, db):
-        # The file holds this account's own live refresh token and the row
-        # would replace it with null: the launch keeps the file's tokens.
+    elif _keeps_scoped_lineage(account, existing, db, config_dir):
+        # The file holds a live refresh token that no evidence gives to another
+        # account and the row would replace it with null: the launch keeps it.
         pass
     else:
-        if file_pair_differs:
-            # Attributable: the file carried a pair that is not the row's and
-            # the sync answered "%s" (refused: another owner, or unprovable).
+        if rescue == "refused" and file_pair_differs:
+            # Attributable: the sync refused a pair that is not the row's. A
+            # routine launch (the row is newer, or the file holds the primary
+            # fallback) replaces the file with no WARNING.
             logger.warning(
                 "Account %d: replacing the per-account file's token pair with the "
                 "row's (sync result: %s)",
@@ -952,71 +983,6 @@ def resolve_account(account_ref, db: Database) -> dict:
 
 
 _IDENTITY_COLS = ("email", "organization_uuid", "account_uuid")
-# A pair the profile endpoint proved to belong to another account is
-# remembered beside the per-account file by its digests (never a token),
-# so the next launch replaces it without a request, even when its access
-# token expired meanwhile (an expired pair cannot be proven again).
-_FOREIGN_PAIR_MARKER = ".jacked-foreign-pair.json"
-
-
-def _pair_digests(oauth: dict, account: dict) -> dict:
-    """The digests that identify a token pair and the row it was refused for.
-
-    >>> d = _pair_digests({"accessToken": "a", "refreshToken": "r"}, {"id": 1, "email": "x@y"})
-    >>> sorted(d) == ["access_sha256", "identity_sha256", "refresh_sha256"] and len(d["access_sha256"]) == 64
-    True
-    """
-    import hashlib
-
-    from jacked.api.credential_helpers import _identity_key
-
-    def digest(value) -> str:
-        return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
-
-    return {
-        "access_sha256": digest(oauth.get("accessToken")),
-        "refresh_sha256": digest(oauth.get("refreshToken")),
-        "identity_sha256": digest("|".join(_identity_key(account))),
-    }
-
-
-def _remember_foreign_pair(config_dir: Path, oauth: dict, account: dict) -> None:
-    """Record beside the per-account file that its pair belongs to another
-    account (a final verdict), as digests. Best effort: a failed write only
-    costs the next launch one profile request."""
-    marker = config_dir / _FOREIGN_PAIR_MARKER
-    try:
-        record = {**_pair_digests(oauth, account), "recorded_at": int(_time.time())}
-        atomic_write_text(marker, json.dumps(record), mode=0o600, mode_strict=False)
-    except OSError as exc:
-        logger.debug("Could not record the foreign pair for %s: %s", config_dir.name, exc)
-
-
-def _known_foreign_pair(config_dir: Path, oauth: dict, account: dict) -> bool:
-    """True when the marker names this exact pair, refused for this exact
-    row identity. Any other marker, or none, is ignored (a re-authed row
-    decides again through the profile request)."""
-    marker = config_dir / _FOREIGN_PAIR_MARKER
-    try:
-        if not marker.exists() or marker.is_symlink():
-            return False
-        record = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(record, dict):
-        return False
-    digests = _pair_digests(oauth, account)
-    return all(record.get(name) == value for name, value in digests.items())
-
-
-def _forget_foreign_pair(config_dir: Path) -> None:
-    """Drop the marker: the file now holds the row's own pair."""
-    try:
-        (config_dir / _FOREIGN_PAIR_MARKER).unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        logger.debug("Could not drop the foreign-pair marker for %s: %s", config_dir.name, exc)
 
 
 def _settle_unowned(
@@ -1164,8 +1130,6 @@ def _is_expired_rotation(account: dict, oauth: dict) -> bool:
     >>> _is_expired_rotation(row, {"accessToken": "a", "refreshToken": "rt-new"})
     False
     """
-    from jacked.api.credential_helpers import expiry_seconds
-
     refresh = oauth.get("refreshToken")
     if not isinstance(refresh, str) or not refresh or refresh == account.get("cc_refresh_token"):
         return False
@@ -1208,6 +1172,20 @@ def _unowned_outcome(account: dict, payload: dict, account_id: int) -> str | Non
             "tries again on the next poll",
         )
         return "deferred"
+    if (
+        isinstance(oauth, dict)
+        and oauth.get("refreshToken")
+        and ownership_refusal_is_status(account, oauth.get("accessToken"))
+    ):
+        # A 401 or 403 names no owner, and an edge or a proxy can give it.
+        # The refresh token beside it can be the only live lineage: only a
+        # final refusal or a local rule may drive the overwrite.
+        _log_deferral(
+            account_id,
+            "Token sync deferred for account %d: the profile endpoint refused the "
+            "token without naming an owner; the file keeps the rotation",
+        )
+        return "deferred"
     # The caller logs the refusal once it stands (_settle_unowned): a refusal
     # decided against a row whose identity changed meanwhile is deferred
     # instead, and must not read as BLOCKED.
@@ -1239,10 +1217,12 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> str:
     - ``"imported"``: the tokens are the tokens of the row, and the row
       holds them now. This call wrote them or their pass-through fields, or
       the row had them before.
-    - ``"refused"``: the rule shows that the tokens are not the tokens of
-      the row, or that nobody can prove it (for example, the token is
-      expired, or its expiry is not a real time). Nothing is written.
-    - ``"deferred"``: the profile request failed, or an error stopped the
+    - ``"refused"``: the profile names another owner, an earlier session
+      remembered that verdict, or a local rule refuses the tokens (no
+      refresh token beside an unproven access token, or an expiry that is
+      not a real time). Nothing is written.
+    - ``"deferred"``: the profile request failed, the endpoint answered 401
+      or 403, the rotation's access token expired, or an error stopped the
       sync. Nothing is written. A later call can decide.
     - ``"unchanged"``: there is nothing to copy (no file, no access token, a
       directory name that is not an id, no row, a row without a Claude Code
@@ -1343,15 +1323,17 @@ def _sync_tokens_from_file(config_dir: Path, db_path: str) -> str:
                 # Never move a row backward: an older pair in the file (on
                 # macOS, the launch-time pair after reconcile took Claude
                 # Code's newer pair from the Keychain) must not replace newer
-                # tokens. Unless the row's token is KNOWN dead: then an owned
-                # token that merely expires sooner is the one that works
-                # (#179i).
+                # tokens. Unless the row's token is KNOWN dead and the file's
+                # access token still works: then an owned token that merely
+                # expires sooner is the one that works (#179i). An expired
+                # older pair works for nobody, and the row's refresh token can
+                # still refresh (a dead access token condemns only itself).
                 row_expires = account.get("cc_expires_at") or 0
                 if (
                     expires_at
                     and row_expires
                     and expires_at < row_expires
-                    and not cc_token_known_dead(account)
+                    and not (cc_token_known_dead(account) and expires_at > _time.time())
                 ):
                     logger.info(
                         "Token sync skipped for account %d: the file holds "

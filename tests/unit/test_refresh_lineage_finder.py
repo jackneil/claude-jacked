@@ -88,8 +88,17 @@ class TestTheFinderDecidesFirst:
         def boom(rt):
             raise RuntimeError("database is locked")
 
-        with mock.patch("jacked.api.credential_helpers.live_payload_ownership", return_value=False):
-            assert refuses_refresh_downgrade(TARGET, LIVE, ROW, lineage_known=boom) is None
+        from jacked.api.authority_guard import ProfileLookup
+        from jacked.api.credential_helpers import clear_ownership_cache
+
+        other = ProfileLookup(200, {"account": {"email": "other@test.com"}})
+        clear_ownership_cache()
+        try:
+            with mock.patch("jacked.api.credential_helpers._ownership_lookup", return_value=other) as ask:
+                assert refuses_refresh_downgrade(TARGET, LIVE, ROW, lineage_known=boom) is None
+        finally:
+            clear_ownership_cache()
+        ask.assert_called_once_with("other-at")
 
     def test_the_two_local_checks_still_run_first(self):
         asked = []

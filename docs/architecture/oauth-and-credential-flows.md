@@ -616,8 +616,9 @@ readback cannot prove what an already-running Claude process cached.
   conditions are true:
   1. The target payload has no refresh token: null, empty or absent.
   2. The authority holds a refresh token that is a non-empty string.
-  3. The shared ownership rule proves that the authority tokens belong to the
-     target row. The rule does not require a stamp.
+  3. No positive evidence gives the authority tokens to another account. The
+     shared ownership rule, which does not require a stamp, proves the owner
+     when it can.
 - Before the rule costs a profile request, the writer asks the database which
   row stores the authority's refresh token (`account_id_for_refresh_token()`
   in `jacked/web/database.py`, passed as `lineage_known`). A refresh token is
@@ -626,11 +627,15 @@ readback cannot prove what an already-running Claude process cached.
   decides. A primary refresh token that `foreign_token_fp` binds names no
   row. The engine preflight, the auto-swap request and the launch's
   scoped-file check pass the finder.
-- An empty store and a payload of another owner do not stop the write. A
-  payload whose owner could not be checked (the profile request failed) is
-  refused with `busy` and code `OWNERSHIP_UNCHECKED`: a transient refusal
-  that every caller retries. A refusal is retryable, a lost refresh lineage
-  is not.
+- An empty store, a row that stores the refresh token for another account, a
+  200 that names another owner, and a payload whose expiry is not a real time
+  do not stop the write. Nothing else does. A failed profile request, an
+  expired access token, a 401 and a 403 prove no owner. A stamp or a
+  per-account directory that names the target then keeps the pair with the
+  final refusal below. Any other payload is refused with `busy` and code
+  `OWNERSHIP_UNCHECKED`: a transient refusal that every caller retries. A
+  refusal is retryable, a lost refresh lineage is not. The launch also replaces
+  a scoped file on the digests that an earlier session remembered for it.
 - A refusal writes nothing. The engine creates no pending row, writes no
   store, and leaves the authority byte-identical.
 - The result is `unusable` with code `CC_REAUTH_REQUIRED`. Its message is
@@ -869,8 +874,10 @@ The sync runs the local rules first. Only a token that they cannot place costs
 a profile request. The sync gives one of four results:
 
 - `imported`: the tokens belong to the row, and the row holds them now.
-- `refused`: the profile names another owner, or the file holds an expired
-  access token and no new refresh token. jacked writes nothing and logs
+- `refused`: the profile names another owner, an earlier session remembered
+  that verdict, or a local rule refuses the tokens (an expired or refused
+  access token with no new refresh token, or an expiry that is not a real
+  time). jacked writes nothing and logs
   `Token sync BLOCKED for account N: ownership not proven`. The line gives the
   row id only. A refusal holds only for the row it was decided against: when
   the row identity (email, organization uuid, account uuid) changed during
@@ -883,21 +890,23 @@ a profile request. The sync gives one of four results:
   a request, even when its access token expired. The launch removes the
   marker when it writes the row's pair.
 - `deferred`: the profile request failed, an error stopped the sync (for
-  example, a half-written file), or the file holds a rotation whose access
-  token expired before the sync could ask (a new refresh token beside an
-  expired access token). Nobody can prove that rotation now, and the file
-  keeps it for the next session. jacked writes nothing. The poll loop keeps
-  the old mtime, so the next poll tries again when the file does not change.
-  The verdict cache keeps the result of a failed request for 5 minutes, so the
-  next request goes out after that time. The first deferral of a row in a
-  process is a WARNING, and the retries are INFO lines.
+  example, a half-written file), the profile endpoint answered 401 or 403
+  beside a new refresh token (that answer names no owner, and an edge or a
+  proxy can give it), or the file holds a rotation whose access token expired
+  before the sync could ask (a new refresh token beside an expired access
+  token). Nobody can prove that rotation now, and the file keeps it for the
+  next session. jacked writes nothing. The poll loop keeps the old mtime, so
+  the next poll tries again when the file does not change. The verdict cache
+  keeps the result of a failed request for 5 minutes and a 401 or 403 for 15
+  minutes, so the next request goes out after that time. The first deferral of
+  a row in a process is a WARNING, and the retries are INFO lines.
 - `unchanged`: there is nothing to copy, or another writer changed the row
   first. jacked writes nothing.
 
 The write is a compare-and-swap on the access token that the sync read before
 the profile request. A writer that changes the row during the request wins.
 
-Two steps keep a rotation that the loop could not prove from being lost:
+These steps keep a rotation that the loop could not prove from being lost:
 
 - When Claude Code stops, jacked clears the verdict cache before the exit-time
   sync, so a deferred token gets one fresh profile request. A refused
@@ -909,15 +918,18 @@ Two steps keep a rotation that the loop could not prove from being lost:
 - Before the next launch of the same account, `prepare_account_dir()` runs the
   sync on the existing per-account file before the pre-launch refresh spends
   the row's refresh token. A proven rotation goes into the row first, and the
-  launch then re-reads the row. A refused result (another owner) falls
-  through, and the launch writes the row's tokens over the file as before,
-  with a WARNING that gives the row id and the sync result. A deferred result
-  (the profile request failed, or the access token of the rotation expired
-  before the launch) keeps the file's tokens for that launch and logs a
-  WARNING, because the row's spent lineage written over the only live
-  rotation would be the real loss. The launch also skips its pre-launch
-  Claude Code refresh in that case, because the rotation in the file may have
-  spent the refresh token of the row. Claude Code refreshes from the file,
+  launch then re-reads the row. A refused result falls through, and the launch
+  writes the row's tokens over the file, with a WARNING that gives the row id
+  and the sync result. Only a refused result logs that WARNING: a routine
+  launch (the row is newer than the file, or the file holds the primary
+  fallback) replaces the file quietly. A deferred result over a pair that is
+  not the row's keeps the file's tokens for that launch and logs a WARNING,
+  because the row's spent lineage written over the only live rotation would
+  be the real loss. A deferred result over the row's own pair (a locked
+  database) keeps nothing: the pre-launch refresh runs, and the launch writes
+  the row's pair. The launch also skips its pre-launch Claude Code refresh when
+  it keeps a rotation, because the rotation in the file may have spent the
+  refresh token of the row. Claude Code refreshes from the file,
   and the sync proves the new access token on its next poll. On a platform
   whose authority is the launch directory's own file, the launch reads back
   the pair it wrote, so a kept rotation reads back as itself, and the
@@ -1055,16 +1067,20 @@ The guard therefore also examines a stamped payload:
 - After a committed repair, the guard keeps the 16-character fingerprint of
   the refresh and access tokens that the engine reports it published
   (`SwitchResult.published_fingerprint`, from the exact payload written) in
-  the setting `last_authority_write_fp`. A stamped payload with these tokens
-  is jacked's own write, so the guard does not examine it again.
+  the internal setting `_last_authority_write_fp`, which the settings API does
+  not show. A stamped payload with these tokens is jacked's own write, so the
+  guard does not examine it again.
 
 The identity watcher refuses to publish an identity for a stamped payload
 whose token belongs to a different account. Its stamp-mismatch evidence
 describes only the account that the authority holds now. The evidence stops
 when a re-stamp or a reassert makes the stamp and the tokens agree. The
-watcher also skips a pass while the config file is younger than 15 seconds,
-because a `/login` writes the identity a moment before it saves the tokens,
-and a republish in that window would undo the user's choice.
+watcher also skips a pass for 15 seconds after the identity keys of the
+config change in a file written inside that time, because a `/login` writes
+the identity a moment before it saves the tokens, and a republish in that
+window would undo the user's choice. Other writes to the file do not count,
+because every running session rewrites it. A skipped pass spends no attempt
+floor and keeps an earlier sticky reason.
 
 `live_payload_belongs_to()` is the one shared stamp and ownership rule. Four
 paths use it: reconcile, the authority guard import, the refresh downgrade

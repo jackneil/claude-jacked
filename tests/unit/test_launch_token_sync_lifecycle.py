@@ -52,7 +52,7 @@ def _fresh_ownership_cache():
 # The launch's log lines for row 1. They give the row id, never a token.
 KEEP_WARNING = (
     "Account 1: the per-account file holds tokens whose ownership could not be "
-    "checked (lookup failed); keeping them for this launch"
+    "checked; keeping them for this launch"
 )
 SKIP_REFRESH_WARNING = (
     "Account 1: skipping the pre-launch Claude Code refresh; the per-account "
