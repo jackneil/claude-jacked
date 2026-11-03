@@ -183,6 +183,10 @@ class SwitchResult:
     # A stable machine-readable reason, when ``outcome`` alone is not enough
     # (transaction.OUTGOING_ACCOUNT_BUSY_CODE, refresh_guard.CC_REAUTH_REQUIRED_CODE).
     code: str = ""
+    # The fingerprint (credentials.fingerprint.payload_fingerprint) of the
+    # token pair a committed activation published; empty otherwise. The
+    # authority guard keeps it to recognize its own write later.
+    published_fingerprint: str = ""
 
 
 @dataclass(frozen=True)

@@ -133,9 +133,11 @@ class _Activator:
     def __init__(self, outcome=SwitchOutcome.OBSERVED_TARGET_UNFENCED) -> None:
         self.outcome = outcome
         self.calls: list[tuple] = []
+        self.republished: list[tuple] = []
 
-    def __call__(self, db, account, context, operation_id):
+    def __call__(self, db, account, context, operation_id, **repair):
         self.calls.append((account, context, operation_id))
+        self.republished.append((repair.get("republish"), repair.get("expected_digest")))
         return _switch_result(self.outcome, int(account["id"]))
 
 

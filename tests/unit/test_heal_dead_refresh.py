@@ -134,14 +134,15 @@ class TestVerdictBinding:
         assert "will retry" not in last_error
         assert "—" not in last_error
 
-    def test_revoked_helper_needs_the_type_and_the_matching_fingerprint(self):
+    def test_revoked_helper_needs_only_the_matching_fingerprint(self):
+        """The breaker does not take part: a cleared breaker cannot release it."""
         fp = _token_fingerprint("rt")
         row = {"refresh_token": "rt", "refresh_failure_type": "invalid_grant",
                "refresh_failed_token_fp": fp}
         assert auth._primary_refresh_revoked(row) is True
         assert auth._primary_refresh_revoked({**row, "refresh_token": "rt-2"}) is False
         assert auth._primary_refresh_revoked({**row, "refresh_failed_token_fp": None}) is False
-        assert auth._primary_refresh_revoked({**row, "refresh_failure_type": "http_503"}) is False
+        assert auth._primary_refresh_revoked({**row, "refresh_failure_type": "http_503"}) is True
         assert auth._primary_refresh_revoked({**row, "refresh_token": None,
                                               "refresh_failed_token_fp": None}) is False
 

@@ -485,10 +485,10 @@ def dead_chain_adoption(account: dict, oauth: dict) -> dict | None:
 
     None means nothing beyond the access token and its expiry may be written:
     the chain is not dead (the normal import rules apply), or the live
-    refresh token is missing, empty, the failed one (the row's value, or the
-    fingerprint ``cc_refresh_failed_token_fp`` after the clean-up removed
-    it), or the row's PRIMARY refresh token (two chains never share one
-    single-use refresh token).
+    refresh token is missing, empty, the failed one (the row's value, or one
+    of the fingerprints in ``cc_refresh_failed_token_fp`` after the clean-up
+    removed it), or the row's PRIMARY refresh token (two chains never share
+    one single-use refresh token).
 
     >>> row = {"cc_refresh_failure_type": "invalid_grant", "cc_refresh_token": None,
     ...        "refresh_token": "primary-rt"}
@@ -772,13 +772,55 @@ def live_holder_account_ids(db, live: dict | None = None) -> set[int] | None:
     for session in sessions:
         account_id = session.get("account_id") if isinstance(session, dict) else None
         if not isinstance(account_id, int) or isinstance(account_id, bool):
+            _note_holders_unknown()
             logger.debug(
                 "live_holder_account_ids: an active session has no account id; "
                 "the holders are unknown"
             )
             return None
         held.add(account_id)
+    _note_holders_known()
     return held
+
+
+# One INFO line per run of unknown holders (the cause is the same on every
+# keeper tick); reset when the holders are known again.
+_holders_unknown_logged = False
+
+
+def _note_holders_unknown() -> None:
+    global _holders_unknown_logged
+    if _holders_unknown_logged:
+        return
+    _holders_unknown_logged = True
+    logger.info(
+        "Credential holders unknown: a tracked session has no account id, so "
+        "every Claude Code refresh token exchange is refused until it ends"
+    )
+
+
+def _note_holders_known() -> None:
+    global _holders_unknown_logged
+    _holders_unknown_logged = False
+
+
+def refresh_token_importable(account: dict, refresh_token) -> bool:
+    """False when ``refresh_token`` is a Claude Code refresh token that the
+    endpoint condemned for this row (one of the fingerprints in
+    ``cc_refresh_failed_token_fp``).
+
+    The dead-chain rule refuses such a token; the live-chain importers ask
+    this too, so a stale payload that still carries the condemned token is
+    not adopted after a new authorization revived the chain.
+
+    >>> from jacked.web.refresh_verdict import token_fingerprint
+    >>> row = {"cc_refresh_failed_token_fp": token_fingerprint("dead")}
+    >>> refresh_token_importable(row, "dead"), refresh_token_importable(row, "new")
+    (False, True)
+    """
+    from jacked.web.refresh_verdict import cc_refresh_condemned
+
+    return not cc_refresh_condemned(account, refresh_token)
 
 
 def cc_rotation_block(account_id: int, db) -> str | None:
@@ -799,7 +841,7 @@ def cc_rotation_block(account_id: int, db) -> str | None:
         return "active"
     held = live_holder_account_ids(db)
     if held is None:
-        return "live_store_unreadable"
+        return "holders_unknown"
     if account_id in held:
         return "live_session_holds"
     return None
@@ -1097,7 +1139,13 @@ def _refresh_import(account_id: int, account: dict, oauth: dict) -> dict:
         return adoption or {}
     updates = {}
     db_cc_refresh = account.get("cc_refresh_token")
-    if live_refresh and live_refresh != db_cc_refresh:
+    if live_refresh and live_refresh != db_cc_refresh and not refresh_token_importable(account, live_refresh):
+        logger.info(
+            "Account %d: not importing a condemned Claude Code refresh token from "
+            "live credentials",
+            account_id,
+        )
+    elif live_refresh and live_refresh != db_cc_refresh:
         # The primary chain's breaker says nothing about this lineage.
         if db_cc_refresh is None:
             logger.info(

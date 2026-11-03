@@ -978,3 +978,153 @@ class TestUsageBlockBadgeWiring:
         )["html"]
         assert "data-stub='block'" in html
         assert html.index("data-stub='block'") < html.index("data-usage-container")
+
+
+# ---------------------------------------------------------------------------
+# Authorize Claude Code Token row (DCR U-3)
+#
+# A switch the engine refused with CC_REAUTH_REQUIRED tells the user to
+# authorize the Claude Code token again. The CC Token pill is clickable only
+# while it looks unhealthy, and the refusal happens exactly when it looks
+# healthy (a live access token or a refresh token on the row), so the menu
+# needs a row that is always there for a Claude account.
+# ---------------------------------------------------------------------------
+
+_CC_ROW_CARD = r"""
+const list = __makeEl('div');
+list.id = 'accounts-list';
+__body.appendChild(list);
+const a = __buildCard(1);
+const ccRow = __makeEl('button');
+ccRow.setAttribute('class', 'btn-authorize-cc account-menu-item');
+ccRow.setAttribute('role', 'menuitem');
+ccRow.setAttribute('data-id', '1');
+ccRow.setAttribute('data-email', 'one@x.com');
+a.menu.appendChild(ccRow);
+list.appendChild(a.card);
+bindAccountEvents();
+const isOpen = (c) => !c.menu.classList.contains('hidden');
+const calls = { cc: [], reauth: [], dialogs: [] };
+global.startCcAuthFlow = (id, email) => { calls.cc.push([id, email]); };
+global.startReauthFlow = (id, email) => { calls.reauth.push([id, email]); };
+"""
+
+
+class TestAuthorizeClaudeCodeTokenRow:
+    def test_claude_menu_offers_the_row_with_its_handler_data(self, tmp_path):
+        panel = _menu_panel(_actions(tmp_path, id=12, email="z@x.com"))
+        row = _item(panel, "btn-authorize-cc")
+        assert row is not None
+        assert ">Authorize Claude Code Token<" in row
+        assert 'data-id="12"' in row and 'data-email="z@x.com"' in row
+        assert 'role="menuitem"' in row
+        assert 'stroke="currentColor" viewBox="0 0 24 24"' in row, "stroke icon, no emoji"
+
+    def test_the_rendered_class_is_the_class_the_handler_binds(self, tmp_path):
+        """A substring match cannot see a renamed class: compare exact tokens
+        of the rendered row against the selector account-actions.js binds."""
+        row = _item(_menu_panel(_actions(tmp_path)), "btn-authorize-cc")
+        classes = re.search(r'class="([^"]+)"', row).group(1).split()
+        source = ACCOUNT_ACTIONS_JS.read_text(encoding="utf-8")
+        bound = re.findall(r"querySelectorAll\('\.(btn-authorize-cc[\w-]*)'\)", source)
+        assert bound == ["btn-authorize-cc"], bound
+        assert bound[0] in classes, classes
+
+    def test_row_is_there_whatever_the_token_state(self, tmp_path):
+        for acct in (
+            {"validation_status": "valid", "has_cc_token": True, "has_cc_refresh_token": True},
+            {"validation_status": "valid", "has_cc_token": False},
+            {"validation_status": "invalid"},
+            {"is_active": False},
+        ):
+            assert "btn-authorize-cc" in _menu_panel(_actions(tmp_path, **acct)), acct
+
+    def test_codex_menu_has_no_row(self, tmp_path):
+        panel = _menu_panel(_actions(tmp_path, provider="codex"))
+        assert "btn-authorize-cc" not in panel
+        assert "Claude Code" not in panel
+
+    def test_row_sits_after_reauth_and_reauth_stays_single(self, tmp_path):
+        panel = _menu_panel(_actions(tmp_path))
+        assert panel.index("btn-reauth") < panel.index("btn-authorize-cc") < panel.index("btn-toggle")
+        assert panel.count("btn-reauth") == 1
+        assert panel.count("btn-authorize-cc") == 1
+        assert ">Re-auth<" in panel
+
+    def test_the_two_rows_say_how_they_differ(self, tmp_path):
+        """Two rows that both 'authorize' must not read as the same control."""
+        panel = _menu_panel(_actions(tmp_path))
+        reauth = _item(panel, "btn-reauth")
+        cc_row = _item(panel, "btn-authorize-cc")
+        reauth_title = re.search(r'title="([^"]+)"', reauth).group(1)
+        cc_title = re.search(r'title="([^"]+)"', cc_row).group(1)
+        assert "sign in to this account again" in reauth_title.lower()
+        assert "usage token" in reauth_title and "Claude Code token" in reauth_title
+        assert "only the claude code token" in cc_title.lower()
+        assert "sign-in stays the same" in cc_title
+        for title in (reauth_title, cc_title):
+            assert "\u2014" not in title
+
+    def test_row_is_not_on_the_card_face(self, tmp_path):
+        html = _actions(tmp_path)
+        assert "btn-authorize-cc" not in html[:html.index('<div class="account-menu-wrap')]
+
+    def test_click_confirms_then_starts_the_cc_flow_for_this_account(self, tmp_path):
+        result = _run_behavior(tmp_path, _CC_ROW_CARD + r"""
+(async () => {
+    global.Swal = { fire: async (opts) => { calls.dialogs.push(opts.title); return { isConfirmed: true }; } };
+    __click(list, a.kebab);
+    __click(list, ccRow);
+    await new Promise(r => setTimeout(r, 10));
+    out({ calls, open: isOpen(a) });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["calls"]["dialogs"] == ["Authorize Claude Code Token?"]
+        assert result["calls"]["cc"] == [["1", "one@x.com"]]
+        assert result["calls"]["reauth"] == []
+        assert result["open"] is False
+
+    def test_cancel_starts_nothing(self, tmp_path):
+        result = _run_behavior(tmp_path, _CC_ROW_CARD + r"""
+(async () => {
+    global.Swal = { fire: async () => ({ isConfirmed: false }) };
+    __click(list, ccRow);
+    await new Promise(r => setTimeout(r, 10));
+    out({ calls });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["calls"]["cc"] == [] and result["calls"]["reauth"] == []
+
+    def test_a_running_action_blocks_the_row(self, tmp_path):
+        result = _run_behavior(tmp_path, _CC_ROW_CARD + r"""
+(async () => {
+    let dialogs = 0;
+    global.Swal = { fire: async () => { dialogs++; return { isConfirmed: true }; } };
+    window.jackedState._accountActionInFlight = true;
+    __click(list, ccRow);
+    await new Promise(r => setTimeout(r, 10));
+    out({ calls, dialogs, toasts: __toasts.map(t => t.message) });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["dialogs"] == 0
+        assert result["calls"]["cc"] == []
+        assert result["toasts"] == ["Another action is in progress"]
+
+    def test_an_action_that_starts_during_the_dialog_wins(self, tmp_path):
+        result = _run_behavior(tmp_path, _CC_ROW_CARD + r"""
+(async () => {
+    global.Swal = { fire: async () => {
+        window.jackedState._accountActionInFlight = true;
+        return { isConfirmed: true };
+    } };
+    __click(list, ccRow);
+    await new Promise(r => setTimeout(r, 10));
+    out({ calls, toasts: __toasts.map(t => t.message) });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["calls"]["cc"] == []
+        assert result["toasts"] == ["Another action started. Try again."]

@@ -295,6 +295,16 @@ def follow_config(
     """
     owner_id = int(owner["id"])
     verdict, why = classify(read_config_identity(), owner, db.get_account(stamp))
+    if verdict == OWNER and not _followable(owner):
+        # The user signed in to an account jacked has disabled or deleted:
+        # the tokens are saved, the choice is not followed (fail safe).
+        guard._mark_handled(digest, owner_id, settled=True)
+        logger.warning(
+            "oauthAccount names account %d, which is disabled or deleted in jacked; "
+            "jacked only adopts the tokens and does not make it the active account",
+            owner_id,
+        )
+        return None
     if verdict == OWNER:
         guard._mark_handled(digest, owner_id, settled=False)
         return _follow_owner(db, payload, digest, owner_id, now=now, activate=activate)
@@ -321,6 +331,17 @@ def follow_config(
         why,
     )
     return None
+
+
+def _followable(owner: dict) -> bool:
+    """True when jacked may make ``owner`` the active account.
+
+    >>> _followable({"is_active": 1, "is_deleted": 0})
+    True
+    >>> _followable({"is_active": 0}), _followable({"is_active": 1, "is_deleted": 1})
+    (False, False)
+    """
+    return bool(owner.get("is_active")) and not owner.get("is_deleted")
 
 
 def _stale_target(db, stamp: int) -> tuple[dict | None, str]:
@@ -384,7 +405,18 @@ def _point_at(db, account_id: int) -> None:
     wanted = str(account_id)
     if all(db.get_setting(key) == wanted for key in _POINTER_KEYS):
         return
-    db.set_settings({key: wanted for key in _POINTER_KEYS})
+    try:
+        db.set_settings({key: wanted for key in _POINTER_KEYS})
+    except Exception as exc:
+        # The guard never raises past the observer; say why the user's
+        # choice is not the active account yet, then let the pass end.
+        logger.warning(
+            "Account %d: could not record it as the active account after a "
+            "stamped rotation (%s); the next pass tries again",
+            account_id,
+            type(exc).__name__,
+        )
+        raise
     logger.info(
         "Account %d adopted as the active account after a stamped rotation "
         "(oauthAccount names it)",

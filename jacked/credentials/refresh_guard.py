@@ -27,6 +27,15 @@ CC_REAUTH_REQUIRED_CODE = "CC_REAUTH_REQUIRED"
 REFRESH_DOWNGRADE_REASON = (
     "not publishing a null refresh token over a live one (cc re-auth required)"
 )
+# The live store holds a refresh token, the target has none, and the owner
+# of the live tokens could not be checked (the profile request failed): a
+# transient refusal, retried by the caller. Fail closed: a refusal is
+# retryable, a lost refresh lineage is not.
+OWNERSHIP_UNCHECKED_CODE = "OWNERSHIP_UNCHECKED"
+REFRESH_DOWNGRADE_UNCHECKED_REASON = (
+    "not publishing a null refresh token over a live one whose owner could not "
+    "be checked; try again later"
+)
 
 
 def _refresh_of(oauth: Any) -> str | None:
@@ -54,15 +63,17 @@ def refuses_refresh_downgrade(
     1. ``target_oauth`` has no refresh token (None, empty or absent).
     2. The live payload holds a refresh token that is a non-empty string.
     3. The shared ownership rule proves that the live tokens belong to
-       ``account`` (``credential_helpers.live_payload_belongs_to``, stamp not
+       ``account`` (``credential_helpers.live_payload_ownership``, stamp not
        required): with no request when the live access or refresh token is
        the row's, else through the cached profile verdict.
 
-    A live store with no refresh token, a payload of another owner, and a
-    payload whose owner cannot be proven are not protected: the write goes
-    ahead, as before. The two local checks run first, so only a real
-    downgrade can cost a profile request. Returns None when the write may go
-    ahead. The function never logs: each caller logs the reason once.
+    A live store with no refresh token and a payload of another owner are not
+    protected: the write goes ahead, as before. A payload whose owner could
+    not be checked (the profile request failed) is refused with
+    ``REFRESH_DOWNGRADE_UNCHECKED_REASON``, a transient refusal the caller
+    retries. The two local checks run first, so only a real downgrade can
+    cost a profile request. Returns None when the write may go ahead. The
+    function never logs: each caller logs the reason once.
 
     >>> row = {"id": 7, "cc_access_token": "at", "cc_refresh_token": None}
     >>> live = {"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt"}}
@@ -78,11 +89,12 @@ def refuses_refresh_downgrade(
     live_oauth = live_payload.get("claudeAiOauth") if isinstance(live_payload, dict) else None
     if _refresh_of(live_oauth) is None:
         return None
-    from jacked.api.credential_helpers import live_payload_belongs_to
+    from jacked.api.credential_helpers import live_payload_ownership
 
-    if not live_payload_belongs_to(account, live_payload, require_stamp=False):
-        return None
-    return REFRESH_DOWNGRADE_REASON
+    owned = live_payload_ownership(account, live_payload, require_stamp=False)
+    if owned is None:
+        return REFRESH_DOWNGRADE_UNCHECKED_REASON
+    return REFRESH_DOWNGRADE_REASON if owned else None
 
 
 def downgrade_check_for(row: dict) -> Callable[[CredentialPayload | None], str | None]:

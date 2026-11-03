@@ -29,7 +29,11 @@ from .models import (
     SwitchResult,
 )
 from .oauth_extra import PASSTHROUGH_KEYS
-from .refresh_guard import CC_REAUTH_REQUIRED_CODE
+from .refresh_guard import (
+    CC_REAUTH_REQUIRED_CODE,
+    OWNERSHIP_UNCHECKED_CODE,
+    REFRESH_DOWNGRADE_UNCHECKED_REASON,
+)
 from .repository import CredentialSwitchRepository
 from .resolver import ResolverSnapshotSink, ResolverState, SnapshotUpdate
 from .store import CredentialStore
@@ -69,6 +73,12 @@ class SwitchRequest:
     # None when the store must not be overwritten yet: the outgoing account's
     # newest tokens could not be saved to its row. None refuses with BUSY.
     preflight: Callable[[], SwitchRequest | None] | None = None
+    # When set, the authority read inside the lease must still hold a payload
+    # with this digest, else the engine refuses with CONCURRENT_WRITE and
+    # writes nothing. The authority guard's re-stamp republishes exactly the
+    # payload it adopted; a rotation that landed meanwhile must be adopted
+    # first, not overwritten.
+    expected_authority_digest: str | None = None
     # Runs inside the switch lease, after the authority read and before any
     # write. It gets the payload the authority holds now (None when there is
     # none) and returns a reason when this write would put a null refresh
@@ -261,6 +271,7 @@ def _result(
     message: str = "",
     sessions_follow: bool | None = None,
     code: str = "",
+    published_fingerprint: str = "",
 ) -> SwitchResult:
     observed = _enrich_identity(request, observed)
     storage_state = "committed" if is_committed else outcome.value
@@ -293,7 +304,25 @@ def _result(
         observed_identity=observed,
         message=message,
         code=code,
+        published_fingerprint=published_fingerprint,
     )
+
+
+_PUBLISHED_OUTCOMES = frozenset({
+    SwitchOutcome.COMMITTED,
+    SwitchOutcome.COMMITTED_DEGRADED,
+    SwitchOutcome.OBSERVED_TARGET_UNFENCED,
+})
+
+
+def _published_fingerprint(request: SwitchRequest, outcome: SwitchOutcome) -> str:
+    """The fingerprint of the pair this request published, for an outcome
+    that published it; empty for every other outcome."""
+    if outcome not in _PUBLISHED_OUTCOMES:
+        return ""
+    from jacked.credentials.fingerprint import payload_fingerprint
+
+    return payload_fingerprint(request.payload.to_mapping().get("claudeAiOauth"))
 
 
 def _enrich_identity(
@@ -372,6 +401,9 @@ class CredentialTransactionEngine:
             return self._record(request, outcome, message=reason)
         assert prepared is not None
         request = prepared
+        refused = self._refuse_changed_authority(request, before)
+        if refused is not None:
+            return refused
         refused = self._refuse_refresh_downgrade(request, before)
         if refused is not None:
             return refused
@@ -584,6 +616,9 @@ class CredentialTransactionEngine:
         assert before.payload is not None
         assert prepared is not None
         request = prepared
+        refused = self._refuse_changed_authority(request, before)
+        if refused is not None:
+            return refused
         refused = self._refuse_refresh_downgrade(request, before)
         if refused is not None:
             return refused
@@ -795,6 +830,37 @@ class CredentialTransactionEngine:
         )
         return self._record(request, outcome, message=reason)
 
+    def _refuse_changed_authority(
+        self, request: SwitchRequest, before: StoreReadResult
+    ) -> SwitchResult | None:
+        """Refuse a write whose expected authority payload is gone.
+
+        A request that republishes the payload it read (the guard's re-stamp)
+        names that payload's digest. When the authority holds something else
+        now (Claude Code rotated meanwhile), the write would overwrite a
+        rotation nobody saved: refuse with CONCURRENT_WRITE, a transient
+        outcome the caller retries after it adopts the new payload.
+        """
+        expected = request.expected_authority_digest
+        if expected is None:
+            return None
+        held = before.payload.digest if before.payload is not None else None
+        if held == expected:
+            return None
+        logger.warning(
+            "Account %d: the authority changed before the write; not republishing",
+            request.account_id,
+        )
+        observed = (
+            before.payload.identity if before.payload is not None else CredentialIdentity()
+        )
+        return self._record(
+            request,
+            SwitchOutcome.CONCURRENT_WRITE,
+            observed,
+            "the authority changed before the write",
+        )
+
     def _refuse_refresh_downgrade(
         self, request: SwitchRequest, before: StoreReadResult
     ) -> SwitchResult | None:
@@ -813,6 +879,12 @@ class CredentialTransactionEngine:
         observed = (
             before.payload.identity if before.payload is not None else CredentialIdentity()
         )
+        if reason == REFRESH_DOWNGRADE_UNCHECKED_REASON:
+            # The owner could not be checked: a transient refusal, not a
+            # verdict on the lineage. BUSY is retried by every caller.
+            return self._record(
+                request, SwitchOutcome.BUSY, observed, reason, code=OWNERSHIP_UNCHECKED_CODE
+            )
         return self._record(
             request,
             SwitchOutcome.UNUSABLE,
@@ -848,4 +920,5 @@ class CredentialTransactionEngine:
             message=message,
             sessions_follow=sessions_follow,
             code=code,
+            published_fingerprint=_published_fingerprint(request, outcome),
         )

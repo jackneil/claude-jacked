@@ -48,6 +48,7 @@ from jacked.credentials.models import (
 from jacked.credentials.refresh_guard import (
     CC_REAUTH_REQUIRED_CODE,
     REFRESH_DOWNGRADE_REASON,
+    REFRESH_DOWNGRADE_UNCHECKED_REASON,
     refuses_refresh_downgrade,
 )
 from jacked.credentials.runtime import INSPECTED_CLAUDE_BUILD, activate_account
@@ -158,13 +159,17 @@ class TestTheGuard:
         assert verdict is None
         assert lookup.calls == 1
 
-    def test_a_live_payload_whose_owner_cannot_be_proven_is_not_protected(self):
+    def test_a_live_payload_whose_owner_cannot_be_checked_is_a_transient_refusal(self):
+        """Fail closed: the owner is unknown, not disproven. The engine maps
+        this reason to BUSY (code OWNERSHIP_UNCHECKED), which every caller
+        retries; a lost refresh lineage could not be retried."""
         lookup = _Lookup(ProfileLookup(None))  # the profile request failed
         with _patched(lookup):
             verdict = refuses_refresh_downgrade(
                 {"refreshToken": None}, _live("unknown-at", "unknown-rt"), _dead_row()
             )
-        assert verdict is None
+        assert verdict == REFRESH_DOWNGRADE_UNCHECKED_REASON
+        assert lookup.calls == 1
 
     def test_a_profile_proof_protects_a_token_the_row_does_not_hold(self):
         lookup = _Lookup(_profile(OWNER, org=ORG, uuid=None))

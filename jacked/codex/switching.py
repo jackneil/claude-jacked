@@ -281,6 +281,14 @@ def _swap_root(
     Returns ``(outgoing_id, captured)``. The first write (config.toml) comes
     after the last check: forcing file storage first rewrote the user's
     config even for a swap that a later guard then refused.
+
+    The store check runs twice. Before the lock, it refuses a keyring user
+    at once instead of after a lock wait. Inside the lock, right before the
+    first write, it catches a store that changed while the swap waited (up to
+    ~17 s): a concurrent ``codex login`` or a config.toml edit can switch to
+    "keyring", or remove the only file credential under "auto". Codex itself
+    does not take this lock, so the second check makes that window as small
+    as the check-to-write gap; it cannot close it completely.
     """
     refuse_unswitchable_store(base, env)
     target_data = _read_json(codex_slot_auth_path(target_id, base))
@@ -305,7 +313,10 @@ def _swap_root(
         # An unknown identity has NO correct slot: skip the capture rather than
         # clobber a tracked account's slot with a stranger's tokens.
         outgoing_id = find_codex_account_id(db, extract_identity(live)) if live else None
-        refuse_stale_replay(target_data, live)  # the last refusal
+        refuse_stale_replay(target_data, live)
+        # The last refusal, right before the first write: the store as it is
+        # now, not as it was before the lock wait.
+        refuse_unswitchable_store(base, env)
 
         ensure_file_storage(base, env)
         # 1. CAPTURE the live root into the outgoing account's slot FIRST, so

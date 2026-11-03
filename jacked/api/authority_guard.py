@@ -402,6 +402,7 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
         is_primary_publication,
         live_payload_belongs_to,
         live_payload_ownership,
+        refresh_token_importable,
     )
 
     account_id = int(row["id"])
@@ -452,7 +453,11 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
             "Account %d: not adopting the Claude Code refresh token over a dead chain",
             account_id,
         )
-    elif refresh_token and refresh_token != row.get("cc_refresh_token"):
+    elif (
+        refresh_token
+        and refresh_token != row.get("cc_refresh_token")
+        and refresh_token_importable(row, refresh_token)
+    ):
         updates["cc_refresh_token"] = refresh_token
         # A live rotation proves the lineage is healthy, so clear the same
         # breaker fields a successful cc refresh clears.
@@ -545,21 +550,35 @@ def _outcome_label(outcome: Any) -> str:
 
 
 def _attempt_repair(
-    db, row: dict, activate: Callable[..., Any] | None, kind: str
+    db,
+    row: dict,
+    activate: Callable[..., Any] | None,
+    kind: str,
+    *,
+    republish: dict | None = None,
+    expected_digest: str | None = None,
 ) -> SwitchOutcome | None:
-    """Run one repair transaction that publishes ``row``; return its outcome.
+    """Run one repair transaction; return its outcome.
 
-    Returns None when the activator raised: the observer pass never breaks
-    over a repair, and the settle rule counts None as a failed attempt.
+    A reassert publishes ``row``. A re-stamp (``republish``) publishes the
+    authority's own payload with the row's stamp, and names the digest the
+    authority must still hold (``expected_digest``). Returns None when the
+    activator raised: the observer pass never breaks over a repair, and the
+    settle rule counts None as a failed attempt.
     """
     from jacked.credentials.models import SwitchContext
     from jacked.credentials.runtime import activate_account
 
     activator = activate or activate_account
+    operation_id = f"{kind}-{uuid.uuid4().hex}"
     try:
-        result = activator(
-            db, row, SwitchContext.REASSERT, f"{kind}-{uuid.uuid4().hex}"
-        )
+        if republish is None:
+            result = activator(db, row, SwitchContext.REASSERT, operation_id)
+        else:
+            result = activator(
+                db, row, SwitchContext.REASSERT, operation_id,
+                republish=republish, expected_digest=expected_digest,
+            )
     except Exception:  # noqa: BLE001 - never break the observer pass
         logger.debug(
             "The authority %s of account %d failed", kind, int(row["id"]),
@@ -570,72 +589,78 @@ def _attempt_repair(
     if _repair_committed(outcome):
         from jacked.api.stamped_evidence import record_publication
 
-        # The next pass then knows this payload as jacked's own write.
-        record_publication(db, int(row["id"]))
+        # The next pass then knows this payload as jacked's own write. The
+        # engine reports the fingerprint of the pair it published; an
+        # activator that reports none (a test double) gets the pair this
+        # repair asked it to publish.
+        record_publication(
+            db,
+            getattr(result, "published_fingerprint", "")
+            or _requested_fingerprint(row, republish),
+        )
     return outcome
 
 
-def _publication_differences(row: dict, payload: dict) -> list[str]:
-    """Name the token fields that a publication of ``row`` would change.
-
-    >>> row = {"cc_access_token": "a", "cc_refresh_token": "r"}
-    >>> live = {"claudeAiOauth": {"accessToken": "a", "refreshToken": "r"}}
-    >>> _publication_differences(row, live)
-    []
-    >>> _publication_differences({**row, "cc_refresh_failure_type": "invalid_grant"}, live)
-    ['refreshToken']
-    """
+def _requested_fingerprint(row: dict, republish: dict | None) -> str:
+    """The fingerprint of the pair a repair asked the engine to publish."""
     from jacked.api.credential_helpers import build_oauth_data
+    from jacked.credentials.fingerprint import payload_fingerprint
 
-    try:
-        published = build_oauth_data(row)
-    except (TypeError, ValueError):
-        return ["accessToken", "refreshToken"]
-    oauth = _oauth_section(payload)
-    return [
-        key
-        for key in ("accessToken", "refreshToken")
-        if (published.get(key) or None) != (oauth.get(key) or None)
-    ]
+    oauth = republish.get("claudeAiOauth") if republish is not None else build_oauth_data(row)
+    return payload_fingerprint(oauth)
 
 
 def _restamp_blocker(row: dict | None, payload: dict | None) -> str:
     """Say why a re-stamp of ``row`` cannot run, or return an empty string.
 
-    A re-stamp publishes the row's own tokens, and it may add only the stamp
-    and the config identity. When the row would publish other tokens than
-    the authority holds (for example, the Claude Code breaker kept the
-    rotated refresh token out of the row), the re-stamp would replace the
-    lineage that Claude Code wrote. The reason names fields only.
+    With the authority's ``payload`` in hand, a re-stamp republishes exactly
+    that payload with the row's stamp: it adds the stamp and the config
+    identity, nothing else, so nothing blocks it but a missing row. Without
+    a payload, the re-stamp publishes the row's own tokens, which needs a
+    Claude Code access token in the row. The reason names fields only.
 
     >>> _restamp_blocker({"cc_access_token": None}, None)
     'holds no Claude Code token to re-stamp with'
+    >>> _restamp_blocker({"cc_access_token": None}, {"claudeAiOauth": {"accessToken": "a"}})
+    ''
+    >>> _restamp_blocker(None, {"claudeAiOauth": {"accessToken": "a"}})
+    'row is missing'
     """
-    if not row or not row.get("cc_access_token"):
-        return "holds no Claude Code token to re-stamp with"
-    if payload is None:
+    if not row:
+        return "row is missing"
+    if payload is not None:
         return ""
-    changed = _publication_differences(row, payload)
-    if changed:
-        return f"cannot republish the {' and '.join(changed)} that the authority holds"
+    if not row.get("cc_access_token"):
+        return "holds no Claude Code token to re-stamp with"
     return ""
 
 
 def _restamp_foreign_holder(
     db, row: dict, activate: Callable[..., Any] | None, payload: dict | None = None
 ) -> SwitchOutcome | None:
-    """Republish the foreign holder's own credentials through the engine.
+    """Re-stamp the authority for the account that holds it.
 
-    The tokens are identical to what Claude Code just wrote, so running
-    sessions are unaffected; the write only adds the stamp and the config
-    identity. With ``payload``, ``_restamp_blocker`` checks that first.
-    Returns the engine's outcome, or None when the re-stamp cannot run or
-    the activator raised.
+    With the authority's ``payload`` the write republishes exactly that
+    payload with the row's stamp (the engine refuses when the authority
+    changed meanwhile, and the guard adopts the new payload on its next
+    pass). Without a payload it publishes the row's own tokens, which are
+    the ones Claude Code wrote. Either way running sessions are unaffected:
+    the write only adds the stamp and the config identity. Returns the
+    engine's outcome, or None when the re-stamp cannot run or the activator
+    raised.
     """
     fresh = db.get_account(int(row["id"])) or row
     if _restamp_blocker(fresh, payload):
         return None
-    return _attempt_repair(db, fresh, activate, "restamp")
+    if payload is None:
+        return _attempt_repair(db, fresh, activate, "restamp")
+    from jacked.credentials.canonical import CredentialPayload
+
+    return _attempt_repair(
+        db, fresh, activate, "restamp",
+        republish=payload,
+        expected_digest=CredentialPayload.from_mapping(payload).digest,
+    )
 
 
 def _claim_repair_slot(digest: str, account_id: int, now: float) -> bool:

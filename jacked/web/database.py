@@ -131,6 +131,7 @@ class Account(BaseModel):
     refresh_last_failed_at: Optional[int] = None
     refresh_failure_type: Optional[str] = None
     refresh_failed_token_fp: Optional[str] = None
+    foreign_token_fp: Optional[str] = None
     cc_refresh_last_failed_at: Optional[int] = None
     cc_refresh_failure_type: Optional[str] = None
     cc_refresh_failed_token_fp: Optional[str] = None
@@ -288,9 +289,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     refresh_last_failed_at INTEGER,  -- Primary-chain breaker: last failed exchange
     refresh_failure_type TEXT,  -- Primary-chain breaker: failure type
     refresh_failed_token_fp TEXT,  -- Fingerprint of the primary refresh token an invalid_grant condemned
+    foreign_token_fp TEXT,  -- Fingerprint of the primary refresh token a cross-account profile verdict covers
     cc_refresh_last_failed_at INTEGER,  -- Claude Code chain breaker: last failed exchange
     cc_refresh_failure_type TEXT,  -- Claude Code chain breaker: failure type
-    cc_refresh_failed_token_fp TEXT,  -- Fingerprint of the cc refresh token an invalid_grant condemned
+    cc_refresh_failed_token_fp TEXT,  -- Fingerprints (newest first, space-separated) of the cc refresh tokens that invalid_grant condemned
     account_uuid TEXT,  -- Claude account uuid (profile account.uuid / token exchange account.uuid)
     profile_json TEXT,  -- Non-secret profile subset: {"account": {...}, "organization": {...}}
     profile_fetched_at REAL,  -- Epoch seconds of the profile fetch that wrote profile_json
@@ -669,6 +671,7 @@ class Database:
     # The trigger that drops the primary invalid_grant fingerprint when the
     # stored refresh token changes (see _migrate_refresh_failed_token_fp).
     REFRESH_FP_TRIGGER = "trg_refresh_failed_token_fp_reset"
+    FOREIGN_FP_TRIGGER = "trg_foreign_token_fp_reset"
 
     @staticmethod
     def _migrate_refresh_failed_token_fp(conn: sqlite3.Connection) -> None:
@@ -683,19 +686,37 @@ class Database:
         new fingerprint itself keeps it. No backfill: an old verdict without
         a fingerprint gets one more exchange, which binds it.
 
-        ``cc_refresh_failed_token_fp`` does the same for the Claude Code
-        chain. The cc clean-up removes the failed token from the row, so
-        this value is the only record of which token died: an importer of
-        live tokens must not adopt a refresh token with this fingerprint.
+        ``cc_refresh_failed_token_fp`` keeps the fingerprints of every
+        Claude Code refresh token that died (newest first, space-separated;
+        no trigger clears it, because a dead token stays dead across
+        lineages). The cc clean-up removes the failed token from the row, so
+        this value is the only record of which tokens died: an importer of
+        live tokens must not adopt a refresh token with one of these
+        fingerprints.
+
+        ``foreign_token_fp`` binds the cross-account validation verdict
+        (``Token belongs to a different account``) to the primary refresh
+        token it was about, the same way: while the row holds that token, no
+        path sends it, whatever a later error writer or a usage success does
+        to ``last_error``; a new refresh token releases it through its own
+        trigger.
 
         >>> conn = sqlite3.connect(":memory:")
         >>> _ = conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, refresh_token TEXT)")
         >>> _ = conn.execute("INSERT INTO accounts VALUES (1, 'rt')")
         >>> Database._migrate_refresh_failed_token_fp(conn)
         >>> Database._migrate_refresh_failed_token_fp(conn)  # idempotent
-        >>> {"refresh_failed_token_fp", "cc_refresh_failed_token_fp"} <= {
+        >>> {"refresh_failed_token_fp", "cc_refresh_failed_token_fp", "foreign_token_fp"} <= {
         ...     r[1] for r in conn.execute("PRAGMA table_info(accounts)")}
         True
+        >>> _ = conn.execute("UPDATE accounts SET foreign_token_fp = 'ff'")
+        >>> _ = conn.execute("UPDATE accounts SET refresh_token = 'rt'")
+        >>> conn.execute("SELECT foreign_token_fp FROM accounts").fetchone()
+        ('ff',)
+        >>> _ = conn.execute("UPDATE accounts SET refresh_token = 'rt-b'")
+        >>> conn.execute("SELECT foreign_token_fp FROM accounts").fetchone()
+        (None,)
+        >>> _ = conn.execute("UPDATE accounts SET refresh_token = 'rt'")  # the primary trigger below
         >>> _ = conn.execute("UPDATE accounts SET refresh_failed_token_fp = 'fp'")
         >>> _ = conn.execute("UPDATE accounts SET refresh_token = 'rt'")
         >>> conn.execute("SELECT refresh_failed_token_fp FROM accounts").fetchone()
@@ -709,7 +730,7 @@ class Database:
         ('fp3',)
         """
         cols = {row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()}
-        for col_name in ("refresh_failed_token_fp", "cc_refresh_failed_token_fp"):
+        for col_name in ("refresh_failed_token_fp", "cc_refresh_failed_token_fp", "foreign_token_fp"):
             if col_name not in cols:
                 try:
                     conn.execute(f"ALTER TABLE accounts ADD COLUMN {col_name} TEXT")
@@ -723,6 +744,16 @@ class Database:
             "AND NEW.refresh_failed_token_fp IS OLD.refresh_failed_token_fp "
             "BEGIN "
             "UPDATE accounts SET refresh_failed_token_fp = NULL WHERE id = NEW.id; "
+            "END"
+        )
+        conn.execute(
+            f"CREATE TRIGGER IF NOT EXISTS {Database.FOREIGN_FP_TRIGGER} "
+            "AFTER UPDATE OF refresh_token ON accounts "
+            "WHEN OLD.refresh_token IS NOT NEW.refresh_token "
+            "AND NEW.foreign_token_fp IS NOT NULL "
+            "AND NEW.foreign_token_fp IS OLD.foreign_token_fp "
+            "BEGIN "
+            "UPDATE accounts SET foreign_token_fp = NULL WHERE id = NEW.id; "
             "END"
         )
 
@@ -1408,6 +1439,7 @@ class Database:
             "refresh_last_failed_at",
             "refresh_failure_type",
             "refresh_failed_token_fp",
+            "foreign_token_fp",
             "cc_refresh_last_failed_at",
             "cc_refresh_failure_type",
             "cc_refresh_failed_token_fp",

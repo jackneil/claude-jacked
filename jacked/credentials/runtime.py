@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Mapping
+
 import logging
 import os
 import re
@@ -365,14 +367,15 @@ def _row_payload(target_id: int, row: dict) -> CredentialPayload:
     )
 
 
-def _activation_preflight(db, request: SwitchRequest):
+def _activation_preflight(db, request: SwitchRequest, *, rebuild_payload: bool = True):
     """The preflight of one activation, run inside the switch lease.
 
     It saves the active account's newest live tokens before they are
     overwritten, then rebuilds the payload and the downgrade check from the
     row as it is now (a same-account activation may just have imported a
-    rotation). Fail closed: a refusal is retryable, a lost refresh lineage
-    is not.
+    rotation). A republish (``rebuild_payload`` False) keeps its payload: it
+    publishes what the authority holds, with a new stamp. Fail closed: a
+    refusal is retryable, a lost refresh lineage is not.
     """
     target_id = request.account_id
 
@@ -393,7 +396,7 @@ def _activation_preflight(db, request: SwitchRequest):
             return None
         return replace(
             request,
-            payload=_row_payload(target_id, row),
+            payload=_row_payload(target_id, row) if rebuild_payload else request.payload,
             preflight=None,
             refresh_downgrade_check=downgrade_check_for(row),
         )
@@ -401,12 +404,36 @@ def _activation_preflight(db, request: SwitchRequest):
     return preflight
 
 
-def activate_account(db, account: dict, context: SwitchContext, operation_id: str) -> SwitchResult:
+def _republished_payload(target_id: int, republish: Mapping) -> CredentialPayload:
+    """The payload a re-stamp publishes: the authority's own object, stamped
+    for ``target_id``.
+
+    >>> p = _republished_payload(4, {"claudeAiOauth": {"accessToken": "a"}, "_jackedAccountId": 1})
+    >>> p.identity.account_id
+    4
+    """
+    return CredentialPayload.from_mapping({**dict(republish), "_jackedAccountId": target_id})
+
+
+def activate_account(
+    db,
+    account: dict,
+    context: SwitchContext,
+    operation_id: str,
+    *,
+    republish: Mapping | None = None,
+    expected_digest: str | None = None,
+) -> SwitchResult:
     """Resolve the exact runtime contract and activate one local account.
 
     The engine refuses (UNUSABLE, code CC_REAUTH_REQUIRED) a write that would
     put a null refresh token over a live one of this account, and leaves the
     authority unchanged (#149i).
+
+    ``republish`` is the authority's own payload: the write publishes it with
+    the account's stamp (a re-stamp adds the stamp and the config identity,
+    nothing else), and ``expected_digest`` names the payload the authority
+    must still hold, else the engine refuses with CONCURRENT_WRITE (#154i).
 
     >>> # Tested via test_credential_runtime.py and test_refresh_downgrade_guard.py
     """
@@ -422,19 +449,26 @@ def activate_account(db, account: dict, context: SwitchContext, operation_id: st
     if isinstance(engine, str):
         return _unsupported(operation_id, account, engine)
     target_id = int(account["id"])
+    payload = (
+        _republished_payload(target_id, republish)
+        if republish is not None
+        else _row_payload(target_id, account)
+    )
     request = SwitchRequest(
         operation_id=operation_id,
         account_id=target_id,
         email=account.get("email") or "",
         organization_id=account.get("organization_uuid") or None,
-        payload=_row_payload(target_id, account),
+        payload=payload,
         context=context,
         interaction=InteractionMode.FOREGROUND,
         display_name=account.get("display_name") or None,
         organization_name=account.get("organization_name") or None,
         refresh_downgrade_check=downgrade_check_for(account),
+        expected_authority_digest=expected_digest,
     )
-    return engine.activate(replace(request, preflight=_activation_preflight(db, request)))
+    preflight = _activation_preflight(db, request, rebuild_payload=republish is None)
+    return engine.activate(replace(request, preflight=preflight))
 
 
 def scoped_launch_needs_global_activation() -> bool:

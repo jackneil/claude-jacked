@@ -253,6 +253,7 @@ const ACCOUNT_MENU_ICONS = {
     copy: 'M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z',
     rename: 'M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z',
     reauth: 'M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15',
+    key: 'M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z',
     disable: 'M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636',
     enable: 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z',
     delete: 'M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16',
@@ -262,9 +263,10 @@ const ACCOUNT_MENU_ICONS = {
  * Render one overflow-menu row.
  *
  * `cls` MUST stay the legacy button class (btn-copy-cmd, btn-edit-label,
- * btn-reauth, btn-toggle, btn-delete) and `attrs` MUST carry the same data-*
- * attributes the old inline buttons carried — the handlers in
- * account-actions.js bind by those classes and read those attributes.
+ * btn-reauth, btn-authorize-cc, btn-toggle, btn-delete) and `attrs` MUST
+ * carry the same data-* attributes the old inline buttons carried — the
+ * handlers in account-actions.js bind by those classes and read those
+ * attributes.
  */
 function renderAccountMenuItem(cls, attrs, iconKey, text, colorCls) {
     const color = colorCls || 'text-slate-300 hover:bg-slate-700/60';
@@ -278,9 +280,9 @@ function renderAccountMenuItem(cls, attrs, iconKey, text, colorCls) {
  * Render the kebab (three-dot) overflow menu for an account card.
  *
  * Everything the user does rarely lives here instead of on the card face:
- * copy launch command, rename, re-auth, enable/disable, delete — plus the
- * account id and organization, which are worth seeing occasionally but not
- * worth permanent card space.
+ * copy launch command, rename, re-auth, authorize the Claude Code token,
+ * enable/disable, delete — plus the account id and organization, which are
+ * worth seeing occasionally but not worth permanent card space.
  *
  * Re-auth is ALWAYS present for Claude accounts, never gated on
  * validation_status: accounts revalidate at most hourly, so the DB can still
@@ -328,11 +330,21 @@ function renderAccountMenu(acct) {
     // "re-login" tooltip guides that); the backend rejects browser OAuth for
     // it, so the row is omitted entirely rather than rendered and failing.
     if (provider !== 'codex') {
+        const emailAttr = `data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}"`;
         items += renderAccountMenuItem(
             'btn-reauth',
-            `data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}"`,
+            `${emailAttr} title="Sign in to this account again. jacked then gets a new usage token and a new Claude Code token."`,
             'reauth',
             'Re-auth',
+        );
+        // The Claude Code token alone, always offered: the CC Token pill is
+        // clickable only while it looks unhealthy, and a switch refused with
+        // CC_REAUTH_REQUIRED names this row while the pill looks healthy.
+        items += renderAccountMenuItem(
+            'btn-authorize-cc',
+            `${emailAttr} title="Authorize only the Claude Code token. The account sign-in stays the same."`,
+            'key',
+            'Authorize Claude Code Token',
         );
     }
 

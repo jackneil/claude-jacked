@@ -10,7 +10,10 @@ A dead chain (``invalid_grant``) follows the dead-chain rule that reconcile
 also applies (``credential_helpers.dead_chain_adoption``, #244i): a NEW
 refresh token is adopted with its pass-through fields and a cleared breaker
 in the same write; any other refresh token gives the access token and its
-expiry only.
+expiry only. A live chain never takes a refresh token that an earlier
+invalid_grant condemned (``credential_helpers.refresh_token_importable``, #152i):
+a cleared breaker does not release a condemned token, so such a file gives
+the access token and its expiry only.
 
 The functions use raw sqlite3, because the sync runs in a thread.
 """
@@ -26,9 +29,16 @@ from jacked.api.credential_helpers import (
     dead_chain_adoption,
     expiry_seconds,
     forget_ownership_verdicts,
+    refresh_token_importable,
 )
 
 logger = logging.getLogger(__name__)
+
+# Logged (values-free) when a live chain refuses a condemned refresh token.
+_CONDEMNED_REFRESH_MESSAGE = (
+    "Account %s: the per-account file holds a Claude Code refresh token that an "
+    "earlier invalid_grant condemned; only the access token is imported"
+)
 
 # A new access token is not the one the API refused: a rotation drops an
 # auth_rejected verdict (it would mark the replacement dead). Any other verdict
@@ -42,7 +52,7 @@ _CLEAR_AUTH_REJECTED = (
 # The columns a sync write was decided from: the access token, the identity
 # the ownership proof was made against (a primary re-auth can move the row to
 # another organization without touching cc_access_token), and the lineage
-# columns the dead-chain rule reads.
+# columns the dead-chain rule reads (the condemned fingerprints included).
 _SYNC_GUARD_COLS = (
     "cc_access_token",
     "email",
@@ -50,6 +60,7 @@ _SYNC_GUARD_COLS = (
     "account_uuid",
     "cc_refresh_token",
     "cc_refresh_failure_type",
+    "cc_refresh_failed_token_fp",
 )
 
 
@@ -84,6 +95,8 @@ def _sync_guards(account: dict, cols: set) -> dict:
 
     >>> _sync_guards({"cc_access_token": "a", "email": "e"}, {"cc_access_token"})
     {'cc_access_token': 'a'}
+    >>> _sync_guards({"cc_refresh_failed_token_fp": "fp"}, {"cc_refresh_failed_token_fp"})
+    {'cc_refresh_failed_token_fp': 'fp'}
     """
     return {column: account.get(column) for column in _SYNC_GUARD_COLS if column in cols}
 
@@ -94,13 +107,19 @@ def _rotation_sets(account: dict, oauth: dict, cols: set) -> tuple[dict, tuple, 
     A dead chain follows the shared dead-chain rule. A live chain takes the
     refresh token as it is, NULL included: when Claude Code consumed it,
     should_refresh_cc must see that it is gone. It also takes the
-    pass-through fields (#174i) and drops an auth_rejected verdict.
+    pass-through fields (#174i) and drops an auth_rejected verdict. A
+    refresh token that an earlier invalid_grant condemned is never taken
+    (#152i): the access token and its expiry move, the row's lineage stays.
 
     >>> dead = {"cc_refresh_failure_type": "invalid_grant", "cc_refresh_token": "spent"}
     >>> _rotation_sets(dead, {"accessToken": "a2", "refreshToken": "spent"}, set())
     ({'cc_access_token': 'a2'}, (), False)
     >>> _rotation_sets(dead, {"accessToken": "a2", "refreshToken": "r2"}, {"cc_refresh_token"})
     ({'cc_access_token': 'a2', 'cc_refresh_token': 'r2'}, (), True)
+    >>> from jacked.web.refresh_verdict import token_fingerprint
+    >>> live = {"id": 1, "cc_refresh_token": "r2", "cc_refresh_failed_token_fp": token_fingerprint("r1")}
+    >>> _rotation_sets(live, {"accessToken": "a3", "refreshToken": "r1"}, set())
+    ({'cc_access_token': 'a3'}, (), False)
     """
     sets = {"cc_access_token": oauth.get("accessToken")}
     expires_at = expiry_seconds(oauth.get("expiresAt"))
@@ -111,12 +130,15 @@ def _rotation_sets(account: dict, oauth: dict, cols: set) -> tuple[dict, tuple, 
         sets.update({column: value for column, value in adoption.items() if column in cols})
         return sets, (), bool(adoption)
     refresh = oauth.get("refreshToken")
+    raw = _CLEAR_AUTH_REJECTED if "cc_refresh_failure_type" in cols else ()
+    if not refresh_token_importable(account, refresh):
+        logger.info(_CONDEMNED_REFRESH_MESSAGE, account.get("id"))
+        return sets, raw, False
     sets["cc_refresh_token"] = refresh
     if "cc_oauth_extra" in cols:
         from jacked.credentials.oauth_extra import capture_oauth_extra
 
         sets["cc_oauth_extra"] = capture_oauth_extra(oauth, refresh)
-    raw = _CLEAR_AUTH_REJECTED if "cc_refresh_failure_type" in cols else ()
     return sets, raw, False
 
 

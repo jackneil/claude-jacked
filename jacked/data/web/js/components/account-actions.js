@@ -146,43 +146,51 @@ async function _confirmCcAuth(email) {
 }
 
 // ---------------------------------------------------------------------------
+// Targeted auth flows: one confirm-then-start path for the token pills and the
+// account menu rows, so a pill and a row for the same flow cannot drift.
+// startReauthFlow and startCcAuthFlow live in oauth-flows.js.
+// ---------------------------------------------------------------------------
+const TARGETED_AUTH_FLOWS = {
+    reauth: { confirm: _confirmReauth, start: (id, email) => startReauthFlow(id, email) },
+    cc: { confirm: _confirmCcAuth, start: (id, email) => startCcAuthFlow(id, email) },
+};
+
+async function startTargetedAuthFlow(kind, id, email) {
+    const flow = TARGETED_AUTH_FLOWS[kind];
+    if (!flow) return;
+    if (window.jackedState._accountActionInFlight) {
+        showToast('Another action is in progress', 'warning', 2000);
+        return;
+    }
+    try {
+        const result = await flow.confirm(email);
+        if (!result.isConfirmed) return;
+        // The dialog can sit open while another action starts.
+        if (window.jackedState._accountActionInFlight) {
+            showToast('Another action started. Try again.', 'warning', 2000);
+            return;
+        }
+        flow.start(id, email);
+    } catch (err) {
+        console.error('Auth confirmation error (' + kind + '):', err);
+        showToast('Something went wrong. Try again.', 'error');
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pill click handler — re-attaches on every render (safe: old element is GC'd)
 // ---------------------------------------------------------------------------
+const PILL_ACTION_FLOWS = { 'reauth-primary': 'reauth', 'auth-cc': 'cc' };
+
 function initPillHandlers() {
     const list = document.getElementById('accounts-list');
     if (!list) return;
-    list.addEventListener('click', async (e) => {
+    list.addEventListener('click', (e) => {
         const pill = e.target.closest('button.token-pill.actionable');
         if (!pill) return;
-        if (window.jackedState._accountActionInFlight) {
-            showToast('Another action is in progress', 'warning', 2000);
-            return;
-        }
-        const action = pill.dataset.action;
-        const id = pill.dataset.accountId;
-        const email = pill.dataset.email;
-        try {
-            if (action === 'reauth-primary') {
-                const result = await _confirmReauth(email);
-                if (!result.isConfirmed) return;
-                if (window.jackedState._accountActionInFlight) {
-                    showToast('Another action started. Try again.', 'warning', 2000);
-                    return;
-                }
-                startReauthFlow(id, email);
-            } else if (action === 'auth-cc') {
-                const result = await _confirmCcAuth(email);
-                if (!result.isConfirmed) return;
-                if (window.jackedState._accountActionInFlight) {
-                    showToast('Another action started. Try again.', 'warning', 2000);
-                    return;
-                }
-                startCcAuthFlow(id, email);
-            }
-        } catch (err) {
-            console.error('Auth confirmation error:', err);
-            showToast('Something went wrong. Try again.', 'error');
-        }
+        startTargetedAuthFlow(
+            PILL_ACTION_FLOWS[pill.dataset.action], pill.dataset.accountId, pill.dataset.email,
+        );
     });
 }
 
@@ -380,8 +388,22 @@ function sessionsFollowCopy(result, email, lead) {
     return `${lead} ${tail}`;
 }
 
+// Shown when the engine refuses a switch with code CC_REAUTH_REQUIRED: jacked's
+// row holds no working Claude Code refresh token for the account while a live
+// session still does, and the engine does not publish a null token over it.
+// One retry can help: the authority can carry the account's rotation under
+// another stamp until the guard pass adopts it (about 10 s). A second refusal
+// needs a new Claude Code authorization, from the account menu row that
+// accounts.js renders for every Claude account.
+const CC_REAUTH_REQUIRED_NOTICE = 'Try the switch again in a moment. If jacked refuses it again, authorize the Claude Code token for this account again from the account menu (Authorize Claude Code Token). A running session holds a working token, and jacked does not replace it.';
+
+// The one renderer for a switch result. The direct answer and the result the
+// poll reads back after a timed-out POST both come here, so a refusal code
+// reads the same on both paths.
 function showCredentialActivationResult(result, email) {
-    if (result && result.restart_required) {
+    if (result && result.code === 'CC_REAUTH_REQUIRED') {
+        showToast(CC_REAUTH_REQUIRED_NOTICE, 'warning', 10000);
+    } else if (result && result.restart_required) {
         showToast(
             result.message || 'Switched the active Codex account. Restart Codex to pick it up.',
             'info',
@@ -458,9 +480,6 @@ function mintSwitchIds() {
 }
 
 // Send the switch and turn whatever comes back into one truthful message.
-// Shown when the server answers a switch with code CC_REAUTH_REQUIRED.
-const CC_REAUTH_REQUIRED_NOTICE = 'Authorize the Claude Code token for this account again (account menu). A running session holds a working token, and jacked does not replace it.';
-
 async function requestSwitch(id, email, ids) {
     const { actionId, operationId, pageSessionId } = ids;
     const headers = {
@@ -495,11 +514,9 @@ async function requestSwitch(id, email, ids) {
             // refused to overwrite its newest tokens. Transient: warn, retry.
             showToast(e.message || 'The current account is being updated. Try the switch again.', 'warning', 8000);
         } else if (outcome.code === 'CC_REAUTH_REQUIRED') {
-            // jacked's row holds no working Claude Code refresh token for
-            // this account, while a session of the account still does. The
-            // server refused to publish a null token over it. A retry cannot
-            // help; a new Claude Code authorization can.
-            showToast(CC_REAUTH_REQUIRED_NOTICE, 'warning', 10000);
+            // The 422 refusal. The shared renderer owns the notice, so the
+            // poll after a timed-out POST shows the same one.
+            showCredentialActivationResult(outcome, email);
         } else {
             // Mostly the 403 local-only refusal, which is long: give it the
             // same reading time as its siblings, and never render `undefined`.
@@ -617,26 +634,14 @@ function bindAccountEvents() {
     // identity, falls back to an incognito window, and can create a duplicate
     // account instead of re-authing the one that was clicked.
     document.querySelectorAll('.btn-reauth').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            if (window.jackedState._accountActionInFlight) {
-                showToast('Another action is in progress', 'warning', 2000);
-                return;
-            }
-            const id = btn.dataset.id;
-            const email = btn.dataset.email || '';
-            try {
-                const result = await _confirmReauth(email);
-                if (!result.isConfirmed) return;
-                if (window.jackedState._accountActionInFlight) {
-                    showToast('Another action started. Try again.', 'warning', 2000);
-                    return;
-                }
-                startReauthFlow(id, email);
-            } catch (err) {
-                console.error('Reauth confirmation error:', err);
-                showToast('Something went wrong. Try again.', 'error');
-            }
-        });
+        btn.addEventListener('click', () => startTargetedAuthFlow('reauth', btn.dataset.id, btn.dataset.email || ''));
+    });
+
+    // Authorize Claude Code Token rows (kebab menu). The same flow the CC
+    // Token pill starts. The pill is clickable only while it looks unhealthy,
+    // so this row is the control the CC_REAUTH_REQUIRED notice names.
+    document.querySelectorAll('.btn-authorize-cc').forEach(btn => {
+        btn.addEventListener('click', () => startTargetedAuthFlow('cc', btn.dataset.id, btn.dataset.email || ''));
     });
 
     // Toggle active/disabled

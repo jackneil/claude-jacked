@@ -709,7 +709,7 @@ class TestPrepareAccountDir:
                         prepare_account_dir(account, db)
                         mock_asyncio.run.assert_called_once()
 
-    @pytest.mark.parametrize("block", ["active_unknown", "live_session_holds", "live_store_unreadable"])
+    @pytest.mark.parametrize("block", ["active_unknown", "live_session_holds", "holders_unknown"])
     def test_pre_launch_cc_refresh_fails_closed(self, tmp_path, block):
         """The pre-launch cc refresh uses the same fail-closed gate as the
         loops: no rotation when the active account is unknown or a running

@@ -274,3 +274,69 @@ def test_not_provably_newer_refusal_logs_why_without_values(tmp_path, db, caplog
     assert "last_refresh=equal" in caplog.text
     for value in ("refresh-live-secret", "refresh-other-secret", "dev@example.com", _T2):
         assert value not in caplog.text
+
+
+# --------------------------------------------------------------------------
+# Part C: the store check runs again inside the swap lock
+#
+# The first store check runs before the lock, and the swap can wait up to
+# ~17 s for the lock. A concurrent `codex login` (or an edit of config.toml)
+# in that window can flip the store to "keyring", or under "auto" remove the
+# only file credential. Without a second check the swap then forced "file"
+# over the user's new choice and wrote auth.json.
+# --------------------------------------------------------------------------
+
+
+def _flipping_lock(base, flip_to, seen):
+    """A lock that, while the swap waits for it, flips the store the way a
+    concurrent `codex login` would, then grants the lock."""
+
+    @contextmanager
+    def lock(_base, retries=340):
+        if flip_to == "keyring":
+            _config(base, "keyring")
+        else:  # "auto", and the only file credential is gone
+            _config(base, "auto")
+            (base / "auth.json").unlink()
+        seen["cfg"] = _snapshot(base / "config.toml")
+        seen["root"] = _snapshot(base / "auth.json")
+        yield True
+
+    return lock
+
+
+@pytest.mark.parametrize("flip_to", ["keyring", "auto-no-file"])
+def test_a_store_flipped_while_the_swap_waits_for_the_lock_is_refused(
+    tmp_path, db, monkeypatch, flip_to
+):
+    base = tmp_path / ".codex"
+    _config(base, "file")  # the first check passes on this store
+    _write(base / "auth.json", _blob("acct-B", "refresh-live", _T2))
+    _write(sw.codex_slot_auth_path(1, base), _auth("acct-A"))
+    seen = {}
+    monkeypatch.setattr(sw, "_codex_swap_lock", _flipping_lock(base, flip_to, seen))
+
+    with pytest.raises(CodexSwapError, match="OS keyring|store mode \"auto\""):
+        sw.swap_codex_account(db, 1, base=base)
+
+    assert seen, "the swap reached the lock, so the first check passed"
+    assert _snapshot(base / "config.toml") == seen["cfg"], "config.toml is byte-identical"
+    assert credential_store_mode(base) == ("keyring" if flip_to == "keyring" else "auto")
+    assert _snapshot(base / "auth.json") == seen["root"]
+    assert db.get_active_account_id("codex") is None
+
+
+def test_the_in_lock_refusal_logs_why_without_values(tmp_path, db, monkeypatch, caplog):
+    base = tmp_path / ".codex"
+    _config(base, "file")
+    _write(base / "auth.json", _blob("acct-B", "refresh-live-secret", _T2))
+    _write(sw.codex_slot_auth_path(4, base), _auth("acct-A", email="me@example.com"))
+    monkeypatch.setattr(sw, "_codex_swap_lock", _flipping_lock(base, "keyring", {}))
+
+    with caplog.at_level("WARNING", logger="jacked.codex.switching"):
+        with pytest.raises(CodexSwapError):
+            sw.swap_codex_account(db, 4, base=base)
+
+    assert "Codex swap to account 4 refused: store_mode=keyring" in caplog.text
+    for value in ("refresh-live-secret", "me@example.com", "access-acct-A"):
+        assert value not in caplog.text

@@ -11,7 +11,10 @@ from __future__ import annotations
 
 from unittest import mock
 
+import pytest
+
 from jacked.api import usage_monitor
+from jacked.api.authority_guard import reset_authority_guard_state
 from jacked.credentials.models import SwitchOutcome
 from tests.unit.test_authority_guard_stamped import (
     OWNER_CONFIG,
@@ -22,6 +25,13 @@ from tests.unit.test_authority_guard_stamped import (
     _profile,
     _Sequence,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clean_guard_state():
+    reset_authority_guard_state()
+    yield
+    reset_authority_guard_state()
 
 
 def test_a_login_adoption_arms_the_cooldown_and_marks_sessions_pending():

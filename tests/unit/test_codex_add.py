@@ -217,8 +217,11 @@ def test_ensure_file_storage_stays_top_level(tmp_path):
 # --------------------------------------------------------------------------
 
 def test_add_forces_file_storage_and_imports(db, tmp_path):
+    # "auto" with a live auth.json is a store jacked can switch. A keyring
+    # store with a leftover auth.json is refused instead: see
+    # test_codex_add_guard.py.
     home = _home(
-        tmp_path, auth=_auth_json(), config='cli_auth_credentials_store = "keyring"\n'
+        tmp_path, auth=_auth_json(), config='cli_auth_credentials_store = "auto"\n'
     )
     acct = add_codex_account(db, home=home, run_login=False)
     assert acct["provider"] == "codex"

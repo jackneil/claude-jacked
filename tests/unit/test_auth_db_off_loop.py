@@ -215,9 +215,12 @@ def test_validate_account_reads_and_marks_checking_off_the_loop(monkeypatch):
 
     assert verdict == {"valid": False, "error": "Unexpected HTTP 500"}
     assert loop_tid not in db.threads["get_account"]
-    # The "checking" mark and the final "unknown" mark.
-    assert len(db.threads["update_account"]) == 2
+    # The "checking" mark, then the final "unknown" mark: a compare-and-swap
+    # on the access token that the request sent.
+    assert len(db.threads["update_account"]) == 1
+    assert len(db.threads["update_account_if_unchanged"]) == 1
     assert loop_tid not in db.threads["update_account"]
+    assert loop_tid not in db.threads["update_account_if_unchanged"]
 
 
 # ---------------------------------------------------------------------------

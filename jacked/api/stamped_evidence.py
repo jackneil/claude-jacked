@@ -20,7 +20,6 @@ email address.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Mapping
@@ -33,7 +32,6 @@ OWNER = "owner"
 STAMPED = "stamped"
 AMBIGUOUS = "ambiguous"
 LAST_WRITE_FP_SETTING = "last_authority_write_fp"
-_TOKEN_KEYS = ("refreshToken", "accessToken")
 
 
 # --- the write fingerprint ---------------------------------------------------
@@ -50,9 +48,9 @@ def token_fingerprint(oauth: Any) -> str:
     >>> one == token_fingerprint({"accessToken": "r", "refreshToken": "a"})
     False
     """
-    oauth = oauth if isinstance(oauth, Mapping) else {}
-    raw = "\x1f".join(str(oauth.get(key) or "") for key in _TOKEN_KEYS)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    from jacked.credentials.fingerprint import payload_fingerprint
+
+    return payload_fingerprint(oauth)
 
 
 def last_published_fingerprint(db) -> str | None:
@@ -75,23 +73,22 @@ def is_own_publication(db, payload: Mapping) -> bool:
     return known is not None and known == token_fingerprint(payload.get("claudeAiOauth"))
 
 
-def record_publication(db, account_id: int) -> None:
-    """Keep the fingerprint of the tokens that a committed repair published.
+def record_publication(db, fingerprint: str) -> None:
+    """Keep the fingerprint of the pair that a committed repair published.
 
-    The engine publishes ``build_oauth_data(row)``, so the fingerprint comes
-    from it. A failure is logged and ignored: without the value, the next
-    pass only examines the payload again.
+    The engine reports the fingerprint of the exact payload it wrote
+    (``SwitchResult.published_fingerprint``); a row read after the commit
+    could already hold a newer pair. A failure is logged and ignored:
+    without the value, the next pass only examines the payload again.
     """
-    from jacked.api.credential_helpers import build_oauth_data
-
+    if not fingerprint:
+        return
     try:
-        row = db.get_account(account_id)
-        if row:
-            db.set_setting(LAST_WRITE_FP_SETTING, token_fingerprint(build_oauth_data(row)))
+        db.set_setting(LAST_WRITE_FP_SETTING, fingerprint)
     except Exception as exc:  # noqa: BLE001 - the fingerprint only saves work
         logger.debug(
-            "Account %d: the fingerprint of the published tokens was not kept (%s)",
-            account_id,
+            "The fingerprint of the published tokens (%s) was not kept (%s)",
+            fingerprint[:4],
             type(exc).__name__,
         )
 

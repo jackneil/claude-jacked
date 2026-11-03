@@ -1100,6 +1100,9 @@ def _sync_row(conn, account_id: int, cols: set) -> dict | None:
             "cc_refresh_token",
             "cc_expires_at",
             "cc_refresh_failure_type",
+            # Read by the dead-chain rule: after the invalid_grant clean-up,
+            # these fingerprints are the only record of the condemned tokens.
+            "cc_refresh_failed_token_fp",
             "keeper_state",
         )
         if name in cols

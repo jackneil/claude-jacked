@@ -96,9 +96,11 @@ class _Sequence:
     def __init__(self, *outcomes: SwitchOutcome) -> None:
         self.outcomes = list(outcomes) or [SwitchOutcome.COMMITTED]
         self.calls: list[tuple] = []
+        self.republished: list[tuple] = []
 
-    def __call__(self, db, account, context, operation_id):
+    def __call__(self, db, account, context, operation_id, **repair):
         self.calls.append((account, context, operation_id))
+        self.republished.append((repair.get("republish"), repair.get("expected_digest")))
         outcome = self.outcomes[min(len(self.calls), len(self.outcomes)) - 1]
         return _switch_result(outcome, int(account["id"]))
 
