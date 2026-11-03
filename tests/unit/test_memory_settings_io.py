@@ -126,3 +126,83 @@ def test_invalid_utf8_raises_the_settings_error(tmp_path):
     p.write_bytes(b'{"k": "\xff"}')
     with pytest.raises(SettingsUnreadableError):
         settings_io.read_settings(p)
+
+
+# --------------------------------------------------------------------------- #
+# settings_io.write_settings is the ONE settings.json writer (#99i)
+# --------------------------------------------------------------------------- #
+
+import ast  # noqa: E402
+import re  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_PACKAGE = Path(__file__).resolve().parents[2] / "jacked"
+# A write whose target names the user settings file. ``settings.local.json``
+# (a project file) and the integrity baseline beside it are other files.
+_SETTINGS_TARGET = re.compile(r"settings_path|SETTINGS_JSON|settings\.json|settings_file")
+_WRITE_CALLS = {
+    "write_text", "write_bytes", "atomic_write_text", "atomic_write_bytes", "dump",
+    "open", "replace", "rename", "copy", "copy2", "copyfile", "move",
+}
+_DEST_LAST = {"copy", "copy2", "copyfile", "move", "replace", "rename"}
+
+
+def _settings_writes(source: str) -> list[str]:
+    """Each call in ``source`` that writes to a settings.json target, as text."""
+    tree = ast.parse(source)
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+        if name not in _WRITE_CALLS:
+            continue
+        if name == "open":
+            modes = [*node.args[1:2], *(k.value for k in node.keywords if k.arg == "mode")]
+            if not any(isinstance(m, ast.Constant) and set(str(m.value)) & set("wax+") for m in modes):
+                continue
+        parts = []
+        if isinstance(fn, ast.Attribute) and name in ("write_text", "write_bytes", "replace", "rename"):
+            parts.append(ast.get_source_segment(source, fn.value) or "")
+        if node.args:
+            target = node.args[-1] if name in _DEST_LAST else node.args[0]
+            parts.append(ast.get_source_segment(source, target) or "")
+        text = " ".join(parts)
+        if _SETTINGS_TARGET.search(text) and "local" not in text and "baseline_path" not in text:
+            found.append(f"{name}({text})")
+    return found
+
+
+def test_the_scanner_finds_each_writer_shape():
+    planted = (
+        "settings_path.write_text(json.dumps(x))\n"
+        "atomic_write_text(SETTINGS_JSON, '{}')\n"
+        "with open(home / '.claude' / 'settings.json', 'w') as fh:\n    json.dump(x, fh)\n"
+        "shutil.copy2(tmp, settings_file)\n"
+    )
+    assert len(_settings_writes(planted)) == 4
+    assert _settings_writes("settings_path.read_text()\nopen(settings_path)\n") == []
+
+
+def test_no_module_other_than_settings_io_writes_settings_json():
+    offenders = []
+    for path in sorted(_PACKAGE.rglob("*.py")):
+        if path.name == "settings_io.py" and path.parent.name == "memory":
+            continue
+        for call in _settings_writes(path.read_text(encoding="utf-8")):
+            offenders.append(f"{path.relative_to(_PACKAGE.parent)}: {call}")
+    assert offenders == [], (
+        "settings.json must be written only through jacked.memory.settings_io.write_settings, "
+        "which keeps the integrity baseline current:\n" + "\n".join(offenders)
+    )
+
+
+def test_write_settings_rebaselines_with_its_reason(tmp_path):
+    from jacked import integrity
+
+    p = tmp_path / ".claude" / "settings.json"
+    settings_io.write_settings(p, {"model": "opus"}, reason="unit test")
+
+    assert integrity.check(p) == []
+    assert integrity.load_baseline(p)["log"][-1]["reason"] == "unit test"

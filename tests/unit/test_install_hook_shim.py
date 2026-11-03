@@ -120,4 +120,6 @@ class TestAtomicWrite:
 
         settings_path = tmp_path / "settings.json"
         _write_settings_atomic(settings_path, {"x": 1})
-        assert [p.name for p in tmp_path.iterdir()] == ["settings.json"]
+        # The one writer also keeps the integrity baseline beside it (#99i).
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["jacked", "settings.json"]
+        assert [p.name for p in (tmp_path / "jacked").iterdir()] == ["integrity.json"]

@@ -613,6 +613,38 @@ function _memoryLoadNotes(h) {
         .join('');
 }
 
+// The hook and settings integrity panel (#99i). Read-only: it shows the state
+// that GET /api/features reports and never changes it. Accepting a change is a
+// terminal command, so a click in the dashboard can never approve a hook that
+// something else added.
+function _integrityPanel(integ) {
+    if (!integ || typeof integ.state !== 'string') return '';
+    const wrap = (body, tone) => `
+        <div class="mt-3 p-3 rounded border ${tone}" data-integrity-panel>${body}</div>`;
+    if (integ.state === 'ok') {
+        return wrap(`<div class="text-xs text-slate-400">Hook and settings integrity: OK (baseline ${escapeHtml(integ.baseline_time || 'unknown')})</div>`,
+            'border-slate-700/50 bg-slate-900/50');
+    }
+    if (integ.state === 'drift') {
+        const lines = Array.isArray(integ.lines) ? integ.lines : [];
+        const count = lines.length;
+        const items = lines
+            .map(l => `<li class="font-mono text-xs text-yellow-200 break-all">${escapeHtml(l)}</li>`)
+            .join('');
+        return wrap(`
+            <div class="text-sm text-yellow-300">Hook and settings integrity: ${count} change${count === 1 ? '' : 's'} outside jacked</div>
+            <ul class="mt-2 space-y-1">${items}</ul>
+            <div class="text-xs text-slate-400 mt-2">Review each change. If you made it, run <code class="text-slate-300">jacked integrity accept</code> in a terminal.</div>`,
+            'border-yellow-600/50 bg-yellow-900/20');
+    }
+    if (integ.state === 'no_baseline') {
+        return wrap('<div class="text-xs text-slate-400">Hook and settings integrity: no baseline yet. jacked makes one at the next session start.</div>',
+            'border-slate-700/50 bg-slate-900/50');
+    }
+    return wrap('<div class="text-xs text-slate-400">Hook and settings integrity: not checked.</div>',
+        'border-slate-700/50 bg-slate-900/50');
+}
+
 function _renderFeatureFilter(placeholder) {
     return `
         <div class="mb-4">
@@ -780,6 +812,7 @@ async function renderFeaturesTab(container) {
                     <div class="space-y-2">
                         ${hookRows}
                     </div>
+                    ${_integrityPanel(features.integrity)}
                 </div>
 
                 ${dcrEngineSection}

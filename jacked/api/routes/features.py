@@ -11,8 +11,9 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from jacked import integrity
 from jacked.memory import load_budget
-from jacked.memory.settings_io import SettingsUnreadableError
+from jacked.memory.settings_io import SettingsUnreadableError, write_settings
 from jacked.memory.vault import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -307,14 +308,12 @@ def _settings_unreadable_response() -> JSONResponse:
 
 
 def _write_settings_json(data: dict):
-    """Write ~/.claude/settings.json through the shared atomic writer.
+    """Write settings.json through ``settings_io.write_settings``, the one writer.
 
-    The CLI, the dashboard, and hook processes can all write this same file;
-    the shared writer gives each one its own temp file and a Windows-aware
-    replace. That replace can pause to retry, so a route calls this in a
-    worker thread (``await asyncio.to_thread``) with ``_settings_lock`` held.
+    It is atomic and keeps the integrity baseline current (#99i). A route calls
+    this in a worker thread with ``_settings_lock`` held.
     """
-    atomic_write_text(SETTINGS_JSON, json.dumps(data, indent=2))
+    write_settings(SETTINGS_JSON, data, reason="dashboard")
 
 
 def _get_valid_agent_names() -> list[str]:
@@ -554,6 +553,7 @@ async def list_features():
         "agents": agents, "commands": commands, "hooks": hooks,
         "knowledge": knowledge,
         "settings_unreadable": settings_unreadable,
+        "integrity": await asyncio.to_thread(integrity.status, SETTINGS_JSON),
     }
 
 

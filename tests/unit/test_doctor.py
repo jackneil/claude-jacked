@@ -513,3 +513,60 @@ def test_doctor_asks_launchctl_once_for_both_launchd_checks(
     else:
         assert warnings == []
         assert "The launchd job is loaded but never ran." in text
+
+
+# --- hook and settings integrity line (#99i) ---------------------------------
+
+@pytest.fixture
+def integrity_home(tmp_path, monkeypatch):
+    """A scratch jacked home, and a free port so doctor never probes a live service."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("JACKED_HOME", str(home))
+    monkeypatch.setattr("jacked.service.process.is_port_available", lambda *a, **k: True)
+    return home
+
+
+def test_doctor_prints_the_integrity_ok_line(integrity_home):
+    from jacked import integrity
+    from jacked.cli import main
+    from jacked.memory import settings_io
+
+    path = settings_io.settings_path(integrity_home)
+    settings_io.write_settings(path, {})
+    time = integrity.load_baseline(path)["log"][-1]["time"]
+
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert f"Hook/settings integrity: OK (baseline {time})" in result.output
+
+
+def test_doctor_prints_each_integrity_finding_unwrapped(integrity_home):
+    import json
+
+    from jacked.cli import main
+    from jacked.memory import settings_io
+
+    path = settings_io.settings_path(integrity_home)
+    settings_io.write_settings(path, {})
+    path.write_text(json.dumps({"hooks": {"UserPromptSubmit": [
+        {"hooks": [{"type": "command", "command": "python3 /tmp/payload.py"}]},
+    ]}}), encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert "Hook/settings integrity: 1 change outside jacked" in result.output
+    assert ("  jacked integrity: settings.json changed outside jacked; "
+            "UserPromptSubmit hook added: python3 /tmp/payload.py") in result.output
+    assert "  Review each change. If you made it, run: jacked integrity accept" in result.output
+
+
+def test_doctor_without_a_baseline_says_so(integrity_home):
+    from jacked.cli import main
+
+    result = CliRunner().invoke(main, ["doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert "Hook/settings integrity: no baseline yet" in result.output

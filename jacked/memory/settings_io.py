@@ -96,8 +96,14 @@ def _read_text(path: Path) -> str:
         raise SettingsUnreadableError(f"{path} is not valid UTF-8: {e}") from e
 
 
-def write_settings(path: Path | str, data: dict) -> None:
+def write_settings(path: Path | str, data: dict, *, reason: str = "jacked settings write") -> None:
     """Atomically write settings.json, then verify it re-reads as a JSON object.
+
+    This is the one jacked writer of settings.json (a static test holds every
+    other module to it). After a verified write it calls
+    ``jacked.integrity.rebaseline`` with ``reason`` and a snapshot from before
+    the write, so the integrity baseline takes in this change and only this
+    change. An integrity failure is logged and never blocks the write.
 
     The atomic write itself (writer-unique tmp + the shared replace) is delegated
     to the shared ``vault.atomic_write_text`` (``jacked.atomic_io``) so every
@@ -109,6 +115,7 @@ def write_settings(path: Path | str, data: dict) -> None:
     from jacked.memory import vault as vault_mod
 
     path = Path(path)
+    before = _integrity_snapshot(path)
     vault_mod.atomic_write_text(path, json.dumps(data, indent=2))
 
     try:
@@ -117,3 +124,32 @@ def write_settings(path: Path | str, data: dict) -> None:
         raise SettingsUnreadableError(f"post-write verification failed for {path}: {e}") from e
     if not isinstance(verify, dict):
         raise SettingsUnreadableError(f"post-write verification failed for {path}: not a JSON object")
+    _rebaseline(path, reason, before)
+
+
+def _integrity_snapshot(path: Path) -> dict | None:
+    """The integrity snapshot from before a write, or None when it cannot be taken."""
+    from jacked import integrity
+
+    try:
+        return integrity.snapshot(path)
+    except Exception as e:  # noqa: BLE001 -- the tripwire must never block a settings write
+        logger.warning("settings: integrity snapshot before the write failed (%s)", type(e).__name__)
+        return None
+
+
+def _rebaseline(path: Path, reason: str, before: dict | None) -> None:
+    """Rebaseline after a verified write. A failure goes to the log, never up.
+
+    With no snapshot from before the write, the baseline stays as it is: this
+    write then shows as a change, which is loud, and a full rebaseline would
+    silently take in any earlier change from outside jacked.
+    """
+    from jacked import integrity
+
+    if before is None:
+        return
+    try:
+        integrity.rebaseline(path, reason=reason, previous=before)
+    except Exception as e:  # noqa: BLE001 -- the tripwire must never block a settings write
+        logger.warning("settings: integrity rebaseline after the write failed (%s)", type(e).__name__)
