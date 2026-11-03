@@ -47,7 +47,7 @@ Forged briefs follow the Ledger contract (see the engine and `jacked/data/comman
   (Deliberately left unconfigured: `.claude/` is committed to this **public** repo, so personal Asana workspace/project/user GIDs are intentionally NOT baked in here. The 2026-11-03 probe also found no connected Asana MCP, no CLI and no token in the environment.)
 
 <!-- Staleness fingerprint - the engine compares these against the live repo on each run -->
-- **Generated at commit**: 34ceb47d71d4af6a20ae85389a16a0a0b07bdf04
+- **Generated at commit**: d8ac48d23fdc4b812a0822c0318fe3c97b530e00
 - **Detected stack**: pyproject.toml
 
 ## Config Staleness Check
