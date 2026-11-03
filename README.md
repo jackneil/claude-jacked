@@ -217,7 +217,7 @@ jacked claude udifi --resume       # unique email substring + Claude arguments
 
 The launcher prepares a per-account `CLAUDE_CONFIG_DIR` and passes every remaining argument through to Claude Code. That records the intended scoped target, but it does not claim the provider runtime used that identity until a certified capability can prove it. Session cards therefore show **Started as**, **Observed configuration**, **Pending next activity**, and **Runtime unverified** separately. A default-credential change marks known global sessions pending; the next hook activity refreshes configuration evidence, not proof of which identity served the provider request.
 
-Auto-swap still evaluates account headroom and records a recommendation. It performs the credential mutation only when a certified cooperative transaction engine and writer fence are installed for the exact runtime. Without that capability, it stays recommendation-only.
+Auto-swap still evaluates account headroom and records a recommendation. It performs the credential mutation only when a certified cooperative transaction engine and writer fence are installed for the exact runtime. Without that capability, it stays recommendation-only. While a swap stays warranted, jacked records each recommendation once, and the dashboard shows its banner once. The swap history keeps the record.
 
 ### Plans and usage windows
 

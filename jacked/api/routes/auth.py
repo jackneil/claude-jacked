@@ -180,11 +180,11 @@ class AccountUsage(BaseModel):
 class KeeperState(BaseModel):
     """The window keeper's last verdict for an account (dashboard reason text).
 
-    The token fingerprint the keeper stores is deliberately not exposed.
-    """
+    The token fingerprint the keeper stores is deliberately not exposed."""
 
     last_ping_at: Optional[int] = None
     last_status: Optional[str] = None
+    pending_windows: Optional[list[str]] = None
     error_type: Optional[str] = None
     request_id: Optional[str] = None
     consecutive_auth_failures: int = 0

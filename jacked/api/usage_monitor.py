@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from jacked.api import swap_recommendation
 from jacked.api.keeper_confirmation import (
     _KEEPER_CONFIRM_MIN_SECONDS as _KEEPER_CONFIRM_MIN_SECONDS,
     _PENDING_REASON_TEXT as _PENDING_REASON_TEXT,
@@ -183,6 +184,7 @@ def reset_locks() -> None:
     _last_committed_swap_time = 0.0
     _same_tier_advisory_last = 0.0
     _drain_advisor_last_sent.clear()
+    swap_recommendation.reset()
 
 
 def note_external_swap() -> None:
@@ -1007,33 +1009,9 @@ async def _execute_swap(
     # not safe for a background mutation.
     transaction_engine = transaction_engine or _certified_auto_swap_engine(db)
     if transaction_engine is None:
-        await asyncio.to_thread(
-            db.record_swap,
-            from_account_id=active_acct_id,
-            to_account_id=target["id"],
-            reason=reason,
-            trigger=trigger,
-            from_5h=usage_5h,
-            from_7d=usage_7d,
-            to_5h=target.get("cached_usage_5h"),
-            to_7d=target.get("cached_usage_7d"),
-            status="recommendation_only",
+        await swap_recommendation.recommend(
+            db, active_acct_id, target, reason, trigger, usage_5h, usage_7d, ws_registry
         )
-        logger.info(
-            "Auto-swap recommendation only: account %d -> %d; no certified "
-            "cooperative credential capability/writer fence is installed",
-            active_acct_id,
-            target["id"],
-        )
-        if ws_registry:
-            await ws_registry.broadcast(
-                "auto_swap_recommended",
-                {
-                    "from_account_id": active_acct_id,
-                    "to_account_id": target["id"],
-                    "reason": reason,
-                },
-            )
         return False
 
     # Arm the in-memory attempt cooldown before invoking the transactional
@@ -1724,6 +1702,7 @@ async def active_account_poll_loop(app):
             )
 
             if reason is None:
+                swap_recommendation.end_episode()
                 _decision_action = "stay"
                 if best is None:
                     _decision_trigger = "tick"
@@ -1847,17 +1826,18 @@ async def active_account_poll_loop(app):
                 logger.debug("Active poll: %s", _decision_reason)
             else:
                 trigger = _trigger_for_reason(reason)
-                logger.info(
-                    "Auto-swap: switching from account %d (5h=%s) to "
-                    "account %d (5h=%s) — %s [%s]",
-                    active_acct_id,
-                    _pct_text(usage_5h),
-                    best["id"],
-                    _pct_text(best.get("cached_usage_5h")),
-                    reason,
-                    trigger,
-                )
                 transaction_engine = _certified_auto_swap_engine(db)
+                if transaction_engine is not None:
+                    logger.info(
+                        "Auto-swap: switching from account %d (5h=%s) to "
+                        "account %d (5h=%s) — %s [%s]",
+                        active_acct_id,
+                        _pct_text(usage_5h),
+                        best["id"],
+                        _pct_text(best.get("cached_usage_5h")),
+                        reason,
+                        trigger,
+                    )
                 swap_committed = await _execute_swap(
                     db,
                     active_acct_id,

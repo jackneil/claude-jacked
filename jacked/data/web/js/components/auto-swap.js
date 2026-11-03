@@ -116,25 +116,34 @@ function renderSwapPauseState(s) {
     `;
 }
 
+// What the panel's controls show for stored settings: the render and the
+// restore after a failed save read the same defaults.
+function _swapFormValues(s) {
+    return {
+        autoSwapEnabled: s.auto_swap_enabled || false,
+        fiveHourRules: s.auto_swap_5h_rules_enabled || false,
+        warn5h: s.auto_swap_5h_warning ?? 80,
+        crit5h: s.auto_swap_5h_critical ?? 90,
+        checkInterval: s.usage_check_interval ?? 300,
+        wkEnabled: s.window_keeper_enabled || false,
+        activeStart: s.window_keeper_active_start || '06:00',
+        activeEnd: s.window_keeper_active_end || '23:00',
+        preWake: s.window_keeper_prewake || '04:00',
+    };
+}
+
 function renderAutoSwapPanel() {
     const s = window.jackedState.swapSettings || {};
-
-    const autoSwapEnabled = s.auto_swap_enabled || false;
-    const fiveHourRules = s.auto_swap_5h_rules_enabled || false;
+    const {
+        autoSwapEnabled, fiveHourRules, warn5h, crit5h, checkInterval,
+        wkEnabled, activeStart, activeEnd, preWake,
+    } = _swapFormValues(s);
     // While the 5-hour rules are off, the two 5-hour sliders change nothing.
     const fiveHourSliderOff = fiveHourRules ? '' : ' disabled';
     const fiveHourRowClass = fiveHourRules ? '' : ` class="${SWAP_5H_DIM_CLASS}"`;
-    const warn5h = s.auto_swap_5h_warning ?? 80;
-    const crit5h = s.auto_swap_5h_critical ?? 90;
-    const checkInterval = s.usage_check_interval ?? 300;
 
     const swapsLast24h = window.jackedState.swapsLast24h;
     const counterText = swapsLast24h == null ? '' : `${swapsLast24h} swaps / 24h`;
-
-    const wkEnabled = s.window_keeper_enabled || false;
-    const activeStart = s.window_keeper_active_start || '06:00';
-    const activeEnd = s.window_keeper_active_end || '23:00';
-    const preWake = s.window_keeper_prewake || '04:00';
 
     return `
         <div id="swap-exhaustion-banner" class="hidden mb-3"></div>
@@ -764,6 +773,9 @@ function showSameTierAdvisory(data) {
 // resume). A save whose response the server read before such a change must
 // not undo it (_saveSwapSettings).
 let _swapPauseEpoch = 0;
+// Counts the edits of the panel's controls: a failed save restores the controls
+// only when no edit came after it.
+let _swapEditEpoch = 0;
 
 // Render the pause block again from window.jackedState.swapSettings, in
 // place, and bind its new pause menu or Resume button.
@@ -849,6 +861,7 @@ function bindAutoSwapEvents() {
         const el = document.getElementById(id);
         if (!el) continue;
         el.addEventListener('change', () => {
+            _swapEditEpoch++;
             clearTimeout(saveTimer);
             saveTimer = setTimeout(() => _saveSwapSettings(), 400);
         });
@@ -862,6 +875,29 @@ function _apply5hRulesState(enabled) {
         const row = document.getElementById(rowId);
         if (row) row.classList.toggle(SWAP_5H_DIM_CLASS, !enabled);
     }
+}
+
+// Put every control back to the stored settings. A save that failed (a 403
+// from the remote-access gate, a dropped connection) changed nothing on the
+// server, so a control that stays flipped would show a state that is not real.
+function _restoreSwapControls() {
+    const v = _swapFormValues(window.jackedState.swapSettings || {});
+    const setProp = (id, prop, value) => {
+        const el = document.getElementById(id);
+        if (el) el[prop] = value;
+    };
+    setProp('chk-auto-swap', 'checked', v.autoSwapEnabled);
+    setProp('chk-swap-5h-rules', 'checked', v.fiveHourRules);
+    setProp('rng-warn-5h', 'value', String(v.warn5h));
+    setProp('lbl-warn-5h', 'textContent', v.warn5h + '%');
+    setProp('rng-crit-5h', 'value', String(v.crit5h));
+    setProp('lbl-crit-5h', 'textContent', v.crit5h + '%');
+    setProp('sel-check-interval', 'value', String(v.checkInterval));
+    setProp('chk-window-keeper', 'checked', v.wkEnabled);
+    setProp('inp-active-start', 'value', v.activeStart);
+    setProp('inp-active-end', 'value', v.activeEnd);
+    setProp('inp-pre-wake', 'value', v.preWake);
+    _apply5hRulesState(v.fiveHourRules);
 }
 
 function _bindSliderLabel(sliderId, labelId) {
@@ -889,6 +925,7 @@ async function _saveSwapSettings() {
         window_keeper_prewake: document.getElementById('inp-pre-wake')?.value || '04:00',
     };
     const pauseEpoch = _swapPauseEpoch;
+    const editEpoch = _swapEditEpoch;
 
     try {
         const stored = await api.put('/api/settings/swap-settings', settings);
@@ -904,6 +941,8 @@ async function _saveSwapSettings() {
         showToast('Settings saved', 'success', 2000);
     } catch (e) {
         console.error('Failed to save swap settings:', e);
+        // An edit made during this save has its own save coming: keep it.
+        if (editEpoch === _swapEditEpoch) _restoreSwapControls();
         showToast(e.message || 'Failed to save settings', 'error');
     }
 }

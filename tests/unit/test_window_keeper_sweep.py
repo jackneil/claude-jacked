@@ -2440,6 +2440,66 @@ class TestWindowReadEvidence:
             "ping_pending", ["7d"], "read_no_window",
         )
 
+    @pytest.mark.parametrize(
+        "week",
+        [pytest.param(None, id="null-window"),
+         pytest.param({"utilization": None, "resets_at": None}, id="null-percent")],
+    )
+    def test_a_poll_that_clears_the_week_never_confirms_it(self, db, week):
+        """A later 200 with seven_day null says that NO weekly window is open.
+        The clear used to move the stamp, and the stamp confirmed it open."""
+        aid, st = _pending_reset_less_week(db, both=False)
+        assert _real_poll(db, aid, {**_ultra_payload(), "seven_day": week}) is False
+        row = db.get_account(aid)
+        assert (row["cached_usage_7d"], row["cached_7d_read_at"]) == (None, None)
+        after = _state(db, aid)
+        assert (after["last_status"], after["pending_windows"]) == ("ping_pending", ["7d"])
+
+    def test_a_clear_after_an_accepted_read_takes_the_evidence_away(self, db):
+        """An accepted read and then a clear, both after the ping: the row now
+        says no window is open, and the older stamp must not contradict it."""
+        aid, st = _pending_reset_less_week(db, both=False)
+        db.update_account_usage_cache(aid, seven_day=41.0, clear_seven_day_reset=True)
+        # The write stamps with the wall clock, one minute after the moved ping.
+        assert kc._pending_confirmed(db.get_account(aid), st, ["7d"]) is True
+        db.update_account_usage_cache(aid, clear_seven_day=True)
+        assert kc._pending_confirmed(db.get_account(aid), st, ["7d"]) is False
+
+    def test_a_read_back_that_cleared_the_week_is_no_evidence(self, db):
+        """The same at the keeper's own read-back: the read landed, it reports
+        no weekly window, and the ping carried no window headers: pending."""
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 7200)
+        payload = {**_ultra_payload(), "seven_day": None}
+
+        async def _read_back(account_id, db_, **_kw):
+            db_.update_account_usage_cache(
+                account_id, raw=payload, **auth_mod.usage_cache_updates(payload)
+            )
+            return payload
+
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_read_back))
+        st = _state(db, aid)
+        assert (st["last_status"], st["pending_windows"], st["pending_reason"]) == (
+            "ping_pending", ["7d"], "read_no_window",
+        )
+
+    @pytest.mark.parametrize(
+        "stamp, confirmed",
+        [(100.5, True), (100.50001, True), (100.49999, False), (None, False)],
+    )
+    def test_a_read_back_stamp_equal_to_the_ping_time_counts(self, stamp, confirmed):
+        """The read-back runs after the ping in program order, and a coarse
+        clock (Windows ticks about every 15 ms) can give both the same reading.
+        Bare pytest runs no doctests of its own: this pins the `>=` directly."""
+        assert kc._window_read_after({"cached_7d_read_at": stamp}, "7d", 100.5) is confirmed
+
+    def test_the_confirmation_module_doctests_pass(self):
+        import doctest
+
+        results = doctest.testmod(kc)
+        assert results.failed == 0
+        assert results.attempted > 0
+
     def test_the_deadline_warning_names_only_the_window_still_not_visible(self, db, caplog):
         """Per-window evidence can confirm one window of two: the 5h reading
         shows open, the weekly reading was rejected. The WARNING at the
