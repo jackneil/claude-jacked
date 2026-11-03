@@ -386,7 +386,8 @@ def session_start_block(cwd, home, env=None) -> str:
             # only reads a memory folder that such a file chose.
             read_only = "set by a repo-local settings file"
             logger.debug("integrity: a repo-local autoMemoryDirectory chose %s, so jacked only reads it", memory.name)
-        found = quarantine.quarantine_file(memory, today=datetime.now().date().isoformat(), read_only=read_only)
+        found = quarantine.quarantine_file(
+            memory, today=datetime.now().date().isoformat(), read_only=read_only, home=home)
     except Exception as exc:  # noqa: BLE001 -- a failed move must never hide the settings check
         logger.warning("integrity: memory quarantine failed (%s)", type(exc).__name__)
         lines.append(f"jacked integrity: memory quarantine failed ({type(exc).__name__}); MEMORY.md left unchanged")

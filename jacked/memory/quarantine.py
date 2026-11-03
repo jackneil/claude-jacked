@@ -13,22 +13,21 @@ attack shapes only, so a note about an attack, or a user's own rule, stays.
 """
 from __future__ import annotations
 
-import contextlib
 import errno
 import hashlib
 import logging
 import os
-import secrets
 import stat
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from jacked.atomic_io import atomic_write_bytes
+from jacked.memory.claude_paths import project_dir_name
 from jacked.memory.injection_shapes import SHAPES as SHAPES
 from jacked.memory.injection_shapes import _physical_lines
 from jacked.memory.injection_shapes import line_shape as line_shape
 from jacked.memory.injection_shapes import suspect_lines as suspect_lines
+from jacked.memory.vault import jacked_home
 from jacked.regular_file import FileTooLargeError, read_regular
 
 logger = logging.getLogger(__name__)
@@ -70,9 +69,6 @@ def quarantine_path(memory: Path, today: str) -> Path:
     return memory.with_name(f"{memory.name}.quarantine-{today}.md")
 
 
-#: A quarantine lock older than this is from a session that stopped, so it is
-#: removed. A real move takes milliseconds.
-LOCK_STALE_SECONDS = 60
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _BINARY = getattr(os, "O_BINARY", 0)
@@ -157,101 +153,22 @@ def _append_archive(target: Path, memory: Path, today: str, entries: bytes) -> N
         os.close(fd)
 
 
-def lock_path(memory: Path) -> Path:
-    """The lock file beside ``memory`` that one move holds.
+def lock_path(memory: Path, home: Path | str | None = None) -> Path:
+    """The lock file that one move of ``memory`` holds.
 
-    >>> lock_path(Path("/m/MEMORY.md")).name
-    '.MEMORY.md.jacked-quarantine.lock'
+    The file is in jacked's own folder, ``<jacked home>/.claude/jacked/locks``,
+    never in the memory folder. Its name is the Claude Code project name of
+    the memory folder (``jacked.project_slug``), so each folder has its own lock.
+
+    >>> lock = lock_path(Path("/m/x/MEMORY.md"), Path("/h"))
+    >>> lock.parent.as_posix()
+    '/h/.claude/jacked/locks'
+    >>> lock.name.startswith("quarantine-") and lock.name.endswith("-m-x.lock")
+    True
     """
-    return memory.with_name(f".{memory.name}.jacked-quarantine.lock")
-
-
-def _take_lock(lock: Path, memory: Path) -> int | None:
-    """Create ``lock`` (``O_CREAT | O_EXCL``) and return its inode number.
-
-    Returns None when another session holds the lock. A lock older than
-    ``LOCK_STALE_SECONDS`` is removed once and taken again. The removal is a
-    rename to a name that only this taker uses, so when two sessions see the
-    same stale lock, only one rename takes it. A late rename that takes a
-    lock other than the stale one (another session made a fresh lock in the
-    meantime) puts that lock back and stops. After the create, the lock at
-    the path must be the file that this taker made.
-    """
-    for attempt in range(2):
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _NOFOLLOW | _BINARY, 0o600)
-        except FileExistsError:
-            try:
-                st = os.lstat(lock)
-            except FileNotFoundError:
-                continue
-            age = time.time() - st.st_mtime
-            if attempt or age <= LOCK_STALE_SECONDS or not _remove_stale(lock, memory, st.st_ino, age):
-                break
-            continue
-        try:
-            ino = os.fstat(fd).st_ino
-        finally:
-            os.close(fd)
-        with contextlib.suppress(FileNotFoundError):
-            if os.lstat(lock).st_ino == ino:
-                return ino
-        break
-    logger.debug("quarantine: another jacked session is moving lines from %s, so this pass stops", memory.name)
-    return None
-
-
-def _remove_stale(lock: Path, memory: Path, stale_ino: int, age: float) -> bool:
-    """Remove the stale ``lock`` with inode ``stale_ino``. False when another taker was first."""
-    aside = lock.with_name(f"{lock.name}.stale.{os.getpid()}.{secrets.token_hex(4)}")
-    try:
-        os.rename(lock, aside)
-    except FileNotFoundError:
-        return True  # another taker removed it; try the create again
-    if os.lstat(aside).st_ino != stale_ino:
-        # This rename took a fresh lock of another session: put it back.
-        # The link never replaces a lock that a third session made at the path.
-        try:
-            os.link(aside, lock)
-        except FileExistsError:
-            logger.debug("quarantine: a newer lock is beside %s, so jacked keeps it", memory.name)
-        except OSError as exc:
-            # A filesystem without hard links (exFAT, FAT): rename the lock back.
-            logger.debug("quarantine: cannot link the lock back beside %s (%s), so jacked renames it back",
-                         memory.name, type(exc).__name__)
-            if _rename_back(aside, lock, memory):
-                return False
-        os.unlink(aside)
-        return False
-    logger.debug("quarantine: the lock beside %s is %d s old, so jacked removes it", memory.name, age)
-    os.unlink(aside)
-    return True
-
-
-def _rename_back(aside: Path, lock: Path, memory: Path) -> bool:
-    """Rename the grabbed lock ``aside`` back to ``lock``. True when it is back.
-
-    A rename can replace a file on POSIX, so it runs only when no lock is at
-    the path. A third session that creates a lock between the check and the
-    rename loses its lock; the window is two system calls on a filesystem
-    without hard links only.
-    """
-    if os.path.lexists(lock):
-        logger.debug("quarantine: a newer lock is beside %s, so jacked keeps it", memory.name)
-        return False
-    try:
-        os.rename(aside, lock)
-    except OSError as exc:
-        logger.debug("quarantine: cannot rename the lock back beside %s (%s)", memory.name, type(exc).__name__)
-        return False
-    return True
-
-
-def _release_lock(lock: Path, ino: int) -> None:
-    """Remove ``lock`` only when it is still the lock with inode ``ino``."""
-    with contextlib.suppress(FileNotFoundError):
-        if os.lstat(lock).st_ino == ino:
-            os.unlink(lock)
+    home = jacked_home() if home is None else Path(home)
+    name = project_dir_name(os.path.abspath(memory.parent))
+    return home / ".claude" / "jacked" / "locks" / f"quarantine-{name}.lock"
 
 
 def _fingerprint(path: Path) -> tuple | None:
@@ -293,7 +210,9 @@ def _not_moved(memory: Path, count: int, reason: str) -> Moved:
     return Moved(path=None, count=count, reason=reason)
 
 
-def quarantine_file(memory: Path | str, *, today: str, read_only: str = "") -> Moved | None:
+def quarantine_file(
+    memory: Path | str, *, today: str, read_only: str = "", home: Path | str | None = None,
+) -> Moved | None:
     """Move each suspect line of ``memory`` to its dated quarantine file.
 
     Returns None when the file is missing, not a regular file, too large to
@@ -312,9 +231,13 @@ def quarantine_file(memory: Path | str, *, today: str, read_only: str = "") -> M
     replace, the memory file must still be the bytes that were read; when
     another process changed it, the pass returns None and the file stays as
     it is. The archive then keeps a copy, and the next pass appends the line
-    again: a duplicate archive entry loses nothing. Both writes go to disk (fsync). The memory file keeps every
-    other line byte for byte. The log names the file, the reason and the
-    line count, never the content and never a link target.
+    again: a duplicate archive entry loses nothing. Both writes go to disk
+    (fsync). The memory file keeps every other line byte for byte.
+
+    One pass at a time holds the lock of the memory folder (``lock_path``,
+    under ``home``, default the jacked home). A pass that finds the lock
+    held returns None at once and never waits. The log names the file, the
+    reason and the line count, never the content and never a link target.
     """
     memory = Path(memory)
     target = quarantine_path(memory, today)
@@ -350,11 +273,22 @@ def quarantine_file(memory: Path | str, *, today: str, read_only: str = "") -> M
         return _not_moved(memory, count, reason)
 
     entries = _entries(lines, shapes)
-    lock = lock_path(memory)
-    held = _take_lock(lock, memory)
-    if held is None:
-        return None
-    try:
+    # The kernel lock (flock, or msvcrt on Windows) is taken without a wait.
+    # The kernel drops it when its holder exits, also on a crash, so a lock
+    # is never stale. A pass that cannot take it stops; the next session
+    # start tries again.
+    from jacked.credentials.lease import REFUSAL_HELD, FileSwitchLease
+
+    lease = FileSwitchLease(lock_path(memory, home))
+    with lease.acquire() as held:
+        if not held:
+            if lease.refusal == REFUSAL_HELD:
+                logger.debug("quarantine: another jacked session holds the quarantine lock for %s, "
+                             "so this pass stops", memory.name)
+            else:
+                logger.warning("quarantine: jacked cannot take the quarantine lock for %s, so this pass "
+                               "moves nothing; the next session start tries again", memory.name)
+            return None
         # Another process (Claude Code, a second session) can append to the
         # memory file after the read. Write only when the file is still the
         # bytes that were read; else the next session start tries again.
@@ -390,8 +324,6 @@ def quarantine_file(memory: Path | str, *, today: str, read_only: str = "") -> M
                 "it" if count == 1 else "them",
             )
             return None
-    finally:
-        _release_lock(lock, held)
 
     logger.warning(
         "quarantine: moved %d line%s from %s to %s",
