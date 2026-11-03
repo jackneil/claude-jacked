@@ -27,11 +27,9 @@ from jacked.version_check import check_version_cached
 
 logger = logging.getLogger(__name__)
 
-# PIL and pystray are guarded separately: icon rendering is pure Pillow and
-# works headless (the mark renderer lives in jacked.service.icon), while
-# pystray needs a display — it resolves its GUI backend at import time, and
-# on a headless box (no $DISPLAY) that raises Xlib.error.DisplayNameError,
-# not ImportError.
+# PIL and pystray are guarded separately. Icon rendering is pure Pillow and
+# works headless (the mark renderer lives in jacked.service.icon). pystray
+# selects its GUI backend at import time, see _import_pystray.
 try:
     from PIL import Image, ImageDraw
 
@@ -39,12 +37,42 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
-try:
-    import pystray
 
-    _TRAY_AVAILABLE = _PIL_AVAILABLE
-except Exception:
-    _TRAY_AVAILABLE = False
+def _import_pystray():
+    """Import pystray. Return ``(module, None)``, or ``(None, failure)``.
+
+    pystray selects its GUI backend at import time, and its backend
+    selector catches only ImportError. Other errors come out of
+    ``import pystray``:
+
+    - On Linux, when PyGObject loads but the GTK 3 typelib or both
+      AppIndicator typelibs (AppIndicator3, AyatanaAppIndicator3) are
+      missing, the AppIndicator backend raises ValueError. pystray does
+      not try its GTK or Xorg backend then.
+    - On a computer with no display, the Xorg backend raises
+      ``Xlib.error.DisplayNameError``.
+
+    A missing package (ImportError) gives no failure text, because the
+    install message of :func:`check_tray_deps` tells what to do. Any other
+    error gives ``"<class name>: <message>"``. :func:`check_tray_deps`
+    logs that text and names it in its abort message when it stops the
+    start. It cannot be logged here: the module is imported before
+    ``ServiceRunner.run`` installs the tray log.
+    """
+    try:
+        import pystray as module
+    except ImportError:
+        return None, None
+    except Exception as exc:  # noqa: BLE001 - pystray raises more than ImportError
+        return None, f"{type(exc).__name__}: {exc}"
+    return module, None
+
+
+_pystray_module, _PYSTRAY_LOAD_FAILURE = _import_pystray()
+if _pystray_module is not None:
+    pystray = _pystray_module
+_TRAY_AVAILABLE = _PIL_AVAILABLE and _pystray_module is not None
+del _pystray_module
 
 try:
     import uvicorn
@@ -172,9 +200,36 @@ def _stop_signals(handler):
                 )
 
 
+# Every message about a pystray load error points at the README section that
+# tells what the Linux tray needs (`jacked install` prints it too).
+LINUX_TRAY_NOTES_POINTER = (
+    'See "Linux tray notes" in the jacked README: '
+    "https://github.com/jackneil/claude-jacked#linux-tray-notes"
+)
+
+
 def check_tray_deps() -> None:
-    """Raise with install instructions if tray deps missing."""
+    """Stop the start when the tray cannot run, and tell the reason.
+
+    When the pystray import failed with an error that is not ImportError
+    (a missing typelib, no display), a reinstall cannot fix it. In that
+    case, log the error at WARNING, and stop with a message that names the
+    error and the README Linux tray notes. ``ServiceRunner.run`` installs
+    the tray log before it runs this check, so ``~/.claude/jacked-tray.log``
+    tells why the start stopped. A missing package keeps the install
+    instructions.
+    """
     if not _TRAY_AVAILABLE:
+        if _PYSTRAY_LOAD_FAILURE is not None:
+            logger.warning(
+                "Tray: pystray could not load (%s), so the service does not "
+                "start. See the README Linux tray notes.",
+                _PYSTRAY_LOAD_FAILURE,
+            )
+            raise SystemExit(
+                "The jacked service cannot start: pystray could not load "
+                f"({_PYSTRAY_LOAD_FAILURE}).\n{LINUX_TRAY_NOTES_POINTER}"
+            )
         raise SystemExit(
             "Service mode requires the [tray] extra.\n"
             'Install it with: uv tool install "claude-jacked[tray]" --force'
@@ -1525,21 +1580,10 @@ class ServiceRunner:
         self._on_stop()
 
     def _setup(self, icon: "pystray.Icon"):
-        """pystray setup callback — runs after icon appears."""
+        """pystray setup callback: runs after the icon appears."""
         # Probe the backend before any step that can fail, so the result is
-        # always logged and reported. With no menu (pystray Xorg), only the
-        # left click works: it runs the default item, Open Dashboard (#232i).
-        from jacked.service.usage_tooltip import tray_backend_has_menu
-
-        self._tray_menu_available = tray_backend_has_menu(icon)
-        if not self._tray_menu_available:
-            logger.warning(
-                "Tray: this desktop has no tray menu (pystray Xorg backend). "
-                "Left-click the icon to open the dashboard. Use `jacked "
-                "service restart` / `jacked service stop` for the other "
-                "actions. The full menu needs PyGObject in the jacked tool "
-                "environment; see the README Linux tray notes."
-            )
+        # always logged and reported.
+        self._report_tray_capabilities(icon)
         icon.visible = True
 
         # Surface a prior failed update if recovery file exists. run() made
@@ -1573,32 +1617,55 @@ class ServiceRunner:
         ).start()
         if self._started_at is not None:
             self._apply_icon("running")
-            # Force a menu rebuild so the dynamic "Started ..." item
-            # picks up the just-set timestamp on first open. Without
-            # this, pystray's macOS backend can show "Started: —"
-            # because the menu was constructed before _setup populated
-            # the field.
+            # Rebuild the menu, so the "Started ..." item shows the new start
+            # time on the first open. Without this, pystray on macOS can show
+            # "Started: -", because it built the menu before _setup set the time.
             try:
                 icon.update_menu()
             except Exception:
                 logger.debug("update_menu after start failed", exc_info=True)
         else:
             self._apply_icon("stopped")
-            # A backend that declares notifications can still refuse one (GTK
-            # with no notification service). The refusal must not end the
-            # setup thread with a traceback on stderr, and the notice stays
-            # in the tray log.
-            title, message = "Jacked Service", "Jacked failed to start"
-            try:
-                self._notify(icon, title, message)
-            except Exception as exc:  # noqa: BLE001 - the setup thread must not die here
-                logger.warning(
-                    "Tray notification refused (%s): %s: %s",
-                    type(exc).__name__,
-                    title,
-                    message,
-                )
-                logger.debug("Tray notification refusal", exc_info=True)
+            self._notify_failed_start(icon)
+
+    def _report_tray_capabilities(self, icon: "pystray.Icon") -> None:
+        """Record whether the pystray backend of *icon* has a menu.
+
+        With no menu (pystray Xorg), only the left click works: it runs the
+        default item, Open Dashboard (#232i). In that case, log one WARNING.
+        The native STATUS payload reports the result as
+        ``tray_menu_available``.
+        """
+        from jacked.service.usage_tooltip import tray_backend_has_menu
+
+        self._tray_menu_available = tray_backend_has_menu(icon)
+        if not self._tray_menu_available:
+            logger.warning(
+                "Tray: this desktop has no tray menu (pystray Xorg backend). "
+                "Left-click the icon to open the dashboard. Use `jacked "
+                "service restart` / `jacked service stop` for the other "
+                "actions. The full menu needs PyGObject in the jacked tool "
+                "environment; see the README Linux tray notes."
+            )
+
+    def _notify_failed_start(self, icon: "pystray.Icon") -> None:
+        """Show the notice that the first start did not become ready.
+
+        A backend that declares notifications can still refuse one (GTK with
+        no notification service). The refusal must not end the setup thread
+        with a traceback on stderr, and the notice stays in the tray log.
+        """
+        title, message = "Jacked Service", "Jacked failed to start"
+        try:
+            self._notify(icon, title, message)
+        except Exception as exc:  # noqa: BLE001 - the setup thread must not die here
+            logger.warning(
+                "Tray notification refused (%s): %s: %s",
+                type(exc).__name__,
+                title,
+                message,
+            )
+            logger.debug("Tray notification refusal", exc_info=True)
 
     def _record_abandoned_update(self) -> None:
         """Tell the user when an update was interrupted before it finished.
