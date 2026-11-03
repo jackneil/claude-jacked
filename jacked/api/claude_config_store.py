@@ -283,13 +283,33 @@ def _release_lock(lock_path: Path, token: LockToken) -> None:
 # ---------------------------------------------------------------------------
 
 
+# On Windows, ``os.stat`` reports ``st_ino`` 0 when it cannot open the file
+# for its attributes (CPython falls back to the directory listing), which a
+# scanner holding a freshly written file can cause for a few milliseconds. A
+# signature taken in that window would differ from one taken outside it and
+# abort a write that nothing changed. The stat is tried again, briefly.
+_INODE_RETRIES = 10
+_INODE_RETRY_PAUSE = 0.01
+
+
 def _stat_signature(path: Path) -> tuple | None:
-    """Return a change signature for ``path``, or None when it is absent."""
-    try:
-        st = os.stat(path)
-    except FileNotFoundError:
-        return None
-    return (st.st_mtime_ns, st.st_size, st.st_ino)
+    """Return a change signature for ``path``, or None when it is absent.
+
+    The signature is the mtime, the size and the inode (the file index on
+    Windows), so a replaced file with the same mtime and size still reads as
+    changed. On Windows a transient ``st_ino`` of 0 is retried (see above);
+    when it stays 0 the signature carries the 0, and both sides of a compare
+    taken that way still agree.
+    """
+    for attempt in range(_INODE_RETRIES):
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return None
+        if st.st_ino or sys.platform != "win32" or attempt == _INODE_RETRIES - 1:
+            return (st.st_mtime_ns, st.st_size, st.st_ino)
+        time.sleep(_INODE_RETRY_PAUSE)
+    return None  # not reached: the last attempt returns above
 
 
 def _read_config_for_write(config_path: Path) -> dict | None:
