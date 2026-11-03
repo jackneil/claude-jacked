@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 from jacked import guardrails
+from tests._platform import requires_symlinks
 
 
 class TestDetectLanguage:
@@ -133,6 +134,38 @@ class TestCreateGuardrails:
         assert result["created"] is True
         target = tmp_path / "JACKED_GUARDRAILS.md"
         assert target.exists()
+
+    @requires_symlinks
+    def test_a_linked_guardrails_file_is_replaced_not_written_through(self, tmp_path):
+        """A repository can ship JACKED_GUARDRAILS.md as a link to a file of
+        the user (~/.bashrc). --force (and the dashboard's init) must replace
+        the link in the project, never overwrite the file it points at."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        outside = tmp_path / "bashrc"
+        outside.write_text("export SAFE=1\n", encoding="utf-8")
+        (repo / "JACKED_GUARDRAILS.md").symlink_to(outside)
+
+        result = guardrails.create_guardrails(repo, language="python", force=True)
+
+        assert result["created"] is True
+        assert outside.read_text(encoding="utf-8") == "export SAFE=1\n"
+        target = repo / "JACKED_GUARDRAILS.md"
+        assert not target.is_symlink()
+        assert "# Design Guardrails" in target.read_text(encoding="utf-8")
+
+    @requires_symlinks
+    def test_a_dangling_guardrails_link_cannot_place_a_file_outside(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        planted = tmp_path / "autostart" / "run.desktop"
+        planted.parent.mkdir()
+        (repo / "JACKED_GUARDRAILS.md").symlink_to(planted)
+
+        guardrails.create_guardrails(repo, language="python")
+
+        assert not planted.exists()
+        assert not (repo / "JACKED_GUARDRAILS.md").is_symlink()
 
     def test_contains_base_content(self, tmp_path):
         """Output contains base guardrails content.

@@ -602,6 +602,39 @@ def test_file_store_retries_a_windows_refusal_when_the_file_is_unchanged(
     assert list(tmp_path.glob(".credentials-stage-*")) == []
 
 
+def test_file_store_retries_when_the_holder_also_refuses_its_recheck_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The handle that refused the replace can refuse the compare-and-swap
+    re-read in the pause too. That refusal spends the same retry budget; it
+    does not make the write UNUSABLE while the budget still has tries."""
+    path = tmp_path / ".credentials.json"
+    path.write_bytes(_payload(1).to_bytes())
+    store = FileCredentialStore(path, trusted_root=tmp_path)
+    assert store.read().status is StoreStatus.OK
+    tries = _windows_replace_held_once(monkeypatch, path, rewrite=False)
+    real_read_bytes = Path.read_bytes
+    held_reads: list = []
+
+    def read_bytes(self):
+        # The holder lets go of the file only after the replace was refused
+        # once, so the first two re-reads in the pause are refused too.
+        if self == path and tries and len(held_reads) < 2:
+            held_reads.append(self)
+            raise PermissionError(13, "The process cannot access the file")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    result = store.write(_payload(3), InteractionMode.FOREGROUND)
+
+    assert result.status is StoreStatus.OK, result
+    assert len(held_reads) == 2
+    assert len(tries) == 2
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 3
+    assert list(tmp_path.glob(".credentials-stage-*")) == []
+
+
 def test_file_store_rearms_the_stamp_when_post_replace_cleanup_fails(
     tmp_path: Path, monkeypatch
 ) -> None:

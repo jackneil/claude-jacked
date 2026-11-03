@@ -138,7 +138,11 @@ def _seed_claude_config(config_dir: Path) -> None:
             local[key] = source[key]
 
     try:
-        atomic_write_text(claude_json, json.dumps(local, indent=2), mode=0o600)
+        # mode_strict=False: storage that refuses chmod still gets the file
+        # (owner-only from creation), as every launch writer here does.
+        atomic_write_text(
+            claude_json, json.dumps(local, indent=2), mode=0o600, mode_strict=False
+        )
     except (OSError, TypeError, ValueError) as exc:
         logger.debug("Failed to write per-account .claude.json (%s)", type(exc).__name__)
 
@@ -209,7 +213,9 @@ def _seed_workspace_trust(config_dir: Path) -> None:
         return
 
     try:
-        atomic_write_text(claude_json, json.dumps(local, indent=2), mode=0o600)
+        atomic_write_text(
+            claude_json, json.dumps(local, indent=2), mode=0o600, mode_strict=False
+        )
     except (OSError, TypeError, ValueError) as exc:
         logger.debug(
             "Failed to write workspace trust for %s (%s)",
@@ -778,7 +784,9 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
         existing["claudeAiOauth"] = build_oauth_data(account)
     # No _jackedAccountId stamp — account_id is derived from directory path
 
-    atomic_write_text(cred_path, json.dumps(existing, indent=2), mode=0o600)
+    atomic_write_text(
+        cred_path, json.dumps(existing, indent=2), mode=0o600, mode_strict=False
+    )
 
     if not kept_rotation:
         _forget_foreign_pair(config_dir)
@@ -977,7 +985,7 @@ def _remember_foreign_pair(config_dir: Path, oauth: dict, account: dict) -> None
     marker = config_dir / _FOREIGN_PAIR_MARKER
     try:
         record = {**_pair_digests(oauth, account), "recorded_at": int(_time.time())}
-        atomic_write_text(marker, json.dumps(record), mode=0o600)
+        atomic_write_text(marker, json.dumps(record), mode=0o600, mode_strict=False)
     except OSError as exc:
         logger.debug("Could not record the foreign pair for %s: %s", config_dir.name, exc)
 

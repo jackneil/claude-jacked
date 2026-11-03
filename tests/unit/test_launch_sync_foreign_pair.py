@@ -15,6 +15,7 @@ an unreadable one is ignored.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -78,6 +79,33 @@ def test_a_final_refusal_is_remembered_as_digests(tmp_path, caplog):
     if os.name != "nt":
         assert (config_dir / MARKER).stat().st_mode & 0o777 == 0o600
     assert "the next launch replaces them" in caplog.text
+
+
+def test_a_final_refusal_is_remembered_on_storage_that_refuses_chmod(tmp_path, monkeypatch):
+    """Storage that creates files but refuses chmod (ENOTSUP) still gets the
+    marker: the launch writers log the refused chmod and write on (#237i)."""
+    from jacked import atomic_io
+
+    _make_row(tmp_path)
+    config_dir = _account_dir(tmp_path)
+    _write_credentials(config_dir, "intruder-at", "intruder-rt")
+    real_set_mode = atomic_io._set_mode
+    refused: list = []
+
+    def set_mode(fd, tmp_name, mode):
+        if os.path.basename(tmp_name).startswith(f".{MARKER}."):
+            refused.append(tmp_name)
+            raise OSError(errno.ENOTSUP, "Operation not supported")
+        return real_set_mode(fd, tmp_name, mode)
+
+    monkeypatch.setattr(atomic_io, "_set_mode", set_mode)
+    with _patched(_Lookup(_intruder())):
+        assert _sync(config_dir, tmp_path) == "refused"
+
+    assert len(refused) == 1
+    assert set(json.loads((config_dir / MARKER).read_text())) == {
+        "access_sha256", "refresh_sha256", "identity_sha256", "recorded_at",
+    }
 
 
 def test_a_remembered_pair_is_replaced_at_the_next_launch_without_a_request(tmp_path, caplog):

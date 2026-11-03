@@ -12,6 +12,7 @@ early-returns the Node install message before running any subprocess, so
 it exercises the real branch while staying hermetic.
 """
 
+import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
@@ -364,6 +365,42 @@ def test_put_enable_npx_missing_surfaces_node_message(monkeypatch):
     assert "Node.js" in body["message"]
     assert body["missing"] == ["ads", "seo"]  # every skill reported missing
     assert body["pack"]["enabled"] is True
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["enable", "disable"])
+def test_put_records_the_decision_off_the_event_loop(monkeypatch, enabled):
+    """set_enabled writes jacked-packs.json through the shared writer, whose
+    Windows retry can pause: it runs in a worker thread, never on the loop."""
+    import asyncio
+    import threading
+
+    from jacked.api.routes.packs import PackToggleRequest, toggle_pack
+
+    recorded: list = []
+
+    def fake_set_enabled(home, name, value):
+        recorded.append((threading.get_ident(), name, value))
+
+    def done(*args, **kwargs):
+        return packs.PackOpResult(ok=True, message="done")
+
+    monkeypatch.setattr(packs, "load_registry", lambda data_root: _sample_registry())
+    monkeypatch.setattr(packs, "set_enabled", fake_set_enabled)
+    monkeypatch.setattr(packs, "install_pack", done)
+    monkeypatch.setattr(packs, "remove_pack", done)
+    monkeypatch.setattr(packs, "pack_status", _fake_pack_status)
+    monkeypatch.setattr(packs, "find_npx", lambda: "/usr/bin/npx")
+
+    async def put():
+        body = await toggle_pack("marketing", PackToggleRequest(enabled=enabled))
+        return body, threading.get_ident()
+
+    body, loop_thread = asyncio.run(put())
+
+    assert body["ok"] is True and body["pack"]["enabled"] is enabled
+    [(thread, name, value)] = recorded
+    assert (name, value) == ("marketing", enabled)
+    assert thread != loop_thread
 
 
 def test_jacked_home_env_honored_on_get(monkeypatch, tmp_path):

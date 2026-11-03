@@ -165,11 +165,16 @@ DIRECT_SETTINGS = {
 
 VALID_PERMISSION_MODES = {"plan", "default", "bypassPermissions", "acceptEdits"}
 
-# Lock for settings.json mutations (single-process, no external deps)
+# Lock for settings.json mutations (single-process, no external deps). The
+# write runs in a worker thread (the shared writer's Windows retry can pause),
+# so each route holds this lock across that await.
 _settings_lock = asyncio.Lock()
 # Serializes skill dir installs/removals and their install-manifest updates, so
 # two concurrent toggles cannot lose each other's manifest entry.
 _skills_lock = asyncio.Lock()
+# Serializes the CLAUDE.md rules toggle: its read-modify-write runs in a worker
+# thread, so two toggles could otherwise interleave their read and write.
+_rules_lock = asyncio.Lock()
 
 
 def reset_locks() -> None:
@@ -179,9 +184,10 @@ def reset_locks() -> None:
     guards) but must be rebound here too — one reset_locks per module is the
     contract enforced by tests/unit/api/test_reset_locks.py.
     """
-    global _settings_lock, _skills_lock, _dcr_lock
+    global _settings_lock, _skills_lock, _rules_lock, _dcr_lock
     _settings_lock = asyncio.Lock()
     _skills_lock = asyncio.Lock()
+    _rules_lock = asyncio.Lock()
     _dcr_lock = asyncio.Lock()
 
 
@@ -305,7 +311,8 @@ def _write_settings_json(data: dict):
 
     The CLI, the dashboard, and hook processes can all write this same file;
     the shared writer gives each one its own temp file and a Windows-aware
-    replace.
+    replace. That replace can pause to retry, so a route calls this in a
+    worker thread (``await asyncio.to_thread``) with ``_settings_lock`` held.
     """
     atomic_write_text(SETTINGS_JSON, json.dumps(data, indent=2))
 
@@ -668,7 +675,7 @@ async def _toggle_hook(name: str, enabled: bool, db=None):
             else:
                 _disable_sound_hooks(settings)
 
-        _write_settings_json(settings)
+        await asyncio.to_thread(_write_settings_json, settings)
 
     return {"name": name, "category": "hooks", "enabled": enabled}
 
@@ -903,7 +910,18 @@ async def _toggle_knowledge(name: str, enabled: bool):
 
 
 async def _toggle_rules(enabled: bool):
-    """Enable/disable behavioral rules in CLAUDE.md."""
+    """Enable/disable behavioral rules in CLAUDE.md.
+
+    The read-modify-write runs in a worker thread, because the shared
+    writer's Windows retry can pause. ``_rules_lock`` stays held across it,
+    so two toggles cannot interleave their read and their write.
+    """
+    async with _rules_lock:
+        return await asyncio.to_thread(_apply_rules_toggle, enabled)
+
+
+def _apply_rules_toggle(enabled: bool):
+    """Add or remove the behavioral rules block in CLAUDE.md (blocking I/O)."""
     if enabled:
         rules_src = DATA_ROOT / "rules" / "jacked_behaviors.md"
         if not rules_src.exists():
@@ -1150,7 +1168,7 @@ async def set_claude_env(name: str, body: EnvToggleRequest):
             num = max(meta["min"], min(meta["max"], num))
             settings["env"][name] = str(num)
 
-        _write_settings_json(settings)
+        await asyncio.to_thread(_write_settings_json, settings)
 
     return {"name": name, "ok": True}
 
@@ -1195,7 +1213,7 @@ async def set_claude_key(name: str, body: DirectSettingRequest):
             hi = meta.get("max", num)
             settings[name] = max(lo, min(hi, num))
 
-        _write_settings_json(settings)
+        await asyncio.to_thread(_write_settings_json, settings)
 
     return {"name": name, "ok": True}
 
@@ -1227,7 +1245,7 @@ async def toggle_claude_plugin(name: str, body: PluginToggleRequest):
         # manipulation as follow-up.
         settings["enabledPlugins"][name] = body.enabled
 
-        _write_settings_json(settings)
+        await asyncio.to_thread(_write_settings_json, settings)
 
     return {"name": name, "enabled": body.enabled}
 
@@ -1265,7 +1283,7 @@ async def set_claude_permissions(body: PermissionsRequest):
         if body.defaultMode is not None:
             settings["permissions"]["defaultMode"] = body.defaultMode
 
-        _write_settings_json(settings)
+        await asyncio.to_thread(_write_settings_json, settings)
 
     return {"ok": True}
 
@@ -1299,7 +1317,7 @@ async def set_raw_settings(body: RawSettingsRequest):
             content={"error": {"message": "Set confirm_overwrite: true to overwrite settings.json", "code": "CONFIRMATION_REQUIRED"}},
         )
     async with _settings_lock:
-        _write_settings_json(body.content)
+        await asyncio.to_thread(_write_settings_json, body.content)
     return {"ok": True}
 
 

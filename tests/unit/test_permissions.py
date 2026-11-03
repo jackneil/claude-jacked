@@ -1,6 +1,9 @@
 """Tests for jacked.api.routes.permissions module."""
 
+import asyncio
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,6 +16,7 @@ from jacked.api.routes.permissions import (
     _validate_repo_path,
     _write_project_settings,
 )
+from tests._platform import requires_symlinks
 
 
 class TestValidateRepoPath:
@@ -90,6 +94,102 @@ class TestProjectSettings:
         """No .json.tmp left behind after write."""
         _write_project_settings(str(tmp_path), {"test": True})
         assert not (tmp_path / ".claude" / "settings.local.json.tmp").exists()
+
+
+def _request():
+    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db=None)))
+
+
+def _project_routes(repo: Path) -> dict:
+    """Each project-settings route, called as the dashboard calls it."""
+    from jacked.api.routes import permissions as p
+
+    async def put():
+        return await p.set_project_permissions(
+            p.ProjectPermissionsRequest(repo_path=str(repo), allow=["Bash(git status:*)"]),
+            _request(),
+        )
+
+    async def rule():
+        return await p.add_permission_rule(
+            p.AddRuleRequest(pattern="Bash(git status:*)", scope="project", repo_path=str(repo)),
+            _request(),
+        )
+
+    async def get():
+        return p.get_project_permissions(str(repo), _request())
+
+    return {"get": get, "put": put, "rule": rule}
+
+
+def _repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    return repo
+
+
+class TestProjectSettingsStayInTheProject:
+    """A repository can ship ``.claude`` (or its settings.local.json) as a
+    link to a place outside the project. The routes refuse it with a 422:
+    a write would leave the project, and a read would copy outside content
+    (the user's global settings, for example) into the project's file."""
+
+    @requires_symlinks
+    @pytest.mark.parametrize("route", ["get", "put", "rule"])
+    def test_a_claude_dir_linked_outside_is_refused(self, tmp_path, route):
+        repo = _repo(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (repo / ".claude").symlink_to(outside, target_is_directory=True)
+
+        result = asyncio.run(_project_routes(repo)[route]())
+
+        assert result.status_code == 422
+        error = json.loads(result.body)["error"]
+        assert error["code"] == "LINK_OUTSIDE_PROJECT"
+        assert error["message"].startswith("The .claude path in this project is a link")
+        assert list(outside.iterdir()) == []  # nothing written outside
+
+    @requires_symlinks
+    @pytest.mark.parametrize("route", ["get", "put", "rule"])
+    def test_a_settings_file_linked_outside_is_refused(self, tmp_path, route):
+        repo = _repo(tmp_path)
+        (repo / ".claude").mkdir()
+        global_settings = tmp_path / "home-settings.json"
+        global_settings.write_text('{"env": {"API_KEY": "secret"}}', encoding="utf-8")
+        link = repo / ".claude" / "settings.local.json"
+        link.symlink_to(global_settings)
+
+        result = asyncio.run(_project_routes(repo)[route]())
+
+        assert result.status_code == 422
+        error = json.loads(result.body)["error"]
+        assert error["message"].startswith(
+            "The .claude/settings.local.json path in this project is a link"
+        )
+        assert link.is_symlink()  # not replaced by a copy of the outside file
+        assert global_settings.read_text(encoding="utf-8") == '{"env": {"API_KEY": "secret"}}'
+
+    @pytest.mark.parametrize("route", ["put", "rule"])
+    def test_a_normal_claude_dir_is_written(self, tmp_path, route):
+        repo = _repo(tmp_path)
+
+        result = asyncio.run(_project_routes(repo)[route]())
+
+        assert not hasattr(result, "status_code"), result.body
+        written = json.loads((repo / ".claude" / "settings.local.json").read_text())
+        assert written["permissions"]["allow"] == ["Bash(git status:*)"]
+
+    @requires_symlinks
+    def test_a_claude_dir_linked_inside_the_project_is_allowed(self, tmp_path):
+        repo = _repo(tmp_path)
+        (repo / "config" / "claude").mkdir(parents=True)
+        (repo / ".claude").symlink_to(repo / "config" / "claude", target_is_directory=True)
+
+        result = asyncio.run(_project_routes(repo)["put"]())
+
+        assert not hasattr(result, "status_code"), result.body
+        assert (repo / "config" / "claude" / "settings.local.json").exists()
 
 
 class TestDangerousPatterns:

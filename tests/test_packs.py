@@ -398,6 +398,42 @@ def test_state_disable_is_durable_not_dropped(tmp_path):
     assert packs.pack_state(home, "design-extras") == "enabled"
 
 
+def test_concurrent_decisions_in_one_process_are_never_lost(tmp_path, monkeypatch):
+    """The dashboard records each toggle in a worker thread (the shared
+    writer can pause on Windows), so two toggles can run at once. Each one
+    reads, changes and writes the whole state file: the second reader must
+    wait for the first writer, or one decision is lost."""
+    import threading
+
+    home = tmp_path
+    real_load = packs.load_state
+    first_read = threading.Event()
+    release = threading.Event()
+    loads: list = []
+
+    def load_state(h):
+        state = real_load(h)
+        loads.append(threading.current_thread().name)
+        if len(loads) == 1:
+            first_read.set()
+            release.wait(timeout=5)  # the first writer pauses after its read
+        return state
+
+    monkeypatch.setattr(packs, "load_state", load_state)
+    first = threading.Thread(target=packs.set_enabled, args=(home, "marketing", True))
+    second = threading.Thread(target=packs.set_enabled, args=(home, "design-extras", True))
+    first.start()
+    assert first_read.wait(timeout=5)
+    second.start()
+    second.join(timeout=0.3)  # unserialized, the second finishes here
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    state = real_load(home)["packs"]
+    assert set(state) == {"marketing", "design-extras"}
+
+
 def test_v1_state_migrated_to_v2_on_load(tmp_path):
     """A v1 state file ({"version":1,"enabled":{name:{enabled_at}}}) is migrated
     in memory: enabled entries become state=enabled, none become disabled."""

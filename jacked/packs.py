@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,9 @@ from jacked.findbin import find_bin
 logger = logging.getLogger(__name__)
 
 STATE_PATH_NAME = "jacked-packs.json"   # lives at home/.claude/jacked-packs.json
+# Serializes set_enabled's read-modify-write inside one process: the dashboard
+# runs each toggle in a worker thread, so two toggles can overlap.
+_STATE_LOCK = threading.Lock()
 
 # Pin the skills CLI to an empirically verified version. The behavioral
 # contracts jacked relies on -- the on-disk layout, the lockfile v3 schema, the
@@ -302,11 +306,15 @@ def set_enabled(home: Path, name: str, enabled: bool) -> None:
     rather than dropping the entry, so the decision survives future
     ``jacked install`` runs and a default-on pack the user removed is not
     silently reinstalled.
+
+    Thread-safe within one process: two concurrent calls (two dashboard
+    toggles in worker threads) never lose each other's entry.
     """
-    state = load_state(home)  # already normalized to v2
-    packs_map = state.setdefault("packs", {})
-    packs_map[name] = {"state": "enabled" if enabled else "disabled", "at": _now_iso()}
-    save_state(home, state)
+    with _STATE_LOCK:
+        state = load_state(home)  # already normalized to v2
+        packs_map = state.setdefault("packs", {})
+        packs_map[name] = {"state": "enabled" if enabled else "disabled", "at": _now_iso()}
+        save_state(home, state)
 
 
 def pack_state(home: Path, name: str) -> str | None:

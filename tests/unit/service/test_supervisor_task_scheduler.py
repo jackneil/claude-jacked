@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -344,3 +345,87 @@ def test_a_utf8_artifact_from_an_older_jacked_is_replaced(tmp_path):
 
     assert result.ok is True, result.reason
     assert path.read_bytes() == rendered.content
+
+
+# --- the legacy VBS renames under a Windows retry ------------------------------
+
+LEGACY_VBS = (
+    b'Set WshShell = CreateObject("WScript.Shell")\r\n'
+    b'WshShell.Run """C:\\bin\\jacked.exe"" service start", 0, False\r\n'
+)
+
+
+def _windows_rename_refused_once(monkeypatch, during_pause) -> list:
+    """The first rename is refused while another handle holds a file, and
+    ``during_pause`` runs in the retry pause (a concurrent writer)."""
+    from jacked import atomic_io
+
+    tries: list = []
+    real_replace = os.replace
+
+    def replace(src, dst):
+        tries.append(Path(dst).name)
+        if len(tries) == 1:
+            raise PermissionError(13, "Access is denied")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(atomic_io.sys, "platform", "win32")
+    monkeypatch.setattr(atomic_io.os, "replace", replace)
+    monkeypatch.setattr(atomic_io.time, "sleep", lambda _seconds: during_pause())
+    return tries
+
+
+def test_retiring_the_legacy_vbs_keeps_a_backup_written_in_the_retry_pause(
+    tmp_path, monkeypatch
+):
+    from jacked.service.supervisors.task_scheduler import _retire_legacy_vbs
+
+    legacy = tmp_path / "jacked.vbs"
+    legacy.write_bytes(LEGACY_VBS)
+    backup = tmp_path / "jacked.vbs.pre-v2"
+    tries = _windows_rename_refused_once(
+        monkeypatch, lambda: backup.write_bytes(b"concurrent")
+    )
+
+    assert _retire_legacy_vbs(legacy, LEGACY_VBS) is None
+    assert backup.read_bytes() == b"concurrent"
+    assert legacy.read_bytes() == LEGACY_VBS
+    assert tries == ["jacked.vbs.pre-v2"]  # not tried again after the change
+
+
+def test_restoring_the_legacy_vbs_keeps_a_script_written_in_the_retry_pause(
+    tmp_path, monkeypatch
+):
+    from jacked.service.supervisors.task_scheduler import _restore_legacy_vbs
+
+    legacy = tmp_path / "jacked.vbs"
+    backup = tmp_path / "jacked.vbs.pre-v2"
+    backup.write_bytes(LEGACY_VBS)
+    tries = _windows_rename_refused_once(
+        monkeypatch, lambda: legacy.write_bytes(b"concurrent")
+    )
+
+    assert _restore_legacy_vbs(legacy, backup) is False
+    assert legacy.read_bytes() == b"concurrent"
+    assert backup.read_bytes() == LEGACY_VBS
+    assert tries == ["jacked.vbs"]
+
+
+def test_the_legacy_vbs_renames_land_on_retry_when_nothing_changed(tmp_path, monkeypatch):
+    from jacked.service.supervisors.task_scheduler import (
+        _restore_legacy_vbs,
+        _retire_legacy_vbs,
+    )
+
+    legacy = tmp_path / "jacked.vbs"
+    legacy.write_bytes(LEGACY_VBS)
+    tries = _windows_rename_refused_once(monkeypatch, lambda: None)
+
+    backup = _retire_legacy_vbs(legacy, LEGACY_VBS)
+    assert backup == tmp_path / "jacked.vbs.pre-v2"
+    assert backup.read_bytes() == LEGACY_VBS and not legacy.exists()
+    assert tries == ["jacked.vbs.pre-v2", "jacked.vbs.pre-v2"]
+
+    tries.clear()
+    assert _restore_legacy_vbs(legacy, backup) is True
+    assert legacy.read_bytes() == LEGACY_VBS and not backup.exists()

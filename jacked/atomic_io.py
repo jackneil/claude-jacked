@@ -17,7 +17,6 @@ the service supervisors can use it with no import cycle.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 import sys
@@ -80,6 +79,25 @@ def _replace_once(src, dst, *, write_through: bool) -> None:
         os.replace(src, dst)
 
 
+def _describe_refusal(refusal: OSError) -> str:
+    """Name a refusal for a log line: its class and its error code.
+
+    The Windows code (``winerror``) is used when there is one, else the
+    ``errno``. The exception text is never used, because it can hold a path.
+
+    >>> _describe_refusal(PermissionError(13, "Access is denied"))
+    'PermissionError errno=13'
+    >>> held = PermissionError(13, "Access is denied")
+    >>> held.winerror = 32
+    >>> _describe_refusal(held)
+    'PermissionError winerror=32'
+    """
+    winerror = getattr(refusal, "winerror", None)
+    if winerror is not None:
+        return f"{type(refusal).__name__} winerror={winerror}"
+    return f"{type(refusal).__name__} errno={refusal.errno}"
+
+
 def replace_with_retry(
     src,
     dst,
@@ -91,42 +109,106 @@ def replace_with_retry(
     """Replace ``dst`` with ``src`` in one step.
 
     On Windows a ``PermissionError`` is retried with the pauses of
-    ``_pause_schedule(retry_budget)`` (ten tries in 0.9 s by default) and
-    re-raised after the last try. A retried replace logs one DEBUG line with
-    the file name and the retry count. On POSIX the replace runs once, and a
-    ``PermissionError`` is a real refusal that is not retried.
+    ``_pause_schedule(retry_budget)`` (ten tries in 0.9 s by default). After
+    the last try, the last refusal is raised again unchanged. A retried
+    replace logs one DEBUG line with the file name, the retry count, and the
+    class and error code of the last refusal (never its text). On POSIX the
+    replace runs once, and a ``PermissionError`` is a real refusal that is
+    not retried.
 
     ``retry_budget`` is the most time, in seconds, the retries may wait. Use
     0 for a write that must never wait (a cache). ``write_through`` asks
     Windows to flush the rename to disk before it returns. POSIX callers that
     need the rename durable sync the parent directory themselves.
+
     ``before_retry`` runs after each pause, before the next try. A
-    compare-and-swap writer uses it to check the target again, and it raises
-    to stop the replace when the target changed during the pause.
+    compare-and-swap writer uses it to check its precondition again, and it
+    raises to stop the replace when the target changed during the pause.
+    That exception propagates unchanged. A ``PermissionError`` from
+    ``before_retry`` is different: the check could not read the file, for
+    the same reason the replace failed. It counts as one more refusal of the
+    same budget, so the retry pauses and runs ``before_retry`` again before
+    the next replace.
     """
     if sys.platform != "win32":
         _replace_once(src, dst, write_through=write_through)
         return
     pauses = _pause_schedule(retry_budget)
     retries = 0
+    last_refusal: PermissionError | None = None
     while True:
         try:
+            if retries and before_retry is not None:
+                before_retry()
             _replace_once(src, dst, write_through=write_through)
-        except PermissionError:
+        except PermissionError as refusal:
             pause = next(pauses, None)
             if pause is None:
                 logger.debug(
-                    "Could not replace %s after %d retries", Path(dst).name, retries
+                    "Could not replace %s after %d retries (%s)",
+                    Path(dst).name,
+                    retries,
+                    _describe_refusal(refusal),
                 )
                 raise
+            last_refusal = refusal
             retries += 1
             time.sleep(pause)
-            if before_retry is not None:
-                before_retry()
             continue
-        if retries:
-            logger.debug("Replaced %s after %d retries", Path(dst).name, retries)
+        if last_refusal is not None:
+            logger.debug(
+                "Replaced %s after %d retries (last refusal: %s)",
+                Path(dst).name,
+                retries,
+                _describe_refusal(last_refusal),
+            )
         return
+
+
+def _remove_temp(tmp_name: str) -> None:
+    """Remove the temp file of a failed write. This is best effort.
+
+    On Windows a scanner or an indexer can hold the new temp file for a
+    short time, so a refused unlink is tried again with the pauses of the
+    default replace budget. When the refusal lasts longer, or the unlink
+    fails another way, the temp file stays and this function returns
+    quietly: the cleanup must never replace the error that stopped the
+    write. POSIX gets one attempt.
+    """
+    pauses = _pause_schedule(RETRY_BUDGET_SECONDS)
+    while True:
+        try:
+            os.unlink(tmp_name)
+            return
+        except PermissionError:
+            pause = next(pauses, None) if sys.platform == "win32" else None
+            if pause is None:
+                return
+            time.sleep(pause)
+        except OSError:
+            return
+
+
+def _set_mode(fd: int, tmp_name: str, mode: int) -> None:
+    """Give the open temp file the permission bits ``mode``.
+
+    ``os.fchmod`` changes the file that ``fd`` (from mkstemp) holds, with no
+    path lookup, so a link that another process puts at the temp name cannot
+    redirect the change. A build with no ``os.fchmod`` (Windows before Python
+    3.13) uses the path. On Windows a mode bit does not change who can open
+    the file: mkstemp gives the file the ACL of its folder. So on Windows a
+    requested mode also gives the file a private ACL (the current user only).
+    """
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, mode)
+    else:
+        os.chmod(tmp_name, mode)
+    if os.name == "nt":
+        # Imported here, as the service writers do: this module imports only
+        # the standard library at load time, so it has no import cycle.
+        from jacked.service.windows_security import secure_windows_path
+
+        secure_windows_path(Path(tmp_name))
 
 
 def _write_atomically(
@@ -137,6 +219,7 @@ def _write_atomically(
     fsync: bool,
     follow_symlinks: bool,
     mode: int | None,
+    mode_strict: bool,
     retry_budget: float,
 ) -> None:
     # A symlink at ``path`` is replaced by a plain file unless the caller
@@ -148,6 +231,7 @@ def _write_atomically(
     # Writer-unique: the CLI, the dashboard service and hook processes can
     # all write the same file, and a shared temp name would let one writer
     # replace the target with another writer's half-written temp file.
+    # mkstemp creates the temp file owner-only (0o600).
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
     )
@@ -157,7 +241,16 @@ def _write_atomically(
             if mode is not None:
                 # Before the bytes land, so a secret never sits in a file
                 # with looser permissions than the caller asked for.
-                os.chmod(tmp_name, mode)
+                try:
+                    _set_mode(handle.fileno(), tmp_name, mode)
+                except OSError as exc:
+                    if mode_strict:
+                        raise
+                    logger.debug(
+                        "Could not set the mode of %s (%s); the write goes on",
+                        target.name,
+                        _describe_refusal(exc),
+                    )
             handle.write(payload)
             if fsync:
                 handle.flush()
@@ -166,8 +259,7 @@ def _write_atomically(
     except BaseException:
         # Any failure (a KeyboardInterrupt mid-write included) removes the
         # temp file, so a crash never leaves a stray temp or a partial target.
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
+        _remove_temp(tmp_name)
         raise
 
 
@@ -178,16 +270,27 @@ def atomic_write_bytes(
     fsync: bool = False,
     follow_symlinks: bool = False,
     mode: int | None = None,
+    mode_strict: bool = True,
     retry_budget: float = RETRY_BUDGET_SECONDS,
 ) -> None:
     """Atomically replace ``path`` with ``data``, byte for byte.
 
     The parent directory is created when it is missing. ``fsync`` flushes the
     bytes to disk before the replace. ``mode`` sets the permission bits of the
-    result (0o600 for a credential file). ``follow_symlinks`` writes through a
+    result (0o600 for a credential file); on Windows it also gives the result
+    a private ACL (the current user only). ``follow_symlinks`` writes through a
     link at ``path`` to the file it points at; by default the link itself is
     replaced by a plain file. ``retry_budget`` is passed to
     ``replace_with_retry``.
+
+    By default a failure to set the mode (the chmod, or the private ACL on
+    Windows) stops the write before the replace, and the error propagates.
+    ``mode_strict=False`` is for storage that creates and replaces files but
+    refuses chmod (ENOTSUP): the failure is logged at DEBUG (the file name,
+    the error class and its code) and the write goes on. The temp file is
+    created owner-only (0o600), so a tolerated failure never leaves the
+    result looser than 0o600: with ``mode=0o600`` it is exactly the mode the
+    caller asked for.
     """
     _write_atomically(
         path,
@@ -196,6 +299,7 @@ def atomic_write_bytes(
         fsync=fsync,
         follow_symlinks=follow_symlinks,
         mode=mode,
+        mode_strict=mode_strict,
         retry_budget=retry_budget,
     )
 
@@ -207,6 +311,7 @@ def atomic_write_text(
     follow_symlinks: bool = False,
     fsync: bool = False,
     mode: int | None = None,
+    mode_strict: bool = True,
     retry_budget: float = RETRY_BUDGET_SECONDS,
 ) -> None:
     """Atomically replace ``path`` with ``text`` encoded as UTF-8.
@@ -222,5 +327,6 @@ def atomic_write_text(
         fsync=fsync,
         follow_symlinks=follow_symlinks,
         mode=mode,
+        mode_strict=mode_strict,
         retry_budget=retry_budget,
     )

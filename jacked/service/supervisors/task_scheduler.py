@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -297,13 +298,37 @@ def _harden_legacy_windows_file(path: Path, content: bytes) -> bytes | None:
         return None
 
 
+class _LegacyVbsTargetChanged(Exception):
+    """A legacy VBS rename target changed while a Windows retry paused."""
+
+
+def _abort_when(changed: Callable[[], bool]) -> Callable[[], None]:
+    """A ``before_retry`` check that stops the rename when ``changed()``.
+
+    A Windows retry pauses while another handle holds a file, and another
+    writer can fill the rename target in that pause. The rename must then
+    stop, not overwrite what that writer put there.
+    """
+
+    def recheck() -> None:
+        if changed():
+            raise _LegacyVbsTargetChanged
+
+    return recheck
+
+
 def _retire_legacy_vbs(path: Path, content: bytes) -> Path | None:
     backup = path.with_name(f"{path.name}.pre-v2")
+
+    def foreign_backup() -> bool:
+        # The backup slot must be free or hold this same script.
+        return backup.exists() and backup.read_bytes() != content
+
     try:
-        if backup.exists() and backup.read_bytes() != content:
+        if foreign_backup():
             return None
-        replace_with_retry(path, backup)
-    except OSError:
+        replace_with_retry(path, backup, before_retry=_abort_when(foreign_backup))
+    except (OSError, _LegacyVbsTargetChanged):
         return None
     return backup if backup.read_bytes() == content else None
 
@@ -311,11 +336,16 @@ def _retire_legacy_vbs(path: Path, content: bytes) -> Path | None:
 def _restore_legacy_vbs(path: Path, backup: Path | None) -> bool:
     if backup is None:
         return True
-    if path.exists() or not backup.exists():
+
+    def blocked() -> bool:
+        # The script slot must be free and the backup still there.
+        return path.exists() or not backup.exists()
+
+    if blocked():
         return False
     try:
-        replace_with_retry(backup, path)
-    except OSError:
+        replace_with_retry(backup, path, before_retry=_abort_when(blocked))
+    except (OSError, _LegacyVbsTargetChanged):
         return False
     return path.exists() and not backup.exists()
 

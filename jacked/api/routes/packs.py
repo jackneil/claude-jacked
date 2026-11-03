@@ -142,6 +142,9 @@ async def toggle_pack(name: str, body: PackToggleRequest):
     so a restart never resurrects the pack as enabled), then remove off-thread.
     The remove result rides back in the body regardless (the user asked for it
     off; intent wins even if removal hit a snag the message explains).
+
+    The intent record runs off-thread too: the shared writer's Windows retry
+    can pause, and ``set_enabled`` serializes concurrent writers itself.
     """
     home = _home()
     registry = packs.load_registry(DATA_ROOT)
@@ -153,10 +156,10 @@ async def toggle_pack(name: str, body: PackToggleRequest):
         )
 
     if body.enabled:
-        packs.set_enabled(home, name, True)
+        await asyncio.to_thread(packs.set_enabled, home, name, True)
         result = await asyncio.to_thread(_install_in_thread, pack, home)
     else:
-        packs.set_enabled(home, name, False)
+        await asyncio.to_thread(packs.set_enabled, home, name, False)
         result = await asyncio.to_thread(packs.remove_pack, pack, home)
 
     return _toggle_response(result, pack, body.enabled, home)

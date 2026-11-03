@@ -447,10 +447,24 @@ jacked replaces a file only through the shared atomic writer in
 `jacked/atomic_io.py` (#237i). On Windows, a replace fails while another
 handle holds the target file: a reader, an indexer, or an antivirus scan. The
 shared replace then retries for up to 1 second, and after that it reports the
-error. The Claude config writer (section 5.5) allows 3 seconds. Before each
-retry, `FileCredentialStore` checks the file again. If the file changed, the
-store refuses the write as a concurrent write. A test fails when a module in
-`jacked/` calls `os.replace` directly.
+error. The Claude config writer (section 5.5) allows 3 seconds. A test fails
+when a module in `jacked/` uses `os.replace` directly.
+
+A compare-and-swap writer checks its precondition again before every retry,
+because another writer can change the target during the pause. If the file
+changed, `FileCredentialStore` refuses the write as a concurrent write. The
+Claude config writer stops with `cas_aborted`, and the Task Scheduler
+supervisor stops the rename of the legacy startup script. When another handle
+also refuses the check, the writer counts one more refused try. The check and
+the replace use the same retry time.
+
+When a caller asks for a mode (0o600 for a credential file), the shared writer
+sets it on the open temp file before the bytes land. It uses the file
+descriptor, so a link put at the temp name cannot redirect the change. On
+Windows a mode bit does not control who can open a file. So the shared writer
+also gives the temp file a private ACL for the current user. If the writer
+cannot set the mode, it does not publish the file. The per-account launch
+files are the exception: they log the failure and continue.
 
 ### 5.4 Metadata and per-account directories are not authorities
 

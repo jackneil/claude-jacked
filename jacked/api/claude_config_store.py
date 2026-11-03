@@ -311,13 +311,28 @@ def _read_config_for_write(config_path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _atomic_write_json(config_path: Path, data: dict) -> None:
+class _ChangedDuringReplace(Exception):
+    """The config changed while the replace waited for a Windows retry."""
+
+
+def _atomic_write_json(config_path: Path, data: dict, *, signature: tuple | None) -> None:
     """Write ``data`` to ``config_path`` through a private, fsynced temp file.
 
     The temp file keeps this module's own ``TMP_PREFIX`` (not the shared
     writer's name) because ``sweep_stale_temp_files`` finds the leftovers of
     an interrupted write by that prefix. The replace is the shared one.
+
+    ``signature`` is the change signature of the config that ``data`` was
+    made from. On Windows the replace pauses and retries while another
+    handle holds the file, and Claude Code can save the config in that
+    pause. So the signature is compared again before every retry, and a
+    change raises ``_ChangedDuringReplace`` instead of replacing it.
     """
+
+    def recheck() -> None:
+        if _stat_signature(config_path) != signature:
+            raise _ChangedDuringReplace
+
     fd, tmp = tempfile.mkstemp(
         dir=str(config_path.parent), prefix=TMP_PREFIX, suffix=".json"
     )
@@ -330,7 +345,12 @@ def _atomic_write_json(config_path: Path, data: dict) -> None:
             os.chmod(tmp, 0o600)
         except OSError:
             pass
-        replace_with_retry(tmp, config_path, retry_budget=_REPLACE_BUDGET_SECONDS)
+        replace_with_retry(
+            tmp,
+            config_path,
+            retry_budget=_REPLACE_BUDGET_SECONDS,
+            before_retry=recheck,
+        )
     except BaseException:
         try:
             os.unlink(tmp)
@@ -379,7 +399,14 @@ def _write_locked(
         )
         return WriteResult(LOCKED, mode)
     try:
-        _atomic_write_json(config_path, config)
+        _atomic_write_json(config_path, config, signature=signature)
+    except _ChangedDuringReplace:
+        logger.info(
+            "Account %d: the Claude config changed while the replace waited "
+            "for a retry; not replaced",
+            account_id,
+        )
+        return WriteResult(CAS_ABORTED, mode)
     except Exception as exc:  # noqa: BLE001 - every write error is reported
         logger.warning(
             "Account %d: could not write the Claude config (%s)",

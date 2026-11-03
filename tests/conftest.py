@@ -270,10 +270,10 @@ def _tripwire_real_claude_config(monkeypatch):
     real_write = claude_config_store._atomic_write_json
     real_acquire = claude_config_store._acquire_lock
 
-    def guarded_write(config_path, data):
+    def guarded_write(config_path, data, **kwargs):
         if _under_real_claude_config(config_path):
             raise RuntimeError(f"test tripwire: write to the real {config_path.name}")
-        return real_write(config_path, data)
+        return real_write(config_path, data, **kwargs)
 
     def guarded_acquire(lock_path, timeout):
         if _under_real_claude_config(lock_path):
