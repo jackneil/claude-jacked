@@ -272,7 +272,7 @@ class TestUnreadableNumbers:
                 summarize_account(_fable_row('"Infinity"'))
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
-        assert "Fable" in warnings[0] and "inf" not in warnings[0].lower()
+        assert "entry fable from limits" in warnings[0] and "inf" not in warnings[0].lower()
 
     @pytest.mark.parametrize("resets_at", ["1e999", "NaN", '"junk"', "[1]"])
     def test_a_bad_model_reset_never_reaches_the_summary(self, resets_at):

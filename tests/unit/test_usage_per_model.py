@@ -497,7 +497,7 @@ def test_a_skipped_limit_warns_once_and_never_logs_the_value(caplog):
     ours = [r for r in caplog.records if r.name == "jacked.service.menubar_summary"]
     warnings = [r.getMessage() for r in ours if r.levelno == logging.WARNING]
     debugs = [r.getMessage() for r in ours if r.levelno == logging.DEBUG]
-    assert len(warnings) == 1 and "Fable" in warnings[0]
+    assert len(warnings) == 1 and "entry fable from limits" in warnings[0]
     assert len(debugs) == 2
     for text in warnings + debugs:
         assert "inf" not in text.lower() and "1e999" not in text

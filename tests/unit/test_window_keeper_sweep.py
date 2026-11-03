@@ -105,7 +105,8 @@ class _Pings:
         return answer
 
 
-def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True, prewake=False):
+def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True, prewake=False,
+              interval=300):
     """One keeper pass with the network edges mocked.
 
     Both schedule inputs are pinned. ``prewake_due`` reads the real clock
@@ -134,7 +135,7 @@ def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True
         # store is UNREADABLE, which blocks every cc rotation.)
         patch("jacked.api.credential_helpers.read_live_credentials", return_value=OTHER_SESSION_LIVE),
     ):
-        return asyncio.run(um._run_window_keeper(db, 300))
+        return asyncio.run(um._run_window_keeper(db, interval))
 
 
 # ---------------------------------------------------------------------------
@@ -1613,6 +1614,19 @@ class TestPendingConfirmation:
             "(read-back landed with no window); confirming by " in m
             for m in infos
         )
+
+
+    @pytest.mark.parametrize("interval, deadline", [(600, 1200), (900, 1800), (300, 900)])
+    def test_the_confirmation_deadline_follows_the_sweep_interval(self, db, interval, deadline):
+        """Two sweeps, and never less than 15 minutes: a 600 s interval waits
+        1200 s, a 900 s interval 1800 s, the 300 s default the 900 s floor."""
+        aid = _mk_5h_lapsed(db)
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        fetch = AsyncMock(side_effect=_lagging_read(lapsed))
+        assert _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=fetch, interval=interval) == 1
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_pending"
+        assert st["pending_until"] == pytest.approx(st["last_ping_at"] + deadline, abs=1.01)
 
     def test_the_grace_window_holds_the_next_sweep(self, db):
         aid = _mk_5h_lapsed(db)

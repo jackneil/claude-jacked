@@ -182,6 +182,16 @@ class TestWindowReason:
         r = _reason(tmp_path, _fresh(keeper_state=ks))
         assert r == {"text": "window opening", "short": "opening", "tone": "muted", "muted": False}
 
+    @pytest.mark.parametrize("reason_code", ["no_header", "read_not_landed"])
+    def test_a_pending_ping_with_a_stale_reading_still_reads_as_opening(self, tmp_path, reason_code):
+        """A read-back that did not land leaves the last reading old: the
+        pending caption still wins over "last read", and the stale dim stays."""
+        ks = {"last_status": "ping_pending", "pending_reason": reason_code,
+              "pending_windows": ["5h"], "pending_until": _now() + 600}
+        acct = _fresh(keeper_state=ks, usage_cached_at=_now() - 2 * 3600)
+        r = _reason(tmp_path, acct)
+        assert r == {"text": "window opening", "short": "opening", "tone": "muted", "muted": True}
+
     def test_rate_limited_without_a_time(self, tmp_path):
         acct = _fresh(keeper_state={"last_status": "rate_limited"})
         assert _reason(tmp_path, acct)["text"] == "rate limited"

@@ -359,17 +359,18 @@ def _epoch_to_iso(epoch) -> Optional[str]:
         return None
 
 
-def _log_skipped_limit(source: str, label: str) -> None:
+def _log_skipped_limit(source: str, key: str) -> None:
     """Log a model limit that the parser skipped: WARNING once per (source,
-    label) in a process, DEBUG after that. The line names the limit, never
-    the value."""
-    key = (source, label)
-    level = logging.DEBUG if key in _SKIPPED_LIMITS_LOGGED else logging.WARNING
-    _SKIPPED_LIMITS_LOGGED.add(key)
+    key) in a process (the service logs at INFO, so a DEBUG-only line would
+    never show), DEBUG after that. The line names the entry key and its
+    source, never the value."""
+    seen = (source, key)
+    level = logging.DEBUG if seen in _SKIPPED_LIMITS_LOGGED else logging.WARNING
+    _SKIPPED_LIMITS_LOGGED.add(seen)
     logger.log(
         level,
-        "Model limit %s from %s has no finite percent; jacked shows no reading for it",
-        label,
+        "Model limit entry %s from %s has no finite percent; jacked shows no reading for it",
+        key,
         source,
     )
 
@@ -400,7 +401,7 @@ def _claude_scoped_models(raw: dict, plan=None) -> list[dict]:
             continue
         utilization = percent_reading(lim.get("percent"))
         if utilization is None:
-            _log_skipped_limit("limits", label)
+            _log_skipped_limit("limits", str(label).lower())
             continue
         severity = lim.get("severity")
         out.append(
@@ -452,7 +453,7 @@ def _codex_named_models(raw: dict, plan=None) -> list[dict]:
             slot = "session"
             utilization = percent_reading(window.get("usedPercent"))
         if utilization is None:
-            _log_skipped_limit("rateLimitsByLimitId", label)
+            _log_skipped_limit("rateLimitsByLimitId", str(limit_id).lower())
             continue
         out.append(
             {
@@ -488,7 +489,7 @@ def _legacy_seven_day_models(raw: dict, plan=None) -> list[dict]:
             continue
         utilization = percent_reading(percent)
         if utilization is None:
-            _log_skipped_limit(f"seven_day_{suffix}", label)
+            _log_skipped_limit("seven_day", suffix)
             continue
         out.append(
             {
