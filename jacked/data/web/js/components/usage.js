@@ -358,6 +358,12 @@ function windowReason(acct, windowKey, nowMs) {
         case 'auto_swap_disabled': return reason('auto-swap off');
         default: break;
     }
+    // The provider accepted the ping and a usage read has not shown the new
+    // window yet (#238i): the window is opening. It is not a retry and not
+    // a lapsed window.
+    if (ks.last_status === 'ping_pending' || ks.skip_reason === 'confirming') {
+        return reason('window opening', 'muted', false, 'opening');
+    }
     if (ks.last_status === 'rate_limited') {
         if (!next) return reason('rate limited', 'muted', false, 'rate limited');
         return due

@@ -899,3 +899,72 @@ def test_fetch_codex_usage_failure_records_error_off_the_loop(db, tmp_path, monk
     assert len(seen["record_account_error"]) == 2
     assert loop_tid not in seen["record_account_error"]
     assert db.get_account(acct["id"])["last_error"] == "codex app-server returned no rate limits"
+
+
+# --------------------------------------------------------------------------
+# A usedPercent that is not a finite number is no reading (#231i)
+# --------------------------------------------------------------------------
+
+NON_FINITE_VALUES = [
+    pytest.param(json.loads("1e999"), None, id="1e999"),
+    pytest.param(float("nan"), None, id="nan"),
+    pytest.param("Infinity", None, id="Infinity-string"),
+    pytest.param(float("-inf"), None, id="-inf"),
+    pytest.param("92", 92.0, id="numeric-string"),
+]
+
+
+def _two_windows(five_pct, seven_pct=26):
+    return {"rateLimits": {
+        "primary": {"usedPercent": five_pct, "windowDurationMins": 300, "resetsAt": 1782683811},
+        "secondary": {"usedPercent": seven_pct, "windowDurationMins": 10080,
+                      "resetsAt": 1783199300},
+        "planType": "pro",
+    }}
+
+
+@pytest.mark.parametrize("value,expected", NON_FINITE_VALUES)
+def test_normalize_reads_only_a_finite_used_percent(value, expected):
+    cu._warned_shapes.clear()
+    norm = cu.normalize_rate_limits(_two_windows(value, value))
+    assert norm["five_hour"]["utilization"] == expected
+    assert norm["seven_day"]["utilization"] == expected
+    # The windows are still reported: a window without a reading is no
+    # evidence that the window is gone.
+    assert norm["five_hour"]["reported"] and norm["seven_day"]["reported"]
+    json.dumps({k: norm[k] for k in ("five_hour", "seven_day")}, allow_nan=False)
+
+
+@pytest.mark.parametrize("value", [json.loads("1e999"), float("nan"), "Infinity", float("-inf")])
+def test_fetch_never_caches_a_used_percent_that_is_not_a_finite_number(
+    db, tmp_path, monkeypatch, value
+):
+    cu._warned_shapes.clear()
+    acct = db.create_account("dev@example.com", "tok", cu.time.time() + 99999, provider="codex")
+    db.update_account_usage_cache(
+        acct["id"], five_hour=40.0, five_hour_resets_at="2026-07-28T19:14:54+00:00"
+    )
+
+    async def fake_read(**kwargs):
+        return _two_windows(value)
+
+    monkeypatch.setattr(cu, "read_codex_rate_limits", fake_read)
+    assert asyncio.run(cu.fetch_codex_usage(acct["id"], db, home=tmp_path / ".codex"))
+    row = db.get_account(acct["id"])
+    # The window has no reading: the last known value and its reset stay.
+    assert (row["cached_usage_5h"], row["cached_5h_resets_at"]) == (
+        40.0, "2026-07-28T19:14:54+00:00")
+    assert row["cached_usage_7d"] == 26
+
+
+def test_an_unreadable_used_percent_warns_once_without_its_value(caplog):
+    import logging
+
+    cu._warned_shapes.clear()
+    with caplog.at_level(logging.DEBUG, logger=cu.logger.name):
+        for _ in range(3):
+            cu.normalize_rate_limits(_two_windows("Infinity"))
+    ours = [r for r in caplog.records if "usedPercent" in r.getMessage()]
+    assert [r.levelno for r in ours] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+    assert "five_hour" in ours[0].getMessage() and "str" in ours[0].getMessage()
+    assert all("Infinity" not in r.getMessage() for r in ours)

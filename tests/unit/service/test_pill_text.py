@@ -33,6 +33,7 @@ def _fresh_plan_state(monkeypatch):
     monkeypatch.setattr(usage_plans, "_drift_logged", set())
     monkeypatch.setattr(menubar_summary, "_VIEW_FAILURES_LOGGED", set())
     monkeypatch.setattr(menubar_summary, "_CAP_FAILURES_LOGGED", set())
+    monkeypatch.setattr(menubar_summary, "_SKIPPED_LIMITS_LOGGED", set())
 
 
 def _ultra(**extra):
@@ -263,6 +264,7 @@ class TestUnreadableNumbers:
                     "worst": compute_worst_account_summary([good, bad])}, allow_nan=False)
 
     def test_a_bad_model_percent_warns_once_without_the_value(self, caplog):
+        # The parser skips the limit; the WARNING names the model, never the value.
         import logging
 
         with caplog.at_level(logging.WARNING, logger="jacked.service.menubar_summary"):
@@ -270,7 +272,7 @@ class TestUnreadableNumbers:
                 summarize_account(_fable_row('"Infinity"'))
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
-        assert "account 9" in warnings[0] and "inf" not in warnings[0].lower()
+        assert "Fable" in warnings[0] and "inf" not in warnings[0].lower()
 
     @pytest.mark.parametrize("resets_at", ["1e999", "NaN", '"junk"', "[1]"])
     def test_a_bad_model_reset_never_reaches_the_summary(self, resets_at):

@@ -305,11 +305,24 @@ an account when its weekly window turned over. A ping is a success only when
 each window that caused it is open after the ping. A reset time in the future
 shows that a window is open. The API can omit the weekly reset time. A weekly
 window without a reset time is open when the usage read after the ping
-succeeds, or when the ping reply has window headers. Otherwise the keeper
-records `ping_ok_no_window` and doubles the retry delay, up to one hour. The
-keeper stores the count of failures, so a restart does not reset the delay. A
+succeeds, or when the ping reply has window headers.
+
+When a window is not open after the ping, the keeper records the ping as
+pending (`ping_pending`), not as a failure. The provider accepted the ping, but
+the usage read can show the new window late. The keeper also records the
+reason: `no_header` (no reset header and no usage read), `read_not_landed` (a
+reset header but no usage read) or `read_no_window` (a usage read with no
+window). For two sweeps, and for at least 15 minutes, the keeper does not ping
+the account again. A usage poll or a later sweep that shows each window open
+sets the state to `ok`. If this grace window ends first, the keeper reads the
+usage one more time, then records `ping_ok_no_window` and doubles the retry
+delay, up to one hour.
+
+The keeper stores the count of failures, so a restart does not reset the delay
+or the grace window. The retry delay starts at the end of the grace window. A
 reset value that is not a time (for example, an empty string) is stored as no
-reset. It runs in `full_sweep_loop`
+reset. A usage percent that is not a finite number (NaN, an infinity) is
+stored as no reading. The keeper runs in `full_sweep_loop`
 (`jacked/api/usage_monitor.py`) at the `usage_check_interval`. The wait
 between sweeps uses the wall clock, so a closed laptop does not stretch it.
 

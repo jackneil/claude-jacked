@@ -2309,6 +2309,40 @@ def test_a_non_numeric_percent_drops_the_segment(home, percent):
     assert "Fable 9" not in _render({"model": {"display_name": "Fable 5"}}, home)
 
 
+@pytest.mark.parametrize("percent", [float("inf"), float("nan"), 10**400])
+def test_a_percent_that_is_not_a_finite_number_drops_only_the_segment(home, percent):
+    """round() raises OverflowError on infinity, the segment guard catches
+    only ValueError, and main() hides the error, so one bad cached percent
+    blanked the whole status line (#231i). A number too large for a float
+    printed hundreds of digits."""
+    _usage_home(home, limits=(_weekly_scoped("Fable", percent),))
+    assert _render({"model": {"display_name": "Fable 5"}}, home) == (
+        f"{BOLD_CYAN}Fable 5{RESET}{SEP}{EMAIL}"
+    )
+
+
+def test_the_231i_payload_no_longer_blanks_the_status_line(home, monkeypatch, capsys):
+    """The #231i payload as jacked caches it: "percent": 1e999, which Python
+    reads as infinity. Before the fix main() swallowed the OverflowError and
+    printed nothing, so Claude Code showed an empty status line."""
+    _write_account(home, emailAddress=EMAIL, organizationUuid=ORG)
+    raw = ('{"five_hour": {}, "seven_day": {}, "limits": [{"kind": "weekly_scoped", '
+           '"percent": 1e999, "is_active": true, '
+           '"scope": {"model": {"display_name": "Fable"}}}]}')
+    _write_db(home, [(EMAIL, ORG, raw, FRESH_AT)])
+    real_render = statusline.render
+    # main() renders with the wall clock; pin it to the fixtures' clock.
+    monkeypatch.setattr(
+        statusline, "render", lambda payload: real_render(payload, home=str(home), now=NOW)
+    )
+    monkeypatch.setattr(
+        sys, "stdin", io.StringIO(json.dumps({"model": {"display_name": "Fable 5"}}))
+    )
+
+    assert statusline.main() == 0
+    assert capsys.readouterr().out == f"{BOLD_CYAN}Fable 5{RESET}{SEP}{EMAIL}\n"
+
+
 # --- account disambiguation ------------------------------------------------ #
 
 

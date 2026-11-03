@@ -95,12 +95,14 @@ _STALL_WARNING_COOLDOWN_SECONDS = 1800
 # (e.g. an exhausted account answering 429) must not be retried every sweep
 # forever — 2026-06 incident: one account pinged every 120s for hours, 429
 # every time. Exponential backoff capped at 1h; cleared on the first ping
-# whose windows are confirmed open (a 200 that opens nothing, verdict
-# ping_ok_no_window, escalates it), and dropped as soon as the account's
+# whose windows are confirmed open, and dropped as soon as the account's
 # token fingerprint changes (a re-auth must never wait out the old token's
-# backoff). Wall clock, not monotonic: macOS monotonic time stops while the
-# lid is closed, which would stretch a 1h backoff across a whole night of
-# dark wakes.
+# backoff). A 200 whose window no usage read shows yet is pending, not a
+# failure: the entry holds the account until the confirmation deadline with
+# ``fails`` unchanged, and only a deadline that passes unconfirmed escalates
+# it (verdict ping_ok_no_window, #238i). Wall clock, not monotonic: macOS
+# monotonic time stops while the lid is closed, which would stretch a 1h
+# backoff across a whole night of dark wakes.
 # Transport errors and 5xx never increment ``fails``.
 _ping_backoff: dict[int, dict] = {}
 _PING_BACKOFF_CAP_SECONDS = 3600
@@ -112,8 +114,19 @@ _PING_BACKOFF_MAX_DOUBLINGS = 16
 _PING_BACKOFF_MAX_FAILS = 10_000
 # Statuses whose persisted retry deadline a restart honors. A transport
 # error is not one: its retry is the next sweep (its next_attempt_at is
-# only the displayed estimate).
+# only the displayed estimate). Nor is ping_pending: its deadline is
+# pending_until, which the pending branch reads itself.
 _RESTORED_SCHEDULE_STATUSES = ("rate_limited", "auth_failed", "error", "ping_ok_no_window")
+# A ping the provider accepted whose window no usage read shows yet waits
+# for a usage read to confirm it: two sweeps, and never less than this.
+# Provider propagation lag is not a failure (#238i).
+_KEEPER_CONFIRM_MIN_SECONDS = 900
+# Why an accepted ping's window is not visible yet: code -> log text.
+_PENDING_REASON_TEXT = {
+    "no_header": "no reset header and no usage read-back",
+    "read_not_landed": "usage read-back did not land",
+    "read_no_window": "read-back landed with no window",
+}
 # Seconds between a keeper pass's per-ping pacing sleeps.
 _KEEPER_PING_PACING_SECONDS = 2
 # Upper bound on a single wall-clock wait slice. Short slices let a dark
@@ -758,11 +771,13 @@ async def _fetch_candidate_usage(accounts: list, active_acct_id: int, db) -> lis
         ):
             continue  # data is fresh enough
         try:
-            await asyncio.wait_for(
+            read = await asyncio.wait_for(
                 fetch_usage(acct["id"], db),
                 timeout=_CANDIDATE_FETCH_TIMEOUT_SECONDS,
             )
             fetched += 1
+            if _read_landed(read):
+                await _confirm_pending_from_poll(db, acct["id"])
         except Exception:
             logger.warning(
                 "Candidate usage: fetch for account %d failed or timed "
@@ -1281,8 +1296,9 @@ async def active_account_poll_loop(app):
 
             # -- Fetch usage (fresh token, bypasses cache) ---------------
             effective_token = read_fresh_active_token(active_acct_id)
+            active_read = None
             try:
-                await asyncio.wait_for(
+                active_read = await asyncio.wait_for(
                     fetch_usage(
                         active_acct_id,
                         db,
@@ -1296,6 +1312,8 @@ async def active_account_poll_loop(app):
                     "— continuing tick with cached data",
                     active_acct_id,
                 )
+            if _read_landed(active_read):
+                await _confirm_pending_from_poll(db, active_acct_id)
 
             # -- Read active account data from DB ------------------------
             # One thread hop: the account list and the poll-interval reads
@@ -2240,10 +2258,12 @@ async def all_accounts_refresh_loop(app):
                 try:
                     # fetch_usage dispatches on provider; for codex it ignores the
                     # token and only polls the live codex account (others no-op).
-                    await fetch_usage(
+                    read = await fetch_usage(
                         acct["id"], db, access_token=None if is_codex else choice.token
                     )
                     refreshed += 1
+                    if _read_landed(read):
+                        await _confirm_pending_from_poll(db, acct["id"])
                 except Exception:
                     logger.warning(
                         "All-accounts refresh: fetch_usage failed for account %s",
@@ -2369,7 +2389,9 @@ def _restore_ping_backoff(account_id: int, state: dict, fp: str | None) -> float
     For the same token only. The escalation count resumes whatever the last
     status was: a transport error keeps the count, so a restart after one
     must not drop it. The retry deadline is honored only for the statuses
-    that set a backoff deadline. Returns that deadline, or None.
+    that set a backoff deadline. Returns that deadline, or None. A pending
+    ping is not a retry schedule: its count resumes, and the pending branch
+    reads its own deadline (``pending_until``).
 
     >>> _restore_ping_backoff(1, {"token_fp": "a", "last_status": "ping_ok_no_window",
     ...     "next_attempt_at": 50.0, "backoff_fails": 4}, "a"), _ping_backoff.pop(1)["fails"]
@@ -2377,6 +2399,9 @@ def _restore_ping_backoff(account_id: int, state: dict, fp: str | None) -> float
     >>> _restore_ping_backoff(1, {"token_fp": "a", "last_status": "transport",
     ...     "next_attempt_at": 50.0, "backoff_fails": 4}, "a"), _ping_backoff.pop(1)["fails"]
     (None, 4)
+    >>> _restore_ping_backoff(1, {"token_fp": "a", "last_status": "ping_pending",
+    ...     "next_attempt_at": 50.0, "pending_until": 50.0, "backoff_fails": 3}, "a"), _ping_backoff.pop(1)["fails"]
+    (None, 3)
     >>> _restore_ping_backoff(1, {"token_fp": "a", "backoff_fails": 10**9}, "a"), _ping_backoff.pop(1)["fails"]
     (None, 10000)
     >>> _restore_ping_backoff(1, {"token_fp": "a", "backoff_fails": "x"}, "b"), 1 in _ping_backoff
@@ -2400,6 +2425,33 @@ def _restore_ping_backoff(account_id: int, state: dict, fp: str | None) -> float
             "fails": fails, "skip_until": skip_until or 0.0, "token_fp": fp,
         }
     return skip_until
+
+
+def _sync_backoff(account_id: int, state: dict, fp: str | None) -> float | None:
+    """Align the in-memory backoff with candidate set *fp*; return its deadline.
+
+    A new candidate set drops the entry: a re-auth never waits out the old
+    token's backoff. With no entry (a restart), the persisted schedule and
+    count resume through :func:`_restore_ping_backoff`. Returns the backoff
+    deadline (epoch seconds), or None.
+
+    >>> _ping_backoff[1] = {"fails": 2, "skip_until": 9.0, "token_fp": "old"}
+    >>> _sync_backoff(1, {}, "new"), 1 in _ping_backoff
+    (None, False)
+    >>> _sync_backoff(1, {"token_fp": "new", "backoff_fails": 2}, "new"), _ping_backoff.pop(1)["fails"]
+    (None, 2)
+    """
+    entry = _ping_backoff.get(account_id)
+    if entry is not None and entry.get("token_fp") != fp:
+        logger.info(
+            "Window keeper: account %d has a new token — dropping its ping backoff",
+            account_id,
+        )
+        _ping_backoff.pop(account_id, None)
+        entry = None
+    if entry is not None:
+        return entry["skip_until"]
+    return _restore_ping_backoff(account_id, state, fp)
 
 
 def _bounded_reset(iso: str | None, now: float, max_ahead: float) -> str | None:
@@ -2771,6 +2823,114 @@ def _window_confirmed(fresh: dict, kind: str, *, evidence: bool) -> bool:
     return kind == "7d" and reset is None and evidence
 
 
+def _read_landed(read) -> bool:
+    """True when a fetch_usage answer is a read that it stored.
+
+    fetch_usage stores a read before it returns it. A cached or backed-off
+    answer, None, or a timeout is a read that never landed.
+
+    >>> _read_landed({}), _read_landed({"five_hour": None})
+    (True, True)
+    >>> _read_landed({"_cached": True}), _read_landed({"_backed_off": True}), _read_landed(None)
+    (False, False, False)
+    """
+    return isinstance(read, dict) and not (read.get("_cached") or read.get("_backed_off"))
+
+
+def _read_since_ping(row: dict, state: dict) -> bool:
+    """True when *row* holds a usage read stored after the keeper's ping.
+
+    Every stored usage read stamps ``usage_cached_at``; the ping time is the
+    state's ``last_ping_at``. A state without a ping time proves nothing.
+
+    >>> _read_since_ping({"usage_cached_at": 101}, {"last_ping_at": 100})
+    True
+    >>> _read_since_ping({"usage_cached_at": 100}, {"last_ping_at": 100})
+    False
+    >>> _read_since_ping({"usage_cached_at": 101}, {"last_ping_at": None})
+    False
+    """
+    try:
+        return float(row.get("usage_cached_at") or 0) > float(state["last_ping_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _window_phrase(windows: list[str]) -> str:
+    """The log name of one or more windows.
+
+    >>> _window_phrase(["5h"]), _window_phrase(["5h", "7d"])
+    ('5h window', '5h and 7d windows')
+    """
+    return " and ".join(windows) + (" windows" if len(windows) > 1 else " window")
+
+
+def _pending_reason(missing: list[str], result, landed: bool) -> str:
+    """Why the windows in *missing* are not visible after an accepted ping.
+
+    ``read_no_window``: the read-back landed and the row still shows no open
+    window (the usage endpoint lags the ping). ``read_not_landed``: the
+    read-back did not land, and the reply carried a reset header for each
+    missing window. ``no_header``: the read-back did not land, and the reply
+    carried no reset header for a missing window. With two missing windows
+    the weaker evidence names the reason, so the reason never claims a
+    header that the reply did not carry.
+
+    >>> from jacked.web.window_keeper import PingResult
+    >>> bare = PingResult(ok=True)
+    >>> h5 = PingResult(ok=True, rate_limit={"anthropic-ratelimit-unified-5h-reset": "1800003600"})
+    >>> _pending_reason(["5h"], bare, True), _pending_reason(["5h"], h5, False)
+    ('read_no_window', 'read_not_landed')
+    >>> _pending_reason(["5h"], bare, False), _pending_reason(["5h", "7d"], h5, False)
+    ('no_header', 'no_header')
+    """
+    if landed:
+        return "read_no_window"
+    headers = {"5h": result.reset_5h_iso(), "7d": result.reset_7d_iso()}
+    if all(headers[name] for name in missing):
+        return "read_not_landed"
+    return "no_header"
+
+
+def _pending_windows(state: dict) -> list[str]:
+    """The windows a pending ping waits for; [] when the state is not pending.
+
+    >>> _pending_windows({"last_status": "ping_pending", "pending_windows": ["7d", "5h"]})
+    ['5h', '7d']
+    >>> _pending_windows({"last_status": "ok", "pending_windows": ["5h"]})
+    []
+    >>> _pending_windows({"last_status": "ping_pending", "pending_windows": "5h"})
+    []
+    """
+    raw = state.get("pending_windows")
+    if state.get("last_status") != "ping_pending" or not isinstance(raw, list):
+        return []
+    return [name for name in ("5h", "7d") if name in raw]
+
+
+def _pending_confirmed(
+    row: dict, state: dict, windows: list[str], *, landed: bool = False
+) -> bool:
+    """True when *row* shows every pending window open (:func:`_window_confirmed`).
+
+    The evidence for a weekly window without a reset is a usage read stored
+    after the ping, or *landed* (the keeper's own read at the deadline). A
+    missing row confirms nothing.
+
+    >>> st = {"last_ping_at": 100}
+    >>> _pending_confirmed({"cached_7d_resets_at": None, "usage_cached_at": 90}, st, ["7d"])
+    False
+    >>> _pending_confirmed({"cached_7d_resets_at": None, "usage_cached_at": 130}, st, ["7d"])
+    True
+    >>> _pending_confirmed({}, st, ["7d"], landed=True)
+    False
+    """
+    if not row:
+        return False
+    evidence = landed or _read_since_ping(row, state)
+    return all(_window_confirmed(row, name, evidence=evidence) for name in windows)
+
+
 async def _keeper_record_success(
     db,
     acct: dict,
@@ -2794,17 +2954,23 @@ async def _keeper_record_success(
     A 200 with no window headers and a read that never lands confirms
     nothing.
 
-    The verdict is ``ok`` only when every needed window is confirmed.
-    Otherwise it is ``ping_ok_no_window``, the WARNING names the windows
-    that jacked cannot confirm open (a window can open with no evidence in
-    time: the provider rounds the start down to the hour and the read-back
-    can lag), and the backoff escalates one step (600 s, 1200 s,
-    2400 s, then the one-hour cap at the default interval). The escalation
-    count is dropped ONLY on success: a ping that never opens its window must
-    not restart at the first step on every sweep.
+    The verdict is ``ok`` when every needed window is confirmed. Otherwise
+    the provider accepted the ping and the window is not visible yet: the
+    read-back runs about two seconds after the ping, before the usage
+    endpoint shows the new window (#238i). That is not a failure. The verdict
+    is ``ping_pending`` with the missing windows, the reason that applied
+    (:func:`_pending_reason`) and a confirmation deadline: two sweeps, and
+    never less than ``_KEEPER_CONFIRM_MIN_SECONDS``. The escalation count
+    stays as it is, and an in-memory hold keeps the generic backoff check
+    from pinging again before the deadline even if the state write fails. A
+    later usage read confirms the windows (:func:`_confirm_pending`,
+    :func:`_confirm_pending_from_poll`); only a deadline that passes
+    unconfirmed escalates the backoff (600 s, 1200 s, 2400 s, then the
+    one-hour cap at the default interval). The count is dropped ONLY on
+    success: a ping that never opens its window must not restart at the
+    first step on every cycle.
     """
     from jacked.usage_plans import has_session
-    from jacked.web import auth as auth_mod
 
     account_id = acct["id"]
     needs_5h, needs_7d = needed
@@ -2820,22 +2986,7 @@ async def _keeper_record_success(
                 account_id,
                 exc_info=True,
             )
-    read = None
-    try:
-        read = await asyncio.wait_for(
-            auth_mod.fetch_usage(
-                account_id, db, access_token=good_token, post_ping=True
-            ),
-            timeout=10.0,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "Full sweep: fetch_usage for account %d exceeded 10s — moving on",
-            account_id,
-        )
-    # fetch_usage stores a read before it returns it; a cached or backed-off
-    # answer, None, or a timeout is a read that never landed.
-    landed = isinstance(read, dict) and not (read.get("_cached") or read.get("_backed_off"))
+    landed = await _keeper_usage_read(db, account_id, good_token, post_ping=True)
     fresh = await asyncio.to_thread(db.get_account, account_id) or {}
     # A deleted row (gone mid-sweep) confirms nothing.
     missing = [
@@ -2850,7 +3001,7 @@ async def _keeper_record_success(
     fresh_fp = _candidate_fingerprint(*_keeper_candidates(fresh)) if fresh else None
     fields = {
         "last_ping_at": int(now),
-        "last_status": "ping_ok_no_window" if missing else "ok",
+        "last_status": "ok",
         "error_type": None,
         "request_id": result.request_id,
         "consecutive_auth_failures": 0,
@@ -2859,19 +3010,199 @@ async def _keeper_record_success(
         "paused_until": None,
         "token_fp": fresh_fp,
     }
-    if missing:
-        logger.warning(
-            "Window keeper: ping for account %d succeeded but jacked cannot "
-            "confirm the %s open (no reset header, usage read-back did not land)",
-            account_id,
-            " and ".join(missing) + (" windows" if len(missing) > 1 else " window"),
-        )
-        fields["next_attempt_at"] = _arm_ping_backoff(
-            account_id, fresh_fp, check_interval, now
-        )
-    else:
+    if not missing:
         _ping_backoff.pop(account_id, None)
+        await asyncio.to_thread(_write_keeper_state, db, account_id, **fields)
+        return
+    reason = _pending_reason(missing, result, landed)
+    pending_until = now + max(2 * check_interval, _KEEPER_CONFIRM_MIN_SECONDS)
+    entry = _ping_backoff.setdefault(
+        account_id, {"fails": 0, "skip_until": 0.0, "token_fp": fresh_fp}
+    )
+    entry["token_fp"] = fresh_fp
+    entry["skip_until"] = pending_until
+    fields.update(
+        last_status="ping_pending",
+        pending_windows=missing,
+        pending_until=pending_until,
+        pending_reason=reason,
+        # Persist the count as it is: with next_attempt_at None,
+        # _write_keeper_state would otherwise write 0.
+        backoff_fails=int(entry["fails"]),
+    )
+    logger.info(
+        "Window keeper: ping for account %d accepted; %s not visible yet (%s); "
+        "confirming by %s",
+        account_id,
+        _window_phrase(missing),
+        _PENDING_REASON_TEXT[reason],
+        datetime.fromtimestamp(pending_until, timezone.utc).isoformat(timespec="seconds"),
+    )
     await asyncio.to_thread(_write_keeper_state, db, account_id, **fields)
+
+
+async def _keeper_usage_read(
+    db, account_id: int, token: str | None, *, post_ping: bool
+) -> bool:
+    """One keeper usage read, bounded to 10 s. True when the read landed.
+
+    A slow read does not fail the ping: the pending state names it
+    (``read_not_landed``), and the verdict at the confirmation deadline
+    names it once. So the timeout is INFO, not a second WARNING.
+    """
+    from jacked.web import auth as auth_mod
+
+    try:
+        read = await asyncio.wait_for(
+            auth_mod.fetch_usage(
+                account_id, db, access_token=token, post_ping=post_ping
+            ),
+            timeout=10.0,
+        )
+    except asyncio.TimeoutError:
+        logger.info(
+            "Window keeper: the usage read for account %d took more than 10s; "
+            "moving on",
+            account_id,
+        )
+        return False
+    return _read_landed(read)
+
+
+async def _finish_pending(db, account_id: int, windows: list[str]) -> None:
+    """Record that a usage read shows every window of an accepted ping open.
+
+    The verdict becomes ``ok``. The write clears the pending fields and the
+    retry deadline, and so (:func:`_write_keeper_state`) the persisted
+    escalation count. The in-memory hold is dropped.
+    """
+    _ping_backoff.pop(account_id, None)
+    await asyncio.to_thread(
+        _write_keeper_state,
+        db,
+        account_id,
+        last_status="ok",
+        pending_windows=None,
+        pending_until=None,
+        pending_reason=None,
+        next_attempt_at=None,
+        skip_reason=None,
+    )
+    logger.info(
+        "Window keeper: the %s of account %d %s confirmed open by the usage poll",
+        _window_phrase(windows),
+        account_id,
+        "are" if len(windows) > 1 else "is",
+    )
+
+
+async def _confirm_pending(
+    db, acct: dict, state: dict, now: float, check_interval: float
+) -> str | None:
+    """Settle a pending ping (``last_status`` ``ping_pending``).
+
+    Returns None when the account is not pending. Otherwise:
+
+    a. Every pending window shows open on the row (:func:`_pending_confirmed`;
+       the regular poll stamps ``usage_cached_at``): ``ok``, returns
+       "confirmed". A confirmation is not a ping.
+    b. Before ``pending_until``: no ping and no read. The skip reason is
+       ``confirming`` with the deadline as the next attempt; returns
+       "skipped".
+    c. At or after the deadline: one normal-paced usage read with the
+       keeper's first candidate token. When the row then shows every window
+       open: as (a). Otherwise ``ping_ok_no_window``, ONE WARNING that names
+       the reason that applied, and the backoff escalates one step; returns
+       "failed". The retry delay counts from the deadline, not from this
+       sweep: a machine that slept through the grace window and the window
+       itself must not get a fresh delay in front of the ping it needs now.
+
+    The hold does not depend on the token: a re-auth does not change whether
+    the accepted ping opened its window. The escalation count follows the
+    generic rules (:func:`_sync_backoff`): a restart resumes the persisted
+    count, a new candidate set drops it.
+    """
+    windows = _pending_windows(state)
+    if not windows:
+        return None
+    account_id = acct["id"]
+    if _pending_confirmed(acct, state, windows):
+        await _finish_pending(db, account_id, windows)
+        return "confirmed"
+    cc_token, primary_token = _keeper_candidates(acct)
+    # Resume the count after a restart (or drop it for a new token set)
+    # before (b) persists it or (c) escalates it.
+    _sync_backoff(account_id, state, _candidate_fingerprint(cc_token, primary_token))
+    try:
+        deadline = float(state["pending_until"])
+    except (KeyError, TypeError, ValueError):
+        deadline = now  # an unreadable deadline never holds the account
+    if now < deadline:
+        await asyncio.to_thread(
+            _note_keeper_skip, db, acct, state, "confirming", next_attempt_at=deadline
+        )
+        return "skipped"
+    landed = await _keeper_usage_read(
+        db, account_id, cc_token or primary_token, post_ping=False
+    )
+    fresh = await asyncio.to_thread(db.get_account, account_id) or {}
+    if _pending_confirmed(fresh, state, windows, landed=landed):
+        await _finish_pending(db, account_id, windows)
+        return "confirmed"
+    logger.warning(
+        "Window keeper: the %s of account %d %s still not visible after the "
+        "confirmation wait (%s)",
+        _window_phrase(windows),
+        account_id,
+        "are" if len(windows) > 1 else "is",
+        "the usage read landed with no window"
+        if landed or _read_since_ping(fresh, state)
+        else "the usage read did not land",
+    )
+    fresh_fp = _candidate_fingerprint(*_keeper_candidates(fresh)) if fresh else None
+    retry_at = _arm_ping_backoff(account_id, fresh_fp, check_interval, deadline)
+    await asyncio.to_thread(
+        _write_keeper_state,
+        db,
+        account_id,
+        last_status="ping_ok_no_window",
+        pending_windows=None,
+        pending_until=None,
+        pending_reason=None,
+        next_attempt_at=retry_at,
+        skip_reason=None,
+        token_fp=fresh_fp,
+    )
+    return "failed"
+
+
+async def _confirm_pending_from_poll(db, account_id: int) -> bool:
+    """Confirm a pending keeper ping from a usage read that a poll stored.
+
+    The active poll, its candidate reads and the all-accounts refresh call
+    this after a read that landed. When the row's keeper state is
+    ``ping_pending`` and every pending window shows open, the verdict
+    becomes ``ok`` (:func:`_finish_pending`): the dashboard flips within one
+    poll instead of one sweep. Returns True when it confirmed. Never raises:
+    a database error is logged and the poll goes on.
+    """
+    try:
+        row = await asyncio.to_thread(db.get_account, account_id)
+    except Exception:
+        logger.warning(
+            "Window keeper: could not confirm a pending ping for account %d",
+            account_id,
+            exc_info=True,
+        )
+        return False
+    if not row:
+        return False
+    state = _keeper_state_of(row)
+    windows = _pending_windows(state)
+    if not windows or not _pending_confirmed(row, state, windows):
+        return False
+    await _finish_pending(db, account_id, windows)
+    return True
 
 
 async def _keeper_record_failure(
@@ -3037,7 +3368,14 @@ async def _keeper_record_failure(
 
 
 async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
-    """Run the keeper for one account. Returns 'pinged', 'failed' or 'skipped'."""
+    """Run the keeper for one account. Returns 'pinged', 'failed' or 'skipped'.
+
+    A pending ping (#238i) holds the account until its confirmation
+    deadline. Once it settles (:func:`_confirm_pending`), the account goes
+    on through the needs and backoff rules in the same pass: a window that
+    lapsed while the machine slept gets its ping now, and a pre-wake pass
+    does not skip it.
+    """
     from jacked.usage_plans import has_session
     from jacked.web import window_keeper as wk
 
@@ -3047,6 +3385,17 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
     if (acct.get("provider") or "claude") == "codex":
         await asyncio.to_thread(_note_keeper_skip, db, acct, state, "codex_no_keeper")
         return "skipped"
+
+    pending = await _confirm_pending(db, acct, state, time.time(), check_interval)
+    if pending == "skipped":
+        return pending
+    if pending is not None:
+        # Settled ("confirmed" or "failed"): read the row and the state it
+        # wrote, then let the rules below decide about a new ping.
+        fresh = await asyncio.to_thread(db.get_account, account_id)
+        if not fresh:
+            return pending
+        acct, state = fresh, _keeper_state_of(fresh)
 
     needs_5h, needs_7d = _keeper_window_needed(acct, state)
     if not needs_5h and not needs_7d:
@@ -3085,19 +3434,7 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
             await asyncio.to_thread(_note_keeper_skip, db, acct, state, None)
         return "skipped"
 
-    entry = _ping_backoff.get(account_id)
-    if entry is not None and entry.get("token_fp") != fp:
-        logger.info(
-            "Window keeper: account %d has a new token — dropping its ping backoff",
-            account_id,
-        )
-        _ping_backoff.pop(account_id, None)
-        entry = None
-    # No in-memory entry: a restart. Resume the persisted schedule and count.
-    skip_until = (
-        entry["skip_until"] if entry is not None
-        else _restore_ping_backoff(account_id, state, fp)
-    )
+    skip_until = _sync_backoff(account_id, state, fp)
     if skip_until and skip_until > now:
         logger.debug(
             "Window keeper: account %d in ping backoff for %.0fs more — skipping",

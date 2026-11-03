@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 
 RESET = "\033[0m"
@@ -18,9 +19,22 @@ SEP = f" {DIM}|{RESET} "
 
 
 def _round_pct(value) -> int | None:
+    """A percent rounded to an int, or None when it is not a finite number.
+
+    A bool, NaN, an infinity and an int too large for a float are no
+    reading: ``round`` raises on NaN and infinity, and a huge int would print
+    hundreds of digits.
+
+    >>> _round_pct(84.6), _round_pct(96), _round_pct(float("inf")), _round_pct(10**400)
+    (85, 96, None, None)
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return round(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return round(number) if math.isfinite(number) else None
 
 
 def _pct_color(pct: int) -> str:

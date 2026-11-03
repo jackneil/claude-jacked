@@ -64,15 +64,28 @@ class WebSocketRegistry:
         socket (e.g. backgrounded Chrome tab with full send buffer) cannot
         block other clients or the caller. Dead / timed-out clients are
         pruned from the registry.
+
+        The message is strict JSON. ``JSON.parse`` in the browser refuses the
+        bare ``NaN`` and ``Infinity`` tokens, and a refused frame loses the
+        whole message, so a payload that holds a non-finite number is not
+        sent. A WARNING names the topic, never the payload.
         """
-        message = json.dumps(
-            {
-                "type": topic,
-                "payload": payload or {},
-                "source": source or "server",
-                "timestamp": int(time.time()),
-            }
-        )
+        try:
+            message = json.dumps(
+                {
+                    "type": topic,
+                    "payload": payload or {},
+                    "source": source or "server",
+                    "timestamp": int(time.time()),
+                },
+                allow_nan=False,
+            )
+        except ValueError:
+            logger.warning(
+                "WebSocket broadcast dropped: topic=%s carries a non-finite number",
+                topic,
+            )
+            return
 
         targets: list[WebSocket] = [
             ws for ws, subs in list(self._clients.items())

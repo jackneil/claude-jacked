@@ -65,6 +65,30 @@ def finite_number(value) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
+def percent_reading(value) -> Optional[float]:
+    """A provider usage percent as a finite float, or None (no reading,
+    never 0%).
+
+    The one reader of every usage percent: the per-model parser, the usage
+    cache writers of both providers and the cached-value reader of the
+    pacing code. A numeric string is read as its number, then
+    :func:`finite_number` applies: a bool, None, NaN, an infinity, a number
+    too large for a float and any other value are no reading.
+
+    >>> percent_reading(92), percent_reading(42.5), percent_reading("92")
+    (92.0, 42.5, 92.0)
+    >>> [percent_reading(v) for v in (None, True, float("nan"), float("-inf"),
+    ...                                "Infinity", "1e999", "92%", 10**400, {})]
+    [None, None, None, None, None, None, None, None, None]
+    """
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    return finite_number(value)
+
+
 def _pct(value: float) -> str:
     """A percent label, rounded half up like ``Math.round`` in usage.js.
 

@@ -22,6 +22,7 @@ from typing import Literal, Optional
 
 import httpx
 
+from jacked.service.pill_text import percent_reading
 from jacked.web.database import Database
 from jacked.web.refresh_verdict import FOREIGN_TOKEN_ERROR as _FOREIGN_TOKEN_ERROR
 from jacked.web.refresh_verdict import SIGN_IN_REQUIRED_ERROR
@@ -1154,20 +1155,25 @@ def _usage_429_rotation_interval(db) -> float:
     return float(_USAGE_429_ROTATION_POLL_PERIODS * max(period, _USAGE_POLL_PERIOD_FLOOR))
 
 
-# (window, value type) pairs already logged; two windows times the few JSON
-# types bound it.
-_UNREADABLE_RESETS_LOGGED: set = set()
+# (window, field, value type) triples already logged; two windows, two
+# fields and the few JSON types bound it.
+_UNREADABLE_LOGGED: set = set()
 
 
-def _note_unreadable_reset(window: str, value) -> None:
-    """Log, once per window and value type, a reset stored as no reset."""
-    key = (window, type(value).__name__)
-    if key in _UNREADABLE_RESETS_LOGGED:
+def _note_unreadable(window: str, field: str, value) -> None:
+    """Log, once per window, field and value type, a provider value that the
+    cache stores as no value. *field* is "reset" or "utilization". The line
+    names the type, never the value."""
+    key = (window, field, type(value).__name__)
+    if key in _UNREADABLE_LOGGED:
         return
-    _UNREADABLE_RESETS_LOGGED.add(key)
+    _UNREADABLE_LOGGED.add(key)
+    must_be, stored_as = (
+        ("a timestamp", "no reset") if field == "reset" else ("a finite number", "no reading")
+    )
     logger.warning(
-        "Usage payload: the %s reset is not a timestamp (a %s value); "
-        "it is stored as no reset", window, type(value).__name__,
+        "Usage payload: the %s %s is not %s (a %s value); it is stored as %s",
+        window, field, must_be, type(value).__name__, stored_as,
     )
 
 
@@ -1178,7 +1184,10 @@ def usage_cache_updates(data: dict) -> dict:
     (no active window) clears that window. A window object with a null
     ``resets_at`` keeps its utilization and clears the stale reset time. A
     ``resets_at`` that is not a timestamp (an empty string, junk) is stored
-    as no reset (:func:`jacked.web.window_keeper.cache_reset_value`).
+    as no reset (:func:`jacked.web.window_keeper.cache_reset_value`). A
+    ``utilization`` that is not a finite number (NaN, an infinity, junk) is
+    no reading (:func:`jacked.service.pill_text.percent_reading`, the reader
+    of every usage percent): the rules of a null utilization apply to it.
 
     One exception to "a missing key keeps the cache": an authoritative Claude
     ``limits`` list (a list in which every entry has a kind in
@@ -1190,16 +1199,19 @@ def usage_cache_updates(data: dict) -> dict:
     authoritative, so a renamed session kind can never clear a live window.
 
     >>> usage_cache_updates({"five_hour": None, "seven_day": {"utilization": 3}})
-    {'clear_five_hour': True, 'seven_day': 3, 'clear_seven_day_reset': True}
+    {'clear_five_hour': True, 'seven_day': 3.0, 'clear_seven_day_reset': True}
     >>> usage_cache_updates({"five_hour": {"utilization": 9, "resets_at": "2026-11-02T00:00:00Z"}})
-    {'five_hour': 9, 'five_hour_resets_at': '2026-11-02T00:00:00Z'}
+    {'five_hour': 9.0, 'five_hour_resets_at': '2026-11-02T00:00:00Z'}
     >>> usage_cache_updates({"seven_day": {"utilization": 3, "resets_at": ""}})
-    {'seven_day': 3, 'clear_seven_day_reset': True}
+    {'seven_day': 3.0, 'clear_seven_day_reset': True}
+    >>> usage_cache_updates({"seven_day": {"utilization": float("inf"),
+    ...                                    "resets_at": "2026-11-08T00:00:00Z"}})
+    {'seven_day_resets_at': '2026-11-08T00:00:00Z'}
     >>> usage_cache_updates({})
     {}
     >>> usage_cache_updates({"limits": [{"kind": "weekly_all"}],
     ...                      "seven_day": {"utilization": 3, "resets_at": "2026-11-08T00:00:00Z"}})
-    {'clear_five_hour': True, 'seven_day': 3, 'seven_day_resets_at': '2026-11-08T00:00:00Z'}
+    {'clear_five_hour': True, 'seven_day': 3.0, 'seven_day_resets_at': '2026-11-08T00:00:00Z'}
     >>> usage_cache_updates({"limits": [{"kind": "session"}, {"kind": "weekly_all"}]})
     {}
     >>> usage_cache_updates({"limits": [{"kind": "rolling_5h"}]})
@@ -1230,10 +1242,12 @@ def usage_cache_updates(data: dict) -> dict:
         if not isinstance(window, dict):
             updates[f"clear_{short}"] = True
             continue
-        utilization = window.get("utilization")
+        utilization = percent_reading(window.get("utilization"))
+        if utilization is None and window.get("utilization") is not None:
+            _note_unreadable(short, "utilization", window.get("utilization"))
         resets_at = cache_reset_value(window.get("resets_at"))
         if resets_at is None and window.get("resets_at") is not None:
-            _note_unreadable_reset(short, window.get("resets_at"))
+            _note_unreadable(short, "reset", window.get("resets_at"))
         if utilization is None and resets_at is None:
             updates[f"clear_{short}"] = True
             continue

@@ -1805,7 +1805,11 @@ class Database:
             return dict(row) if row else None
 
     # Keys set_keeper_state accepts. A typo must fail loudly in tests, not
-    # silently grow the JSON blob the dashboard reads.
+    # silently grow the JSON blob the dashboard reads. The pending_* keys
+    # belong to a ping the provider accepted whose window no usage read
+    # shows yet (last_status "ping_pending"): pending_windows lists "5h" and
+    # "7d", pending_until is the epoch confirmation deadline, and
+    # pending_reason is "no_header", "read_not_landed" or "read_no_window".
     KEEPER_STATE_FIELDS = frozenset(
         {
             "last_ping_at",
@@ -1818,6 +1822,9 @@ class Database:
             "paused_until",
             "token_fp",
             "backoff_fails",
+            "pending_windows",
+            "pending_until",
+            "pending_reason",
         }
     )
 
@@ -1862,6 +1869,10 @@ class Database:
         ('ok', 'backoff')
         >>> Database.parse_keeper_state(db.get_account(acct["id"])["keeper_state"])["skip_reason"]
         'backoff'
+        >>> st = db.set_keeper_state(acct["id"], last_status="ping_pending",
+        ...     pending_windows=["5h"], pending_until=1800000900, pending_reason="read_no_window")
+        >>> st["pending_windows"], st["pending_until"], st["pending_reason"]
+        (['5h'], 1800000900, 'read_no_window')
         """
         unknown = set(fields) - self.KEEPER_STATE_FIELDS
         if unknown:
