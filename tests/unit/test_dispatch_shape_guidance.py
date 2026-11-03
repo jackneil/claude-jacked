@@ -204,8 +204,12 @@ def test_full_suite_runs_once_per_goal_never_per_milestone():
     behaviors = _read("rules/jacked_behaviors.md")
     assert "every test file that imports or reads a changed file" in behaviors
     assert "In `/bhag` a cell is the merge unit" in behaviors
+    assert "Re-run only the failing tests." in behaviors
+    assert "for a `SKILL.md`, grep its parent directory name" in behaviors
+    assert "(outside a goal, once per push; a /bhag cell is its own batch)" in _read("skills/chain-of-command/SKILL.md")
     bhag = _read("commands/bhag.md")
     assert "Run only the targeted tests while building the cell" in bhag
+    assert "every test file that imports or reads a changed file" in bhag
     assert "run <repo's real test command> ONCE" in bhag and "never after each edit" in bhag
 
 
@@ -226,3 +230,8 @@ def test_merge_mode_stacks_milestones_and_merges_once_at_the_end():
     assert "evidence holds the branch name and the commit SHA" in goal
     assert "the merged PR number in its evidence" in goal
     assert "until the current one's PR has fully merged" not in goal
+    assert "branches off the branch of the last DONE milestone" in goal
+    assert "A blocked milestone gets no PR and nothing branches off it" in goal
+    assert "gh pr update-branch <PR#>" in goal and "shows BEHIND" in goal
+    assert "At merge time, append the merged PR number" in goal
+    assert "the first done entry with no merged PR number" in goal
