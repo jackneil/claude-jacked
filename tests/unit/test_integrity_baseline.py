@@ -333,6 +333,27 @@ class TestBaselineScriptKeys:
 
         assert loaded["baseline"]["scripts"] == {"C:/hooks/x.py": "sha256:a", "/h/y.py": "sha256:b"}
 
+    def test_a_posix_key_with_a_backslash_is_left_alone(self, home):
+        from jacked import integrity_baseline
+
+        settings = settings_io.settings_path(home)
+        path = integrity_baseline.baseline_path(settings)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_doc(scripts={"/h/a\\b.py": "sha256:a"})), encoding="utf-8")
+
+        assert integrity_baseline.load_baseline(settings)["baseline"]["scripts"] == {"/h/a\\b.py": "sha256:a"}
+
+    def test_two_keys_that_normalise_to_one_script_make_the_baseline_unreadable(self, home):
+        from jacked import integrity_baseline
+
+        settings = settings_io.settings_path(home)
+        path = integrity_baseline.baseline_path(settings)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_doc(scripts={"C:\\h\\x.py": "sha256:a", "C:/h/x.py": "sha256:b"})), encoding="utf-8")
+
+        with pytest.raises(integrity_baseline.BaselineUnreadableError):
+            integrity_baseline.load_baseline(settings)
+
 
 class TestMalformedBaseline:
     def test_every_hostile_shape_is_unreadable_on_every_surface(self, home, tmp_path):

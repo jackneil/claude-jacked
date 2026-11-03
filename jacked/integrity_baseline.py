@@ -92,20 +92,27 @@ def load_baseline(settings_file: Path | str) -> dict | None:
     if isinstance(scripts, dict):
         # One key form on every platform: a baseline written before the POSIX
         # key rule (a Windows path with backslashes) still matches its script.
-        doc["baseline"]["scripts"] = {_posix_key(k): v for k, v in scripts.items()}
+        normalised = {_posix_key(k): v for k, v in scripts.items()}
+        if len(normalised) != len(scripts):
+            raise BaselineUnreadableError(f"{path.name} names one script twice")
+        doc["baseline"]["scripts"] = normalised
     return doc
 
 
 def _posix_key(key: str) -> str:
     """A script key in POSIX form, whatever platform wrote it.
 
-    >>> _posix_key("C:\\\\hooks\\\\x.py"), _posix_key("/h/x.py")
-    ('C:/hooks/x.py', '/h/x.py')
+    Only a key that is a Windows path (a drive letter or a UNC prefix) is
+    converted: a POSIX path may hold a backslash as a plain character.
+
+    >>> _posix_key("C:\\\\hooks\\\\x.py"), _posix_key("/h/x.py"), _posix_key("/h/a\\\\b.py")
+    ('C:/hooks/x.py', '/h/x.py', '/h/a\\\\b.py')
     """
+    import ntpath
     from pathlib import PureWindowsPath
 
-    return PureWindowsPath(key).as_posix() if "\\" in key else key
-
+    drive, _ = ntpath.splitdrive(key)
+    return PureWindowsPath(key).as_posix() if drive else key
 
 def _str_map(value) -> bool:
     return isinstance(value, dict) and all(isinstance(v, str) for v in value.values())
