@@ -16,7 +16,7 @@ description: "Cut a release the way this repo actually ships: detects PyPI/npm/c
 - **Verify**: poll `https://pypi.org/pypi/claude-jacked/json` until the new version appears; confirm the publish.yml run succeeded (`gh run list --workflow=publish.yml`); optionally `uv tool install --upgrade claude-jacked` and check `jacked --version`. Before tagging, confirm README's "Version History" table carries the new version's row, and that the merged PR's Tests run shows a real "N passed" line on each OS leg (a green check alone has hidden a pytest that died early with exit 0).
 
 <!-- Staleness fingerprint - the engine compares these against the live repo on each run -->
-- **Generated at commit**: 3e0b6025f0ba7394e0ad044c38a7dc0fc9335a6f
+- **Generated at commit**: 6be720e70dd7f16ac7d042a2c959a841b53d607e
 - **Detected stack**: pyproject.toml
 
 ## Config Staleness Check

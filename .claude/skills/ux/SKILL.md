@@ -26,7 +26,7 @@ none found: the local dashboard has no login. Only ask the user about creds if a
 - **Discoverability**: common actions (add account, switch, refresh, open settings, find the integrity state) should be reachable without hunting.
 
 <!-- Staleness fingerprint - the engine compares these against the live repo on each run -->
-- **Generated at commit**: 3e0b6025f0ba7394e0ad044c38a7dc0fc9335a6f
+- **Generated at commit**: 6be720e70dd7f16ac7d042a2c959a841b53d607e
 - **Detected stack**: pyproject.toml
 
 ## Config Staleness Check

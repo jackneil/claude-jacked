@@ -28,7 +28,7 @@ Vanilla JS (no framework/bundler): emphasize:
 - Update pages (`update.html`, `update_bootstrap.html`) and the install summary: phases render and errors read clearly.
 
 <!-- Staleness fingerprint - the engine compares these against the live repo on each run -->
-- **Generated at commit**: 3e0b6025f0ba7394e0ad044c38a7dc0fc9335a6f
+- **Generated at commit**: 6be720e70dd7f16ac7d042a2c959a841b53d607e
 - **Detected stack**: pyproject.toml
 
 ## Config Staleness Check
