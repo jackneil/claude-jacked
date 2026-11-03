@@ -401,11 +401,17 @@ def session_start_block(cwd, home, env=None) -> str:
             logger.debug("integrity: a repo-local autoMemoryDirectory chose %s, so jacked only reads it", memory.name)
         found = quarantine.quarantine_file(
             memory, today=datetime.now().date().isoformat(), read_only=read_only, home=home)
-        kept = quarantine.kept_marked(memory)
     except Exception as exc:  # noqa: BLE001 -- a failed move must never hide the settings check
         logger.warning("integrity: memory quarantine failed (%s)", type(exc).__name__)
         lines.append(f"jacked integrity: memory quarantine failed ({type(exc).__name__}); MEMORY.md left unchanged")
         found = None
+    # The kept count has its own guard: a failure here never changes what the
+    # quarantine reported, and a quarantine failure never hides a kept line.
+    try:
+        kept = quarantine.kept_marked(memory)
+    except Exception as exc:  # noqa: BLE001 -- the count is a report, never a gate
+        logger.warning("integrity: the kept-line count failed (%s)", type(exc).__name__)
+        lines.append(f"jacked integrity: could not count keep-marked lines in {memory.name} ({type(exc).__name__})")
         kept = 0
     moved = found if found and found.moved else None
     if moved:

@@ -220,8 +220,13 @@ def _bytes_shape(line: bytes, *, keep: bool = True) -> str | None:
     ``keep`` honors the keep marker: a line that holds it has no shape.
     """
     view = line.decode("utf-8", errors="replace")
-    if keep and KEEP_MARKER in view:
-        return None
+    if KEEP_MARKER in view:
+        if keep:
+            return None
+        # The count of kept lines must see the line as it was written: a
+        # shape anchored at the end of the line (a bare role tag, an alias)
+        # would miss it with the marker still attached.
+        view = view.replace(KEEP_MARKER, "").rstrip()
     for part in view.splitlines() or [view]:
         shape = line_shape(part)
         if shape:
