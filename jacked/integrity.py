@@ -401,10 +401,12 @@ def session_start_block(cwd, home, env=None) -> str:
             logger.debug("integrity: a repo-local autoMemoryDirectory chose %s, so jacked only reads it", memory.name)
         found = quarantine.quarantine_file(
             memory, today=datetime.now().date().isoformat(), read_only=read_only, home=home)
+        kept = quarantine.kept_marked(memory)
     except Exception as exc:  # noqa: BLE001 -- a failed move must never hide the settings check
         logger.warning("integrity: memory quarantine failed (%s)", type(exc).__name__)
         lines.append(f"jacked integrity: memory quarantine failed ({type(exc).__name__}); MEMORY.md left unchanged")
         found = None
+        kept = 0
     moved = found if found and found.moved else None
     if moved:
         plural = "" if moved.count == 1 else "s"
@@ -417,6 +419,14 @@ def session_start_block(cwd, home, env=None) -> str:
         lines.append(
             f"jacked integrity: suspected injected lines in {memory.name}, {found.reason}; "
             f"not moved ({found.count} line{plural})"
+        )
+    if kept:
+        # The keep marker is an opt-out that anyone who can write the file can
+        # add: a kept suspect line is reported every session, never silently.
+        plural = "" if kept == 1 else "s"
+        lines.append(
+            f"jacked integrity: {kept} suspected injected line{plural} in {memory.name} "
+            f"stay{'s' if kept == 1 else ''} by the keep marker; review {'it' if kept == 1 else 'them'}"
         )
     # Each step below has its own guard, so a failure can never lose the lines
     # above: a line that moved is reported only here, and only once.
