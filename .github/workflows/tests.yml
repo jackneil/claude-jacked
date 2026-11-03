@@ -44,6 +44,12 @@ jobs:
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r .github/requirements/ci-uv.txt
 
+      - name: Check that uv.lock is current
+        # The steps below use --frozen, which never compares uv.lock with
+        # pyproject.toml. This step fails when a pyproject.toml change arrives
+        # without its uv.lock update. It uses the hash-locked uv from above.
+        run: uv lock --check
+
       - name: Lint
         # The rule set is pinned in pyproject.toml ([tool.ruff.lint]).
         run: uv run --frozen ruff check .
