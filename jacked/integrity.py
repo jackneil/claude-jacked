@@ -14,9 +14,10 @@ file it describes. It holds:
 * the SHA-256 of the whole settings file,
 * every hook entry, as event -> matcher -> list of {command, digest}, for ALL
   hooks, not only the jacked hooks,
-* the SHA-256 of each hook script that a hook command names, when the path
-  resolves to a regular file (an interpreter such as ``python3`` or ``bash``
-  is not a script),
+* the SHA-256 of each hook script that a hook command names, and of each
+  file that an option of the command loads (``node -r /h/pre.js``), when the
+  path resolves to a regular file (an interpreter such as ``python3`` or
+  ``bash`` is not a script),
 * the SHA-256 of the value of every settings key. Each ``env`` entry is a key
   of its own (``env.CLAUDE_CODE_DISABLE_AUTO_MEMORY``). The baseline and the
   findings name a key. They never hold or show a value.
@@ -69,9 +70,9 @@ _FENCE = "```"
 #: What the script watch does not cover. ``jacked doctor``, the dashboard
 #: panel and the README say it, so an OK state is not read as more than it is.
 COVERAGE_NOTE = (
-    "Scope: jacked hashes a hook script only when the hook command names it with an absolute path, "
-    "~/ or $HOME. A script named with ${CLAUDE_PLUGIN_ROOT}, another variable or a relative path "
-    "is watched only through the hook command."
+    "Scope: jacked hashes a hook script, or a file that an option loads, only when the hook command "
+    "names it with an absolute path, ~/ or $HOME. A script or file named with ${CLAUDE_PLUGIN_ROOT}, "
+    "another variable or a relative path is watched only through the hook command."
 )
 @dataclass(frozen=True)
 class Finding:

@@ -618,9 +618,9 @@ function _memoryLoadNotes(h) {
 // terminal command, so a click in the dashboard can never approve a hook that
 // something else added.
 // What the script watch does not cover (the same text as jacked doctor).
-const _INTEGRITY_SCOPE = 'jacked hashes a hook script only when the hook command names it with an absolute path, '
-    + '~/ or $HOME. A script named with ${CLAUDE_PLUGIN_ROOT}, another variable or a relative path '
-    + 'is watched only through the hook command.';
+const _INTEGRITY_SCOPE = 'jacked hashes a hook script, or a file that an option loads, only when the hook command '
+    + 'names it with an absolute path, ~/ or $HOME. A script or file named with ${CLAUDE_PLUGIN_ROOT}, '
+    + 'another variable or a relative path is watched only through the hook command.';
 
 function _integrityPanel(integ) {
     if (!integ || typeof integ.state !== 'string') return '';

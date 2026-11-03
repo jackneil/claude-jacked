@@ -210,14 +210,40 @@ def _remove_stale(lock: Path, memory: Path, stale_ino: int, age: float) -> bool:
         return True  # another taker removed it; try the create again
     if os.lstat(aside).st_ino != stale_ino:
         # This rename took a fresh lock of another session: put it back.
+        # The link never replaces a lock that a third session made at the path.
         try:
             os.link(aside, lock)
+        except FileExistsError:
+            logger.debug("quarantine: a newer lock is beside %s, so jacked keeps it", memory.name)
         except OSError as exc:
-            logger.debug("quarantine: cannot put back the lock beside %s (%s)", memory.name, type(exc).__name__)
+            # A filesystem without hard links (exFAT, FAT): rename the lock back.
+            logger.debug("quarantine: cannot link the lock back beside %s (%s), so jacked renames it back",
+                         memory.name, type(exc).__name__)
+            if _rename_back(aside, lock, memory):
+                return False
         os.unlink(aside)
         return False
     logger.debug("quarantine: the lock beside %s is %d s old, so jacked removes it", memory.name, age)
     os.unlink(aside)
+    return True
+
+
+def _rename_back(aside: Path, lock: Path, memory: Path) -> bool:
+    """Rename the grabbed lock ``aside`` back to ``lock``. True when it is back.
+
+    A rename can replace a file on POSIX, so it runs only when no lock is at
+    the path. A third session that creates a lock between the check and the
+    rename loses its lock; the window is two system calls on a filesystem
+    without hard links only.
+    """
+    if os.path.lexists(lock):
+        logger.debug("quarantine: a newer lock is beside %s, so jacked keeps it", memory.name)
+        return False
+    try:
+        os.rename(aside, lock)
+    except OSError as exc:
+        logger.debug("quarantine: cannot rename the lock back beside %s (%s)", memory.name, type(exc).__name__)
+        return False
     return True
 
 
