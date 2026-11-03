@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from jacked.atomic_io import atomic_write_bytes, atomic_write_text
 from jacked.memory import load_budget
-from jacked.memory.settings_io import SettingsTooLargeError, SettingsUnreadableError, settings_text
+from jacked.memory.settings_io import SETTINGS_MAX_BYTES, SettingsTooLargeError, SettingsUnreadableError, settings_text
 
 logger = logging.getLogger(__name__)
 
@@ -1299,8 +1299,8 @@ async def set_raw_settings(body: RawSettingsRequest):
     async with _settings_lock:
         try:
             await asyncio.to_thread(_write_settings_json, body.content)
-        except SettingsTooLargeError as exc:
-            return _error(status.HTTP_413_CONTENT_TOO_LARGE, str(exc), "SETTINGS_TOO_LARGE")
+        except SettingsTooLargeError:  # a fixed message: exception text never reaches a response
+            return _error(status.HTTP_413_CONTENT_TOO_LARGE, f"The new settings.json would be larger than the limit of {SETTINGS_MAX_BYTES} bytes; the file is not changed", "SETTINGS_TOO_LARGE")
     return {"ok": True}
 
 
