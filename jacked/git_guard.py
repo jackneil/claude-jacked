@@ -49,8 +49,13 @@ GIT_CONFIG_OVERRIDE_ARGS = (
     "-c", "protocol.allow=never",
 )
 
-#: The ``git config`` arguments that list the filter driver keys.
-FILTER_CONFIG_ARGS = ("config", "-z", "--get-regexp", r"^filter\.")
+#: The ``git config`` arguments that list every config key, filter drivers
+#: included. ``--get-regexp '^filter\\.'`` is not used: git matches it with the
+#: C library regex under the process locale, and under a UTF-8 locale a key
+#: whose subsection holds a byte that is not valid UTF-8 never matches, so
+#: that driver stays enabled while the exit code is 0. ``--list`` emits every
+#: key byte for byte; ``filter_drivers`` does the prefix test itself.
+FILTER_CONFIG_ARGS = ("config", "-z", "--list")
 
 # The keys that make a filter driver run a program, and the value that turns
 # each one off. An empty command runs nothing, and a driver that is not
@@ -166,7 +171,7 @@ def run_git(
 
 
 def filter_drivers(config: str) -> list[str]:
-    """Return the driver names in ``git config -z --get-regexp ^filter\\.`` output.
+    """Return the driver names in ``git config -z --list`` output.
 
     Each entry is "<key>LF<value>" and ends with NUL. The driver name is the
     part between "filter." and the last dot, so it can hold "=" and ".".

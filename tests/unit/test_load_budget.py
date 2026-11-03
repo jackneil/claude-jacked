@@ -165,13 +165,13 @@ def test_measure_stops_its_scan_at_the_scan_limit(tmp_path):
     import time
 
     path = _sparse(tmp_path / "MEMORY.md", 1 << 30)
-    start = time.monotonic()
+    start = time.process_time()  # CPU time: load-proof
     result = lb.measure(path)
-    elapsed = time.monotonic() - start
+    elapsed = time.process_time() - start
 
     assert result == (1, 1 << 30)  # no newline in the scanned part: at least 1 line
     assert result.lines_exact is False
-    assert elapsed < 0.5, f"measure() took {elapsed:.2f}s"
+    assert elapsed < 1.0, f"measure() took {elapsed:.2f}s of CPU time"
 
 
 def test_a_file_of_exactly_the_scan_limit_has_exact_lines(tmp_path):

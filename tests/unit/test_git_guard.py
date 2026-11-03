@@ -45,7 +45,7 @@ def test_the_config_call_has_the_overrides_and_no_filter_environment(monkeypatch
     ((argv, call_env),) = calls
     assert argv[:3] == ["/usr/bin/git", "-C", "/repo"]
     assert tuple(argv[3:3 + len(git_guard.GIT_CONFIG_OVERRIDE_ARGS)]) == git_guard.GIT_CONFIG_OVERRIDE_ARGS
-    assert argv[-4:] == list(git_guard.FILTER_CONFIG_ARGS)
+    assert argv[-len(git_guard.FILTER_CONFIG_ARGS):] == list(git_guard.FILTER_CONFIG_ARGS)
     assert "GIT_CONFIG_COUNT" not in call_env
     assert env["GIT_OPTIONAL_LOCKS"] == "0" and env["PATH"] == "/bin"
     assert env["GIT_CONFIG_KEY_0"] == "filter.evil.clean" and env["GIT_CONFIG_VALUE_0"] == ""
@@ -115,6 +115,29 @@ def test_a_real_repo_config_gives_every_driver_an_override(tmp_path, monkeypatch
             "filter.Proc.required"} <= keys
 
 
+@requires_git
+@pytest.mark.skipif(os.name == "nt", reason="a subsection byte that is not UTF-8 cannot pass through the Windows environment")
+def test_a_driver_name_that_is_not_utf8_is_listed_under_a_utf8_locale(tmp_path, monkeypatch):
+    """``git config --get-regexp`` matched with the C regex under the process
+    locale, so under en_US.UTF-8 a subsection that starts with the byte 0xFF
+    never matched and that driver stayed enabled (git 2.54 on macOS). ``--list`` emits every key."""
+    (tmp_path / "gc").write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gc"))
+    monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    for key in (b"filter.\xffvil.clean", b"filter.plain.clean"):
+        subprocess.run([b"git", b"-C", os.fsencode(str(repo)), b"config", key, b"/x"], check=True)
+
+    env = git_guard.guarded_git_env(shutil.which("git"), str(repo))
+
+    assert env is not None
+    keys = {os.fsencode(v) for k, v in env.items() if k.startswith("GIT_CONFIG_KEY_")}
+    assert {b"filter.\xffvil.clean", b"filter.\xffvil.required", b"filter.plain.clean"} <= keys
+
+
 def _argv_spy(monkeypatch, module):
     seen = []
 
@@ -179,7 +202,9 @@ def test_a_flood_of_output_is_cut_at_the_limit_and_git_is_ended(caplog):
     finally:
         tracemalloc.stop()
 
-    assert elapsed < 1, f"{elapsed:.2f}s"
+    # The child sleeps 30 s after the flood: a return well under that proves
+    # the kill. The margin keeps a loaded machine (load 40+) from failing it.
+    assert elapsed < 10, f"{elapsed:.2f}s"
     assert out.truncated and len(out.data) == git_guard.OUTPUT_LIMIT == 1024 * 1024
     assert code != 0  # the child was ended
     assert peak < 16 * 1024 * 1024, f"peak {peak >> 20} MiB"
@@ -205,7 +230,9 @@ def test_a_silent_slow_git_times_out_within_the_timeout():
     with pytest.raises(subprocess.TimeoutExpired):
         git_guard.run_git(_python("import time; time.sleep(30)"), name="status",
                           env=os.environ, timeout=0.5, consumer=git_guard.Capture())
-    assert time.monotonic() - start < 2
+    # 0.5 s timeout plus the 1 s reaper; the child would sleep 30 s. The
+    # margin covers process start-up on a loaded machine.
+    assert time.monotonic() - start < 10
 
 
 def test_run_git_closes_stdin_and_stderr_and_hides_the_console(monkeypatch):

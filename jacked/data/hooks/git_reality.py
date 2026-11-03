@@ -16,7 +16,8 @@ reads the real state of the repository before its first turn::
     ```
 
 The git calls, in order. Each call has a timeout of 3 seconds
-(``GIT_TIMEOUT_S``), so the worst case is 15 seconds:
+(``GIT_TIMEOUT_S``) plus one second to reap its reader, so the worst case
+is 20 seconds:
 
   1. ``git rev-parse --is-inside-work-tree``. Any answer but "true" (a plain
      folder, a ``.git`` folder, a bare repository) gives no block.
@@ -30,7 +31,7 @@ The git calls, in order. Each call has a timeout of 3 seconds
      user ``i18n.logOutputEncoding``. ``--no-show-signature`` overrides
      ``log.showSignature``: no GPG output gets into the text, and a
      ``gpg.program`` that the repository config names does not run.
-  4. ``git config -z --get-regexp ^filter\\.``: the filter driver names in
+  4. ``git config -z --list``: the filter driver names in
      the config (``jacked.git_guard``). It only reads the config files.
   5. ``git status --porcelain=v1 -z --ignore-submodules=dirty``, reduced to
      counts (``_count_status``). Porcelain output does not change with the

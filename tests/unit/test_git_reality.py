@@ -441,14 +441,14 @@ class TestUntrustedText:
         body = ("long body line\n" * 2_000_000)[:30_000_000]
         sha = _commit(repo, f"huge\n\n{body}")
 
-        start = time.monotonic()
+        start = time.process_time()  # CPU time here: load-proof, git runs in its own process
         block = _emit(repo)
-        elapsed = time.monotonic() - start
+        elapsed = time.process_time() - start
 
         lines = block.split("\n")
         assert f"  {sha} huge" in lines
         assert len(lines) == 40 and TRIM_RE.match(lines[-1])
-        assert elapsed < 0.5, f"{elapsed:.2f}s"
+        assert elapsed < 1.0, f"{elapsed:.2f}s of CPU time"
 
         full = _emit(repo, **NO_CAPS).split("\n")
         limit = git_reality.RECORD_LIMIT
@@ -799,10 +799,14 @@ class TestGitCalls:
         not shebang_exec_supported(), reason="the fake clean filter is a shebang script"
     )
     @pytest.mark.skipif(os.name != "posix", reason="a driver name that is not UTF-8 needs byte argv")
-    def test_a_driver_name_that_is_not_utf8_cannot_make_the_counts_run_a_filter(self, root):
+    def test_a_driver_name_that_is_not_utf8_cannot_make_the_counts_run_a_filter(self, root, monkeypatch):
         """A driver name with the byte 0xFF must reach the override byte for
         byte. A lossy decode turns it into a different name, and git then runs
-        the real driver."""
+        the real driver. The name starts with the byte and the locale is pinned
+        to UTF-8: under it, a regex enumeration never lists the key at all
+        (the hook's real environment)."""
+        monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+        monkeypatch.setenv("LANG", "en_US.UTF-8")
         repo = _repo(root)
         _write(repo, "tracked.txt", "same content\n")
         _git(repo, "add", "tracked.txt")
@@ -811,8 +815,8 @@ class TestGitCalls:
         shim = os.fsencode(str(_clean_shim(root, marker)))
         for field, value in ((b"clean", shim), (b"required", b"true")):
             subprocess.run([b"git", b"-C", os.fsencode(str(repo)), b"config",
-                            b"filter.e\xffvil." + field, value], check=True)
-        (repo / ".git" / "info" / "attributes").write_bytes(b"* filter=e\xffvil\n")
+                            b"filter.\xffvil." + field, value], check=True)
+        (repo / ".git" / "info" / "attributes").write_bytes(b"* filter=\xffvil\n")
         _make_stat_dirty(repo / "tracked.txt")
         _assert_plain_status_runs(repo, marker)
 
