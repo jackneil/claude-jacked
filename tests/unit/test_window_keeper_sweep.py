@@ -19,6 +19,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import jacked.api.keeper.state as keeper_state
+import jacked.api.keeper.sweep as keeper_sweep
 import jacked.api.keeper_confirmation as kc
 import jacked.api.usage_monitor as um
 import jacked.web.auth as auth_mod
@@ -62,10 +64,10 @@ TRANSPORT = PingResult(ok=False, error_type="transport", message="ConnectError",
 @pytest.fixture(autouse=True)
 def _reset_keeper_state():
     um._ping_backoff.clear()
-    um._sweep_wake.clear()
+    keeper_state._sweep_wake.clear()
     yield
     um._ping_backoff.clear()
-    um._sweep_wake.clear()
+    keeper_state._sweep_wake.clear()
 
 
 @pytest.fixture
@@ -124,7 +126,7 @@ def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True
     )
     fetch = fetch or AsyncMock(return_value={"_cached": True})
     with (
-        patch.object(um, "_KEEPER_PING_PACING_SECONDS", 0),
+        patch.object(keeper_sweep, "_KEEPER_PING_PACING_SECONDS", 0),
         patch("jacked.web.window_keeper.ping_account", new=pings),
         patch("jacked.web.window_keeper.is_active_hours", return_value=active),
         patch("jacked.web.window_keeper.prewake_due", return_value=prewake),
@@ -174,7 +176,7 @@ class TestWallClockSleep:
         assert clock.sleeps == 1
 
     def test_sleep_until_stops_on_wake(self):
-        um._sweep_wake.set()
+        keeper_state._sweep_wake.set()
         sleeper = AsyncMock()
         with patch("jacked.api.usage_monitor.asyncio.sleep", sleeper):
             asyncio.run(um._sleep_until(time.time() + 300))
@@ -239,8 +241,8 @@ class TestPrewake:
         for k, v in settings.items():
             db.set_setting(k, v)
         with (
-            patch.object(um, "datetime", _fixed_now(dt)),
-            patch.object(um, "_KEEPER_PING_PACING_SECONDS", 0),
+            patch.object(keeper_sweep, "datetime", _fixed_now(dt)),
+            patch.object(keeper_sweep, "_KEEPER_PING_PACING_SECONDS", 0),
             patch("jacked.web.window_keeper.ping_account", new=pings),
             patch("jacked.web.auth.fetch_usage", AsyncMock(return_value={"_cached": True})),
         ):
@@ -459,7 +461,7 @@ class TestRecoveryLadder:
         refresh = AsyncMock()
         live = {"_jackedAccountId": 999, "claudeAiOauth": {"accessToken": "cc-tok", "refreshToken": "cc-rt"}}
         with (
-            patch.object(um, "_KEEPER_PING_PACING_SECONDS", 0),
+            patch.object(keeper_sweep, "_KEEPER_PING_PACING_SECONDS", 0),
             patch("jacked.web.window_keeper.ping_account", new=pings),
             patch("jacked.web.window_keeper.is_active_hours", return_value=True),
             patch("jacked.web.auth.refresh_cc_token_result", refresh),
@@ -500,7 +502,7 @@ class TestRecoveryLadder:
         live = {"_jackedAccountId": 999, "claudeAiOauth": {"accessToken": "cc-tok", "refreshToken": "cc-rt"}}
         refresh_stub = AsyncMock(return_value=CCRefreshResult(CCRefreshOutcome.NO_REFRESH_TOKEN))
         with (
-            patch.object(um, "_KEEPER_PING_PACING_SECONDS", 0),
+            patch.object(keeper_sweep, "_KEEPER_PING_PACING_SECONDS", 0),
             patch("jacked.web.window_keeper.ping_account", new=pings),
             patch("jacked.web.window_keeper.is_active_hours", return_value=True),
             patch("jacked.web.auth.refresh_cc_token_result", refresh),
@@ -748,7 +750,7 @@ class TestBackoffTokenIdentity:
         um._ping_backoff[7] = {"fails": 3, "skip_until": time.time() + 999, "token_fp": "x"}
         um.clear_ping_backoff(7)
         assert 7 not in um._ping_backoff
-        assert um._sweep_wake.is_set()
+        assert keeper_state._sweep_wake.is_set()
 
     def test_storing_cc_tokens_clears_backoff_and_wakes(self, tmp_path):
         from jacked.web.oauth import OAuthFlow
@@ -767,7 +769,7 @@ class TestBackoffTokenIdentity:
         flow = OAuthFlow(db, purpose="claude_code", target_account_id=acct["id"])
         flow._store_cc_tokens(_tokens_after_exchange(), _profile())
         assert acct["id"] not in um._ping_backoff
-        assert um._sweep_wake.is_set()
+        assert keeper_state._sweep_wake.is_set()
 
     def test_reauth_primary_store_clears_backoff(self, tmp_path):
         from jacked.web.oauth import OAuthFlow
@@ -782,7 +784,7 @@ class TestBackoffTokenIdentity:
         flow = OAuthFlow(db, purpose="primary", target_account_id=acct["id"])
         flow._store_account(_tokens_after_exchange(), _profile(), {})
         assert acct["id"] not in um._ping_backoff
-        assert um._sweep_wake.is_set()
+        assert keeper_state._sweep_wake.is_set()
 
     def test_reconcile_import_clears_backoff(self, db):
         from jacked.api import credential_helpers as ch
@@ -804,7 +806,7 @@ class TestBackoffTokenIdentity:
             ch.reconcile_credentials_from_live_store(aid, db)
         assert db.get_account(aid)["cc_access_token"] == "cc-live"
         assert aid not in um._ping_backoff
-        assert um._sweep_wake.is_set()
+        assert keeper_state._sweep_wake.is_set()
 
     def test_authority_guard_import_clears_backoff(self, db):
         from jacked.api.authority_guard import _import_rotated_tokens
@@ -817,7 +819,7 @@ class TestBackoffTokenIdentity:
         profile = {"account": {"email": "a@test.com"}}
         assert _import_rotated_tokens(db, db.get_account(aid), payload, profile=profile) >= 1
         assert aid not in um._ping_backoff
-        assert um._sweep_wake.is_set()
+        assert keeper_state._sweep_wake.is_set()
 
 
 # ---------------------------------------------------------------------------

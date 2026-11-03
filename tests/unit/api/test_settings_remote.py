@@ -644,10 +644,10 @@ _SWAP_ROUTES = ("swap-settings", "swap-pause", "swap-resume")
 def sweep_wakes(monkeypatch):
     """The swap-settings PUT wakes the sweep loop: record the wake instead of
     setting the module's asyncio.Event."""
-    import jacked.api.usage_monitor as usage_monitor
+    import jacked.api.keeper.state as keeper_state
 
     calls = []
-    monkeypatch.setattr(usage_monitor, "_sweep_wake", SimpleNamespace(set=lambda: calls.append(1)))
+    monkeypatch.setattr(keeper_state, "_sweep_wake", SimpleNamespace(set=lambda: calls.append(1)))
     return calls
 
 

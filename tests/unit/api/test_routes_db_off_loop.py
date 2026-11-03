@@ -110,7 +110,7 @@ def test_update_swap_settings_writes_off_the_loop_and_wakes_on_it(monkeypatch):
     same hop reads the kept fields (the 5-hour toggle and the pause) back for
     the response; the sweep's asyncio.Event is set afterwards, on the loop
     thread."""
-    import jacked.api.usage_monitor as usage_monitor
+    import jacked.api.keeper.state as keeper_state
     from jacked.api.routes.settings_swap import SwapSettings, update_swap_settings
 
     class _Wake:
@@ -119,7 +119,7 @@ def test_update_swap_settings_writes_off_the_loop_and_wakes_on_it(monkeypatch):
         def set(self):
             _Wake.thread = threading.get_ident()
 
-    monkeypatch.setattr(usage_monitor, "_sweep_wake", _Wake())
+    monkeypatch.setattr(keeper_state, "_sweep_wake", _Wake())
     db = _RecordingDB()
     body = SwapSettings(
         auto_swap_5h_rules_enabled=True,
@@ -149,10 +149,10 @@ def test_update_swap_settings_keeps_and_reads_back_the_fields_a_save_did_not_sen
     """A save that sends neither the 5-hour toggle nor the pause (a dashboard
     tab from before the toggle) writes neither, and the same worker hop reads
     both back, so the response says what is in effect."""
-    import jacked.api.usage_monitor as usage_monitor
+    import jacked.api.keeper.state as keeper_state
     from jacked.api.routes.settings_swap import SwapSettings, update_swap_settings
 
-    monkeypatch.setattr(usage_monitor, "_sweep_wake", SimpleNamespace(set=lambda: None))
+    monkeypatch.setattr(keeper_state, "_sweep_wake", SimpleNamespace(set=lambda: None))
     db = _RecordingDB()
     db.settings.update({
         "auto_swap_5h_rules_enabled": "true",
@@ -176,11 +176,11 @@ def test_update_swap_settings_keeps_and_reads_back_the_fields_a_save_did_not_sen
 
 
 def test_update_swap_settings_write_error_propagates_and_skips_the_wake(monkeypatch):
-    import jacked.api.usage_monitor as usage_monitor
+    import jacked.api.keeper.state as keeper_state
     from jacked.api.routes.settings_swap import SwapSettings, update_swap_settings
 
     woken = []
-    monkeypatch.setattr(usage_monitor, "_sweep_wake", SimpleNamespace(set=lambda: woken.append(1)))
+    monkeypatch.setattr(keeper_state, "_sweep_wake", SimpleNamespace(set=lambda: woken.append(1)))
 
     class _LockedDB(_RecordingDB):
         def set_settings(self, values):

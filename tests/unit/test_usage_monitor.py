@@ -495,7 +495,7 @@ def _ping_429():
 
 
 def _sweep_stopper(sweeps):
-    """Replacement for usage_monitor._sleep_until: let *sweeps* sweeps run,
+    """Replacement for keeper.sweep._sleep_until: let *sweeps* sweeps run,
     then cancel the loop at the next inter-sweep wait."""
     count = 0
 
@@ -526,10 +526,10 @@ class TestWindowKeeperPings:
         async def _run():
             with (
                 patch(
-                    "jacked.api.usage_monitor._sleep_until",
+                    "jacked.api.keeper.sweep._sleep_until",
                     side_effect=_sweep_stopper(1),
                 ),
-                patch("jacked.api.usage_monitor._KEEPER_PING_PACING_SECONDS", 0),
+                patch("jacked.api.keeper.sweep._KEEPER_PING_PACING_SECONDS", 0),
                 patch(
                     "jacked.web.auth.fetch_usage",
                     new_callable=AsyncMock,
@@ -613,6 +613,7 @@ class TestPostPingWindowReadBack:
             kwargs["transport"] = httpx.MockTransport(handler)
             return real_client(*args, **kwargs)
 
+        import jacked.api.keeper.sweep as keeper_sweep
         import jacked.api.usage_monitor as mod
 
         ping = AsyncMock(return_value=_ping_ok())  # no reset header
@@ -622,7 +623,7 @@ class TestPostPingWindowReadBack:
                 patch("jacked.web.auth.fetch_profile", new_callable=AsyncMock),
                 patch("jacked.web.window_keeper.ping_account", ping),
                 patch("jacked.web.window_keeper.is_active_hours", return_value=True),
-                patch.object(mod, "_KEEPER_PING_PACING_SECONDS", 0),
+                patch.object(keeper_sweep, "_KEEPER_PING_PACING_SECONDS", 0),
             ):
                 asyncio.run(mod._run_window_keeper(db, 300))
                 row = db.get_account(aid)
@@ -674,7 +675,7 @@ class TestWindowKeeperPingBackoff:
 
     def _patches(self, ping):
         return (
-            patch("jacked.api.usage_monitor._KEEPER_PING_PACING_SECONDS", 0),
+            patch("jacked.api.keeper.sweep._KEEPER_PING_PACING_SECONDS", 0),
             patch("jacked.web.window_keeper.is_active_hours", return_value=True),
             patch("jacked.web.window_keeper.needs_ping", return_value=True),
             patch("jacked.web.window_keeper.ping_account", ping),
@@ -695,7 +696,7 @@ class TestWindowKeeperPingBackoff:
         async def _run():
             p1, p2, p3, p4, p5 = self._patches(ping)
             with p1, p2, p3, p4, p5, patch(
-                "jacked.api.usage_monitor._sleep_until",
+                "jacked.api.keeper.sweep._sleep_until",
                 side_effect=_sweep_stopper(3),
             ):
                 with caplog.at_level(
@@ -3041,6 +3042,7 @@ class TestNoteExternalSwap:
 class TestResetLocksState:
     def test_reset_locks_clears_new_module_state(self):
         from jacked.api import usage_monitor as um
+        from jacked.api.keeper import state as keeper_state
 
         um._swap_failure_count = 3
         um._last_swap_failure_at = 123.0
@@ -3053,6 +3055,9 @@ class TestResetLocksState:
         um._ping_backoff[1] = {"fails": 4, "skip_until": time.monotonic() + 60}
 
         um.reset_locks()
+        # The ping backoff is keeper state: its owner resets it (the lifespan
+        # calls both).
+        keeper_state.reset_locks()
 
         assert um._swap_failure_count == 0
         assert um._last_swap_failure_at == 0.0

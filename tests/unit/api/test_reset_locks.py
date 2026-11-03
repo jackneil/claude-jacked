@@ -28,6 +28,7 @@ REGISTERED_MODULES: tuple[str, ...] = (
     "jacked.api.routes.permissions",
     "jacked.api.routes.system",
     "jacked.api.usage_monitor",
+    "jacked.api.keeper.state",
     "jacked.web.oauth",
 )
 
@@ -154,11 +155,11 @@ def test_reset_locks_clears_per_account_refresh_locks() -> None:
 
 
 def test_reset_locks_rebinds_sweep_wake_event() -> None:
-    """usage_monitor._sweep_wake must rebind — the Event-not-Lock case."""
-    from jacked.api import usage_monitor
-    before = usage_monitor._sweep_wake
-    usage_monitor.reset_locks()
-    after = usage_monitor._sweep_wake
+    """reset_locks must rebind keeper.state._sweep_wake: the Event-not-Lock case."""
+    from jacked.api.keeper import state as keeper_state
+    before = keeper_state._sweep_wake
+    keeper_state.reset_locks()
+    after = keeper_state._sweep_wake
     assert before is not after
     assert isinstance(after, asyncio.Event)
 
@@ -253,14 +254,9 @@ def test_every_module_level_asyncio_primitive_is_registered() -> None:
     )
 
 
-def test_registered_modules_are_wired_into_lifespan() -> None:
-    """Parse main.py's AST to find the ``_module_specs`` tuple inside the
-    lifespan function and confirm every REGISTERED_MODULES entry appears
-    in it. A plain import check is insufficient — a contributor could
-    remove a module from the tuple while leaving a stray import, and
-    ``reset_locks`` for that module would silently stop running. The
-    tuple is the load-bearing structure.
-    """
+def _lifespan_module_specs() -> set[str]:
+    """The module names in the ``_module_specs`` tuple inside main.py's
+    ``lifespan`` (empty when the tuple is not found)."""
     main_path = Path(__file__).parent.parent.parent.parent / "jacked" / "api" / "main.py"
     tree = ast.parse(main_path.read_text(encoding="utf-8"))
 
@@ -283,6 +279,18 @@ def test_registered_modules_are_wired_into_lifespan() -> None:
             for elt in value.elts:
                 if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                     wired.add(elt.value)
+    return wired
+
+
+def test_registered_modules_are_wired_into_lifespan() -> None:
+    """Parse main.py's AST to find the ``_module_specs`` tuple inside the
+    lifespan function and confirm every REGISTERED_MODULES entry appears
+    in it. A plain import check is insufficient — a contributor could
+    remove a module from the tuple while leaving a stray import, and
+    ``reset_locks`` for that module would silently stop running. The
+    tuple is the load-bearing structure.
+    """
+    wired = _lifespan_module_specs()
 
     assert wired, (
         "Could not locate ``_module_specs`` tuple inside ``lifespan`` in "
@@ -294,4 +302,23 @@ def test_registered_modules_are_wired_into_lifespan() -> None:
         f"REGISTERED_MODULES entries not present in main.py's "
         f"``_module_specs`` tuple: {missing}. Each must be registered in "
         f"that tuple so the lifespan actually calls its reset_locks()."
+    )
+
+
+def test_every_lifespan_module_is_registered() -> None:
+    """Every module in main.py's ``_module_specs`` is in REGISTERED_MODULES.
+
+    The lifespan skips a listed module that has no ``reset_locks()``, and it
+    logs nothing. Each registered module must expose a callable
+    ``reset_locks`` (test_registered_module_exposes_callable_reset_locks), so
+    a listed module that resets nothing fails here before it ships. With
+    test_registered_modules_are_wired_into_lifespan, the two lists are equal.
+    """
+    wired = _lifespan_module_specs()
+    assert wired, "Could not locate ``_module_specs`` inside ``lifespan`` in jacked/api/main.py."
+    extra = sorted(wired - set(REGISTERED_MODULES))
+    assert not extra, (
+        f"main.py's ``_module_specs`` lists modules that REGISTERED_MODULES "
+        f"does not: {extra}. Register each one here. A module without "
+        f"reset_locks() must not be in the tuple at all."
     )

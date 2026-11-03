@@ -248,10 +248,10 @@ async def lifespan(app: FastAPI):
         "jacked.api.routes.auth",
         "jacked.web.auth",
         "jacked.api.routes.features",
-        "jacked.api.routes.packs",
         "jacked.api.routes.permissions",
         "jacked.api.routes.system",
         "jacked.api.usage_monitor",
+        "jacked.api.keeper.state",
         "jacked.web.oauth",
     )
     modules_to_reset: list = []
