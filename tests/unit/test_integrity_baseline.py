@@ -355,6 +355,45 @@ class TestBaselineScriptKeys:
             integrity_baseline.load_baseline(settings)
 
 
+class TestUnmatchedBaselineKeys:
+    def _baseline_with_key(self, home, key):
+        from jacked import integrity, integrity_baseline
+
+        settings = settings_io.settings_path(home)
+        settings_io.write_settings(settings, {"hooks": {"Stop": {}}}, reason="test")
+        integrity.ensure_baseline(settings)
+        doc = integrity_baseline.load_baseline(settings)
+        doc["baseline"]["scripts"][key] = "sha256:stale"
+        integrity_baseline.baseline_path(settings).write_text(json.dumps(doc), encoding="utf-8")
+        return settings
+
+    def test_a_baseline_key_that_no_snapshot_key_matches_is_reported(self, home):
+        """Fail closed: a key the hooks no longer name, with the hooks unchanged,
+        means the script is not watched, so the check says so."""
+        from jacked import integrity
+
+        settings = self._baseline_with_key(home, "/h/x.py")
+
+        findings = integrity.check(settings)
+
+        assert [(f.kind, f.path, f.change) for f in findings] == [("script_changed", "/h/x.py", "no longer watched")]
+        assert "is no longer watched" in findings[0].text()
+
+    def test_a_hook_change_explains_its_own_vanished_key(self, home):
+        """When the hook map changed, that finding explains the missing key: no
+        second finding for the same cause."""
+        from jacked import integrity
+
+        settings = self._baseline_with_key(home, "/h/x.py")
+        doc = json.loads(settings.read_text(encoding="utf-8"))
+        doc["hooks"]["UserPromptSubmit"] = [{"matcher": "", "hooks": [{"type": "command", "command": "python3 /h/other.py"}]}]
+        settings.write_text(json.dumps(doc), encoding="utf-8")
+
+        kinds = [f.kind for f in integrity.check(settings)]
+
+        assert "hook_added" in kinds and kinds.count("script_changed") == 0
+
+
 class TestMalformedBaseline:
     def test_every_hostile_shape_is_unreadable_on_every_surface(self, home, tmp_path):
         path = _seed(home, {"hooks": {"Stop": [_hook("echo hi")]}})

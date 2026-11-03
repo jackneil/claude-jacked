@@ -108,7 +108,7 @@ class Finding:
         elif self.kind == "settings_changed":
             detail = "the file content changed"
         elif self.kind == "script_changed":
-            state = {MISSING: " is missing", "created": " now exists"}.get(self.change, "")
+            state = {MISSING: " is missing", "created": " now exists", "no longer watched": " is no longer watched"}.get(self.change, "")
             return one_line(f"hook script changed outside jacked; {self.path}{state}")
         else:
             return ("the baseline file cannot be read; review settings.json and the hook "
@@ -288,9 +288,18 @@ def check(settings_file: Path | str) -> list[Finding] | None:
         findings.append(Finding("settings_changed"))
     # The snapshot holds the state of each script that the hooks name now;
     # each is read once per check.
+    hooks_same = not any(f.kind.startswith("hook_") for f in findings)
     for path, digest in sorted(old.get("scripts", {}).items()):
         now = new["scripts"].get(path)
-        if now is None or now == digest:
+        if now == digest:
+            continue
+        if now is None:
+            # No hook names this script any more. A hook change explains it
+            # (reported above); with the hooks unchanged, the key no longer
+            # matches the snapshot's form, so the script is not watched: say so
+            # rather than pass it silently.
+            if hooks_same:
+                findings.append(Finding("script_changed", path=path, change="no longer watched"))
             continue
         change = MISSING if now == MISSING else "created" if digest == MISSING else ""
         findings.append(Finding("script_changed", path=path, change=change))

@@ -105,14 +105,15 @@ def _posix_key(key: str) -> str:
     Only a key that is a Windows path (a drive letter or a UNC prefix) is
     converted: a POSIX path may hold a backslash as a plain character.
 
-    >>> _posix_key("C:\\\\hooks\\\\x.py"), _posix_key("/h/x.py"), _posix_key("/h/a\\\\b.py")
-    ('C:/hooks/x.py', '/h/x.py', '/h/a\\\\b.py')
+    >>> _posix_key("C:\\\\hooks\\\\x.py"), _posix_key("\\\\h\\\\x.py"), _posix_key("/h/x.py"), _posix_key("/h/a\\\\b.py")
+    ('C:/hooks/x.py', '/h/x.py', '/h/x.py', '/h/a\\\\b.py')
     """
     import ntpath
     from pathlib import PureWindowsPath
 
     drive, _ = ntpath.splitdrive(key)
-    return PureWindowsPath(key).as_posix() if drive else key
+    windows_form = bool(drive) or key.startswith("\\")  # a drive, a UNC prefix, or a rooted path
+    return PureWindowsPath(key).as_posix() if windows_form else key
 
 def _str_map(value) -> bool:
     return isinstance(value, dict) and all(isinstance(v, str) for v in value.values())
