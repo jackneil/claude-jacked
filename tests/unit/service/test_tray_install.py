@@ -83,6 +83,200 @@ class TestSetupTrayAutostart:
 
 
 # ---------------------------------------------------------------------------
+# `jacked install` end to end: each tray branch says what it did
+# ---------------------------------------------------------------------------
+
+_HEADLESS_NOTICE = (
+    "[-] No display (DISPLAY and WAYLAND_DISPLAY are not set). Skipping the "
+    "tray icon: the tray service needs a display. To use the dashboard here, "
+    "run `jacked webux --no-browser`."
+)
+_BACKEND_NOTICE = (
+    "[WARN] Skipping the tray icon: pystray could not load (ValueError: "
+    "Namespace AyatanaAppIndicator3 not available). See \"Linux tray notes\" "
+    "in the jacked README: "
+    "https://github.com/jackneil/claude-jacked#linux-tray-notes"
+)
+_MISSING_NOTICE = (
+    "[WARN] Skipping the tray icon: jacked could not import pystray. "
+    "Reinstall jacked with: uv tool install claude-jacked --force"
+)
+
+
+def _invoke_with_tray_probes(monkeypatch, tmp_path, argv, *, headless, importable, failure):
+    """Run a jacked command with the tray probes fixed.
+
+    Return the exit code, the output (ANSI codes removed, whitespace runs
+    joined, so a console line wrap cannot split a phrase), the calls that
+    would start the service, and the calls that would write the Remote
+    access setting. ``failure`` is the backend error that the tray module
+    recorded when pystray could not load. The conftest guard keeps the real
+    Claude Code CLI out of reach.
+    """
+    import re
+
+    from click.testing import CliRunner
+
+    import jacked.cli as cli
+    from jacked.service import tray
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("JACKED_HOME", str(home))
+    monkeypatch.setattr(cli, "_is_headless", lambda: headless)
+    monkeypatch.setattr(cli, "_tray_extra_installed", lambda: importable)
+    monkeypatch.setattr(tray, "_PYSTRAY_LOAD_FAILURE", failure)
+    starts, settings = [], []
+    monkeypatch.setattr(
+        cli,
+        "_ensure_autostart_and_running",
+        lambda port, **kw: starts.append((port, kw)) or True,  # the service is running
+    )
+    monkeypatch.setattr(
+        cli,
+        "_persist_remote_access_from_host",
+        lambda *args, **kw: settings.append((args, kw)),
+    )
+
+    result = CliRunner().invoke(cli.main, argv)
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    return result.exit_code, " ".join(plain.split()), starts, settings
+
+
+def _install_with_tray_probes(monkeypatch, tmp_path, **probes):
+    """Run `jacked install` with the tray probes fixed. See _invoke_with_tray_probes."""
+    code, output, starts, _settings = _invoke_with_tray_probes(
+        monkeypatch, tmp_path, ["install", "--no-rules", "--no-packs"], **probes
+    )
+    assert code == 0, output
+    return output, starts
+
+
+class TestInstallTrayNotices:
+    """The tray service needs a display: pystray opens the display when it
+    loads. So `jacked install` checks for a display first, and each branch
+    that skips the tray prints why."""
+
+    def test_a_headless_box_recommends_webux(self, monkeypatch, tmp_path):
+        # With no display, pystray cannot load either (Xlib raises
+        # DisplayNameError), so the import probe fails too. The display
+        # check must answer first, or the tray is skipped for the wrong
+        # reason.
+        output, starts = _install_with_tray_probes(
+            monkeypatch, tmp_path, headless=True, importable=False,
+            failure="DisplayNameError: Can't connect to display \":0\"",
+        )
+
+        assert _HEADLESS_NOTICE in output, output
+        assert "Skipping the tray icon: pystray" not in output, output
+        assert "could not import pystray" not in output, output
+        assert starts == []
+
+    def test_a_backend_error_is_named_with_the_tray_notes(self, monkeypatch, tmp_path):
+        output, starts = _install_with_tray_probes(
+            monkeypatch, tmp_path, headless=False, importable=False,
+            failure="ValueError: Namespace AyatanaAppIndicator3 not available",
+        )
+
+        assert _BACKEND_NOTICE in output, output
+        assert "No display" not in output, output
+        assert starts == []
+
+    def test_a_backend_error_with_brackets_is_printed_as_it_is(
+        self, monkeypatch, tmp_path
+    ):
+        # The error text comes from an exception message. Unescaped, "[/...]"
+        # raises rich.errors.MarkupError and ends `jacked install`.
+        output, starts = _install_with_tray_probes(
+            monkeypatch, tmp_path, headless=False, importable=False,
+            failure="ValueError: no typelib in [/usr/lib/girepository-1.0]",
+        )
+
+        assert (
+            "pystray could not load (ValueError: no typelib in "
+            "[/usr/lib/girepository-1.0])." in output
+        ), output
+        assert starts == []
+
+    def test_a_missing_pystray_package_says_to_reinstall(self, monkeypatch, tmp_path):
+        output, starts = _install_with_tray_probes(
+            monkeypatch, tmp_path, headless=False, importable=False, failure=None,
+        )
+
+        assert _MISSING_NOTICE in output, output
+        assert "No display" not in output, output
+        assert starts == []
+
+    def test_a_box_with_a_display_starts_the_tray_as_before(self, monkeypatch, tmp_path):
+        from jacked.service import DEFAULT_PORT
+
+        output, starts = _install_with_tray_probes(
+            monkeypatch, tmp_path, headless=False, importable=True, failure=None,
+        )
+
+        assert starts == [(DEFAULT_PORT, {"label": "Tray"})]
+        assert "Skipping the tray icon" not in output, output
+        assert "No display" not in output, output
+
+
+class TestServiceInstallTrayCheck:
+    """`jacked service install` makes the same check as `jacked install`
+    before it registers autostart, with the same lines. The service is the
+    command's only job, so a refusal exits 1, and it writes no setting."""
+
+    ARGV = ["service", "install", "--host", "0.0.0.0"]
+
+    def test_a_headless_box_is_refused_with_the_webux_line(self, monkeypatch, tmp_path):
+        code, output, starts, settings = _invoke_with_tray_probes(
+            monkeypatch, tmp_path, self.ARGV, headless=True, importable=False,
+            failure="DisplayNameError: Can't connect to display \":0\"",
+        )
+
+        assert code == 1, output
+        assert _HEADLESS_NOTICE in output, output
+        assert "Skipping the tray icon: pystray" not in output, output
+        assert (starts, settings) == ([], [])
+
+    def test_a_backend_error_is_refused_with_the_tray_notes(self, monkeypatch, tmp_path):
+        code, output, starts, settings = _invoke_with_tray_probes(
+            monkeypatch, tmp_path, self.ARGV, headless=False, importable=False,
+            failure="ValueError: Namespace AyatanaAppIndicator3 not available",
+        )
+
+        assert code == 1, output
+        assert _BACKEND_NOTICE in output, output
+        assert (starts, settings) == ([], [])
+
+    def test_a_missing_pystray_package_is_refused_with_the_reinstall_line(
+        self, monkeypatch, tmp_path
+    ):
+        code, output, starts, settings = _invoke_with_tray_probes(
+            monkeypatch, tmp_path, self.ARGV, headless=False, importable=False,
+            failure=None,
+        )
+
+        assert code == 1, output
+        assert _MISSING_NOTICE in output, output
+        assert (starts, settings) == ([], [])
+
+    def test_a_box_with_a_display_installs_the_service_as_before(
+        self, monkeypatch, tmp_path
+    ):
+        from jacked.service import DEFAULT_PORT
+
+        code, output, starts, settings = _invoke_with_tray_probes(
+            monkeypatch, tmp_path, self.ARGV, headless=False, importable=True,
+            failure=None,
+        )
+
+        assert code == 0, output
+        assert starts == [(DEFAULT_PORT, {"label": "Service"})]
+        assert settings == [(("0.0.0.0",), {"allow_one_shot": False})]
+        assert "Skipping the tray icon" not in output, output
+
+
+# ---------------------------------------------------------------------------
 # _ensure_autostart_and_running
 # ---------------------------------------------------------------------------
 

@@ -26,7 +26,7 @@ class TestRunClaudeMcp:
         with mock.patch("jacked.findbin.find_bin", return_value=None):
             assert _run_claude_mcp("get", "chrome-devtools") is None
 
-    def test_returns_completed_process_on_success(self):
+    def test_returns_completed_process_on_success(self, real_claude_binary):
         fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
         with mock.patch("shutil.which", return_value="/usr/bin/claude"), \
              mock.patch("subprocess.run", return_value=fake) as run:
@@ -40,19 +40,19 @@ class TestRunClaudeMcp:
                 creationflags=NO_WINDOW,
             )
 
-    def test_custom_timeout_passed_through(self):
+    def test_custom_timeout_passed_through(self, real_claude_binary):
         fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
         with mock.patch("shutil.which", return_value="/usr/bin/claude"), \
              mock.patch("subprocess.run", return_value=fake) as run:
             _run_claude_mcp("add", "foo", timeout=30)
             assert run.call_args[1]["timeout"] == 30
 
-    def test_returns_none_on_timeout(self):
+    def test_returns_none_on_timeout(self, real_claude_binary):
         with mock.patch("shutil.which", return_value="/usr/bin/claude"), \
              mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired("cmd", 10)):
             assert _run_claude_mcp("get", "chrome-devtools") is None
 
-    def test_returns_none_on_os_error(self):
+    def test_returns_none_on_os_error(self, real_claude_binary):
         with mock.patch("shutil.which", return_value="/usr/bin/claude"), \
              mock.patch("subprocess.run", side_effect=OSError("no such file")):
             assert _run_claude_mcp("get", "chrome-devtools") is None
