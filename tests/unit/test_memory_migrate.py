@@ -8,6 +8,7 @@ test_memory_vault.py -- JACKED_HOME / JACKED_VAULT_DIR under tmp_path, a git
 identity via env, and cli.console swapped for a StringIO Console.
 """
 import json
+import logging
 import subprocess
 from datetime import datetime
 from io import StringIO
@@ -189,6 +190,41 @@ def test_discover_includes_cwd_repo_outside_roots(env):
     env.monkeypatch.chdir(outside)
     found = migrate_mod.discover_remember_dirs([root])  # root is empty
     assert any(p.resolve() == outside.resolve() for p, _ in found)
+
+
+@requires_symlinks
+def test_a_looped_dot_git_in_the_cwd_stops_the_walk_to_the_parent_repo(env, caplog):
+    """A ``.git`` that is a symlink to itself cannot be read. The walk stops there,
+    so the parent repo (and its ``.remember``) is not taken as the cwd's repo."""
+    root = env.tmp / "Github"
+    root.mkdir()
+    parent = _make_repo(env.tmp / "elsewhere" / "parent", "git@github.com:acme/parent.git")
+    _write_remember(parent / ".remember")
+    nested = parent / "nested"
+    nested.mkdir()
+    (nested / ".git").symlink_to(nested / ".git")
+    _write_remember(nested / ".remember")
+    env.monkeypatch.chdir(nested)
+    caplog.set_level(logging.DEBUG, logger="jacked.memory.migrate")
+
+    assert migrate_mod.discover_remember_dirs([root]) == []
+    (record,) = [r for r in caplog.records if r.name == "jacked.memory.migrate"]
+    assert record.levelno == logging.DEBUG
+    assert "OSError" in record.getMessage()
+    assert str(env.tmp) not in record.getMessage()
+
+
+def test_a_plain_subfolder_of_a_repo_still_finds_the_repo(env):
+    root = env.tmp / "Github"
+    root.mkdir()
+    parent = _make_repo(env.tmp / "elsewhere" / "parent", "git@github.com:acme/parent.git")
+    _write_remember(parent / ".remember")
+    (parent / "sub").mkdir()
+    env.monkeypatch.chdir(parent / "sub")
+
+    found = migrate_mod.discover_remember_dirs([root])
+
+    assert [p.resolve() for p, _ in found] == [parent.resolve()]
 
 
 # --------------------------------------------------------------------------- #

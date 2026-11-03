@@ -609,7 +609,7 @@ function _isSkillFeature(k) {
 function _memoryLoadNotes(h) {
     if (!h || h.name !== 'memory_vault' || !Array.isArray(h.load_warnings)) return '';
     return h.load_warnings
-        .map(w => `<div class="text-xs text-yellow-400 mt-1">${escapeHtml(w)}</div>`)
+        .map(w => `<div class="text-xs text-yellow-400 mt-1 break-words">${escapeHtml(w)}</div>`)
         .join('');
 }
 

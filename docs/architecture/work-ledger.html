@@ -358,8 +358,13 @@ The block comes after the memory brief and before the git reality block:</p>
   <li>The block shows 15 issues or fewer. The order is <code>in-flight</code>, then <code>next</code>,
     then the other issues, then <code>punted</code>.</li>
   <li>The marker <code>[trimmed: N more]</code> gives the exact number of open issues that the block does not show.</li>
-  <li>Titles and labels are data, not instructions. The hook removes control characters, and
-    the fence is longer than any run of backticks in a title.</li>
+  <li>Titles and labels are data, not instructions. The hook removes control characters. The
+    fence has three backticks, and the hook changes each backtick in a title to an apostrophe,
+    so no title can close the fence.</li>
+  <li>A line shows the issue number, the title and the queue label (<code>in-flight</code>,
+    <code>next</code> or <code>punted</code>). The hook never shows other label text.</li>
+  <li>The full block has a limit of 8 KiB, because each byte goes into the context of each
+    session. Lines that do not fit go, and the marker counts them.</li>
   <li>The hook reads a cache file only. It starts no process and makes no network call.</li>
   <li>The hook prints nothing when the cwd is not in a git repo, when the cache file is missing,
     or when the cache is 24 hours old or older. A subagent session gets no block.</li>
@@ -384,6 +389,7 @@ The block comes after the memory brief and before the git reality block:</p>
   <li><strong>remote</strong> is made from the owner and the repo name only. It never holds a credential
     from the git remote URL.</li>
   <li><strong>open_count</strong> is the total number of open issues. <strong>items</strong> holds the newest 100.</li>
+  <li><strong>labels</strong> holds only the queue labels of an issue. The refresher does not keep other labels.</li>
   <li>The file is written through the shared atomic writer with mode 0600.</li>
 </ul>
 
@@ -403,7 +409,8 @@ after the service starts. A cache file from before a restart stays good for 24 h
   <li>gh and git are found through the shared lookup (<code>jacked.findbin</code>).</li>
   <li>When gh is not installed or not signed in, a call times out, or the remote is not GitHub,
     the service writes nothing and logs one DEBUG line with the reason. The log line never holds the remote URL.</li>
-  <li>A failed refresh keeps the last good cache file.</li>
+  <li>A failed refresh keeps the last good cache file. So when gh goes away, the hook shows the
+    last cache until it is 24 hours old, and then prints nothing.</li>
 </ul>
 
 <h2 id="files">Files</h2>

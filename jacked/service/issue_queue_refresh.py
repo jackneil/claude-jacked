@@ -49,6 +49,7 @@ from urllib.parse import urlsplit
 from jacked.atomic_io import atomic_write_text
 from jacked.data.hooks.issue_queue import cache_path, repo_slug
 from jacked.findbin import find_bin
+from jacked.git_guard import GIT_CONFIG_OVERRIDE_ARGS
 from jacked.memory.vault import one_line
 from jacked.winproc import NO_WINDOW
 
@@ -73,7 +74,8 @@ PROJECT_LIMIT = 100
 #: the issues past this page; no issue is lost from the count.
 ISSUE_PAGE = 100
 
-#: The queue labels and how a new one looks: (color, description).
+#: The queue labels and how a new one looks: (color, description). The cache
+#: keeps only these labels, because the hook shows no other label.
 LABELS = {
     "in-flight": ("1d76db", "Work in progress on a branch or a PR"),
     "next": ("0e8a16", "Queued as the next work to do"),
@@ -172,9 +174,15 @@ def _gh_env() -> dict:
 
 
 def _origin_url(git: str, path: str) -> str:
+    """The ``origin`` URL of the repo at ``path``.
+
+    The call carries the shared ``-c`` overrides (``jacked.git_guard``) like
+    every git call in a checkout that can be untrusted, and takes no
+    optional lock.
+    """
     env = dict(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
-    proc = _run([git, "-C", path, "remote", "get-url", "origin"], env=env)
+    proc = _run([git, "-C", path, *GIT_CONFIG_OVERRIDE_ARGS, "remote", "get-url", "origin"], env=env)
     if proc.returncode != 0:
         raise _Skip("no origin remote")
     return proc.stdout.decode("utf-8", errors="replace").strip()
@@ -200,7 +208,10 @@ def _fetch(gh: str, owner: str, name: str) -> tuple[list[dict], int]:
             {
                 "number": int(node["number"]),
                 "title": str(node["title"]),
-                "labels": [str(label["name"]) for label in node["labels"]["nodes"]],
+                "labels": [
+                    name for name in (str(label["name"]) for label in node["labels"]["nodes"])
+                    if name in LABELS
+                ],
             }
             for node in issues["nodes"]
         ]
@@ -219,11 +230,11 @@ def refresh_repo(path: str, *, now: datetime | None = None) -> bool:
     Never raises: an expected skip is a DEBUG line, and any other error is a
     WARNING with the error class.
     """
-    slug = repo_slug(path)
-    if slug is None:
-        logger.debug("issue queue refresh: skip (not a git repository)")
-        return False
+    slug = None
     try:
+        slug = repo_slug(path)
+        if slug is None:
+            raise _Skip("not a git repository")
         git = find_bin("git")
         if not git:
             raise _Skip("git not found")
@@ -244,10 +255,10 @@ def refresh_repo(path: str, *, now: datetime | None = None) -> bool:
         atomic_write_text(cache_path(slug), json.dumps(payload, indent=1) + "\n", mode=0o600)
         return True
     except _Skip as reason:
-        logger.debug("issue queue refresh: skip %s (%s)", slug, reason)
+        logger.debug("issue queue refresh: skip %s (%s)", slug or "a project", reason)
         return False
     except Exception as exc:  # noqa: BLE001 -- one repository must not stop the pass
-        logger.warning("issue queue refresh: %s failed (%s)", slug, type(exc).__name__)
+        logger.warning("issue queue refresh: %s failed (%s)", slug or "a project", type(exc).__name__)
         return False
 
 
@@ -259,7 +270,11 @@ def _known_repos(db) -> list[str]:
         path = (row or {}).get("repo_path")
         if not path:
             continue
-        slug = repo_slug(path)
+        try:
+            slug = repo_slug(path)
+        except Exception as exc:  # noqa: BLE001 -- one repository must not stop the pass
+            logger.debug("issue queue refresh: skip a known project (%s)", type(exc).__name__)
+            continue
         if slug is not None and slug not in chosen:
             chosen[slug] = path
     return list(chosen.values())

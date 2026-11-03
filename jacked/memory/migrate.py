@@ -45,6 +45,7 @@ from pathlib import Path
 
 from jacked.memory import settings_io
 from jacked.memory import vault as vault_mod
+from jacked.regular_file import path_kind
 
 logger = logging.getLogger(__name__)
 
@@ -144,15 +145,14 @@ def _recognized_files(remember_dir: Path) -> list[Path]:
 
 
 def _enclosing_repo(start: Path) -> Path | None:
-    """The nearest ancestor of ``start`` (inclusive) that holds a ``.git``, or
-    None -- so a cwd outside the configured roots still gets its repo migrated."""
+    """The nearest ancestor of ``start`` (inclusive) that holds a ``.git``, or None.
+    A ``.git`` that cannot be read (a symlink loop, no permission) stops the walk
+    with None and a DEBUG line: the parent repo is not the repo of ``start``."""
     try:
         p = Path(start).resolve()
-    except OSError:
-        return None
-    for cand in [p, *p.parents]:
-        if (cand / ".git").exists():
-            return cand
+        return next((c for c in [p, *p.parents] if path_kind(c / ".git") is not None), None)
+    except (OSError, RuntimeError) as exc:
+        logger.debug("memory migrate: cannot read a .git above the cwd (%s)", type(exc).__name__)
     return None
 
 

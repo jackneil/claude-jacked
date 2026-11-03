@@ -38,8 +38,9 @@ USER_CLIS = frozenset({
 # Programs that hooks run with the session folder (an untrusted checkout) as
 # the process cwd. On Windows a bare name resolves from the cwd first, so a
 # repo with its own git.exe or git.cmd at the root would run. find_bin skips
-# such a cwd hit.
-CWD_RESOLVED = frozenset({"git"})
+# such a cwd hit. gh is in this set too (merge capture runs it in the merged
+# repo), and it is also a user CLI, so a bare gh is flagged either way.
+CWD_RESOLVED = frozenset({"git", "gh"})
 
 # The whole package is service-reachable (the service, its hooks, and the
 # children it spawns with the service env such as ``jacked install --force``

@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from jacked import integrity
 from jacked.memory import load_budget
-from jacked.memory.settings_io import SettingsUnreadableError, write_settings
+from jacked.memory.settings_io import SettingsTooLargeError, SettingsUnreadableError, write_settings
 from jacked.memory.vault import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -298,20 +298,17 @@ def _settings_unreadable_response() -> JSONResponse:
     """The 503 a mutation endpoint returns when settings.json exists but can't be
     parsed: refuse to modify it rather than clobber the user's real config with a
     fresh file (mirrors the memory-vault toggle's refusal shape)."""
-    return JSONResponse(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={"error": {
-            "message": "settings.json is unreadable; refusing to modify it",
-            "code": "SETTINGS_UNREADABLE",
-        }},
-    )
+    return _error(status.HTTP_503_SERVICE_UNAVAILABLE,
+                  "settings.json is unreadable; refusing to modify it", "SETTINGS_UNREADABLE")
 
 
 def _write_settings_json(data: dict):
     """Write settings.json through ``settings_io.write_settings``, the one writer.
 
     It is atomic and keeps the integrity baseline current (#99i). A route calls
-    this in a worker thread with ``_settings_lock`` held.
+    this in a worker thread with ``_settings_lock`` held. Settings over the
+    read limit raise ``SettingsTooLargeError`` before the write, so the file
+    stays readable.
     """
     write_settings(SETTINGS_JSON, data, reason="dashboard")
 
@@ -1297,12 +1294,13 @@ class RawSettingsRequest(BaseModel):
 async def set_raw_settings(body: RawSettingsRequest):
     """Overwrite settings.json with raw JSON content. Requires confirm_overwrite."""
     if not body.confirm_overwrite:
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={"error": {"message": "Set confirm_overwrite: true to overwrite settings.json", "code": "CONFIRMATION_REQUIRED"}},
-        )
+        return _error(status.HTTP_422_UNPROCESSABLE_CONTENT,
+                      "Set confirm_overwrite: true to overwrite settings.json", "CONFIRMATION_REQUIRED")
     async with _settings_lock:
-        await asyncio.to_thread(_write_settings_json, body.content)
+        try:
+            await asyncio.to_thread(_write_settings_json, body.content)
+        except SettingsTooLargeError as exc:
+            return _error(status.HTTP_413_CONTENT_TOO_LARGE, str(exc), "SETTINGS_TOO_LARGE")
     return {"ok": True}
 
 

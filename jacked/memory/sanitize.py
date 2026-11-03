@@ -29,6 +29,12 @@ def strip_control(s: str) -> str:
     return _CONTROL_CHARS_RE.sub("", s or "")
 
 
+#: The fence of every block of untrusted data that jacked puts in a session's
+#: context or a prompt. It has a fixed length: ``fence_safe`` removes every
+#: backtick from the data, so no data line can close it.
+FENCE = "```"
+
+
 def fence_safe(s: str) -> str:
     """Change each backtick in ``s`` to an apostrophe.
 

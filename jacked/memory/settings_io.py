@@ -44,6 +44,39 @@ class SettingsUnreadableError(Exception):
     """
 
 
+class SettingsTooLargeError(SettingsUnreadableError):
+    """The new settings would make a file over ``SETTINGS_MAX_BYTES``.
+
+    Nothing was written. ``read_settings`` refuses a file over the limit, so
+    a write of that file would make the settings unreadable.
+    """
+
+
+def settings_text(data: dict) -> str:
+    """Return ``data`` as settings.json text, or raise ``SettingsTooLargeError``.
+
+    Every settings.json writer calls this before it writes, so the check
+    happens before the original file changes. The size is the size on disk:
+    the UTF-8 bytes, plus the extra byte of each line ending when a text-mode
+    write uses CRLF (Windows).
+
+    >>> settings_text({"a": 1})
+    '{\\n  "a": 1\\n}'
+    """
+    text = json.dumps(data, indent=2)
+    size = len(text.encode("utf-8")) + text.count("\n") * (len(os.linesep) - 1)
+    if size > SETTINGS_MAX_BYTES:
+        logger.warning(
+            "settings: the new settings.json would be %d bytes, larger than the limit of %d bytes,"
+            " so it is not written", size, SETTINGS_MAX_BYTES,
+        )
+        raise SettingsTooLargeError(
+            f"the new settings.json would be {size} bytes, larger than the limit of"
+            f" {SETTINGS_MAX_BYTES} bytes; the file is not changed"
+        )
+    return text
+
+
 def settings_path(home: Path | str) -> Path:
     """``<home>/.claude/settings.json``."""
     return Path(home) / ".claude" / "settings.json"
@@ -117,18 +150,21 @@ def write_settings(path: Path | str, data: dict, *, reason: str = "jacked settin
     A settings.json that is a symlink (a dotfiles setup) stays a symlink: the
     write goes to the regular file that the link points at
     (``_write_target``). The integrity baseline keeps the path of the link.
+    The size check (``settings_text``) comes before the write, so settings
+    over the limit leave the original file as it is.
     """
     from jacked.memory import vault as vault_mod
 
     from jacked import integrity
 
     path = Path(path)
+    text = settings_text(data)  # raises before anything is touched
     target = _write_target(path)
     # One lock over the snapshot, the write and the rebaseline: two jacked
     # writers that interleave would lose a log entry and report each other.
     with integrity.baseline_lock(path):
         before = _integrity_snapshot(path)
-        vault_mod.atomic_write_text(target, json.dumps(data, indent=2))
+        vault_mod.atomic_write_text(target, text)
 
         try:
             verify = json.loads(_read_text(path))

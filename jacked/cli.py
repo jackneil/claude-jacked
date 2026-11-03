@@ -2845,7 +2845,7 @@ def _rotate_backups(dir_path: Path, prefix: str, keep: int = 5) -> None:
 
 
 def _write_settings_atomic(settings_path: Path, data: dict) -> None:
-    """Write settings.json via ``settings_io.write_settings`` (atomic; rebaselines integrity, #99i)."""
+    """Write settings.json via ``settings_io.write_settings`` (atomic, size-checked; rebaselines integrity, #99i)."""
     from jacked.memory.settings_io import write_settings
 
     write_settings(settings_path, data, reason="jacked cli")

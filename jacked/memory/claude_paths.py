@@ -26,6 +26,7 @@ import stat
 from collections.abc import Mapping
 from pathlib import Path
 
+from jacked import project_slug as _project_slug
 from jacked.regular_file import NotRegularFileError, open_regular_fd
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,6 @@ logger = logging.getLogger(__name__)
 Env = Mapping[str, str]
 
 MEMORY_INDEX = "MEMORY.md"
-# Claude Code keeps a project folder name to 200 characters, then adds a hash.
-_NAME_LIMIT = 200
 # A git pointer file holds one short path, and Claude Code also refuses a large
 # .git file. So a larger file is not a pointer.
 _POINTER_LIMIT = 4096
@@ -82,52 +81,13 @@ def config_dir(home, env: Env | None = None) -> Path:
 def project_dir_name(path: str) -> str:
     """Return the folder name that Claude Code gives ``path`` under ``projects/``.
 
-    Each UTF-16 unit that is not an ASCII letter or digit becomes ``-``
-    (``jacked.recover._encode_cwd``), so a character outside the BMP gives two.
-    The name is then ASCII, so its length counts UTF-16 units, as the
-    JavaScript length does. A name over 200 units keeps its first 200 and gets
-    ``-`` and the base 36 of a 32-bit hash of the path over its UTF-16 units,
-    as Claude Code 2.1.317 writes it.
+    ``jacked.project_slug`` owns the algorithm (the UTF-16 encoding, the
+    200-unit limit and the hash).
 
     >>> project_dir_name("/Users/jack.neil/Github/claude-jacked")
     '-Users-jack-neil-Github-claude-jacked'
-    >>> project_dir_name("/tmp/" + "a" * 196)[195:]
-    'aaaaa-r0traf'
     """
-    from jacked.recover import _encode_cwd
-
-    name = _encode_cwd(path)
-    if len(name) <= _NAME_LIMIT:
-        return name
-    return f"{name[:_NAME_LIMIT]}-{_base36(abs(_string_hash(path)))}"
-
-
-def _string_hash(text: str) -> int:
-    """Return the signed 32-bit hash of ``text`` over UTF-16 units (the Claude Code hash).
-
-    >>> _string_hash("abc"), _string_hash("")
-    (96354, 0)
-    """
-    value = 0
-    units = text.encode("utf-16-le", "surrogatepass")
-    for i in range(0, len(units), 2):
-        value = ((value << 5) - value + (units[i] | units[i + 1] << 8)) & 0xFFFFFFFF
-    return value - (1 << 32) if value & 0x80000000 else value
-
-
-def _base36(number: int) -> str:
-    """Return ``number`` in lowercase base 36, as JavaScript ``toString(36)`` does.
-
-    >>> _base36(0), _base36(35), _base36(36)
-    ('0', 'z', '10')
-    """
-    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-    out = ""
-    while True:
-        number, rest = divmod(number, 36)
-        out = digits[rest] + out
-        if not number:
-            return out
+    return _project_slug.project_dir_name(path)
 
 
 def repo_root(cwd) -> Path | None:
