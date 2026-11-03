@@ -7308,26 +7308,26 @@ def memory_status(quiet: bool):
         console.print(
             "\n[yellow]Run `jacked memory init` to create the vault.[/yellow]"
         )
-        return
-
-    if not st["groups"]:
+    elif not st["groups"]:
         console.print("\n[dim]No groups yet.[/dim]")
-        return
-
-    table = Table(title="Groups")
-    table.add_column("Group", style="cyan", no_wrap=True)
-    table.add_column("Repos", justify="right", no_wrap=True)
-    for t in _memory.VALID_TYPES:
-        table.add_column(t, justify="right", no_wrap=True)
-    for group in sorted(st["groups"]):
-        info = st["groups"][group]
-        counts = info.get("counts", {})
-        table.add_row(
-            group,
-            str(len(info.get("repos", []))),
-            *[str(counts.get(t, 0)) for t in _memory.VALID_TYPES],
-        )
-    console.print(table)
+    else:
+        table = Table(title="Groups")
+        table.add_column("Group", style="cyan", no_wrap=True)
+        table.add_column("Repos", justify="right", no_wrap=True)
+        for t in _memory.VALID_TYPES:
+            table.add_column(t, justify="right", no_wrap=True)
+        for group in sorted(st["groups"]):
+            info = st["groups"][group]
+            counts = info.get("counts", {})
+            table.add_row(
+                group,
+                str(len(info.get("repos", []))),
+                *[str(counts.get(t, 0)) for t in _memory.VALID_TYPES],
+            )
+        console.print(table)
+    from jacked.memory import load_budget as _load_budget  # session-start load caps (#98i)
+    for line in _load_budget.warnings(None, home):  # one line each: soft_wrap, no hard breaks
+        console.print(f"[yellow]{_rich_escape(line)}[/yellow]", soft_wrap=True)
 
 
 @memory_group.command(name="add")

@@ -14,16 +14,24 @@ Step order is FIXED -- do not reorder, the cache keys on these exact bytes:
   1. session-account tracker (silent; daemon thread, same as its own main())
   2. chain-of-command policy   -> stdout
   3. memory-vault recall brief -> stdout
+  4. git reality block         -> stdout (changes with the repo, so after 2-3)
+  5. load budget warnings      -> stdout (LAST: only when a file nears its cap)
 
 Each step is guarded on its own: a failure in one NEVER stops the ones after
 it, and nothing here may crash a session start (every path exits 0). Steps 2
 and 3 no-op quietly when their feature is off (the chain-of-command skill file
 is absent / the memory vault is disabled), so this single entry stays correct
-whatever the user has toggled.
+whatever the user has toggled. Step 4 does not depend on the vault: it prints
+in every git work tree and prints nothing anywhere else, so a session start
+outside a git repo adds zero bytes. Step 5 prints only when a file that Claude
+Code loads at session start (MEMORY.md, a CLAUDE.md) is over 90% of its load
+cap, so a healthy machine gets zero bytes from it, and it goes last because
+its text changes as the files grow.
 """
 
 import json
 import logging
+import os
 import sys
 import threading
 
@@ -98,12 +106,46 @@ def _emit_memory_recall(data: dict) -> None:
         print(brief)
 
 
+def _emit_git_reality(data: dict) -> None:
+    """Step 4: print the git reality block for the session cwd (or nothing).
+
+    The cwd is the payload's ``cwd``, else the process cwd (the recall rule).
+    Each git call is time-bounded, and the block itself never raises (see
+    ``jacked.data.hooks.git_reality``).
+    """
+    from jacked.data.hooks import git_reality
+
+    block = git_reality.emit_git_reality(git_reality.payload_cwd(data))
+    if block:
+        print(block)
+
+
+def _emit_load_budget(data: dict) -> None:
+    """Step 5 (LAST): warn about each file Claude Code loads at session start
+    that is over 90% of its load cap (or print nothing).
+
+    The cwd is the payload's ``cwd``, else the process cwd (the recall rule).
+    A subagent session gets nothing, the same as the recall brief. The step
+    only measures; it never edits a file (see ``jacked.memory.load_budget``).
+    """
+    if os.environ.get("CLAUDE_CODE_PARENT_SESSION_ID") or os.environ.get("CLAUDE_CODE_AGENT_TYPE"):
+        return
+    from jacked.memory import load_budget, vault
+
+    cwd = str(data.get("cwd") or os.getcwd())
+    block = load_budget.render_block(load_budget.warnings(cwd, vault.jacked_home()))
+    if block:
+        print(block)
+
+
 # The emitting steps, in the order their output must appear. Order is the
 # whole point of this module. The (silent) tracker step is not listed: main()
 # starts it first and joins it last, so its DB write overlaps these renders.
 STEPS = (
     ("chain of command", _emit_chain_of_command),
     ("memory recall", _emit_memory_recall),
+    ("git reality", _emit_git_reality),
+    ("load budget", _emit_load_budget),
 )
 
 

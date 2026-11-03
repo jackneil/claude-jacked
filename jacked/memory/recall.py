@@ -173,7 +173,7 @@ def build_brief(cwd: str) -> str:
     sections = _assemble_sections(vault, gdir, group, repo_short, state)
     brief = fit_to_budget(sections, TOKEN_BUDGET, emit_order=_EMIT_ORDER)
     # Vault content is injected into the session context; strip any control /
-    # escape sequences a note body might carry (keeps tab/newline/CR).
+    # escape sequences a note body might carry (keeps tab and newline; strips CR).
     brief = vault_mod._CONTROL_CHARS_RE.sub("", brief)
     if brief:
         _record_last_recall(home)
@@ -557,13 +557,13 @@ def _has_remote(vault: Path) -> bool:
 
 def _is_dirty(vault: Path) -> bool:
     """True when the vault working tree has uncommitted changes (or git can't be
-    read). Treating an unreadable status as dirty is the safe default: skip the
-    pull rather than risk fighting a concurrent write."""
+    read; unreadable counts as dirty, so the pull never fights a concurrent write).
+    GIT_OPTIONAL_LOCKS=0 keeps the status read off the index.lock a capture commit needs."""
     try:
         proc = subprocess.run(
             ["git", "-C", str(vault), "status", "--porcelain"],
             capture_output=True, text=True, timeout=_SYNC_TIMEOUT,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
     except (OSError, subprocess.SubprocessError):
         return True

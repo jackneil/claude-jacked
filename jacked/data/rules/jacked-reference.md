@@ -217,6 +217,39 @@ Language-specific coding standards enforced through templates and git hooks.
 | Upgrade left the service down | Read `~/.claude/jacked-update-failed.txt`. `jacked upgrade` is a transaction: it runs `jacked service preflight` before it replaces the old install, and it reinstalls the previous version if the new one cannot start. The file names both versions and the manual recovery commands |
 | Is this build able to start? | Run `jacked service preflight`. Exit code 0 means the build can provision its service contract. Exit code 1 prints `[FAIL] <error type>: <reason>`. The command starts no process and changes no supervisor. Add `--json` for one machine-readable object |
 
+## Load Budget
+
+At session start, Claude Code loads only the first 200 lines or the first 25 KB of the auto memory index, `~/.claude/projects/<project>/memory/MEMORY.md`. The rest of the file does not load, and Claude Code gives the user no sign of it. Each CLAUDE.md loads in full up to 4 MiB. The Claude Code docs advise under 200 lines for each CLAUDE.md.
+
+jacked measures these files and warns when a file is over 90% of its cap. It never edits a file. The warning shows in three places:
+
+- At session start, as the last block of the SessionStart output. A session with no warning gets no extra text.
+- In `jacked memory status`, after the other output.
+- On the dashboard, on the Memory Vault card (Settings > Features). The card shows the warning when the vault is off too.
+
+To groom MEMORY.md, run the memory-librarian skill. To audit a CLAUDE.md, run `/audit-rules`. The caps are constants in `jacked/memory/load_budget.py`.
+
+## Compaction
+
+Claude Code compacts a long conversation into a summary. It compacts automatically near the context limit, and when you run `/compact`. A summary can lose the state of the work in progress. After a compaction, the project-root CLAUDE.md and the auto memory index load again from disk, but instructions that were only in the conversation do not.
+
+To control what the summary keeps, run `/compact <instructions>`. Keep this work state each time:
+
+| Keep | Why |
+|------|-----|
+| The modified files | The next step must know which files changed and which edits are not tested |
+| The test commands and their last results | The next run must use the same commands and compare against the last result |
+| The current task and its next step | The session must continue the same task, not start again |
+| The punted items and the reason for each | Work that was put off must not disappear in the summary |
+
+Example:
+
+```
+/compact Keep the work state: the modified files, the test commands and their last results, the current task and its next step, and each punted item with its reason.
+```
+
+For instructions that apply to every compaction, add a "Compact Instructions" section to CLAUDE.md. The jacked behavioral rules contain one line that asks for this work state at each compaction.
+
 ## Environment Variables
 
 | Variable | Default | Purpose |

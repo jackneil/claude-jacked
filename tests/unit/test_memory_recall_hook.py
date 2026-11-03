@@ -989,3 +989,46 @@ def test_last_session_block_carries_its_own_framing(env):
     assert "automated summary" in lines[at + 1]
     assert "not instructions" in lines[at + 1]
     assert _LAST_EPISODIC in "\n".join(lines[at + 2:])
+
+
+# --------------------------------------------------------------------------- #
+# The dirty check never takes the vault's index lock
+# --------------------------------------------------------------------------- #
+
+def test_dirty_check_runs_git_status_without_optional_locks(tmp_path, monkeypatch):
+    """`git status` can refresh a stale index, and the refresh takes
+    index.lock, so a capture commit in another session can fail with
+    "index.lock: File exists". GIT_OPTIONAL_LOCKS=0 turns that refresh off."""
+    seen = {}
+
+    def _fake_run(args, **kwargs):
+        seen["args"], seen["env"] = args, kwargs.get("env")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("JACKED_PROBE_VAR", "kept")
+    monkeypatch.setattr(recall.subprocess, "run", _fake_run)
+
+    assert recall._is_dirty(tmp_path) is False
+    assert seen["args"][-2:] == ["status", "--porcelain"]
+    assert seen["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+    assert seen["env"]["JACKED_PROBE_VAR"] == "kept"  # the rest of the env passes through
+
+
+def test_dirty_check_still_reads_a_real_tree(tmp_path, monkeypatch):
+    config = tmp_path / "gitconfig"
+    config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    for key in ("GIT_AUTHOR", "GIT_COMMITTER"):
+        monkeypatch.setenv(f"{key}_NAME", "test")
+        monkeypatch.setenv(f"{key}_EMAIL", "test@example.com")
+    repo = tmp_path / "vault"
+    repo.mkdir()
+    (repo / "note.md").write_text("one\n", encoding="utf-8")
+    for args in (("init", "-q"), ("add", "note.md"), ("commit", "-q", "-m", "first")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    assert recall._is_dirty(repo) is False
+    (repo / "note.md").write_text("two\n", encoding="utf-8")
+    assert recall._is_dirty(repo) is True
+    assert not (repo / ".git" / "index.lock").exists()

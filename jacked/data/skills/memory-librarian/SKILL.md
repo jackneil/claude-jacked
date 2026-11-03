@@ -1,6 +1,6 @@
 ---
 name: memory-librarian
-description: Groom the jacked memory vault for a group. Dedupe notes, reconcile contradictions newest-wins-with-a-trail, review candidate auto-captures, archive stale hot entries, validate frontmatter, and re-sync the index. Use when the SessionStart brief nudges "memory drift is high", when asked to "groom the vault", "tidy memory", "clean up notes", "reconcile the vault", or after a burst of captures has piled up unreviewed notes.
+description: Groom the jacked memory vault for a group. Dedupe notes, reconcile contradictions newest-wins-with-a-trail, review candidate auto-captures, archive stale hot entries, validate frontmatter, and re-sync the index. Use when the SessionStart brief nudges "memory drift is high", when asked to "groom the vault", "tidy memory", "clean up notes", "reconcile the vault", or after a burst of captures has piled up unreviewed notes. Also use it when a load budget line says MEMORY.md is near or over the size Claude Code loads at session start.
 ---
 
 # Memory Librarian
@@ -12,6 +12,7 @@ This is judgment, not a checklist to run mechanically. When you are unsure wheth
 ## When to run
 
 - The SessionStart brief said memory drift is high (notes added since the last groom crossed the threshold). That is the nudge to spend a few minutes here.
+- A load budget line (at session start, in `jacked memory status`, or on the dashboard Memory Vault card) says MEMORY.md is near or over the size that Claude Code loads at session start.
 - The user asks for it directly.
 - You just finished a session that added several notes and want to leave the vault clean.
 
@@ -28,6 +29,8 @@ Work one group at a time (default to the group for the current repo). Before cha
 Use `jacked memory search <term>` to pull related notes together and `jacked memory status` to see the drift counter and note counts. Search is grep over `hot.md`, then the index, then note bodies, so the words you groom a note with are the words a future search will match on. Write for that future query.
 
 ## What to do
+
+**Keep MEMORY.md under its load budget.** At session start, Claude Code loads only the first 200 lines or the first 25 KB of the auto memory index, `~/.claude/projects/<project>/memory/MEMORY.md`. The rest does not load. In every pass, groom that index to under 180 lines and under 22 KB. This is a goal of the pass, not a side effect. The jacked warn line is `WARN_RATIO` of `LINE_CAP` and `BYTE_CAP` in `jacked/memory/load_budget.py`. Keep one short line for each entry. Move the detail into the topic files that the index links to. When an entry is out of date, do not delete it: record the supersession in its topic file (what replaced it, when, and why), so the history stays. To see the line and size counts, run `jacked memory status` in the repo. The native memory folder is not in the vault repo, so there is nothing to commit for it.
 
 **Dedupe.** When two or more notes state the same fact, keep the newest one and delete the others. Before deleting, fold in anything a duplicate said that the survivor did not, so nothing is lost. Add a short line in the survivor's body noting that it absorbed the others and when. Bump its `updated` date.
 

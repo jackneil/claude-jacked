@@ -82,7 +82,7 @@ _GIT_FALLBACK_NAME = "jacked-memory"
 _GIT_FALLBACK_EMAIL = "memory@jacked.local"
 _GIT_TIMEOUT = 30
 
-# Control chars except tab/newline/carriage-return, stripped from any text we
+# Control chars except tab and newline (CR goes too), stripped from any text we
 # print through Rich (search excerpts, git error tails): a note body or a
 # remote-derived string could carry a terminal escape/OSC sequence.
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
@@ -393,7 +393,7 @@ def today() -> str:
 # --------------------------------------------------------------------------- #
 
 def strip_control(s: str) -> str:
-    """Strip control chars (keeps tab/newline/CR) via the single vault regex.
+    """Strip control chars (keeps tab and newline; strips CR) via the single vault regex.
 
     Vault content is echoed to terminals and injected into session context, so
     a note body or a remote-derived string could carry a terminal escape/OSC

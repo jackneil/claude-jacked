@@ -11,6 +11,7 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from jacked.memory import load_budget
 from jacked.memory.settings_io import SettingsUnreadableError
 from jacked.memory.vault import atomic_write_text
 
@@ -509,15 +510,14 @@ async def list_features():
     for name in ("sounds", "memory_vault", "statusline"):
         meta = hook_meta[name]
         installed = _detect_hook_installed(settings, name)
-        entry = {
-            "name": name,
-            "display_name": meta["display_name"],
-            "description": meta["description"],
-            "installed": installed,
-            "source_available": True,
-        }
-        if name == "memory_vault" and installed:
-            entry["health"] = _memory_vault_health()
+        entry = {"name": name, **meta, "installed": installed, "source_available": True}
+        if name == "memory_vault":
+            # The session-start load-cap lines (#98i) are read-only, and the
+            # card shows them whether or not the vault is installed, because
+            # Claude Code keeps its own MEMORY.md either way.
+            entry["load_warnings"] = await asyncio.to_thread(load_budget.machine_warnings)
+            if installed:
+                entry["health"] = _memory_vault_health()
         hooks.append(entry)
 
     # Knowledge

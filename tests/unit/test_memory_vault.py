@@ -977,3 +977,95 @@ def test_a_traversing_group_argument_cannot_hide_the_mark(env, group):
         assert r.exit_code == 0, r.output
     hits = memory.search(env.vault, "Pangolin", group=group)
     assert hits and all(line.startswith(CANDIDATE_MARK) for _, _, line in hits)
+
+
+# --------------------------------------------------------------------------- #
+# status: the session-start load caps (#98i), printed after everything else
+# --------------------------------------------------------------------------- #
+
+STATUS_MEMORY_230_LINE = (
+    "MEMORY.md is 230 lines / 27.0 KB; Claude Code loads only the first "
+    "200 lines / 25 KB; run memory-librarian"
+)
+
+
+def _budget_memory(env):
+    """Run from a session folder outside git; return its native MEMORY.md path."""
+    from jacked.memory import load_budget
+
+    for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_PROJECT_DIR_NAME", "CLAUDE_CODE_DISABLE_AUTO_MEMORY"):
+        env.monkeypatch.delenv(var, raising=False)
+    cwd = env.tmp / "session"
+    cwd.mkdir()
+    env.monkeypatch.chdir(cwd)
+    memory = load_budget.native_memory_path(cwd, env.home, {})
+    memory.parent.mkdir(parents=True)
+    return memory
+
+
+def _seed_over_cap(memory):
+    memory.write_bytes((b"x" * 116 + b"\n") * 229 + b"y" * 206 + b"\n")
+
+
+def _status_lines(env):
+    env.buf.truncate(0)
+    env.buf.seek(0)
+    r = CliRunner().invoke(main, ["memory", "status"])
+    assert r.exit_code == 0, r.output
+    return [line for line in env.buf.getvalue().splitlines() if line.strip()]
+
+
+def test_status_prints_the_budget_line_last_before_init(env):
+    _seed_over_cap(_budget_memory(env))
+    lines = _status_lines(env)
+    assert lines[-1] == STATUS_MEMORY_230_LINE
+    assert any("jacked memory init" in line for line in lines[:-1])
+
+
+def test_status_prints_the_budget_line_after_the_no_groups_note(env):
+    _init_empty(env)
+    _seed_over_cap(_budget_memory(env))
+    lines = _status_lines(env)
+    assert lines[-1] == STATUS_MEMORY_230_LINE
+    assert lines[-2] == "No groups yet."
+
+
+def test_status_prints_the_budget_line_after_the_groups_table(env):
+    _init_empty(env)
+    CliRunner().invoke(main, [
+        "memory", "add", "--type", "decision", "--title", "One",
+        "--group", "hank", "--body", "Body.",
+    ])
+    _seed_over_cap(_budget_memory(env))
+    lines = _status_lines(env)
+    assert lines[-1] == STATUS_MEMORY_230_LINE
+    assert any("hank" in line for line in lines[:-1])
+
+
+def test_status_prints_no_budget_line_under_the_cap(env):
+    _budget_memory(env).write_bytes((b"x" * 59 + b"\n") * 150)
+    lines = _status_lines(env)
+    assert not any("Claude Code loads" in line for line in lines)
+
+
+def test_status_quiet_prints_nothing_even_over_the_cap(env):
+    _seed_over_cap(_budget_memory(env))
+    r = CliRunner().invoke(main, ["memory", "status", "--quiet"])
+    assert r.exit_code == 1
+    assert env.buf.getvalue() == ""
+
+
+def test_status_keeps_each_budget_line_whole_on_a_narrow_console(env):
+    """A pipe or a narrow terminal must still get one line per warning."""
+    narrow = StringIO()
+    env.monkeypatch.setattr(cli, "console", Console(file=narrow, width=60, highlight=False))
+    _seed_over_cap(_budget_memory(env))
+    r = CliRunner().invoke(main, ["memory", "status"])
+    assert r.exit_code == 0, r.output
+    assert STATUS_MEMORY_230_LINE in narrow.getvalue().splitlines()
+
+
+def test_strip_control_keeps_tab_and_newline_and_strips_cr():
+    """The regex strips CR too (the safer behavior), as its docs now say."""
+    text = "a" + chr(9) + "b" + chr(10) + "c" + chr(13) + "d" + chr(27) + "[0m" + chr(127)
+    assert vault_mod.strip_control(text) == "a" + chr(9) + "b" + chr(10) + "cd[0m"
