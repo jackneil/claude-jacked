@@ -19,6 +19,7 @@ import pytest
 
 DATA = Path(__file__).resolve().parents[2] / "jacked" / "data"
 WHATS_NEXT = DATA / "skills" / "whats-next" / "SKILL.md"
+REPO_WRAPPER = DATA.parents[1] / ".claude" / "skills" / "whats-next" / "SKILL.md"
 
 ENGINE_MARKER = "<!-- ENGINE -->"
 
@@ -365,3 +366,14 @@ def test_step_8_pointer_is_the_only_pasted_thing(engine: str) -> None:
     assert "never the file's contents" in s
     assert "The brief-file template." in s        # template = file structure
     assert "Inline path (the common case" not in s  # inline-first doctrine removed
+
+
+def test_repo_wrapper_embeds_engine_body_verbatim(engine: str) -> None:
+    """The repo wrapper is `repo-config overlay + the shipped engine body
+    verbatim`, the same contract the dcr wrapper test guards; containment makes
+    a drift between the two impossible to miss."""
+    assert engine in REPO_WRAPPER.read_text(encoding="utf-8"), (
+        "repo .claude/skills/whats-next/SKILL.md no longer embeds the shipped engine "
+        "body verbatim; rebuild the wrapper (or re-run /jacked-setup whats-next)"
+    )
+
