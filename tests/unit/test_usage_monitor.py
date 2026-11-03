@@ -25,6 +25,7 @@ from jacked.api.usage_monitor import (
 )
 from jacked.credentials.models import SwitchOutcome
 from jacked.credentials.transaction import CredentialTransactionEngine
+from jacked.web.auto_swap.selection import REASON_PREFIX_FIVE_H
 
 
 class _TestCertifiedEngine(CredentialTransactionEngine):
@@ -355,8 +356,15 @@ class TestAutoSwapTriggers:
 
 
 class TestNoTarget:
-    def test_no_target_logs_warning(self, caplog):
-        """should_swap=True but no eligible target -> logs warning."""
+    @pytest.mark.parametrize(
+        "wall, expected_why",
+        [
+            pytest.param(None, REASON_PREFIX_FIVE_H, id="the swap reason"),
+            pytest.param("weekly wall test", "weekly wall test", id="the wall"),
+        ],
+    )
+    def test_no_target_logs_warning(self, caplog, wall, expected_why):
+        """should_swap=True but no eligible target -> logs warning that names why."""
         import jacked.api.usage_monitor as mod
 
         mod._last_exhaustion_warning = 0.0
@@ -396,6 +404,10 @@ class TestNoTarget:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="tok",
                 ),
+                patch(
+                    "jacked.web.auto_swap.walls.walled_reason",
+                    return_value=wall,
+                ),
             ):
                 with caplog.at_level(
                     logging.WARNING, logger="jacked.api.usage_monitor"
@@ -407,11 +419,16 @@ class TestNoTarget:
                 engine = db._certified_auto_swap_engine
                 assert engine.activations == []
 
-                # Warning should be logged
-                assert any("no eligible target" in r.message for r in caplog.records), (
+                # Warning should be logged, and it says why the swap was wanted
+                warnings = [
+                    r.getMessage() for r in caplog.records
+                    if "no eligible target" in r.getMessage()
+                ]
+                assert warnings, (
                     f"Expected 'no eligible target' warning, "
                     f"got: {[r.message for r in caplog.records]}"
                 )
+                assert warnings[0].split("): ", 1)[1].startswith(expected_why)
 
                 # WebSocket should broadcast exhaustion
                 broadcast_calls = ws_registry.broadcast.call_args_list

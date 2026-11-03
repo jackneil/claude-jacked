@@ -1789,10 +1789,10 @@ async def active_account_poll_loop(app):
                 if now_ts - _last_exhaustion_warning > _EXHAUSTION_COOLDOWN_SECONDS:
                     logger.warning(
                         "Auto-swap needed but no eligible target "
-                        "(active account %d at 5h=%s, 7d=%s)",
+                        "(active account %d at 5h=%s, 7d=%s): %s",
                         active_acct_id,
-                        _pct_text(usage_5h),
-                        _pct_text(usage_7d),
+                        _pct_text(usage_5h), _pct_text(usage_7d),
+                        wall or reason,
                     )
                     _last_exhaustion_warning = now_ts
 

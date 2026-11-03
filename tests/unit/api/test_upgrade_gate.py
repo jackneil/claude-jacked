@@ -21,6 +21,7 @@ import asyncio
 import logging
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -666,6 +667,84 @@ def test_repeated_denials_from_one_host_are_folded_into_one_line(
     assert lines[0].endswith("(enabled=False, scope=tailscale)")
     assert lines[1].endswith("(enabled=False, scope=tailscale) (2 more in the last 60 s)")
     assert upgrade.calls == []
+
+
+def _denied_decision(db, audit: str, host: str = TAILNET_IP) -> None:
+    from jacked.api import mutation_gate
+
+    request = SimpleNamespace(
+        client=SimpleNamespace(host=host),
+        app=SimpleNamespace(state=SimpleNamespace(db=db)),
+    )
+    allowed, _reason, _host = mutation_gate.mutation_decision(request, audit=audit)
+    assert allowed is False
+
+
+def _gate_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "jacked.api.mutation_gate"]
+
+
+def test_a_denied_upgrade_is_logged_inside_the_window_of_a_denied_switch(db, caplog):
+    """/cso M2 (Repudiation): the fold is per action. A denied switch from a
+    peer must not hide that peer's denied upgrade 60 s later or sooner."""
+    _set_remote_access(db, False, "tailscale")
+
+    with caplog.at_level(logging.INFO, logger="jacked.api.mutation_gate"):
+        _denied_decision(db, "switch")
+        _denied_decision(db, "upgrade")
+
+    lines = _gate_lines(caplog)
+    assert len(lines) == 2
+    assert lines[0].startswith("Remote credential mutation DENIED (switch)")
+    assert lines[1].startswith("Remote credential mutation DENIED (upgrade)")
+    assert TAILNET_IP in lines[1]
+
+
+def test_an_ended_denial_window_is_pruned_and_its_folded_count_is_written(
+    db, caplog, monkeypatch
+):
+    """A peer that stops being refused leaves no entry behind, and the count
+    it folded is written by the next line instead of being lost."""
+    from jacked.api import mutation_gate
+
+    _set_remote_access(db, False, "tailscale")
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(mutation_gate.time, "monotonic", lambda: clock["now"])
+
+    with caplog.at_level(logging.INFO, logger="jacked.api.mutation_gate"):
+        for _ in range(3):
+            _denied_decision(db, "switch")
+        _denied_decision(db, "upgrade", host="100.64.12.8")
+        assert len(mutation_gate._denial_log_state) == 2
+        clock["now"] += mutation_gate.DENIAL_LOG_INTERVAL_SECONDS + 1
+        _denied_decision(db, "swap-pause", host="100.64.12.9")
+
+    assert [key[0] for key in mutation_gate._denial_log_state] == ["swap-pause"]
+    lines = _gate_lines(caplog)
+    assert len(lines) == 4
+    assert lines[2].startswith("Remote credential mutation DENIED (switch)")
+    assert lines[2].endswith("(2 more after the last line)")
+    assert lines[3].startswith("Remote credential mutation DENIED (swap-pause)")
+
+
+def test_a_window_that_has_not_ended_keeps_its_entry_and_its_count(db, caplog, monkeypatch):
+    from jacked.api import mutation_gate
+
+    _set_remote_access(db, False, "tailscale")
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(mutation_gate.time, "monotonic", lambda: clock["now"])
+
+    with caplog.at_level(logging.INFO, logger="jacked.api.mutation_gate"):
+        _denied_decision(db, "switch")
+        _denied_decision(db, "switch")
+        clock["now"] += 1
+        _denied_decision(db, "upgrade")
+
+    assert len(_gate_lines(caplog)) == 2
+    assert len(mutation_gate._denial_log_state) == 2
+    assert mutation_gate._denial_log_state[next(
+        key for key in mutation_gate._denial_log_state if key[0] == "switch"
+    )][1] == 1
 
 
 def test_cancel_running_upgrade_stops_the_child_inside_the_lease(monkeypatch):

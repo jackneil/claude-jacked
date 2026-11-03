@@ -1196,43 +1196,6 @@ def reconcile_outgoing_before_activation(db, target_id: int) -> bool:
     return saved
 
 
-def write_platform_credentials(data: dict) -> bool:
-    """Write credentials to the platform's native credential store.
-
-    macOS: a Keychain generic-password entry written through the signed
-    /usr/bin/security tool, addressed by the full service/account locator.
-    Bytes are handed to the tool on stdin. A payload too large for the tool's
-    stdin line limit goes in a subprocess argument instead, the same way
-    Claude Code writes this item, so the bytes are briefly visible to other
-    local processes. JACKED_KEYCHAIN_ARGV_FALLBACK=0 refuses that write.
-
-    Linux/Windows: no-op (they use .credentials.json)
-
-    Returns True if written successfully, False otherwise.
-
-    >>> write_platform_credentials({}) if sys.platform != "darwin" else True
-    True
-    """
-    if sys.platform != "darwin":
-        return True  # no-op on non-macOS (file write is sufficient)
-    from jacked.credentials.canonical import CredentialFormatError, CredentialPayload
-    from jacked.credentials.macos_store import MacOSCredentialStore
-    from jacked.credentials.models import InteractionMode, StoreStatus
-
-    try:
-        payload = CredentialPayload.from_mapping(data)
-        result = MacOSCredentialStore(_get_keychain_username()).write(
-            payload, InteractionMode.BACKGROUND
-        )
-        if result.status is StoreStatus.OK:
-            return True
-        logger.warning("Keychain write did not commit: %s", result.reason)
-        return False
-    except (CredentialFormatError, OSError, RuntimeError) as exc:
-        logger.warning("Keychain write error: %s", exc)
-        return False
-
-
 # ---------------------------------------------------------------------------
 # Credential data builders
 # ---------------------------------------------------------------------------

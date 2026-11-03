@@ -361,6 +361,36 @@ def test_recovery_skips_while_a_switch_holds_the_lease(
     assert _runtime_records(caplog, logging.WARNING) == []
 
 
+def test_a_row_that_a_switch_finished_before_the_lease_is_not_settled_again(
+    db, home, linux_claude, cooperative_linux, caplog
+):
+    """The rows are listed under the lease. A row that a switch finishes in the
+    window between the first listing and the lease is not this sweep's: the
+    sweep must not classify it or claim in the log that it settled it."""
+    key = _install_key(home)
+    DatabaseCredentialSwitchRepository(db).create_pending(
+        _signed_pending(cooperative_linux, key)
+    )
+    _write_authority(home, TARGET)
+    real_prepare = startup_recovery._prepare
+
+    def prepare_then_switch_finishes(database, pending_count):
+        dependencies = real_prepare(database, pending_count)
+        # The switch finalizes its own row: it leaves phase ``pending``.
+        database.update_credential_switch(OPERATION_ID, phase="failed_preserved")
+        return dependencies
+
+    with (
+        mock.patch.object(startup_recovery, "_prepare", prepare_then_switch_finishes),
+        caplog.at_level(logging.INFO, logger=RUNTIME_LOGGER),
+    ):
+        recovered = startup_recovery.recover_pending_switches(db)
+
+    assert recovered == []
+    assert _recovered_lines(caplog) == []
+    assert _runtime_records(caplog, logging.WARNING) == []
+
+
 def test_a_failed_claude_probe_is_logged_and_never_raises(
     db, home, cooperative_linux, caplog
 ):

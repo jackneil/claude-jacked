@@ -3,7 +3,7 @@
 Covers build_oauth_data(), the engine activation that every account switch
 runs (``jacked.credentials.runtime.activate_account``) through the files it
 writes, the ``~/.claude.json`` identity across switches,
-read/write_platform_credentials(), read_fresh_active_token(), and the
+read_platform_credentials(), read_fresh_active_token(), and the
 reassign_sessions DB method.
 """
 
@@ -21,13 +21,11 @@ from jacked.api.credential_helpers import (
     build_oauth_data,
     read_fresh_active_token,
     read_platform_credentials,
-    write_platform_credentials,
 )
 from jacked.credentials.canonical import CredentialPayload
 from jacked.credentials.models import (
     StoreReadResult,
     StoreStatus,
-    StoreWriteResult,
     SwitchContext,
     SwitchOutcome,
 )
@@ -519,71 +517,6 @@ def test_read_platform_credentials_malformed_json():
         result = read_platform_credentials()
 
     assert result is None
-
-
-# ------------------------------------------------------------------
-# write_platform_credentials: macOS Keychain
-# ------------------------------------------------------------------
-
-
-def test_write_platform_credentials_uses_native_store():
-    """Writes through Security.framework without a credential subprocess."""
-    cred_data = {
-        "_jackedAccountId": 1,
-        "claudeAiOauth": {"accessToken": "test_token"},
-    }
-    store = mock.MagicMock()
-    store.write.return_value = StoreWriteResult(StoreStatus.OK)
-
-    with (
-        mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
-        mock.patch(
-            "jacked.credentials.macos_store.MacOSCredentialStore",
-            return_value=store,
-        ) as store_class,
-        mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
-    ):
-        mock_sys.platform = "darwin"
-        result = write_platform_credentials(cred_data)
-
-    assert result is True
-    store_class.assert_called_once_with("testuser")
-    payload = store.write.call_args.args[0]
-    assert payload.identity.account_id == 1
-
-
-def test_write_platform_credentials_linux_noop():
-    """Returns True (no-op) on Linux.
-
-    >>> test_write_platform_credentials_linux_noop()
-    """
-    with mock.patch("jacked.api.credential_helpers.sys") as mock_sys:
-        mock_sys.platform = "linux"
-        result = write_platform_credentials({"claudeAiOauth": {"accessToken": "x"}})
-
-    assert result is True
-
-
-def test_write_platform_credentials_keychain_error():
-    """Returns False when keychain add command fails.
-
-    >>> test_write_platform_credentials_keychain_error()
-    """
-    store = mock.MagicMock()
-    store.write.return_value = StoreWriteResult(StoreStatus.DENIED, "authorization denied")
-
-    with (
-        mock.patch("jacked.api.credential_helpers.sys") as mock_sys,
-        mock.patch(
-            "jacked.credentials.macos_store.MacOSCredentialStore",
-            return_value=store,
-        ),
-        mock.patch("jacked.api.credential_helpers._get_keychain_username", return_value="testuser"),
-    ):
-        mock_sys.platform = "darwin"
-        result = write_platform_credentials({"claudeAiOauth": {"accessToken": "x"}})
-
-    assert result is False
 
 
 # ------------------------------------------------------------------

@@ -3,6 +3,8 @@
 import os
 from pathlib import Path
 
+import pytest
+
 
 from jacked import guardrails
 from tests._platform import requires_symlinks
@@ -134,6 +136,17 @@ class TestCreateGuardrails:
         assert result["created"] is True
         target = tmp_path / "JACKED_GUARDRAILS.md"
         assert target.exists()
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+    def test_a_new_file_is_readable_by_others_and_a_rewrite_keeps_its_mode(self, tmp_path):
+        """The guardrails file is a repository document, not a private file."""
+        result = guardrails.create_guardrails(tmp_path, language="python")
+        target = Path(result["path"])
+        assert target.stat().st_mode & 0o777 == 0o644
+
+        target.chmod(0o640)
+        guardrails.create_guardrails(tmp_path, language="python", force=True)
+        assert target.stat().st_mode & 0o777 == 0o640
 
     @requires_symlinks
     def test_a_linked_guardrails_file_is_replaced_not_written_through(self, tmp_path):
