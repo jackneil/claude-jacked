@@ -409,7 +409,7 @@ def describe_command(command: str, home: Path) -> tuple[str, str, str]:
     program = name if _PROGRAM_RE.fullmatch(name or "") else "(other)"
     script, _ = _parse_command(command, home)
     digest = hashlib.sha256(command.encode("utf-8", errors="surrogatepass")).hexdigest()[:8]
-    return program, str(script) if script else "", digest
+    return program, script.as_posix() if script else "", digest  # one form on every platform
 
 
 def snapshot(settings_file: Path | str) -> dict:
@@ -432,8 +432,8 @@ def snapshot(settings_file: Path | str) -> dict:
     for event, matcher, command, digest in _hook_items(settings):
         hooks.setdefault(event, {}).setdefault(matcher, []).append({"command": command, "digest": digest})
         for path in _script_paths(command, home):
-            if str(path) not in scripts:
-                scripts[str(path)] = _script_state(path, budget)
+            if path.as_posix() not in scripts:
+                scripts[path.as_posix()] = _script_state(path, budget)
     values: dict = {}
     for key, value in settings.items():
         if key == "hooks":
