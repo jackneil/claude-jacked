@@ -13,7 +13,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import ntpath
 import os
+import posixpath
 import re
 import shlex
 import stat
@@ -310,8 +312,9 @@ def _parse_command(command: str, home: Path) -> tuple[Path | None, list[Path]]:
     pending = None  # "file" or "value": the next word is an option operand
 
     def load(operand: str) -> None:
-        path = Path(_expand_home(operand, home))
-        if path.is_absolute() and path not in loaded:
+        token = _expand_home(operand, home)
+        path = Path(token)
+        if _is_absolute(token) and path not in loaded:
             loaded.append(path)
 
     for raw in tokens:
@@ -341,9 +344,21 @@ def _parse_command(command: str, home: Path) -> tuple[Path | None, list[Path]]:
                 return None, loaded
             if token.startswith(("-", "+")) or token in _SUBCOMMANDS:
                 continue
-        path = Path(token)
-        return (path if path.is_absolute() else None), loaded
+        return (Path(token) if _is_absolute(token) else None), loaded
     return None, loaded
+
+
+def _is_absolute(token: str) -> bool:
+    """True for an absolute path in POSIX or Windows form, on every platform.
+
+    ``Path.is_absolute`` answers for the host only: on Windows ``/h/x.py`` has
+    no drive and is not absolute, so a hook written with POSIX paths would go
+    unwatched there. The watch takes both forms.
+
+    >>> _is_absolute("/h/x.py"), _is_absolute("C:/h/x.py"), _is_absolute("x.py"), _is_absolute("-r")
+    (True, True, False, False)
+    """
+    return posixpath.isabs(token) or ntpath.isabs(token) or bool(ntpath.splitdrive(token)[0] and ntpath.splitdrive(token)[1].startswith(("\\", "/")))
 
 
 def _script_paths(command: str, home: Path) -> list[Path]:
