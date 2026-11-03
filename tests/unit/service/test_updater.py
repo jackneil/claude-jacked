@@ -10,6 +10,7 @@ import sys
 from unittest.mock import patch, MagicMock
 
 import pytest
+from jacked.winproc import system_program
 
 
 
@@ -1432,7 +1433,7 @@ class TestSpawnFromTrayWindows:
 
         mock_popen.assert_called_once()
         args = mock_popen.call_args[0][0]
-        assert args[0] == "cmd.exe"
+        assert args[0] == system_program("cmd")
         assert args[1] == "/c"
         assert args[2].endswith(".bat")
         kwargs = mock_popen.call_args[1]
@@ -1713,7 +1714,7 @@ class TestWindowsBatchPhases:
         )
         mock_popen.assert_called_once()
         args = mock_popen.call_args[0][0]
-        assert args[0] == "cmd.exe"
+        assert args[0] == system_program("cmd")
         batch_path = args[2]
         body = open(batch_path).read()
         try:

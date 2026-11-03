@@ -15,7 +15,9 @@ code the service can reach goes through ``find_bin``. A guard test
 for such a name.
 
 Trust model: PATH hits are returned as-is, because PATH is the caller's own
-environment. The off-PATH fallback directories are user-writable, so a
+environment. On Windows ``shutil.which`` also searches the process cwd first;
+a hit there that is not a PATH entry is skipped (``_is_unlisted_cwd_hit``),
+because a hook's cwd is an untrusted checkout. The off-PATH fallback directories are user-writable, so a
 fallback candidate is returned only when ``_resolve_trusted`` can resolve it
 one component at a time with nothing on the way that anyone but the current
 user or root could change: every real directory, every symlink (intermediate
@@ -34,6 +36,7 @@ Usage:
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shutil
@@ -319,6 +322,70 @@ def _clean_dir(directory: str | None, label: str) -> str | None:
     return os.path.normpath(directory)
 
 
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _path_dirs() -> list[str]:
+    return [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+
+
+def _is_unlisted_cwd_hit(found: str) -> bool:
+    """True when ``shutil.which`` found ``found`` only because it searches the cwd.
+
+    On Windows, CPython's ``shutil.which`` looks in the process cwd before
+    PATH (3.11 always; 3.12 and later unless
+    ``NoDefaultCurrentDirectoryInExePath`` is set). A hook runs with the
+    session folder as its cwd, so a cloned repository with its own
+    ``git.exe`` or ``git.cmd`` at the root would run. A cwd that is itself a
+    PATH entry is the user's choice, so a hit there stays. POSIX ``which``
+    never searches the cwd unless PATH names it, so this is always False there.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        cwd = _norm(os.getcwd())
+    except OSError:
+        return False
+    if _norm(os.path.dirname(found) or os.curdir) != cwd:
+        return False
+    return cwd not in {_norm(d) for d in _path_dirs()}
+
+
+def _which_on_path(name: str) -> str | None:
+    """Search only the PATH entries for ``name`` (Windows), never the cwd.
+
+    A name without a ``PATHEXT`` extension is tried with each extension, in
+    ``PATHEXT`` order, as ``shutil.which`` does.
+    """
+    exts = [e.lower() for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
+    names = [name] if os.path.splitext(name)[1].lower() in exts else [name + e for e in exts]
+    try:
+        cwd = _norm(os.getcwd())
+    except OSError:
+        cwd = None
+    for directory in _path_dirs():
+        if _norm(directory) == cwd:
+            continue
+        for candidate in names:
+            path = os.path.join(directory, candidate)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def require_bin(name: str) -> str:
+    """Return ``find_bin(name)``, or raise ``FileNotFoundError`` when it is None.
+
+    A spawn site that already handles a failed spawn (``OSError``) can call
+    this inside its ``try``, so a missing binary takes the same path.
+    """
+    found = find_bin(name)
+    if found is None:
+        raise FileNotFoundError(errno.ENOENT, f"{name} not found", name)
+    return found
+
+
 def find_bin(name: str, *, home: str | None = None) -> str | None:
     """Find a binary by name, searching PATH then known install locations.
 
@@ -329,6 +396,10 @@ def find_bin(name: str, *, home: str | None = None) -> str | None:
     if not _is_bare_name(name):
         return None
     found = shutil.which(name)
+    if found and _is_unlisted_cwd_hit(found):
+        # Values-free: the name is a fixed command name.
+        logger.debug("find_bin: skipped a %s in the current folder, which is not on PATH", name)
+        found = _which_on_path(name)
     if found:
         return found
 

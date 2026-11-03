@@ -32,6 +32,7 @@ from pathlib import Path
 
 from jacked.atomic_io import atomic_write_text
 from jacked.findbin import find_bin
+from jacked.memory.sanitize import _CONTROL_CHARS_RE
 
 logger = logging.getLogger(__name__)
 
@@ -756,14 +757,11 @@ def _skill_present(home: Path, name: str) -> bool:
     return _lexists(claude_link) or _lexists(canonical)
 
 
-# Control chars except tab/newline/carriage-return. npx stderr is upstream
-# controlled; a compromised package could embed terminal escape/OSC sequences
-# (screen-clear, OSC-52 clipboard write, OSC-8 hyperlink) that fire when the
-# tail is later cat'd from the log. Strip them at the source so both the log
-# sink and the console print carry inert text.
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
-
-
+# npx stderr is upstream controlled: a compromised package could embed terminal
+# escapes (screen-clear, OSC-52 clipboard write, OSC-8 hyperlink), C1 controls or
+# bidi overrides that fire or mislead when the tail is cat'd from the log. The
+# shared sanitizer strips them at the source (it keeps tab and newline, strips
+# CR), so both the log sink and the console print carry inert text.
 def _tail(text: str, n: int = 500) -> str:
     return _CONTROL_CHARS_RE.sub("", (text or "").strip())[-n:]
 

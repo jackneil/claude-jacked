@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from jacked.service.spec import ServiceSpec, SupervisorKind
+from jacked.winproc import system_program
 
 from ._artifacts import (
     ArtifactDisposition,
@@ -184,10 +185,10 @@ def _uninstall_task(spec, path, marker, run, common) -> SupervisorAction:
         return _refused(path, "registered task identity is foreign")
     # /End returns 1 when no instance is running. Deletion is still required
     # and is the authoritative unregister operation for this exact task.
-    ended = run(["schtasks.exe", "/End", "/TN", spec.service_id], **common)
+    ended = run([system_program("schtasks"), "/End", "/TN", spec.service_id], **common)
     if ended.returncode not in {0, 1}:
         return _refused(path, f"Task Scheduler stop exit {ended.returncode}")
-    deleted = run(["schtasks.exe", "/Delete", "/TN", spec.service_id, "/F"], **common)
+    deleted = run([system_program("schtasks"), "/Delete", "/TN", spec.service_id, "/F"], **common)
     if deleted.returncode != 0:
         return _refused(path, f"Task Scheduler exit {deleted.returncode}")
     return SupervisorAction(True, "uninstall", "unregistered Task Scheduler task")

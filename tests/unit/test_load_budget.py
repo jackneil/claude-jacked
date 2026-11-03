@@ -19,15 +19,22 @@ from pathlib import Path
 import pytest
 
 from jacked.memory import load_budget as lb
+from tests._platform import requires_fifo, returns_without_blocking
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA = REPO_ROOT / "jacked" / "data"
 NO_ENV: dict = {}
 
-MEMORY_230_LINE = (
-    "MEMORY.md is 230 lines / 27.0 KB; Claude Code loads only the first "
+MEMORY_230_TAIL = (
+    "is 230 lines / 27.0 KB; Claude Code loads only the first "
     "200 lines / 25 KB; run memory-librarian"
 )
+MEMORY_230_LINE = f"MEMORY.md (~/.claude/projects/-a-b/memory) {MEMORY_230_TAIL}"
+
+
+def memory_line(memory: Path, home: Path, tail: str = MEMORY_230_TAIL) -> str:
+    """The warning line for the index ``memory``: its folder, home as ``~``."""
+    return f"MEMORY.md (~/{memory.parent.relative_to(home).as_posix()}) {tail}"
 
 requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="needs the git binary")
 requires_node = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
@@ -141,6 +148,62 @@ def test_measure_counts_every_line_across_read_chunks(tmp_path, monkeypatch):
     assert lb.measure(path) == (11, 34)
 
 
+def _sparse(path: Path, size: int) -> Path:
+    """A file of ``size`` bytes with no data written: it takes no disk space."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.truncate(size)
+    return path
+
+
+def test_the_scan_limit_is_the_claude_md_skip_size_plus_one():
+    assert lb.SCAN_LIMIT == lb.CLAUDE_MD_MAX_BYTES + 1
+
+
+def test_measure_stops_its_scan_at_the_scan_limit(tmp_path):
+    """A 1 GiB file is measured from fstat; the scan reads only SCAN_LIMIT bytes."""
+    import time
+
+    path = _sparse(tmp_path / "MEMORY.md", 1 << 30)
+    start = time.monotonic()
+    result = lb.measure(path)
+    elapsed = time.monotonic() - start
+
+    assert result == (1, 1 << 30)  # no newline in the scanned part: at least 1 line
+    assert result.lines_exact is False
+    assert elapsed < 0.5, f"measure() took {elapsed:.2f}s"
+
+
+def test_a_file_of_exactly_the_scan_limit_has_exact_lines(tmp_path):
+    path = tmp_path / "CLAUDE.md"
+    path.write_bytes(b"x\n" * (lb.SCAN_LIMIT // 2) + b"y" * (lb.SCAN_LIMIT % 2))
+    result = lb.measure(path)
+    assert result == (lb.SCAN_LIMIT // 2 + 1, lb.SCAN_LIMIT)
+    assert result.lines_exact is True
+
+
+def test_a_small_file_has_exact_lines(tmp_path):
+    path = tmp_path / "MEMORY.md"
+    path.write_bytes(b"a\nb\n")
+    assert lb.measure(path).lines_exact is True
+
+
+def test_a_huge_claude_md_warns_with_a_lower_bound_on_its_lines(tmp_path, home):
+    _sparse(tmp_path / "proj" / "CLAUDE.md", 1 << 30)
+    (line,) = lb.warnings(tmp_path / "proj", home, NO_ENV)
+    assert line == (
+        "`proj/CLAUDE.md` is at least 1 line / 1024.0 MiB; Claude Code skips a file "
+        "over 4 MiB and loads none of it; run /audit-rules"
+    )
+
+
+def test_a_huge_memory_index_warns_with_a_lower_bound_on_its_lines(project, home):
+    _sparse(_memory(project, home), 1 << 30)
+    (line,) = lb.warnings(project, home, NO_ENV)
+    assert line.startswith("MEMORY.md")
+    assert " is at least 1 line / 1024.0 MiB; Claude Code loads only the first 200 lines" in line
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a POSIX FIFO")
 def test_measure_never_opens_a_fifo(tmp_path):
     """A FIFO named MEMORY.md would block a reader forever at session start."""
@@ -204,6 +267,13 @@ def test_a_short_name_is_the_recover_encoding():
     ("/tmp/" + "a" * 196, ("-tmp-" + "a" * 196)[:200] + "-r0traf"),
     ("/x/" + "Z" * 400, ("-x-" + "Z" * 400)[:200] + "-62bmxm"),
     ("/tmp/" + "é" * 250, ("-tmp-" + "-" * 250)[:200] + "-wtvgxz"),
+    # A character outside the BMP is two UTF-16 units, so it gives two hyphens,
+    # and the 200 limit counts units. The emoji here sits on units 199 and 200.
+    ("/tmp/\U0001F600", "-tmp---"),
+    ("/x/" + "a" * 195 + "\U0001F600", "-x-" + "a" * 195 + "--"),
+    ("/x/" + "a" * 195 + "\U0001F600b", "-x-" + "a" * 195 + "---jh0v1g"),
+    ("/x/" + "a" * 196 + "\U0001F600b", "-x-" + "a" * 196 + "--86wqpl"),
+    ("/srv/" + "\U0001F600" * 120, "-srv-" + "-" * 195 + "-6clv4h"),
 ])
 def test_a_name_over_200_characters_gets_claude_codes_hash(path, expected):
     assert lb.project_dir_name(path) == expected
@@ -226,6 +296,11 @@ def test_project_dir_name_matches_claude_codes_own_function(tmp_path):
         "/Users/jack.neil/" + "very-long-directory-name/" * 12 + "repo",
         "/srv/" + "Ünïcödé/" * 40,
         "/x/" + "Q" * 199,
+        "/tmp/\U0001F600",
+        "/x/" + "a" * 195 + "\U0001F600",
+        "/x/" + "a" * 195 + "\U0001F600b",
+        "/x/" + "a" * 196 + "\U0001F600b",
+        "/srv/" + "\U0001F600" * 120,
     ]
     script = tmp_path / "xm.js"
     script.write_text(
@@ -280,6 +355,41 @@ def test_a_real_git_worktree_maps_to_its_main_checkout(tmp_path, monkeypatch):
     ):
         subprocess.run(["git", "-C", str(main), *args], check=True, capture_output=True)
     assert lb.repo_root(tmp_path / "wt").resolve() == main.resolve()
+
+
+def test_a_pointer_that_is_not_utf8_keeps_its_own_root_and_logs_why(tmp_path, caplog):
+    import logging
+
+    main = _plain_repo(tmp_path / "main")
+    wt = _linked_worktree(main, tmp_path / "wt")
+    (wt / ".git").write_bytes(b"gitdir: /x/\xff\xfe\n")
+    caplog.set_level(logging.DEBUG, logger="jacked.memory.claude_paths")
+
+    assert lb.repo_root(wt) == wt
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("UnicodeDecodeError" in m and ".git" in m for m in messages), messages
+    assert not any("\\xff" in m or "/x/" in m for m in messages)  # never the pointer text
+
+
+def test_a_pointer_read_error_keeps_its_own_root_and_logs_why(tmp_path, caplog, monkeypatch):
+    import logging
+
+    from jacked.memory import claude_paths
+
+    main = _plain_repo(tmp_path / "main")
+    wt = _linked_worktree(main, tmp_path / "wt")
+    real_read = os.read
+
+    def failing_read(fd, n):
+        raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(claude_paths.os, "read", failing_read)
+    caplog.set_level(logging.DEBUG, logger="jacked.memory.claude_paths")
+    try:
+        assert lb.repo_root(wt) == wt
+    finally:
+        monkeypatch.setattr(claude_paths.os, "read", real_read)
+    assert any("OSError" in r.getMessage() for r in caplog.records)
 
 
 def test_a_worktree_whose_back_pointer_disagrees_keeps_its_own_root(tmp_path):
@@ -342,7 +452,9 @@ def test_a_symlinked_path_names_the_same_folder_as_its_target(tmp_path, home):
     link.symlink_to(real)
     assert lb.native_memory_path(link, home, NO_ENV) == lb.native_memory_path(real, home, NO_ENV)
     write_230_lines_27000_bytes(lb.native_memory_path(real, home, NO_ENV))
-    assert lb.warnings(link, home, NO_ENV) == [MEMORY_230_LINE]
+    assert lb.warnings(link, home, NO_ENV) == [
+        memory_line(lb.native_memory_path(real, home, NO_ENV), home)
+    ]
 
 
 def test_claude_config_dir_moves_the_projects_folder(project, home, tmp_path):
@@ -400,6 +512,47 @@ def test_an_invalid_auto_memory_directory_keeps_the_default(project, home, value
     assert lb.native_memory_path(project, home, NO_ENV) == _default_memory(home, project)
 
 
+def _fifo_settings(home: Path, project: Path, where: str, tmp_path: Path) -> Path:
+    """Put a FIFO (or a symlink to one) where a settings file goes. Returns the FIFO."""
+    target = {
+        "local": project / ".claude" / "settings.local.json",
+        "project": project / ".claude" / "settings.json",
+        "user": home / ".claude" / "settings.json",
+        "user-link": home / ".claude" / "settings.json",
+    }[where]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if where == "user-link":
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+        target.symlink_to(fifo)
+        return fifo
+    os.mkfifo(target)
+    return target
+
+
+@requires_fifo
+@pytest.mark.parametrize("where", ["local", "project", "user", "user-link"])
+def test_a_fifo_settings_file_does_not_block_the_warnings(project, home, tmp_path, where):
+    """Each settings file is read at session start; a FIFO there must not hang it."""
+    fifo = _fifo_settings(home, project, where, tmp_path)
+
+    finished, result = returns_without_blocking(lambda: lb.warnings(project, home, NO_ENV), [fifo])
+
+    assert finished, "warnings() blocked on a FIFO settings file"
+    assert result == []
+
+
+@requires_fifo
+@pytest.mark.parametrize("where", ["user", "user-link"])
+def test_a_fifo_settings_file_does_not_block_the_machine_warnings(project, home, tmp_path, where):
+    fifo = _fifo_settings(home, project, where, tmp_path)
+
+    finished, result = returns_without_blocking(lambda: lb.machine_warnings(home, NO_ENV), [fifo])
+
+    assert finished, "machine_warnings() blocked on a FIFO settings file"
+    assert result == []
+
+
 def test_an_unreadable_settings_file_is_skipped(project, home):
     (home / ".claude" / "settings.json").write_text("{not json", encoding="utf-8")
     assert lb.native_memory_path(project, home, NO_ENV) == _default_memory(home, project)
@@ -424,17 +577,73 @@ def test_the_loaded_files_in_order_memory_project_then_global(tmp_path, home):
         )
     ]
     user = _write_lines(home / ".claude" / "CLAUDE.md", 1)
-    _write_lines(tmp_path / "CLAUDE.md", 1)  # above the repo: not part of the project
-    assert lb.always_loaded_files(sub, home, NO_ENV) == [memory, *project_files, user]
+    above = _write_lines(tmp_path / "CLAUDE.md", 1)  # above the repo: Claude Code loads it too
+    assert lb.always_loaded_files(sub, home, NO_ENV) == [memory, *project_files, above, user]
 
 
-def test_outside_git_only_the_folder_itself_is_read(tmp_path, home):
+def test_outside_git_every_ancestor_folder_is_read(tmp_path, home):
+    """Claude Code reads CLAUDE.md "recursively from the cwd up to the root directory"."""
     outer = tmp_path / "outer"
     inner = outer / "inner"
     inner.mkdir(parents=True)
-    _write_lines(outer / "CLAUDE.md", 1)
+    above = _write_lines(outer / "CLAUDE.md", 1)
     own = _write_lines(inner / "CLAUDE.md", 1)
-    assert lb.always_loaded_files(inner, home, NO_ENV) == [own]
+    assert lb.always_loaded_files(inner, home, NO_ENV) == [own, above]
+
+
+def test_an_over_budget_file_above_the_repo_root_warns(tmp_path, home):
+    workspace = tmp_path / "workspace"
+    repo = _plain_repo(workspace / "repo")
+    _write_lines(workspace / "CLAUDE.md", 230)
+    assert lb.warnings(repo, home, NO_ENV) == [
+        "`workspace/CLAUDE.md` is 230 lines / 2.5 KB; Claude Code loads all of it, but its "
+        "docs advise under 200 lines per file; run /audit-rules"
+    ]
+
+
+def test_an_over_budget_ancestor_outside_git_warns(tmp_path, home):
+    workspace = tmp_path / "workspace"
+    inner = workspace / "inner"
+    inner.mkdir(parents=True)
+    _write_lines(workspace / ".claude" / "CLAUDE.md", 230)
+    (line,) = lb.warnings(inner, home, NO_ENV)
+    assert line.startswith("`workspace/.claude/CLAUDE.md` is 230 lines")
+
+
+def test_two_ancestors_with_the_same_folder_name_get_two_part_labels(tmp_path, home):
+    outer = tmp_path / "top" / "app"
+    inner = outer / "src" / "app"
+    inner.mkdir(parents=True)
+    _write_lines(outer / "CLAUDE.md", 230)
+    _write_lines(inner / "CLAUDE.md", 230)
+    labels = [line.split(" is ", 1)[0] for line in lb.warnings(inner, home, NO_ENV)]
+    assert labels == ["`src/app/CLAUDE.md`", "`top/app/CLAUDE.md`"]
+
+
+def test_a_two_part_label_never_names_the_home_folder(tmp_path):
+    home = tmp_path / "someone"
+    (home / ".claude").mkdir(parents=True)
+    inner = home / "app" / "x" / "app"
+    inner.mkdir(parents=True)
+    _write_lines(home / "app" / "CLAUDE.md", 230)
+    _write_lines(inner / "CLAUDE.md", 230)
+    labels = [line.split(" is ", 1)[0] for line in lb.warnings(inner, home, NO_ENV)]
+    assert labels == ["`x/app/CLAUDE.md`", "`~/app/CLAUDE.md`"]
+
+
+def test_the_user_claude_md_stays_one_user_entry_under_home(tmp_path):
+    """From a folder under home, ~/.claude/CLAUDE.md is also an ancestor file."""
+    home = tmp_path / "someone"
+    project = home / "Github" / "proj"
+    project.mkdir(parents=True)
+    home_file = _write_lines(home / "CLAUDE.md", 1)
+    user = _write_lines(home / ".claude" / "CLAUDE.md", 230)
+    home_local = _write_lines(home / "CLAUDE.local.md", 1)
+    assert lb.always_loaded_files(project, home, NO_ENV) == [home_file, home_local, user]
+    assert lb.warnings(project, home, NO_ENV) == [
+        "~/.claude/CLAUDE.md is 230 lines / 2.5 KB; Claude Code loads all of it, but its "
+        "docs advise under 200 lines per file; run /audit-rules"
+    ]
 
 
 def test_auto_memory_off_drops_the_index_from_the_loaded_files(project, home):
@@ -471,24 +680,65 @@ def test_no_warning_under_the_warn_line(project, home):
 
 def test_the_memory_warning_text(project, home):
     write_230_lines_27000_bytes(_memory(project, home))
-    assert lb.warnings(project, home, NO_ENV) == [MEMORY_230_LINE]
+    assert lb.warnings(project, home, NO_ENV) == [memory_line(_memory(project, home), home)]
 
 
 def test_a_file_between_the_warn_line_and_the_cap_warns(project, home):
     """190 lines is under the 200-line cap but over the 180-line warn line."""
     _write_lines(_memory(project, home), 190)
-    assert lb.warnings(project, home, NO_ENV) == [
-        "MEMORY.md is 190 lines / 2.1 KB; Claude Code loads only the first "
-        "200 lines / 25 KB; run memory-librarian"
-    ]
+    assert lb.warnings(project, home, NO_ENV) == [memory_line(
+        _memory(project, home), home,
+        "is 190 lines / 2.1 KB; Claude Code loads only the first 200 lines / 25 KB; "
+        "run memory-librarian",
+    )]
 
 
 def test_bytes_alone_trigger_the_memory_warning(project, home):
     _write_lines(_memory(project, home), 100, line_bytes=230)
+    assert lb.warnings(project, home, NO_ENV) == [memory_line(
+        _memory(project, home), home,
+        "is 100 lines / 23.0 KB; Claude Code loads only the first 200 lines / 25 KB; "
+        "run memory-librarian",
+    )]
+
+
+def test_two_worktrees_name_the_one_index_they_share(tmp_path, home):
+    main = _plain_repo(tmp_path / "main")
+    wt = _linked_worktree(main, tmp_path / "wt")
+    index = _default_memory(home, main)
+    write_230_lines_27000_bytes(index)
+    expected = [f"MEMORY.md (~/.claude/projects/{index.parent.parent.name}/memory) {MEMORY_230_TAIL}"]
+    assert lb.warnings(wt, home, NO_ENV) == expected
+    assert lb.warnings(main, home, NO_ENV) == expected
+
+
+def test_a_local_auto_memory_directory_names_its_folder(project, home):
+    (project / ".claude").mkdir()
+    (project / ".claude" / "settings.local.json").write_text(
+        json.dumps({"autoMemoryDirectory": "~/notes/mem"}), encoding="utf-8"
+    )
+    write_230_lines_27000_bytes(home / "notes" / "mem" / "MEMORY.md")
+    assert lb.warnings(project, home, NO_ENV) == [f"MEMORY.md (~/notes/mem) {MEMORY_230_TAIL}"]
+
+
+def test_an_auto_memory_directory_outside_home_names_its_full_folder(project, home, tmp_path):
+    folder = tmp_path / "elsewhere" / "mem"
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"autoMemoryDirectory": str(folder)}), encoding="utf-8"
+    )
+    write_230_lines_27000_bytes(folder / "MEMORY.md")
     assert lb.warnings(project, home, NO_ENV) == [
-        "MEMORY.md is 100 lines / 23.0 KB; Claude Code loads only the first "
-        "200 lines / 25 KB; run memory-librarian"
+        f"MEMORY.md ({folder.as_posix()}) {MEMORY_230_TAIL}"
     ]
+
+
+@posix_names
+def test_a_hostile_auto_memory_directory_stays_one_inert_line(project, home):
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"autoMemoryDirectory": "~/a\nb`c\u202e"}), encoding="utf-8"
+    )
+    write_230_lines_27000_bytes(home / "a\nb`c\u202e" / "MEMORY.md")
+    assert lb.warnings(project, home, NO_ENV) == [f"MEMORY.md (~/a b'c) {MEMORY_230_TAIL}"]
 
 
 def test_the_claude_md_warning_never_claims_a_truncation(tmp_path, home):
@@ -540,6 +790,12 @@ def test_a_hostile_folder_name_stays_one_inert_line(tmp_path, home):
     assert not any(ch in line for ch in "\n\r\x1b\u202e")
 
 
+def test_the_label_cleaner_uses_the_vault_sanitizer():
+    """One sanitizer for the hook text: load_budget keeps no private copy."""
+    assert not hasattr(lb, "_INVISIBLE_RE")
+    assert lb._clean("a\u200eb\x85c\x9bd") == "ab cd"
+
+
 def test_no_warning_text_carries_an_em_dash(tmp_path, home):
     repo = _plain_repo(tmp_path / "repo")
     write_230_lines_27000_bytes(lb.native_memory_path(repo, home, NO_ENV))
@@ -552,7 +808,7 @@ def test_no_warning_text_carries_an_em_dash(tmp_path, home):
 def test_warnings_for_the_process_folder(project, home, monkeypatch):
     write_230_lines_27000_bytes(_memory(project, home))
     monkeypatch.chdir(project)
-    assert lb.warnings(None, home, NO_ENV) == [MEMORY_230_LINE]
+    assert lb.warnings(None, home, NO_ENV) == [memory_line(_memory(project, home), home)]
 
 
 # --------------------------------------------------------------------------- #
@@ -598,6 +854,51 @@ def test_machine_warnings_fall_back_to_the_folder_name(home):
     assert line.startswith("MEMORY.md (myproj) is 230 lines")
 
 
+def test_machine_warnings_survive_a_transcript_that_is_not_utf8(home):
+    folder = _projects(home) / "-nonexistent-root-myproj"
+    write_230_lines_27000_bytes(folder / "memory" / "MEMORY.md")
+    (folder / "s1.jsonl").write_bytes(b'{"cwd": "/x/caf\xc3')  # a cut multibyte character
+    (line,) = lb.machine_warnings(home, NO_ENV)
+    assert line.startswith("MEMORY.md (myproj) is 230 lines")
+
+
+@pytest.mark.parametrize("cwd", [["/x/evil"], {"p": "/x/evil"}, 7, ""])
+def test_machine_warnings_ignore_a_cwd_that_is_not_a_string(home, cwd):
+    folder = _projects(home) / "-nonexistent-root-myproj"
+    write_230_lines_27000_bytes(folder / "memory" / "MEMORY.md")
+    (folder / "s1.jsonl").write_text(json.dumps({"cwd": cwd}) + "\n", encoding="utf-8")
+    (line,) = lb.machine_warnings(home, NO_ENV)
+    assert line.startswith("MEMORY.md (myproj) is 230 lines")
+
+
+def test_the_project_label_reads_only_the_first_records(home):
+    folder = _projects(home) / "-nonexistent-root-myproj"
+    write_230_lines_27000_bytes(folder / "memory" / "MEMORY.md")
+    filler = json.dumps({"type": "summary"}) + "\n"
+    (folder / "s1.jsonl").write_text(
+        filler * lb.LABEL_RECORDS + json.dumps({"cwd": "/x/late-name"}) + "\n", encoding="utf-8"
+    )
+    (line,) = lb.machine_warnings(home, NO_ENV)
+    assert line.startswith("MEMORY.md (myproj) is 230 lines")
+
+
+@pytest.mark.parametrize("error", [OSError, UnicodeDecodeError, ValueError])
+def test_a_failing_transcript_read_falls_back_to_the_folder_name(home, monkeypatch, error):
+    from jacked import recover
+
+    def boom(*args, **kwargs):
+        if error is UnicodeDecodeError:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")
+        raise error("boom")
+
+    folder = _projects(home) / "-nonexistent-root-myproj"
+    write_230_lines_27000_bytes(folder / "memory" / "MEMORY.md")
+    (folder / "s1.jsonl").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(recover, "_read_cwd", boom)
+    (line,) = lb.machine_warnings(home, NO_ENV)
+    assert line.startswith("MEMORY.md (myproj) is 230 lines")
+
+
 def test_machine_warnings_include_the_user_claude_md(home):
     _write_lines(home / ".claude" / "CLAUDE.md", 230)
     (line,) = lb.machine_warnings(home, NO_ENV)
@@ -616,7 +917,7 @@ def test_machine_warnings_read_the_user_auto_memory_directory(home):
     write_230_lines_27000_bytes(home / "mem" / "MEMORY.md")
     write_230_lines_27000_bytes(_projects(home) / "-stale" / "memory" / "MEMORY.md")
     (line,) = lb.machine_warnings(home, NO_ENV)
-    assert line.startswith("MEMORY.md (autoMemoryDirectory) is 230 lines")
+    assert line == f"MEMORY.md (~/mem) {MEMORY_230_TAIL}"
 
 
 def test_machine_warnings_are_empty_on_a_clean_machine(home):

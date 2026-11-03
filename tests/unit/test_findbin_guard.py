@@ -35,6 +35,12 @@ USER_CLIS = frozenset({
     "node", "npm", "npx", "pipx", "uv", "uvx",
 })
 
+# Programs that hooks run with the session folder (an untrusted checkout) as
+# the process cwd. On Windows a bare name resolves from the cwd first, so a
+# repo with its own git.exe or git.cmd at the root would run. find_bin skips
+# such a cwd hit.
+CWD_RESOLVED = frozenset({"git"})
+
 # The whole package is service-reachable (the service, its hooks, and the
 # children it spawns with the service env such as ``jacked install --force``
 # from the updater) except these CLI-only modules, which run in the user's
@@ -116,7 +122,7 @@ def _bare_cli(node: ast.expr | None) -> str | None:
         return _bare_cli(node.values[0])
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         head = _shell_program(node.value)
-        return head if head in USER_CLIS else None
+        return head if head in USER_CLIS or head in CWD_RESOLVED else None
     return None
 
 
@@ -195,17 +201,19 @@ def test_service_reachable_code_uses_find_bin_for_user_clis():
     'import subprocess\nsubprocess.run("  codex login", shell=True)\n',
     'import os\nos.posix_spawnp("codex", ["codex"], {})\n',
     'import os\nos.execvp("claude", ["claude"])\n',
+    'import subprocess\nsubprocess.run(["git", "-C", "x", "status"])\n',
+    'import shutil\nshutil.which("git")\n',
+    'import subprocess\nsubprocess.run("git status", shell=True)\n',
 ])
 def test_guard_flags_bare_user_cli_lookups(snippet):
     assert violations_in(snippet, "x.py")
 
 
 @pytest.mark.parametrize("snippet", [
-    'import shutil\nshutil.which("git")\n',  # system tool, on the safe PATH
     'import shutil\nshutil.which(name)\n',  # dynamic: caller owns the name
     'import subprocess\nsubprocess.run([codex, "login"])\n',  # resolved path
     'import subprocess\nsubprocess.run(["launchctl", "print"])\n',
-    'import subprocess\nsubprocess.run("git status", shell=True)\n',
+    'import subprocess\nsubprocess.run("tar -xf x", shell=True)\n',  # system tool
     'import shutil\nshutil.which("codex")  # findbin: allow user-shell only\n',
 ])
 def test_guard_accepts_resolved_or_system_lookups(snippet):

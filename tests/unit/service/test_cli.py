@@ -392,6 +392,19 @@ class TestServiceStop:
         assert "signalled" in result.output.lower()
 
 
+@pytest.fixture
+def tray_service_can_start(monkeypatch):
+    """Pin the check of `jacked service install` to "the tray service can start".
+
+    tests/unit/service/test_tray_install.py tests the check itself. These tests
+    are about what the install does after it. Without the pin they fail where
+    the check refuses: a runner with no display (the Linux CI leg) or no
+    pystray.
+    """
+    monkeypatch.setattr("jacked.cli._tray_service_can_start_here", lambda: True)
+
+
+@pytest.mark.usefixtures("tray_service_can_start")
 class TestServiceInstall:
     @pytest.fixture(autouse=True)
     def _service_becomes_ready(self, monkeypatch):
@@ -448,6 +461,7 @@ class TestServiceUninstall:
         assert "pid or port" in result.output.lower()
 
 
+@pytest.mark.usefixtures("tray_service_can_start")
 class TestServiceInstallError:
     @pytest.fixture(autouse=True)
     def _service_becomes_ready(self, monkeypatch):
@@ -458,11 +472,13 @@ class TestServiceInstallError:
         side_effect=ValueError("bad"),
     )
     def test_install_shows_error_when_binary_not_found(self, mock_install):
+        """The service is the only job of `service install`: a failed install
+        prints its error and exits 1, never 0."""
         from jacked.cli import main
 
         runner = CliRunner()
         result = runner.invoke(main, ["service", "install"])
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output
         assert "Error" in result.output
         assert "safe service install failed" in result.output
 
@@ -476,6 +492,7 @@ class TestServiceInstallError:
         mock_install.return_value = MagicMock(ok=True, reason="installed")
         runner = CliRunner()
         result = runner.invoke(main, ["service", "install"])
+        assert result.exit_code == 0, result.output
         assert "OK" in result.output
 
 
@@ -1237,6 +1254,7 @@ class TestServiceStartBootMigration:
         assert mock_runner_cls.call_args.kwargs["host"] == "192.168.1.5"
 
 
+@pytest.mark.usefixtures("tray_service_can_start")
 class TestServiceInstallRemoteAccessParity:
     """`service install --host X` maps X onto the dashboard Remote access
     setting (OVERWRITING existing keys — the command expresses intent), then
@@ -2701,6 +2719,7 @@ def test_install_starts_over_a_dead_manual_owner_without_a_handoff(
     assert "Autostart registered from exact ServiceSpec" in output
 
 
+@pytest.mark.usefixtures("tray_service_can_start")
 def test_service_install_command_starts_over_a_dead_manual_owner(
     tmp_path, monkeypatch
 ):

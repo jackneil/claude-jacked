@@ -3,6 +3,8 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+import ntpath
+from jacked.winproc import system_program
 
 
 from jacked.service.spec import SupervisorKind
@@ -80,9 +82,9 @@ def test_install_task_retires_known_legacy_vbs_and_runs_task(tmp_path, monkeypat
     assert result.ok is True
     assert not legacy.exists()
     assert legacy.with_name("jacked.vbs.pre-v2").read_text() == legacy_content
-    assert runner.call_args_list[1].args[0][:2] == ["schtasks.exe", "/Create"]
+    assert runner.call_args_list[1].args[0][:2] == [system_program("schtasks"), "/Create"]
     assert runner.call_args_list[2].args[0] == [
-        "schtasks.exe",
+        system_program("schtasks"),
         "/Run",
         "/TN",
         "ai.hank.jacked",
@@ -185,11 +187,11 @@ def test_ambiguous_task_create_is_deleted_before_legacy_vbs_returns(
 
     def run(command, **_kwargs):
         calls.append(command)
-        if command[0] == "powershell.exe" and len(calls) == 1:
+        if ntpath.basename(command[0]).lower() == "powershell.exe" and len(calls) == 1:
             return SimpleNamespace(returncode=3, stdout="")
         if command[1] == "/Create":
             raise subprocess.TimeoutExpired("schtasks", 15)
-        if command[0] == "powershell.exe":
+        if ntpath.basename(command[0]).lower() == "powershell.exe":
             return SimpleNamespace(returncode=0, stdout=decode_task_xml(rendered.content))
         if command[1] == "/Delete":
             assert not legacy.exists()
@@ -201,7 +203,7 @@ def test_ambiguous_task_create_is_deleted_before_legacy_vbs_returns(
     assert result.ok is False
     assert "previous Task Scheduler state restored" in result.reason
     assert legacy.exists()
-    steps = ["query" if call[0] == "powershell.exe" else call[1] for call in calls]
+    steps = ["query" if ntpath.basename(call[0]).lower() == "powershell.exe" else call[1] for call in calls]
     assert steps == ["query", "/Create", "query", "/Delete"]
 
 
@@ -306,7 +308,7 @@ def test_a_registered_task_read_back_is_owned_and_its_backup_restores(tmp_path):
     restored_from = []
 
     def run(argv, **kwargs):
-        if argv[0] == "powershell.exe":
+        if ntpath.basename(argv[0]).lower() == "powershell.exe":
             return SimpleNamespace(returncode=0, stdout=_query_output(previous), stderr=b"")
         if argv[1] == "/Create" and ".transition-backup" in argv[5]:
             restored_from.append(Path(argv[5]).read_bytes())

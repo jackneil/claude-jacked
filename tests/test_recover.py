@@ -53,6 +53,13 @@ def test_encode_cwd_replaces_every_non_alphanumeric():
     assert rec._encode_cwd("C:\\Users\\me\\repo") == "C--Users-me-repo"
 
 
+def test_encode_cwd_counts_utf16_units_like_claude_code():
+    # Claude Code replaces each UTF-16 unit, so a character outside the BMP
+    # (two units) gives two hyphens; a BMP character gives one.
+    assert rec._encode_cwd("/tmp/\U0001F600") == "-tmp---"
+    assert rec._encode_cwd("/tmp/\u00e9t\u00e9") == "-tmp--t-"
+
+
 def test_resolve_fast_path_with_space_and_at_sign(tmp_path):
     projects = tmp_path / "projects"
     cwd = "/Users/j.n/Drive-j.n@x.ai/My Drive/Net"
@@ -384,3 +391,96 @@ def test_recommend_skips_headless_sdk_session(tmp_path):
     assert cands[0].session_id == SID_B and cands[0].headless
     assert cands[rec.recommend_index(cands)].session_id == SID_A
     assert cands[0].to_dict()["headless"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Transcript lines are read with a bound, and a bad line never stops the read
+# --------------------------------------------------------------------------- #
+
+def test_the_line_limit_is_the_api_request_limit():
+    from jacked import jsonl_lines
+
+    assert jsonl_lines.LINE_LIMIT == 32 * 1024 * 1024
+
+
+def test_read_cwd_skips_a_line_over_the_limit_with_bounded_memory(tmp_path):
+    """A first line of 64 MiB is skipped in pieces, never held whole."""
+    import tracemalloc
+
+    path = tmp_path / "s.jsonl"
+    with open(path, "wb") as f:
+        for _ in range(64):
+            f.write(b"x" * (1 << 20))
+        f.write(b"\n" + json.dumps(_user_line("/real/cwd")).encode() + b"\n")
+
+    tracemalloc.start()
+    try:
+        cwd = rec._read_cwd(path)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert cwd == "/real/cwd"
+    assert peak < 48 * 1024 * 1024, f"peak allocation {peak >> 20} MiB"
+
+
+def test_a_line_of_exactly_the_limit_is_parsed(tmp_path, monkeypatch):
+    from jacked import jsonl_lines
+
+    monkeypatch.setattr(jsonl_lines, "LINE_LIMIT", 64)
+    record = json.dumps({"cwd": "/c", "pad": ""})
+    record = record[:-2] + "x" * (64 - len(record)) + record[-2:]
+    assert len(record) == 64
+    path = tmp_path / "s.jsonl"
+    path.write_text(record + "\n", encoding="utf-8")
+    assert rec._read_cwd(path) == "/c"
+
+
+def test_a_skipped_line_is_logged_with_its_size(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from jacked import jsonl_lines
+
+    monkeypatch.setattr(jsonl_lines, "LINE_LIMIT", 64)
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(b"y" * 200 + b"\n" + json.dumps({"cwd": "/c"}).encode() + b"\n")
+    caplog.set_level(logging.DEBUG, logger="jacked.jsonl_lines")
+
+    assert rec._read_cwd(path) == "/c"
+    assert any("201 bytes" in r.getMessage() for r in caplog.records)
+
+
+def test_iter_records_skips_a_line_that_is_not_utf8_and_continues(tmp_path):
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(b'{"cwd": "/bad\xe2\x82"}\n' + json.dumps({"cwd": "/good"}).encode() + b"\n")
+    assert list(rec._iter_records(path)) == [{"cwd": "/good"}]
+
+
+def test_read_cwd_ignores_a_cwd_that_is_not_a_string(tmp_path):
+    path = tmp_path / "s.jsonl"
+    path.write_text(
+        json.dumps({"cwd": ["/a"]}) + "\n" + json.dumps({"cwd": {"p": 1}}) + "\n"
+        + json.dumps({"cwd": "/str"}) + "\n",
+        encoding="utf-8",
+    )
+    assert rec._read_cwd(path) == "/str"
+
+
+def test_read_cwd_can_stop_after_a_number_of_records(tmp_path):
+    path = tmp_path / "s.jsonl"
+    path.write_text(
+        json.dumps({"type": "summary"}) + "\n" + json.dumps({"cwd": "/late"}) + "\n",
+        encoding="utf-8",
+    )
+    assert rec._read_cwd(path, max_records=1) is None
+    assert rec._read_cwd(path, max_records=2) == "/late"
+
+
+def test_scan_candidate_survives_bad_lines(tmp_path):
+    path = tmp_path / "11111111-1111-1111-1111-111111111111.jsonl"
+    path.write_bytes(
+        b"[1, 2]\n" + b"\xff\xfe\n" + json.dumps(_user_line("/c")).encode() + b"\n"
+    )
+    cand = rec._scan_candidate(path)
+    assert cand.msg_count == 1
+    assert cand.truncated is False

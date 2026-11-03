@@ -1,0 +1,54 @@
+"""The one sanitizer for text that jacked prints or puts in a session's context.
+
+Note bodies, commit messages, remote errors and file names can carry terminal
+escapes, C1 controls or bidi overrides. ``jacked.memory.vault`` re-exports
+these names, so ``vault.strip_control`` and ``vault.one_line`` stay valid.
+"""
+from __future__ import annotations
+
+import re
+
+# Control chars except tab and newline (CR goes too), stripped from any text we
+# print through Rich (search excerpts, git error tails) or put in a session's
+# context (the recall brief, the git reality block, the load budget lines): a
+# note body or a remote-derived string could carry a terminal escape/OSC
+# sequence. C1 controls go too (U+009B is a one-character CSI), and so do the
+# bidi marks, embeddings, overrides and isolates (U+200E, U+200F, U+202A to
+# U+202E, U+2066 to U+2069), which can show text in an order that is not its
+# real order. This is the one sanitizer for that text.
+_CONTROL_CHARS_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def strip_control(s: str) -> str:
+    """Strip control chars (keeps tab and newline; strips CR) via the single regex.
+
+    Vault content is echoed to terminals and injected into session context, so
+    a note body or a remote-derived string could carry a terminal escape/OSC
+    sequence; this is the one place that regex is applied.
+    """
+    return _CONTROL_CHARS_RE.sub("", s or "")
+
+
+def fence_safe(s: str) -> str:
+    """Change each backtick in ``s`` to an apostrophe.
+
+    Text from a repository or a file goes into a session's context inside a
+    fenced block or a code span. Without backticks it cannot close the fence
+    or the span, whatever its length.
+
+    >>> fence_safe("a ``` b")
+    "a ''' b"
+    """
+    return s.replace("`", "'")
+
+
+def one_line(s: str) -> str:
+    """Control-stripped, whitespace-collapsed single line.
+
+    Whitespace collapses first, so a line-break control (CR, NEL, U+2028)
+    keeps the words on each side of it apart.
+
+    >>> one_line("a\\rb\\x85c  d\\x1b[0m")
+    'a b c d[0m'
+    """
+    return " ".join(strip_control(" ".join((s or "").split())).split())

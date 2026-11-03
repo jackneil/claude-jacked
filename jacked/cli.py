@@ -135,8 +135,10 @@ def _is_headless() -> bool:
     """True when there's no GUI display to draw a tray icon on.
 
     macOS/Windows always have a window server. On Linux/BSD a tray needs X11 or
-    Wayland; absent both (CI, servers, Docker, SSH) we skip the icon and just
-    run the service."""
+    Wayland. With neither (CI, servers, Docker, SSH), the tray service cannot
+    start: pystray opens the display when it loads. So `jacked install` skips
+    the tray there and names `jacked webux --no-browser`, the foreground
+    dashboard with no tray."""
     import os
 
     if sys.platform in ("darwin", "win32"):
@@ -818,7 +820,9 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
 
     _ok, _reason = can_auto_upgrade()
     if not _ok:
-        console.print(f"[red]Cannot auto-upgrade:[/red] {_reason}")
+        # The reason names `claude-jacked[tray]`: escape it, or Rich reads
+        # "[tray]" as a style tag and drops it from the printed command.
+        console.print(f"[red]Cannot auto-upgrade:[/red] {_rich_escape(_reason)}")
         sys.exit(2)
 
     method = detect_install_method()
@@ -895,19 +899,24 @@ def _upgrade_target_version() -> str | None:
         newest_listed_version,
     )
 
-    def answer(probe) -> str | None:
+    def answer(name: str, probe) -> str | None:
         # Each probe has its own guard: a failure of one probe never hides
         # the answer of the other.
         try:
             return probe(timeout=5.0)
-        except Exception:  # noqa: BLE001 - a lookup failure never blocks an upgrade
+        except Exception as exc:  # noqa: BLE001 - a lookup failure never blocks an upgrade
+            # The error class only: the message of a network error can hold
+            # the index URL.
+            logger.debug("Upgrade target probe %s failed: %s", name, type(exc).__name__)
             return None
 
     # The two probes are independent network reads. Run them at the same
     # time, so an unreachable index costs one timeout, not two.
     with ThreadPoolExecutor(max_workers=2) as pool:
         pypi_latest, simple_latest = pool.map(
-            answer, (get_latest_pypi_version, get_latest_from_simple_index)
+            answer,
+            ("get_latest_pypi_version", "get_latest_from_simple_index"),
+            (get_latest_pypi_version, get_latest_from_simple_index),
         )
     target = newest_listed_version(pypi_latest, simple_latest)
     if not target:
@@ -1056,7 +1065,7 @@ def _run_rollback_steps(
             cmd[0] = resolved_uv
 
     console.print(f"\n[yellow]Rolling back to v{plan.previous_version}[/yellow]")
-    console.print(f"[dim]$ {rollback_label}[/dim]")
+    console.print(f"[dim]$ {_rich_escape(rollback_label)}[/dim]")
     if _rollback_step_failed(cmd, "Rollback command"):
         return _ROLLBACK_STEP_PACKAGE
 
@@ -1313,7 +1322,7 @@ def _upgrade_install_package(cmd: list[str], label: str) -> str:
     from jacked.service.updater import run_process_tree
 
     _upgrade_phase("installing_package", "begin")
-    console.print(f"[dim]$ {label}[/dim]")
+    console.print(f"[dim]$ {_rich_escape(label)}[/dim]")
     # Own process group plus relayed output: a closed terminal can neither
     # hang up nor break the installer halfway through replacing the venv.
     with _defer_upgrade_signals():
@@ -2331,8 +2340,7 @@ def _spawn_windows_upgrade_helper(
     # launching terminal closing (modern terminals kill their job on close).
     # Fall back to CREATE_NO_WINDOW alone if the job forbids breakaway — never
     # back to DETACHED_PROCESS, or the windows come right back.
-    NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    from jacked.winproc import run_batch_detached
     # Capture the batch's stdout/stderr into the update log by handing cmd.exe
     # an inherited handle on it — the same pattern the tray updater uses. This
     # is what makes the batch's bare `echo`/command output land in the log, and
@@ -2348,18 +2356,7 @@ def _spawn_windows_upgrade_helper(
         close_fds=True,
     )
     try:
-        try:
-            subprocess.Popen(
-                ["cmd.exe", "/c", batch_path],
-                creationflags=NO_WINDOW | BREAKAWAY,
-                **_helper_kwargs,
-            )
-        except OSError:
-            subprocess.Popen(
-                ["cmd.exe", "/c", batch_path],
-                creationflags=NO_WINDOW,
-                **_helper_kwargs,
-            )
+        run_batch_detached(batch_path, **_helper_kwargs)
     finally:
         # cmd.exe holds its own inherited copy of the handle; close ours.
         if _lf is not subprocess.DEVNULL:
@@ -5773,20 +5770,65 @@ def _ensure_autostart_and_running(
 def _setup_tray_autostart() -> None:
     """Register login autostart and start the tray now so `jacked install` makes
     the icon appear. The tray is ON by default (pystray/Pillow are core deps);
-    `jacked install --no-tray` skips this. No-ops when pystray can't import, or
-    on a headless box (no display) so CI/servers run the service without trying
-    to draw a broken icon."""
-    if not _tray_extra_installed():
-        return
-    if _is_headless():
-        console.print(
-            "[dim][-][/dim] Headless environment (no display). Skipping the tray icon. "
-            "Run `jacked service start` to run the service without a tray."
-        )
+    `jacked install --no-tray` skips this. When the tray service cannot start
+    on this box, the tray step is skipped with the reason (see
+    _tray_service_can_start_here), and the rest of the install goes on."""
+    if not _tray_service_can_start_here():
         return
     from jacked.service import DEFAULT_PORT
 
     _ensure_autostart_and_running(DEFAULT_PORT, label="Tray")
+
+
+def _tray_service_can_start_here() -> bool:
+    """True when the tray service can start here. Otherwise print why.
+
+    The tray service needs a display: pystray opens the display when it
+    loads, and the service does not start without the tray. So the display
+    check comes first. With no display (CI, servers, Docker, SSH), this names
+    `jacked webux --no-browser`, the foreground dashboard with no tray. When
+    pystray cannot load on a box with a display, this tells why (see
+    _tray_import_failure_notice). `jacked install` and `jacked service
+    install` both ask this before they register autostart, so neither
+    installs a service that cannot start.
+    """
+    if _is_headless():
+        console.print(
+            "[dim][-][/dim] No display (DISPLAY and WAYLAND_DISPLAY are not set). "
+            "Skipping the tray icon: the tray service needs a display. "
+            "To use the dashboard here, run `jacked webux --no-browser`."
+        )
+        return False
+    if not _tray_extra_installed():
+        console.print(_tray_import_failure_notice())
+        return False
+    return True
+
+
+def _tray_import_failure_notice() -> str:
+    """The `jacked install` line for a box with a display where pystray cannot load.
+
+    When the tray module recorded a backend error at import (a missing
+    AppIndicator typelib, for example), the line names that error and the
+    README Linux tray notes, because a reinstall cannot fix it. Otherwise
+    the package is missing, and the line gives the reinstall command.
+    """
+    failure, pointer = None, ""
+    try:
+        from jacked.service import tray
+    except Exception as exc:  # noqa: BLE001 - install never dies over the tray
+        logger.debug("Could not read the tray load failure: %s", type(exc).__name__)
+    else:
+        failure, pointer = tray._PYSTRAY_LOAD_FAILURE, tray.LINUX_TRAY_NOTES_POINTER
+    if failure:
+        return (
+            "[yellow][WARN][/yellow] Skipping the tray icon: pystray could not "
+            f"load ({_rich_escape(failure)}). {pointer}"
+        )
+    return (
+        "[yellow][WARN][/yellow] Skipping the tray icon: jacked could not import "
+        "pystray. Reinstall jacked with: uv tool install claude-jacked --force"
+    )
 
 
 # Plugins that jacked's behaviors and skills genuinely depend on. Missing
@@ -6173,13 +6215,13 @@ def doctor():
         console.print(
             "\n[bold yellow]pip install detected.[/bold yellow]\n"
             "  Auto-upgrade disabled.  Migrate to uv with:\n"
-            "  [cyan]uv tool install \"claude-jacked[tray]\" --force[/cyan]"
+            "  [cyan]uv tool install \"claude-jacked\\[tray]\" --force[/cyan]"
         )
     elif str(method).startswith("unknown"):
         console.print(
             "\n[bold red]Could not detect install method.[/bold red]\n"
             "  Nuclear-option recovery:\n"
-            "  [cyan]uv tool install \"claude-jacked[tray]\" --force[/cyan]"
+            "  [cyan]uv tool install \"claude-jacked\\[tray]\" --force[/cyan]"
         )
 
     # Plugin + external-tool recommendations (moved off the install banner).
@@ -8314,13 +8356,21 @@ def service_install(host: str | None, port: int | None):
     """Configure jacked to start automatically on login, and start it now."""
     from jacked.service import DEFAULT_PORT
 
+    # The same check as `jacked install`, made first: a service that cannot
+    # start here is not installed, and a refused install changes no setting.
+    # The service is this command's only job, so a refusal exits 1.
+    if not _tray_service_can_start_here():
+        sys.exit(1)
+
     # An explicit --host expresses intent about the persistent Remote access
     # mode: map it into the settings DB (overwriting existing keys), then
     # install host-free so every boot resolves the bind from the DB. An
     # unmapped IP cannot safely become an extra process beside the supervisor.
     if host is not None:
         _persist_remote_access_from_host(host, allow_one_shot=False)
-    _ensure_autostart_and_running(port or DEFAULT_PORT, label="Service")
+    if not _ensure_autostart_and_running(port or DEFAULT_PORT, label="Service"):
+        # Each failure path has printed its error. A failed install exits 1.
+        sys.exit(1)
 
 
 @service.command(name="recover")

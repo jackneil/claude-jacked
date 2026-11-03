@@ -635,3 +635,80 @@ def test_macos_traverse_only_directories_are_accepted(tmp_path, caplog):
         assert _lookup(home, caplog) == str(exe)
     finally:
         exe.parent.chmod(0o755)
+
+
+# --------------------------------------------------------------------------- #
+# Windows: shutil.which searches the process cwd first; a repo is not PATH
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def win_repo(tmp_path, monkeypatch):
+    """A cloned repo as the process cwd, with its own git.cmd at the root, and a
+    real git.exe in a PATH folder. The platform is win32 for find_bin."""
+    import jacked.findbin as fb
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "git.cmd").write_text("@echo planted", encoding="utf-8")
+    bindir = tmp_path / "Git" / "cmd"
+    bindir.mkdir(parents=True)
+    (bindir / "git.exe").write_text("real", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(fb.sys, "platform", "win32")
+    monkeypatch.setenv("PATH", str(bindir))
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    return repo, bindir
+
+
+@pytest.mark.parametrize("hit_form", ["absolute", "relative"])
+def test_windows_skips_a_cwd_hit_that_is_not_on_path(win_repo, tmp_path, monkeypatch, hit_form):
+    """CPython 3.11 returns '.\\git.cmd' for a cwd hit; 3.12 returns the full path."""
+    import jacked.findbin as fb
+
+    repo, bindir = win_repo
+    hit = str(repo / "git.cmd") if hit_form == "absolute" else os.path.join(os.curdir, "git.cmd")
+    monkeypatch.setattr(fb.shutil, "which", lambda name, *a, **k: hit)
+
+    assert find_bin("git", home=str(tmp_path / "home")) == str(bindir / "git.exe")
+
+
+def test_windows_gives_none_when_only_the_cwd_has_the_program(win_repo, tmp_path, monkeypatch):
+    import jacked.findbin as fb
+
+    repo, bindir = win_repo
+    (bindir / "git.exe").unlink()
+    monkeypatch.setattr(fb.shutil, "which", lambda name, *a, **k: str(repo / "git.cmd"))
+
+    assert find_bin("git", home=str(tmp_path / "home")) is None
+
+
+def test_windows_keeps_a_cwd_hit_when_the_cwd_is_on_path(win_repo, tmp_path, monkeypatch):
+    """A user who puts the folder on PATH chose it."""
+    import jacked.findbin as fb
+
+    repo, bindir = win_repo
+    monkeypatch.setenv("PATH", os.pathsep.join([str(repo).upper(), str(bindir)]))
+    monkeypatch.setattr(fb.os.path, "normcase", lambda p: p.lower())  # Windows folds case
+    monkeypatch.setattr(fb.shutil, "which", lambda name, *a, **k: str(repo / "git.cmd"))
+
+    assert find_bin("git", home=str(tmp_path / "home")) == str(repo / "git.cmd")
+
+
+def test_posix_keeps_a_cwd_hit(win_repo, tmp_path, monkeypatch):
+    """POSIX which never searches the cwd unless PATH names it, so a hit stays."""
+    import jacked.findbin as fb
+
+    repo, _ = win_repo
+    monkeypatch.setattr(fb.sys, "platform", "linux")
+    monkeypatch.setattr(fb.shutil, "which", lambda name, *a, **k: str(repo / "git.cmd"))
+
+    assert find_bin("git", home=str(tmp_path / "home")) == str(repo / "git.cmd")
+
+
+def test_require_bin_returns_the_path_or_raises_file_not_found(monkeypatch):
+    import jacked.findbin as fb
+
+    monkeypatch.setattr(fb, "find_bin", lambda name, **k: "/usr/bin/git" if name == "git" else None)
+    assert fb.require_bin("git") == "/usr/bin/git"
+    with pytest.raises(FileNotFoundError):
+        fb.require_bin("nope")

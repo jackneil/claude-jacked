@@ -782,8 +782,8 @@ class TestGitRealityStep:
 # A memory index under the warn line must leave these bytes as they are.
 HEAD_STUBBED_STDOUT = f"{CHAIN_SENTINEL}\n{RECALL_SENTINEL}\n"
 BUDGET_HEADING = "=== LOAD BUDGET (jacked) ==="
-MEMORY_230_LINE = (
-    "MEMORY.md is 230 lines / 27.0 KB; Claude Code loads only the first "
+MEMORY_230_TAIL = (
+    "is 230 lines / 27.0 KB; Claude Code loads only the first "
     "200 lines / 25 KB; run memory-librarian"
 )
 
@@ -806,6 +806,11 @@ def budget(tmp_path, monkeypatch):
     memory = load_budget.native_memory_path(cwd, home, {})
     memory.parent.mkdir(parents=True)
     return cwd, memory
+
+
+def _line230(memory: Path) -> str:
+    """The warning line for a 230-line index in the default projects folder."""
+    return f"MEMORY.md (~/.claude/projects/{memory.parent.parent.name}/memory) {MEMORY_230_TAIL}"
 
 
 def _budget_payload(cwd: Path | None) -> str:
@@ -847,8 +852,8 @@ class TestLoadBudgetStep:
         _run(_budget_payload(cwd))
 
         out = capsys.readouterr().out
-        assert out == HEAD_STUBBED_STDOUT + f"{BUDGET_HEADING}\n{BLOCK_FRAMING}\n{MEMORY_230_LINE}\n"
-        assert out.endswith(f"\n{MEMORY_230_LINE}\n")
+        assert out == HEAD_STUBBED_STDOUT + f"{BUDGET_HEADING}\n{BLOCK_FRAMING}\n{_line230(memory)}\n"
+        assert out.endswith(f"\n{_line230(memory)}\n")
 
     def test_the_budget_block_prints_after_the_recall_brief(self, steps, budget, capsys):
         cwd, memory = budget
@@ -857,7 +862,7 @@ class TestLoadBudgetStep:
         _run(_budget_payload(cwd))
 
         out = capsys.readouterr().out
-        assert out.index(RECALL_SENTINEL) < out.index(BUDGET_HEADING) < out.index(MEMORY_230_LINE)
+        assert out.index(RECALL_SENTINEL) < out.index(BUDGET_HEADING) < out.index(_line230(memory))
 
     def test_the_budget_block_is_printed_after_every_other_step(self, budget, capsys, monkeypatch):
         """Each other step prints its label, in the real STEPS order. The
@@ -879,7 +884,7 @@ class TestLoadBudgetStep:
         _run(_budget_payload(cwd))
 
         out = capsys.readouterr().out
-        assert out.endswith(f"\n{MEMORY_230_LINE}\n")
+        assert out.endswith(f"\n{_line230(memory)}\n")
         others = [label for label, _ in real if label != "load budget"]
         assert others
         for label in others:
@@ -894,7 +899,7 @@ class TestLoadBudgetStep:
 
         _run(_budget_payload(None))
 
-        assert capsys.readouterr().out.endswith(f"\n{MEMORY_230_LINE}\n")
+        assert capsys.readouterr().out.endswith(f"\n{_line230(memory)}\n")
 
     def test_the_budget_step_is_silent_in_a_subagent_session(
         self, steps, budget, capsys, monkeypatch
@@ -1076,3 +1081,41 @@ class TestOpenWorkStep:
 
         assert later == ["ran"]
         assert capsys.readouterr().out.startswith(f"{CHAIN_SENTINEL}\n{RECALL_SENTINEL}\n")
+
+# --------------------------------------------------------------------------- #
+# The developer's Claude Code environment never reaches these tests
+# --------------------------------------------------------------------------- #
+
+# The variables that move the files Claude Code loads, or change what the
+# hook prints. tests/conftest.py removes each one before every test.
+CLAUDE_SESSION_ENV = (
+    "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_PROJECT_DIR_NAME", "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+    "CLAUDE_PROJECTS_DIR", "CLAUDE_CODE_AGENT_TYPE", "CLAUDE_CODE_PARENT_SESSION_ID",
+)
+
+
+class TestDeveloperEnvironmentIsolation:
+    def test_no_claude_session_variable_reaches_a_test(self):
+        import os
+
+        assert [var for var in CLAUDE_SESSION_ENV if var in os.environ] == []
+
+    def test_a_developer_claude_config_dir_cannot_change_the_byte_identical_tests(self, tmp_path):
+        """Run the byte-identical tests in a child pytest whose environment has a
+        CLAUDE_CONFIG_DIR with an over-budget CLAUDE.md, as a developer's shell can."""
+        import os
+        import subprocess
+        import sys
+
+        config = tmp_path / "developer-config"
+        config.mkdir()
+        (config / "CLAUDE.md").write_text("x\n" * 230, encoding="utf-8")
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": str(config), "PYTHONDONTWRITEBYTECODE": "1"}
+        repo = Path(__file__).resolve().parents[2]
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", str(Path(__file__)), "-q", "-p", "no:cacheprovider",
+             "-k", "byte_identical and not developer"],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=300,
+        )
+        assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+        assert " passed" in proc.stdout and "failed" not in proc.stdout

@@ -5,9 +5,9 @@ Find the most-recently-active prior session for a working directory from the
 raw on-disk transcripts under ~/.claude/projects, and reconstruct a budgeted
 working-state digest so a fresh session can pick up where a crashed one died.
 
-Self-contained by design: imports only jacked.transcript + stdlib so /recover
-works on a bare install (the moment right after a crash). Never import
-jacked.retriever / jacked.searcher here.
+Self-contained by design: imports only jacked.transcript, jacked.jsonl_lines
+and stdlib so /recover works on a bare install (the moment right after a
+crash). Never import jacked.retriever / jacked.searcher here.
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from jacked import transcript as _t
+from jacked.jsonl_lines import iter_lines as _iter_lines, iter_records as _iter_records
 
 DEFAULT_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 DEFAULT_BUDGET_CHARS = 12000
@@ -58,25 +59,18 @@ def _norm_path(p: str) -> str:
 def _encode_cwd(cwd: str) -> str:
     """Encode a cwd the way current Claude Code names its projects dir:
     every non-alphanumeric character (separators, dots, spaces, '@', ':')
-    becomes '-', so the leading separator becomes a leading dash."""
-    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    becomes '-', so the leading separator becomes a leading dash.
 
+    Claude Code replaces each UTF-16 unit of the JavaScript string, so a
+    character outside the BMP (an emoji is two units) gives two hyphens.
 
-def _iter_records(path: Path):
-    """Yield parsed JSON objects from a JSONL file, skipping blank/garbled
-    lines. Tolerates a crash-truncated final line (it is simply skipped)."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-    except (IOError, OSError):
-        return
+    >>> _encode_cwd("/tmp/\U0001F600 x")
+    '-tmp----x'
+    """
+    return "".join(
+        c if c.isascii() and c.isalnum() else "--" if ord(c) > 0xFFFF else "-"
+        for c in str(cwd)
+    )
 
 
 def _parse_ts(value) -> Optional[datetime]:
@@ -88,11 +82,14 @@ def _parse_ts(value) -> Optional[datetime]:
         return None
 
 
-def _read_cwd(path: Path) -> Optional[str]:
-    """Return the first top-level 'cwd' field found in a transcript."""
-    for rec_obj in _iter_records(path):
+def _read_cwd(path: Path, max_records: Optional[int] = None) -> Optional[str]:
+    """Return the first top-level 'cwd' field in a transcript that is a non-empty
+    string, reading at most ``max_records`` records when it is given."""
+    for i, rec_obj in enumerate(_iter_records(path)):
+        if max_records is not None and i >= max_records:
+            break
         cwd = rec_obj.get("cwd") if isinstance(rec_obj, dict) else None
-        if cwd:
+        if isinstance(cwd, str) and cwd:
             return cwd
     return None
 
@@ -195,16 +192,17 @@ def _scan_candidate(path: Path) -> SessionCandidate:
     msg_count = 0
     last_line_ok = True
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped:
+        with open(path, "rb") as f:
+            for stripped in _iter_lines(f):
+                if stripped == "":
                     continue
                 try:
-                    rec_obj = json.loads(stripped)
+                    rec_obj = json.loads(stripped or "")  # None: an unreadable line
                     last_line_ok = True
                 except json.JSONDecodeError:
                     last_line_ok = False
+                    continue
+                if not isinstance(rec_obj, dict):
                     continue
                 t = rec_obj.get("type")
                 if t == "ai-title":

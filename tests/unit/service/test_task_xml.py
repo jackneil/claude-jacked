@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from jacked.winproc import system_program
 
 from jacked.service.supervisors._task_xml import (
     canonical_task_xml,
@@ -114,7 +115,7 @@ class TestQueryTaskXml:
         assert (result.returncode, result.absent) == (0, False)
         assert result.xml == encode_task_xml(BODY)
         argv = run.call_args.args[0]
-        assert argv[:4] == ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+        assert argv[:4] == [system_program("powershell"), "-NoProfile", "-NonInteractive", "-Command"]
         assert "GetTask('ai.hank.jacked')" in argv[4]
         kwargs = run.call_args.kwargs
         assert kwargs["capture_output"] is True and kwargs.get("text") is not True

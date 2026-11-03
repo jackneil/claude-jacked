@@ -26,6 +26,8 @@ import stat
 from collections.abc import Mapping
 from pathlib import Path
 
+from jacked.regular_file import NotRegularFileError, open_regular_fd
+
 logger = logging.getLogger(__name__)
 
 Env = Mapping[str, str]
@@ -44,25 +46,17 @@ _TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
 def open_regular(path) -> int | None:
     """Open ``path`` read-only when it is a regular file, else return None.
 
-    The type is checked before the open and on the open handle, so a FIFO, a
-    device or a folder is never read. A FIFO read would block a session start.
+    The type is checked before the open and on the open handle
+    (``jacked.regular_file.open_regular_fd``), so a FIFO, a device or a folder
+    is never read. A FIFO read would block a session start.
     """
     try:
-        if not stat.S_ISREG(os.stat(path).st_mode):
-            return None
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
-    except (FileNotFoundError, NotADirectoryError):
+        return open_regular_fd(path)
+    except (FileNotFoundError, NotADirectoryError, NotRegularFileError):
         return None
     except OSError as exc:
         logger.warning("claude paths: cannot open %s (%s)", Path(path).name, type(exc).__name__)
         return None
-    try:
-        if stat.S_ISREG(os.fstat(fd).st_mode):
-            return fd
-    except OSError as exc:
-        logger.warning("claude paths: cannot stat %s (%s)", Path(path).name, type(exc).__name__)
-    os.close(fd)
-    return None
 
 
 def session_folder(cwd) -> Path:
@@ -88,10 +82,12 @@ def config_dir(home, env: Env | None = None) -> Path:
 def project_dir_name(path: str) -> str:
     """Return the folder name that Claude Code gives ``path`` under ``projects/``.
 
-    Each character that is not an ASCII letter or digit becomes ``-``
-    (``jacked.recover._encode_cwd``). A name over 200 characters keeps its
-    first 200 and gets ``-`` and the base 36 of a 32-bit hash of the path, as
-    Claude Code 2.1.317 writes it.
+    Each UTF-16 unit that is not an ASCII letter or digit becomes ``-``
+    (``jacked.recover._encode_cwd``), so a character outside the BMP gives two.
+    The name is then ASCII, so its length counts UTF-16 units, as the
+    JavaScript length does. A name over 200 units keeps its first 200 and gets
+    ``-`` and the base 36 of a 32-bit hash of the path over its UTF-16 units,
+    as Claude Code 2.1.317 writes it.
 
     >>> project_dir_name("/Users/jack.neil/Github/claude-jacked")
     '-Users-jack-neil-Github-claude-jacked'
@@ -204,7 +200,8 @@ def _read_pointer(path: Path) -> str | None:
         return None
     try:
         data = os.read(fd, _POINTER_LIMIT + 1)
-    except OSError:
+    except OSError as exc:
+        logger.debug("claude paths: cannot read %s (%s)", path.name, type(exc).__name__)
         return None
     finally:
         os.close(fd)
@@ -213,7 +210,8 @@ def _read_pointer(path: Path) -> str | None:
         return None
     try:
         return data.decode("utf-8").strip()
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as exc:
+        logger.debug("claude paths: %s is not a git pointer (%s)", path.name, type(exc).__name__)
         return None
 
 

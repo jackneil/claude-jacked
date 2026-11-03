@@ -1133,6 +1133,26 @@ def test_run_skills_strips_terminal_escapes_from_tail(skills_env, caplog):
         assert "\x1b" not in rec.getMessage()
 
 
+@pytest.mark.parametrize("ch", ["\x9b", "\x85", "\u202e", "\u2066", "\u200f"])
+def test_run_skills_strips_c1_controls_and_bidi_overrides_from_tail(skills_env, caplog, ch):
+    """U+009B is a one-character CSI; the bidi controls reorder what a reader sees.
+    The tail uses the shared jacked sanitizer, not a private C0-only copy."""
+    env = skills_env
+    env.set_scenario(mode="exit_nonzero", exit_code=1, stderr=f"npm ERR!{ch}2J boom")
+    with caplog.at_level("WARNING"):
+        res = packs.install_pack(_pack(), env.home, include_codex=False)
+    assert res.ok is False
+    assert ch not in res.message and "npm ERR!2J boom" in res.message
+    for rec in caplog.records:
+        assert ch not in rec.getMessage()
+
+
+def test_packs_has_no_private_sanitizer():
+    from jacked.memory import sanitize
+
+    assert packs._CONTROL_CHARS_RE is sanitize._CONTROL_CHARS_RE
+
+
 def test_registry_source_rejects_trailing_newline(tmp_path, caplog):
     """\\Z (not $) anchoring: a trailing newline in a source must be rejected."""
     bad = {"packs": {"nl": {"source": "acme/skills\n", "skills": ["alpha"]},

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from jacked.winproc import system_program
 
 from jacked.service.spec import SupervisorKind
 from jacked.service.supervisors import (
@@ -198,13 +199,13 @@ def test_uninstall_task_stops_and_deletes_exact_registered_definition(tmp_path):
     assert result.ok is True
     assert not path.exists()
     assert runner.call_args_list[1].args[0] == [
-        "schtasks.exe",
+        system_program("schtasks"),
         "/End",
         "/TN",
         "ai.hank.jacked",
     ]
     assert runner.call_args_list[2].args[0] == [
-        "schtasks.exe",
+        system_program("schtasks"),
         "/Delete",
         "/TN",
         "ai.hank.jacked",
@@ -248,7 +249,7 @@ def test_uninstall_task_is_idempotent_when_task_and_artifact_absent(tmp_path):
     assert runner.call_count == 1
     query = runner.call_args.args[0]
     assert query[:4] == [
-        "powershell.exe",
+        system_program("powershell"),
         "-NoProfile",
         "-NonInteractive",
         "-Command",

@@ -222,3 +222,90 @@ class TestParseJsonlFile:
         """Should raise error for missing file."""
         with pytest.raises(FileNotFoundError):
             parse_jsonl_file(tmp_path / "nonexistent.jsonl")
+
+
+# --------------------------------------------------------------------------- #
+# Every transcript reader reads lines with a bound (jacked.jsonl_lines)
+# --------------------------------------------------------------------------- #
+
+_HUGE = 64 * 1024 * 1024
+
+
+def _hostile_jsonl(path, *records):
+    """A 64 MiB first line, a line that is not UTF-8, a JSON array line, then ``records``."""
+    with open(path, "wb") as f:
+        chunk = b"x" * (1 << 20)
+        for _ in range(_HUGE // len(chunk)):
+            f.write(chunk)
+        f.write(b"\n\xff\xfe not utf-8\n[1, 2]\n")
+        for record in records:
+            f.write(json.dumps(record).encode("utf-8") + b"\n")
+    return path
+
+
+def _peak(fn):
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        result = fn()
+        return result, tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+class TestBoundedReaders:
+    def test_parse_jsonl_file(self, tmp_path):
+        path = _hostile_jsonl(tmp_path / "s.jsonl", {
+            "type": "user", "message": {"role": "user", "content": "Hello Claude"},
+            "timestamp": "2025-01-18T10:00:00Z", "uuid": "m1",
+        })
+        transcript, peak = _peak(lambda: parse_jsonl_file(path))
+        assert [m.content for m in transcript.user_messages] == ["Hello Claude"]
+        assert peak < 48 * 1024 * 1024, f"peak {peak >> 20} MiB"
+
+    def test_extract_agent_summary(self, tmp_path):
+        from jacked.transcript import extract_agent_summary
+
+        text = "A real agent summary. " * 20
+        path = _hostile_jsonl(tmp_path / "agent-abc.jsonl", {
+            "type": "assistant", "message": {"content": [{"type": "text", "text": text}]},
+        })
+        summary, peak = _peak(lambda: extract_agent_summary(path))
+        assert summary is not None and summary.summary_text == text.strip()
+        assert peak < 48 * 1024 * 1024, f"peak {peak >> 20} MiB"
+
+    def test_extract_summary_labels(self, tmp_path):
+        from jacked.transcript import extract_summary_labels
+
+        path = _hostile_jsonl(tmp_path / "s.jsonl", {"type": "summary", "summary": "Chapter one"})
+        labels, peak = _peak(lambda: extract_summary_labels(path))
+        assert [label.label for label in labels] == ["Chapter one"]
+        assert peak < 48 * 1024 * 1024, f"peak {peak >> 20} MiB"
+
+    def test_extract_session_slug(self, tmp_path):
+        from jacked.transcript import extract_session_slug
+
+        path = _hostile_jsonl(tmp_path / "s.jsonl", {"slug": "brave-otter"})
+        slug, peak = _peak(lambda: extract_session_slug(path))
+        assert slug == "brave-otter"
+        assert peak < 48 * 1024 * 1024, f"peak {peak >> 20} MiB"
+
+    def test_parse_jsonl_file_warns_for_each_unreadable_line(self, tmp_path, caplog):
+        import logging
+
+        path = tmp_path / "s.jsonl"
+        path.write_bytes(b"\xff\xfe\nnot json\n[1]\n")
+        caplog.set_level(logging.WARNING, logger="jacked.transcript")
+        assert parse_jsonl_file(path).messages == []
+        assert [r.getMessage() for r in caplog.records] == [
+            "Skipping invalid line 1", "Skipping invalid line 2", "Skipping invalid line 3",
+        ]
+
+    def test_crlf_line_ends_still_parse(self, tmp_path):
+        """Binary reads keep the CR; the strip removes it, as text mode did."""
+        from jacked.transcript import extract_session_slug
+
+        path = tmp_path / "s.jsonl"
+        path.write_bytes(b'{"type": "x"}\r\n{"slug": "crlf"}\r\n')
+        assert extract_session_slug(path) == "crlf"
