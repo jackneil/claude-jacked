@@ -1,6 +1,7 @@
 """Shared fixtures for jacked tests."""
 
 import atexit
+import errno
 import inspect
 import os
 import re
@@ -588,6 +589,169 @@ def _skill_listing_stays_off_the_machine(monkeypatch):
     for var in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_MODEL", "CLAUDE_CODE_DISABLE_1M_CONTEXT",
                 "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", skill_listing.ENV_BUDGET_VAR):
         monkeypatch.delenv(var, raising=False)
+
+
+def _find_bin_without_claude(find_bin):
+    """Wrap ``find_bin`` so that it never resolves the Claude Code CLI."""
+
+    def find_bin_without_claude(name, *args, **kwargs):
+        if Path(str(name)).stem.lower() == "claude":  # claude, claude.exe, claude.cmd
+            return None
+        return find_bin(name, *args, **kwargs)
+
+    find_bin_without_claude.__wrapped__ = find_bin
+    return find_bin_without_claude
+
+
+@pytest.fixture
+def real_claude_binary():
+    """Opt in: this test resolves and spawns ``claude`` for real.
+
+    ``_no_real_claude_binary`` (the resolver) and ``_no_real_claude_spawn``
+    (the spawn) keep the Claude Code CLI from every other test. Request this
+    fixture only in a test that fakes what it finds (its own ``claude`` stub
+    on PATH, or a patched ``shutil.which``), never to reach the developer's
+    real CLI.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _no_real_claude_binary(request, monkeypatch):
+    """No test may resolve the developer's real Claude Code CLI.
+
+    Before this fixture, one CliRunner ``jacked install`` on a developer
+    machine ran the real ``claude mcp get`` and four ``claude plugin
+    install`` calls (found 2026-11-03): ``find_bin`` searches PATH first, and
+    only CI has no ``claude``. tests/unit/test_findbin_guard.py makes every
+    lookup go through ``jacked.findbin.find_bin``, so this fixture hides the
+    name from that resolver: at its source, which the call-time imports
+    read, and in every loaded ``jacked`` module that bound the name at
+    import. A module that the test imports first binds the wrapper from the
+    source. Other names resolve as before. A test that needs the real
+    resolver requests ``real_claude_binary``.
+
+    ``find_bin("claude") or "claude"`` (jacked/launch.py,
+    jacked/memory/capture.py) lets the OS search PATH for the bare name, so
+    ``_no_real_claude_spawn`` refuses the spawn itself.
+    """
+    import sys
+
+    import jacked.findbin as findbin
+
+    real = getattr(findbin.find_bin, "__wrapped__", findbin.find_bin)
+    if "real_claude_binary" in request.fixturenames:
+        resolver = real
+    else:
+        resolver = _find_bin_without_claude(real)
+    monkeypatch.setattr(findbin, "find_bin", resolver)
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("jacked.") or module is findbin:
+            continue
+        bound = getattr(module, "__dict__", {}).get("find_bin")
+        # The real resolver, or a wrapper that an earlier test's first import
+        # bound (monkeypatch cannot undo a binding it never made).
+        if bound is real or getattr(bound, "__wrapped__", None) is real:
+            monkeypatch.setattr(module, "find_bin", resolver)
+
+
+_CLAUDE_NAMES = frozenset({"claude", "claude.exe", "claude.cmd"})
+# Taken before any test runs: a test can replace shutil.which with a fake that
+# answers "/usr/bin/claude" for every name, and the tripwire must not read
+# that answer for `git`.
+_REAL_WHICH = shutil.which
+
+
+def _developer_claude_files() -> frozenset:
+    """The real files of the developer's Claude Code CLI (empty on CI).
+
+    ``~/.local/bin/claude`` is a link to a versioned file such as
+    ``~/.local/share/claude/versions/2.1.317``, and
+    jacked/credentials/runtime.py spawns that resolved file. Its name is not
+    "claude", so the tripwire also matches these exact files.
+    """
+    candidates = [_REAL_WHICH("claude")]
+    for folder in (REAL_HOME / ".local" / "bin", REAL_HOME / ".claude" / "local"):
+        candidates += [folder / name for name in ("claude", "claude.exe")]
+    return frozenset(
+        os.path.realpath(path) for path in candidates if path and os.path.isfile(path)
+    )
+
+
+_DEVELOPER_CLAUDE_FILES = _developer_claude_files()
+
+
+def _spawned_program(args) -> str:
+    """The program of a subprocess call: argv[0], or the first word of a command line.
+
+    A value that is not a path (a test double, for example) gives "", so
+    Popen itself reports it as before.
+    """
+    try:
+        if isinstance(args, (list, tuple)):
+            return os.fsdecode(args[0]) if args else ""
+        text = os.fsdecode(args).strip()
+    except TypeError:
+        return ""
+    if text.startswith('"') and '"' in text[1:]:
+        return text[1:text.index('"', 1)]
+    return text.split()[0] if text else ""
+
+
+def _spawns_claude(program: str) -> bool:
+    """True when ``program`` names or resolves to the Claude Code CLI."""
+    if not program:
+        return False
+    if Path(program).name.lower() in _CLAUDE_NAMES:
+        return True
+    resolved = _REAL_WHICH(program)
+    if not resolved:
+        return False
+    real = os.path.realpath(resolved)
+    return (
+        Path(resolved).name.lower() in _CLAUDE_NAMES
+        or Path(real).name.lower() in _CLAUDE_NAMES
+        or real in _DEVELOPER_CLAUDE_FILES
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_claude_spawn(request, monkeypatch):
+    """No test may spawn the Claude Code CLI: a spawn fails as a missing binary.
+
+    ``_no_real_claude_binary`` hides ``claude`` from the resolver, but
+    ``find_bin("claude") or "claude"`` (jacked/launch.py,
+    jacked/memory/capture.py) then spawns the bare name, and the OS searches
+    PATH for it. So subprocess.run and subprocess.Popen refuse a program that
+    is claude, claude.exe or claude.cmd by its name, by the path that
+    shutil.which resolves for it, or by that path's real file, and any spawn
+    of the developer's real CLI file. The refusal is FileNotFoundError, the
+    error that CI gets with no ``claude`` installed, so a test behaves as it
+    does on CI. Every other program runs as before. A test that spawns its
+    own ``claude`` stub requests ``real_claude_binary``.
+    """
+    if "real_claude_binary" in request.fixturenames:
+        return
+    spawn, run = subprocess.Popen, subprocess.run
+
+    def refuse(args, executable=None):
+        # `executable=` names the program that runs, whatever argv[0] says.
+        for program in (_spawned_program(args), _spawned_program([executable or ""])):
+            if _spawns_claude(program):
+                raise FileNotFoundError(
+                    errno.ENOENT, "the tests must not run the real claude binary", program
+                )
+
+    class _NoClaudePopen(spawn):
+        def __init__(self, args, *popen_args, **popen_kwargs):
+            refuse(args, popen_kwargs.get("executable"))
+            super().__init__(args, *popen_args, **popen_kwargs)
+
+    def _no_claude_run(args, *run_args, **run_kwargs):
+        refuse(args, run_kwargs.get("executable"))
+        return run(args, *run_args, **run_kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _NoClaudePopen)
+    monkeypatch.setattr(subprocess, "run", _no_claude_run)
 
 
 @pytest.fixture(autouse=True)

@@ -44,7 +44,7 @@ class TestRunClaudePlugin:
         monkeypatch.setattr("jacked.findbin.find_bin", lambda _name: None)
         assert _run_claude_plugin("list") is None
 
-    def test_invokes_claude_plugin_with_closed_stdin(self, monkeypatch):
+    def test_invokes_claude_plugin_with_closed_stdin(self, monkeypatch, real_claude_binary):
         monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/claude")
         captured = {}
 
@@ -76,7 +76,7 @@ class TestInstallRequiredPlugins:
         _install_required_plugins()
         assert calls == []  # never shells out without claude
 
-    def test_installs_every_missing_plugin(self, monkeypatch):
+    def test_installs_every_missing_plugin(self, monkeypatch, real_claude_binary):
         monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/claude")
         monkeypatch.setattr("jacked.cli._installed_plugins", set)  # none configured
         installed_ids = []
@@ -92,7 +92,7 @@ class TestInstallRequiredPlugins:
         assert set(installed_ids) == set(_REQUIRED_PLUGINS)
         assert "code-review@claude-plugins-official" in installed_ids
 
-    def test_skips_already_configured(self, monkeypatch):
+    def test_skips_already_configured(self, monkeypatch, real_claude_binary):
         monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/claude")
         monkeypatch.setattr("jacked.cli._installed_plugins", lambda: set(_REQUIRED_PLUGINS))
         calls = []
@@ -100,7 +100,7 @@ class TestInstallRequiredPlugins:
         _install_required_plugins(force=False)
         assert calls == []  # all present -> nothing installed
 
-    def test_force_reinstalls_even_if_configured(self, monkeypatch):
+    def test_force_reinstalls_even_if_configured(self, monkeypatch, real_claude_binary):
         monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/claude")
         monkeypatch.setattr("jacked.cli._installed_plugins", lambda: set(_REQUIRED_PLUGINS))
         calls = []
@@ -111,7 +111,7 @@ class TestInstallRequiredPlugins:
         _install_required_plugins(force=True)
         assert len(calls) == len(_REQUIRED_PLUGINS)
 
-    def test_install_failure_is_non_fatal(self, monkeypatch):
+    def test_install_failure_is_non_fatal(self, monkeypatch, real_claude_binary):
         monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/claude")
         monkeypatch.setattr("jacked.cli._installed_plugins", set)
         monkeypatch.setattr(
@@ -121,7 +121,7 @@ class TestInstallRequiredPlugins:
         # Must not raise even when every install fails.
         _install_required_plugins()
 
-    def test_none_result_is_non_fatal(self, monkeypatch):
+    def test_none_result_is_non_fatal(self, monkeypatch, real_claude_binary):
         monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/claude")
         monkeypatch.setattr("jacked.cli._installed_plugins", set)
         monkeypatch.setattr("jacked.cli._run_claude_plugin", lambda *a, **k: None)

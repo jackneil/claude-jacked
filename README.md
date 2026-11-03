@@ -264,7 +264,9 @@ jacked install --force                  # wires up hooks AND starts the tray (au
 
 - **A plain uv install gets the Xorg tray.** jacked shows its tray icon through pystray. pystray uses the AppIndicator or GTK tray only when PyGObject loads in the jacked tool environment (the Python environment that `uv tool install` makes for jacked). `uv tool install claude-jacked` does not install PyGObject, so pystray uses the Xorg tray. pystray selects the tray when the service starts.
 - **The Xorg tray has no menu.** A left click on the icon opens the dashboard. For the other actions, use `jacked service restart` and `jacked service stop`. When the service starts on this tray, it writes a warning to `~/.claude/jacked-tray.log`, and `jacked service status` shows `Tray menu: unavailable`.
-- **The full menu needs PyGObject.** PyGObject has no prebuilt package (wheel) on PyPI, so you must build it on your computer. The pystray FAQ, [How do I use pystray in a virtualenv on Linux?](https://pystray.readthedocs.io/en/latest/faq.html#how-do-i-use-pystray-in-a-virtualenv-on-linux), describes the build. `jacked upgrade` reinstalls the jacked tool environment. The reinstall removes a PyGObject that you added with `--with`.
+- **The full menu needs PyGObject and system libraries.** First, install the GTK 3 libraries and one AppIndicator typelib (`AppIndicator3` or `AyatanaAppIndicator3`) from the packages of your distribution. Then add PyGObject to the jacked tool environment. Then restart the service with `jacked service restart`. PyGObject has no prebuilt package (wheel) on PyPI, so you must build it on your computer. The pystray FAQ, [How do I use pystray in a virtualenv on Linux?](https://pystray.readthedocs.io/en/latest/faq.html#how-do-i-use-pystray-in-a-virtualenv-on-linux), describes the build. `jacked upgrade` reinstalls the jacked tool environment. The reinstall removes a PyGObject that you added with `--with`.
+- **Without an AppIndicator typelib, the service does not start.** When PyGObject loads, pystray tries the AppIndicator tray first. If neither AppIndicator typelib is installed, or the GTK 3 libraries are missing, pystray stops with an error. pystray does not use the GTK tray or the Xorg tray then, so the jacked service does not start at all. The service writes the error to `~/.claude/jacked-tray.log`, for example `ValueError: Namespace AyatanaAppIndicator3 not available`.
+- **With no display, the service does not start.** pystray opens the display when it loads. On a computer with no display, `jacked service start` stops with an error. Use `jacked webux --no-browser` there instead.
 
 ### Service behavior
 
@@ -392,7 +394,7 @@ jacked install
 ```
 
 Notes:
-- Requires a system tray provider (most desktop environments ship one - GNOME may need the AppIndicator extension; KDE/Cinnamon/XFCE work out of the box). On a headless box, run `jacked service start`, then use `jacked service status` for the actual dashboard URL and `~/.claude/jacked-service.log` for logs.
+- Requires a system tray provider (most desktop environments ship one - GNOME may need the AppIndicator extension; KDE/Cinnamon/XFCE work out of the box). The tray service also needs a display. On a headless box (no display), `jacked install` does not start the tray, and `jacked service start` stops with an error. Run the dashboard in the foreground with `jacked webux --no-browser` instead. It prints the dashboard URL when it starts. See [Linux tray notes](#linux-tray-notes).
 - `jacked service install` reconciles and enables a per-user systemd unit. It never needs a root system service.
 
 ---
