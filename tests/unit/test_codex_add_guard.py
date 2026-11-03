@@ -105,6 +105,7 @@ def test_a_failed_login_restores_the_store(db, tmp_path, config):
 
 def test_an_interrupted_login_restores_the_store_too(db, tmp_path):
     home = _home(tmp_path, auth=None, config=KEYRING)
+    before = _config_bytes(home)  # as written (text mode: CRLF on Windows)
 
     def login(_home, _env):
         raise KeyboardInterrupt
@@ -112,7 +113,7 @@ def test_an_interrupted_login_restores_the_store_too(db, tmp_path):
     with pytest.raises(KeyboardInterrupt):
         add_codex_account(db, home=home, run_login=True, login_runner=login)
 
-    assert _config_bytes(home) == KEYRING.encode()
+    assert _config_bytes(home) == before
 
 
 def test_a_present_file_credential_is_imported_without_a_login(db, tmp_path, monkeypatch):
