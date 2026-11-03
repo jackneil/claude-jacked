@@ -5,14 +5,12 @@ Find the most-recently-active prior session for a working directory from the
 raw on-disk transcripts under ~/.claude/projects, and reconstruct a budgeted
 working-state digest so a fresh session can pick up where a crashed one died.
 
-Self-contained by design: imports only jacked.transcript, jacked.jsonl_lines
-and stdlib so /recover works on a bare install (the moment right after a
+Self-contained by design: imports only jacked.transcript, jacked.jsonl_lines,
+jacked.project_dirs, jacked.project_slug and stdlib so /recover works on a bare install (the moment right after a
 crash). Never import jacked.retriever / jacked.searcher here.
 """
 from __future__ import annotations
 
-import json
-import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,9 +18,14 @@ from pathlib import Path
 from typing import Optional
 
 from jacked import transcript as _t
-from jacked.jsonl_lines import iter_lines as _iter_lines, iter_records as _iter_records
+from jacked.jsonl_lines import (
+    iter_lines as _iter_lines,
+    iter_records as _iter_records,
+    parse_line as _parse_line,
+)
+from jacked.project_dirs import resolve_project_dir  # noqa: F401  (the /recover entry point)
+from jacked.project_slug import encode as _slug_encode
 
-DEFAULT_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 DEFAULT_BUDGET_CHARS = 12000
 _RECENT_USER_ASKS = 3
 _MAX_TOOL_ACTIONS = 12
@@ -52,25 +55,17 @@ _CA_RE = re.compile(r"<command-args>(.*?)</command-args>", re.IGNORECASE | re.DO
 _RAW_CMD_RE = re.compile(r"^/(goal|loop)\b", re.IGNORECASE)
 
 
-def _norm_path(p: str) -> str:
-    return str(p).replace("\\", "/").rstrip("/").lower()
-
-
 def _encode_cwd(cwd: str) -> str:
-    """Encode a cwd the way current Claude Code names its projects dir:
-    every non-alphanumeric character (separators, dots, spaces, '@', ':')
-    becomes '-', so the leading separator becomes a leading dash.
+    """Encode a cwd the way Claude Code does, with no length limit.
 
-    Claude Code replaces each UTF-16 unit of the JavaScript string, so a
-    character outside the BMP (an emoji is two units) gives two hyphens.
+    Every UTF-16 unit that is not an ASCII letter or digit becomes '-'
+    (``jacked.project_slug.encode``). A long result can be longer than a file
+    name can be, so a folder on disk uses ``project_dir_name``.
 
     >>> _encode_cwd("/tmp/\U0001F600 x")
     '-tmp----x'
     """
-    return "".join(
-        c if c.isascii() and c.isalnum() else "--" if ord(c) > 0xFFFF else "-"
-        for c in str(cwd)
-    )
+    return _slug_encode(str(cwd))
 
 
 def _parse_ts(value) -> Optional[datetime]:
@@ -80,64 +75,6 @@ def _parse_ts(value) -> Optional[datetime]:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-def _read_cwd(path: Path, max_records: Optional[int] = None) -> Optional[str]:
-    """Return the first top-level 'cwd' field in a transcript that is a non-empty
-    string, reading at most ``max_records`` records when it is given."""
-    for i, rec_obj in enumerate(_iter_records(path)):
-        if max_records is not None and i >= max_records:
-            break
-        cwd = rec_obj.get("cwd") if isinstance(rec_obj, dict) else None
-        if isinstance(cwd, str) and cwd:
-            return cwd
-    return None
-
-
-def _newest_jsonls(d: Path, n: int = 3) -> list[Path]:
-    files = [f for f in d.glob("*.jsonl") if f.is_file()]
-    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-    return files[:n]
-
-
-def _dir_matches_cwd(d: Path, norm_target: str) -> bool:
-    for f in _newest_jsonls(d):
-        cwd = _read_cwd(f)
-        if cwd and _norm_path(cwd) == norm_target:
-            return True
-    return False
-
-
-def resolve_project_dir(cwd, projects_root=None) -> Optional[Path]:
-    """Map a working directory to its ~/.claude/projects/<slug> dir.
-
-    Never trusts the slug alone (the stored encoding is lossy): verifies the
-    fast-path slug by reading a transcript's recorded cwd, else enumerates all
-    project dirs and matches on the cwd field.
-    """
-    if projects_root is None:
-        env = os.getenv("CLAUDE_PROJECTS_DIR")
-        projects_root = Path(env) if env else DEFAULT_PROJECTS_ROOT
-    root = Path(projects_root)
-    if not root.exists():
-        return None
-    norm = _norm_path(str(cwd))
-    fast = root / _encode_cwd(str(cwd))
-    if fast.is_dir() and _dir_matches_cwd(fast, norm):
-        return fast
-    # Several dirs can hold transcripts recorded with this cwd (an older
-    # encoding, or a session launched elsewhere that later reported it).
-    # Prefer the one with the most recently written transcript, never the
-    # alphabetically first.
-    matches = [d for d in root.iterdir() if d.is_dir() and _dir_matches_cwd(d, norm)]
-    if not matches:
-        return None
-    return max(matches, key=_newest_mtime)
-
-
-def _newest_mtime(d: Path) -> float:
-    newest = _newest_jsonls(d, n=1)
-    return newest[0].stat().st_mtime if newest else 0.0
 
 
 @dataclass
@@ -193,14 +130,11 @@ def _scan_candidate(path: Path) -> SessionCandidate:
     last_line_ok = True
     try:
         with open(path, "rb") as f:
-            for stripped in _iter_lines(f):
+            for number, stripped in enumerate(_iter_lines(f), 1):
                 if stripped == "":
                     continue
-                try:
-                    rec_obj = json.loads(stripped or "")  # None: an unreadable line
-                    last_line_ok = True
-                except json.JSONDecodeError:
-                    last_line_ok = False
+                last_line_ok, rec_obj = _parse_line(stripped, number)
+                if not last_line_ok:
                     continue
                 if not isinstance(rec_obj, dict):
                     continue

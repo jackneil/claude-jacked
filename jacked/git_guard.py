@@ -16,6 +16,10 @@ Two parts close those paths:
   that turns each driver off. A list of known driver names cannot do this,
   because the repository picks the names.
 
+``run_git`` runs each of these reads. It gives the output to a consumer in
+chunks, so a huge commit message or a huge config never sits in memory
+whole, and the whole call ends within its timeout.
+
 Calls into the jacked memory vault do not use this module: the vault is a
 repository that jacked owns, and its sync needs remote access, which
 ``protocol.allow=never`` closes.
@@ -25,7 +29,10 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
+import time
 from collections.abc import Mapping
+from typing import Protocol
 
 from jacked.winproc import NO_WINDOW
 
@@ -42,8 +49,13 @@ GIT_CONFIG_OVERRIDE_ARGS = (
     "-c", "protocol.allow=never",
 )
 
-#: The ``git config`` arguments that list the filter driver keys.
-FILTER_CONFIG_ARGS = ("config", "-z", "--get-regexp", r"^filter\.")
+#: The ``git config`` arguments that list every config key, filter drivers
+#: included. ``--get-regexp '^filter\\.'`` is not used: git matches it with the
+#: C library regex under the process locale, and under a UTF-8 locale a key
+#: whose subsection holds a byte that is not valid UTF-8 never matches, so
+#: that driver stays enabled while the exit code is 0. ``--list`` emits every
+#: key byte for byte; ``filter_drivers`` does the prefix test itself.
+FILTER_CONFIG_ARGS = ("config", "-z", "--list")
 
 # The keys that make a filter driver run a program, and the value that turns
 # each one off. An empty command runs nothing, and a driver that is not
@@ -51,12 +63,115 @@ FILTER_CONFIG_ARGS = ("config", "-z", "--get-regexp", r"^filter\.")
 _FILTER_OFF = (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))
 
 
+#: The most bytes of git output that ``Capture`` keeps. The reads that use it
+#: print a few lines (rev-parse, branch, config, a file list), so a larger
+#: output is not a real answer: the reader stops, git is ended and the caller
+#: sees ``truncated``. The log and the status of git reality read with their
+#: own consumers, which keep less per record or only counts, so they never
+#: need the whole output in memory.
+OUTPUT_LIMIT = 1024 * 1024
+_READ_CHUNK = 64 * 1024
+# After git is ended, how long the reader thread can take to see the end of
+# the pipe before it is left behind (a daemon thread).
+_REAP_S = 1.0
+
+
 class GitGuardError(ValueError):
     """The environment cannot carry the filter overrides."""
 
 
+class Consumer(Protocol):
+    """Takes the stdout of a git call as it comes, in chunks."""
+
+    def feed(self, chunk: bytes) -> bool:
+        """Take the next chunk. Return False to stop the read and end git."""
+
+    def close(self) -> None:
+        """The output ended (EOF). It is not called after ``feed`` returned False."""
+
+
+class Capture:
+    """Keep the first ``limit`` bytes (default ``OUTPUT_LIMIT``) of an output.
+
+    >>> c = Capture(4); c.feed(b"abc"), c.feed(b"def"), bytes(c.data), c.truncated
+    (True, False, b'abcd', True)
+    """
+
+    def __init__(self, limit: int | None = None) -> None:
+        self.limit = OUTPUT_LIMIT if limit is None else limit
+        self.data = bytearray()
+        self.truncated = False
+
+    def feed(self, chunk: bytes) -> bool:
+        room = self.limit - len(self.data)
+        if len(chunk) > room:
+            self.data += chunk[:room]
+            self.truncated = True
+            return False
+        self.data += chunk
+        return True
+
+    def close(self) -> None:
+        return None
+
+
+def run_git(
+    argv: list[str], *, name: str, env: Mapping[str, str], timeout: float,
+    consumer: Consumer, cwd: str | None = None,
+) -> int:
+    """Run git and give its stdout to ``consumer`` in chunks. Return the exit code.
+
+    The output is never held whole: ``consumer`` keeps what it needs. When
+    ``consumer.feed`` returns False, the read stops and git is ended; the
+    exit code is then the code of the ended process, and the consumer says
+    why it stopped. stderr goes to ``os.devnull``, because no caller reads
+    it. The whole call ends within ``timeout`` seconds: a slow git is ended
+    and ``subprocess.TimeoutExpired`` is raised. ``name`` is the fixed
+    subcommand name for the DEBUG log, which never holds the argv, a path
+    or the output. An ``OSError`` from the start of git goes up.
+    """
+    deadline = time.monotonic() + timeout
+    proc = subprocess.Popen(
+        argv, cwd=cwd, env=dict(env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, creationflags=NO_WINDOW,
+    )
+    state: dict = {"stopped": False, "read": 0, "error": None}
+
+    def pump() -> None:
+        try:
+            while chunk := proc.stdout.read1(_READ_CHUNK):
+                state["read"] += len(chunk)
+                if not consumer.feed(chunk):
+                    state["stopped"] = True
+                    return
+            consumer.close()
+        except Exception as exc:  # noqa: BLE001 -- raised again in the caller thread
+            state["error"] = exc
+
+    reader = threading.Thread(target=pump, name=f"git-{name}-output", daemon=True)
+    reader.start()
+    try:
+        reader.join(max(0.0, deadline - time.monotonic()))
+        if reader.is_alive():
+            raise subprocess.TimeoutExpired("git", timeout)
+        if state["error"] is not None:
+            raise state["error"]
+        if state["stopped"]:
+            logger.debug("git guard: stopped the output of git %s after %d bytes",
+                         name, state["read"])
+            proc.kill()
+        return proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        reader.join(_REAP_S)
+        if not reader.is_alive():
+            proc.stdout.close()
+
+
 def filter_drivers(config: str) -> list[str]:
-    """Return the driver names in ``git config -z --get-regexp ^filter\\.`` output.
+    """Return the driver names in ``git config -z --list`` output.
 
     Each entry is "<key>LF<value>" and ends with NUL. The driver name is the
     part between "filter." and the last dot, so it can hold "=" and ".".
@@ -73,6 +188,28 @@ def filter_drivers(config: str) -> list[str]:
         if name and name not in drivers:
             drivers.append(name)
     return drivers
+
+
+def config_text(raw: bytes) -> str | None:
+    """Return the ``git config`` output ``raw`` as text that gives back the same bytes.
+
+    ``subprocess`` encodes each environment key and value with
+    ``os.fsencode``, so the text comes from ``os.fsdecode`` (on POSIX: UTF-8
+    with ``surrogateescape``). A driver name that is not UTF-8 then reaches
+    git byte for byte. Return None when the text does not give back ``raw``
+    (on Windows a name that is not UTF-8 cannot pass), so the caller fails
+    closed. A lossy decode would make an override for a different name, and
+    git would run the real driver.
+
+    >>> config_text(b"filter.a.clean\\n/x\\0")
+    'filter.a.clean\\n/x\\x00'
+    """
+    try:
+        text = os.fsdecode(raw)
+        same = os.fsencode(text) == raw
+    except (UnicodeError, ValueError):
+        return None
+    return text if same else None
 
 
 def filter_overrides(env: Mapping[str, str], drivers: list[str]) -> dict[str, str]:
@@ -113,17 +250,18 @@ def guarded_git_env(
     ``GIT_OPTIONAL_LOCKS=0`` and the overrides for every filter driver of the
     config. The driver list comes from one ``git config`` call, with the
     ``-c`` overrides and without the filter environment. None means that the
-    drivers cannot be read (git failed, timed out or cannot start). Then the
+    drivers cannot be read (git failed, timed out, cannot start, or printed
+    more than ``OUTPUT_LIMIT`` bytes, so the list can be incomplete). Then the
     caller must not run a read that can use a filter. This function never
     raises; the reason goes to the DEBUG log.
     """
     env = dict(os.environ if base_env is None else base_env)
     env["GIT_OPTIONAL_LOCKS"] = "0"
+    out = Capture()
     try:
-        proc = subprocess.run(
+        code = run_git(
             [git, "-C", cwd, *GIT_CONFIG_OVERRIDE_ARGS, *FILTER_CONFIG_ARGS],
-            env=env, stdin=subprocess.DEVNULL, capture_output=True,
-            timeout=timeout, creationflags=NO_WINDOW, check=False,
+            name="config", env=env, timeout=timeout, consumer=out,
         )
     except subprocess.TimeoutExpired as exc:
         logger.debug("git guard: git config timed out (%s)", type(exc).__name__)
@@ -131,10 +269,17 @@ def guarded_git_env(
     except OSError as exc:
         logger.debug("git guard: git config did not run (%s)", type(exc).__name__)
         return None
-    if proc.returncode not in (0, 1):  # 1: no filter key in the config
-        logger.debug("git guard: git config exited %d", proc.returncode)
+    if out.truncated:
+        logger.debug("git guard: git config printed more than %d bytes", OUTPUT_LIMIT)
         return None
-    drivers = filter_drivers(proc.stdout.decode("utf-8", errors="replace"))
+    if code not in (0, 1):  # 1: no filter key in the config
+        logger.debug("git guard: git config exited %d", code)
+        return None
+    config = config_text(bytes(out.data))
+    if config is None:
+        logger.debug("git guard: a filter key cannot pass through the environment")
+        return None
+    drivers = filter_drivers(config)
     try:
         env.update(filter_overrides(env, drivers))
     except GitGuardError as exc:

@@ -2,7 +2,8 @@
 
 Standard library only, so ``jacked.recover`` stays usable on a bare install.
 A line over ``LINE_LIMIT`` bytes is read in small pieces and skipped, so a
-reader never holds it whole. A line that is not UTF-8 is skipped too.
+reader never holds it whole. A line that is not UTF-8, or that is nested
+too deep for the parser, is skipped too.
 """
 from __future__ import annotations
 
@@ -26,8 +27,10 @@ def iter_lines(f):
     The line is read in pieces of ``_SKIP_CHUNK`` bytes. A line over
     ``LINE_LIMIT`` bytes (the newline not counted), or a line that is not
     UTF-8, yields None: the caller skips it, and the read goes on at the next
-    line. The pieces of a long line are dropped as they are read.
+    line. The pieces of a long line are dropped as they are read. Each skip
+    goes to the DEBUG log with the line number, never with the content.
     """
+    number = 0
     while True:
         buf: bytearray | None = bytearray()
         size = 0
@@ -43,31 +46,56 @@ def iter_lines(f):
                 break
         if not size:
             return
+        number += 1
         if buf is None:
             logger.debug(
-                "jsonl: skipped a line of %d bytes (the limit is %d)", size, LINE_LIMIT
+                "jsonl: skipped line %d of %d bytes (the limit is %d)", number, size, LINE_LIMIT
             )
             yield None
             continue
         try:
-            yield buf.decode("utf-8").strip()
-        except UnicodeDecodeError:
-            yield None
+            text = buf.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            logger.debug("jsonl: skipped line %d (%s)", number, type(exc).__name__)
+            text = None
+        yield text
+
+
+def parse_line(line: str | None, number: int) -> tuple[bool, object]:
+    """Return ``(True, value)`` for a JSON line, else ``(False, None)``.
+
+    ``line`` comes from ``iter_lines`` (None is a line it skipped), and
+    ``number`` is its line number. A line that the parser cannot take
+    because it is nested too deep (``RecursionError``) is malformed too: the
+    read goes on at the next line, and the skip goes to the DEBUG log.
+
+    >>> parse_line('{"a": 1}', 1), parse_line("{", 2), parse_line("[" * 100_000, 3)
+    ((True, {'a': 1}), (False, None), (False, None))
+    """
+    if line is None:
+        return False, None
+    try:
+        return True, json.loads(line)
+    except json.JSONDecodeError:
+        return False, None
+    except RecursionError:
+        logger.debug("jsonl: skipped line %d, nested too deep to parse", number)
+        return False, None
 
 
 def iter_records(path: Path):
     """Yield parsed JSON objects from a JSONL file, skipping blank/garbled
     lines. Tolerates a crash-truncated final line (it is simply skipped).
-    A line over ``LINE_LIMIT`` bytes or not in UTF-8 is skipped too."""
+    A line over ``LINE_LIMIT`` bytes, not in UTF-8 or nested too deep to
+    parse is skipped too."""
     try:
         with open(path, "rb") as f:
-            for line in iter_lines(f):
-                if not line:
+            for number, line in enumerate(iter_lines(f), 1):
+                if line == "":
                     continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                ok, data = parse_line(line, number)
+                if ok:
+                    yield data
     except (IOError, OSError):
         return
 
@@ -76,14 +104,12 @@ def iter_objects(f):
     """Yield ``(line number, object)`` for each non-blank line of the binary file ``f``.
 
     ``object`` is the parsed JSON object (a dict), or None for a line that is
-    too long, not UTF-8, not JSON, or JSON that is not an object. A blank line
-    yields nothing, but it counts in the line numbers.
+    too long, not UTF-8, not JSON, nested too deep to parse, or JSON that is
+    not an object. A blank line yields nothing, but it counts in the line
+    numbers.
     """
     for number, line in enumerate(iter_lines(f), 1):
         if line == "":
             continue
-        try:
-            data = json.loads(line) if line is not None else None
-        except json.JSONDecodeError:
-            data = None
+        data = parse_line(line, number)[1]
         yield number, data if isinstance(data, dict) else None

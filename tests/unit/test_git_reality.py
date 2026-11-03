@@ -20,7 +20,6 @@ import pytest
 from jacked import git_guard
 from jacked.data.hooks import git_reality
 from jacked.memory.recall import estimate_tokens
-from jacked.winproc import NO_WINDOW
 from tests._platform import shebang_exec_supported, write_python_shim
 
 pytestmark = pytest.mark.skipif(
@@ -98,14 +97,14 @@ def _marker(n: int) -> str:
 
 def _spy_on_git(monkeypatch) -> list[str]:
     """Record the git subcommand of each call the block makes."""
-    real_run = subprocess.run
+    real_run = git_guard.run_git
     calls: list[str] = []
 
     def _spy(argv, **kwargs):
         calls.append(_subcommand(argv))
         return real_run(argv, **kwargs)
 
-    monkeypatch.setattr(git_reality.subprocess, "run", _spy)
+    monkeypatch.setattr(git_guard, "run_git", _spy)
     return calls
 
 
@@ -442,14 +441,14 @@ class TestUntrustedText:
         body = ("long body line\n" * 2_000_000)[:30_000_000]
         sha = _commit(repo, f"huge\n\n{body}")
 
-        start = time.monotonic()
+        start = time.process_time()  # CPU time here: load-proof, git runs in its own process
         block = _emit(repo)
-        elapsed = time.monotonic() - start
+        elapsed = time.process_time() - start
 
         lines = block.split("\n")
         assert f"  {sha} huge" in lines
         assert len(lines) == 40 and TRIM_RE.match(lines[-1])
-        assert elapsed < 0.5, f"{elapsed:.2f}s"
+        assert elapsed < 1.0, f"{elapsed:.2f}s of CPU time"
 
         full = _emit(repo, **NO_CAPS).split("\n")
         limit = git_reality.RECORD_LIMIT
@@ -578,7 +577,7 @@ class TestFailures:
         def _timeout(argv, **kwargs):
             raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
 
-        monkeypatch.setattr(git_reality.subprocess, "run", _timeout)
+        monkeypatch.setattr(git_guard, "run_git", _timeout)
         caplog.set_level(logging.DEBUG, logger=LOGGER)
 
         assert _emit(repo) == ""
@@ -588,14 +587,14 @@ class TestFailures:
     def test_a_timeout_logs_the_subcommand_and_never_the_argv(self, root, monkeypatch, caplog, slow):
         repo = _repo(root)
         _commit(repo, "one\n")
-        real_run = subprocess.run
+        real_run = git_guard.run_git
 
         def _run(argv, **kwargs):
             if _subcommand(argv) == slow:
                 raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"), b"out", b"err")
             return real_run(argv, **kwargs)
 
-        monkeypatch.setattr(git_reality.subprocess, "run", _run)
+        monkeypatch.setattr(git_guard, "run_git", _run)
         caplog.set_level(logging.DEBUG, logger=LOGGER)
         caplog.set_level(logging.DEBUG, logger="jacked.git_guard")  # it runs git config
 
@@ -608,14 +607,14 @@ class TestFailures:
     def test_a_failing_git_call_prints_nothing(self, root, monkeypatch, caplog, failing):
         repo = _repo(root)
         _commit(repo, "one\n")
-        real_run = subprocess.run
+        real_run = git_guard.run_git
 
         def _run(argv, **kwargs):
             if _subcommand(argv) == failing:
-                return subprocess.CompletedProcess(argv, 128, b"", b"fatal: boom")
+                return 128
             return real_run(argv, **kwargs)
 
-        monkeypatch.setattr(git_reality.subprocess, "run", _run)
+        monkeypatch.setattr(git_guard, "run_git", _run)
         caplog.set_level(logging.DEBUG, logger=LOGGER)
 
         assert _emit(repo) == ""
@@ -628,7 +627,7 @@ class TestFailures:
         def _oserror(argv, **kwargs):
             raise PermissionError(13, "denied")
 
-        monkeypatch.setattr(git_reality.subprocess, "run", _oserror)
+        monkeypatch.setattr(git_guard, "run_git", _oserror)
         caplog.set_level(logging.DEBUG, logger=LOGGER)
 
         assert _emit(repo) == ""
@@ -637,14 +636,17 @@ class TestFailures:
     def test_undecodable_bytes_are_replaced_not_raised(self, root, monkeypatch):
         repo = _repo(root)
         _commit(repo, "one\n")
-        real_run = subprocess.run
+        real_run = git_guard.run_git
 
         def _run(argv, **kwargs):
             if _subcommand(argv) == "log":
-                return subprocess.CompletedProcess(argv, 0, b"abc1234\x1fbad \xff\xfe bytes\x1f\x00", b"")
+                consumer = kwargs["consumer"]
+                consumer.feed(b"abc1234\x1fbad \xff\xfe bytes\x1f\x00")
+                consumer.close()
+                return 0
             return real_run(argv, **kwargs)
 
-        monkeypatch.setattr(git_reality.subprocess, "run", _run)
+        monkeypatch.setattr(git_guard, "run_git", _run)
 
         assert "  abc1234 bad �� bytes" in _emit(repo).split("\n")
 
@@ -692,14 +694,14 @@ class TestGitCalls:
     def test_each_call_is_bounded_and_takes_no_optional_locks(self, root, monkeypatch):
         repo = _repo(root)
         _commit(repo, "one\n")
-        real_run = subprocess.run
+        real_run = git_guard.run_git
         calls: list[tuple[list[str], dict]] = []
 
         def _spy(argv, **kwargs):
             calls.append((list(argv), kwargs))
             return real_run(argv, **kwargs)
 
-        monkeypatch.setattr(git_reality.subprocess, "run", _spy)
+        monkeypatch.setattr(git_guard, "run_git", _spy)
         assert _emit(repo)
 
         assert [_subcommand(argv) for argv, _ in calls] == [
@@ -709,8 +711,8 @@ class TestGitCalls:
             assert argv[1:3] == ["-C", str(repo)]
             assert kwargs["timeout"] == git_reality.GIT_TIMEOUT_S == 3
             assert kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
-            assert kwargs["stdin"] is subprocess.DEVNULL
-            assert kwargs["creationflags"] == NO_WINDOW
+            assert kwargs["name"] == _subcommand(argv)
+        # stdin, stderr and the console flag: test_git_guard.py tests run_git itself.
         log_argv = calls[2][0]
         assert "--no-show-signature" in log_argv
         assert log_argv[-2:] == ["HEAD", "--"]
@@ -796,6 +798,36 @@ class TestGitCalls:
     @pytest.mark.skipif(
         not shebang_exec_supported(), reason="the fake clean filter is a shebang script"
     )
+    @pytest.mark.skipif(os.name != "posix", reason="a driver name that is not UTF-8 needs byte argv")
+    def test_a_driver_name_that_is_not_utf8_cannot_make_the_counts_run_a_filter(self, root, monkeypatch):
+        """A driver name with the byte 0xFF must reach the override byte for
+        byte. A lossy decode turns it into a different name, and git then runs
+        the real driver. The name starts with the byte and the locale is pinned
+        to UTF-8: under it, a regex enumeration never lists the key at all
+        (the hook's real environment)."""
+        monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
+        monkeypatch.setenv("LANG", "en_US.UTF-8")
+        repo = _repo(root)
+        _write(repo, "tracked.txt", "same content\n")
+        _git(repo, "add", "tracked.txt")
+        _commit(repo, "base\n")
+        marker = root / "nonutf8-ran.txt"
+        shim = os.fsencode(str(_clean_shim(root, marker)))
+        for field, value in ((b"clean", shim), (b"required", b"true")):
+            subprocess.run([b"git", b"-C", os.fsencode(str(repo)), b"config",
+                            b"filter.\xffvil." + field, value], check=True)
+        (repo / ".git" / "info" / "attributes").write_bytes(b"* filter=\xffvil\n")
+        _make_stat_dirty(repo / "tracked.txt")
+        _assert_plain_status_runs(repo, marker)
+
+        block = git_reality.emit_git_reality(str(repo))
+
+        assert "working tree: 0 modified, 0 staged, 0 deleted, 0 untracked" in block
+        assert not marker.exists(), "the hook ran the repository's filter"
+
+    @pytest.mark.skipif(
+        not shebang_exec_supported(), reason="the fake clean filter is a shebang script"
+    )
     def test_a_submodule_config_cannot_make_the_counts_run_a_clean_filter(self, root):
         """``git status`` runs ``git status`` inside each submodule, and the
         submodule has its own config. The hook does not look inside one."""
@@ -829,13 +861,13 @@ class TestGitCalls:
         repo = _repo(root)
         _commit(repo, "base\n")
         seen = []
-        real_run = subprocess.run
+        real_run = git_guard.run_git
 
         def record(argv, *a, **k):
             seen.append(list(argv))
             return real_run(argv, *a, **k)
 
-        monkeypatch.setattr(git_reality.subprocess, "run", record)
+        monkeypatch.setattr(git_guard, "run_git", record)
         git_reality.emit_git_reality(str(repo))
         assert seen, "no git call recorded"
         for argv in seen:
@@ -932,3 +964,63 @@ class TestGitCalls:
 
         assert (index.read_bytes(), os.stat(index).st_mtime_ns) == before
         assert not (repo / ".git" / "index.lock").exists()
+
+
+# --------------------------------------------------------------------------- #
+# W9: the log and the status are read in fixed memory, with exact results
+# --------------------------------------------------------------------------- #
+
+class TestBoundedReaders:
+    STATUS = b"R  new.txt\0MD-old.txt\0 M a.txt\0?? b.txt\0UU c.txt\0 D d.txt\0C  e\0f\0"
+
+    @pytest.mark.parametrize("size", [1, 2, 3, 5, 7, 4096])
+    def test_the_status_counts_do_not_change_with_the_chunk_size(self, size):
+        from jacked.git_reality_read import StatusCounter
+
+        counter = StatusCounter()
+        for i in range(0, len(self.STATUS), size):
+            assert counter.feed(self.STATUS[i:i + size])
+        counter.close()
+        assert counter.counts == {
+            "modified": 1, "staged": 2, "deleted": 1, "untracked": 1, "conflicted": 1,
+        }
+
+    def test_a_status_entry_that_is_not_xy_path_stops_the_read(self, root):
+        from jacked.git_reality_read import StatusCounter
+
+        counter = StatusCounter()
+        assert counter.feed(b" M a.txt\0bad\0 M never-read\0") is False
+        assert counter.error and counter.counts["modified"] == 1
+
+    @pytest.mark.parametrize("keep", [15, 16])
+    @pytest.mark.parametrize("size", [1, 3, 4096])
+    def test_the_clipped_count_is_exact_for_any_cut(self, monkeypatch, keep, size):
+        """15 kept bytes cut an "é" in two; 16 do not. The count is the same."""
+        from jacked import git_reality_read as read
+
+        monkeypatch.setattr(read, "RECORD_LIMIT", 4)
+        monkeypatch.setattr(read, "_FIELD_KEEP", keep)
+        body = "é" * 20 + "x"
+        data = f"abc1234\x1fsubject\x1f{body}\0".encode()
+        reader = read.LogReader()
+        for i in range(0, len(data), size):
+            assert reader.feed(data[i:i + size])
+        reader.close()
+        lines = read.commit_lines(reader.records)
+        assert lines == ["  abc1234 subj", "    éééé",
+                         f"    [clipped: {len(body) - 4} more characters]"]
+
+    def test_a_huge_commit_body_is_read_in_fixed_memory(self, root):
+        import tracemalloc
+
+        repo = _repo(root)
+        body = ("long body line\n" * 2_000_000)[:30_000_000]
+        _commit(repo, f"huge\n\n{body}")
+        tracemalloc.start()
+        try:
+            block = _emit(repo)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert "huge" in block
+        assert peak < 16 * 1024 * 1024, f"peak {peak >> 20} MiB"

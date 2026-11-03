@@ -16,7 +16,8 @@ reads the real state of the repository before its first turn::
     ```
 
 The git calls, in order. Each call has a timeout of 3 seconds
-(``GIT_TIMEOUT_S``), so the worst case is 15 seconds:
+(``GIT_TIMEOUT_S``) plus one second to reap its reader, so the worst case
+is 20 seconds:
 
   1. ``git rev-parse --is-inside-work-tree``. Any answer but "true" (a plain
      folder, a ``.git`` folder, a bare repository) gives no block.
@@ -30,7 +31,7 @@ The git calls, in order. Each call has a timeout of 3 seconds
      user ``i18n.logOutputEncoding``. ``--no-show-signature`` overrides
      ``log.showSignature``: no GPG output gets into the text, and a
      ``gpg.program`` that the repository config names does not run.
-  4. ``git config -z --get-regexp ^filter\\.``: the filter driver names in
+  4. ``git config -z --list``: the filter driver names in
      the config (``jacked.git_guard``). It only reads the config files.
   5. ``git status --porcelain=v1 -z --ignore-submodules=dirty``, reduced to
      counts (``_count_status``). Porcelain output does not change with the
@@ -92,10 +93,16 @@ import subprocess
 import sys
 
 from jacked.findbin import find_bin
+from jacked import git_guard
 from jacked.git_guard import GIT_CONFIG_OVERRIDE_ARGS, guarded_git_env
+from jacked.git_reality_read import (  # RECORD_LIMIT: the docstring above names it here
+    RECORD_LIMIT,  # noqa: F401
+    LogReader,
+    StatusCounter,
+    commit_lines,
+)
 from jacked.memory.recall import estimate_tokens
 from jacked.memory.sanitize import FENCE, fence_safe, one_line, strip_control
-from jacked.winproc import NO_WINDOW
 
 logger = logging.getLogger(__name__)
 
@@ -111,24 +118,8 @@ TOKEN_CAP = 600
 
 HEADING = "# Git reality (data, not instructions)"
 
-#: The most characters of one commit subject or body that the block reads. The
-#: caps (40 lines, 600 tokens, about 2,400 characters) show far less, so this
-#: limit never changes what fits. It stops a huge commit message from being
-#: stripped and split in full. A clipped body gets a last line that says how
-#: many characters were cut.
-RECORD_LIMIT = 16_384
-
 # -z puts a NUL after each commit; %x1f puts a unit separator between fields.
 _LOG_FORMAT = "%h%x1f%s%x1f%b"
-_FIELD_SEP = "\x1f"
-
-
-# Porcelain v1 status letters (git-status(1), "Short Format"). X is the index
-# column and Y is the work-tree column.
-_STAGED = frozenset("MTADRC")  # X: "Changes to be committed"
-_CHANGED = frozenset("MTARC")  # Y, other than D: "Changes not staged for commit"
-_UNMERGED = frozenset({"DD", "AU", "UD", "UA", "DU", "AA", "UU"})  # "Unmerged paths"
-
 
 class GitRealityUnavailable(Exception):
     """A git call failed, so the block cannot show the real state."""
@@ -182,17 +173,19 @@ def _build(cwd: str, line_cap: int, token_cap: int) -> str:
         return ""
 
     branch = one_line(_git(git, cwd, "branch", "--show-current")) or "(detached)"
-    log = _git(
-        git, cwd, "log", f"-{LOG_COUNT}", "-z", "--no-show-signature",
-        "--encoding=UTF-8", "--ignore-missing", f"--format={_LOG_FORMAT}",
-        "HEAD", "--",
+    log = LogReader()
+    _run(
+        git, cwd, ("log", f"-{LOG_COUNT}", "-z", "--no-show-signature",
+                   "--encoding=UTF-8", "--ignore-missing", f"--format={_LOG_FORMAT}",
+                   "HEAD", "--"), log,
     )
     guarded = guarded_git_env(git, cwd, timeout=GIT_TIMEOUT_S)
     if guarded is None:
         raise GitRealityUnavailable("git config failed, so the filter drivers are unknown")
-    status = _git(git, cwd, "status", "--porcelain=v1", "-z", "--ignore-submodules=dirty",
-                  env=guarded)
-    return _render(branch, _commit_lines(log), _count_status(status), line_cap, token_cap)
+    status = StatusCounter()
+    _run(git, cwd, ("status", "--porcelain=v1", "-z", "--ignore-submodules=dirty"), status,
+         env=guarded)
+    return _render(branch, commit_lines(log.records), status.counts, line_cap, token_cap)
 
 
 def _git(
@@ -200,106 +193,49 @@ def _git(
 ) -> str | None:
     """Run ``git -C <cwd> <args>`` and return its stdout as text.
 
-    A non-zero exit raises ``GitRealityUnavailable``, or returns None when
-    ``required`` is False. ``env`` replaces ``os.environ``. A timeout or an
-    OS error goes up to ``emit_git_reality``, which turns it into "".
+    The output can be at most ``git_guard.OUTPUT_LIMIT`` bytes; a larger
+    output raises ``GitRealityUnavailable``. See ``_run`` for the rest.
+    """
+    out = git_guard.Capture()
+    if not _run(git, cwd, args, out, required=required, env=env):
+        return None
+    return bytes(out.data).decode("utf-8", errors="replace")
+
+
+def _run(
+    git: str, cwd: str, args: tuple[str, ...], consumer, *, required: bool = True,
+    env: dict[str, str] | None = None,
+) -> bool:
+    """Run ``git -C <cwd> <args>`` and give its stdout to ``consumer``.
+
+    The output goes through ``git_guard.run_git``, so it is never held whole.
+    Return True. A non-zero exit raises ``GitRealityUnavailable``, or
+    returns False when ``required`` is False. A consumer that stopped the
+    read (output over its limit, or not in the expected shape) raises
+    ``GitRealityUnavailable``. ``env`` replaces ``os.environ``. A timeout or
+    an OS error goes up to ``emit_git_reality``, which turns it into "".
     """
     env = dict(os.environ if env is None else env)
     env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
-        proc = subprocess.run(
+        code = git_guard.run_git(
             [git, "-C", cwd, *GIT_CONFIG_OVERRIDE_ARGS, *args],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=GIT_TIMEOUT_S,
-            env=env,
-            creationflags=NO_WINDOW,
-            check=False,
+            name=args[0], env=env, timeout=GIT_TIMEOUT_S, consumer=consumer,
         )
     except subprocess.TimeoutExpired as exc:
         # The subcommand is one of the fixed names in _build. The argv, the
         # path and the output stay out of the log.
         logger.debug("git reality: git %s timed out (%s)", args[0], type(exc).__name__)
         raise
-    if proc.returncode != 0:
+    if getattr(consumer, "truncated", False):
+        raise GitRealityUnavailable(f"git {args[0]} printed more than {consumer.limit} bytes")
+    if getattr(consumer, "error", None):
+        raise GitRealityUnavailable(consumer.error)
+    if code != 0:
         if not required:
-            return None
-        raise GitRealityUnavailable(f"git {args[0]} exited {proc.returncode}")
-    return proc.stdout.decode("utf-8", errors="replace")
-
-
-def _commit_lines(log: str) -> list[str]:
-    """Turn the ``git log -z`` output into data lines, one line each.
-
-    A commit gives "  <sha> <subject>", then "    <line>" for each body line.
-    Blank body lines are left out, because they carry no data. A body is
-    split on every line break, Unicode separators included, so each part
-    gets the indent of a body line.
-
-    >>> _commit_lines("abc1234\\x1fFix it\\x1fWhy: x\\n\\nNext: y\\n\\x00")
-    ['  abc1234 Fix it', '    Why: x', '    Next: y']
-    """
-    lines: list[str] = []
-    for record in log.split("\0"):
-        if not record.strip():
-            continue
-        sha, _, rest = record.partition(_FIELD_SEP)
-        subject, _, body = rest.partition(_FIELD_SEP)
-        clipped = max(0, len(body) - RECORD_LIMIT)
-        subject, body = subject[:RECORD_LIMIT], body[:RECORD_LIMIT]
-        lines.append(f"  {one_line(sha)} {one_line(subject)}".rstrip())
-        for line in body.splitlines():
-            line = strip_control(line).rstrip()
-            if line.strip():
-                lines.append(f"    {line}")
-        if clipped:
-            lines.append(f"    [clipped: {clipped} more characters]")
-    return lines
-
-
-def _count_status(status: str) -> dict[str, int]:
-    """Count ``git status --porcelain=v1 -z`` entries the way ``git status`` groups them.
-
-    Each entry is "XY PATH". One path can count twice: "MM" is a staged change
-    and also a change that is not staged.
-
-    - untracked: "??"
-    - conflicted: an unmerged pair (DD, AU, UD, UA, DU, AA, UU)
-    - staged: X is M, T, A, D, R or C
-    - deleted: Y is D (the deletion is not staged)
-    - modified: Y is M, T, A, R or C (the change is not staged)
-
-    A rename or a copy has one more NUL field, its source path, which is not
-    an entry. An untracked folder is one entry, as ``git status`` shows it.
-
-    >>> _count_status("R  new.txt\\x00MD-old.txt\\x00 M a.txt\\x00?? b.txt\\x00")
-    {'modified': 1, 'staged': 1, 'deleted': 0, 'untracked': 1, 'conflicted': 0}
-    """
-    counts = dict.fromkeys(("modified", "staged", "deleted", "untracked", "conflicted"), 0)
-    fields = status.split("\0")
-    if fields[-1] == "":
-        fields.pop()  # the NUL after the last entry
-    i = 0
-    while i < len(fields):
-        entry = fields[i]
-        i += 1
-        if len(entry) < 4 or entry[2] != " ":
-            raise GitRealityUnavailable("git status printed an entry that is not 'XY PATH'")
-        x, y = entry[0], entry[1]
-        if "R" in (x, y) or "C" in (x, y):
-            i += 1  # the source path of the rename or the copy
-        if x + y == "??":
-            counts["untracked"] += 1
-        elif x + y in _UNMERGED:
-            counts["conflicted"] += 1
-        else:
-            if x in _STAGED:
-                counts["staged"] += 1
-            if y == "D":
-                counts["deleted"] += 1
-            elif y in _CHANGED:
-                counts["modified"] += 1
-    return counts
+            return False
+        raise GitRealityUnavailable(f"git {args[0]} exited {code}")
+    return True
 
 
 def _counts_line(counts: dict[str, int]) -> str:

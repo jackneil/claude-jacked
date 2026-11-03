@@ -699,13 +699,14 @@ def test_detect_diverts_to_jacked_home_when_settings_json_is_stock(tmp_path, mon
 # --------------------------------------------------------------------------- #
 
 FEATURES_MEMORY_230_LINE = (
-    "MEMORY.md (claude-jacked) is 230 lines / 27.0 KB; Claude Code loads only "
-    "the first 200 lines / 25 KB; run memory-librarian"
+    "MEMORY.md (~/.claude/projects/-Users-someone-Github-claude-jacked/memory) is 230 lines"
+    " / 27.0 KB; Claude Code loads only the first 200 lines / 25 KB; run memory-librarian"
 )
 
 
 def _seed_project_memory(menv, monkeypatch):
-    """An over-cap native MEMORY.md for one project, with a transcript that names it."""
+    """An over-cap native MEMORY.md for one project, with a transcript. The
+    card names the index by its folder, so the transcript does not change it."""
     for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_DISABLE_AUTO_MEMORY"):
         monkeypatch.delenv(var, raising=False)
     project = menv.home / ".claude" / "projects" / "-Users-someone-Github-claude-jacked"
@@ -791,7 +792,9 @@ def test_settings_js_renders_each_load_warning_as_one_plain_line(tmp_path):
         "_memoryLoadNotes({name: 'memory_vault', installed: false, "
         "load_warnings: ['MEMORY.md is <b>big</b>', 'second line']})",
     )
-    assert html.count('<div class="text-xs text-yellow-400 mt-1">') == 2
+    # break-words: a label names a folder such as
+    # ~/.claude/projects/-Users-someone-Github-repo/memory, one long word.
+    assert html.count('<div class="text-xs text-yellow-400 mt-1 break-words">') == 2
     assert "MEMORY.md is &lt;b&gt;big&lt;/b&gt;" in html
     assert "second line" in html
     assert "border-l" not in html and "<button" not in html

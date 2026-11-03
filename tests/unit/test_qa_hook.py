@@ -3,7 +3,7 @@
 import json
 import os
 import subprocess
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -209,11 +209,11 @@ class TestShouldSuggest:
 
 
 class TestGetChangedFiles:
-    """Test _get_changed_files() subprocess handling of the diff calls.
+    """Test _get_changed_files() handling of the diff calls.
 
     The git_guard config read is stubbed here (its own tests are in
-    test_git_guard.py and TestChangedFilesInAnUntrustedRepo), so the mocked
-    subprocess.run sees only the diff calls.
+    test_git_guard.py and TestChangedFilesInAnUntrustedRepo), and
+    ``run_git`` is replaced, so the fake sees only the diff calls.
     """
 
     @pytest.fixture(autouse=True)
@@ -222,66 +222,76 @@ class TestGetChangedFiles:
 
         monkeypatch.setattr(qa_suggest, "guarded_git_env", lambda *a, **k: {"GIT_OPTIONAL_LOCKS": "0"})
 
-    def test_returns_file_list(self, tmp_path):
+    @staticmethod
+    def _fake(monkeypatch, *results):
+        """Replace run_git: each call takes the next (exit code, stdout) or raises it."""
+        from jacked.data.hooks import qa_suggest
+
+        calls = []
+        queue = list(results)
+
+        def run(argv, *, name, env, timeout, consumer, cwd=None):
+            calls.append({"argv": list(argv), "timeout": timeout, "cwd": cwd})
+            result = queue.pop(0) if len(queue) > 1 else queue[0]
+            if isinstance(result, BaseException):
+                raise result
+            code, stdout = result
+            if stdout and not consumer.feed(stdout):
+                return -9
+            consumer.close()
+            return code
+
+        monkeypatch.setattr(qa_suggest, "run_git", run)
+        return calls
+
+    def test_returns_file_list(self, tmp_path, monkeypatch):
         from jacked.data.hooks.qa_suggest import _get_changed_files
 
-        mock_result = MagicMock()
-        mock_result.stdout = "src/app.js\nstyles/main.css\n"
-        mock_result.returncode = 0
-
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
-            files = _get_changed_files(str(tmp_path))
+        calls = self._fake(monkeypatch, (0, b"src/app.js\nstyles/main.css\n"))
+        files = _get_changed_files(str(tmp_path))
 
         assert files == ["src/app.js", "styles/main.css"]
-        # Verify timeout is set
-        call_kwargs = mock_run.call_args
-        assert call_kwargs.kwargs.get("timeout") == 5 or (
-            len(call_kwargs.args) > 0 and "timeout" in str(call_kwargs)
-        )
+        assert calls[0]["timeout"] == 5
+        assert calls[0]["cwd"] == str(tmp_path)
 
-    def test_returns_empty_on_subprocess_error(self, tmp_path):
+    def test_returns_empty_on_subprocess_error(self, tmp_path, monkeypatch):
         from jacked.data.hooks.qa_suggest import _get_changed_files
 
-        with patch(
-            "subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="git", timeout=5)
-        ):
-            files = _get_changed_files(str(tmp_path))
+        self._fake(monkeypatch, subprocess.TimeoutExpired(cmd="git", timeout=5))
+        assert _get_changed_files(str(tmp_path)) == []
 
-        assert files == []
-
-    def test_returns_empty_on_nonzero_exit(self, tmp_path):
+    def test_returns_empty_on_nonzero_exit(self, tmp_path, monkeypatch):
         from jacked.data.hooks.qa_suggest import _get_changed_files
-
-        mock_result = MagicMock()
-        mock_result.stdout = ""
-        mock_result.returncode = 128
 
         # Both HEAD and --cached fail
-        with patch("subprocess.run", return_value=mock_result):
-            files = _get_changed_files(str(tmp_path))
+        self._fake(monkeypatch, (128, b""))
+        assert _get_changed_files(str(tmp_path)) == []
 
-        assert files == []
-
-    def test_falls_back_to_cached_on_head_failure(self, tmp_path):
+    def test_falls_back_to_cached_on_head_failure(self, tmp_path, monkeypatch):
         """When HEAD doesn't exist (zero-commit repo), falls back to --cached."""
         from jacked.data.hooks.qa_suggest import _get_changed_files
 
-        head_fail = MagicMock()
-        head_fail.stdout = ""
-        head_fail.returncode = 128
-
-        cached_ok = MagicMock()
-        cached_ok.stdout = "src/index.tsx\n"
-        cached_ok.returncode = 0
-
-        with patch("subprocess.run", side_effect=[head_fail, cached_ok]) as mock_run:
-            files = _get_changed_files(str(tmp_path))
+        calls = self._fake(monkeypatch, (128, b""), (0, b"src/index.tsx\n"))
+        files = _get_changed_files(str(tmp_path))
 
         assert files == ["src/index.tsx"]
-        assert mock_run.call_count == 2
-        # Second call should use --cached
-        second_call_args = mock_run.call_args_list[1][0][0]
-        assert "--cached" in second_call_args
+        assert len(calls) == 2
+        assert "--cached" in calls[1]["argv"]
+
+    def test_a_list_over_the_output_limit_keeps_its_complete_lines(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        from jacked import git_guard
+        from jacked.data.hooks.qa_suggest import _get_changed_files
+
+        monkeypatch.setattr(git_guard, "OUTPUT_LIMIT", 20)
+        self._fake(monkeypatch, (0, b"src/a.js\nsrc/b.css\nsrc/c.tsx\n"))
+        caplog.set_level(logging.DEBUG, logger="jacked.data.hooks.qa_suggest")
+
+        assert _get_changed_files(str(tmp_path)) == ["src/a.js", "src/b.css"]
+        assert any("cut at 20 bytes" in r.getMessage() for r in caplog.records)
 
 
 class TestSuggestionMessageRuntime:
@@ -592,13 +602,13 @@ class TestChangedFilesInAnUntrustedRepo:
 
         repo = _repo_with(git_root, {"app.js": "one\n"})
         seen = []
-        real_run = subprocess.run
+        real_run = qa_suggest.run_git
 
         def spy(argv, **kwargs):
             seen.append((list(argv), kwargs.get("env") or {}))
             return real_run(argv, **kwargs)
 
-        monkeypatch.setattr(qa_suggest.subprocess, "run", spy)
+        monkeypatch.setattr(qa_suggest, "run_git", spy)
         qa_suggest._get_changed_files(str(repo))
         diffs = [(argv, env) for argv, env in seen if "diff" in argv]
         assert diffs

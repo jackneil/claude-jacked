@@ -24,7 +24,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Callable
 from pathlib import Path
 
 from jacked.memory.claude_paths import (
@@ -67,9 +66,12 @@ BLOCK_FRAMING = (
     "line. Do not edit a file unless the user asks."
 )
 
-# How many transcript records the dashboard label reads. Claude Code writes
-# the cwd in the first record of a session, so a few records are enough.
-LABEL_RECORDS = 20
+#: A test seam for the ancestor walk of ``_candidates``. None (production):
+#: the walk goes up to the filesystem root, as Claude Code does. A folder: the
+#: walk stops after that folder. tests/conftest.py sets it to the pytest base
+#: temp folder, so no test reads a real CLAUDE.md above the pytest tree (a
+#: developer HOME, a Windows temp folder).
+ANCESTOR_STOP: Path | None = None
 
 # The instruction files Claude Code reads in each folder, in its read order.
 _INSTRUCTION_FILES = (("CLAUDE.md",), (".claude", "CLAUDE.md"), ("CLAUDE.local.md",))
@@ -168,16 +170,18 @@ def _candidates(cwd: Path, home: Path, env: Env) -> list[tuple[str, Path]]:
     folder). Claude Code reads the instruction files "recursively from the
     cwd up to the root directory", in a repository or not. When a folder
     above ``cwd`` is the home folder, its ``.claude/CLAUDE.md`` is the user
-    file, and it is listed once, as ``user``.
+    file, and it is listed once, as ``user``. ``ANCESTOR_STOP`` (a test
+    seam) can stop the walk before the root.
     """
     found = []
     if auto_memory_enabled(cwd, home, env):
         found.append(("memory", native_memory_path(cwd, home, env)))
     user = config_dir(home, env) / "CLAUDE.md"
+    stop = None if ANCESTOR_STOP is None else _key(ANCESTOR_STOP)
     here = cwd
     while True:
         found.extend(("project", here.joinpath(*parts)) for parts in _INSTRUCTION_FILES)
-        if here.parent == here:
+        if here.parent == here or _key(here) == stop:
             break
         here = here.parent
     found.append(("user", user))
@@ -300,22 +304,17 @@ def _tail(kind: str, lines: int, nbytes: int) -> str | None:
     return None
 
 
-def _warn(kind: str, path: Path, label: str | Callable[[], str]) -> str | None:
-    """Return the warning line for ``path``, or None.
-
-    ``label`` is the name to show, or a function that makes it. The function
-    runs only when the file is over its warn line.
-    """
+def _warn(kind: str, path: Path, label: str) -> str | None:
+    """Return the warning line for ``path``, named ``label``, or None."""
     size = measure(path)
     tail = None if size is None else _tail(kind, *size)
     if tail is None:
         return None
     lines, nbytes = size
-    name = label() if callable(label) else label
     count = f"{lines} {'line' if lines == 1 else 'lines'}"
     if not size.lines_exact:
         count = f"at least {count}"
-    return f"{name} is {count} / {_size(nbytes)}; {tail}"
+    return f"{label} is {count} / {_size(nbytes)}; {tail}"
 
 
 def warnings(cwd, home, env: Env | None = None) -> list[str]:
@@ -369,27 +368,6 @@ def _project_folders(config: Path) -> list[Path]:
         return []
 
 
-def _project_label(folder: Path) -> str:
-    """Return a readable name for a ``projects/`` folder.
-
-    It is the last part of the folder that the newest session there ran in,
-    else the decoded folder name. Only the first ``LABEL_RECORDS`` records of
-    the transcript are read. A transcript that cannot be read gives the folder
-    name, so one damaged file never stops the other warnings.
-    """
-    from jacked import recover
-    from jacked.web.analytics_paths import decode_project_hash
-
-    try:
-        for transcript in recover._newest_jsonls(folder, n=1):
-            cwd = recover._read_cwd(transcript, max_records=LABEL_RECORDS)
-            if isinstance(cwd, str) and cwd:
-                return _clean(cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or cwd)
-    except (OSError, UnicodeError, ValueError) as exc:
-        logger.debug("load budget: cannot read a transcript (%s)", type(exc).__name__)
-    return _clean(decode_project_hash(folder.name)["name"] or folder.name)
-
-
 def machine_warnings(home=None, env: Env | None = None) -> list[str]:
     """Return the warning lines that the dashboard shows, for all projects at once.
 
@@ -397,7 +375,9 @@ def machine_warnings(home=None, env: Env | None = None) -> list[str]:
     each project under ``<config dir>/projects/`` (or the one index that a
     user ``autoMemoryDirectory`` names) and the user CLAUDE.md. A project's
     own CLAUDE.md files need a session folder: SessionStart and ``jacked
-    memory status`` report them.
+    memory status`` report them. A memory line names the folder of its
+    index, as SessionStart does, so two projects with the same folder name
+    get two labels. No transcript is read.
     """
     from jacked.memory import vault
 
@@ -412,8 +392,8 @@ def machine_warnings(home=None, env: Env | None = None) -> list[str]:
                                _memory_label(override / MEMORY_INDEX, home)))
         else:
             for folder in _project_folders(config):
-                lines.append(_warn("memory", folder / "memory" / MEMORY_INDEX,
-                                   lambda folder=folder: f"MEMORY.md ({_project_label(folder)})"))
+                index = folder / "memory" / MEMORY_INDEX
+                lines.append(_warn("memory", index, _memory_label(index, home)))
     user = config / "CLAUDE.md"
     lines.append(_warn("user", user, _label("user", user, home, env)))
     return [line for line in lines if line]
