@@ -1145,6 +1145,10 @@ def _refresh_import(account_id: int, account: dict, oauth: dict) -> dict:
             "live credentials",
             account_id,
         )
+        # The pass-through fields describe the refused lineage: binding them
+        # to the row's own refresh token would publish another lineage's
+        # expiry. Keep what the row has.
+        return updates
     elif live_refresh and live_refresh != db_cc_refresh:
         # The primary chain's breaker says nothing about this lineage.
         if db_cc_refresh is None:

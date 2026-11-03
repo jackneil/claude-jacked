@@ -115,3 +115,57 @@ def test_a_failed_pointer_write_warns_with_the_exception_type(caplog):
     lines = [r.getMessage() for r in caplog.records if "could not record it as the active account" in r.getMessage()]
     assert len(lines) == 1
     assert "Account 5" in lines[0] and "RuntimeError" in lines[0]
+
+
+# --- the downgrade check sees the object the request publishes ---------------
+
+
+class _DeadRowDb:
+    """A row whose cc chain is dead: build_oauth_data publishes no refresh token."""
+
+    def __init__(self):
+        self.row = {"id": 7, "email": "a@b.com", "cc_access_token": "at", "cc_refresh_token": None,
+                    "cc_expires_at": 9_999_999_999, "cc_refresh_failure_type": "invalid_grant"}
+
+    def get_account(self, account_id):
+        return dict(self.row)
+
+
+def _preflight(db, request, *, rebuild_payload):
+    from unittest import mock
+
+    from jacked.credentials import runtime
+
+    with mock.patch.object(runtime, "reconcile_outgoing_before_activation", lambda _db, _tid: True):
+        return runtime._activation_preflight(db, request, rebuild_payload=rebuild_payload)()
+
+
+def test_a_republish_is_checked_against_the_object_it_publishes():
+    from jacked.credentials.runtime import _republished_payload
+
+    db = _DeadRowDb()
+    authority = {"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt-live", "expiresAt": 9_999_999_999_000},
+                 "_jackedAccountId": 1}
+    held = CredentialPayload.from_mapping(authority)
+    request = replace(_request(_republished_payload(7, authority)), account_id=7)
+
+    prepared = _preflight(db, request, rebuild_payload=False)
+
+    assert prepared.payload.to_mapping()["claudeAiOauth"]["refreshToken"] == "rt-live"
+    assert prepared.refresh_downgrade_check(held) is None  # the same pair goes back, with a stamp
+
+
+def test_a_row_publication_over_a_live_pair_is_still_refused():
+    from jacked.credentials.refresh_guard import REFRESH_DOWNGRADE_REASON
+    from jacked.credentials.runtime import _row_payload
+
+    db = _DeadRowDb()
+    held = CredentialPayload.from_mapping(
+        {"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt-live", "expiresAt": 9_999_999_999_000}}
+    )
+    request = replace(_request(_row_payload(7, db.row)), account_id=7)
+
+    prepared = _preflight(db, request, rebuild_payload=True)
+
+    assert prepared.payload.to_mapping()["claudeAiOauth"].get("refreshToken") is None
+    assert prepared.refresh_downgrade_check(held) == REFRESH_DOWNGRADE_REASON

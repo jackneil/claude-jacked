@@ -95,7 +95,9 @@ The dead-chain rule:
   This applies to a dead chain and to a live chain, because a cleared
   breaker does not release a condemned token. Reconcile, the launch token
   sync and the authority guard use `refresh_token_importable()` in
-  `credential_helpers.py`.
+  `credential_helpers.py`. An importer that refuses a condemned token also
+  takes none of its pass-through fields: they describe the refused lineage,
+  and the row keeps its own.
 - The `cc` flow never sends a condemned `cc` refresh token. When an importer
   brought one back, the flow runs the `invalid_grant` clean-up with no
   request. jacked logs `Account N: not sending the Claude Code refresh token;
@@ -211,7 +213,9 @@ an error after a failed refresh or validation keeps the text of the verdict.
 Only two events release the verdict: a new stored refresh token (a database
 trigger clears the fingerprint), or a validation that proves the row's own
 account. That validation clears the fingerprint only while the row holds the
-access token that it checked.
+access token that it checked. A row that carries the text of the verdict
+with no fingerprint (a mark from before the column) is bound one time when
+the schema opens, before any refresh path runs.
 
 Each write that validation makes after a request is a compare-and-swap on
 the access token that the request sent. Thus a re-authorization that lands
@@ -568,9 +572,10 @@ readback cannot prove what an already-running Claude process cached.
   `not publishing a null refresh token over a live one (cc re-auth required)`.
 - The engine logs one WARNING line with the account id and that message. The
   line holds no token value.
-- `activate_account()` builds the check from the account row. The preflight
-  builds it again from the row that it reads inside the lease. The auto-swap
-  request carries the same check.
+- `activate_account()` builds the check for the object the request
+  publishes: the row's pair, or the authority's own object for a re-stamp.
+  The preflight builds it again inside the lease, for the object it keeps or
+  rebuilds. The auto-swap request carries the same check.
 - Usually the preflight reconcile adopts the live lineage first (section 11),
   and the write then publishes it. The refusal protects a row that the
   adoption cannot repair. An example is a row that stores the live refresh

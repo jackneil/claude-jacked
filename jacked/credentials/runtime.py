@@ -394,14 +394,23 @@ def _activation_preflight(db, request: SwitchRequest, *, rebuild_payload: bool =
                 exc_info=True,
             )
             return None
+        payload = _row_payload(target_id, row) if rebuild_payload else request.payload
         return replace(
             request,
-            payload=_row_payload(target_id, row) if rebuild_payload else request.payload,
+            payload=payload,
             preflight=None,
-            refresh_downgrade_check=downgrade_check_for(row),
+            # The check sees the object this request publishes: the row's
+            # pair, or the authority's own object for a re-stamp.
+            refresh_downgrade_check=downgrade_check_for(row, _oauth_of(payload)),
         )
 
     return preflight
+
+
+def _oauth_of(payload: CredentialPayload) -> dict:
+    """The ``claudeAiOauth`` object of ``payload`` (an empty dict when absent)."""
+    oauth = payload.to_mapping().get("claudeAiOauth")
+    return oauth if isinstance(oauth, dict) else {}
 
 
 def _republished_payload(target_id: int, republish: Mapping) -> CredentialPayload:
@@ -464,7 +473,7 @@ def activate_account(
         interaction=InteractionMode.FOREGROUND,
         display_name=account.get("display_name") or None,
         organization_name=account.get("organization_name") or None,
-        refresh_downgrade_check=downgrade_check_for(account),
+        refresh_downgrade_check=downgrade_check_for(account, _oauth_of(payload)),
         expected_authority_digest=expected_digest,
     )
     preflight = _activation_preflight(db, request, rebuild_payload=republish is None)

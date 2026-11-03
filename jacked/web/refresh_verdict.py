@@ -98,6 +98,10 @@ def primary_tokens_foreign(row: dict) -> bool:
     binding alone, like ``primary_refresh_revoked``: the error text and the
     status do not take part.
 
+    A mark that predates the binding column (the text with no fingerprint)
+    is bound once when the schema opens (``Database._bind_legacy_foreign_marks``),
+    so the predicate never has to read the text.
+
     >>> row = {"refresh_token": "rt", "foreign_token_fp": token_fingerprint("rt")}
     >>> primary_tokens_foreign(row)
     True

@@ -82,3 +82,30 @@ def test_the_guard_adopts_a_new_token_on_a_live_chain():
     updates = authority_guard._adoption_updates(row, payload, profile)
 
     assert updates.get("cc_refresh_token") == "cc-rt-new"
+
+
+# --- a refused condemned token leaves the pass-through fields alone ----------
+
+
+def test_reconcile_keeps_the_rows_pass_through_fields_when_it_refuses_a_condemned_token():
+    row = _live_row(cc_oauth_extra="kept-extra")
+    live = {"accessToken": "cc-at-2", "refreshToken": "cc-rt-dead", "expiresAt": FUTURE_MS,
+            "refreshTokenExpiresAt": 123456789000}
+
+    updates = credential_helpers._refresh_import(3, row, live)
+
+    assert "cc_refresh_token" not in updates
+    assert "cc_oauth_extra" not in updates  # another lineage's expiry is not bound to cc-rt
+
+
+def test_the_guard_keeps_the_rows_pass_through_fields_when_it_refuses_a_condemned_token():
+    row = _live_row(cc_oauth_extra="kept-extra")
+    payload = {"claudeAiOauth": {"accessToken": "cc-at-2", "refreshToken": "cc-rt-dead",
+                                 "expiresAt": FUTURE_MS, "refreshTokenExpiresAt": 123456789000}}
+    profile = {"account": {"email": "carol@test.com"}, "organization": {"uuid": "org-3"}}
+
+    updates = authority_guard._adoption_updates(row, payload, profile)
+
+    assert updates.get("cc_access_token") == "cc-at-2"
+    assert "cc_refresh_token" not in updates
+    assert "cc_oauth_extra" not in updates

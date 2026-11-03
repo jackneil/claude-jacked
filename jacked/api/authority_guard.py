@@ -441,6 +441,11 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
 
     refresh_token = oauth.get("refreshToken")
     adoption = dead_chain_adoption(row, oauth)
+    refused_condemned = bool(
+        refresh_token
+        and refresh_token != row.get("cc_refresh_token")
+        and not refresh_token_importable(row, refresh_token)
+    )
     if adoption is not None:
         # The settled #149i rule, shared with reconcile and the launch sync:
         # a proven new lineage over a dead chain is adopted, with its
@@ -472,9 +477,10 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
         updates["cc_refresh_failure_type"] = None
         updates["cc_refresh_last_failed_at"] = None
     # Claude Code's pass-through fields (#174i). An adoption carries them,
-    # bound to the adopted token; a dead chain that adopts nothing takes
-    # none, because they describe the lineage jacked does not take.
-    if adoption is None and not cc_chain_dead(row):
+    # bound to the adopted token; a dead chain that adopts nothing, and a
+    # live chain that refused a condemned token, take none, because they
+    # describe the lineage jacked does not take.
+    if adoption is None and not cc_chain_dead(row) and not refused_condemned:
         from jacked.credentials.oauth_extra import capture_oauth_extra
 
         row_refresh = updates.get("cc_refresh_token", row.get("cc_refresh_token"))

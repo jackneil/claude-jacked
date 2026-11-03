@@ -757,6 +757,66 @@ class Database:
             "END"
         )
 
+    @staticmethod
+    def _bind_legacy_foreign_marks(conn: sqlite3.Connection) -> None:
+        """Bind a cross-account verdict recorded before ``foreign_token_fp``.
+
+        A row marked ``Token belongs to a different account`` by code that
+        wrote the text alone keeps the verdict only through the binding
+        (``refresh_verdict.primary_tokens_foreign``). This binds such a row
+        once, to the primary refresh token it holds now, before any refresh
+        path runs. A valid row, a row with no refresh token, and a bound row
+        are left alone. The pass runs ONE time per database (the internal
+        setting ``_foreign_marks_bound`` records it): a row whose binding a
+        later re-authorization released must not be bound again by its stale
+        text.
+
+        >>> from jacked.web.refresh_verdict import FOREIGN_TOKEN_ERROR, token_fingerprint
+        >>> conn = sqlite3.connect(":memory:")
+        >>> _ = conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, refresh_token TEXT, "
+        ...                  "last_error TEXT, validation_status TEXT, foreign_token_fp TEXT)")
+        >>> _ = conn.execute("INSERT INTO accounts VALUES (1, 'rt', ?, 'invalid', NULL)", (FOREIGN_TOKEN_ERROR,))
+        >>> _ = conn.execute("INSERT INTO accounts VALUES (2, 'rt', ?, 'valid', NULL)", (FOREIGN_TOKEN_ERROR,))
+        >>> _ = conn.execute("INSERT INTO accounts VALUES (3, NULL, ?, 'invalid', NULL)", (FOREIGN_TOKEN_ERROR,))
+        >>> Database._bind_legacy_foreign_marks(conn)
+        >>> Database._bind_legacy_foreign_marks(conn)  # idempotent
+        >>> [r[0] is None for r in conn.execute("SELECT foreign_token_fp FROM accounts ORDER BY id")]
+        [False, True, True]
+        >>> conn.execute("SELECT foreign_token_fp FROM accounts WHERE id = 1").fetchone()[0] == token_fingerprint("rt")
+        True
+        """
+        from jacked.web.refresh_verdict import FOREIGN_TOKEN_ERROR, token_fingerprint
+
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+        if not {"foreign_token_fp", "last_error", "validation_status", "refresh_token"} <= cols:
+            return
+        marker = "_foreign_marks_bound"  # internal: list_settings() hides it
+        try:
+            done = conn.execute("SELECT value FROM settings WHERE key = ?", (marker,)).fetchone()
+        except sqlite3.OperationalError:
+            done = None  # no settings table (a bare schema): bind, keep no marker
+        if done is not None:
+            return
+        rows = conn.execute(
+            "SELECT id, refresh_token FROM accounts WHERE last_error = ? "
+            "AND validation_status IS NOT 'valid' AND foreign_token_fp IS NULL "
+            "AND refresh_token IS NOT NULL AND refresh_token != ''",
+            (FOREIGN_TOKEN_ERROR,),
+        ).fetchall()
+        for account_id, refresh_token in rows:
+            conn.execute(
+                "UPDATE accounts SET foreign_token_fp = ? WHERE id = ? AND refresh_token IS ? "
+                "AND foreign_token_fp IS NULL",
+                (token_fingerprint(refresh_token), account_id, refresh_token),
+            )
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, '1', datetime('now'))",
+                (marker,),
+            )
+        except sqlite3.OperationalError:
+            pass  # no settings table: the next open binds again, which is harmless there
+
     def _init_schema(self) -> None:
         with self._writer() as conn:
             # Pre-schema crash recovery: if accounts_new exists but accounts doesn't,
@@ -1050,6 +1110,7 @@ class Database:
             # the old table, and a column added after the rebuild needs no
             # copy.
             self._migrate_refresh_failed_token_fp(conn)
+            self._bind_legacy_foreign_marks(conn)
             # Migration: add swap outcome tracking to swap_log.
             # status distinguishes committed swaps from pending/failed attempts;
             # residency_seconds is how long the outgoing account was active.
@@ -2379,14 +2440,21 @@ class Database:
         )
 
     def list_settings(self) -> list[dict]:
-        """List all settings.
+        """List all settings, except jacked's internal markers (keys that
+        start with an underscore, for example the one-shot migration pass
+        record ``_foreign_marks_bound``).
 
         >>> db = Database(":memory:")
         >>> db.list_settings()
         []
+        >>> db.set_setting("_internal", "1"); db.set_setting("shown", "2")
+        >>> [row["key"] for row in db.list_settings()]
+        ['shown']
         """
         with self._reader() as conn:
-            cursor = conn.execute("SELECT * FROM settings ORDER BY key ASC")
+            cursor = conn.execute(
+                "SELECT * FROM settings WHERE key NOT LIKE '\\_%' ESCAPE '\\' ORDER BY key ASC"
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     # Alias for api-layer compatibility

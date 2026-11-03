@@ -97,31 +97,38 @@ def refuses_refresh_downgrade(
     return REFRESH_DOWNGRADE_REASON if owned else None
 
 
-def downgrade_check_for(row: dict) -> Callable[[CredentialPayload | None], str | None]:
-    """The engine's refresh downgrade check for a payload built from ``row``.
+def downgrade_check_for(
+    row: dict, target_oauth: dict | None = None
+) -> Callable[[CredentialPayload | None], str | None]:
+    """The engine's refresh downgrade check for the payload a request publishes.
 
     ``SwitchRequest.refresh_downgrade_check`` takes it. The engine calls it
     with what the authority holds now, inside the switch lease and before
-    any write. It returns the refusal reason when the row's payload
-    (``build_oauth_data``) would put a null refresh token over a live one of
-    this account, else None.
+    any write. It returns the refusal reason when the published payload
+    (``target_oauth``; by default the row's ``build_oauth_data``) would put
+    a null refresh token over a live one of this account, else None. A
+    re-stamp republishes the authority's own object, so its check sees that
+    object, never the row's.
 
     >>> from jacked.credentials.canonical import CredentialPayload
     >>> row = {"id": 7, "cc_access_token": "at", "cc_refresh_token": None,
     ...        "cc_expires_at": 9999999999, "cc_refresh_failure_type": "invalid_grant"}
-    >>> check = downgrade_check_for(row)
-    >>> check(CredentialPayload.from_mapping(
-    ...     {"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt"}})) == REFRESH_DOWNGRADE_REASON
+    >>> held = CredentialPayload.from_mapping({"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt"}})
+    >>> downgrade_check_for(row)(held) == REFRESH_DOWNGRADE_REASON
     True
-    >>> check(None) is None
+    >>> downgrade_check_for(row, {"accessToken": "at", "refreshToken": "rt"})(held) is None
+    True
+    >>> downgrade_check_for(row)(None) is None
     True
     """
-    from jacked.api.credential_helpers import build_oauth_data
+    if target_oauth is None:
+        from jacked.api.credential_helpers import build_oauth_data
 
-    target_oauth = build_oauth_data(row)
+        target_oauth = build_oauth_data(row)
+    published = target_oauth
 
     def check(live: CredentialPayload | None) -> str | None:
         live_mapping = live.to_mapping() if live is not None else None
-        return refuses_refresh_downgrade(target_oauth, live_mapping, row)
+        return refuses_refresh_downgrade(published, live_mapping, row)
 
     return check
