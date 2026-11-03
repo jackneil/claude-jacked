@@ -168,11 +168,16 @@ def test_preserve_missing_dir_is_a_noop(tmp_path):
 
 
 def test_backup_dir_for_is_timestamped_and_unique(tmp_path):
+    from datetime import datetime, timezone
+
     base = _skills_base(tmp_path)
     target = base / "dcr"
-    first = m.backup_dir_for(target, "dcr")
+    # One fixed clock for both calls: a real clock can tick between them and
+    # give two different stamps, which is unique by accident, not by the rule.
+    now = datetime(2026, 11, 3, 16, 4, 6, tzinfo=timezone.utc)
+    first = m.backup_dir_for(target, "dcr", now=now)
     first.mkdir(parents=True)
-    second = m.backup_dir_for(target, "dcr")
+    second = m.backup_dir_for(target, "dcr", now=now)
     assert first.parent == m.backups_root(target) == base.parent / "jacked-backups" / "skills"
     assert second != first and second.name.startswith(first.name)
 
