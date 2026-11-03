@@ -366,7 +366,7 @@ The block comes after the memory brief and before the git reality block:</p>
   <li>The block shows only the issues opened by the owner, a member or a collaborator of the repo,
     and each issue with a queue label. On a public repo, anyone can open an issue, but only a user
     with triage rights can add a label. So an issue from a stranger shows only after a maintainer
-    labels it. The refresher keeps only these issues, and the hook does the same check again: a cache
+    labels it, and then only as its number and label, because the author can still change the title. The refresher keeps only these issues, and the hook does the same check again: a cache
     item with no author association, or with an author outside these three and no queue label,
     gives no block.</li>
   <li>The full block has a limit of 8 KiB, because each byte goes into the context of each
