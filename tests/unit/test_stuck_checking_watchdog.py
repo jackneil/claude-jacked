@@ -244,7 +244,10 @@ class TestValidateAccountClearsLastError:
             fake_client.__aexit__.return_value = False
             fake_client.get = fake_get
 
-            async def fake_refresh(*args, **kwargs):
+            async def fake_refresh(account_id, db_, stale_token=None):
+                # The real renewal stores the new token before it returns
+                # it; the validated mark is bound to the token the row holds.
+                db_.update_account(account_id, access_token="fresh_access_token")
                 return "fresh_access_token"
 
             with patch.object(auth_mod.httpx, "AsyncClient", return_value=fake_client), \

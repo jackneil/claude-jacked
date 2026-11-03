@@ -1027,6 +1027,15 @@ async def _cc_chain_died(
                 "was being cleaned up; keeping the new lineage",
                 account_id,
             )
+            # The failed token left the row with the new lineage; its
+            # fingerprint is still the only record that it died. A
+            # column-only compare-and-swap adds it beside the new lineage.
+            known = current.get("cc_refresh_failed_token_fp")
+            db.update_account_if_unchanged(
+                account_id,
+                {"cc_refresh_failed_token_fp": known},
+                cc_refresh_failed_token_fp=_condemned_after(known, failed_refresh_token),
+            )
             latest = db.get_account(account_id) or current
             return TokenExchangeResult(
                 success=True, access_token=latest.get("cc_access_token"), chain="cc",
@@ -2398,9 +2407,14 @@ def _settle_profile_verdict(account_id: int, data: dict, token: str, db: Databas
       about the old identity, so nothing is recorded and the result asks
       for a new check (``recheck``).
     - The row is gone: nothing is recorded.
-    - Any other outcome marks the row validated. That proves the token, not
-      that usage is readable: the usage path's error and failure counter
-      stay until a successful usage fetch clears them
+    - The profile carries no owner value while a cross-account verdict
+      binds the row's primary tokens: the profile proves no owner, so the
+      verdict stands and nothing is recorded.
+    - Any other outcome marks the row validated, while the row still holds
+      ``token`` (a re-authorization that stored another token meanwhile
+      keeps its own status, and the result asks for a new check). That
+      proves the token, not that usage is readable: the usage path's error
+      and failure counter stay until a successful usage fetch clears them
       (``clear_account_errors``). A profile that names the row's own
       account also releases a cross-account binding, while the row still
       holds ``token``. A profile with nothing to compare proves no owner,
@@ -2418,7 +2432,21 @@ def _settle_profile_verdict(account_id: int, data: dict, token: str, db: Databas
         return {"valid": False, "error": _RECHECK_ERROR, "recheck": True}
     if applied is ProfileApply.OWNER_MISMATCH:
         return _mark_foreign(account_id, token, db)
-    db.mark_account_validated(account_id)
+    if applied is ProfileApply.PROFILE_UNREADABLE and _primary_tokens_foreign(
+        db.get_account(account_id) or {}
+    ):
+        logger.info(
+            "Account %d: the profile names no owner; the cross-account verdict stands",
+            account_id,
+        )
+        return {"valid": False, "error": _FOREIGN_TOKEN_ERROR}
+    if not db.mark_account_validated(account_id, access_token=token):
+        logger.info(
+            "Account %d: validation verdict not recorded; the token changed "
+            "during the check",
+            account_id,
+        )
+        return {"valid": False, "error": _RECHECK_ERROR, "recheck": True}
     if applied is ProfileApply.APPLIED:
         db.update_account_if_unchanged(
             account_id, {"access_token": token}, foreign_token_fp=None,

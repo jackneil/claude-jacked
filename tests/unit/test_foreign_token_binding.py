@@ -144,10 +144,39 @@ class TestTheMarkBindsTheVerdict:
         row = db.get_account(account_id)
         assert (row["validation_status"], row["foreign_token_fp"]) == ("valid", None)
 
-    def test_an_unreadable_profile_proves_nothing_and_keeps_it(self, tmp_path):
+    def test_an_unreadable_profile_proves_nothing_and_keeps_it(self, tmp_path, caplog):
+        """The profile carries no owner value: it proves no owner, so the
+        verdict stands and the row is not marked valid over it."""
         db, account_id = _bound(tmp_path)
-        auth._settle_profile_verdict(account_id, {"account": {"uuid": "u"}}, "at-foreign", db)
-        assert db.get_account(account_id)["foreign_token_fp"] == BOUND
+        with caplog.at_level("INFO", logger="jacked.auth"):
+            verdict = auth._settle_profile_verdict(
+                account_id, {"account": {"uuid": "u"}}, "at-foreign", db)
+
+        assert verdict == {"valid": False, "error": FOREIGN_TOKEN_ERROR}
+        row = db.get_account(account_id)
+        assert (row["validation_status"], row["foreign_token_fp"], row["last_validated_at"]) == (
+            "invalid", BOUND, None)
+        assert f"Account {account_id}: the profile names no owner; the cross-account verdict stands" in caplog.text
+
+    def test_an_unreadable_profile_still_marks_an_unbound_row_valid(self, tmp_path):
+        db, account_id = _db(tmp_path)
+        verdict = auth._settle_profile_verdict(
+            account_id, {"account": {"uuid": "u"}}, "at-foreign", db)
+
+        assert verdict == {"valid": True, "error": None}
+        assert db.get_account(account_id)["validation_status"] == "valid"
+
+    def test_the_validated_mark_needs_the_checked_token(self, tmp_path, caplog):
+        """A 200 for an access token the row no longer holds proves nothing
+        about the row's current tokens: no mark, and a new check is asked."""
+        db, account_id = _db(tmp_path)
+        with caplog.at_level("INFO", logger="jacked.auth"):
+            verdict = auth._settle_profile_verdict(account_id, _profile(OWNER), "at-older", db)
+
+        assert verdict == {"valid": False, "error": auth._RECHECK_ERROR, "recheck": True}
+        row = db.get_account(account_id)
+        assert (row["validation_status"], row["last_validated_at"]) == ("unknown", None)
+        assert f"Account {account_id}: validation verdict not recorded; the token changed" in caplog.text
 
     def test_the_release_needs_the_checked_token(self, tmp_path):
         """A proof about an older access token does not release a binding on

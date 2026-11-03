@@ -19,8 +19,12 @@ from jacked.api.claude_identity import (
     write_identity,
 )
 from jacked.api.credential_helpers import (
+    FOREIGN_PRIMARY_CODE,
+    FOREIGN_PRIMARY_MESSAGE,
     ClaudeConfigUnwritable,
+    ForeignPrimaryTokens,
     build_oauth_data,
+    publishes_foreign_primary,
     reconcile_outgoing_before_activation,
 )
 from jacked.findbin import find_bin
@@ -53,7 +57,7 @@ from .models import (
     SwitchOutcome,
     SwitchResult,
 )
-from .refresh_guard import downgrade_check_for
+from .refresh_guard import downgrade_check_for, lineage_finder
 from .resolver import (
     CanonicalCredentialResolver,
     FileResolverSnapshotSink,
@@ -243,6 +247,23 @@ def _unsupported(operation_id: str, account: dict, reason: str) -> SwitchResult:
     )
 
 
+def _unusable(operation_id: str, account: dict, reason: str, code: str) -> SwitchResult:
+    """A refusal before the engine: the request cannot form a safe transaction."""
+    account_id = int(account["id"])
+    return SwitchResult(
+        operation_id=operation_id,
+        outcome=SwitchOutcome.UNUSABLE,
+        desired_default=IdentityAxis(account_id, "desired"),
+        storage=IdentityAxis(None, "unchanged"),
+        committed_authority=IdentityAxis(None, "unchanged"),
+        existing_session_activation=SessionActivationState.UNCHANGED,
+        provider_verification=ProviderVerificationState.UNVERIFIED,
+        observed_identity=CredentialIdentity(),
+        message=reason,
+        code=code,
+    )
+
+
 def _engine_for(
     db, resolution: CapabilityResolution, home: Path
 ) -> CredentialTransactionEngine | str:
@@ -394,14 +415,23 @@ def _activation_preflight(db, request: SwitchRequest, *, rebuild_payload: bool =
                 exc_info=True,
             )
             return None
-        payload = _row_payload(target_id, row) if rebuild_payload else request.payload
+        try:
+            payload = _row_payload(target_id, row) if rebuild_payload else request.payload
+        except ForeignPrimaryTokens as exc:
+            # The row was bound to another account's tokens after the early
+            # check (writers run on threads): refuse inside the lease too.
+            logger.warning("Account %d: activation refused; %s", target_id, exc)
+            return None
         return replace(
             request,
             payload=payload,
             preflight=None,
             # The check sees the object this request publishes: the row's
-            # pair, or the authority's own object for a re-stamp.
-            refresh_downgrade_check=downgrade_check_for(row, _oauth_of(payload)),
+            # pair, or the authority's own object for a re-stamp. The
+            # database names the owner of a live refresh token first.
+            refresh_downgrade_check=downgrade_check_for(
+                row, _oauth_of(payload), lineage_known=lineage_finder(db)
+            ),
         )
 
     return preflight
@@ -437,7 +467,10 @@ def activate_account(
 
     The engine refuses (UNUSABLE, code CC_REAUTH_REQUIRED) a write that would
     put a null refresh token over a live one of this account, and leaves the
-    authority unchanged (#149i).
+    authority unchanged (#149i). A row whose primary tokens belong to another
+    account, with no usable Claude Code chain of its own, is refused before
+    the engine (UNUSABLE, code FOREIGN_PRIMARY_TOKENS): nothing publishes
+    another account's token under this row's stamp.
 
     ``republish`` is the authority's own payload: the write publishes it with
     the account's stamp (a re-stamp adds the stamp and the config identity,
@@ -446,6 +479,11 @@ def activate_account(
 
     >>> # Tested via test_credential_runtime.py and test_refresh_downgrade_guard.py
     """
+    if republish is None and publishes_foreign_primary(account):
+        logger.warning(
+            "Account %d: activation refused; %s", int(account["id"]), FOREIGN_PRIMARY_MESSAGE
+        )
+        return _unusable(operation_id, account, FOREIGN_PRIMARY_MESSAGE, FOREIGN_PRIMARY_CODE)
     home = Path.home()
     try:
         identity = detect_claude_identity(home)

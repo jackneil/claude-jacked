@@ -1980,7 +1980,55 @@ class Database:
             )
             return cursor.rowcount > 0
 
-    def mark_account_validated(self, account_id: int) -> bool:
+    def account_id_for_refresh_token(self, refresh_token: Optional[str]) -> Optional[int]:
+        """The id of the live row that stores ``refresh_token``, or None.
+
+        A refresh token is issued to one account, so the row that stores it
+        names the owner of a live credential store without a network
+        request (``refresh_guard``). The token counts as the row's Claude
+        Code refresh token, or as its primary refresh token while no
+        cross-account verdict binds it (``foreign_token_fp``): a bound
+        primary token belongs to another account and names no owner.
+
+        >>> db = Database(":memory:")
+        >>> a = db.create_account("a@t.com", "at", 9999999999, refresh_token="rt-a")
+        >>> b = db.create_account("b@t.com", "bt", 9999999999)
+        >>> _ = db.update_account(b["id"], cc_access_token="cc-b", cc_refresh_token="cc-rt-b")
+        >>> db.account_id_for_refresh_token("rt-a") == a["id"]
+        True
+        >>> db.account_id_for_refresh_token("cc-rt-b") == b["id"]
+        True
+        >>> db.account_id_for_refresh_token("rt-x"), db.account_id_for_refresh_token(None)
+        (None, None)
+        >>> from jacked.web.refresh_verdict import token_fingerprint
+        >>> _ = db.update_account(a["id"], foreign_token_fp=token_fingerprint("rt-a"))
+        >>> db.account_id_for_refresh_token("rt-a") is None
+        True
+        """
+        if not isinstance(refresh_token, str) or not refresh_token:
+            return None
+        from jacked.web.refresh_verdict import primary_tokens_foreign
+
+        with self._reader() as conn:
+            rows = conn.execute(
+                """SELECT id, refresh_token, cc_refresh_token, foreign_token_fp
+                   FROM accounts
+                   WHERE is_deleted = 0
+                     AND (refresh_token = ? OR cc_refresh_token = ?)
+                   ORDER BY id""",
+                (refresh_token, refresh_token),
+            ).fetchall()
+        for row in rows:
+            row = dict(row)
+            if row.get("cc_refresh_token") == refresh_token:
+                return int(row["id"])
+            if not primary_tokens_foreign(row):
+                return int(row["id"])
+        return None
+
+    def mark_account_validated(
+        self, account_id: int, *, access_token: Optional[str] = None
+    ) -> bool:
         """Record a successful credential validation without hiding usage failures.
 
         Validation owns ``validation_status`` and ``last_validated_at``. It
@@ -1995,8 +2043,16 @@ class Database:
         validation itself and the watchdog write. The check and the write
         are one statement, so a concurrent usage failure is never wiped.
 
+        With ``access_token``, the write is a compare-and-swap on it: a
+        validation proves the token it sent, and a re-authorization that
+        stored another token meanwhile keeps its own status (False).
+
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@t.com", "tok", 9999999999)
+        >>> db.mark_account_validated(acct["id"], access_token="other")
+        False
+        >>> db.mark_account_validated(acct["id"], access_token="tok")
+        True
         >>> _ = db.record_account_error(acct["id"], "usage failed")
         >>> db.mark_account_validated(acct["id"])
         True
@@ -2010,9 +2066,14 @@ class Database:
         True
         """
         now = datetime.now(timezone.utc).isoformat()
+        params: list = [int(time.time()), now, account_id]
+        guard = ""
+        if access_token is not None:
+            guard = " AND access_token = ?"
+            params.append(access_token)
         with self._writer() as conn:
             cursor = conn.execute(
-                """UPDATE accounts SET
+                f"""UPDATE accounts SET
                     validation_status = 'valid',
                     last_validated_at = ?,
                     last_error = CASE WHEN COALESCE(consecutive_failures, 0) = 0
@@ -2020,8 +2081,8 @@ class Database:
                     last_error_at = CASE WHEN COALESCE(consecutive_failures, 0) = 0
                                          THEN NULL ELSE last_error_at END,
                     updated_at = ?
-                   WHERE id = ? AND is_deleted = 0""",
-                (int(time.time()), now, account_id),
+                   WHERE id = ? AND is_deleted = 0{guard}""",
+                tuple(params),
             )
             return cursor.rowcount > 0
 

@@ -177,11 +177,39 @@ def add_codex_account(
     status = detect_codex_account(home, env)
     if not run_login:
         _refuse_unless_importable(status)
+    needs_login = _needs_login(status)
+    if needs_login and login_runner is None and not find_bin("codex"):
+        # Refuse before the store flip: without the CLI no login can write
+        # the auth.json that a "file" store needs.
+        raise CodexImportError("the `codex` CLI is not installed or not on PATH")
+    config_path = home / "config.toml"
+    before = config_path.read_bytes() if config_path.exists() else None
     ensure_file_storage(home, env)
-    if _needs_login(status):
-        (login_runner or _run_codex_login)(home, env)
+    if needs_login:
+        try:
+            (login_runner or _run_codex_login)(home, env)
+        except BaseException:
+            # The login did not write auth.json: put the store back the way
+            # it was, or Codex would read an absent file.
+            _restore_config(config_path, before)
+            raise
 
     return import_codex_account(db, home=home, env=env, make_active=make_active)
+
+
+def _restore_config(config_path: Path, before: Optional[bytes]) -> None:
+    """Restore ``config.toml`` to ``before`` (None: it did not exist)."""
+    try:
+        if before is None:
+            config_path.unlink(missing_ok=True)
+        else:
+            config_path.write_bytes(before)
+    except OSError as exc:
+        logger.warning(
+            "Could not restore config.toml after a failed Codex login (%s); "
+            "cli_auth_credentials_store may now read \"file\"",
+            type(exc).__name__,
+        )
 
 
 _NO_SIGN_IN = "no Codex account is signed in. Run `codex login` first."

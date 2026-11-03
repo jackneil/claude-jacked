@@ -1255,6 +1255,41 @@ def write_platform_credentials(data: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 
+class ForeignPrimaryTokens(ValueError):
+    """The row would publish its primary tokens, and they belong to a
+    different account (``refresh_verdict.primary_tokens_foreign``)."""
+
+
+FOREIGN_PRIMARY_MESSAGE = (
+    "the account's primary tokens belong to a different account (re-auth required)"
+)
+# The stable machine-readable code of that refusal (``SwitchResult.code``).
+FOREIGN_PRIMARY_CODE = "FOREIGN_PRIMARY_TOKENS"
+
+
+def publishes_foreign_primary(account: dict) -> bool:
+    """True when a publication of ``account`` would fall back to primary
+    tokens that belong to a different account: nothing may publish it.
+
+    The answer is ``build_oauth_data``'s own: the one builder decides which
+    chain a row publishes, so no second copy of that decision can drift.
+
+    >>> from jacked.web.refresh_verdict import token_fingerprint
+    >>> bound = {"access_token": "p", "refresh_token": "rt", "foreign_token_fp": token_fingerprint("rt")}
+    >>> publishes_foreign_primary(bound)
+    True
+    >>> publishes_foreign_primary({**bound, "cc_access_token": "a", "cc_refresh_token": "r"})
+    False
+    >>> publishes_foreign_primary({"access_token": "p", "refresh_token": "rt"})
+    False
+    """
+    try:
+        build_oauth_data(account)
+    except ForeignPrimaryTokens:
+        return True
+    return False
+
+
 def build_oauth_data(account: dict) -> dict:
     """Build Claude Code credential format from account dict.
 
@@ -1262,6 +1297,11 @@ def build_oauth_data(account: dict) -> dict:
     Falls back to primary tokens when CC tokens don't exist yet.
     CRITICAL: The fallback path sets refreshToken to None to prevent
     Claude Code from consuming the primary refresh token.
+
+    Raises ``ForeignPrimaryTokens`` instead of falling back to the primary
+    tokens while a cross-account verdict binds them
+    (``publishes_foreign_primary``): no publisher hands another account's
+    token to Claude Code under this row's stamp.
 
     >>> build_oauth_data({"access_token": "at", "refresh_token": "rt", "expires_at": 100, "scopes": None, "subscription_type": "max", "rate_limit_tier": "t1"})["accessToken"]
     'at'
@@ -1328,6 +1368,14 @@ def build_oauth_data(account: dict) -> dict:
     # Fallback: primary tokens, but NEVER expose primary refresh_token.
     # If Claude Code consumed this refresh token, it would break jacked's
     # background refresh — the exact bug dual-token architecture prevents.
+    from jacked.web.refresh_verdict import primary_tokens_foreign
+
+    if primary_tokens_foreign(account):
+        # The primary tokens belong to another account (a validation bound
+        # the verdict to the stored refresh token): the fallback would hand
+        # that account's token to Claude Code under this row's stamp. Every
+        # publisher fails closed instead.
+        raise ForeignPrimaryTokens(FOREIGN_PRIMARY_MESSAGE)
     return {
         "accessToken": account.get("access_token", ""),
         "refreshToken": None,  # NEVER expose primary refresh_token

@@ -27,6 +27,7 @@ import click
 
 from jacked.findbin import find_bin
 from jacked.api.credential_helpers import (
+    FOREIGN_PRIMARY_MESSAGE,
     _malformed_expiry,
     _safe_replace,
     build_oauth_data,
@@ -37,8 +38,10 @@ from jacked.api.credential_helpers import (
     expiry_seconds,
     is_primary_publication,
     live_payload_ownership,
+    publishes_foreign_primary,
 )
 from jacked.credentials.refresh_guard import (
+    lineage_finder,
     CC_REAUTH_REQUIRED_CODE,
     refuses_refresh_downgrade,
 )
@@ -518,12 +521,38 @@ def _publish_launch_credentials(
         )
 
 
-def _keeps_scoped_lineage(account: dict, existing: dict) -> bool:
+def _refuse_foreign_primary(account: dict) -> None:
+    """Stop the launch of a row whose primary tokens belong to another account.
+
+    The per-account file would carry the other account's token under this
+    row's directory (``publishes_foreign_primary``). The copy is the use
+    route's.
+
+    >>> _refuse_foreign_primary({"id": 1, "access_token": "at", "refresh_token": "rt"})
+    >>> from jacked.web.refresh_verdict import token_fingerprint
+    >>> bound = {"id": 1, "access_token": "at", "refresh_token": "rt",
+    ...          "foreign_token_fp": token_fingerprint("rt")}
+    >>> try:
+    ...     _refuse_foreign_primary(bound)
+    ... except click.ClickException as exc:
+    ...     print(exc.message)
+    Account 1 has invalid credentials. Re-auth first. Reason: the account's primary tokens belong to a different account (re-auth required).
+    """
+    if publishes_foreign_primary(account):
+        raise click.ClickException(
+            f"Account {account.get('id')} has invalid credentials. Re-auth first. "
+            f"Reason: {FOREIGN_PRIMARY_MESSAGE}."
+        )
+
+
+def _keeps_scoped_lineage(account: dict, existing: dict, db=None) -> bool:
     """True when the row's pair would put a null refresh token over the
     per-account file's live one of this account (refresh_guard, #149i).
 
     The file is unstamped, so the shared ownership rule does not require a
-    stamp. A refusal is logged once with the row id and no token.
+    stamp. With ``db``, the row that stores the file's refresh token names
+    its owner first, which spares the profile request. A refusal is logged
+    once with the row id and no token.
 
     >>> row = {"id": 4, "cc_access_token": "at", "cc_refresh_token": None,
     ...        "cc_expires_at": 9999999999, "cc_refresh_failure_type": "invalid_grant"}
@@ -532,7 +561,9 @@ def _keeps_scoped_lineage(account: dict, existing: dict) -> bool:
     >>> _keeps_scoped_lineage(row, {})
     False
     """
-    reason = refuses_refresh_downgrade(build_oauth_data(account), existing, account)
+    reason = refuses_refresh_downgrade(
+        build_oauth_data(account), existing, account, lineage_known=lineage_finder(db)
+    )
     if reason is None:
         return False
     logger.warning("Account %d: %s", int(account["id"]), reason)
@@ -742,6 +773,9 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
         except (json.JSONDecodeError, OSError):
             existing = {}
 
+    # The row as re-read above may be bound to another account's tokens
+    # since the resolver checked it: the publish below must never carry them.
+    _refuse_foreign_primary(account)
     kept_rotation = rescue == "deferred" and isinstance(existing.get("claudeAiOauth"), dict)
     if kept_rotation:
         # The file's tokens could not be checked (the profile request failed):
@@ -752,7 +786,7 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
             "not be checked (lookup failed); keeping them for this launch",
             account_id,
         )
-    elif _keeps_scoped_lineage(account, existing):
+    elif _keeps_scoped_lineage(account, existing, db):
         # The file holds this account's own live refresh token and the row
         # would replace it with null: the launch keeps the file's tokens.
         pass
@@ -944,6 +978,7 @@ def resolve_account(account_ref, db: Database) -> dict:
             f"Account {account.get('id')} ({account.get('email')}) is a Codex account. "
             f"Launch it with: jacked codex launch {account.get('id')}"
         )
+    _refuse_foreign_primary(account)
 
     return account
 

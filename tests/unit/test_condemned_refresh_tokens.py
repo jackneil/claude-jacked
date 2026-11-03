@@ -297,6 +297,30 @@ class TestSuccessiveCcFailures:
         assert db.get_account(account_id)["cc_refresh_failed_token_fp"] == (
             token_fingerprint("cc_rt_1"))
 
+    def test_a_lineage_re_authorized_during_the_clean_up_records_the_failed_token(self, tmp_path):
+        """The invalid_grant was about cc_rt_1; a re-auth stored cc_rt_new
+        before the clean-up ran. The new lineage is kept, and the fingerprint
+        of the token that died is still recorded beside it, newest first."""
+        db, account_id = _cc_account(tmp_path)
+        db.update_account(account_id, cc_refresh_failed_token_fp=token_fingerprint("cc_rt_0"))
+        db.update_account(account_id, cc_access_token="cc_at_new", cc_refresh_token="cc_rt_new")
+
+        result = _died(db, account_id, "cc_rt_1", None)
+
+        assert result.success is True and result.access_token == "cc_at_new"
+        row = db.get_account(account_id)
+        assert row["cc_refresh_token"] == "cc_rt_new"
+        assert row["cc_refresh_failure_type"] is None
+        assert condemned_fingerprints(row["cc_refresh_failed_token_fp"]) == (
+            token_fingerprint("cc_rt_1"), token_fingerprint("cc_rt_0"))
+
+    def test_a_kept_lineage_records_the_failed_token_only_once(self, tmp_path):
+        db, account_id = _cc_account(tmp_path)
+        db.update_account(account_id, cc_refresh_token="cc_rt_new")
+        _died(db, account_id, "cc_rt_1", None)
+        _died(db, account_id, "cc_rt_1", None)
+        assert db.get_account(account_id)["cc_refresh_failed_token_fp"] == token_fingerprint("cc_rt_1")
+
     def test_an_adoption_records_the_failed_token_too(self, tmp_path):
         """F-7: every branch records the failed token's fingerprint; the
         adoption branch still clears the breaker."""

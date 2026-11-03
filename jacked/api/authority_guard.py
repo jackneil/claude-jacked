@@ -609,10 +609,16 @@ def _attempt_repair(
 
 def _requested_fingerprint(row: dict, republish: dict | None) -> str:
     """The fingerprint of the pair a repair asked the engine to publish."""
-    from jacked.api.credential_helpers import build_oauth_data
+    from jacked.api.credential_helpers import ForeignPrimaryTokens, build_oauth_data
     from jacked.credentials.fingerprint import payload_fingerprint
 
-    oauth = republish.get("claudeAiOauth") if republish is not None else build_oauth_data(row)
+    if republish is not None:
+        oauth = republish.get("claudeAiOauth")
+    else:
+        try:
+            oauth = build_oauth_data(row)
+        except ForeignPrimaryTokens:
+            return ""  # nothing publishable was requested
     return payload_fingerprint(oauth)
 
 

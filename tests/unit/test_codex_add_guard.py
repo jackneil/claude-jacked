@@ -68,6 +68,53 @@ def test_a_login_that_follows_still_forces_file_storage(db, tmp_path):
     assert acct["email"] == "dev@example.com"
 
 
+def test_a_missing_cli_refuses_before_the_store_flip(db, tmp_path, monkeypatch):
+    """Without the `codex` CLI no login can write auth.json, so the store is
+    not flipped to "file" first (that would sign the user out)."""
+    home = _home(tmp_path, auth=None, config=KEYRING)
+    before = _config_bytes(home)
+    monkeypatch.setattr(codex_accounts, "find_bin", lambda name: None)
+    monkeypatch.setattr(
+        codex_accounts, "ensure_file_storage",
+        lambda *_a, **_k: pytest.fail("the store must not be flipped without a CLI"),
+    )
+
+    with pytest.raises(CodexImportError, match="codex.*CLI"):
+        add_codex_account(db, home=home, run_login=True)
+
+    assert _config_bytes(home) == before
+
+
+@pytest.mark.parametrize("config", [KEYRING, None], ids=["keyring-config", "no-config"])
+def test_a_failed_login_restores_the_store(db, tmp_path, config):
+    """`codex login` failed or was interrupted: config.toml goes back to what
+    it was (or away, when it did not exist), so Codex does not read an
+    absent auth.json."""
+    home = _home(tmp_path, auth=None, config=config)
+    before = _config_bytes(home)
+
+    def login(_home, _env):
+        raise CodexImportError("`codex login` failed (exit 1)")
+
+    with pytest.raises(CodexImportError, match="exit 1"):
+        add_codex_account(db, home=home, run_login=True, login_runner=login)
+
+    assert _config_bytes(home) == before
+    assert db.list_accounts(include_inactive=True) == []
+
+
+def test_an_interrupted_login_restores_the_store_too(db, tmp_path):
+    home = _home(tmp_path, auth=None, config=KEYRING)
+
+    def login(_home, _env):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        add_codex_account(db, home=home, run_login=True, login_runner=login)
+
+    assert _config_bytes(home) == KEYRING.encode()
+
+
 def test_a_present_file_credential_is_imported_without_a_login(db, tmp_path, monkeypatch):
     home = _home(tmp_path, auth=_auth_json(), config=AUTO)
     monkeypatch.setattr(

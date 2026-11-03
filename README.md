@@ -731,7 +731,7 @@ jacked switches a Codex account only when Codex keeps the credential in the `aut
 2. Run `codex login`.
 3. Click **Add Account**, then click **Codex**.
 
-On the computer that runs jacked, you can use `jacked codex add` instead. When jacked cannot switch the store, this command sets `cli_auth_credentials_store = "file"`, then runs `codex login`, then adds the account. With `--no-login`, the command does not sign in, so it refuses the same as the dashboard.
+On the computer that runs jacked, you can use `jacked codex add` instead. When jacked cannot switch the store, this command sets `cli_auth_credentials_store = "file"`, then runs `codex login`, then adds the account. With `--no-login`, the command does not sign in, so it refuses the same as the dashboard. The command finds the `codex` CLI before it changes the store. If `codex login` fails, or you stop it, jacked puts `config.toml` back as it was, so Codex does not read an `auth.json` that does not exist.
 
 ### What if jacked cannot open the sign-in window for a re-auth?
 

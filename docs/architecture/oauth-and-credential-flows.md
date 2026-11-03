@@ -88,7 +88,9 @@ The dead-chain rule:
   consumer can then send a dead token.
 - The flow adds the fingerprint of the failed `cc` refresh token to
   `cc_refresh_failed_token_fp`. It also does this when it adopts a new live
-  lineage. The column keeps the fingerprint of each condemned `cc` token. The
+  lineage, and when a re-authorization stored a new `cc` lineage before the
+  clean-up ran: the clean-up keeps the new lineage and still records the
+  token that died. The column keeps the fingerprint of each condemned `cc` token. The
   newest fingerprint is first, and a space separates two fingerprints. A dead
   token stays dead, so the flow never removes an earlier fingerprint.
 - No importer adopts a `cc` refresh token with one of these fingerprints.
@@ -191,9 +193,15 @@ the token works. It does not prove that the token belongs to the row. When
 the profile names another account (another email, organization, or account
 uuid), validation applies nothing from the profile. It marks the row
 `invalid` with the error `Token belongs to a different account`. It writes
-this mark only while the row holds the token that it checked. A profile with
-no owner value (no account object or no email) is not evidence of another
-owner. The request after a token renewal uses the same rule.
+this mark only while the row holds the token that it checked. The `valid`
+mark follows the same rule: validation records it only while the row holds
+the access token that it checked. When a re-authorization stored another
+token meanwhile, validation records nothing and asks for a new check. A
+profile with no owner value (no account object or no email) is not evidence
+of another owner. While `foreign_token_fp` binds the row's primary refresh
+token, such a profile proves no owner: the verdict stands, and validation
+does not mark the row valid. The request after a token renewal uses the same
+rule.
 
 The mark also binds the verdict to the row's primary refresh token:
 `foreign_token_fp` holds the fingerprint of that token. While the row holds a
@@ -216,6 +224,22 @@ account. That validation clears the fingerprint only while the row holds the
 access token that it checked. A row that carries the text of the verdict
 with no fingerprint (a mark from before the column) is bound one time when
 the schema opens, before any refresh path runs.
+
+No publisher writes the primary tokens of a bound row to a credential store.
+`build_oauth_data()` in `jacked/api/credential_helpers.py` builds the payload
+for every publisher. It refuses (`ForeignPrimaryTokens`) when
+`foreign_token_fp` binds the row's primary refresh token and the row has no
+usable Claude Code chain of its own. Each publisher then fails closed. The
+switch engine answers `unusable` with code `FOREIGN_PRIMARY_TOKENS` before it
+resolves the platform, and its preflight refuses inside the lease when a
+validation bound the row after that check. The auto-swap skips the target and
+logs one line. The launch stops with the message of the use route, in the
+resolver and again before it writes the per-account file. A re-stamp
+publishes the authority's own payload, so the verdict does not apply to it.
+The window keeper sends no bound primary token: a ping is a usage request,
+and it would open the other account's window under this row. A bound row with
+a usable Claude Code chain publishes that chain, which is the row's own
+lineage.
 
 Each write that validation makes after a request is a compare-and-swap on
 the access token that the request sent. Thus a re-authorization that lands
@@ -561,6 +585,14 @@ readback cannot prove what an already-running Claude process cached.
   2. The authority holds a refresh token that is a non-empty string.
   3. The shared ownership rule proves that the authority tokens belong to the
      target row. The rule does not require a stamp.
+- Before the rule costs a profile request, the writer asks the database which
+  row stores the authority's refresh token (`account_id_for_refresh_token()`
+  in `jacked/web/database.py`, passed as `lineage_known`). A refresh token is
+  issued to one account. The target row: the write is refused. Another row:
+  the write goes ahead. No row, or a failed lookup: the ownership rule
+  decides. A primary refresh token that `foreign_token_fp` binds names no
+  row. The engine preflight, the auto-swap request and the launch's
+  scoped-file check pass the finder.
 - An empty store and a payload of another owner do not stop the write. A
   payload whose owner could not be checked (the profile request failed) is
   refused with `busy` and code `OWNERSHIP_UNCHECKED`: a transient refusal
@@ -596,7 +628,7 @@ readback cannot prove what an already-running Claude process cached.
 | `failed_preserved` | Failure occurred and the previous authority value was observed intact |
 | `indeterminate` | The authority cannot be classified safely as before or target |
 | `restart_required` | The requested background operation cannot safely activate an uncooperative topology |
-| `unusable` | The request or store state cannot form a safe transaction. Code `CC_REAUTH_REQUIRED` means the write would put a null refresh token over a live one |
+| `unusable` | The request or store state cannot form a safe transaction. Code `CC_REAUTH_REQUIRED` means the write would put a null refresh token over a live one. Code `FOREIGN_PRIMARY_TOKENS` means the row's primary tokens belong to a different account and the row has no Claude Code chain to publish |
 | `unsupported` | A certified capability, complete writer evidence, or platform support is absent |
 | `diverged` | Pre-write stores conflict in a mode that cannot repair safely, including a missing authority with a readable required mirror |
 
