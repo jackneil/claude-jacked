@@ -126,3 +126,75 @@ def test_invalid_utf8_raises_the_settings_error(tmp_path):
     p.write_bytes(b'{"k": "\xff"}')
     with pytest.raises(SettingsUnreadableError):
         settings_io.read_settings(p)
+
+
+# --------------------------------------------------------------------------- #
+# W4: a write never makes a settings file that the reader refuses
+# --------------------------------------------------------------------------- #
+
+# 800,000 "é" are 1.6 MB as UTF-8, but json.dumps writes each one as the
+# 6-byte escape é, so the file would be about 4.8 MB.
+_TOO_LARGE = {"k": "é" * 800_000}
+
+
+def _writers(tmp_path, monkeypatch):
+    from jacked import cli
+    from jacked.api.routes import features
+
+    monkeypatch.setattr(features, "SETTINGS_JSON", tmp_path / "settings.json")
+    return {
+        "settings_io": lambda data: settings_io.write_settings(tmp_path / "settings.json", data),
+        "cli": lambda data: cli._write_settings_atomic(tmp_path / "settings.json", data),
+        "features": features._write_settings_json,
+    }
+
+
+@pytest.mark.parametrize("writer", ["settings_io", "cli", "features"])
+def test_settings_over_the_limit_are_refused_before_the_file_changes(tmp_path, monkeypatch, writer):
+    path = tmp_path / "settings.json"
+    original = b'{\n  "hooks": {}\n}\n'
+    path.write_bytes(original)
+
+    with pytest.raises(settings_io.SettingsTooLargeError) as caught:
+        _writers(tmp_path, monkeypatch)[writer](_TOO_LARGE)
+
+    assert path.read_bytes() == original
+    assert str(settings_io.SETTINGS_MAX_BYTES) in str(caught.value)
+    assert str(len(json.dumps(_TOO_LARGE, indent=2).encode("utf-8"))) in str(caught.value)
+    assert isinstance(caught.value, SettingsUnreadableError)
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_settings_text_counts_the_text_mode_line_endings(monkeypatch):
+    data = {"k": "x" * 100}
+    size = len(json.dumps(data, indent=2).encode("utf-8"))
+    monkeypatch.setattr(settings_io, "SETTINGS_MAX_BYTES", size)
+    assert settings_io.settings_text(data) == json.dumps(data, indent=2)
+    monkeypatch.setattr(settings_io.os, "linesep", "\r\n")
+    with pytest.raises(settings_io.SettingsTooLargeError):
+        settings_io.settings_text(data)
+
+
+def test_settings_at_the_limit_are_written_and_read_back(tmp_path, monkeypatch):
+    data = {"k": "x" * 100}
+    monkeypatch.setattr(settings_io, "SETTINGS_MAX_BYTES",
+                        len(json.dumps(data, indent=2).encode("utf-8")))
+    path = tmp_path / "settings.json"
+    settings_io.write_settings(path, data)
+    assert settings_io.read_settings(path) == data
+
+
+def test_the_raw_settings_route_answers_413_for_settings_over_the_limit(tmp_path, monkeypatch):
+    import asyncio
+
+    from jacked.api.routes import features
+
+    path = tmp_path / "settings.json"
+    path.write_bytes(b"{}\n")
+    monkeypatch.setattr(features, "SETTINGS_JSON", path)
+    response = asyncio.run(features.set_raw_settings(
+        features.RawSettingsRequest(content=_TOO_LARGE, confirm_overwrite=True)
+    ))
+    assert response.status_code == 413
+    assert json.loads(response.body)["error"]["code"] == "SETTINGS_TOO_LARGE"
+    assert path.read_bytes() == b"{}\n"

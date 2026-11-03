@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from jacked import project_dirs as pd
 from jacked import recover as rec
 
 
@@ -415,7 +416,7 @@ def test_read_cwd_skips_a_line_over_the_limit_with_bounded_memory(tmp_path):
 
     tracemalloc.start()
     try:
-        cwd = rec._read_cwd(path)
+        cwd = pd._read_cwd(path)
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -433,7 +434,7 @@ def test_a_line_of_exactly_the_limit_is_parsed(tmp_path, monkeypatch):
     assert len(record) == 64
     path = tmp_path / "s.jsonl"
     path.write_text(record + "\n", encoding="utf-8")
-    assert rec._read_cwd(path) == "/c"
+    assert pd._read_cwd(path) == "/c"
 
 
 def test_a_skipped_line_is_logged_with_its_size(tmp_path, monkeypatch, caplog):
@@ -446,14 +447,21 @@ def test_a_skipped_line_is_logged_with_its_size(tmp_path, monkeypatch, caplog):
     path.write_bytes(b"y" * 200 + b"\n" + json.dumps({"cwd": "/c"}).encode() + b"\n")
     caplog.set_level(logging.DEBUG, logger="jacked.jsonl_lines")
 
-    assert rec._read_cwd(path) == "/c"
+    assert pd._read_cwd(path) == "/c"
     assert any("201 bytes" in r.getMessage() for r in caplog.records)
 
 
-def test_iter_records_skips_a_line_that_is_not_utf8_and_continues(tmp_path):
+def test_iter_records_skips_a_line_that_is_not_utf8_and_continues(tmp_path, caplog):
+    import logging
+
     path = tmp_path / "s.jsonl"
-    path.write_bytes(b'{"cwd": "/bad\xe2\x82"}\n' + json.dumps({"cwd": "/good"}).encode() + b"\n")
+    path.write_bytes(b"\n" + b'{"cwd": "/bad\xe2\x82"}\n' + json.dumps({"cwd": "/good"}).encode() + b"\n")
+    caplog.set_level(logging.DEBUG, logger="jacked.jsonl_lines")
+
     assert list(rec._iter_records(path)) == [{"cwd": "/good"}]
+    (record,) = [r for r in caplog.records if r.name == "jacked.jsonl_lines"]
+    assert record.getMessage() == "jsonl: skipped line 2 (UnicodeDecodeError)"
+    assert "/bad" not in record.getMessage()  # never the content
 
 
 def test_read_cwd_ignores_a_cwd_that_is_not_a_string(tmp_path):
@@ -463,24 +471,189 @@ def test_read_cwd_ignores_a_cwd_that_is_not_a_string(tmp_path):
         + json.dumps({"cwd": "/str"}) + "\n",
         encoding="utf-8",
     )
-    assert rec._read_cwd(path) == "/str"
+    assert pd._read_cwd(path) == "/str"
 
 
-def test_read_cwd_can_stop_after_a_number_of_records(tmp_path):
+def test_read_cwd_can_stop_after_a_number_of_lines(tmp_path):
     path = tmp_path / "s.jsonl"
     path.write_text(
-        json.dumps({"type": "summary"}) + "\n" + json.dumps({"cwd": "/late"}) + "\n",
+        json.dumps({"type": "summary"}) + "\n\n" + json.dumps({"cwd": "/late"}) + "\n",
         encoding="utf-8",
     )
-    assert rec._read_cwd(path, max_records=1) is None
-    assert rec._read_cwd(path, max_records=2) == "/late"
+    assert pd._read_cwd(path, max_lines=2) is None  # a blank line counts too
+    assert pd._read_cwd(path, max_lines=3) == "/late"
 
 
-def test_scan_candidate_survives_bad_lines(tmp_path):
+def test_read_cwd_stops_reading_at_the_line_bound(tmp_path, monkeypatch):
+    """Malformed lines count, and the bound is checked before the next line
+    is read, so a damaged tail of 100,000 lines is never read."""
+    head = (json.dumps({"type": "summary"}) + "\n").encode() * 20
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(head + b"{not json\n" * 100_000)
+    consumed = []
+    real_open = open
+
+    class Counting:
+        def __init__(self, f):
+            self._f = f
+
+        def readline(self, size=-1):
+            data = self._f.readline(size)
+            consumed.append(len(data))
+            return data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._f.close()
+
+    monkeypatch.setattr(pd, "open", lambda *a, **k: Counting(real_open(*a, **k)), raising=False)
+
+    assert pd._read_cwd(path, max_lines=20) is None
+    assert sum(consumed) == len(head)
+
+
+def test_scan_candidate_survives_bad_lines(tmp_path, caplog):
+    import logging
+
     path = tmp_path / "11111111-1111-1111-1111-111111111111.jsonl"
     path.write_bytes(
         b"[1, 2]\n" + b"\xff\xfe\n" + json.dumps(_user_line("/c")).encode() + b"\n"
     )
+    caplog.set_level(logging.DEBUG, logger="jacked.jsonl_lines")
     cand = rec._scan_candidate(path)
     assert cand.msg_count == 1
     assert cand.truncated is False
+    assert [r.getMessage() for r in caplog.records if r.name == "jacked.jsonl_lines"] == [
+        "jsonl: skipped line 2 (UnicodeDecodeError)",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# W1: a long cwd resolves through the full Claude Code name, never ENAMETOOLONG
+# --------------------------------------------------------------------------- #
+
+_LONG_EMOJI_CWD = "/tmp/" + "/".join(["a" * 40 + "\U0001F600" * 20] * 4)
+
+
+def test_a_long_emoji_cwd_resolves_through_the_hashed_fast_path(tmp_path):
+    import os
+
+    from jacked.project_slug import project_dir_name
+
+    projects = tmp_path / "projects"
+    name = project_dir_name(_LONG_EMOJI_CWD)
+    # The raw encoding is over the 255-byte file name limit; the real name is not.
+    assert len(rec._encode_cwd(_LONG_EMOJI_CWD)) > 255
+    assert len(name) <= 255
+    real = _write_session(projects / name, SID_A, [_user_line(_LONG_EMOJI_CWD)])
+    # A decoy that recorded the same cwd more recently wins only in the search,
+    # so the result proves that the fast path found the hashed folder.
+    decoy = _write_session(projects / "-decoy", SID_A, [_user_line(_LONG_EMOJI_CWD)])
+    os.utime(real, (1_000_000, 1_000_000))
+    os.utime(decoy, (2_000_000, 2_000_000))
+    assert rec.resolve_project_dir(_LONG_EMOJI_CWD, projects_root=projects) == projects / name
+
+
+def test_a_fast_path_os_error_falls_through_to_the_search(tmp_path, monkeypatch):
+    projects = tmp_path / "projects"
+    cwd = "/some/repo"
+    pdir = projects / "-folder-with-another-name"
+    _write_session(pdir, SID_A, [_user_line(cwd)])
+    # A name over the file name limit makes the fast-path stat raise ENAMETOOLONG.
+    monkeypatch.setattr(pd, "project_dir_name", lambda path: "x" * 400)
+    assert rec.resolve_project_dir(cwd, projects_root=projects) == pdir
+
+
+def test_the_slug_names_stay_importable_from_both_modules():
+    from jacked import project_slug
+    from jacked.memory import claude_paths
+
+    assert rec._encode_cwd(_LONG_EMOJI_CWD) == project_slug.encode(_LONG_EMOJI_CWD)
+    assert claude_paths.project_dir_name(_LONG_EMOJI_CWD) == project_slug.project_dir_name(
+        _LONG_EMOJI_CWD
+    )
+
+
+# --------------------------------------------------------------------------- #
+# W3: a record nested too deep for the parser is a malformed line, not a crash
+# --------------------------------------------------------------------------- #
+
+_DEEP = "[" * 10_000 + "]" * 10_000
+
+
+def test_a_record_nested_too_deep_is_skipped_with_its_line_number(tmp_path, caplog):
+    import logging
+
+    from jacked import jsonl_lines
+
+    path = tmp_path / "s.jsonl"
+    path.write_text("\n" + _DEEP + "\n" + json.dumps({"cwd": "/after"}) + "\n", encoding="utf-8")
+    caplog.set_level(logging.DEBUG, logger="jacked.jsonl_lines")
+
+    assert list(rec._iter_records(path)) == [{"cwd": "/after"}]
+    with open(path, "rb") as f:
+        assert list(jsonl_lines.iter_objects(f)) == [(2, None), (3, {"cwd": "/after"})]
+    assert pd._read_cwd(path) == "/after"
+    assert any("line 2" in r.getMessage() and "too deep" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_a_record_nested_too_deep_does_not_stop_the_candidate_scan(tmp_path):
+    pdir = tmp_path / "p"
+    path = _write_session(pdir, SID_A, [_user_line("/repo")])
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(_DEEP + "\n")
+    (cand,) = rec.list_candidates(pdir)
+    assert cand.msg_count == 1
+    assert cand.truncated is True
+
+
+# --------------------------------------------------------------------------- #
+# W10: the project-folder search reads a bounded number of lines per transcript
+# --------------------------------------------------------------------------- #
+
+def test_the_folder_search_reads_at_most_cwd_lines_per_transcript(tmp_path, monkeypatch):
+    head = (json.dumps({"type": "summary"}) + "\n").encode() * pd.CWD_LINES
+    folder = tmp_path / "-some-folder"
+    folder.mkdir()
+    (folder / f"{SID_A}.jsonl").write_bytes(head + b"{not json\n" * 100_000)
+    consumed = []
+    real_open = open
+
+    class Counting:
+        def __init__(self, f):
+            self._f = f
+
+        def readline(self, size=-1):
+            data = self._f.readline(size)
+            consumed.append(len(data))
+            return data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._f.close()
+
+    monkeypatch.setattr(pd, "open", lambda *a, **k: Counting(real_open(*a, **k)), raising=False)
+
+    assert pd._dir_matches_cwd(folder, "/repo") is False
+    assert sum(consumed) == len(head)
+
+
+def test_the_folder_search_finds_a_cwd_on_the_last_line_of_the_bound(tmp_path):
+    filler = json.dumps({"type": "summary"}) + "\n"
+    folder = tmp_path / "-x"
+    folder.mkdir()
+    path = folder / f"{SID_A}.jsonl"
+    path.write_text(filler * (pd.CWD_LINES - 1) + json.dumps({"cwd": "/repo"}) + "\n",
+                    encoding="utf-8")
+    assert pd._dir_matches_cwd(folder, "/repo") is True
+    path.write_text(filler * pd.CWD_LINES + json.dumps({"cwd": "/repo"}) + "\n", encoding="utf-8")
+    assert pd._dir_matches_cwd(folder, "/repo") is False
+
+
+def test_the_cwd_bound_is_ten_times_the_measured_depth():
+    assert pd.CWD_LINES == 200 >= 10 * 8

@@ -165,6 +165,13 @@ def _isolate_home(monkeypatch, tmp_path_factory):
     monkeypatch.delenv("JACKED_HOME", raising=False)
     for var in CLAUDE_SESSION_ENV:
         monkeypatch.delenv(var, raising=False)
+    # The load-budget walk reads CLAUDE.md files up to the filesystem root.
+    # It stops at the pytest base folder here, so a real over-budget file
+    # above the pytest tree (a developer HOME, a Windows temp folder) cannot
+    # change a test result. A test of the walk itself sets the stop itself.
+    from jacked.memory import load_budget
+
+    monkeypatch.setattr(load_budget, "ANCESTOR_STOP", tmp_path_factory.getbasetemp())
     yield home
 
 

@@ -2843,13 +2843,13 @@ def _rotate_backups(dir_path: Path, prefix: str, keep: int = 5) -> None:
 def _write_settings_atomic(settings_path: Path, data: dict) -> None:
     """Atomically write settings.json through the shared atomic writer.
 
-    Prevents half-written JSON if the process is killed mid-install.
+    Prevents half-written JSON if the process is killed mid-install. Settings
+    over the read limit raise ``SettingsTooLargeError`` before the write.
     """
-    import json as _json
-
     from jacked.atomic_io import atomic_write_text
+    from jacked.memory.settings_io import settings_text
 
-    atomic_write_text(settings_path, _json.dumps(data, indent=2))
+    atomic_write_text(settings_path, settings_text(data))
 
 
 def _link_or_copy(src: Path, dst: Path) -> str:

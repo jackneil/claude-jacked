@@ -591,6 +591,35 @@ def test_outside_git_every_ancestor_folder_is_read(tmp_path, home):
     assert lb.always_loaded_files(inner, home, NO_ENV) == [own, above]
 
 
+def test_the_test_fixture_stops_the_ancestor_walk_at_the_pytest_base_folder(tmp_path_factory):
+    """tests/conftest.py sets the stop, so no test reads a file above the pytest tree."""
+    assert lb.ANCESTOR_STOP == tmp_path_factory.getbasetemp()
+
+
+def test_an_over_budget_file_above_the_ancestor_stop_is_not_read(home, monkeypatch):
+    """A developer HOME or a Windows temp folder can hold a real over-budget
+    CLAUDE.md above the pytest tree. With the stop set, the walk does not
+    reach it, so the result of test_no_warning_under_the_warn_line holds."""
+    import tempfile
+
+    outer = Path(tempfile.mkdtemp(prefix="jacked-ancestor-stop-"))
+    try:
+        base = outer / "base"
+        project = base / "project"
+        project.mkdir(parents=True)
+        _write_lines(outer / "CLAUDE.md", 400)
+        _write_lines(_memory(project, home), 150)
+        _write_lines(project / "CLAUDE.md", 150)
+        _write_lines(home / ".claude" / "CLAUDE.md", 180)
+        monkeypatch.setattr(lb, "ANCESTOR_STOP", None)
+        assert len(lb.warnings(project, home, NO_ENV)) == 1  # the walk finds the file
+        monkeypatch.setattr(lb, "ANCESTOR_STOP", base)
+        assert lb.warnings(project, home, NO_ENV) == []
+        assert outer / "CLAUDE.md" not in lb.always_loaded_files(project, home, NO_ENV)
+    finally:
+        shutil.rmtree(outer)
+
+
 def test_an_over_budget_file_above_the_repo_root_warns(tmp_path, home):
     workspace = tmp_path / "workspace"
     repo = _plain_repo(workspace / "repo")
@@ -843,15 +872,22 @@ def test_machine_warnings_name_each_over_cap_project(home):
     )
     _write_lines(_projects(home) / "-Users-someone-Github-small" / "memory" / "MEMORY.md", 20)
     assert lb.machine_warnings(home, NO_ENV) == [
-        "MEMORY.md (claude-jacked) is 230 lines / 27.0 KB; Claude Code loads only "
-        "the first 200 lines / 25 KB; run memory-librarian"
+        "MEMORY.md (~/.claude/projects/-Users-someone-Github-claude-jacked/memory) is 230 lines"
+        " / 27.0 KB; Claude Code loads only the first 200 lines / 25 KB; run memory-librarian"
     ]
 
 
-def test_machine_warnings_fall_back_to_the_folder_name(home):
-    write_230_lines_27000_bytes(_projects(home) / "-nonexistent-root-myproj" / "memory" / "MEMORY.md")
-    (line,) = lb.machine_warnings(home, NO_ENV)
-    assert line.startswith("MEMORY.md (myproj) is 230 lines")
+def test_machine_warnings_give_two_projects_with_the_same_name_two_labels(home):
+    for side in ("client", "server"):
+        folder = _projects(home) / f"-workspace-{side}-repo"
+        write_230_lines_27000_bytes(folder / "memory" / "MEMORY.md")
+        (folder / "s1.jsonl").write_text(
+            json.dumps({"type": "user", "cwd": f"/workspace/{side}/repo"}) + "\n", encoding="utf-8"
+        )
+    assert lb.machine_warnings(home, NO_ENV) == [
+        f"MEMORY.md (~/.claude/projects/-workspace-{side}-repo/memory) {MEMORY_230_TAIL}"
+        for side in ("client", "server")
+    ]
 
 
 def test_machine_warnings_survive_a_transcript_that_is_not_utf8(home):
@@ -859,44 +895,34 @@ def test_machine_warnings_survive_a_transcript_that_is_not_utf8(home):
     write_230_lines_27000_bytes(folder / "memory" / "MEMORY.md")
     (folder / "s1.jsonl").write_bytes(b'{"cwd": "/x/caf\xc3')  # a cut multibyte character
     (line,) = lb.machine_warnings(home, NO_ENV)
-    assert line.startswith("MEMORY.md (myproj) is 230 lines")
+    assert line == f"MEMORY.md (~/.claude/projects/-nonexistent-root-myproj/memory) {MEMORY_230_TAIL}"
 
 
-@pytest.mark.parametrize("cwd", [["/x/evil"], {"p": "/x/evil"}, 7, ""])
-def test_machine_warnings_ignore_a_cwd_that_is_not_a_string(home, cwd):
-    folder = _projects(home) / "-nonexistent-root-myproj"
-    write_230_lines_27000_bytes(folder / "memory" / "MEMORY.md")
-    (folder / "s1.jsonl").write_text(json.dumps({"cwd": cwd}) + "\n", encoding="utf-8")
-    (line,) = lb.machine_warnings(home, NO_ENV)
-    assert line.startswith("MEMORY.md (myproj) is 230 lines")
-
-
-def test_the_project_label_reads_only_the_first_records(home):
-    folder = _projects(home) / "-nonexistent-root-myproj"
-    write_230_lines_27000_bytes(folder / "memory" / "MEMORY.md")
-    filler = json.dumps({"type": "summary"}) + "\n"
-    (folder / "s1.jsonl").write_text(
-        filler * lb.LABEL_RECORDS + json.dumps({"cwd": "/x/late-name"}) + "\n", encoding="utf-8"
-    )
-    (line,) = lb.machine_warnings(home, NO_ENV)
-    assert line.startswith("MEMORY.md (myproj) is 230 lines")
-
-
-@pytest.mark.parametrize("error", [OSError, UnicodeDecodeError, ValueError])
-def test_a_failing_transcript_read_falls_back_to_the_folder_name(home, monkeypatch, error):
-    from jacked import recover
+def test_machine_warnings_read_no_transcript(home, monkeypatch):
+    from jacked import project_dirs
 
     def boom(*args, **kwargs):
-        if error is UnicodeDecodeError:
-            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")
-        raise error("boom")
+        raise AssertionError("the dashboard read a transcript")
 
     folder = _projects(home) / "-nonexistent-root-myproj"
     write_230_lines_27000_bytes(folder / "memory" / "MEMORY.md")
-    (folder / "s1.jsonl").write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(recover, "_read_cwd", boom)
+    (folder / "s1.jsonl").write_text(json.dumps({"cwd": "/x/myproj"}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(project_dirs, "_read_cwd", boom)
+    monkeypatch.setattr(project_dirs, "_newest_jsonls", boom)
     (line,) = lb.machine_warnings(home, NO_ENV)
-    assert line.startswith("MEMORY.md (myproj) is 230 lines")
+    assert line.startswith("MEMORY.md (~/.claude/projects/-nonexistent-root-myproj/memory) is")
+
+
+def test_machine_warnings_survive_a_transcript_nested_too_deep_to_parse(home):
+    deep = _projects(home) / "-nonexistent-root-deep"
+    write_230_lines_27000_bytes(deep / "memory" / "MEMORY.md")
+    (deep / "s1.jsonl").write_text("[" * 10_000 + "]" * 10_000 + "\n", encoding="utf-8")
+    other = _projects(home) / "-nonexistent-root-other"
+    write_230_lines_27000_bytes(other / "memory" / "MEMORY.md")
+    assert lb.machine_warnings(home, NO_ENV) == [
+        f"MEMORY.md (~/.claude/projects/-nonexistent-root-{name}/memory) {MEMORY_230_TAIL}"
+        for name in ("deep", "other")
+    ]
 
 
 def test_machine_warnings_include_the_user_claude_md(home):

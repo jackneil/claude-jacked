@@ -706,14 +706,14 @@ class TestGitRealityStep:
     def test_a_git_timeout_leaves_the_other_steps_alone(
         self, steps, capsys, tmp_path, monkeypatch
     ):
-        from jacked.data.hooks import git_reality
+        from jacked import git_guard
 
         repo = _one_commit_repo(tmp_path, monkeypatch)
 
         def _timeout(argv, **kwargs):
             raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
 
-        monkeypatch.setattr(git_reality.subprocess, "run", _timeout)
+        monkeypatch.setattr(git_guard, "run_git", _timeout)
 
         _run(_payload(repo))
 

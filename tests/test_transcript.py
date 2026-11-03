@@ -297,9 +297,13 @@ class TestBoundedReaders:
         path = tmp_path / "s.jsonl"
         path.write_bytes(b"\xff\xfe\nnot json\n[1]\n")
         caplog.set_level(logging.WARNING, logger="jacked.transcript")
+        caplog.set_level(logging.DEBUG, logger="jacked.jsonl_lines")
         assert parse_jsonl_file(path).messages == []
-        assert [r.getMessage() for r in caplog.records] == [
+        assert [r.getMessage() for r in caplog.records if r.name == "jacked.transcript"] == [
             "Skipping invalid line 1", "Skipping invalid line 2", "Skipping invalid line 3",
+        ]
+        assert [r.getMessage() for r in caplog.records if r.name == "jacked.jsonl_lines"] == [
+            "jsonl: skipped line 1 (UnicodeDecodeError)",
         ]
 
     def test_crlf_line_ends_still_parse(self, tmp_path):
