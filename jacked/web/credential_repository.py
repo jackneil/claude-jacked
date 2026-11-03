@@ -44,21 +44,15 @@ class DatabaseCredentialSwitchRepository:
         self.db = db
 
     def create_pending(self, record: PendingSwitchRecord) -> None:
-        previous_account_id = None
-        for setting_key in ("desired_account_id", "active_account_id"):
-            previous_raw = self.db.get_setting(setting_key)
-            try:
-                candidate_id = int(previous_raw) if previous_raw else None
-            except (TypeError, ValueError):
-                candidate_id = None
-            if candidate_id and self.db.get_account(candidate_id) is not None:
-                previous_account_id = candidate_id
-                break
+        from jacked.web.database import selected_account_id
+
         self.db.create_credential_switch(
             {
                 "operation_id": record.operation_id,
                 "account_id": record.account_id,
-                "previous_account_id": previous_account_id,
+                # The audit names the account this switch leaves: the one
+                # jacked selected for new sessions, if its row still exists.
+                "previous_account_id": selected_account_id(self.db, existing_only=True),
                 "organization_id": record.organization_id,
                 "machine_install_id": record.machine_install_id,
                 "context": record.context.value,
@@ -79,6 +73,8 @@ class DatabaseCredentialSwitchRepository:
 
     def finalize(self, record: FinalizeSwitchRecord) -> None:
         """Publish journal, committed pointer, and audits in one DB transaction."""
+        from jacked.web.database import SELECTED_ACCOUNT_KEYS
+
         now = datetime.now(timezone.utc).isoformat()
         with self.db._writer() as conn:
             pending = conn.execute(
@@ -107,7 +103,8 @@ class DatabaseCredentialSwitchRepository:
             )
             if cursor.rowcount != 1:
                 raise ValueError("credential switch operation is already terminal")
-            for key in ("active_account_id", "desired_account_id"):
+            # A committed switch moves both pointers together.
+            for key in SELECTED_ACCOUNT_KEYS:
                 conn.execute(
                     """INSERT INTO settings (key, value, updated_at)
                        VALUES (?, ?, ?)

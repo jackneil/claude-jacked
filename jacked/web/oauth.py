@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, urlencode
 import httpx
 from aiohttp import web
 
-from jacked.web.database import Database
+from jacked.web.database import Database, selected_account_id
 
 logger = logging.getLogger("jacked.oauth")
 
@@ -700,23 +700,17 @@ class OAuthFlow:
     def _should_become_active(self, account: dict) -> bool:
         """Whether this freshly-stored account should become the active one.
 
-        True only when there is no valid active account yet, or this account
-        already IS the active one (a re-auth). Adding an account must never
-        steal the active selection from a different existing account — the
-        user stays on whoever they were on. First account (or one added when
-        the prior active account is gone) still becomes active.
+        True only when there is no valid selected account yet, or this
+        account already IS the selected one (a re-auth). The selection is
+        ``selected_account_id`` with ``existing_only``. Adding an account must
+        never steal the active selection from a different existing account —
+        the user stays on whoever they were on. First account (or one added
+        when the prior selected account is gone) still becomes active.
         """
-        for setting_key in ("desired_account_id", "active_account_id"):
-            current = self.db.get_setting(setting_key)
-            if not current:
-                continue
-            try:
-                existing = self.db.get_account(int(current))
-            except (TypeError, ValueError):
-                continue
-            if existing is not None:
-                return existing["id"] == account.get("id")
-        return True
+        selected_id = selected_account_id(self.db, existing_only=True)
+        if selected_id is None:
+            return True
+        return selected_id == account.get("id")
 
     async def _complete_auth(self, code: str) -> dict:
         """Complete the OAuth flow: token exchange, API key, profile, usage, DB store."""

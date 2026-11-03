@@ -9,6 +9,10 @@ import pytest
 
 from jacked import usage_plans
 from jacked.web.auto_swap import (
+    REASON_PREFIX_BURN_RATE,
+    REASON_PREFIX_HIGHER_TIER,
+    REASON_PREFIX_MODEL_WEEKLY,
+    REASON_PREFIX_WEEKLY_CRITICAL,
     BurnRate,
     _resets_within,
     compute_7d_deficit,
@@ -17,8 +21,10 @@ from jacked.web.auto_swap import (
     has_viable_headroom,
     pick_best_target,
     plan_label,
+    should_swap_now,
     tier_critical_threshold,
     update_burn_rate,
+    weekly_critical_threshold,
 )
 
 # A verified Ultra payload (live shape, 2026-11-01): an authoritative limits
@@ -66,6 +72,35 @@ def _acct(id, usage_5h=0, usage_7d=0, cc_token=True, active=True,
         "rate_limit_tier": rate_limit_tier,
         "subscription_type": subscription_type,
     }
+
+
+def _claude_raw(weekly_pct, weekly_resets, models=()):
+    """A live-shape Claude usage payload: the weekly_all limit plus one
+    weekly_scoped limit per (label, percent, resets_at, is_active) in models."""
+    limits = [{"kind": "weekly_all", "group": "weekly", "percent": weekly_pct,
+               "resets_at": weekly_resets, "scope": None, "is_active": False}]
+    for label, pct, resets, is_active in models:
+        limits.append({
+            "kind": "weekly_scoped", "group": "weekly", "percent": pct,
+            "resets_at": resets, "is_active": is_active,
+            "scope": {"model": {"id": None, "display_name": label}, "surface": None},
+        })
+    return json.dumps({
+        "five_hour": None,
+        "seven_day": {"utilization": weekly_pct, "resets_at": weekly_resets},
+        "limits": limits,
+    })
+
+
+def _claude_acct(id, *, usage_7d, resets_7d, models=(),
+                 rate_limit_tier="default_claude_max_20x"):
+    """A Claude row with its cached payload; the default tier is a verified
+    Ultra (no 5-hour window, so the 5h value is None)."""
+    row = _acct(id, usage_7d=usage_7d, resets_7d=resets_7d,
+                rate_limit_tier=rate_limit_tier)
+    row["cached_usage_5h"] = None
+    row["cached_usage_raw"] = _claude_raw(usage_7d, resets_7d, models)
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +168,50 @@ def test_tier_threshold_comes_from_the_catalog(tmp_path, monkeypatch):
     assert tier_critical_threshold(
         {"subscription_type": "max", "rate_limit_tier": "default_claude_max_5x"}
     ) == 85.0
+
+
+# ---------------------------------------------------------------------------
+# weekly_critical_threshold (#224i: leave only a walled account)
+# ---------------------------------------------------------------------------
+
+def test_weekly_threshold_ultra():
+    assert weekly_critical_threshold(
+        {"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x"}
+    ) == 98.0
+
+def test_weekly_threshold_codex_pro():
+    assert weekly_critical_threshold({"provider": "codex", "subscription_type": "pro"}) == 98.0
+
+def test_weekly_threshold_unknown_plan_reads_the_default():
+    assert weekly_critical_threshold({}) == 98.0
+
+def test_weekly_threshold_comes_from_the_catalog(tmp_path, monkeypatch):
+    """A catalog edit moves the weekly threshold for one plan only. It is a
+    separate field from session_critical_pct (the 5h knob)."""
+    monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
+        "claude": {"subscriptions": {"max": {
+            "label": "Max", "session_critical_pct": 85,
+            "tiers": {
+                "default_claude_max_20x": {"id": "ultra", "label": "Ultra",
+                                           "weekly_critical_pct": 90},
+                "default_claude_max_5x": {"id": "max", "label": "Max"},
+            },
+        }}},
+    }))
+    ultra = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x"}
+    max5 = {"subscription_type": "max", "rate_limit_tier": "default_claude_max_5x"}
+    assert weekly_critical_threshold(ultra) == 90.0
+    assert weekly_critical_threshold(max5) == 98.0
+    assert tier_critical_threshold(ultra) == 85.0
+
+def test_walled_departure_names_are_in_the_facade():
+    import jacked.web.auto_swap as auto_swap
+
+    assert REASON_PREFIX_WEEKLY_CRITICAL == "weekly critical:"
+    assert REASON_PREFIX_MODEL_WEEKLY == "model weekly critical:"
+    for name in ("REASON_PREFIX_WEEKLY_CRITICAL", "REASON_PREFIX_MODEL_WEEKLY",
+                 "weekly_critical_threshold"):
+        assert name in auto_swap.__all__, name
 
 
 # ---------------------------------------------------------------------------
@@ -354,13 +433,14 @@ class TestHasViableHeadroom:
         assert has_viable_headroom(acct, active_start="09:00", active_end="17:00") is False
 
     def test_t0_with_deficit_bypasses_burn_floor(self):
-        """T0 drains to 100: 98% used (deficit 2 >= 1) is admitted even
-        though unused 2% < burn_per_window — the floor would permanently
-        strand the final slice of every account."""
+        """T0 drains toward 100: 97% used (deficit 3 >= 1) is admitted even
+        though unused 3% < burn_per_window — the floor would permanently
+        strand the final slice of every account. From 98% the #224i weekly
+        wall takes over (TestPickBestTargetWalledAdmission)."""
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
         accounts = [
             _acct(1, usage_5h=90),
-            _acct(2, usage_5h=0, usage_7d=98,
+            _acct(2, usage_5h=0, usage_7d=97,
                   resets_7d=_iso(now + timedelta(hours=2))),
         ]
         result = pick_best_target(
@@ -371,11 +451,13 @@ class TestHasViableHeadroom:
         assert result["id"] == 2
 
     def test_t0_bypass_requires_deficit_of_at_least_1(self):
+        """The 7d reset is 20 minutes away, so the weekly wall is suppressed
+        and the deficit rule alone keeps the 99.5% account out."""
         now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
         accounts = [
             _acct(1, usage_5h=90),
             _acct(2, usage_5h=0, usage_7d=99.5,
-                  resets_7d=_iso(now + timedelta(hours=2))),
+                  resets_7d=_iso(now + timedelta(minutes=20))),
         ]
         result = pick_best_target(
             accounts, current_id=1,
@@ -1067,7 +1149,8 @@ class TestShouldSwapNow:
                        resets_7d=_iso(now + timedelta(days=3)))
         best = _acct(2, usage_5h=10, usage_7d=50,
                      resets_7d=_iso(now + timedelta(days=3)))
-        reason = should_swap_now(active=active, best=best, now=now)
+        reason = should_swap_now(active=active, best=best, now=now,
+                                 five_hour_rules=True)
         assert reason is not None
         assert "5h" in reason.lower() or "critical" in reason.lower()
 
@@ -1079,7 +1162,8 @@ class TestShouldSwapNow:
                        resets_7d=_iso(now + timedelta(days=3)))
         best = _acct(2, usage_5h=10, usage_7d=50,
                      resets_7d=_iso(now + timedelta(days=3)))
-        reason = should_swap_now(active=active, best=best, now=now)
+        reason = should_swap_now(active=active, best=best, now=now,
+                                 five_hour_rules=True)
         assert reason is None
 
     def test_5h_critical_suppressed_within_30_min_window(self):
@@ -1090,7 +1174,8 @@ class TestShouldSwapNow:
         active = _acct(1, usage_5h=95, usage_7d=50,
                        resets_5h=_iso(now + timedelta(minutes=25)),
                        resets_7d=_iso(now + timedelta(days=3)))
-        reason = should_swap_now(active=active, best=None, now=now)
+        reason = should_swap_now(active=active, best=None, now=now,
+                                 five_hour_rules=True)
         assert reason is None
 
     def test_5h_critical_fires_beyond_suppression_window(self):
@@ -1099,7 +1184,8 @@ class TestShouldSwapNow:
         active = _acct(1, usage_5h=95, usage_7d=50,
                        resets_5h=_iso(now + timedelta(minutes=40)),
                        resets_7d=_iso(now + timedelta(days=3)))
-        reason = should_swap_now(active=active, best=None, now=now)
+        reason = should_swap_now(active=active, best=None, now=now,
+                                 five_hour_rules=True)
         assert reason is not None
         assert reason.startswith("5h critical:")
 
@@ -1111,7 +1197,8 @@ class TestShouldSwapNow:
                        resets_7d=_iso(now + timedelta(days=3)))
         best = _acct(2, usage_5h=10, usage_7d=50,
                      resets_7d=_iso(now + timedelta(hours=12)))
-        reason = should_swap_now(active=active, best=best, now=now)
+        reason = should_swap_now(active=active, best=best, now=now,
+                                 five_hour_rules=True)
         assert reason is not None
 
     def test_t3_active_rides_out_5h_window(self):
@@ -1134,7 +1221,8 @@ class TestShouldSwapNow:
         br = BurnRate(rate_5h_per_min=2.0, last_check_5h=82.0,
                       rate_7d_per_min=0.0, last_check_7d=0.0)
         reason = should_swap_now(active=active, best=best, burn_rate=br,
-                                 check_interval_min=5, now=now)
+                                 check_interval_min=5, now=now,
+                                 five_hour_rules=True)
         assert reason is not None
         assert "burn" in reason.lower() or "project" in reason.lower()
 
@@ -1156,7 +1244,8 @@ class TestShouldSwapNow:
         active = _acct(1, usage_5h=95, usage_7d=50,
                        resets_5h=_iso(now + timedelta(hours=2)),
                        resets_7d=None)
-        reason = should_swap_now(active=active, best=None, now=now)
+        reason = should_swap_now(active=active, best=None, now=now,
+                                 five_hour_rules=True)
         assert reason is not None
         assert reason.startswith(REASON_PREFIX_FIVE_H)
 
@@ -1251,7 +1340,8 @@ class TestShouldSwapNow:
         active = _acct(1, usage_5h=95, usage_7d=50,
                        resets_5h=_iso(now + timedelta(hours=2)),
                        resets_7d=_iso(now + timedelta(days=3)))
-        r = should_swap_now(active=active, best=None, now=now)
+        r = should_swap_now(active=active, best=None, now=now,
+                            five_hour_rules=True)
         assert r.startswith(REASON_PREFIX_FIVE_H), r
 
         active = _acct(1, usage_5h=82, usage_7d=50,
@@ -1260,7 +1350,8 @@ class TestShouldSwapNow:
         br = BurnRate(rate_5h_per_min=2.0, last_check_5h=82.0,
                       rate_7d_per_min=0.0, last_check_7d=0.0)
         r = should_swap_now(active=active, best=None, burn_rate=br,
-                            check_interval_min=5, now=now)
+                            check_interval_min=5, now=now,
+                            five_hour_rules=True)
         assert r.startswith(REASON_PREFIX_BURN_RATE), r
 
 
@@ -1615,7 +1706,8 @@ class TestIntraT0Preemption:
                        resets_7d=_iso(now + timedelta(hours=20)))
         best = _acct(2, usage_5h=10, usage_7d=50,
                      resets_7d=_iso(now + timedelta(hours=6)))
-        reason = should_swap_now(active=active, best=best, now=now)
+        reason = should_swap_now(active=active, best=best, now=now,
+                                 five_hour_rules=True)
         assert reason is not None
         assert reason.startswith(REASON_PREFIX_INTRA_TIER)
 
@@ -1698,3 +1790,409 @@ class TestStrandingEstimate:
     def test_none_when_no_reset_data(self):
         from jacked.web.auto_swap import stranding_estimate
         assert stranding_estimate(_acct(1, resets_7d=None)) is None
+
+
+# ---------------------------------------------------------------------------
+# #224i walled-only departure: rules 2a (weekly) and 2b (model weekly)
+# ---------------------------------------------------------------------------
+
+
+class TestWalledOnlyDeparture:
+    """Leave an account only when it cannot serve: its weekly limit, or its
+    binding model limit, is at the plan's weekly_critical_pct (98). The 5h
+    rules (3 and 4) run only when the caller turns them on."""
+
+    NOW = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+
+    def _far(self):
+        return _iso(self.NOW + timedelta(hours=72))  # T2 for the weekly window
+
+    def _soon(self):
+        return _iso(self.NOW + timedelta(minutes=10))
+
+    # -- rule 2a: the weekly limit -----------------------------------------
+
+    def test_weekly_wall_departs(self):
+        active = _claude_acct(1, usage_7d=100, resets_7d=self._far())
+        healthy = _claude_acct(2, usage_7d=30, resets_7d=self._far())
+        reason = should_swap_now(active=active, best=healthy, now=self.NOW)
+        assert reason == "weekly critical: 7d usage 100.0% >= 98%"
+        assert reason.startswith(REASON_PREFIX_WEEKLY_CRITICAL)
+
+    def test_weekly_wall_resetting_soon_is_suppressed(self):
+        """The account gets its whole week back before a swap pays off. At
+        100% a T0 account is drained by rule 2, which has no reset
+        suppression, so 99% isolates rule 2a."""
+        active = _claude_acct(1, usage_7d=99, resets_7d=self._soon())
+        assert should_swap_now(active=active, best=None, now=self.NOW) is None
+        active = _claude_acct(1, usage_7d=99, resets_7d=_iso(self.NOW + timedelta(hours=2)))
+        assert should_swap_now(active=active, best=None, now=self.NOW) == (
+            "weekly critical: 7d usage 99.0% >= 98%"
+        )
+
+    def test_the_weekly_wall_starts_at_the_threshold(self):
+        active = _claude_acct(1, usage_7d=97.9, resets_7d=self._far())
+        assert should_swap_now(active=active, best=None, now=self.NOW) is None
+        active = _claude_acct(1, usage_7d=98.0, resets_7d=self._far())
+        assert should_swap_now(active=active, best=None, now=self.NOW) == (
+            "weekly critical: 7d usage 98.0% >= 98%"
+        )
+
+    def test_the_model_wall_starts_at_the_threshold(self):
+        far = self._far()
+        below = _claude_acct(1, usage_7d=60, resets_7d=far,
+                             models=[("Fable", 97.9, far, True)])
+        assert should_swap_now(active=below, best=None, now=self.NOW) is None
+        at = _claude_acct(1, usage_7d=60, resets_7d=far, models=[("Fable", 98, far, True)])
+        assert should_swap_now(active=at, best=None, now=self.NOW) == (
+            "model weekly critical: Fable 98.0% >= 98%"
+        )
+
+    def test_a_missing_or_text_weekly_reading_is_not_a_wall(self):
+        """A missing reading is not 0% and not 100%; a TEXT value from an
+        old writer reads through coerce_pct and never raises."""
+        active = _claude_acct(1, usage_7d=100, resets_7d=self._far())
+        active["cached_usage_7d"] = None
+        assert should_swap_now(active=active, best=None, now=self.NOW) is None
+        active["cached_usage_7d"] = "99.5"
+        assert should_swap_now(active=active, best=None, now=self.NOW) == (
+            "weekly critical: 7d usage 99.5% >= 98%"
+        )
+
+    # -- rule 2b: the binding model limit ----------------------------------
+
+    def test_model_wall_departs_with_the_exact_reason(self):
+        far = self._far()
+        active = _claude_acct(1, usage_7d=60, resets_7d=far,
+                              models=[("Fable", 100, far, True)])
+        healthy = _claude_acct(2, usage_7d=30, resets_7d=far)
+        assert should_swap_now(active=active, best=healthy, now=self.NOW) == (
+            "model weekly critical: Fable 100.0% >= 98%"
+        )
+
+    def test_model_wall_resetting_soon_is_suppressed(self):
+        active = _claude_acct(1, usage_7d=60, resets_7d=self._far(),
+                              models=[("Fable", 100, self._soon(), True)])
+        assert should_swap_now(active=active, best=None, now=self.NOW) is None
+
+    def test_the_binding_model_is_the_provider_flagged_one(self):
+        """The same selection as the pill and the poll urgency: the limit the
+        provider flags is_active, else the highest. A walled model that is
+        not binding is not the active's wall."""
+        far = self._far()
+        active = _claude_acct(1, usage_7d=60, resets_7d=far,
+                              models=[("Fable", 40, far, True), ("Sonnet", 99, far, False)])
+        assert should_swap_now(active=active, best=None, now=self.NOW) is None
+
+    def test_a_non_string_model_reset_never_raises(self):
+        """A provider can send any JSON type for resets_at. A number is not a
+        reset the code can read, so it never suppresses the wall."""
+        active = _claude_acct(1, usage_7d=60, resets_7d=self._far(),
+                              models=[("Fable", 100, 1793780314, True)])
+        assert should_swap_now(active=active, best=None, now=self.NOW) == (
+            "model weekly critical: Fable 100.0% >= 98%"
+        )
+
+    # -- a reset that already passed makes the reading stale ---------------
+
+    def _past(self):
+        return _iso(self.NOW - timedelta(minutes=5))
+
+    def test_a_weekly_wall_whose_reset_passed_is_stale(self):
+        """The window reset 5 minutes ago; the 100% reading is from before
+        the reset. The next poll replaces it, so it is not a departure."""
+        active = _claude_acct(1, usage_7d=100, resets_7d=self._past())
+        assert should_swap_now(active=active, best=None, now=self.NOW) is None
+
+    def test_a_model_wall_whose_reset_passed_is_stale(self):
+        active = _claude_acct(1, usage_7d=60, resets_7d=self._far(),
+                              models=[("Fable", 100, self._past(), True)])
+        assert should_swap_now(active=active, best=None, now=self.NOW) is None
+
+    def test_a_missing_or_unreadable_reset_keeps_the_wall(self):
+        """With no reset that the code can read, nothing shows the reading is
+        stale or about to lift, so the wall holds (today's behavior)."""
+        far = self._far()
+        for resets in (None, "not-a-date"):
+            weekly = _claude_acct(1, usage_7d=100, resets_7d=resets)
+            assert should_swap_now(active=weekly, best=None, now=self.NOW) == (
+                "weekly critical: 7d usage 100.0% >= 98%"
+            )
+            model = _claude_acct(1, usage_7d=60, resets_7d=far,
+                                 models=[("Fable", 100, resets, True)])
+            assert should_swap_now(active=model, best=None, now=self.NOW) == (
+                "model weekly critical: Fable 100.0% >= 98%"
+            )
+
+    def test_the_5h_rules_keep_their_own_reset_handling(self):
+        """Unchanged by the stale-wall rule: a past 5h reset is headroom for a
+        candidate (_has_5h_headroom), and it does not suppress rule 3."""
+        from jacked.web.auto_swap import _has_5h_headroom
+
+        active = _acct(1, usage_5h=95, usage_7d=50, resets_5h=self._past(),
+                       resets_7d=_iso(self.NOW + timedelta(days=3)))
+        assert _has_5h_headroom(active, now=self.NOW) is True
+        assert should_swap_now(active=active, best=None, now=self.NOW,
+                               five_hour_rules=True) == "5h critical: 95.0% >= 90%"
+
+    # -- no candidate, rule order, thresholds ------------------------------
+
+    def test_walls_fire_without_a_candidate(self):
+        """No candidate does not silence a wall. The monitor turns a reason
+        with no target into the no_target decision, the exhaustion WARNING
+        and the all_accounts_exhausted banner. An Ultra user walled on the
+        week needs that banner, so the rule must not require a candidate."""
+        far = self._far()
+        weekly = _claude_acct(1, usage_7d=100, resets_7d=far)
+        assert should_swap_now(active=weekly, best=None, now=self.NOW).startswith(
+            REASON_PREFIX_WEEKLY_CRITICAL)
+        model = _claude_acct(1, usage_7d=60, resets_7d=far,
+                             models=[("Fable", 100, far, True)])
+        assert should_swap_now(active=model, best=None, now=self.NOW).startswith(
+            REASON_PREFIX_MODEL_WEEKLY)
+
+    def test_the_weekly_rule_comes_before_the_model_rule(self):
+        far = self._far()
+        both = _claude_acct(1, usage_7d=100, resets_7d=far,
+                            models=[("Fable", 100, far, True)])
+        assert should_swap_now(active=both, best=None, now=self.NOW).startswith(
+            REASON_PREFIX_WEEKLY_CRITICAL)
+
+    def test_a_higher_tier_candidate_still_wins_over_a_weekly_wall(self):
+        active = _claude_acct(1, usage_7d=100, resets_7d=self._far())  # T2
+        t0 = _acct(2, usage_7d=50, resets_7d=_iso(self.NOW + timedelta(hours=12)))
+        assert should_swap_now(active=active, best=t0, now=self.NOW).startswith(
+            REASON_PREFIX_HIGHER_TIER)
+
+    def test_an_explicit_threshold_wins_over_the_catalog(self):
+        far = self._far()
+        weekly = _claude_acct(1, usage_7d=92, resets_7d=far)
+        assert should_swap_now(active=weekly, best=None, now=self.NOW) is None
+        assert should_swap_now(active=weekly, best=None, now=self.NOW,
+                               weekly_critical=90) == "weekly critical: 7d usage 92.0% >= 90%"
+        model = _claude_acct(1, usage_7d=60, resets_7d=far,
+                             models=[("Fable", 92, far, True)])
+        assert should_swap_now(active=model, best=None, now=self.NOW) is None
+        assert should_swap_now(active=model, best=None, now=self.NOW, weekly_critical=90) == (
+            "model weekly critical: Fable 92.0% >= 90%"
+        )
+
+    def test_the_threshold_defaults_to_the_active_plan(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
+            "claude": {"subscriptions": {"max": {"label": "Max", "tiers": {
+                "default_claude_max_20x": {"id": "ultra", "label": "Ultra",
+                                           "weekly_critical_pct": 90},
+                "default_claude_max_5x": {"id": "max", "label": "Max"},
+            }}}},
+        }))
+        far = self._far()
+        ultra = _claude_acct(1, usage_7d=92, resets_7d=far)
+        assert should_swap_now(active=ultra, best=None, now=self.NOW) == (
+            "weekly critical: 7d usage 92.0% >= 90%"
+        )
+        max5 = _claude_acct(1, usage_7d=92, resets_7d=far,
+                            rate_limit_tier="default_claude_max_5x")
+        assert should_swap_now(active=max5, best=None, now=self.NOW) is None
+
+    # -- rules 3 and 4 are off by default ----------------------------------
+
+    def test_the_5h_critical_rule_is_off_by_default(self):
+        active = _acct(1, usage_5h=95, usage_7d=50,
+                       resets_5h=_iso(self.NOW + timedelta(hours=2)),
+                       resets_7d=_iso(self.NOW + timedelta(days=3)))
+        assert should_swap_now(active=active, best=None, now=self.NOW) is None
+        assert should_swap_now(active=active, best=None, now=self.NOW,
+                               five_hour_rules=True) == "5h critical: 95.0% >= 90%"
+
+    def test_the_burn_rate_rule_is_off_by_default(self):
+        active = _acct(1, usage_5h=82, usage_7d=50,
+                       resets_5h=_iso(self.NOW + timedelta(hours=2)),
+                       resets_7d=_iso(self.NOW + timedelta(days=3)))
+        br = BurnRate(rate_5h_per_min=2.0, last_check_5h=82.0,
+                      rate_7d_per_min=0.0, last_check_7d=0.0)
+        assert should_swap_now(active=active, best=None, burn_rate=br,
+                               check_interval_min=5, now=self.NOW) is None
+        reason = should_swap_now(active=active, best=None, burn_rate=br,
+                                 check_interval_min=5, now=self.NOW,
+                                 five_hour_rules=True)
+        assert reason.startswith(REASON_PREFIX_BURN_RATE)
+
+
+class TestPickBestTargetWalledAdmission:
+    """pick_best_target never offers an account that cannot serve: one walled
+    on the model the active account binds on, or one that rule 2a or 2b would
+    eject on the next tick (a swap that undoes itself is a ping-pong)."""
+
+    NOW = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+
+    def _far(self):
+        return _iso(self.NOW + timedelta(hours=72))
+
+    def _t0(self, hours=12):
+        return _iso(self.NOW + timedelta(hours=hours))
+
+    def _fable_active(self, pct=100):
+        far = self._far()
+        return _claude_acct(99, usage_7d=60, resets_7d=far,
+                            models=[("Fable", pct, far, True)])
+
+    def test_a_candidate_walled_on_the_active_binding_model_is_skipped(self):
+        """The candidate binds on Sonnet (20%), so rule 2b would not eject it,
+        but it cannot serve Fable, the model the user works on."""
+        far = self._far()
+        walled = _claude_acct(1, usage_7d=50, resets_7d=self._t0(12),
+                              models=[("Sonnet", 20, far, True), ("Fable", 98, far, False)])
+        healthy = _claude_acct(2, usage_7d=50, resets_7d=self._t0(20),
+                               models=[("Fable", 20, far, True)])
+        active = self._fable_active()
+        assert pick_best_target([active, walled, healthy], current_id=99, now=self.NOW)["id"] == 2
+        assert pick_best_target([active, walled], current_id=99, now=self.NOW) is None
+        # The rule follows the active's binding model, walled or not.
+        assert pick_best_target([self._fable_active(pct=40), walled],
+                                current_id=99, now=self.NOW) is None
+        # An active with no model limit names no model to protect.
+        bare = _claude_acct(99, usage_7d=60, resets_7d=far)
+        assert pick_best_target([bare, walled], current_id=99, now=self.NOW)["id"] == 1
+
+    def test_a_candidate_walled_on_another_model_is_admitted(self):
+        """Walled on Sonnet, binding on Fable at 20%: it serves Fable, and
+        rule 2b reads Fable, so the swap holds."""
+        far = self._far()
+        sonnet_walled = _claude_acct(1, usage_7d=50, resets_7d=self._t0(),
+                                     models=[("Fable", 20, far, True), ("Sonnet", 100, far, False)])
+        assert pick_best_target([self._fable_active(), sonnet_walled],
+                                current_id=99, now=self.NOW)["id"] == 1
+
+    def test_a_candidate_whose_own_binding_model_is_walled_is_skipped(self):
+        """Rule 2b would eject it on the next tick (model weekly critical:
+        Sonnet), and the walled active would come back: a ping-pong."""
+        far = self._far()
+        binds_walled = _claude_acct(1, usage_7d=50, resets_7d=self._t0(),
+                                    models=[("Sonnet", 100, far, True), ("Fable", 20, far, False)])
+        assert pick_best_target([self._fable_active(), binds_walled],
+                                current_id=99, now=self.NOW) is None
+        resets_soon = _claude_acct(1, usage_7d=50, resets_7d=self._t0(),
+                                   models=[("Sonnet", 100, _iso(self.NOW + timedelta(minutes=10)), True),
+                                           ("Fable", 20, far, False)])
+        assert pick_best_target([self._fable_active(), resets_soon],
+                                current_id=99, now=self.NOW)["id"] == 1
+
+    def test_a_t0_candidate_at_its_weekly_wall_is_skipped(self):
+        """A T0 candidate at 98.5% has a deficit of 1.5, which bypasses the
+        burn floor, but rule 2a would eject it on the next tick. One that
+        resets within the suppression window is admitted: 2a stays quiet
+        until its week comes back."""
+        active = _claude_acct(99, usage_7d=100, resets_7d=self._far())
+        near_wall = _claude_acct(1, usage_7d=98.5, resets_7d=self._t0(6))
+        assert pick_best_target([active, near_wall], current_id=99, now=self.NOW) is None
+        resets_soon = _claude_acct(1, usage_7d=98.5,
+                                   resets_7d=_iso(self.NOW + timedelta(minutes=20)))
+        assert pick_best_target([active, resets_soon], current_id=99, now=self.NOW)["id"] == 1
+
+    def test_two_t0_accounts_at_their_weekly_wall_never_swap(self):
+        """The ping-pong this admission rule closes. A is at 98.5% and B at
+        99.0%, both T0 with resets hours away, so the T0 burn-floor bypass
+        (deficit >= 1.0) would admit each. Whichever is active, rule 2a
+        walls it and pick_best_target offers the other in neither
+        direction: a no-target stay, not a swap every cooldown."""
+        a = _claude_acct(1, usage_7d=98.5, resets_7d=self._t0(6))
+        b = _claude_acct(2, usage_7d=99.0, resets_7d=self._t0(8))
+        for active in (a, b):
+            assert should_swap_now(active=active, best=None, now=self.NOW).startswith(
+                REASON_PREFIX_WEEKLY_CRITICAL)
+            assert pick_best_target([a, b], current_id=active["id"], now=self.NOW) is None
+
+    def test_a_pro_candidate_at_its_own_wall_is_skipped_under_an_ultra_active(
+        self, tmp_path, monkeypatch,
+    ):
+        """Pro's field is 95 here and Ultra's 98. A Pro candidate at 96% is
+        walled on its own plan, so it is skipped. The Ultra active's 98
+        would admit it (the explicit override shows it), and rule 2a at
+        Pro's 95 would eject it on the next tick. This is why the monitor
+        never passes the active's threshold to pick_best_target."""
+        monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
+            "claude": {"subscriptions": {
+                "max": {"label": "Max", "tiers": {
+                    "default_claude_max_20x": {"id": "ultra", "label": "Ultra"},
+                }},
+                "pro": {"label": "Pro", "session": "always", "weekly_critical_pct": 95},
+            }},
+        }))
+        active = _claude_acct(99, usage_7d=100, resets_7d=self._far())
+        pro = _acct(1, usage_7d=96, resets_7d=self._t0(6), subscription_type="pro")
+        assert weekly_critical_threshold(active) == 98.0
+        assert weekly_critical_threshold(pro) == 95.0
+        assert pick_best_target([active, pro], current_id=99, now=self.NOW) is None
+        assert pick_best_target([active, pro], current_id=99, now=self.NOW,
+                                weekly_critical=98)["id"] == 1
+        assert should_swap_now(active=pro, best=None, now=self.NOW) == (
+            "weekly critical: 7d usage 96.0% >= 95%"
+        )
+
+    def test_a_candidate_whose_fable_reset_passed_is_admitted(self):
+        """Its Fable limit reset 5 minutes ago, so the 100% reading is stale:
+        neither rule 2b nor the active's-binding-model rule holds it back."""
+        far = self._far()
+        stale = _claude_acct(1, usage_7d=50, resets_7d=self._t0(),
+                             models=[("Fable", 100, _iso(self.NOW - timedelta(minutes=5)), True)])
+        assert pick_best_target([self._fable_active(), stale],
+                                current_id=99, now=self.NOW)["id"] == 1
+        live = _claude_acct(1, usage_7d=50, resets_7d=self._t0(),
+                            models=[("Fable", 100, far, True)])
+        assert pick_best_target([self._fable_active(), live],
+                                current_id=99, now=self.NOW) is None
+
+    def test_a_candidate_whose_weekly_reset_passed_is_not_walled(self):
+        """The shared predicate does not hold a 99% candidate whose 7d reset
+        passed: the reading is stale. pick_best_target still waits for the
+        refresh, because an expired 7d window has no tier (TIER_EXCLUDED)
+        to price it with. The monitor re-fetches such a candidate on the next
+        tick (_candidate_staleness_override)."""
+        from jacked.web.auto_swap import TIER_EXCLUDED, tier_for
+        from jacked.web.auto_swap.selection import _cannot_serve
+
+        past = _iso(self.NOW - timedelta(minutes=5))
+        stale = _claude_acct(1, usage_7d=99, resets_7d=past)
+        assert _cannot_serve(stale, None, None, self.NOW) is False
+        live = _claude_acct(1, usage_7d=99, resets_7d=self._t0(6))
+        assert _cannot_serve(live, None, None, self.NOW) is True
+        assert tier_for(stale, now=self.NOW) == TIER_EXCLUDED
+
+    def test_pick_honors_an_explicit_threshold(self):
+        far = self._far()
+        cand = _claude_acct(1, usage_7d=50, resets_7d=self._t0(),
+                            models=[("Sonnet", 10, far, True), ("Fable", 92, far, False)])
+        active = self._fable_active(pct=50)
+        assert pick_best_target([active, cand], current_id=99, now=self.NOW)["id"] == 1
+        assert pick_best_target([active, cand], current_id=99, now=self.NOW,
+                                weekly_critical=90) is None
+
+    def test_each_candidate_is_judged_by_its_own_plan(self, tmp_path, monkeypatch):
+        """A candidate's wall is its own plan's field: the threshold rule 2b
+        applies to it once it is active."""
+        monkeypatch.setattr(usage_plans, "_catalog_cache", _write_catalog(tmp_path, {
+            "claude": {"subscriptions": {"max": {"label": "Max", "tiers": {
+                "default_claude_max_20x": {"id": "ultra", "label": "Ultra",
+                                           "weekly_critical_pct": 90},
+                "default_claude_max_5x": {"id": "max", "label": "Max"},
+            }}}},
+        }))
+        far = self._far()
+        models = [("Sonnet", 10, far, True), ("Fable", 92, far, False)]
+        ultra = _claude_acct(1, usage_7d=50, resets_7d=self._t0(), models=models)
+        max5 = _claude_acct(2, usage_7d=50, resets_7d=self._t0(),
+                            models=models, rate_limit_tier="default_claude_max_5x")
+        active = _claude_acct(99, usage_7d=60, resets_7d=far,
+                              models=[("Fable", 50, far, True)],
+                              rate_limit_tier="default_claude_max_5x")
+        assert pick_best_target([active, ultra], current_id=99, now=self.NOW) is None
+        assert pick_best_target([active, max5], current_id=99, now=self.NOW)["id"] == 2
+
+
+def test_resets_within_at_reads_only_strings():
+    from jacked.web.auto_swap.selection import _resets_within_at
+
+    now = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    assert _resets_within_at(1793780314, 30, now) is False
+    assert _resets_within_at({"at": "soon"}, 30, now) is False
+    assert _resets_within_at(_iso(now + timedelta(minutes=10)), 30, now) is True

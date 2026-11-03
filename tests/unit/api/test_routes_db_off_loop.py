@@ -25,6 +25,7 @@ class _RecordingDB:
     def __init__(self, activity=None):
         self.threads: list[tuple[str, int]] = []
         self._activity = activity or []
+        self.settings: dict[str, str] = {}
 
     def _mark(self, name):
         self.threads.append((name, threading.get_ident()))
@@ -38,6 +39,11 @@ class _RecordingDB:
 
     def set_settings(self, values):
         self._mark("set_settings:" + ",".join(values))
+        self.settings.update(values)
+
+    def get_setting(self, key):
+        self._mark(f"get_setting:{key}")
+        return self.settings.get(key)
 
     def get_project_activity_summary(self, limit=100):
         self._mark("get_project_activity_summary")
@@ -94,8 +100,9 @@ def test_menubar_summary_lists_accounts_off_the_loop(monkeypatch):
 
 
 def test_update_swap_settings_writes_off_the_loop_and_wakes_on_it(monkeypatch):
-    """The settings writes run in ONE worker hop, in their original order;
-    the sweep's asyncio.Event is set afterwards, on the loop thread."""
+    """The settings writes run in ONE worker hop, in their original order,
+    and the same hop reads the stored pause back for the response; the
+    sweep's asyncio.Event is set afterwards, on the loop thread."""
     import jacked.api.usage_monitor as usage_monitor
     from jacked.api.routes.settings_swap import SwapSettings, update_swap_settings
 
@@ -110,14 +117,16 @@ def test_update_swap_settings_writes_off_the_loop_and_wakes_on_it(monkeypatch):
     body = SwapSettings(auto_swap_paused_until="2026-10-29T12:00:00+00:00")
     result, loop_thread = _run_on_loop(lambda: update_swap_settings(_request(db), body))
 
-    assert result is body
+    assert result == body
     # One transaction for the whole bundle (#162 review: two overlapping
     # saves must never persist a mixed threshold pair).
     assert [name for name, _ in db.threads] == [
-        "set_settings:auto_swap_enabled,auto_swap_5h_warning,"
-        "auto_swap_5h_critical,auto_swap_7d_threshold,usage_check_interval,"
+        "set_settings:auto_swap_enabled,auto_swap_5h_rules_enabled,"
+        "auto_swap_5h_warning,"
+        "auto_swap_5h_critical,usage_check_interval,"
         "window_keeper_enabled,window_keeper_active_start,"
         "window_keeper_active_end,window_keeper_prewake,auto_swap_paused_until",
+        "get_setting:auto_swap_paused_until",
     ]
     worker_threads = {t for _, t in db.threads}
     assert len(worker_threads) == 1 and loop_thread not in worker_threads

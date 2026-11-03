@@ -8,6 +8,8 @@ from typing import Optional
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from jacked.api.usage_monitor import _setting_bool, _Snapshot
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -23,10 +25,27 @@ def _validate_time(v: str) -> str:
 
 
 class SwapSettings(BaseModel):
+    """The auto-swap and window keeper settings that the dashboard reads and writes.
+
+    ``auto_swap_5h_rules_enabled`` controls the 5-hour rules of auto-swap
+    (5h critical and burn rate). The default is off. Then auto-swap leaves an
+    account only when its weekly limit or its model limit reaches the
+    critical level of the plan.
+
+    The model ignores a field that it does not know. A dashboard page or a
+    menu bar from before a field was removed can still send that field (for
+    example ``auto_swap_7d_threshold``), and its save still works.
+
+    >>> SwapSettings().auto_swap_5h_rules_enabled
+    False
+    >>> "auto_swap_7d_threshold" in SwapSettings(auto_swap_7d_threshold=70).model_dump()
+    False
+    """
+
     auto_swap_enabled: bool = False
+    auto_swap_5h_rules_enabled: bool = False
     auto_swap_5h_warning: int = Field(default=80, ge=0, le=100)
     auto_swap_5h_critical: int = Field(default=90, ge=0, le=100)
-    auto_swap_7d_threshold: int = Field(default=85, ge=0, le=100)
     usage_check_interval: int = Field(default=300, ge=60, le=3600)
     auto_swap_paused_until: Optional[str] = None
     window_keeper_enabled: bool = False
@@ -80,9 +99,9 @@ def _get_db(request: Request):
 
 SWAP_SETTING_KEYS = (
     "auto_swap_enabled",
+    "auto_swap_5h_rules_enabled",
     "auto_swap_5h_warning",
     "auto_swap_5h_critical",
-    "auto_swap_7d_threshold",
     "usage_check_interval",
     "auto_swap_paused_until",
     "window_keeper_enabled",
@@ -100,22 +119,24 @@ def get_swap_settings(request: Request):
         return SwapSettings()
 
     # One snapshot: the thresholds are validated as a set (warning below
-    # critical), so they must never mix two saves.
-    stored = db.get_settings(SWAP_SETTING_KEYS)
+    # critical), so they must never mix two saves. The booleans go through
+    # the reader that the auto-swap tick and the window keeper use, so the
+    # dashboard shows what they do with the same stored string.
+    snap = _Snapshot(db, SWAP_SETTING_KEYS)
 
     def _g(key, default):
-        val = stored[key]
+        val = snap.get_setting(key)
         return val if val is not None else default
 
     try:
         return SwapSettings(
-            auto_swap_enabled=_g("auto_swap_enabled", "false") == "true",
+            auto_swap_enabled=_setting_bool(snap, "auto_swap_enabled", False),
+            auto_swap_5h_rules_enabled=_setting_bool(snap, "auto_swap_5h_rules_enabled", False),
             auto_swap_5h_warning=int(_g("auto_swap_5h_warning", "80")),
             auto_swap_5h_critical=int(_g("auto_swap_5h_critical", "90")),
-            auto_swap_7d_threshold=int(_g("auto_swap_7d_threshold", "85")),
             usage_check_interval=int(_g("usage_check_interval", "300")),
             auto_swap_paused_until=_g("auto_swap_paused_until", None) or None,
-            window_keeper_enabled=_g("window_keeper_enabled", "false") == "true",
+            window_keeper_enabled=_setting_bool(snap, "window_keeper_enabled", False),
             window_keeper_active_start=_g("window_keeper_active_start", "06:00"),
             window_keeper_active_end=_g("window_keeper_active_end", "23:00"),
             window_keeper_prewake=_g("window_keeper_prewake", "04:00"),
@@ -128,32 +149,49 @@ def get_swap_settings(request: Request):
 
 @router.put("/swap-settings", response_model=SwapSettings)
 async def update_swap_settings(request: Request, body: SwapSettings):
-    """Update auto-swap and window keeper settings."""
+    """Update auto-swap and window keeper settings.
+
+    The pause (``auto_swap_paused_until``) is written only when the request
+    sends it. The pause has its own endpoints, and a manual switch sets a
+    15-minute hold, so a dashboard save that does not send it keeps it.
+    """
     db = _get_db(request)
     if db is None:
         return SwapSettings()
 
-    # One transaction, in a worker: two overlapping saves can never persist a
-    # mix (warning from one, critical from the other). The asyncio.Event
-    # below is set on the loop.
-    await asyncio.to_thread(db.set_settings, {
+    values = {
         "auto_swap_enabled": str(body.auto_swap_enabled).lower(),
+        "auto_swap_5h_rules_enabled": str(body.auto_swap_5h_rules_enabled).lower(),
         "auto_swap_5h_warning": str(body.auto_swap_5h_warning),
         "auto_swap_5h_critical": str(body.auto_swap_5h_critical),
-        "auto_swap_7d_threshold": str(body.auto_swap_7d_threshold),
         "usage_check_interval": str(body.usage_check_interval),
         "window_keeper_enabled": str(body.window_keeper_enabled).lower(),
         "window_keeper_active_start": body.window_keeper_active_start,
         "window_keeper_active_end": body.window_keeper_active_end,
         "window_keeper_prewake": body.window_keeper_prewake,
-        "auto_swap_paused_until": body.auto_swap_paused_until or "",
-    })
+    }
+    # The dashboard form never sends the pause; the menu bar sends back what
+    # GET returned. Clearing a hold the request did not mention would let
+    # auto-swap leave the account the user just chose.
+    if "auto_swap_paused_until" in body.model_fields_set:
+        values["auto_swap_paused_until"] = body.auto_swap_paused_until or ""
+
+    # One transaction, in a worker: two overlapping saves can never persist a
+    # mix (warning from one, critical from the other). The same worker hop
+    # reads the stored pause back, so the response says what is in effect,
+    # also for a pause this save kept. The asyncio.Event below is set on the
+    # loop.
+    def _write() -> Optional[str]:
+        db.set_settings(values)
+        return db.get_setting("auto_swap_paused_until")
+
+    stored_pause = await asyncio.to_thread(_write)
 
     # Wake the sweep loop immediately so changes take effect now
     from jacked.api.usage_monitor import _sweep_wake
     _sweep_wake.set()
 
-    return body
+    return body.model_copy(update={"auto_swap_paused_until": stored_pause or None})
 
 
 @router.post("/swap-pause")

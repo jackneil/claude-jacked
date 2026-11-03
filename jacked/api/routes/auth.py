@@ -34,6 +34,7 @@ from jacked.web.auth import (
     refresh_account_token,
     validate_account,
 )
+from jacked.web.database import selected_account_id
 from jacked.web.oauth import OAuthFlow, get_flow
 
 logger = logging.getLogger(__name__)
@@ -2350,17 +2351,8 @@ def get_session_states(request: Request, staleness: int = 60):
             headers={"Cache-Control": "no-store"},
         )
 
-    desired = None
-    for setting_key in ("desired_account_id", "active_account_id"):
-        raw_id = db.get_setting(setting_key)
-        try:
-            candidate_id = int(raw_id) if raw_id else None
-        except (TypeError, ValueError):
-            candidate_id = None
-        if candidate_id:
-            desired = db.get_account(candidate_id)
-            if desired is not None:
-                break
+    desired_id = selected_account_id(db, existing_only=True)
+    desired = db.get_account(desired_id) if desired_id is not None else None
     desired_public = (
         {
             "account_id": desired["id"],

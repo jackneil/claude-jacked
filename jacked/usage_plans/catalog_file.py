@@ -33,6 +33,10 @@ WINDOW_KINDS = ("session", "weekly", "weekly_model")
 _BUILTIN_WINDOWS = {"session": 5 * 3600, "weekly": 7 * 86400, "weekly_model": 7 * 86400}
 _BUILTIN_SESSION = "reported"
 _BUILTIN_CRITICAL_PCT = 80.0
+# The weekly (and model-weekly) usage at which auto-swap leaves an account:
+# the account is walled and cannot serve (#224i). A separate field from the
+# 5-hour session_critical_pct.
+_BUILTIN_WEEKLY_CRITICAL_PCT = 98.0
 
 # Shown when a plan has no 5-hour window and its catalog entry has no note.
 GENERIC_NO_SESSION_NOTE = "This plan has no 5-hour limit. Weekly limits still apply."
@@ -63,6 +67,7 @@ class PlanEntry:
     formerly: Optional[str]
     session: str
     session_critical_pct: float
+    weekly_critical_pct: float
     session_note: Optional[str] = None
     session_temporary_note: Optional[str] = None
     verified_at: Optional[str] = None
@@ -95,6 +100,7 @@ class Catalog:
 _BUILTIN_DEFAULT = PlanEntry(
     id=None, label=None, formerly=None,
     session=_BUILTIN_SESSION, session_critical_pct=_BUILTIN_CRITICAL_PCT,
+    weekly_critical_pct=_BUILTIN_WEEKLY_CRITICAL_PCT,
 )
 _EMPTY_CATALOG = Catalog(version=SUPPORTED_VERSION, verified_at=None, providers={})
 
@@ -198,6 +204,26 @@ def _entry_windows(spec: dict, parent: PlanEntry) -> tuple:
     return tuple(sorted(windows.items()))
 
 
+def _percent(spec: dict, key: str, inherited: float) -> float:
+    """A threshold percent from *spec*, or *inherited* when it is absent.
+
+    A value that is not a number in 0 < x <= 100 rejects the entry.
+
+    >>> _percent({"weekly_critical_pct": 90}, "weekly_critical_pct", 98.0)
+    90.0
+    >>> _percent({}, "weekly_critical_pct", 98.0)
+    98.0
+    >>> _percent({"weekly_critical_pct": 101}, "weekly_critical_pct", 98.0)
+    Traceback (most recent call last):
+    ...
+    jacked.usage_plans.catalog_file._EntryError: invalid weekly_critical_pct 101
+    """
+    value = spec.get(key, inherited)
+    if not _is_number(value) or not 0 < value <= 100:
+        raise _EntryError(f"invalid {key} {value!r}")
+    return float(value)
+
+
 def _entry(spec, parent: PlanEntry, entry_id: Optional[str]) -> PlanEntry:
     """Validate one plan object and apply inheritance from *parent*."""
     if not isinstance(spec, dict):
@@ -217,9 +243,8 @@ def _entry(spec, parent: PlanEntry, entry_id: Optional[str]) -> PlanEntry:
     session = spec.get("session", parent.session)
     if session not in SESSION_POLICIES:
         raise _EntryError(f"invalid session policy {session!r}")
-    critical = spec.get("session_critical_pct", parent.session_critical_pct)
-    if not _is_number(critical) or not 0 < critical <= 100:
-        raise _EntryError(f"invalid session_critical_pct {critical!r}")
+    critical = _percent(spec, "session_critical_pct", parent.session_critical_pct)
+    weekly_critical = _percent(spec, "weekly_critical_pct", parent.weekly_critical_pct)
     verified_at = spec.get("verified_at", parent.verified_at)
     if verified_at is not None and not (
         isinstance(verified_at, str) and _DATE_RE.match(verified_at)
@@ -233,7 +258,8 @@ def _entry(spec, parent: PlanEntry, entry_id: Optional[str]) -> PlanEntry:
     return PlanEntry(
         id=entry_id, label=label,
         formerly=optional_text("formerly", _LABEL_MAX, None),
-        session=session, session_critical_pct=float(critical),
+        session=session, session_critical_pct=critical,
+        weekly_critical_pct=weekly_critical,
         session_note=optional_text("session_note", _NOTE_MAX, None),
         session_temporary_note=optional_text("session_temporary_note", _NOTE_MAX, None),
         verified_at=verified_at, sources=tuple(sources),

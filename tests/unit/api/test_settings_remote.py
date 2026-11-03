@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 import jacked.api.routes.settings_remote as sr
 from jacked.api.main import app
+from jacked.api.routes.settings_swap import SWAP_SETTING_KEYS
 from jacked.service.bind import BindPlan, set_active_plan
 from jacked.service.restart import set_restart_handler
 from jacked.web.database import Database
@@ -153,26 +154,47 @@ def test_put_missing_field_is_422(client):
 # ---------------------------------------------------------------------------
 
 
-def test_generic_put_on_protected_key_is_422(client):
-    resp = client.put(
-        "/api/settings/remote_access_enabled", json={"value": "true"}
-    )
+# Every key that a dedicated endpoint owns: the remote-access pair (a security
+# decision with its own restart flow) and every auto-swap / window keeper
+# setting (PUT /api/settings/swap-settings validates them as one set). The
+# 5-hour rules toggle is named on its own too, so the test still fails if it
+# drops out of SWAP_SETTING_KEYS.
+_DEDICATED_KEYS = list(dict.fromkeys([
+    "remote_access_enabled",
+    "remote_access_scope",
+    "auto_swap_5h_rules_enabled",
+    *SWAP_SETTING_KEYS,
+]))
+
+
+@pytest.mark.parametrize("key", _DEDICATED_KEYS)
+def test_generic_put_on_protected_key_is_422(client, db, key):
+    resp = client.put(f"/api/settings/{key}", json={"value": "true"})
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "PROTECTED_KEY"
+    assert db.get_setting(key) is None
 
 
-def test_generic_put_on_protected_scope_is_422(client):
-    resp = client.put(
-        "/api/settings/remote_access_scope", json={"value": "all"}
-    )
+@pytest.mark.parametrize("key", _DEDICATED_KEYS)
+def test_generic_delete_on_protected_key_is_422(client, db, key):
+    db.set_setting(key, "kept")
+    resp = client.delete(f"/api/settings/{key}")
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "PROTECTED_KEY"
+    assert db.get_setting(key) == "kept"
 
 
-def test_generic_delete_on_protected_key_is_422(client):
-    resp = client.delete("/api/settings/remote_access_enabled")
-    assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "PROTECTED_KEY"
+def test_generic_delete_removes_a_stale_retired_7d_row(client, db):
+    """No endpoint owns the retired ``auto_swap_7d_threshold`` now, so the
+    generic DELETE must not answer "Use the dedicated endpoint". It deletes
+    a row that an old jacked wrote after the database opened."""
+    key = "auto_swap_7d_threshold"
+    assert key not in _DEDICATED_KEYS
+    db.set_setting(key, "85")
+    resp = client.delete(f"/api/settings/{key}")
+    assert resp.status_code == 200
+    assert resp.json() == {"key": key, "deleted": True}
+    assert db.get_setting(key) is None
 
 
 # ---------------------------------------------------------------------------

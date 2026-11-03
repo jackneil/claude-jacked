@@ -88,6 +88,26 @@ def tier_critical_threshold(account: dict) -> float:
     return float(resolve_plan(account).session_critical_pct)
 
 
+def weekly_critical_threshold(account: dict) -> float:
+    """Return the weekly usage at which auto-swap leaves the account (#224i).
+
+    At this level the account is walled: its weekly limit, or the weekly
+    limit of its binding model (for example Fable), cannot serve a session.
+    The value is the plan's ``weekly_critical_pct`` in the plan catalog
+    (``jacked/data/usage_plans.json``): 98 for every plan today, inherited
+    from each provider's default, and 98 when the catalog is missing. It is
+    a separate field from the 5h ``session_critical_pct``. A catalog edit,
+    not a code change, moves it.
+
+    >>> weekly_critical_threshold({"subscription_type": "max",
+    ...                            "rate_limit_tier": "default_claude_max_20x"})
+    98.0
+    >>> weekly_critical_threshold({"provider": "codex", "subscription_type": "pro"})
+    98.0
+    """
+    return float(resolve_plan(account).weekly_critical_pct)
+
+
 def achievable_burn(
     account: dict,
     now: datetime | None = None,

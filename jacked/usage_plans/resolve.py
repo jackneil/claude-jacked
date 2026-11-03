@@ -102,6 +102,7 @@ class PlanMatch:
     label_source: str  # provider | catalog | raw | none
     session: str
     session_critical_pct: float
+    weekly_critical_pct: float
     session_note: Optional[str]
     session_temporary_note: Optional[str]
     drift: tuple = ()
@@ -153,8 +154,8 @@ def resolve_plan(row: Mapping) -> PlanMatch:
     """Match an account row to its catalog plan.
 
     >>> p = resolve_plan({"subscription_type": "max", "rate_limit_tier": "default_claude_max_20x"})
-    >>> p.id, p.label, p.formerly, p.session, p.session_critical_pct
-    ('ultra', 'Ultra', 'Max 20x', 'until_verified', 95.0)
+    >>> p.id, p.label, p.formerly, p.session, p.session_critical_pct, p.weekly_critical_pct
+    ('ultra', 'Ultra', 'Max 20x', 'until_verified', 95.0, 98.0)
     >>> resolve_plan({"provider": "codex", "subscription_type": "pro"}).session
     'never'
     """
@@ -181,6 +182,7 @@ def resolve_plan(row: Mapping) -> PlanMatch:
         label=label, formerly=entry.formerly if entry is not None else None,
         label_source=source, session=base.session,
         session_critical_pct=base.session_critical_pct,
+        weekly_critical_pct=base.weekly_critical_pct,
         session_note=base.session_note,
         session_temporary_note=base.session_temporary_note,
         drift=tuple(drift), plan_key=plan_key, windows=windows,

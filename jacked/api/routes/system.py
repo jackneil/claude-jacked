@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from jacked.api.mutation_gate import denied_response, mutation_decision
 from jacked.api.remote_access import REASON_OUTSIDE_SCOPE, REASON_REMOTE_ACCESS_OFF
+from jacked.api.routes.settings_swap import SWAP_SETTING_KEYS
 from jacked.findbin import find_bin
 from jacked.install_summary import DEFAULT_LAST_INSTALL_PATH as _LAST_INSTALL_PATH
 from jacked.memory.vault import atomic_write_text
@@ -1127,16 +1128,11 @@ _PROTECTED_SETTING_KEYS = {
     # Legacy secret from the retired gatekeeper — old DBs may still carry it;
     # never allow it to be rewritten (or listed) via the generic endpoint.
     "gatekeeper.api_key",
-    "usage_check_interval",
-    "auto_swap_5h_warning",
-    "auto_swap_5h_critical",
-    "auto_swap_7d_threshold",
-    "auto_swap_enabled",
-    "window_keeper_enabled",
-    "window_keeper_active_start",
-    "window_keeper_active_end",
-    "window_keeper_prewake",
-    "auto_swap_paused_until",
+    # Every auto-swap and window keeper setting belongs to PUT
+    # /api/settings/swap-settings, which validates them as one set (warning
+    # below critical, active hours in order). Taken from that route's own key
+    # list, so a new swap setting is protected the day it is added.
+    *SWAP_SETTING_KEYS,
     # Bind host is a security decision — only the dedicated remote-access
     # endpoint (with its restart flow) may write these, never the generic PUT.
     "remote_access_enabled",

@@ -713,7 +713,7 @@ Jacked identifies an eligible account that still has headroom and records an aut
 
 ### Can jacked switch Claude accounts automatically?
 
-Only on a runtime with a certified cooperative credential capability. Auto-swap always watches the 5-hour headroom (on plans that have a 5-hour window) and the 7-day headroom, but current unsupported or unfenced builds stay recommendation-only. Manual **Use Account** requests return the exact outcome instead of claiming success from a database setting, and are gated by the remote-access setting (always allowed on the host; from a remote browser only inside the enabled scope).
+Only on a runtime with a certified cooperative credential capability. Current unsupported or unfenced builds stay recommendation-only. Auto-swap leaves an account only when its weekly limit or a model limit (for example, the Fable limit) reaches the critical level of the plan. The plan catalog sets this level in `weekly_critical_pct` (98% by default). The 5-hour rules are off by default: a swap makes the new account read the whole session again, and a 5-hour limit resets within hours. To use the 5-hour thresholds too, open the **Auto-Swap & Window Keeper** panel on the Accounts page. Turn on **Swap on the 5-hour window**. When auto-swap picks the next account, it still skips an account that is near its 5-hour limit. Manual **Use Account** requests return the exact outcome instead of claiming success from a database setting, and are gated by the remote-access setting (always allowed on the host; from a remote browser only inside the enabled scope).
 
 ### How do I check how much Claude usage I have left?
 

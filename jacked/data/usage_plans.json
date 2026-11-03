@@ -10,7 +10,8 @@
       },
       "default": {
         "session": "reported",
-        "session_critical_pct": 80
+        "session_critical_pct": 80,
+        "weekly_critical_pct": 98
       },
       "subscriptions": {
         "max": {
@@ -95,7 +96,8 @@
       },
       "default": {
         "session": "reported",
-        "session_critical_pct": 80
+        "session_critical_pct": 80,
+        "weekly_critical_pct": 98
       },
       "subscriptions": {
         "pro": {
