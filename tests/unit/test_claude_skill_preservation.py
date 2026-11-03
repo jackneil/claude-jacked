@@ -61,7 +61,9 @@ def _owning_manifest(skill_dir: Path, name: str) -> dict:
 def _skill(root: Path, name: str, body: str) -> Path:
     d = root / name
     d.mkdir(parents=True, exist_ok=True)
-    (d / "SKILL.md").write_text(body, encoding="utf-8")
+    # Bytes, not write_text: Windows would turn the newline into CRLF and the
+    # tests compare the bytes on disk against the literal body.
+    (d / "SKILL.md").write_bytes(body.encode("utf-8"))
     return d
 
 
@@ -1365,7 +1367,7 @@ def test_publish_keeps_a_file_another_writer_added_to_jackeds_own_copy(
 
     def copy_while_another_writer_adds_a_file(src_root, staging):
         if Path(src_root).name == "dcr":
-            (dcr / "notes.md").write_text("my notes\n", encoding="utf-8")
+            (dcr / "notes.md").write_bytes(b"my notes\n")
         return real_copy(src_root, staging)
 
     monkeypatch.setattr(_cli, "_copy_skill_tree", copy_while_another_writer_adds_a_file)
@@ -1435,7 +1437,7 @@ def test_a_change_between_the_check_and_the_move_aside_is_put_back(
 
     def another_writer_at_the_move_aside(s, d):
         if s == dst:
-            (dst / "notes.md").write_text("my notes\n", encoding="utf-8")
+            (dst / "notes.md").write_bytes(b"my notes\n")
 
     _record_renames(monkeypatch, before=another_writer_at_the_move_aside)
     out = _transaction(src, dst, owning, copy=_cli._copy_skill_tree)
@@ -1554,7 +1556,8 @@ def test_editable_links_resolve_after_the_publish(tmp_path, monkeypatch, start):
     out = _transaction(src, dst, manifest, copy=_cli._copy_skill_tree)
 
     assert out.error is None and out.backup is None
-    links = sorted(p for p in dst.rglob("*") if p.is_symlink())
+    links = sorted((p for p in dst.rglob("*") if p.is_symlink()), key=lambda p: p.relative_to(dst).as_posix())
+    # Sorted by the posix string: a WindowsPath sorts case-insensitively.
     assert [p.relative_to(dst).as_posix() for p in links] == [
         "SKILL.md", "measure.js", "references/n.md",
     ]
