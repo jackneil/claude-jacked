@@ -74,6 +74,31 @@ def test_exceptions_inside_a_list_arg_are_described():
     assert "RuntimeError" in entry["msg"] and "ValueError" in entry["msg"]
 
 
+def test_exceptions_nested_in_mappings_and_sequences_are_described():
+    nested = {"accounts": [{"id": 7, "error": _leaky()}, ({"path": ValueError(PATH)},)]}
+    entry = _format_entry(_record("state: %s", (nested,)))
+    assert TOKEN not in entry["msg"] and PATH not in entry["msg"]
+    assert "RuntimeError" in entry["msg"] and "ValueError" in entry["msg"]
+
+
+def test_containers_past_the_depth_limit_give_their_type_only():
+    deep = [[[[[[_leaky()]]]]]]
+    entry = _format_entry(_record("deep: %s", (deep,)))
+    assert TOKEN not in entry["msg"]
+    assert "<list>" in entry["msg"]
+
+
+def test_a_set_holding_an_exception_and_a_nested_list_still_formats():
+    entry = _format_entry(_record("set: %s", (frozenset({_leaky(), (1, ValueError(PATH))}),)))
+    assert TOKEN not in entry["msg"] and PATH not in entry["msg"]
+
+
+def test_a_non_string_message_holding_an_exception_is_described():
+    entry = _format_entry(_record({"stage": "refresh", "error": _leaky()}))
+    assert TOKEN not in entry["msg"]
+    assert "RuntimeError" in entry["msg"]
+
+
 def test_an_exception_as_the_message_is_described():
     entry = _format_entry(_record(_leaky()))
     assert entry["msg"] == "RuntimeError"

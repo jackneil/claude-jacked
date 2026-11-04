@@ -206,29 +206,64 @@ class _Described:
         return format(self._text, spec)
 
 
-def _client_value(value: object) -> object:
+_MAX_CLIENT_DEPTH = 4
+
+
+def _client_value(value: object, depth: int = 0) -> object:
     """Return ``value`` with each exception in it replaced by its description.
 
-    A list, tuple or set is examined one level deep.
+    Lists, tuples, sets and mappings are examined at every level, to
+    ``_MAX_CLIENT_DEPTH`` levels. A container that is deeper than that limit
+    gives its type name only, so no unexamined text gets to a client.
 
     >>> _client_value(ValueError("secret"))
     ValueError
     >>> _client_value([KeyError("k"), 3])
     [KeyError, 3]
+    >>> _client_value({"outer": [{"inner": OSError("/home/u/x")}]})
+    {'outer': [{'inner': OSError}]}
+    >>> _client_value([[[[[ValueError("deep")]]]]])
+    [[[[<list>]]]]
     >>> _client_value("text")
     'text'
     """
     if isinstance(value, BaseException):
         return _Described(value)
-    if isinstance(value, (list, tuple, set, frozenset)) and any(
-        isinstance(item, BaseException) for item in value
-    ):
-        items = [_client_value(item) for item in value]
-        # Base types only: a namedtuple or a subclass can need other arguments.
-        if isinstance(value, list):
-            return items
-        return tuple(items) if isinstance(value, tuple) else set(items)
-    return value
+    is_sequence = isinstance(value, (list, tuple, set, frozenset))
+    if not is_sequence and not isinstance(value, Mapping):
+        return value
+    if depth >= _MAX_CLIENT_DEPTH:
+        return _TypeOnly(value)
+    if isinstance(value, Mapping):
+        return {key: _client_value(val, depth + 1) for key, val in value.items()}
+    items = [_client_value(item, depth + 1) for item in value]
+    # Base types only: a namedtuple or a subclass can need other arguments.
+    if isinstance(value, list):
+        return items
+    if isinstance(value, tuple):
+        return tuple(items)
+    try:
+        return set(items)
+    except TypeError:
+        # A replaced item can be unhashable (a list from a nested sequence).
+        return items
+
+
+class _TypeOnly:
+    """A value that the dashboard shows by its type name only."""
+
+    __slots__ = ("_text",)
+
+    def __init__(self, value: object) -> None:
+        self._text = f"<{type(value).__name__}>"
+
+    def __str__(self) -> str:
+        return self._text
+
+    __repr__ = __str__
+
+    def __format__(self, spec: str) -> str:
+        return format(self._text, spec)
 
 
 def _client_message(record: logging.LogRecord) -> str:
@@ -252,7 +287,8 @@ def _client_message(record: logging.LogRecord) -> str:
     """
     if isinstance(record.msg, BaseException):
         return describe(record.msg)
-    template = str(record.msg)
+    # A message that is not a string (a dict, a list) can hold an exception.
+    template = record.msg if isinstance(record.msg, str) else str(_client_value(record.msg))
     args = record.args
     if not args:
         return template
