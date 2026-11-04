@@ -2859,14 +2859,21 @@ def _link_or_copy(src: Path, dst: Path) -> str:
 
     'linked-already' means dst is already the SAME file as src (a per-file
     symlink or hardlink to it, or src itself reached through a symlinked parent
-    dir). Nothing is touched then: unlinking dst in the last case would delete
+    dir). Nothing is touched then: replacing dst in the last case would replace
     the packaged source file.
+
+    Each step makes the new file or link under a temp name beside dst and
+    then replaces dst in one step (`jacked.atomic_install`). A step that fails
+    leaves dst as it was, so a full disk never leaves an agent or command
+    missing or truncated (#260i). A link at dst is replaced, never written
+    through.
 
     >>> isinstance(_link_or_copy.__doc__, str)
     True
     """
     import os as _os
-    import shutil as _shutil
+
+    from jacked.atomic_install import atomic_copy_file, atomic_hardlink, atomic_symlink
 
     try:
         if dst.exists() and _os.path.samefile(src, dst):
@@ -2874,17 +2881,13 @@ def _link_or_copy(src: Path, dst: Path) -> str:
     except OSError:
         pass
 
-    # Remove existing file/symlink at destination
-    if dst.is_symlink() or dst.exists():
-        dst.unlink()
-
     if not _is_editable_install():
-        _shutil.copy(src, dst)
+        atomic_copy_file(src, dst)
         return "copied"
 
     # Editable mode — try symlink first
     try:
-        _os.symlink(src.resolve(), dst)
+        atomic_symlink(src.resolve(), dst)
         return "symlinked"
     except OSError:
         pass
@@ -2892,13 +2895,13 @@ def _link_or_copy(src: Path, dst: Path) -> str:
     # Fallback: hardlink (same volume only)
     try:
         if src.stat().st_dev == dst.parent.stat().st_dev:
-            _os.link(src, dst)
+            atomic_hardlink(src, dst)
             return "hardlinked"
     except OSError:
         pass
 
     # Last resort: plain copy
-    _shutil.copy(src, dst)
+    atomic_copy_file(src, dst)
     return "copied"
 
 
@@ -2913,8 +2916,8 @@ def _copy_skill_tree(src_skill_root: Path, skill_dir: Path) -> int:
 
     A `skill_dir` that is itself a symlink (a hand-made dev link, or an old
     editable install that linked the whole dir) is unlinked first. Writing
-    into it would go THROUGH the link: `_link_or_copy` unlinks each dst before
-    linking, so it would delete the source files the link points at. Callers run
+    into it would go THROUGH the link: `_link_or_copy` replaces each dst, so
+    it would replace the source files the link points at. Callers run
     `preserve_user_skill_dir` before this, so a link jacked does not own has
     already been moved aside by then. The shared transaction
     (`_install_skill_dir_transactional`) gives this a new staging dir, so
@@ -2964,10 +2967,9 @@ def _remove_skill_dir(skill_dir: Path) -> None:
     >>> callable(_remove_skill_dir)
     True
     """
-    if skill_dir.is_symlink():
-        skill_dir.unlink()
-    else:
-        shutil.rmtree(skill_dir)
+    from jacked.atomic_install import remove_tree
+
+    remove_tree(skill_dir)
 
 
 @dataclass
@@ -3007,65 +3009,6 @@ class SkillInstallOutcome:
         return ""
 
 
-# The private dirs of one skill transaction are named ``.<name>.<tag>-<pid>``
-# beside the skill dir. The leading dot keeps the skill loader from taking
-# one for a skill. The pid of the process that made the dir lets a later run
-# tell the leftover of a dead process from an install that is still running.
-_SKILL_STAGING_TAG = "jacked-staging"
-_SKILL_PREVIOUS_TAG = "jacked-previous"
-
-
-def _skill_side_dir(skill_dir: Path, name: str, tag: str, pid: int | None = None) -> Path:
-    """The private dir ``.<name>.<tag>-<pid>`` beside `skill_dir`. The pid is
-    the pid of this process when none is given.
-
-    >>> _skill_side_dir(Path("skills") / "qa", "qa", _SKILL_STAGING_TAG, 7).as_posix()
-    'skills/.qa.jacked-staging-7'
-    """
-    return skill_dir.parent / f".{name}.{tag}-{os.getpid() if pid is None else pid}"
-
-
-def _clear_skill_leftovers(skill_dir: Path, name: str) -> None:
-    """Remove the private dirs that an earlier install of skill `name` left.
-
-    A crash during the copy leaves a staging dir. A crash between the two
-    publish renames leaves a previous dir, which holds jacked's own old copy.
-    A leftover is removed when its pid is this process or a process that is
-    proven dead (`process_liveness` is False). The leftover of a live process
-    belongs to an install that is still running, and an unknown answer proves
-    nothing, so both stay. A removal that fails is logged at WARNING, and the
-    install continues: it checks for its own staging dir again before the
-    copy. Raises OSError when the skills dir cannot be listed.
-
-    >>> callable(_clear_skill_leftovers)
-    True
-    """
-    from jacked.service.process import process_liveness
-
-    try:
-        entries = list(skill_dir.parent.iterdir())
-    except FileNotFoundError:
-        return
-    me = os.getpid()
-    prefixes = tuple(
-        f".{name}.{tag}-" for tag in (_SKILL_STAGING_TAG, _SKILL_PREVIOUS_TAG)
-    )
-    for entry in entries:
-        prefix = next((p for p in prefixes if entry.name.startswith(p)), None)
-        if prefix is None:
-            continue
-        pid_text = entry.name[len(prefix):]
-        if not (pid_text.isascii() and pid_text.isdigit()):
-            continue
-        pid = int(pid_text)
-        if pid != me and process_liveness(pid) is not False:
-            continue
-        try:
-            _remove_skill_dir(entry)
-        except OSError as e:
-            logger.warning("Could not remove the leftover %s of skill %s: %s", entry, name, e)
-
-
 def _install_skill_dir_transactional(
     src, skill_dir: Path, name: str, prior_manifest, *, preserve, copy,
 ) -> SkillInstallOutcome:
@@ -3079,16 +3022,16 @@ def _install_skill_dir_transactional(
     ``.<name>.jacked-staging-<pid>``, and can return a file count. The copy
     never writes into the live skill dir.
 
-    The publish renames the staging dir to the skill path with
-    `replace_with_retry`. When the path was free when the copy started, that
-    is the only rename. When jacked's own copy (or a link that jacked owns)
-    was there, that copy is renamed to ``.<name>.jacked-previous-<pid>``
-    first, the staging dir takes its place, and the previous dir is removed.
-    A reader sees the old copy or the new one, never a mix of the two
-    (#260i). A crash between the two renames leaves the previous dir beside
-    the skill. The next install of the same skill removes it first, because
-    it is jacked's own old copy. It removes a staging dir that a crash left
-    in the same way.
+    The stage and publish steps are `jacked.atomic_install.install_dir`, the one
+    atomic directory installer. When the path was free when the copy
+    started, the publish renames the staging dir to the skill path. When
+    jacked's own copy (or a link that jacked owns) was there, that copy is
+    renamed to ``.<name>.jacked-previous-<pid>`` first, the staging dir takes
+    its place, and the previous dir is removed. A reader sees the old copy
+    or the new one, never a mix of the two (#260i). This is the same for a
+    user's dir and for jacked's own copy, so no owner needs a special case.
+    The next install of the same skill removes a staging or previous dir
+    that a crash left.
 
     Only jacked's own copy, as it was when the transaction saw it, is set
     aside and removed. Its fingerprint (the full-dir hash of the install
@@ -3120,7 +3063,7 @@ def _install_skill_dir_transactional(
     import errno
 
     from jacked import install_manifest as _m
-    from jacked.atomic_io import replace_with_retry
+    from jacked.atomic_install import install_dir, present
 
     if _is_packaged_source(skill_dir, src):
         logger.info(
@@ -3132,125 +3075,85 @@ def _install_skill_dir_transactional(
         backup = preserve(skill_dir, name, src, prior_manifest)
     except OSError as e:
         return SkillInstallOutcome(error=e)
-    staging = _skill_side_dir(skill_dir, name, _SKILL_STAGING_TAG)
-    staged = False
-    previous = None
+    outcome = SkillInstallOutcome(backup=backup)
 
-    def refuse_if_changed(path: Path) -> None:
-        # `path` is the occupant, at the skill path or just set aside.
-        if _m.skill_content_hash(path) != seen:
-            raise FileExistsError(
-                errno.EEXIST, "The skill path changed during the install", str(skill_dir),
+    def report(e: OSError, step: str, path: Path) -> None:
+        if outcome.rollback_error is None:
+            outcome.rollback_error = e
+        if step == "staging":
+            logger.warning(
+                "Could not remove the staging copy of skill %s at %s: %s", name, path, e,
+            )
+        else:
+            logger.warning(
+                "Could not put the previous copy of skill %s back from %s to %s: %s",
+                name, path, skill_dir, e,
             )
 
     try:
         # Only jacked's own copy, seen at this point, is ever set aside by the
         # publish. A dir that appears at a free path during the copy is
-        # another writer's: the rename onto it fails, and it stays as it is.
-        occupied = backup is None and (skill_dir.exists() or skill_dir.is_symlink())
+        # another writer's: the publish refuses it, and it stays as it is.
+        occupied = backup is None and present(skill_dir)
         # The fingerprint of jacked's copy as it is now. A change during the
         # copy (a file added, an edit, a dir that replaced it) is not
         # jacked's, so the publish must not set it aside and delete it.
         seen = _m.skill_content_hash(skill_dir) if occupied else None
-        _clear_skill_leftovers(skill_dir, name)
-        if staging.exists() or staging.is_symlink():
-            raise FileExistsError(
-                errno.EEXIST, "A leftover staging dir could not be removed", str(staging),
-            )
-        staged = True
-        written = copy(src, staging)
-        if occupied and (skill_dir.exists() or skill_dir.is_symlink()):
-            refuse_if_changed(skill_dir)  # before any rename
-            aside = _skill_side_dir(skill_dir, name, _SKILL_PREVIOUS_TAG)
-            replace_with_retry(skill_dir, aside)
-            previous = aside
-            # A change that landed between that check and the rename is in
-            # the previous dir now. The rollback renames the dir back.
-            refuse_if_changed(aside)
-        if skill_dir.exists() or skill_dir.is_symlink():
-            # Another writer made the path during the copy. A rename onto a
-            # file, a link or a non-empty dir fails on its own, but rename(2)
-            # does replace an EMPTY dir on POSIX: refuse before the rename,
-            # so nothing another writer created is ever replaced.
-            raise FileExistsError(errno.EEXIST, "The skill path is in use", str(skill_dir))
-        replace_with_retry(staging, skill_dir)
-        staged = False  # the staging dir is the live skill dir now
-    except OSError as e:
-        outcome = SkillInstallOutcome(backup=backup, error=e)
-        _roll_back_skill_dir(
-            skill_dir, name, outcome,
-            staging=staging if staged else None, previous=previous,
+
+        def refuse_if_changed(path: Path) -> None:
+            # `path` is the occupant, at the skill path or just set aside.
+            if _m.skill_content_hash(path) != seen:
+                raise FileExistsError(
+                    errno.EEXIST, "The skill path changed during the install", str(skill_dir),
+                )
+
+        written = install_dir(
+            skill_dir, lambda staging: copy(src, staging),
+            replace_existing=occupied, check=refuse_if_changed, name=name,
+            # Looked up at call time, so a test can stand in for it.
+            remove=lambda d: _remove_skill_dir(d),
+            on_rollback_error=report,
         )
+    except OSError as e:
+        outcome.error = e
+        _restore_user_skill_dir(skill_dir, name, outcome)
         return outcome
-    if previous is not None:
-        try:
-            _remove_skill_dir(previous)
-        except OSError as e:
-            # The new copy is live, so the install worked. The next install
-            # of this skill removes the leftover.
-            logger.warning(
-                "Could not remove the previous copy of skill %s at %s: %s", name, previous, e,
-            )
-    return SkillInstallOutcome(
-        backup=backup, copied=written if isinstance(written, int) else 0,
-    )
+    outcome.copied = written if isinstance(written, int) else 0
+    return outcome
 
 
-def _roll_back_skill_dir(
-    skill_dir: Path, name: str, outcome: SkillInstallOutcome, *,
-    staging: Path | None = None, previous: Path | None = None,
-) -> None:
-    """Undo one failed copy or publish of `_install_skill_dir_transactional`.
+def _restore_user_skill_dir(skill_dir: Path, name: str, outcome: SkillInstallOutcome) -> None:
+    """After a failed copy or publish, move the user's backup back.
 
-    Removes ONLY ``staging``, the dir that this transaction made (None when
-    it made none). Renames ``previous`` (jacked's own copy, set aside by the
-    publish) back, and moves the user's backup back, each only when the skill
-    path is free. A dir at the skill path is not this transaction's, so it is
-    never removed and nothing is moved into it (shutil.move would put the
-    backup INSIDE it). Updates `outcome` in place: ``restored``, ``backup``
-    and ``rollback_error``. The first rollback failure is the one that
-    ``rollback_error`` keeps, and each one is logged at WARNING with its
-    paths. The copy failure, and a restore of the user's dir that worked, are
-    logged at INFO: `jacked install --json` keeps its console quiet, so the
-    log is the only operator record of them there.
+    `jacked.atomic_install.install_dir` already removed the staging dir and put
+    jacked's previous copy back. This step moves the user's backup to the
+    skill path only when that path is free. A dir at the skill path is not
+    this transaction's, so nothing is moved into it (shutil.move would put
+    the backup INSIDE it). Updates `outcome` in place: ``restored``,
+    ``backup`` and ``rollback_error``. The first rollback failure is the one
+    that ``rollback_error`` keeps, and each one is logged at WARNING with
+    its paths. The copy failure, and a restore of the user's dir that
+    worked, are logged at INFO: `jacked install --json` keeps its console
+    quiet, so the log is the only operator record of them there.
     """
     import errno
 
-    from jacked.atomic_io import replace_with_retry
+    from jacked.atomic_install import present
 
-    def failed(e: OSError, message: str, *args) -> None:
-        if outcome.rollback_error is None:
-            outcome.rollback_error = e
-        logger.warning(message, *args, e)
-
-    def require_free() -> None:
-        if skill_dir.exists() or skill_dir.is_symlink():
-            raise FileExistsError(errno.EEXIST, "The skill path is in use", str(skill_dir))
-
-    if staging is not None:
-        try:
-            if staging.exists() or staging.is_symlink():
-                _remove_skill_dir(staging)
-        except OSError as e:
-            failed(e, "Could not remove the staging copy of skill %s at %s: %s", name, staging)
-    if previous is not None:
-        try:
-            require_free()
-            replace_with_retry(previous, skill_dir)
-        except OSError as e:
-            failed(
-                e, "Could not put the previous copy of skill %s back from %s to %s: %s",
-                name, previous, skill_dir,
-            )
     backup = outcome.backup
     if backup is None:
         logger.info("skill %s: copy failed (%s)", name, outcome.error)
         return
     try:
-        require_free()
+        if present(skill_dir):
+            raise FileExistsError(errno.EEXIST, "The skill path is in use", str(skill_dir))
         shutil.move(str(backup), str(skill_dir))
     except OSError as e:
-        failed(e, "Could not restore skill %s from %s to %s: %s", name, backup, skill_dir)
+        if outcome.rollback_error is None:
+            outcome.rollback_error = e
+        logger.warning(
+            "Could not restore skill %s from %s to %s: %s", name, backup, skill_dir, e,
+        )
         return
     outcome.backup = None
     outcome.restored = True
@@ -5045,7 +4948,6 @@ def _run_install(
     ``{"name": <skill>, "error": <exception class name>}``, so the JSON record
     can say which skills were not installed and why.
     """
-    import shutil
 
     if not as_json:
         console.print("[bold]Installing Jacked...[/bold]\n")
@@ -5166,6 +5068,8 @@ def _run_install(
         console.print("[yellow][-][/yellow] No skills found to install")
 
     # Copy jacked reference doc (comprehensive knowledge for Claude about jacked)
+    from jacked.atomic_install import atomic_copy_file
+
     ref_src = pkg_root / "rules" / "jacked-reference.md"
     ref_dst = home / ".claude" / "jacked-reference.md"
     if ref_src.exists():
@@ -5173,10 +5077,10 @@ def _run_install(
         if ref_dst.exists():
             dst_content = ref_dst.read_text(encoding="utf-8")
             if src_content != dst_content:
-                shutil.copy(ref_src, ref_dst)
+                atomic_copy_file(ref_src, ref_dst)
                 console.print("[green][OK][/green] Updated jacked reference doc")
         else:
-            shutil.copy(ref_src, ref_dst)
+            atomic_copy_file(ref_src, ref_dst)
             console.print("[green][OK][/green] Installed jacked reference doc")
 
     # Install agents (symlink for editable, copy otherwise)
