@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from jacked.atomic_io import replace_with_retry
 from jacked.service.instance_models import InstanceManifest, ProcessIdentity
 
 logger = logging.getLogger(__name__)
@@ -122,7 +123,7 @@ def publish_manifest(path: Path, manifest: InstanceManifest) -> None:
             file.write(encoded)
             file.flush()
             os.fsync(file.fileno())
-        os.replace(temp_path, path)
+        replace_with_retry(temp_path, path)
         if os.name == "posix":
             path.chmod(0o600)
             directory_fd = os.open(path.parent, os.O_RDONLY)

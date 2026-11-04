@@ -4,6 +4,7 @@ Tests prepare_account_dir(), resolve_account(), launch_claude(),
 hook CLAUDE_CONFIG_DIR support, and account deletion cleanup.
 """
 
+import errno
 import json
 import os
 import stat
@@ -646,6 +647,51 @@ class TestPrepareAccountDir:
             file_mode = stat.S_IMODE(cred_file.stat().st_mode)
             assert file_mode == 0o600
 
+    def test_storage_that_refuses_chmod_still_gets_the_per_account_files(self, tmp_path):
+        """Some writable storage creates and replaces files but refuses chmod
+        (ENOTSUP). The launch writers keep their old policy there: the
+        refused chmod is logged and the per-account files are still written,
+        so credential preparation does not stop (#237i)."""
+        db = _make_db(tmp_path)
+        account = db.get_account(1)
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".claude.json").write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "projects": {"/trusted": {"hasTrustDialogAccepted": True}},
+        }))
+        from jacked import atomic_io
+
+        real_set_mode_bits = atomic_io._set_mode_bits
+        refused: list = []
+
+        def set_mode_bits(fd, tmp_name, mode):
+            # The chmod of the shared writer's temp files for the two
+            # per-account files is refused; the writer's own tolerance runs.
+            name = Path(tmp_name).name
+            if name.startswith(("..credentials.json.", "..claude.json.")):
+                refused.append(name.rsplit(".", 2)[0])
+                raise OSError(errno.ENOTSUP, "Operation not supported")
+            return real_set_mode_bits(fd, tmp_name, mode)
+
+        with (
+            mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"),
+            mock.patch("jacked.launch.should_refresh", return_value=False),
+            mock.patch.object(Path, "home", return_value=home),
+            mock.patch.object(atomic_io, "_set_mode_bits", set_mode_bits),
+        ):
+            from jacked.launch import prepare_account_dir
+
+            result = prepare_account_dir(account, db)
+
+        oauth = json.loads((result / ".credentials.json").read_text())["claudeAiOauth"]
+        assert oauth["accessToken"] == "alice_cc_access"
+        seeded = json.loads((result / ".claude.json").read_text())
+        assert seeded["hasCompletedOnboarding"] is True  # _seed_claude_config
+        assert seeded["projects"]["/trusted"] == {"hasTrustDialogAccepted": True}  # trust seed
+        assert sorted(set(refused)) == ["..claude.json", "..credentials.json"]
+        assert [p.name for p in result.iterdir() if p.name.endswith(".tmp")] == []
+
     def test_scoped_launch_skips_global_activation_on_file_authority_platforms(self, tmp_path):
         """Where the credential file is the authority, the launch dir is what Claude
         reads; the global file must stay untouched and the snapshot must say so."""
@@ -676,14 +722,14 @@ class TestPrepareAccountDir:
         db = _make_db(tmp_path)
         account = db.get_account(1)
 
-        def corrupt_replace(src, dst, **kwargs):
-            Path(dst).write_text("{not json", encoding="utf-8")
+        def corrupt_write(path, text, **kwargs):
+            Path(path).write_text("{not json", encoding="utf-8")
 
         with (
             mock.patch("jacked.launch.ACCOUNTS_DIR", tmp_path / "accounts"),
             mock.patch("jacked.launch.should_refresh", return_value=False),
             mock.patch("jacked.launch.scoped_launch_needs_global_activation", return_value=False),
-            mock.patch("jacked.launch._safe_replace", corrupt_replace),
+            mock.patch("jacked.launch.atomic_write_text", corrupt_write),
             pytest.raises(click.ClickException, match="read back"),
         ):
             from jacked.launch import prepare_account_dir
@@ -914,6 +960,8 @@ class TestPrepareAccountDir:
 
         assert per_account.read_bytes() == before
         assert not list(acct_dir.glob(".claude_json_tmp_*"))
+        # The shared writer's temp files (..claude.json.<random>.tmp).
+        assert [p.name for p in acct_dir.iterdir() if p.name.endswith(".tmp")] == []
 
     def test_seed_steps_start_an_absent_per_account_config_from_empty(self, tmp_path):
         db = _make_db(tmp_path)
@@ -979,6 +1027,8 @@ class TestSeedClaudeConfigFailClosed:
 
         assert (config_dir / ".claude.json").is_dir()
         assert not list(config_dir.glob(".claude_json_tmp_*"))
+        # The shared writer's temp files (..claude.json.<random>.tmp).
+        assert [p.name for p in config_dir.iterdir() if p.name.endswith(".tmp")] == []
 
 
 # ---------------------------------------------------------------------------

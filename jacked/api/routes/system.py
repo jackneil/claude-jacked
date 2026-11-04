@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from jacked.api.mutation_gate import denied_response, mutation_decision
+from jacked.api.project_paths import first_outside_project, outside_project_response
 from jacked.api.remote_access import REASON_OUTSIDE_SCOPE, REASON_REMOTE_ACCESS_OFF
 from jacked.api.routes.settings_swap import SWAP_SETTING_KEYS
 from jacked.findbin import find_bin
@@ -523,6 +524,9 @@ def get_project_lessons(repo_path: str, request: Request):
     error = _validate_project_path(repo_path, request)
     if error:
         return error
+    # A repository can ship lessons.md as a link to a private file.
+    if first_outside_project(repo_path, "lessons.md"):
+        return outside_project_response("lessons.md")
 
     lessons_path = Path(repo_path) / "lessons.md"
     if not lessons_path.exists():
@@ -569,6 +573,10 @@ def update_project_lessons(body: LessonsUpdateRequest, request: Request):
     error = _validate_project_path(body.repo_path, request)
     if error:
         return error
+    # The save keeps the file's header lines, so a lessons.md that links to
+    # a private file would copy that file's text into the project.
+    if first_outside_project(body.repo_path, "lessons.md"):
+        return outside_project_response("lessons.md")
 
     lessons_path = Path(body.repo_path) / "lessons.md"
 
@@ -600,6 +608,12 @@ def update_project_lessons(body: LessonsUpdateRequest, request: Request):
             lesson_lines.append(f"- {text}")
 
     content = "\n".join(header_lines + lesson_lines) + "\n"
+
+    # The link check runs again right before the write: this handler runs in
+    # the threadpool, and a link made after the check above would move the
+    # write outside the project.
+    if first_outside_project(body.repo_path, "lessons.md"):
+        return outside_project_response("lessons.md")
 
     try:
         # Two tabs can save at once (this handler runs in the threadpool):

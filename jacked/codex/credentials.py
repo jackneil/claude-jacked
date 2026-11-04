@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
+from jacked.atomic_io import atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 _AUTH_NS = "https://api.openai.com/auth"
@@ -69,7 +71,7 @@ def credential_store_mode(
     if not cfg.exists():
         return _DEFAULT_STORE_MODE
     try:
-        text = cfg.read_text(errors="replace")
+        text = cfg.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return _DEFAULT_STORE_MODE
 
@@ -94,28 +96,16 @@ def credential_store_mode(
 
 
 def _atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
-    """Write ``content`` to ``path`` atomically, preserving the existing mode."""
-    import tempfile
+    """Write ``content`` to ``path`` atomically as UTF-8, keeping the existing mode.
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    The shared writer retries the replace while Codex holds the file open on
+    Windows. TOML is UTF-8, so the reads above decode UTF-8 too.
+    """
     try:
         mode = path.stat().st_mode & 0o777
     except OSError:
         pass
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".cfg-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(content)
-        os.chmod(tmp, mode)
-        # Windows-safe replace (retries if the config file is held open) — reuse
-        # the platform util the Claude credential path already ships.
-        from jacked.api.credential_helpers import _safe_replace
-
-        _safe_replace(tmp, str(path))
-        tmp = None
-    finally:
-        if tmp is not None and os.path.exists(tmp):
-            os.unlink(tmp)
+    atomic_write_text(path, content, mode=mode)
 
 
 def ensure_file_storage(
@@ -135,7 +125,7 @@ def ensure_file_storage(
     existing = ""
     if cfg.exists():
         try:
-            existing = cfg.read_text(errors="replace")
+            existing = cfg.read_text(encoding="utf-8", errors="replace")
         except OSError:
             existing = ""
     # Drop any existing top-level key occurrences (commented lines are kept).

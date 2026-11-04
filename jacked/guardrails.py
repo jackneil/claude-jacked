@@ -12,6 +12,7 @@ import stat
 from pathlib import Path
 from typing import Optional
 
+from jacked.atomic_io import atomic_write_text
 
 # Where bundled templates live inside the package
 _DATA_DIR = Path(__file__).parent / "data"
@@ -141,7 +142,10 @@ def create_guardrails(
         if lang_src.exists():
             content += "\n" + lang_src.read_text(encoding="utf-8")
 
-    target.write_text(content, encoding="utf-8")
+    # The shared writer replaces a link at the target with a plain file: a
+    # repository can ship JACKED_GUARDRAILS.md as a link to a file of the user
+    # (~/.bashrc), and write_text would overwrite that file through the link.
+    atomic_write_text(target, content)
     return {
         "created": True,
         "path": str(target),

@@ -345,8 +345,10 @@ def test_state_roundtrip_and_atomic(tmp_path):
 
 def test_save_state_tmp_is_writer_unique(tmp_path, monkeypatch):
     """Two concurrent writers must never share a tmp path: a shared name lets
-    one writer os.replace the other's half-written file away. Capture the tmp
-    names two saves generate and assert they differ."""
+    one writer replace the target with the other's half-written file. Capture
+    the tmp names two saves generate and assert they differ."""
+    from jacked import atomic_io
+
     home = tmp_path
     seen = []
     real_mkstemp = tempfile.mkstemp
@@ -356,23 +358,25 @@ def test_save_state_tmp_is_writer_unique(tmp_path, monkeypatch):
         seen.append(name)
         return fd, name
 
-    monkeypatch.setattr(packs.tempfile, "mkstemp", spy_mkstemp)
+    monkeypatch.setattr(atomic_io.tempfile, "mkstemp", spy_mkstemp)
     packs.save_state(home, {"version": 2, "packs": {}})
     packs.save_state(home, {"version": 2, "packs": {"marketing": {"state": "enabled"}}})
     assert len(seen) == 2 and seen[0] != seen[1]
-    # both tmps were consumed by os.replace
+    # both tmps were consumed by the replace
     assert not Path(seen[0]).exists() and not Path(seen[1]).exists()
 
 
 def test_save_state_cleans_tmp_on_write_failure(tmp_path, monkeypatch):
     """A failed write must not leave the unique tmp behind."""
+    from jacked import atomic_io
+
     home = tmp_path
     (home / ".claude").mkdir(parents=True, exist_ok=True)
 
     def boom(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(packs.os, "replace", boom)
+    monkeypatch.setattr(atomic_io.os, "replace", boom)
     with pytest.raises(OSError):
         packs.save_state(home, {"version": 2, "packs": {}})
     leftovers = [p for p in (home / ".claude").iterdir() if p.suffix == ".tmp"]
@@ -392,6 +396,42 @@ def test_state_disable_is_durable_not_dropped(tmp_path):
     # ...but it IS explicitly disabled (durable), not simply forgotten.
     assert packs.pack_state(home, "marketing") == "disabled"
     assert packs.pack_state(home, "design-extras") == "enabled"
+
+
+def test_concurrent_decisions_in_one_process_are_never_lost(tmp_path, monkeypatch):
+    """The dashboard records each toggle in a worker thread (the shared
+    writer can pause on Windows), so two toggles can run at once. Each one
+    reads, changes and writes the whole state file: the second reader must
+    wait for the first writer, or one decision is lost."""
+    import threading
+
+    home = tmp_path
+    real_load = packs.load_state
+    first_read = threading.Event()
+    release = threading.Event()
+    loads: list = []
+
+    def load_state(h):
+        state = real_load(h)
+        loads.append(threading.current_thread().name)
+        if len(loads) == 1:
+            first_read.set()
+            release.wait(timeout=5)  # the first writer pauses after its read
+        return state
+
+    monkeypatch.setattr(packs, "load_state", load_state)
+    first = threading.Thread(target=packs.set_enabled, args=(home, "marketing", True))
+    second = threading.Thread(target=packs.set_enabled, args=(home, "design-extras", True))
+    first.start()
+    assert first_read.wait(timeout=5)
+    second.start()
+    second.join(timeout=0.3)  # unserialized, the second finishes here
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    state = real_load(home)["packs"]
+    assert set(state) == {"marketing", "design-extras"}
 
 
 def test_v1_state_migrated_to_v2_on_load(tmp_path):

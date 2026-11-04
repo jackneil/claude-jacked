@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 
 
 def _read_cache(cache_path: str, version: int, source: dict) -> dict | None:
@@ -20,29 +18,22 @@ def _read_cache(cache_path: str, version: int, source: dict) -> dict | None:
     return cached
 
 
-def _write_cache(
-    cache_path: str,
-    prefix: str,
-    version: int,
-    source: dict,
-    payload: dict,
-) -> None:
+def _write_cache(cache_path: str, version: int, source: dict, payload: dict) -> None:
+    """Persist one cache record. A failed write is a cache miss next time.
+
+    The shared writer is imported here, on the cache-miss path only: it loads
+    ``logging`` and ``tempfile``, which a cache-hit render never needs. The
+    replace never waits (``retry_budget=0``): the statusline prints after
+    this call, and a lost write only costs one recompute.
+    """
+    from jacked.atomic_io import atomic_write_text
+
     record = {"version": version, "source": source, **payload}
-    temporary = None
     try:
-        descriptor, temporary = tempfile.mkstemp(
-            dir=os.path.dirname(cache_path), prefix=prefix, suffix=".tmp"
+        atomic_write_text(
+            cache_path,
+            json.dumps(record, separators=(",", ":")) + "\n",
+            retry_budget=0,
         )
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(record, output, separators=(",", ":"))
-            output.write("\n")
-        os.replace(temporary, cache_path)
-        temporary = None
     except OSError:
         pass
-    finally:
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass

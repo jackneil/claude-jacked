@@ -6,7 +6,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-VERSION_CACHE = Path.home() / ".claude" / "jacked-version-cache.json"
+from jacked.atomic_io import atomic_write_text
+
+VERSION_CACHE =Path.home() / ".claude" / "jacked-version-cache.json"
 CACHE_TTL = 43200  # 12 hours — surfaces the update badge within half a day of a
                    # release; the tray menu also has "Check for updates" on demand
 CACHE_TTL_PROBE_FAILURE = 3600  # 1 hour — retry sooner after a transient PyPI/network failure
@@ -232,28 +234,13 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
         # _cache_ttl): bounce back faster instead of pretending we know.
         effective_ttl = _cache_ttl(pypi_latest, simple_latest, installable, current_version)
 
-        # Atomic write — tempfile + os.replace — preserves the crash-safety
-        # guarantee the prior implementation had. Half-written cache files
-        # otherwise survive Ctrl-C / OOM during write and silently break
-        # subsequent reads.
+        # The shared atomic writer keeps the crash-safety guarantee: a
+        # half-written cache file would survive Ctrl-C / OOM during the write
+        # and silently break later reads. The cache is best effort, so a
+        # failed write only means the next check asks PyPI again.
         try:
-            import tempfile
-            import os
-            VERSION_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(VERSION_CACHE.parent), prefix=".vcache-", suffix=".tmp"
-            )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(cache_data, fh)
-                os.replace(tmp_path, VERSION_CACHE)
-            except Exception:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                raise
-        except Exception:
+            atomic_write_text(VERSION_CACHE, json.dumps(cache_data))
+        except OSError:
             pass
 
         return {

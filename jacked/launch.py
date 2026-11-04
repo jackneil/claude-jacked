@@ -16,7 +16,6 @@ import logging
 import os
 import shutil
 import subprocess
-import tempfile
 import threading
 import time as _time
 import uuid
@@ -25,11 +24,11 @@ from pathlib import Path
 
 import click
 
+from jacked.atomic_io import atomic_write_text
 from jacked.findbin import find_bin
 from jacked.api.credential_helpers import (
     FOREIGN_PRIMARY_MESSAGE,
     _malformed_expiry,
-    _safe_replace,
     build_oauth_data,
     cc_token_known_dead,
     clear_ownership_cache,
@@ -138,24 +137,16 @@ def _seed_claude_config(config_dir: Path) -> None:
         if key in source:
             local[key] = source[key]
 
-    # Atomic write (matches the _seed_workspace_trust pattern)
-    fd, tmp = tempfile.mkstemp(
-        dir=str(config_dir), prefix=".claude_json_tmp_", suffix=".json"
-    )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(local, f, indent=2)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        _safe_replace(tmp, str(claude_json))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        logger.debug("Failed to write per-account .claude.json")
+        # mode_strict=False: storage that refuses chmod still gets the file
+        # (owner-only from creation), as every launch writer here does. The
+        # tolerance covers the POSIX mode bits only: on Windows the private
+        # ACL is still required, and a refused ACL stops the write.
+        atomic_write_text(
+            claude_json, json.dumps(local, indent=2), mode=0o600, mode_strict=False
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        logger.debug("Failed to write per-account .claude.json (%s)", type(exc).__name__)
 
 
 def _seed_workspace_trust(config_dir: Path) -> None:
@@ -223,24 +214,16 @@ def _seed_workspace_trust(config_dir: Path) -> None:
     if not changed:
         return
 
-    # Atomic write
-    fd, tmp = tempfile.mkstemp(
-        dir=str(config_dir), prefix=".claude_json_tmp_", suffix=".json"
-    )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(local, f, indent=2)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        _safe_replace(tmp, str(claude_json))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        logger.debug("Failed to write workspace trust to %s", claude_json)
+        atomic_write_text(
+            claude_json, json.dumps(local, indent=2), mode=0o600, mode_strict=False
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        logger.debug(
+            "Failed to write workspace trust for %s (%s)",
+            config_dir.name,
+            type(exc).__name__,
+        )
 
 
 def _seed_oauth_account(config_dir: Path, account: dict, db=None) -> None:
@@ -803,24 +786,9 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
         existing["claudeAiOauth"] = build_oauth_data(account)
     # No _jackedAccountId stamp — account_id is derived from directory path
 
-    # Atomic write
-    fd, tmp = tempfile.mkstemp(
-        dir=str(config_dir), prefix=".credentials_tmp_", suffix=".json"
+    atomic_write_text(
+        cred_path, json.dumps(existing, indent=2), mode=0o600, mode_strict=False
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        _safe_replace(tmp, str(cred_path))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
 
     if not kept_rotation:
         _forget_foreign_pair(config_dir)
@@ -1019,14 +987,7 @@ def _remember_foreign_pair(config_dir: Path, oauth: dict, account: dict) -> None
     marker = config_dir / _FOREIGN_PAIR_MARKER
     try:
         record = {**_pair_digests(oauth, account), "recorded_at": int(_time.time())}
-        fd, tmp = tempfile.mkstemp(dir=str(config_dir), prefix=".jacked-foreign-pair_", suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(record, fh)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        _safe_replace(tmp, str(marker))
+        atomic_write_text(marker, json.dumps(record), mode=0o600, mode_strict=False)
     except OSError as exc:
         logger.debug("Could not record the foreign pair for %s: %s", config_dir.name, exc)
 

@@ -544,12 +544,103 @@ def test_file_store_checks_again_right_before_replace(tmp_path: Path, monkeypatc
     assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 2
 
 
+def _windows_replace_held_once(monkeypatch, path: Path, *, rewrite: bool) -> list:
+    """Run the store's replace as Windows does: the first try is refused
+    while another handle holds the file, optionally after that holder
+    rewrote it (Claude Code refreshing its token)."""
+    from jacked import atomic_io
+
+    tries: list = []
+
+    def move(src, dst):
+        tries.append(dst)
+        if len(tries) == 1:
+            if rewrite:
+                path.write_bytes(_payload(2).to_bytes())
+                os.utime(path, ns=(10**12, 10**12))
+            raise PermissionError(13, "Access is denied")
+        os.replace(src, dst)
+
+    monkeypatch.setattr(atomic_io.sys, "platform", "win32")
+    monkeypatch.setattr(atomic_io.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(atomic_io, "_move_file_write_through", move)
+    return tries
+
+
+def test_file_store_checks_again_before_each_windows_retry(tmp_path: Path, monkeypatch) -> None:
+    """A write that lands while the retry pauses wins: the store refuses
+    instead of replacing it with an older view."""
+    path = tmp_path / ".credentials.json"
+    path.write_bytes(_payload(1).to_bytes())
+    store = FileCredentialStore(path, trusted_root=tmp_path)
+    assert store.read().status is StoreStatus.OK
+    tries = _windows_replace_held_once(monkeypatch, path, rewrite=True)
+
+    result = store.write(_payload(3), InteractionMode.FOREGROUND)
+
+    assert result.status is StoreStatus.CONCURRENT_WRITE
+    assert len(tries) == 1
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 2
+    assert list(tmp_path.glob(".credentials-stage-*")) == []
+
+
+def test_file_store_retries_a_windows_refusal_when_the_file_is_unchanged(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A reader or an antivirus scan holds the file briefly: the retry lands."""
+    path = tmp_path / ".credentials.json"
+    path.write_bytes(_payload(1).to_bytes())
+    store = FileCredentialStore(path, trusted_root=tmp_path)
+    assert store.read().status is StoreStatus.OK
+    tries = _windows_replace_held_once(monkeypatch, path, rewrite=False)
+
+    result = store.write(_payload(3), InteractionMode.FOREGROUND)
+
+    assert result.status is StoreStatus.OK
+    assert len(tries) == 2
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 3
+    assert list(tmp_path.glob(".credentials-stage-*")) == []
+
+
+def test_file_store_retries_when_the_holder_also_refuses_its_recheck_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The handle that refused the replace can refuse the compare-and-swap
+    re-read in the pause too. That refusal spends the same retry budget; it
+    does not make the write UNUSABLE while the budget still has tries."""
+    path = tmp_path / ".credentials.json"
+    path.write_bytes(_payload(1).to_bytes())
+    store = FileCredentialStore(path, trusted_root=tmp_path)
+    assert store.read().status is StoreStatus.OK
+    tries = _windows_replace_held_once(monkeypatch, path, rewrite=False)
+    real_read_bytes = Path.read_bytes
+    held_reads: list = []
+
+    def read_bytes(self):
+        # The holder lets go of the file only after the replace was refused
+        # once, so the first two re-reads in the pause are refused too.
+        if self == path and tries and len(held_reads) < 2:
+            held_reads.append(self)
+            raise PermissionError(13, "The process cannot access the file")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+    result = store.write(_payload(3), InteractionMode.FOREGROUND)
+
+    assert result.status is StoreStatus.OK, result
+    assert len(held_reads) == 2
+    assert len(tries) == 2
+    assert CredentialPayload.from_json(path.read_bytes()).identity.account_id == 3
+    assert list(tmp_path.glob(".credentials-stage-*")) == []
+
+
 def test_file_store_rearms_the_stamp_when_post_replace_cleanup_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
     """A failure after the replace commits must not poison the next write.
 
-    ``_durable_replace`` publishes the bytes; a later ``os.chmod`` /
+    The shared replace publishes the bytes; a later ``os.chmod`` /
     ``_sync_directory`` OSError makes ``write()`` report UNUSABLE while the new
     bytes are already on disk. If the compare-and-swap stamp still held the
     pre-write file, the next write would refuse with CONCURRENT_WRITE and the

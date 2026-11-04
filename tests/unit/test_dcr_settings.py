@@ -198,7 +198,7 @@ def test_write_is_atomic_replace_not_truncate(tmp_path):
     """os.replace (not an in-place rewrite) is what makes a concurrent reader
     see either the old file or the new one, never a half-written one."""
     dcr_settings.write_config(tmp_path, dcr_settings.DEFAULTS)
-    with patch("jacked.dcr_settings.os.replace") as replace:
+    with patch("jacked.atomic_io.os.replace") as replace:
         dcr_settings.write_config(tmp_path, dcr_settings.DEFAULTS)
     assert replace.called
     # The replace was mocked out, so the tmp survived — prove a tmp really existed.
@@ -273,7 +273,7 @@ def test_write_access_error_is_not_confused_with_an_unreadable_config(tmp_path):
 
 
 def test_write_converts_a_replace_failure_and_still_cleans_up_its_tmp(tmp_path):
-    with patch("jacked.dcr_settings.os.replace", side_effect=OSError("no space left")):
+    with patch("jacked.atomic_io.os.replace", side_effect=OSError("no space left")):
         with pytest.raises(DcrSettingsAccessError) as excinfo:
             dcr_settings.write_config(tmp_path, dcr_settings.DEFAULTS)
     assert "no space left" in str(excinfo.value)

@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import stat
-import tempfile
 import time
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping, Protocol
+
+from jacked.atomic_io import atomic_write_text
 
 from .models import CredentialCapability, CredentialIdentity, StoreStatus
 from .store import CredentialStore
@@ -245,21 +246,12 @@ def publish_snapshot(path: Path, snapshot: ResolverSnapshot) -> None:
     _validate_snapshot_path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     _validate_snapshot_path(path)
-    descriptor, temp_name = tempfile.mkstemp(
-        prefix=".resolver-snapshot-", dir=path.parent
+    atomic_write_text(
+        path,
+        json.dumps(value, sort_keys=True, separators=(",", ":")),
+        fsync=True,
+        mode=0o600,
     )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(value, output, sort_keys=True, separators=(",", ":"))
-            output.flush()
-            os.fsync(output.fileno())
-        os.chmod(temp_name, 0o600)
-        os.replace(temp_name, path)
-    finally:
-        try:
-            Path(temp_name).unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def _validate_snapshot_path(path: Path) -> None:

@@ -14,6 +14,12 @@ from pydantic import BaseModel, Field
 # would snapshot the original Lock at import time and miss every subsequent
 # rebind — silently reintroducing the "bound to a different event loop" bug
 # after the first tray restart. Do NOT auto-tidy this back to a from-import.
+from jacked.api.project_paths import (
+    LinkOutsideProject,
+    first_outside_project,
+    outside_project_response,
+    refuse_outside_project,
+)
 from jacked.api.routes import features as _features_mod
 from jacked.api.routes.features import (
     VALID_PERMISSION_MODES,
@@ -27,11 +33,21 @@ router = APIRouter()
 
 _project_settings_lock = asyncio.Lock()
 
+# The project paths these routes read and write. A link at either one that
+# points outside the project is refused (jacked.api.project_paths).
+_PROJECT_SETTINGS_PATHS = (".claude", ".claude/settings.local.json")
+
 
 def reset_locks() -> None:
     """Rebind to the current event loop — see routes.auth.reset_locks."""
     global _project_settings_lock
     _project_settings_lock = asyncio.Lock()
+
+
+def _settings_link_error(project: Path) -> JSONResponse | None:
+    """The 422 answer when a project settings path links outside ``project``."""
+    escaped = first_outside_project(project, *_PROJECT_SETTINGS_PATHS)
+    return outside_project_response(escaped) if escaped else None
 
 
 def _read_project_settings(repo_path: str) -> dict:
@@ -46,7 +62,16 @@ def _read_project_settings(repo_path: str) -> dict:
 
 
 def _write_project_settings(repo_path: str, data: dict):
-    """Write <repo>/.claude/settings.local.json atomically."""
+    """Write <repo>/.claude/settings.local.json atomically.
+
+    The shared writer's Windows retry can pause, so a route calls this in a
+    worker thread (``await asyncio.to_thread``) with
+    ``_project_settings_lock`` held. The link check runs again here, right
+    before the write: a link at ``.claude`` made after the route's check
+    would move the write outside the project. ``LinkOutsideProject`` is the
+    refusal; the route answers it with ``outside_project_response``.
+    """
+    refuse_outside_project(repo_path, *_PROJECT_SETTINGS_PATHS)
     claude_dir = Path(repo_path) / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(claude_dir / "settings.local.json", json.dumps(data, indent=2))
@@ -92,6 +117,9 @@ def get_project_permissions(repo_path: str, request: Request):
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": "Invalid repo_path"}},
         )
+    link_error = _settings_link_error(resolved)
+    if link_error:
+        return link_error
     settings = _read_project_settings(str(resolved))
     perms = settings.get("permissions", {})
     return {
@@ -125,6 +153,9 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"error": {"message": "Invalid repo_path"}},
         )
+    link_error = await asyncio.to_thread(_settings_link_error, resolved)
+    if link_error:
+        return link_error
     # Validate all patterns against the same rules as add_permission_rule —
     # dangerous-patterns blocklist + file-tool depth check. Prevents bypass via bulk PUT.
     for list_name, patterns in [("allow", body.allow), ("deny", body.deny), ("ask", body.ask)]:
@@ -169,7 +200,10 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
             settings["permissions"]["ask"] = body.ask
         if body.defaultMode is not None:
             settings["permissions"]["defaultMode"] = body.defaultMode
-        _write_project_settings(str(resolved), settings)
+        try:
+            await asyncio.to_thread(_write_project_settings, str(resolved), settings)
+        except LinkOutsideProject as escaped:
+            return outside_project_response(escaped.relative)
     return {"ok": True}
 
 
@@ -262,6 +296,9 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={"error": {"message": "Invalid repo_path"}},
             )
+        link_error = await asyncio.to_thread(_settings_link_error, resolved)
+        if link_error:
+            return link_error
         async with _project_settings_lock:
             settings = _read_project_settings(str(resolved))
             if "permissions" not in settings:
@@ -270,7 +307,12 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
             if pattern not in rules:
                 rules.append(pattern)
                 settings["permissions"][body.list_name] = rules
-                _write_project_settings(str(resolved), settings)
+                try:
+                    await asyncio.to_thread(
+                        _write_project_settings, str(resolved), settings
+                    )
+                except LinkOutsideProject as escaped:
+                    return outside_project_response(escaped.relative)
         return {"ok": True, "scope": "project"}
     else:
         async with _features_mod._settings_lock:
@@ -286,5 +328,5 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
             if pattern not in rules:
                 rules.append(pattern)
                 settings["permissions"][body.list_name] = rules
-                _write_settings_json(settings)
+                await asyncio.to_thread(_write_settings_json, settings)
         return {"ok": True, "scope": "global"}

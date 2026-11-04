@@ -2719,12 +2719,33 @@ def test_a_malformed_usage_cache_is_a_safe_miss(home, legacy_cache):
     assert "WRONG" not in line
 
 
+def test_a_held_usage_cache_never_makes_the_render_wait(home, monkeypatch):
+    """On Windows a reader can hold the cache file. The cache write gives up
+    at once (a lost write is only a miss) instead of pausing the render."""
+    from jacked import atomic_io
+
+    _usage_home(home)
+    pauses: list = []
+
+    def held(src, dst):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(atomic_io.sys, "platform", "win32")
+    monkeypatch.setattr(atomic_io.time, "sleep", pauses.append)
+    monkeypatch.setattr(atomic_io.os, "replace", held)
+
+    assert _scoped() in _render({"model": {"display_name": "Fable 5"}}, home)
+    assert pauses == []
+    assert not _usage_cache_path(home).exists()
+    assert not list((home / ".claude").glob(".statusline-usage.cache.*.tmp"))
+
+
 def test_a_usage_cache_write_failure_does_not_hide_the_segment(home, monkeypatch):
-    from jacked import statusline_cache
+    from jacked import atomic_io
 
     _usage_home(home)
     monkeypatch.setattr(
-        statusline_cache.tempfile,
+        atomic_io.tempfile,
         "mkstemp",
         lambda *a, **k: (_ for _ in ()).throw(OSError("cache unavailable")),
     )

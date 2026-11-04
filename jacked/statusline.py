@@ -229,13 +229,7 @@ def _read_usage_cache(cache_path: str, source: dict) -> "str | None":
 
 def _write_usage_cache(cache_path: str, segment: str, source: dict) -> None:
     """Persist the usage segment against its revision (empty ones too)."""
-    _write_cache(
-        cache_path,
-        ".statusline-usage-",
-        _USAGE_CACHE_VERSION,
-        source,
-        {"segment": segment},
-    )
+    _write_cache(cache_path, _USAGE_CACHE_VERSION, source, {"segment": segment})
 
 
 def _read_cached_usage(db_path: str, email: str, org_uuid: str):

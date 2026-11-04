@@ -7,11 +7,13 @@ import os
 import re
 import stat
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
+from jacked.atomic_io import replace_with_retry
 from jacked.service.spec import ServiceSpec
 from jacked.service.supervisors._artifacts import (
     ArtifactDisposition,
@@ -136,7 +138,7 @@ def _prepare_transition(
         else None
     )
     if evidence.previous_task and task_backup is None:
-        _restore_legacy_vbs(evidence.legacy_path, legacy_backup)
+        _restore_legacy_vbs(evidence.legacy_path, legacy_backup, evidence.legacy_content)
         return SupervisorAction(False, "refused", "registered task backup failed")
     return _Transition(request, evidence, task_backup, legacy_backup)
 
@@ -149,7 +151,9 @@ def _reconcile_and_activate(transition: _Transition) -> SupervisorAction:
         return _failed_transition(transition, type(exc).__name__, False)
     if reconciled.disposition is ArtifactDisposition.FOREIGN:
         is_restored = _restore_legacy_vbs(
-            transition.evidence.legacy_path, transition.legacy_backup
+            transition.evidence.legacy_path,
+            transition.legacy_backup,
+            transition.evidence.legacy_content,
         )
         _remove_task_backup(
             transition.task_backup, transition.evidence.previous_task
@@ -296,27 +300,64 @@ def _harden_legacy_windows_file(path: Path, content: bytes) -> bytes | None:
         return None
 
 
+class _LegacyVbsTargetChanged(Exception):
+    """A legacy VBS rename target changed while a Windows retry paused."""
+
+
+def _abort_when(changed: Callable[[], bool]) -> Callable[[], None]:
+    """A ``before_retry`` check that stops the rename when ``changed()``.
+
+    A Windows retry pauses while another handle holds a file, and another
+    writer can fill the rename target in that pause. The rename must then
+    stop, not overwrite what that writer put there.
+    """
+
+    def recheck() -> None:
+        if changed():
+            raise _LegacyVbsTargetChanged
+
+    return recheck
+
+
 def _retire_legacy_vbs(path: Path, content: bytes) -> Path | None:
     backup = path.with_name(f"{path.name}.pre-v2")
+
+    def foreign_backup() -> bool:
+        # The backup slot must be free or hold this same script.
+        return backup.exists() and backup.read_bytes() != content
+
     try:
-        if backup.exists() and backup.read_bytes() != content:
+        if foreign_backup():
             return None
-        os.replace(path, backup)
-    except OSError:
+        replace_with_retry(path, backup, before_retry=_abort_when(foreign_backup))
+    except (OSError, _LegacyVbsTargetChanged):
         return None
     return backup if backup.read_bytes() == content else None
 
 
-def _restore_legacy_vbs(path: Path, backup: Path | None) -> bool:
+def _restore_legacy_vbs(path: Path, backup: Path | None, content: bytes) -> bool:
+    """Move the retired script ``content`` back from ``backup`` to ``path``.
+
+    Return True when there is no backup to restore, or when ``path`` now
+    holds ``content`` and the backup is gone. Any other result is False.
+    """
     if backup is None:
         return True
-    if path.exists() or not backup.exists():
-        return False
+
+    def blocked() -> bool:
+        # The script slot must be free and the backup must still hold the
+        # retired script.
+        return path.exists() or not backup.exists() or backup.read_bytes() != content
+
     try:
-        os.replace(backup, path)
-    except OSError:
+        # The first check is inside the try too: the backup can go between
+        # exists() and read_bytes(), and that read then raises OSError.
+        if blocked():
+            return False
+        replace_with_retry(backup, path, before_retry=_abort_when(blocked))
+        return path.read_bytes() == content and not backup.exists()
+    except (OSError, _LegacyVbsTargetChanged):
         return False
-    return path.exists() and not backup.exists()
 
 
 def _rollback_new_task(transition: _Transition) -> bool:
@@ -398,7 +439,9 @@ def _failed_transition(
         evidence.previous_artifact,
     )
     legacy_ok = (
-        _restore_legacy_vbs(evidence.legacy_path, transition.legacy_backup)
+        _restore_legacy_vbs(
+            evidence.legacy_path, transition.legacy_backup, evidence.legacy_content
+        )
         if manager_ok
         else False
     )

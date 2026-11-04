@@ -2794,29 +2794,15 @@ def _rotate_backups(dir_path: Path, prefix: str, keep: int = 5) -> None:
 
 
 def _write_settings_atomic(settings_path: Path, data: dict) -> None:
-    """Atomically write settings.json via tempfile + os.replace.
+    """Atomically write settings.json through the shared atomic writer.
 
     Prevents half-written JSON if the process is killed mid-install.
     """
     import json as _json
-    import tempfile
 
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        prefix=".settings-",
-        suffix=".tmp",
-        dir=str(settings_path.parent),
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            _json.dump(data, f, indent=2)
-        os.replace(tmp, settings_path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    from jacked.atomic_io import atomic_write_text
+
+    atomic_write_text(settings_path, _json.dumps(data, indent=2))
 
 
 def _link_or_copy(src: Path, dst: Path) -> str:

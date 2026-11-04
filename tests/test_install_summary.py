@@ -78,6 +78,16 @@ def test_write_last_install_roundtrip(tmp_path):
     assert json.loads(p.read_text(encoding="utf-8"))["to_version"] == "0.51.0"
 
 
+def test_write_last_install_does_not_use_a_fixed_temp_name(tmp_path):
+    """A blocker at the old fixed ``<name>.tmp`` proves each write stages its
+    own temp file (two writers can never share one) and leaves none behind."""
+    p = tmp_path / "last.json"
+    (tmp_path / "last.json.tmp").mkdir()
+    s.write_last_install({"to_version": "1.0"}, p)
+    assert json.loads(p.read_text(encoding="utf-8"))["to_version"] == "1.0"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["last.json", "last.json.tmp"]
+
+
 # --- CLI integration: install wires the manifest + summary (Task A3) ---
 from click.testing import CliRunner  # noqa: E402
 from jacked.cli import main  # noqa: E402

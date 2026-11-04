@@ -120,5 +120,4 @@ class TestAtomicWrite:
 
         settings_path = tmp_path / "settings.json"
         _write_settings_atomic(settings_path, {"x": 1})
-        tmpfiles = list(tmp_path.glob(".settings-*.tmp"))
-        assert tmpfiles == []
+        assert [p.name for p in tmp_path.iterdir()] == ["settings.json"]

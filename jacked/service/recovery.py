@@ -7,6 +7,7 @@ import stat
 import time
 from pathlib import Path
 
+from jacked.atomic_io import replace_with_retry
 from jacked.service.instance_models import ServicePaths
 
 
@@ -62,7 +63,7 @@ def quarantine_invalid_ownership(paths: ServicePaths) -> Path | None:
         backup = paths.manifest.with_name(
             f"{paths.manifest.name}.invalid-{time.time_ns()}"
         )
-        os.replace(paths.manifest, backup)
+        replace_with_retry(paths.manifest, backup)
         if paths.control.exists() or paths.control.is_symlink():
             paths.control.unlink()
         return backup

@@ -443,6 +443,39 @@ uses private staging, flush and fsync, durable replacement, owner-only modes,
 and link/reparse-point checks. It rejects paths outside the trusted root,
 symlinks, hard links, and non-regular targets.
 
+jacked replaces a file only through the shared atomic writer in
+`jacked/atomic_io.py` (#237i). On Windows, a replace fails while another
+handle holds the target file: a reader, an indexer, or an antivirus scan. The
+shared replace then retries for up to 1 second, and after that it reports the
+error. The Claude config writer (section 5.5) allows 3 seconds. A test fails
+when a module in `jacked/` uses `os.replace` directly.
+
+A compare-and-swap writer checks its precondition again before every retry,
+because another writer can change the target during the pause. If the file
+changed, `FileCredentialStore` refuses the write as a concurrent write. The
+Claude config writer stops with `cas_aborted`, and the Task Scheduler
+supervisor stops the rename of the legacy startup script. When another handle
+also refuses the check, the writer counts one more refused try. The check and
+the replace use the same retry time.
+
+When a caller asks for a mode (0o600 for a credential file), the shared writer
+sets it on the open temp file before the bytes land. The mode goes through the
+file descriptor, so a link put at the temp name cannot redirect it. On Windows
+a mode bit does not control who can open a file. So the shared writer also
+gives the temp file a private ACL for the current user. The ACL goes through
+the temp file's name (and so does the mode on a Windows build without
+`os.fchmod`): a process that can put a link at that name can already read the
+folder's files, so the name is not a new exposure. If the writer cannot set the
+mode, it does not publish the file. The per-account launch files are the
+exception for the mode bits only: they log a refused chmod and continue,
+because some storage cannot carry mode bits. A refused Windows ACL stops every
+writer, because on Windows the ACL is the only protection the file has.
+
+The dashboard routes that write into a project (`.claude/settings.local.json`
+and `lessons.md`) check that the path is not a link to a location outside the
+project. The check runs twice: once in the route, and once more in the worker
+right before the write, so a link made between the two is refused as well.
+
 ### 5.4 Metadata and per-account directories are not authorities
 
 `~/.claude.json` contains identity and tier metadata used by Claude Code's UI.
@@ -1148,6 +1181,7 @@ every switch reports `observed_target_unfenced`, so a rule that acted only on
 | `jacked/credentials/capabilities.py` | Topology-keyed capability registry (platform, config mode, build floor) |
 | `jacked/credentials/runtime.py` | Production capability assembly and activation entry points |
 | `jacked/credentials/macos_store.py` | Keychain authority adapter driven by the signed security tool |
+| `jacked/atomic_io.py` | The one atomic file writer and the Windows-aware replace retry (#237i) |
 | `jacked/credentials/file_store.py` | Cross-platform durable JSON file adapter |
 | `jacked/credentials/resolver.py` | Authority/mirror consensus and snapshot publication |
 | `jacked/credentials/transaction.py` | Switch state machine and outcome axes |

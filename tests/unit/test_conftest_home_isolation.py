@@ -1,8 +1,8 @@
 """No test reaches the developer's real ~/.claude (tests/conftest.py).
 
 Import-time path constants resolve under an isolated HOME, the launch's
-per-account tree sits under each test's HOME, and a credential write under
-the real ~/.claude trips before it lands.
+per-account tree sits under each test's HOME, and a file write under the
+real ~/.claude (or to the real ~/.claude.json) trips before it lands.
 """
 
 import os
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from jacked.api import credential_helpers
+from jacked import atomic_io
 from tests.conftest import REAL_HOME
 
 
@@ -33,13 +33,18 @@ def test_the_launch_accounts_dir_is_under_this_tests_home():
     assert Path(os.environ["HOME"]) in jacked.launch.ACCOUNTS_DIR.parents
 
 
-def test_a_credential_write_under_the_real_claude_dir_trips(tmp_path):
+@pytest.mark.parametrize(
+    "real_target",
+    [
+        REAL_HOME / ".claude" / "accounts" / "999" / ".credentials.json",
+        REAL_HOME / ".claude.json",
+    ],
+)
+def test_a_write_to_the_real_claude_files_trips(tmp_path, real_target):
     src = tmp_path / "staged.json"
     src.write_text("{}", encoding="utf-8")
     with pytest.raises(RuntimeError, match="real ~/.claude"):
-        credential_helpers._safe_replace(
-            str(src), str(REAL_HOME / ".claude" / "accounts" / "999" / ".credentials.json")
-        )
+        atomic_io.replace_with_retry(str(src), str(real_target))
     assert src.exists()  # nothing moved
 
 
@@ -48,20 +53,20 @@ def test_a_credential_write_under_a_temp_home_is_allowed(tmp_path):
     src.write_text("{}", encoding="utf-8")
     dst = tmp_path / ".claude" / "accounts" / "1" / ".credentials.json"
     dst.parent.mkdir(parents=True)
-    credential_helpers._safe_replace(str(src), str(dst))
+    atomic_io.replace_with_retry(str(src), str(dst))
     assert dst.exists()
 
 
-def test_the_launch_modules_own_writer_alias_is_guarded_too(tmp_path, monkeypatch):
-    """launch.py binds _safe_replace by name at import; the guard must cover
-    that alias, not only the credential_helpers attribute."""
-    import jacked.launch
+def test_every_name_bound_to_the_shared_replace_is_guarded(tmp_path):
+    """Modules bind ``replace_with_retry`` by name at import. The guard sits
+    on the primitive under it, so every bound name trips."""
     from jacked.api import claude_config_store
+    from jacked.credentials import file_store
 
     src = tmp_path / "staged.json"
     src.write_text("{}", encoding="utf-8")
     real_dst = str(REAL_HOME / ".claude" / "accounts" / "999" / ".credentials.json")
-    for writer in (jacked.launch._safe_replace, claude_config_store._safe_replace):
+    for writer in (claude_config_store.replace_with_retry, file_store.replace_with_retry):
         with pytest.raises(RuntimeError, match="real ~/.claude"):
             writer(str(src), real_dst)
     assert src.exists()

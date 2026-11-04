@@ -161,17 +161,90 @@ def test_a_lock_held_past_the_hold_limit_is_not_replaced(tmp_path, monkeypatch):
 def test_the_write_is_fsynced_before_the_replace(tmp_path, monkeypatch):
     order: list[str] = []
     real_fsync = os.fsync
-    real_replace = store._safe_replace
+    real_replace = store.replace_with_retry
 
     monkeypatch.setattr(store.os, "fsync", lambda fd: order.append("fsync") or real_fsync(fd))
     monkeypatch.setattr(
         store,
-        "_safe_replace",
+        "replace_with_retry",
         lambda src, dst, **kw: order.append("replace") or real_replace(src, dst, **kw),
     )
 
     assert write_identity(tmp_path, build_identity_block(_row())).status == "written"
     assert order == ["fsync", "replace"]
+
+
+def test_the_replace_keeps_its_longer_windows_budget(tmp_path, monkeypatch):
+    """Antivirus and indexers hold the config briefly on Windows, so this
+    replace asks the shared one for 3 s of retries (the default is 1 s)."""
+    budgets: list = []
+    real_replace = store.replace_with_retry
+
+    def spy(src, dst, **kwargs):
+        budgets.append(kwargs.get("retry_budget"))
+        return real_replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(store, "replace_with_retry", spy)
+
+    assert write_identity(tmp_path, build_identity_block(_row())).status == "written"
+    assert budgets == [3.0]
+
+
+def _windows_replace_refused_once(monkeypatch, during_pause) -> list:
+    """The first replace is refused while another handle holds the config,
+    and ``during_pause`` runs in the retry pause."""
+    from jacked import atomic_io
+
+    tries: list = []
+    real_replace = os.replace
+
+    def replace(src, dst):
+        tries.append(dst)
+        if len(tries) == 1:
+            raise PermissionError(13, "Access is denied")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(atomic_io.sys, "platform", "win32")
+    monkeypatch.setattr(atomic_io.os, "replace", replace)
+    monkeypatch.setattr(atomic_io.time, "sleep", lambda _seconds: during_pause())
+    return tries
+
+
+def _set_email(config) -> str:
+    config["oauthAccount"] = {"emailAddress": "a@b.c"}
+    return "replace"
+
+
+def test_a_change_during_a_windows_retry_pause_aborts_the_write(tmp_path, monkeypatch):
+    """Claude Code can save the config while the retry pauses (it does not
+    always honor the lock). The stale staged document must not replace it."""
+    _write(tmp_path, {"projects": {"a": 1}, "oauthAccount": {"emailAddress": "z@q.io"}})
+    config = tmp_path / ".claude.json"
+
+    def claude_code_saves():
+        _write(tmp_path, {"projects": {"a": 1, "b": 2}, "oauthAccount": {"emailAddress": "z@q.io"}})
+        os.utime(config, ns=(1, 1))
+
+    tries = _windows_replace_refused_once(monkeypatch, claude_code_saves)
+
+    result = store._write_locked(config, _set_email, None, 4, time.monotonic())
+
+    assert result.status == "cas_aborted"
+    assert len(tries) == 1
+    assert _read(tmp_path) == {"projects": {"a": 1, "b": 2}, "oauthAccount": {"emailAddress": "z@q.io"}}
+    assert list(tmp_path.glob(store.TMP_PREFIX + "*")) == []
+
+
+def test_an_unchanged_config_is_written_on_the_windows_retry(tmp_path, monkeypatch):
+    _write(tmp_path, {"projects": {"a": 1}, "oauthAccount": {"emailAddress": "z@q.io"}})
+    config = tmp_path / ".claude.json"
+    tries = _windows_replace_refused_once(monkeypatch, lambda: None)
+
+    result = store._write_locked(config, _set_email, None, 4, time.monotonic())
+
+    assert result.status == "written"
+    assert len(tries) == 2
+    assert _read(tmp_path) == {"projects": {"a": 1}, "oauthAccount": {"emailAddress": "a@b.c"}}
 
 
 # --- lock ownership and verify ----------------------------------------------
