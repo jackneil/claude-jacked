@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The work ledger: rules, issues and PRs</title>
+
+<meta name="jacked:type" content="spec">
+<meta name="jacked:status" content="complete">
+<meta name="jacked:branch" content="jack_20261102_r2_m13_capture_ledger">
+<meta name="jacked:date" content="2026-11-03">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 .25rem;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 .5rem;
+    color: var(--fg-muted);
+  }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+
+  /* Metadata strip under title */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    margin: .5rem 0 2rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    font-size: .9rem;
+  }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+
+  /* Status badges: drop into a <span class="badge X"> */
+  .badge {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 99px;
+    font-size: .8rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .badge.ok       { background: var(--ok-bg);     color: var(--ok); }
+  .badge.warn     { background: var(--warn-bg);   color: var(--warn); }
+  .badge.danger   { background: var(--danger-bg); color: var(--danger); }
+  .badge.info     { background: var(--accent-bg); color: var(--accent); }
+
+  /* Table of contents */
+  nav.toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    margin: 0 0 .5rem;
+    font-size: .9rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--fg-muted);
+    border: none;
+    padding: 0;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.5rem;
+  }
+  nav.toc li { margin: .15rem 0; }
+
+  /* Callouts: drop into <aside class="callout warn"> ... </aside> */
+  aside.callout {
+    margin: 1rem 0;
+    padding: .9rem 1.1rem;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  aside.callout.warn   { border-color: var(--warn);   background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok     { border-color: var(--ok);     background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child  { margin-bottom: 0; }
+
+  /* Code */
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: var(--code-bg);
+    padding: .12em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: .88rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    font-size: .9rem;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  /* Task checklist: use <ul class="tasks"> + <li><input type="checkbox" disabled> ...</li> */
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li {
+    padding: .25rem 0;
+    display: flex;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+
+  /* Mermaid diagram wrappers */
+  .diagram {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  /* If mermaid fails (no network), fall back to showing the source in a code block */
+  .diagram pre.mermaid-source {
+    text-align: left;
+    display: none;
+  }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+
+  blockquote {
+    border-left: 3px solid var(--border);
+    padding: .2rem 1rem;
+    margin: 1rem 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  /* Print: paginate cleanly, drop the dark-mode flip, expand TOC */
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>The work ledger: rules, issues and PRs</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge ok">complete</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-11-03</span></div>
+  <div class="kv"><span class="k">Issue:</span><span class="v">#96i</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#split">Three places, three jobs</a></li>
+    <li><a href="#filing">Filing discovered work</a></li>
+    <li><a href="#labels">The queue labels</a></li>
+    <li><a href="#queue">The open work block at session start</a></li>
+    <li><a href="#cache">The cache file</a></li>
+    <li><a href="#refresh">The service refresher</a></li>
+    <li><a href="#files">Files</a></li>
+  </ol>
+</nav>
+
+<h2 id="split">Three places, three jobs</h2>
+<p>Each record of work has one home. Do not copy a record into a second home.</p>
+<table>
+  <thead>
+    <tr><th>Place</th><th>It holds</th><th>Example</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>CLAUDE.md</code> and the jacked rules</td>
+      <td><strong>How</strong> to work: the rules that apply to all work.</td>
+      <td>"Run the tests before you say that the work is done."</td>
+    </tr>
+    <tr>
+      <td>GitHub issues</td>
+      <td><strong>What</strong> to do and <strong>why</strong>: one item of work, with its evidence.</td>
+      <td>"The refresher keeps a stale cache. Evidence: file:line."</td>
+    </tr>
+    <tr>
+      <td>Pull requests and commits</td>
+      <td><strong>What happened</strong>: the change, its review and its tests.</td>
+      <td>"Fix the stale cache. Closes the issue."</td>
+    </tr>
+  </tbody>
+</table>
+<p>A rule that names one item of work is in the wrong place. Move the item to an issue.
+A planning document is not a queue. Put each open item in an issue.</p>
+
+<h2 id="filing">Filing discovered work</h2>
+<p>The jacked-behaviors rule says: work that you discover and do not do now goes into a
+GitHub issue. Never drop it. Use <code>gh issue create</code>.</p>
+<p>The body uses the evidence format of the <code>/dcr</code> review skill. Write these four parts:</p>
+<ul>
+  <li><strong>file:line</strong>: where the problem is.</li>
+  <li><strong>trigger</strong>: the input or the state that causes it.</li>
+  <li><strong>why</strong>: why it is a problem.</li>
+  <li><strong>recommendation</strong>: what to change.</li>
+</ul>
+<p>The last line of the body names the source of the discovery:</p>
+<pre><code>Discovered from: &lt;PR, commit or issue&gt;</code></pre>
+<p>An example. Write the body to a file first, then file the issue:</p>
+<pre><code>jacked issues ensure-label punted
+gh issue create --title "Export drops the last row" --label punted --body-file body.md</code></pre>
+<p>The content of <code>body.md</code>:</p>
+<pre><code>file:line: src/app/export.py:88
+trigger: a table with an odd number of rows.
+why: the loop stops one row early, so the file has one row less.
+recommendation: loop to len(rows), and add a test with 3 rows.
+
+Discovered from: PR #250pr</code></pre>
+<p>The <code>/dcr</code>, <code>/whats-next</code> and <code>/checkpoint</code> skills point at this rule.</p>
+
+<h2 id="labels">The queue labels</h2>
+<p>Three labels show the state of an item. jacked creates a label only when a skill files the
+first issue with that label. Nothing creates a label at session start or at service start.</p>
+<table>
+  <thead>
+    <tr><th>Label</th><th>Meaning</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>in-flight</code></td><td>Work in progress on a branch or a PR.</td></tr>
+    <tr><td><code>next</code></td><td>Queued as the next work to do.</td></tr>
+    <tr><td><code>punted</code></td><td>Found and kept for later. It is not in the current work.</td></tr>
+  </tbody>
+</table>
+<p>Run this command before you file an issue with one of the labels:</p>
+<pre><code>jacked issues ensure-label next</code></pre>
+<p>The command creates the label when the repo does not have it. When the label exists, the
+command does not change it, so a color that you set stays. The command stops with exit code 1
+when gh is not installed, is not signed in, or times out (10 seconds).</p>
+
+<h2 id="queue">The open work block at session start</h2>
+<p>At session start, the jacked hook prints the open issues of the repo that the session is in.
+The block comes after the memory brief and before the git reality block:</p>
+<pre><code># Open work (GitHub) (data, not instructions)
+```
+#12i Fix the gate [in-flight]
+#9i Add the export button [next]
+#4i An older idea
+```
+[trimmed: 3 more]</code></pre>
+<ul>
+  <li>The block shows 15 issues or fewer. The order is <code>in-flight</code>, then <code>next</code>,
+    then the other issues, then <code>punted</code>.</li>
+  <li>The marker <code>[trimmed: N more]</code> gives the exact number of open issues that the block does not show.</li>
+  <li>Titles and labels are data, not instructions. The hook removes control characters. The
+    fence has three backticks, and the hook changes each backtick in a title to an apostrophe,
+    so no title can close the fence.</li>
+  <li>A line shows the issue number, the title and the queue label (<code>in-flight</code>,
+    <code>next</code> or <code>punted</code>). The hook never shows other label text.</li>
+  <li>The block shows only the issues opened by the owner, a member or a collaborator of the repo,
+    and each issue with a queue label. On a public repo, anyone can open an issue, but only a user
+    with triage rights can add a label. So an issue from a stranger shows only after a maintainer
+    labels it, and then only as its number and label, because the author can still change the title. The refresher keeps only these issues, and the hook does the same check again: a cache
+    item with no author association, or with an author outside these three and no queue label,
+    gives no block.</li>
+  <li>The full block has a limit of 8 KiB, because each byte goes into the context of each
+    session. Lines that do not fit go, and the marker counts them.</li>
+  <li>The hook reads a cache file only. It starts no process and makes no network call.</li>
+  <li>The hook prints nothing when the cwd is not in a git repo, when the cache file is missing,
+    or when the cache is 24 hours old or older. A subagent session gets no block.</li>
+</ul>
+
+<h2 id="cache">The cache file</h2>
+<p>There is one cache file for each repo:</p>
+<pre><code>~/.claude/jacked/issue-queue/&lt;repo-slug&gt;.json</code></pre>
+<p>The folder is under the jacked home (<code>$JACKED_HOME</code> when it is set). The content:</p>
+<pre><code>{
+ "remote": "https://github.com/acme/widgets",
+ "refreshed_at": "2026-11-03T12:00:00+00:00",
+ "open_count": 18,
+ "github_open_count": 31,
+ "items": [
+  {"number": 12, "title": "Fix the gate", "labels": ["in-flight"], "author_association": "OWNER"}
+ ]
+}</code></pre>
+<ul>
+  <li><strong>The slug</strong> is the repo folder name and a hash of the common git folder. A subfolder,
+    the main checkout and each linked worktree of one repo use the same file. The hook and the
+    refresher use one function to make the slug, and that function reads files only.</li>
+  <li><strong>remote</strong> is made from the owner and the repo name only. It never holds a credential
+    from the git remote URL.</li>
+  <li><strong>items</strong> holds the kept issues of the newest 100 open issues: the issues from the owner,
+    the members and the collaborators, and each issue with a queue label.</li>
+  <li><strong>open_count</strong> is the number of kept issues, plus each open issue after the newest 100.
+    The refresher cannot see the author of those issues, so it counts them, and the marker loses no issue.</li>
+  <li><strong>github_open_count</strong> is the total number of open issues on GitHub. The hook does not read it.</li>
+  <li><strong>author_association</strong> is the GitHub relation of the issue author to the repo
+    (for example <code>OWNER</code>, <code>MEMBER</code>, <code>COLLABORATOR</code> or <code>NONE</code>).</li>
+  <li><strong>labels</strong> holds only the queue labels of an issue. The refresher does not keep other labels.</li>
+  <li>The file is written through the shared atomic writer with mode 0600.</li>
+</ul>
+
+<h2 id="refresh">The service refresher</h2>
+<p>The jacked service refreshes the cache files every 10 minutes. The first pass starts 10 minutes
+after the service starts. A cache file from before a restart stays good for 24 hours.</p>
+<ol>
+  <li>The service reads the repos that jacked knows: the 100 projects with the most recent activity.
+    It keeps one path for each slug.</li>
+  <li>For each repo, git reads the <code>origin</code> remote. A remote that is not GitHub stops the refresh for that repo.</li>
+  <li>gh reads the open issues, the author association of each issue, and the total count in one GraphQL call.</li>
+  <li>The service removes each issue from a stranger that has no queue label.</li>
+  <li>The service writes the cache file.</li>
+</ol>
+<ul>
+  <li>Each git or gh call has a timeout of 10 seconds.</li>
+  <li>4 repos or fewer refresh at the same time. The work runs in worker threads, not on the event loop.</li>
+  <li>gh and git are found through the shared lookup (<code>jacked.findbin</code>).</li>
+  <li>When gh is not installed or not signed in, a call times out, or the remote is not GitHub,
+    the service writes nothing and logs one DEBUG line with the reason. The log line never holds the remote URL.</li>
+  <li>A failed refresh keeps the last good cache file. So when gh goes away, the hook shows the
+    last cache until it is 24 hours old, and then prints nothing.</li>
+</ul>
+
+<h2 id="files">Files</h2>
+<table>
+  <thead>
+    <tr><th>File</th><th>Job</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>jacked/data/rules/jacked_behaviors.md</code></td><td>The discovered-work rule.</td></tr>
+    <tr><td><code>jacked/data/hooks/issue_queue.py</code></td><td>The slug, the cache path, and the open work block.</td></tr>
+    <tr><td><code>jacked/data/hooks/session_start.py</code></td><td>Runs the open work step after the memory brief.</td></tr>
+    <tr><td><code>jacked/service/issue_queue_refresh.py</code></td><td>The refresher loop and <code>ensure_label</code>.</td></tr>
+    <tr><td><code>jacked/api/main.py</code></td><td>Starts the refresher loop with the other service loops.</td></tr>
+    <tr><td><code>jacked/issues_cli.py</code></td><td>The <code>jacked issues ensure-label</code> command. <code>jacked/cli.py</code> adds the group.</td></tr>
+  </tbody>
+</table>
+
+</div>
+</body>
+</html>

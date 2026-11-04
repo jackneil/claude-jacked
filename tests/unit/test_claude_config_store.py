@@ -193,23 +193,55 @@ def test_the_replace_keeps_its_longer_windows_budget(tmp_path, monkeypatch):
 
 
 def _windows_replace_refused_once(monkeypatch, during_pause) -> list:
-    """The first replace is refused while another handle holds the config,
-    and ``during_pause`` runs in the retry pause."""
+    """The store's first replace is refused while another handle holds the
+    config, and ``during_pause`` runs once, in that retry pause.
+
+    Return the list of the store's replace tries (the replaces of its own
+    ``TMP_PREFIX`` temp file). Other replaces (``during_pause`` saving the
+    config through the shared atomic writer) are not refused or counted.
+
+    Only ``atomic_io`` gets the fake pause. ``os`` and ``time`` are shared
+    modules, so a fake ``time.sleep`` would also replace the store's own
+    10 ms pause in ``_stat_signature`` (the Windows retry of a zero inode),
+    and ``during_pause`` would run again inside the recheck. Later pauses
+    are real pauses, so the shared writer's own retries still wait.
+    """
+    import types
+
     from jacked import atomic_io
 
     tries: list = []
     real_replace = os.replace
+    real_sleep = time.sleep
+    paused: list = []
 
     def replace(src, dst):
-        tries.append(dst)
-        if len(tries) == 1:
-            raise PermissionError(13, "Access is denied")
+        if Path(src).name.startswith(store.TMP_PREFIX):
+            tries.append(dst)
+            if len(tries) == 1:
+                raise PermissionError(13, "Access is denied")
         real_replace(src, dst)
+
+    def pause(seconds):
+        if paused:
+            real_sleep(seconds)
+            return
+        paused.append(seconds)
+        during_pause()
 
     monkeypatch.setattr(atomic_io.sys, "platform", "win32")
     monkeypatch.setattr(atomic_io.os, "replace", replace)
-    monkeypatch.setattr(atomic_io.time, "sleep", lambda _seconds: during_pause())
+    monkeypatch.setattr(atomic_io, "time", types.SimpleNamespace(sleep=pause))
     return tries
+
+
+def _save_like_claude_code(config: Path, data: dict) -> None:
+    """Save ``config`` the way an outside writer does it: a whole new file
+    through the shared atomic replace. A reader never sees a half-written or
+    truncated config, and on Windows a held file gets the usual retries."""
+    from jacked.atomic_io import atomic_write_bytes
+
+    atomic_write_bytes(config, json.dumps(data).encode("utf-8"))
 
 
 def _set_email(config) -> str:
@@ -224,14 +256,57 @@ def test_a_change_during_a_windows_retry_pause_aborts_the_write(tmp_path, monkey
     config = tmp_path / ".claude.json"
 
     def claude_code_saves():
-        _write(tmp_path, {"projects": {"a": 1, "b": 2}, "oauthAccount": {"emailAddress": "z@q.io"}})
-        os.utime(config, ns=(1, 1))
+        # A new file through an atomic replace: the size and the file index
+        # change, so the recheck sees the save. A truncating in-place write
+        # here could leave the config empty if a Windows scanner refused it
+        # after the truncate.
+        _save_like_claude_code(
+            config, {"projects": {"a": 1, "b": 2}, "oauthAccount": {"emailAddress": "z@q.io"}}
+        )
 
     tries = _windows_replace_refused_once(monkeypatch, claude_code_saves)
 
     result = store._write_locked(config, _set_email, None, 4, time.monotonic())
 
     assert result.status == "cas_aborted"
+    assert len(tries) == 1
+    assert _read(tmp_path) == {"projects": {"a": 1, "b": 2}, "oauthAccount": {"emailAddress": "z@q.io"}}
+    assert list(tmp_path.glob(store.TMP_PREFIX + "*")) == []
+
+
+def test_a_save_during_the_pause_runs_once_when_the_recheck_stat_retries(tmp_path, monkeypatch):
+    """On Windows a scanner can hold the file that Claude Code just saved, so
+    the recheck's stat reads st_ino 0 and the store pauses 10 ms before it
+    stats again. That pause is the store's own, not the replace retry pause,
+    so the save must not run a second time in it. (The Windows CI leg of
+    run 41657691384 ran it again there, and the config read back empty.)"""
+    _write(tmp_path, {"projects": {"a": 1}, "oauthAccount": {"emailAddress": "z@q.io"}})
+    config = tmp_path / ".claude.json"
+    real_stat = os.stat
+    saves: list = []
+    zeroed: list = []
+
+    def stat_with_one_zero_inode_after_the_save(path, *args, **kwargs):
+        st = real_stat(path, *args, **kwargs)
+        if saves and not zeroed and Path(path) == config:
+            zeroed.append(True)
+            return os.stat_result((*st[:1], 0, *st[2:]))  # st_ino is index 1
+        return st
+
+    def claude_code_saves():
+        saves.append(True)
+        _save_like_claude_code(
+            config, {"projects": {"a": 1, "b": 2}, "oauthAccount": {"emailAddress": "z@q.io"}}
+        )
+
+    tries = _windows_replace_refused_once(monkeypatch, claude_code_saves)
+    monkeypatch.setattr(store.os, "stat", stat_with_one_zero_inode_after_the_save)
+
+    result = store._write_locked(config, _set_email, None, 4, time.monotonic())
+
+    assert result.status == "cas_aborted"
+    assert zeroed == [True]
+    assert saves == [True]
     assert len(tries) == 1
     assert _read(tmp_path) == {"projects": {"a": 1, "b": 2}, "oauthAccount": {"emailAddress": "z@q.io"}}
     assert list(tmp_path.glob(store.TMP_PREFIX + "*")) == []

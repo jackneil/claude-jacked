@@ -609,33 +609,37 @@ def scan_roots(roots: list[Path]) -> list[tuple[Path, str]]:
 # Frontmatter parse / serialize / validate (hand-rolled; no yaml dep)
 # --------------------------------------------------------------------------- #
 
-_LIST_KEYS = ("repos", "tags")
+_FIXED_KEYS = ("type", "repos", "group", "created", "updated", "tags")
+_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 
 
 def serialize_frontmatter(meta: dict) -> str:
     """Serialize note metadata to the fixed block-style frontmatter.
 
-    List keys (repos, tags) render as block lists when non-empty and inline
-    ``[]`` when empty. Scalar keys render inline.
+    List keys render as block lists (inline ``[]`` when empty), scalars inline.
+    Every other key (``superseded_by``) follows, sorted, each value on one line,
+    so a re-render never drops it; a key name that cannot round-trip raises.
     """
-    lines = ["---"]
-    lines.append(f"type: {meta.get('type', '')}")
-    lines.append(_render_list("repos", meta.get("repos", [])))
-    lines.append(f"group: {meta.get('group', '')}")
-    lines.append(f"created: {meta.get('created', '')}")
-    lines.append(f"updated: {meta.get('updated', '')}")
-    lines.append(_render_list("tags", meta.get("tags", [])))
+    lines = [
+        "---", f"type: {meta.get('type', '')}", _render_list("repos", meta.get("repos", [])),
+        f"group: {meta.get('group', '')}", f"created: {meta.get('created', '')}",
+        f"updated: {meta.get('updated', '')}", _render_list("tags", meta.get("tags", [])),
+    ]
+    for key in sorted(k for k in meta if k not in _FIXED_KEYS):
+        if not _KEY_RE.fullmatch(key):
+            raise ValueError(f"frontmatter key {key!r} cannot round-trip")
+        val = meta[key]
+        if isinstance(val, list):
+            lines.append(_render_list(key, [one_line(str(v)) for v in val]))
+        elif val is not None and one_line(str(val)):
+            lines.append(f"{key}: {one_line(str(val))}")
     lines.append("---")
     return "\n".join(lines)
 
 
 def _render_list(key: str, values) -> str:
     values = list(values or [])
-    if not values:
-        return f"{key}: []"
-    block = [f"{key}:"]
-    block.extend(f"  - {v}" for v in values)
-    return "\n".join(block)
+    return "\n".join([f"{key}:", *(f"  - {v}" for v in values)]) if values else f"{key}: []"
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -648,11 +652,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     if not text.startswith("---"):
         return {}, text
     lines = text.splitlines()
-    end = None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == "---":
-            end = i
-            break
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
     if end is None:
         return {}, text
 
@@ -664,8 +664,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     i = 0
     while i < len(fm):
         line = fm[i]
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or ":" not in line:
+        if not line.strip() or line.strip().startswith("#") or ":" not in line:
             i += 1
             continue
         key, _, val = line.partition(":")
@@ -912,6 +911,7 @@ created: 2026-07-18
 updated: 2026-07-18
 tags:
   - candidate             # marks an unreviewed auto-capture
+superseded_by: <note>     # only on a superseded decision
 ---
 
 The fact, written in the vocabulary a future query would use.

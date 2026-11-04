@@ -26,6 +26,7 @@ from rich.panel import Panel
 # stdlib-only at import time too, so this costs nothing at startup.
 from jacked.dcr_settings import EFFORT_CHOICES as _DCR_EFFORT_CHOICES
 from jacked.dcr_settings import ENGINE_CHOICES as _DCR_ENGINE_CHOICES
+from jacked.issues_cli import issues_group
 from jacked.service import REPLACEMENT_READY_TIMEOUT
 
 
@@ -6581,7 +6582,6 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
 @main.group(name="packs")
 def packs_group():
     """Manage optional third-party skill packs."""
-    pass
 
 
 @packs_group.command(name="list")
@@ -7091,6 +7091,9 @@ def dcr_engine_clear():
     console.print("DCR engine config cleared. Reviews use Claude (default).")
     if not existed:
         console.print("[dim](No config file was present.)[/dim]")
+
+
+main.add_command(issues_group)
 
 
 @main.group(name="memory")
@@ -7710,7 +7713,6 @@ def memory_mark_groomed():
 @main.group(name="permissions")
 def permissions_group():
     """Audit and prune Claude Code Bash permission rules."""
-    pass
 
 
 @main.command(name="menubar")
@@ -7882,7 +7884,6 @@ def _resolve_service_start_host(typed_host: str | None) -> str | None:
 @main.group()
 def service():
     """Manage the jacked background service (tray icon + auto-start)."""
-    pass
 
 
 @service.command(name="start")
@@ -8828,7 +8829,6 @@ def permissions_audit(fix, yes):
 @main.group(name="guardrails")
 def guardrails_group():
     """Manage design guardrails for projects."""
-    pass
 
 
 @guardrails_group.command(name="init")
@@ -8868,7 +8868,6 @@ def guardrails_init(repo: str, language: str, force: bool):
 @main.group(name="lint-hook")
 def lint_hook_group():
     """Manage git pre-push lint hooks for projects."""
-    pass
 
 
 @lint_hook_group.command(name="init")

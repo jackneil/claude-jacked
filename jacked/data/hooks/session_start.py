@@ -14,16 +14,21 @@ Step order is FIXED -- do not reorder, the cache keys on these exact bytes:
   1. session-account tracker (silent; daemon thread, same as its own main())
   2. chain-of-command policy   -> stdout
   3. memory-vault recall brief -> stdout
-  4. git reality block         -> stdout (changes with the repo, so after 2-3)
-  5. load budget warnings      -> stdout (LAST: only when a file nears its cap)
+  4. open work (GitHub issues) -> stdout (from a cache; changes with the queue)
+  5. git reality block         -> stdout (changes with the repo, so after 2-4)
+  6. load budget warnings      -> stdout (LAST: only when a file nears its cap)
 
 Each step is guarded on its own: a failure in one NEVER stops the ones after
 it, and nothing here may crash a session start (every path exits 0). Steps 2
 and 3 no-op quietly when their feature is off (the chain-of-command skill file
 is absent / the memory vault is disabled), so this single entry stays correct
-whatever the user has toggled. Step 4 does not depend on the vault: it prints
+whatever the user has toggled. Step 4 reads the issue queue cache that the
+jacked service writes; it starts no subprocess and makes no network call, and
+it prints nothing when the cache is missing or 24 hours old, so a machine
+that never had gh adds zero bytes. When gh goes away, the service stops the
+refreshes, and a cache that exists stays in use until it is 24 hours old. Step 5 does not depend on the vault: it prints
 in every git work tree and prints nothing anywhere else, so a session start
-outside a git repo adds zero bytes. Step 5 prints only when a file that Claude
+outside a git repo adds zero bytes. Step 6 prints only when a file that Claude
 Code loads at session start (MEMORY.md, a CLAUDE.md) is over 90% of its load
 cap, so a healthy machine gets zero bytes from it, and it goes last because
 its text changes as the files grow.
@@ -106,8 +111,25 @@ def _emit_memory_recall(data: dict) -> None:
         print(brief)
 
 
+def _emit_issue_queue(data: dict) -> None:
+    """Step 4: print the open GitHub issues of the session repo (or nothing).
+
+    The block comes from the cache that the jacked service refreshes every 10
+    minutes, so this step starts no subprocess (see
+    ``jacked.data.hooks.issue_queue``). The cwd rule is the recall rule. A
+    subagent session gets nothing, the same as the recall brief.
+    """
+    if os.environ.get("CLAUDE_CODE_PARENT_SESSION_ID") or os.environ.get("CLAUDE_CODE_AGENT_TYPE"):
+        return
+    from jacked.data.hooks import git_reality, issue_queue
+
+    block = issue_queue.emit_issue_queue(git_reality.payload_cwd(data))
+    if block:
+        print(block)
+
+
 def _emit_git_reality(data: dict) -> None:
-    """Step 4: print the git reality block for the session cwd (or nothing).
+    """Step 5: print the git reality block for the session cwd (or nothing).
 
     The cwd is the payload's ``cwd``, else the process cwd (the recall rule).
     Each git call is time-bounded, and the block itself never raises (see
@@ -121,7 +143,7 @@ def _emit_git_reality(data: dict) -> None:
 
 
 def _emit_load_budget(data: dict) -> None:
-    """Step 5 (LAST): warn about each file Claude Code loads at session start
+    """Step 6 (LAST): warn about each file Claude Code loads at session start
     that is over 90% of its load cap (or print nothing).
 
     The cwd is the payload's ``cwd``, else the process cwd (the recall rule).
@@ -144,6 +166,7 @@ def _emit_load_budget(data: dict) -> None:
 STEPS = (
     ("chain of command", _emit_chain_of_command),
     ("memory recall", _emit_memory_recall),
+    ("open work", _emit_issue_queue),
     ("git reality", _emit_git_reality),
     ("load budget", _emit_load_budget),
 )

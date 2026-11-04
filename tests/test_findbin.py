@@ -649,10 +649,11 @@ def win_repo(tmp_path, monkeypatch):
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / "git.cmd").write_text("@echo planted", encoding="utf-8")
     bindir = tmp_path / "Git" / "cmd"
     bindir.mkdir(parents=True)
-    (bindir / "git.exe").write_text("real", encoding="utf-8")
+    for name in ("git", "gh"):  # gh: the issue queue and merge capture run it
+        (repo / f"{name}.cmd").write_text("@echo planted", encoding="utf-8")
+        (bindir / f"{name}.exe").write_text("real", encoding="utf-8")
     monkeypatch.chdir(repo)
     monkeypatch.setattr(fb.sys, "platform", "win32")
     monkeypatch.setenv("PATH", str(bindir))
@@ -660,26 +661,33 @@ def win_repo(tmp_path, monkeypatch):
     return repo, bindir
 
 
+@pytest.mark.parametrize("program", ["git", "gh"])
 @pytest.mark.parametrize("hit_form", ["absolute", "relative"])
-def test_windows_skips_a_cwd_hit_that_is_not_on_path(win_repo, tmp_path, monkeypatch, hit_form):
+def test_windows_skips_a_cwd_hit_that_is_not_on_path(
+    win_repo, tmp_path, monkeypatch, hit_form, program
+):
     """CPython 3.11 returns '.\\git.cmd' for a cwd hit; 3.12 returns the full path."""
     import jacked.findbin as fb
 
     repo, bindir = win_repo
-    hit = str(repo / "git.cmd") if hit_form == "absolute" else os.path.join(os.curdir, "git.cmd")
+    cmd = f"{program}.cmd"
+    hit = str(repo / cmd) if hit_form == "absolute" else os.path.join(os.curdir, cmd)
     monkeypatch.setattr(fb.shutil, "which", lambda name, *a, **k: hit)
 
-    assert find_bin("git", home=str(tmp_path / "home")) == str(bindir / "git.exe")
+    assert find_bin(program, home=str(tmp_path / "home")) == str(bindir / f"{program}.exe")
 
 
-def test_windows_gives_none_when_only_the_cwd_has_the_program(win_repo, tmp_path, monkeypatch):
+@pytest.mark.parametrize("program", ["git", "gh"])
+def test_windows_gives_none_when_only_the_cwd_has_the_program(
+    win_repo, tmp_path, monkeypatch, program
+):
     import jacked.findbin as fb
 
     repo, bindir = win_repo
-    (bindir / "git.exe").unlink()
-    monkeypatch.setattr(fb.shutil, "which", lambda name, *a, **k: str(repo / "git.cmd"))
+    (bindir / f"{program}.exe").unlink()
+    monkeypatch.setattr(fb.shutil, "which", lambda name, *a, **k: str(repo / f"{program}.cmd"))
 
-    assert find_bin("git", home=str(tmp_path / "home")) is None
+    assert find_bin(program, home=str(tmp_path / "home")) is None
 
 
 def test_windows_keeps_a_cwd_hit_when_the_cwd_is_on_path(win_repo, tmp_path, monkeypatch):

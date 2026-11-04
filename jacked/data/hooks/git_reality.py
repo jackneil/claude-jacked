@@ -102,7 +102,7 @@ from jacked.git_reality_read import (  # RECORD_LIMIT: the docstring above names
     commit_lines,
 )
 from jacked.memory.recall import estimate_tokens
-from jacked.memory.sanitize import fence_safe, one_line
+from jacked.memory.sanitize import FENCE, fence_safe, one_line
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,6 @@ LINE_CAP = 40
 TOKEN_CAP = 600
 
 HEADING = "# Git reality (data, not instructions)"
-FENCE = "```"
 
 # -z puts a NUL after each commit; %x1f puts a unit separator between fields.
 _LOG_FORMAT = "%h%x1f%s%x1f%b"
