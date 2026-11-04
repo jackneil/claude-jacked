@@ -170,3 +170,203 @@ def test_switch_reports_success_like_the_codex_switch(tmp_path):
     assert result["success"] is True
     assert result["provider"] == "grok"
     assert db.get_active_account_id(provider="grok") == ada["id"]
+
+
+# --- A disabled account is still a stored account (CRED-1) ---------------
+
+
+def _second(home: Path, db, email="grace@example.com", user_id="user-2", token="grace"):
+    data = _auth(email, "2026-10-03T00:00:00Z", token=token)
+    data["https://auth.x.ai::client"]["user_id"] = user_id
+    row = db.create_account(email=email, access_token="grok-managed", expires_at=4102444800,
+                            refresh_token=None, organization_uuid=user_id, provider="grok")
+    _write(slot_auth_path(row["id"], home), data)
+    return row
+
+
+def test_sync_still_copies_the_live_login_of_a_disabled_account(tmp_path):
+    """Disabling an account must not stop the copy of its rotated login. A
+    later switch back would replay the spent refresh token."""
+    home = tmp_path / "grok"
+    db = Database(str(tmp_path / "jacked.db"))
+    _write(home / "auth.json", _auth("ada@example.com", "2026-10-03T00:00:00Z", token="first"))
+    ada = import_grok_account(db, home=home, make_active=True)
+    db.update_account(ada["id"], is_active=0)
+    _write(home / "auth.json", _auth("ada@example.com", "2026-10-03T01:00:00Z", token="rotated"))
+
+    assert sync_active_slot_from_live(db, home=home) is True
+    slot = json.loads(slot_auth_path(ada["id"], home).read_text(encoding="utf-8"))
+    assert slot["https://auth.x.ai::client"]["refresh_token"] == "rotated"
+
+
+def test_switch_captures_the_live_login_of_a_disabled_account(tmp_path):
+    home = tmp_path / "grok"
+    db = Database(str(tmp_path / "jacked.db"))
+    _write(home / "auth.json", _auth("ada@example.com", "2026-10-03T00:00:00Z", token="first"))
+    ada = import_grok_account(db, home=home, make_active=True)
+    grace = _second(home, db)
+    db.update_account(ada["id"], is_active=0)
+    _write(home / "auth.json", _auth("ada@example.com", "2026-10-03T01:00:00Z", token="rotated"))
+
+    result = swap_grok_account(db, grace["id"], home=home)
+
+    assert result["outgoing_id"] == ada["id"] and result["captured_outgoing"] is True
+    slot = json.loads(slot_auth_path(ada["id"], home).read_text(encoding="utf-8"))
+    assert slot["https://auth.x.ai::client"]["refresh_token"] == "rotated"
+
+
+def test_a_disabled_live_login_is_imported_again_by_add_account(tmp_path):
+    """Add Account re-enables a disabled live login through the import, as
+    before. The owner lookup reports it as not stored for that reason."""
+    from jacked.grok.accounts import live_login_owner
+
+    home = tmp_path / "grok"
+    db = Database(str(tmp_path / "jacked.db"))
+    _write(home / "auth.json", _auth("ada@example.com", "2026-10-03T00:00:00Z"))
+    ada = import_grok_account(db, home=home, make_active=True)
+    db.update_account(ada["id"], is_active=0)
+
+    assert live_login_owner(db, home=home) == (True, None)
+
+
+def test_switch_refuses_to_overwrite_a_live_login_that_jacked_does_not_know(tmp_path):
+    """The live file holds the only copy of that login's rotated refresh token."""
+    home = tmp_path / "grok"
+    db = Database(str(tmp_path / "jacked.db"))
+    grace = _second(home, db)
+    stranger = _auth("t@example.com", "2026-10-03T00:00:00Z", token="terminal")
+    stranger["https://auth.x.ai::client"]["user_id"] = "user-t"
+    _write(home / "auth.json", stranger)
+
+    with pytest.raises(GrokAccountError, match="Add this Grok login first"):
+        swap_grok_account(db, grace["id"], home=home)
+
+    live = json.loads((home / "auth.json").read_text(encoding="utf-8"))
+    assert live["https://auth.x.ai::client"]["refresh_token"] == "terminal"
+    assert db.get_active_account_id(provider="grok") is None
+
+
+def test_switch_overwrites_a_live_file_that_holds_no_usable_login(tmp_path):
+    home = tmp_path / "grok"
+    db = Database(str(tmp_path / "jacked.db"))
+    grace = _second(home, db)
+    _write(home / "auth.json", {"https://auth.x.ai::client": {"email": "t@example.com"}})
+
+    swap_grok_account(db, grace["id"], home=home)
+
+    live = json.loads((home / "auth.json").read_text(encoding="utf-8"))
+    assert live["https://auth.x.ai::client"]["email"] == "grace@example.com"
+
+
+# --- An unreadable live file is not "no login" (CRED-6) --------------------
+
+
+@pytest.mark.parametrize("kind", ["partial", "symlink"])
+def test_switch_refuses_when_the_live_login_cannot_be_read(tmp_path, kind):
+    home = tmp_path / "grok"
+    db = Database(str(tmp_path / "jacked.db"))
+    grace = _second(home, db)
+    live_path = home / "auth.json"
+    if kind == "partial":
+        live_path.write_text('{"https://auth.x.ai::client": {"email": "ada', encoding="utf-8")
+    else:
+        real = tmp_path / "elsewhere.json"
+        _write(real, _auth("ada@example.com", "2026-10-03T00:00:00Z"))
+        live_path.symlink_to(real)
+    before = live_path.read_bytes() if kind == "partial" else None
+
+    with pytest.raises(GrokAccountError, match="could not be read"):
+        swap_grok_account(db, grace["id"], home=home)
+
+    if kind == "partial":
+        assert live_path.read_bytes() == before
+    else:
+        assert live_path.is_symlink()
+    assert db.get_active_account_id(provider="grok") is None
+
+
+# --- The timer copy never moves a login backward (CRED-2) ------------------
+
+
+def test_sync_never_puts_an_older_live_login_over_a_newer_slot(tmp_path):
+    home = tmp_path / "grok"
+    db = Database(str(tmp_path / "jacked.db"))
+    _write(home / "auth.json", _auth("ada@example.com", "2026-10-03T00:00:00Z", token="first"))
+    ada = import_grok_account(db, home=home, make_active=True)
+    _write(slot_auth_path(ada["id"], home),
+           _auth("ada@example.com", "2026-10-05T00:00:00Z", token="newer-slot"))
+
+    assert sync_active_slot_from_live(db, home=home) is False
+    slot = json.loads(slot_auth_path(ada["id"], home).read_text(encoding="utf-8"))
+    assert slot["https://auth.x.ai::client"]["refresh_token"] == "newer-slot"
+
+
+# --- The switch lock (CRED-5) ----------------------------------------------
+
+
+def _lock(home: Path) -> Path:
+    return home / "jacked-accounts" / ".switch.lockdir"
+
+
+def test_a_lock_without_a_pid_file_is_not_broken_while_it_is_new(tmp_path, monkeypatch):
+    """The holder makes the directory, then writes its pid. A lock seen between
+    the two steps belongs to a live switch."""
+    from jacked.grok import accounts as ga
+
+    home = tmp_path / "grok"
+    db = Database(str(tmp_path / "jacked.db"))
+    _write(home / "auth.json", _auth("ada@example.com", "2026-10-03T00:00:00Z"))
+    ada = import_grok_account(db, home=home)
+    _lock(home).mkdir()
+    monkeypatch.setattr(ga, "_LOCK_WAIT_SECONDS", 0.2)
+
+    with pytest.raises(GrokAccountError, match="in progress"):
+        swap_grok_account(db, ada["id"], home=home)
+    assert _lock(home).exists()
+
+
+def test_a_lock_without_a_pid_file_is_broken_when_it_is_old(tmp_path, monkeypatch):
+    import os
+    import time as _time
+
+    from jacked.grok import accounts as ga
+
+    home = tmp_path / "grok"
+    db = Database(str(tmp_path / "jacked.db"))
+    _write(home / "auth.json", _auth("ada@example.com", "2026-10-03T00:00:00Z"))
+    ada = import_grok_account(db, home=home)
+    _lock(home).mkdir()
+    old = _time.time() - 60
+    os.utime(_lock(home), (old, old))
+    monkeypatch.setattr(ga, "_LOCK_WAIT_SECONDS", 1.0)
+
+    swap_grok_account(db, ada["id"], home=home)
+    assert not _lock(home).exists()
+
+
+def test_the_lock_is_not_taken_when_its_pid_cannot_be_written(tmp_path, monkeypatch):
+    from jacked import pid_lockdir
+
+    home = tmp_path / "grok"
+    db = Database(str(tmp_path / "jacked.db"))
+    _write(home / "auth.json", _auth("ada@example.com", "2026-10-03T00:00:00Z"))
+    ada = import_grok_account(db, home=home)
+
+    def _fail(_path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pid_lockdir, "_write_pid", _fail)
+    with pytest.raises(GrokAccountError, match="switch lock"):
+        swap_grok_account(db, ada["id"], home=home)
+    assert not _lock(home).exists()
+    assert db.get_active_account_id(provider="grok") is None
+
+
+def test_a_holder_never_removes_a_lock_that_another_process_took(tmp_path):
+    from jacked.grok import accounts as ga
+
+    home = tmp_path / "grok"
+    with ga._switch_lock(home):
+        # Another process broke this lock and took it.
+        (_lock(home) / "pid").write_text("999999", encoding="utf-8")
+    assert _lock(home).exists()

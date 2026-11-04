@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Mapping, Optional
 
+from jacked import pid_lockdir
 from jacked.atomic_io import atomic_write_text
 from jacked.findbin import find_bin
 from jacked.service.process import process_liveness
@@ -53,6 +54,8 @@ from .swap_guards import (
     CodexSwapError,
     refuse_stale_replay,
     refuse_unswitchable_store,
+    slot_copy_allowed,
+    slot_is_newer,
     validate_field_complete,
 )
 
@@ -140,41 +143,28 @@ def _codex_swap_lock(base: Path, retries: int = 340) -> Iterator[bool]:
     # via asyncio.to_thread) outlasts a usage poll's WORST-CASE lock hold —
     # _APP_SERVER_TIMEOUT (12s) plus the ~3s app-server terminate tail — and
     # acquires once it finishes instead of failing. The usage poll itself passes
-    # retries=1 (non-blocking skip).
+    # retries=1 (non-blocking skip). The stale and release rules are in
+    # jacked.pid_lockdir (a lock with no pid is stale only when it is old).
     lock_dir = base / ".jacked-codex-swap.lock"
-    pid_file = lock_dir / "pid"
     acquired = False
     for _ in range(retries):
+        base.mkdir(parents=True, exist_ok=True)
         try:
-            base.mkdir(parents=True, exist_ok=True)
-            os.mkdir(lock_dir)
-            try:
-                pid_file.write_text(str(os.getpid()))
-            except OSError:
-                pass
-            acquired = True
+            acquired = pid_lockdir.try_acquire(lock_dir)
+        except OSError:
+            logger.warning("Could not write the Codex swap lock; the lock is not taken")
             break
-        except FileExistsError:
-            holder = None
-            try:
-                holder = int(pid_file.read_text().strip())
-            except (FileNotFoundError, ValueError):
-                pass
-            stale = holder is None
-            if holder is not None:
-                try:
-                    stale = process_liveness(holder) is False
-                except (OSError, SystemError):
-                    stale = False
-            if stale:
-                shutil.rmtree(lock_dir, ignore_errors=True)
-                continue
-            time.sleep(0.05)
+        if acquired:
+            break
+        if pid_lockdir.is_stale(lock_dir, process_liveness):
+            shutil.rmtree(lock_dir, ignore_errors=True)
+            continue
+        time.sleep(0.05)
     try:
         yield acquired
     finally:
         if acquired:
-            shutil.rmtree(lock_dir, ignore_errors=True)
+            pid_lockdir.release(lock_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -201,12 +191,14 @@ def find_codex_account_id(db, identity) -> Optional[int]:
 
     Prefers the org/workspace sentinel (account_id), then falls back to email
     (case-insensitive) — so personal/no-workspace accounts (account_id == "")
-    still resolve to their slot instead of being silently dropped.
+    still resolve to their slot instead of being silently dropped. A disabled
+    row counts: it still owns its slot, so a swap must capture its live login
+    and the timer copy must keep its slot current.
     """
     org = identity.account_id
     email = (identity.email or "").lower()
     by_email: Optional[int] = None
-    for a in db.list_accounts():
+    for a in db.list_accounts(include_inactive=True):
         if a.get("provider") != "codex":
             continue
         if org and (a.get("organization_uuid") or "") == org:
@@ -262,6 +254,9 @@ def sync_active_slot_from_live(
         slot = _read_json(slot_path) or {}
         same_token = _refresh_token_of(slot) == _refresh_token_of(live)
         if same_token and slot.get("last_refresh") == live.get("last_refresh"):
+            return False
+        if not slot_copy_allowed(slot, live):
+            logger.debug("Codex slot of account %s is not older than the live login", active_id)
             return False
         _atomic_write_json(slot_path, live)
     logger.info("Copied the live Codex login into the slot of account %s", active_id)
@@ -367,10 +362,13 @@ def _swap_root(
         ensure_file_storage(base, env)
         # 1. CAPTURE the live root into the outgoing account's slot FIRST, so
         #    the tokens Codex rotated while it was active are not lost.
+        #    A slot that a `jacked codex launch` rotated is newer: keep it.
         captured = False
         if live and outgoing_id is not None and outgoing_id != target_id:
-            _atomic_write_json(codex_slot_auth_path(outgoing_id, base), live)
-            captured = True
+            outgoing_slot = codex_slot_auth_path(outgoing_id, base)
+            if not slot_is_newer(_read_json(outgoing_slot), live):
+                _atomic_write_json(outgoing_slot, live)
+                captured = True
         # 2. Write the target field-complete into the shared root.
         _atomic_write_json(root_path, target_data)
     return outgoing_id, captured

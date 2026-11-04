@@ -11,10 +11,11 @@ under a lock, after it captures the outgoing login into its slot.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shutil
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 from fastapi import status
 from fastapi.responses import JSONResponse
@@ -133,22 +134,26 @@ async def _start_grok_login(db, account: dict, target_id: Optional[int], notify)
     to the dashboard. A start failure is a 400. A sign-in that still runs is
     a 409.
     """
-    from jacked.grok.login_import import finish_login, prepare_login_env
+    from jacked.grok.login_import import finish_login, new_login_name, prepare_login_env
     from jacked.web.external_login import (
         LoginInProgressError,
         LoginStartError,
         start_provider_login,
     )
 
+    # This sign-in's own private home: the cleanup of another sign-in never
+    # removes it.
+    name = new_login_name()
+
     def _on_exit(outcome: str) -> None:
-        payload = finish_login(db, outcome, target_id=target_id)
+        payload = finish_login(db, outcome, target_id=target_id, name=name)
         if notify is not None:
             notify("provider_login_finished", payload)
 
     try:
         return await asyncio.to_thread(
             start_provider_login, GROK, account, db,
-            prepare=prepare_login_env, on_exit=_on_exit,
+            prepare=lambda: prepare_login_env(name=name), on_exit=_on_exit,
         )
     except LoginInProgressError as exc:
         return _error("GROK_LOGIN_IN_PROGRESS", exc.public_message, status.HTTP_409_CONFLICT)
@@ -224,7 +229,10 @@ def forget_slot(db, account: dict) -> None:
 
     A Claude account: its ``~/.claude/accounts/<id>`` directory. A Codex or
     Grok account: its active pointer and its auth slot. The slot holds a live
-    refresh token, so it must not outlive the row.
+    refresh token, so it must not outlive the row. Call this after the row is
+    deleted. The removal holds the switch lock of the provider: the timer copy
+    writes the slot under that lock, so it cannot write the slot again after
+    the removal.
     """
     account_id = account["id"]
     provider = provider_of(account)
@@ -233,6 +241,47 @@ def forget_slot(db, account: dict) -> None:
         if acct_dir.exists() and acct_dir.is_dir() and not acct_dir.is_symlink():
             shutil.rmtree(acct_dir, ignore_errors=True)
         return
+    if provider not in (CODEX, GROK):
+        return
+    try:
+        with _slot_lock(provider):
+            _forget_provider_slot(db, provider, account_id)
+    except Exception:
+        # A lock that cannot be taken must not keep a refresh token on disk.
+        logger.warning("The %s switch lock was not free; removing the slot anyway", provider)
+        _forget_provider_slot(db, provider, account_id)
+
+
+@contextlib.contextmanager
+def _slot_lock(provider: str) -> Iterator[None]:
+    """The lock that the switch and the timer copy of ``provider`` hold.
+
+    A missing provider folder holds no slot, so the lock is not made there.
+    """
+    if provider == CODEX:
+        from jacked.codex.credentials import codex_home
+        from jacked.codex.switching import _codex_swap_lock
+
+        base = codex_home()
+        if not base.is_dir():
+            yield
+            return
+        with _codex_swap_lock(base) as locked:
+            if not locked:
+                raise RuntimeError("the Codex swap lock is busy")
+            yield
+        return
+    from jacked.grok.accounts import _switch_lock, grok_home
+
+    home = grok_home()
+    if not (home / "jacked-accounts").is_dir():
+        yield
+        return
+    with _switch_lock(home):
+        yield
+
+
+def _forget_provider_slot(db, provider: str, account_id: int) -> None:
     try:
         if db.get_active_account_id(provider) == account_id:
             db.delete_setting(db.active_account_setting_key(provider))
@@ -243,12 +292,10 @@ def forget_slot(db, account: dict) -> None:
             from jacked.codex.switching import codex_account_home
 
             slot = codex_account_home(account_id)
-        elif provider == GROK:
+        else:
             from jacked.grok.accounts import grok_home, slot_dir
 
             slot = slot_dir(account_id, grok_home())
-        else:
-            return
         if slot.exists() and slot.is_dir() and not slot.is_symlink():
             shutil.rmtree(slot, ignore_errors=True)
     except Exception:

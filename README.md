@@ -1,6 +1,6 @@
 # claude-jacked - multi-account manager and skills suite for Claude Code
 
-**When you hit a Claude Code usage limit, jacked shows which account has headroom and helps you move deliberately instead of guessing which credentials a session is using.** Run every Claude, Codex, and Grok account you own as one fleet, watch each account's 5-hour, 7-day, and per-model usage live, and get an auto-swap recommendation before a limit stops you. The whole fleet stays one click away in a macOS menu-bar app, or a system-tray app on Windows and Linux.
+**When you hit a Claude Code usage limit, jacked shows which account has headroom and helps you move deliberately instead of guessing which credentials a session is using.** Run every Claude, Codex, and Grok account you own as one fleet, watch the 5-hour, 7-day, and per-model usage of each Claude and Codex account live (jacked cannot read Grok usage limits), and get an auto-swap recommendation before a limit stops you. The whole fleet stays one click away in a macOS menu-bar app, or a system-tray app on Windows and Linux.
 
 It is also a skills manager for Claude Code: one `jacked install` deploys 20 curated slash commands, 28 skills, and 10 review agents into `~/.claude`, mirrors them into Codex when Codex is installed, and keeps them updated from a web dashboard.
 
@@ -15,7 +15,7 @@ It is also a skills manager for Claude Code: one `jacked install` deploys 20 cur
 
 ## What you get: multi-account Claude Code, live usage tracking, and a skills suite
 
-- **Run multiple Claude accounts without losing account truth.** Add every account you own, watch each account's 5-hour (when its plan has one), 7-day, and per-model usage live, and let auto-swap recommend a fresh account before you hit a limit. Credential changes report what was actually verified, and session cards distinguish where a session started, what configuration was later observed, and whether the provider runtime is still unverified. Works for Codex and Grok accounts too, side by side with Claude.
+- **Run multiple Claude accounts without losing account truth.** Add every account you own, watch each account's 5-hour (when its plan has one), 7-day, and per-model usage live, and let auto-swap recommend a fresh account before you hit a limit. Credential changes report what was actually verified, and session cards distinguish where a session started, what configuration was later observed, and whether the provider runtime is still unverified. Works for Codex and Grok accounts too, side by side with Claude. jacked cannot read Grok usage limits, so a Grok account shows no usage.
 - **A menu-bar app that actually earns its pixels.** A live pill shows usage for the account jacked can currently resolve next to the clock (`18%·4%·F9%`, tinted green/yellow/red). Left-click drops the whole fleet down in a compact panel: every account, every org, per-model caps, reset times, and the current credential state. Right-click for actions, or pin the panel to your screen edge. It refreshes within about a second of any account switch or usage change, and it tells you when a new jacked version ships: a badge on the icon, a notification banner, and a one-click update.
 - **A curated skills suite, one command to install.** `jacked install` puts 20 battle-tested slash commands, 28 skills, and 10 review agents into Claude Code (`/dcr` risk-tiered multi-lens review, `/qa`/`/ux` browser testing, `/release`, `/whats-next` roadmap advisor, `/lockdown` supply-chain audit, and more; skills are slash-invocable too, so all 48 answer to a `/name`), plus design-engineering skills for UI animation and polish adapted with credit from [Emil Kowalski's skills](https://github.com/emilkowalski/skills) and a website-cloning skill adapted with credit from [JCodesMore's ai-website-cloner-template](https://github.com/JCodesMore/ai-website-cloner-template). When Codex is installed too, the same pass deploys the suite into Codex's native formats: skills into `~/.agents/skills`, commands as both prompts and command-derived skills, the behavioral rules (Codex-adapted) into `~/.codex/AGENTS.md`, the 10 review agents as Codex TOML custom agents, the chrome-devtools MCP server, and a `$qa` suggestion hook, with a few Claude-only helpers held back and everything tracked in a Codex manifest so `jacked uninstall` reverses it. Upgrades diff cleanly: added/changed/removed, never touching your own files. On top of the bundled suite, `jacked install` also installs curated third-party skill packs live from their upstream repos (a 28-skill `marketing` pack and a `design-extras` pack, on by default), opt out with `--no-packs` or `jacked packs disable`.
 - **Manage everything from a web dashboard.** Accounts, usage analytics, feature toggles, appearance themes, swap history, logs, all from your browser. No config files, no terminal commands.
@@ -772,7 +772,7 @@ jacked switches a Codex account only when Codex keeps the credential in the `aut
 
 1. Set `cli_auth_credentials_store = "file"` in `~/.codex/config.toml`.
 2. Run `codex login`.
-3. Click **Add Account**, then click **Codex**.
+3. Click **Add Account**, select **Codex**, then click **Continue**.
 
 On the computer that runs jacked, you can use `jacked codex add` instead. When jacked cannot switch the store, this command sets `cli_auth_credentials_store = "file"`, then runs `codex login`, then adds the account. With `--no-login`, the command does not sign in, so it refuses the same as the dashboard. The command finds the `codex` CLI before it changes the store. If `codex login` fails, or you stop it, jacked puts `config.toml` back as it was, so Codex does not read an `auth.json` that does not exist.
 
@@ -784,13 +784,13 @@ Grok keeps its login in `~/.grok/auth.json` (on Windows, `%USERPROFILE%\.grok\au
 
 To add a Grok account:
 
-1. Click **Add Account**, then click **Grok**.
+1. Click **Add Account**, select **Grok**, then click **Continue**.
 2. Sign in to Grok in the browser window that jacked opens. jacked runs `grok login` in a private folder, so the sign-in does not replace the Grok login that is live now.
 3. Wait for the message on the dashboard. jacked adds the account when the sign-in is done.
 
 If no Grok login is live, the new account becomes the live login and the active Grok account. Else the active Grok account stays the same. If you signed in with `grok login` in a terminal and jacked does not know that login, **Add Account > Grok** imports it.
 
-**Use Account** on a Grok account copies the live login into the copy of its account first, then writes the stored login into `auth.json`. Grok reads the new login on its next request, so you do not restart Grok. jacked does not write a stored login that is older than the live login of the same account. **Re-auth** on a Grok account opens the Grok sign-in for that account. You must sign in as that account. jacked refuses a sign-in as a different account.
+**Use Account** on a Grok account copies the live login into the copy of its account first, then writes the stored login into `auth.json`. Grok reads the new login on its next request, so you do not restart Grok. jacked does not write a stored login that is older than the live login of the same account. If jacked does not know the live login, or cannot read `auth.json`, jacked does not switch, because the switch would remove that login. Add the live login with **Add Account > Grok** first, or run `grok logout` to sign it out. If jacked cannot read `auth.json`, try the switch again. **Re-auth** on a Grok account opens the Grok sign-in for that account. You must sign in as that account. jacked refuses a sign-in as a different account.
 
 Only one Grok sign-in runs at a time. A sign-in stops after 16 minutes, because the sign-in code expires after 15 minutes. A sign-in runs a browser on the computer that runs jacked, so a remote dashboard cannot start it.
 

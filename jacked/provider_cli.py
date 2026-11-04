@@ -41,12 +41,14 @@ def _sign_in(db) -> dict:
     ``finish_login``.
     """
     from jacked.findbin import find_bin
-    from jacked.grok.login_import import CLI, finish_login, prepare_login_env
+    from jacked.grok.login_import import CLI, finish_login, new_login_name, prepare_login_env
 
     grok = find_bin("grok")
     if not grok:
         raise click.ClickException("The grok CLI is not installed. Install it, then try again.")
-    extra_env, extra_args = prepare_login_env(name=CLI)
+    # Its own private home: a second `jacked grok add` never removes it.
+    name = new_login_name(CLI)
+    extra_env, extra_args = prepare_login_env(name=name)
     console.print("Sign in to the Grok account to add. A browser opens for the sign-in.")
     try:
         code = subprocess.run(  # noqa: S603 - find_bin result plus fixed arguments
@@ -55,7 +57,7 @@ def _sign_in(db) -> dict:
     except OSError as exc:
         code = 1
         console.print(f"[red]Could not run grok login:[/red] {type(exc).__name__}")
-    return finish_login(db, "signed_in" if code == 0 else "failed", name=CLI)
+    return finish_login(db, "signed_in" if code == 0 else "failed", name=name)
 
 
 @grok_group.command(name="add")

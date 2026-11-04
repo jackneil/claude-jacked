@@ -61,7 +61,9 @@ TIMED_OUT = "timed_out"
 NO_BROWSER = "no_browser"
 
 # The one live login process of each provider. A second sign-in would write
-# the same credential file, so it is refused while the first one runs.
+# the same credential file, so it is refused while the first one is
+# registered: from its start until its watcher has handled the result
+# (``on_exit``), not only while the CLI process runs.
 _live_logins: dict[str, subprocess.Popen] = {}
 _live_lock = threading.Lock()
 
@@ -78,14 +80,16 @@ class LoginInProgressError(LoginStartError):
 
 
 def login_running(provider: str) -> bool:
-    """True while a sign-in that jacked started for ``provider`` runs.
+    """True while a sign-in that jacked started for ``provider`` is registered.
+
+    The CLI can have exited while the watcher still stores its login. The
+    sign-in counts as running until that is done.
 
     >>> login_running("nobody")
     False
     """
     with _live_lock:
-        proc = _live_logins.get(provider)
-        return proc is not None and proc.poll() is None
+        return provider in _live_logins
 
 
 def _write_opener(profile_dir: Path) -> Optional[Path]:
@@ -267,8 +271,7 @@ def start_provider_login(
 
     run_env = dict(env if env is not None else os.environ)
     with _live_lock:
-        running = _live_logins.get(provider_name)
-        if running is not None and running.poll() is None:
+        if provider_name in _live_logins:
             raise LoginInProgressError(
                 f"A {provider_name.capitalize()} sign-in is already open. Finish it or "
                 "wait for it to end, then try again."
@@ -292,12 +295,23 @@ def start_provider_login(
             start_new_session=True,
         )
         _live_logins[provider_name] = proc
-    threading.Thread(
-        target=_watch_login,
-        args=(proc, target, db, provider_name, on_exit),
-        daemon=True,
-        name=f"jacked-{provider_name}-login",
-    ).start()
+    try:
+        threading.Thread(
+            target=_watch_login,
+            args=(proc, target, db, provider_name, on_exit),
+            daemon=True,
+            name=f"jacked-{provider_name}-login",
+        ).start()
+    except RuntimeError:
+        # Without a watcher nobody removes the registration, and every later
+        # sign-in for this provider would be refused.
+        _stop(proc)
+        with _live_lock:
+            if _live_logins.get(provider_name) is proc:
+                del _live_logins[provider_name]
+        raise LoginStartError(
+            f"jacked could not follow the {provider_name.capitalize()} sign-in. Try again."
+        ) from None
     logger.info("Started %s sign-in (pid %s)", provider_name, proc.pid)
     return {
         "profile_login": True,
