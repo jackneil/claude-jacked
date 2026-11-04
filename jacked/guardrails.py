@@ -7,11 +7,11 @@ hook installation for jacked-managed projects.
 
 from __future__ import annotations
 
-import shutil
 import stat
 from pathlib import Path
 from typing import Optional
 
+from jacked.atomic_install import atomic_copy_file
 from jacked.atomic_io import atomic_write_text
 
 # Where bundled templates live inside the package
@@ -247,7 +247,7 @@ def install_hook(
         return {"installed": False, "reason": f"no hook template for language: {language}"}
 
     # Copy template to .git/hooks/pre-push (extensionless)
-    shutil.copy2(src, target)
+    atomic_copy_file(src, target)
 
     # Set executable bit (no-op on Windows/NTFS, but correct for Unix)
     try:
@@ -352,7 +352,7 @@ def deploy_templates(force: bool = False) -> dict:
         if dst.exists() and not force:
             results["guardrails"].append({"file": src.name, "skipped": True})
             continue
-        shutil.copy2(src, dst)
+        atomic_copy_file(src, dst)
         results["guardrails"].append({"file": src.name, "deployed": True})
 
     # Deploy hook templates
@@ -362,7 +362,7 @@ def deploy_templates(force: bool = False) -> dict:
         if dst.exists() and not force:
             results["hooks"].append({"file": src.name, "skipped": True})
             continue
-        shutil.copy2(src, dst)
+        atomic_copy_file(src, dst)
         results["hooks"].append({"file": src.name, "deployed": True})
 
     return results

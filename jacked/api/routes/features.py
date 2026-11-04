@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -12,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from jacked import integrity
+from jacked.atomic_install import atomic_copy_file
 from jacked.memory import load_budget
 from jacked.memory.settings_io import SETTINGS_MAX_BYTES, SettingsTooLargeError, SettingsUnreadableError, write_settings
 from jacked.memory.vault import atomic_write_text
@@ -642,7 +642,7 @@ async def _toggle_file_feature(src: Path, dst: Path, enabled: bool, name: str, c
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 content={"error": {"message": "Invalid path", "code": "INVALID_FEATURE"}},
             )
-        shutil.copy(src, dst)
+        await asyncio.to_thread(atomic_copy_file, src, dst)  # #260i: one step
     else:
         if dst.exists():
             dst.unlink()
