@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Mapping, Optional
 
+from jacked import pid_lockdir
 from jacked.atomic_io import atomic_write_text
 
 from jacked.public_errors import PublicError
@@ -170,84 +171,108 @@ def _atomic_write(path: Path, data: dict) -> None:
 def _switch_lock(home: Path) -> Iterator[None]:
     """One switch or slot copy at a time, on Windows, macOS and Linux.
 
-    ``mkdir`` is atomic on all three (``flock`` does not exist on Windows).
-    The holder writes its pid into the lock. A lock whose pid file is missing,
-    or whose process is dead, was left by a switch that died, and is broken.
-    This is the rule of the Codex swap lock (``_codex_swap_lock``). This lock
-    does not touch Grok's own ``auth.json.lock``.
+    The lock is a directory with the pid of its holder
+    (``jacked.pid_lockdir``), with the rules of the Codex swap lock: a dead
+    holder makes it stale, and a lock with no pid is stale only when it is
+    old. This lock does not touch Grok's own ``auth.json.lock``.
     """
     parent = home / "jacked-accounts"
     parent.mkdir(parents=True, exist_ok=True)
     lock_dir = parent / ".switch.lockdir"
-    pid_file = lock_dir / "pid"
     deadline = time.time() + _LOCK_WAIT_SECONDS
     while True:
         try:
-            lock_dir.mkdir()
-        except FileExistsError:
-            if _lock_is_stale(pid_file):
-                shutil.rmtree(lock_dir, ignore_errors=True)
-                logger.warning("Removed a Grok switch lock that a dead process left")
-                continue
-            if time.time() > deadline:
-                raise GrokAccountError(
-                    "Another Grok account switch is still in progress."
-                ) from None
-            time.sleep(0.05)
-            continue
-        try:
-            pid_file.write_text(str(os.getpid()), encoding="utf-8")
+            if pid_lockdir.try_acquire(lock_dir):
+                break
         except OSError:
-            pass
-        break
+            raise GrokAccountError(
+                "jacked could not write the Grok switch lock. Check that the Grok "
+                "folder is writable, then try again."
+            ) from None
+        if pid_lockdir.is_stale(lock_dir):
+            shutil.rmtree(lock_dir, ignore_errors=True)
+            logger.warning("Removed a Grok switch lock that a dead process left")
+            continue
+        if time.time() > deadline:
+            raise GrokAccountError(
+                "Another Grok account switch is still in progress."
+            ) from None
+        time.sleep(0.05)
     try:
         yield
     finally:
-        shutil.rmtree(lock_dir, ignore_errors=True)
+        pid_lockdir.release(lock_dir)
 
 
-def _lock_is_stale(pid_file: Path) -> bool:
-    """True when the lock holder is gone: no pid file, or a dead process."""
-    from jacked.service.process import process_liveness
+def _matching_row(db, data: Optional[dict]) -> Optional[dict]:
+    """The stored Grok row of a login, by user id then email.
 
-    try:
-        holder = int(pid_file.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return True
-    try:
-        return process_liveness(holder) is False
-    except (OSError, SystemError):
-        return False
-
-
-def find_grok_account_id(db, data: Optional[dict]) -> Optional[int]:
-    """Match a live auth file to a stored Grok row, by user id then email."""
+    Every row that is not deleted counts. A disabled account still owns its
+    slot: a switch must capture its live login, and the timer copy must keep
+    its slot current, or a later switch back replays a spent refresh token.
+    """
     if not data:
         return None
     user_id = _user_id(data)
     email = (identity_email(data) or "").lower()
-    by_email: Optional[int] = None
-    for account in db.list_accounts():
+    by_email: Optional[dict] = None
+    for account in db.list_accounts(include_inactive=True):
         if (account.get("provider") or "") != "grok":
             continue
         if user_id and (account.get("organization_uuid") or "") == user_id:
-            return account["id"]
+            return account
         if email and (account.get("email") or "").lower() == email:
-            by_email = account["id"]
+            by_email = account
     return by_email
+
+
+def find_grok_account_id(db, data: Optional[dict]) -> Optional[int]:
+    """Match a live auth file to a stored Grok row (enabled or disabled)."""
+    row = _matching_row(db, data)
+    return row["id"] if row else None
 
 
 def live_login_owner(db, home: Optional[Path] = None) -> tuple[bool, Optional[int]]:
     """Who the live Grok login belongs to: ``(signed_in, account_id)``.
 
     ``signed_in`` is False when no usable login is live. ``account_id`` is
-    None for a usable login that matches no stored Grok account.
+    None for a usable login that matches no enabled Grok account. Add
+    Account imports that login, and the import enables a disabled row again.
     """
     root = home if home is not None else grok_home()
     live = _read_json(root / "auth.json")
     if not usable_login(live):
         return False, None
-    return True, find_grok_account_id(db, live)
+    row = _matching_row(db, live)
+    return True, (row["id"] if row and row.get("is_active") else None)
+
+
+def read_live_login(path: Path, action: str = "switch") -> Optional[dict]:
+    """The live login at ``path``, or None when there is no file.
+
+    A file that exists and does not read as a login (a Grok write in
+    progress, a partial file, a symlink) is not "no login". Writing over it
+    can lose the only copy of a rotated refresh token, so this raises.
+    ``action`` names the step that the user can try again.
+    """
+    if not path.exists() and not path.is_symlink():
+        return None
+    live = _read_json(path)
+    if live is None:
+        raise GrokAccountError(f"The live Grok login could not be read. Try the {action} again.")
+    return live
+
+
+def _slot_is_newer(slot: Optional[dict], live: Optional[dict]) -> bool:
+    """True when ``slot`` expires after ``live``: the copy would go backward.
+
+    >>> a = {"s": {"email": "a@x.com", "expires_at": "2026-10-05T00:00:00Z"}}
+    >>> b = {"s": {"email": "a@x.com", "expires_at": "2026-10-03T00:00:00Z"}}
+    >>> _slot_is_newer(a, b), _slot_is_newer(b, a), _slot_is_newer(None, a)
+    (True, False, False)
+    """
+    slot_exp, live_exp = _expires(slot), _expires(live)
+    return slot_exp is not None and live_exp is not None and slot_exp > live_exp
 
 
 def _refuse_stale(target: dict, live: Optional[dict]) -> None:
@@ -357,6 +382,9 @@ def sync_active_slot_from_live(db, home: Optional[Path] = None) -> bool:
             and _expires(slot) == _expires(live)
         ):
             return False
+        if _slot_is_newer(slot, live):
+            logger.debug("Grok slot of account %s is newer than the live login", active_id)
+            return False
         _atomic_write(slot_path, live)
     logger.info("Copied the live Grok login into account %s slot", active_id)
     return True
@@ -367,7 +395,9 @@ def swap_grok_account(db, target_id: int, home: Optional[Path] = None) -> dict:
 
     Captures the current auth.json into the outgoing account's slot first.
     Refuses to overwrite a newer live login with an older stored copy of the
-    same account. Grok re-reads auth.json on the next request.
+    same account, a live file that does not read, and a usable live login
+    that matches no stored account. Grok re-reads auth.json on the next
+    request.
     """
     root = home if home is not None else grok_home()
     live_path = root / "auth.json"
@@ -378,13 +408,21 @@ def swap_grok_account(db, target_id: int, home: Optional[Path] = None) -> dict:
             raise GrokAccountError(
                 "No stored Grok login for this account. Re-auth it first."
             )
-        live = _read_json(live_path)
+        live = read_live_login(live_path)
         _refuse_stale(target, live)
         outgoing_id = find_grok_account_id(db, live) if live else None
+        if outgoing_id is None and usable_login(live):
+            raise GrokAccountError(
+                "The live Grok login is not in jacked, and a switch would remove it. "
+                "Add this Grok login first, or run `grok logout` to sign it out. "
+                "Then switch."
+            )
         captured = False
         if live and outgoing_id is not None and outgoing_id != target_id:
-            _atomic_write(slot_auth_path(outgoing_id, root), live)
-            captured = True
+            outgoing_slot = slot_auth_path(outgoing_id, root)
+            if not _slot_is_newer(_read_json(outgoing_slot), live):
+                _atomic_write(outgoing_slot, live)
+                captured = True
         _atomic_write(live_path, target)
 
     db.set_active_account_id(target_id, provider="grok")

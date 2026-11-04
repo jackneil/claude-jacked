@@ -78,7 +78,9 @@ def test_add_signs_in_apart_from_the_live_login(env, monkeypatch):
     assert db.get_active_account_id("grok") == a["id"]
     assert any(r["email"] == "b@x.com" for r in db.list_accounts())
     db.close()
-    assert not (home / "jacked-accounts" / ".sign-in-cli").exists()
+    sign_in_home = Path(runs[0][3]).parent
+    assert sign_in_home.name.startswith(".sign-in-cli-")
+    assert not sign_in_home.exists()
 
 
 def test_add_with_no_login_refuses_when_nothing_new_is_live(env):

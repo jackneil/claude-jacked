@@ -33,6 +33,14 @@ GROK_OUT = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_registered_logins():
+    """Each test starts and ends with no registered sign-in."""
+    el._live_logins.clear()
+    yield
+    el._live_logins.clear()
+
+
 class _Proc:
     def __init__(self, text: str, code=0):
         self.stdout = io.StringIO(text)
@@ -157,7 +165,6 @@ def test_only_one_login_of_a_provider_runs_at_a_time(tmp_path, monkeypatch):
     # The second request never cleared the first login's isolated home.
     assert prepared == [1]
     assert started == [["/home/u/.grok/bin/grok", "login", "--device-auth", "--x"]]
-    el._live_logins.clear()
 
 
 def test_an_unknown_provider_is_refused():
@@ -205,3 +212,40 @@ def test_the_profile_opener_never_falls_back_to_the_system_browser(tmp_path):
 
 def test_the_profile_opener_refuses_a_non_https_url(tmp_path):
     assert profile_opener.open_in_profile(tmp_path / "p", "file:///etc/passwd") == 2
+
+
+def test_a_sign_in_whose_result_is_still_stored_counts_as_running(tmp_path, monkeypatch):
+    """The CLI has exited, and on_exit still stores its login. A second sign-in
+    that starts now would remove the private home of the first one."""
+    monkeypatch.setattr("jacked.web.browser_launch.PROFILE_ROOT", tmp_path / "profiles")
+    el._live_logins["grok"] = _Proc("", code=0)
+
+    assert el.login_running("grok")
+    with patch.object(el, "find_bin", return_value="/home/u/.grok/bin/grok"), \
+            patch.object(el.subprocess, "Popen") as popen, \
+            pytest.raises(el.LoginInProgressError):
+        el.start_provider_login("grok", {"email": "g@x.com", "id": 3}, db=None, env={},
+                                prepare=lambda: pytest.fail("prepare must not run"))
+    popen.assert_not_called()
+
+
+def test_a_watcher_that_cannot_start_frees_the_provider(tmp_path, monkeypatch):
+    """Without a watcher nobody removes the registration, and every later
+    sign-in would be refused."""
+    monkeypatch.setattr("jacked.web.browser_launch.PROFILE_ROOT", tmp_path / "profiles")
+    proc = _Proc("", code=None)
+
+    class _NoThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    with patch.object(el, "find_bin", return_value="/home/u/.grok/bin/grok"), \
+            patch.object(el.subprocess, "Popen", return_value=proc), \
+            patch.object(el.threading, "Thread", _NoThread), \
+            pytest.raises(el.LoginStartError):
+        el.start_provider_login("grok", {"email": "g@x.com", "id": 3}, db=None, env={})
+    assert proc.killed
+    assert not el.login_running("grok")

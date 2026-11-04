@@ -1,6 +1,7 @@
 """Dashboard routes for a Grok account: add, switch, re-auth, delete, CC auth."""
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -122,13 +123,19 @@ def test_add_of_a_second_account_keeps_the_live_login(client, db, home, logins):
     assert slot["https://auth.x.ai::client"]["refresh_token"] == "b"
 
 
-def test_the_end_of_a_sign_in_is_pushed_to_the_dashboard(db, home, logins):
-    """The watcher thread sends the result over the WebSocket registry."""
+def _pushed_result(db, logins, data):
+    """Run an Add Account sign-in to its end. Return the event the dashboard got.
+
+    The broadcast runs on the server loop, apart from the thread that plays
+    the CLI exit, so the test waits on an event and not on a sleep loop.
+    """
     sent = []
+    arrived = threading.Event()
 
     class _Registry:
         async def broadcast(self, topic, payload=None, source=None):
             sent.append((topic, payload))
+            arrived.set()
 
     app = FastAPI()
     app.include_router(router, prefix="/api/auth")
@@ -136,15 +143,31 @@ def test_the_end_of_a_sign_in_is_pushed_to_the_dashboard(db, home, logins):
     app.state.ws_registry = _Registry()
     with TestClient(app) as local:
         assert local.post("/api/auth/accounts/add?provider=grok").status_code == 200
-        logins.finish(data=_auth("n@x.com", "user-n"))
-        for _ in range(100):
-            if sent:
-                break
-            import time
-            time.sleep(0.01)
-    assert sent and sent[0][0] == "provider_login_finished"
-    payload = sent[0][1]
+        logins.finish(data=data)
+        assert arrived.wait(timeout=10)
+    assert sent[0][0] == "provider_login_finished"
+    return sent[0][1]
+
+
+def test_the_end_of_a_sign_in_is_pushed_to_the_dashboard(db, home, logins):
+    """The watcher thread sends the result over the WebSocket registry."""
+    payload = _pushed_result(db, logins, _auth("n@x.com", "user-n"))
     assert payload["ok"] is True and payload["email"] == "n@x.com" and payload["live"] is True
+    assert "\u2014" not in payload["message"]
+
+
+def test_a_storage_failure_after_the_sign_in_is_pushed_to_the_dashboard(
+    db, home, logins, monkeypatch
+):
+    """An OSError after a good `grok login` used to escape the handler, so the
+    dashboard waited for a result that never came."""
+    def _boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("jacked.grok.login_import.store_signed_in_login", _boom)
+    payload = _pushed_result(db, logins, _auth("n@x.com", "user-n"))
+    assert payload["ok"] is False and payload["provider"] == "grok"
+    assert "could not store the Grok sign-in" in payload["message"]
     assert "\u2014" not in payload["message"]
 
 
@@ -280,3 +303,72 @@ def test_delete_removes_the_grok_slot_and_active_pointer(client, db, home):
     assert resp.status_code == 200
     assert db.get_active_account_id("grok") is None
     assert not slot.parent.exists()
+
+
+@pytest.mark.parametrize("provider", ["grok", "codex"])
+def test_delete_removes_the_slot_under_the_switch_lock(db, home, tmp_path, monkeypatch, provider):
+    """The timer copy writes the slot under the switch lock. A delete that
+    removes the slot outside that lock can lose the race, and the copy then
+    writes the refresh token back after the row is gone."""
+    import contextlib
+
+    from jacked.api import provider_accounts
+
+    held = {"now": False, "removed_inside": None}
+
+    @contextlib.contextmanager
+    def _recording_lock(*_args, **_kwargs):
+        held["now"] = True
+        try:
+            yield True
+        finally:
+            held["now"] = False
+
+    real_rmtree = provider_accounts.shutil.rmtree
+
+    def _rmtree(path, *args, **kwargs):
+        held["removed_inside"] = held["now"]
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(provider_accounts.shutil, "rmtree", _rmtree)
+    if provider == "grok":
+        monkeypatch.setattr("jacked.grok.accounts._switch_lock", _recording_lock)
+        _write(home / "auth.json", _auth("a@x.com", "user-a"))
+        account = import_grok_account(db, home=home, make_active=True)
+        slot = slot_auth_path(account["id"], home).parent
+    else:
+        from jacked.codex import switching as sw
+
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+        monkeypatch.setattr(sw, "_codex_swap_lock", _recording_lock)
+        account = db.create_account("c@x.com", "codex-managed", 4102444800,
+                                    provider="codex", organization_uuid="acct-C")
+        db.set_active_account_id(account["id"], provider="codex")
+        slot = sw.codex_account_home(account["id"])
+        _write(slot / "auth.json", {"auth_mode": "chatgpt"})
+
+    db.delete_account(account["id"])
+    provider_accounts.forget_slot(db, account)
+
+    assert not slot.exists()
+    assert held["removed_inside"] is True
+    assert db.get_active_account_id(provider) is None
+
+
+def test_each_dashboard_sign_in_gets_its_own_private_home(client, db, home, logins):
+    """The result of one sign-in is stored from its own home, so the cleanup
+    of one sign-in never removes the login of another."""
+    assert client.post("/api/auth/accounts/add?provider=grok").status_code == 200
+    first_prepare, first_exit = logins.hooks[-1]
+    assert client.post("/api/auth/accounts/add?provider=grok").status_code == 200
+    second_prepare, _second_exit = logins.hooks[-1]
+    env1, _ = first_prepare()
+    env2, _ = second_prepare()
+    assert env1["GROK_HOME"] != env2["GROK_HOME"]
+    _write(Path(env1["GROK_HOME"]) / "auth.json", _auth("n@x.com", "user-n"))
+
+    first_exit("signed_in")
+
+    assert [r["email"] for r in db.list_accounts() if r["provider"] == "grok"] == ["n@x.com"]
+    assert not Path(env1["GROK_HOME"]).exists()
+    assert Path(env2["GROK_HOME"]).exists()

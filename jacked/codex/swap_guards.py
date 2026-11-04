@@ -120,6 +120,48 @@ def parse_refresh(ts: Optional[str]) -> Optional[datetime]:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def slot_copy_allowed(slot: Optional[Mapping], live: Mapping) -> bool:
+    """True when the timer copy can put ``live`` over ``slot``.
+
+    ``jacked codex launch`` runs Codex with ``CODEX_HOME`` set to the slot,
+    so Codex can rotate the slot while the root keeps the spent token of the
+    same account. The copy runs only when the slot has no refresh token, or
+    when the live ``last_refresh`` is strictly newer.
+
+    >>> slot = {"tokens": {"refresh_token": "s"}, "last_refresh": "2026-07-02T00:00:00Z"}
+    >>> slot_copy_allowed(slot, {"last_refresh": "2026-07-01T00:00:00Z"})
+    False
+    >>> slot_copy_allowed(slot, {"last_refresh": "2026-07-03T00:00:00Z"})
+    True
+    >>> slot_copy_allowed({}, {}), slot_copy_allowed(slot, {})
+    (True, False)
+    """
+    if not slot or not _refresh_token(slot):
+        return True
+    live_ref = parse_refresh(live.get("last_refresh"))
+    slot_ref = parse_refresh(slot.get("last_refresh"))
+    return live_ref is not None and slot_ref is not None and live_ref > slot_ref
+
+
+def slot_is_newer(slot: Optional[Mapping], live: Mapping) -> bool:
+    """True when ``slot`` holds a strictly newer ``last_refresh`` than ``live``.
+
+    The swap does not capture the live root over such a slot: the root holds
+    a token that Codex already spent in that slot.
+
+    >>> slot_is_newer({"last_refresh": "2026-07-02T00:00:00Z"},
+    ...               {"last_refresh": "2026-07-01T00:00:00Z"})
+    True
+    >>> slot_is_newer(None, {}), slot_is_newer({}, {"last_refresh": "2026-07-01T00:00:00Z"})
+    (False, False)
+    """
+    if not slot:
+        return False
+    slot_ref = parse_refresh(slot.get("last_refresh"))
+    live_ref = parse_refresh(live.get("last_refresh"))
+    return slot_ref is not None and live_ref is not None and slot_ref > live_ref
+
+
 def same_codex_identity(a, b) -> bool:
     """Same account across two auth blobs — by account_id when present, else email."""
     ia, ib = extract_identity(a), extract_identity(b)
