@@ -8,6 +8,12 @@ project moves the read or the write out of the project: for example, a save
 could copy the user's global settings, or a private file, into a file that
 the project commits. A route checks each path with ``first_outside_project``
 before it reads or writes, and refuses with ``outside_project_response``.
+
+The project folder itself comes from the request (``repo_path``), and the
+dashboard can serve a remote client. So a route first gets the folder with
+``known_project_path``: the folder must be a project that jacked recorded
+from its own session activity, and the route then uses the recorded text,
+not the request text. A path that jacked did not record gets no disk access.
 """
 
 from __future__ import annotations
@@ -18,6 +24,101 @@ from fastapi import status
 from fastapi.responses import JSONResponse
 
 LINK_OUTSIDE_PROJECT = "LINK_OUTSIDE_PROJECT"
+
+# The number of recent projects that a request can name. The dashboard shows
+# the 20 most recent projects, so every project that it can send is in this
+# set.
+KNOWN_PROJECT_LIMIT = 100
+
+
+class ProjectRefused(Exception):
+    """A route does not open the project that a request names.
+
+    ``status_code``, ``code`` and ``message`` make the JSON error answer.
+    """
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+    def response(self) -> JSONResponse:
+        """The JSON error answer for this refusal."""
+        return JSONResponse(
+            status_code=self.status_code,
+            content={"error": {"message": self.message, "code": self.code}},
+        )
+
+
+def _spellings(repo_path: str) -> set[str]:
+    """The ways that a client can write one recorded project path.
+
+    The database keeps each path with forward slashes. ``Path`` removes a
+    trailing slash and a doubled slash without a disk access.
+
+    >>> {"/a/b", "/a/b/"} <= _spellings("/a/b/")
+    True
+    """
+    spellings = {repo_path, str(Path(repo_path))}
+    return spellings | {s.replace("\\", "/") for s in spellings}
+
+
+def known_project_path(repo_path, db) -> str:
+    """Return the path that jacked recorded for the project ``repo_path``.
+
+    The request text is attacker input when the dashboard serves a remote
+    client. This function compares the text with the projects that jacked
+    recorded from its own session activity, before any disk access at the
+    path. It returns the recorded text, so the route opens files only at a
+    recorded path. ``..`` in the request does not match a recorded path.
+
+    Raise ``ProjectRefused`` when the value is empty, when the project list
+    cannot be read (fail closed), or when jacked did not record the project.
+
+    >>> class Db:
+    ...     def get_project_activity_summary(self, limit=20):
+    ...         return [{"repo_path": "/work/repo"}]
+    >>> known_project_path("/work/repo/", Db())
+    '/work/repo'
+    >>> try:
+    ...     known_project_path("/work/repo/../secret", Db())
+    ... except ProjectRefused as refused:
+    ...     refused.code
+    'UNKNOWN_PROJECT'
+    """
+    if not isinstance(repo_path, str) or not repo_path:
+        raise ProjectRefused(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "INVALID_REPO_PATH",
+            "The request has no project path. Send the repo_path of a project.",
+        )
+    if db is None:
+        raise ProjectRefused(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "DB_UNAVAILABLE",
+            "The project list is not available, because the database did not "
+            "start. The dashboard does not open project files without it.",
+        )
+    try:
+        rows = db.get_project_activity_summary(limit=KNOWN_PROJECT_LIMIT)
+    except Exception:
+        raise ProjectRefused(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "DB_ERROR",
+            "The dashboard cannot read the project list from the database.",
+        ) from None
+    requested = _spellings(repo_path)
+    for row in rows:
+        recorded = row.get("repo_path")
+        if recorded and recorded in requested:
+            return recorded
+    raise ProjectRefused(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "UNKNOWN_PROJECT",
+        f"Jacked has no activity for the project {repo_path}. "
+        "Use Claude Code in the project first.",
+    )
 
 
 class LinkOutsideProject(Exception):

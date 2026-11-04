@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._known_projects import request_for
 from tests._platform import requires_symlinks
 from tests.unit.api import test_db_off_loop_guard as db_guard
 
@@ -112,8 +113,8 @@ def _lessons_routes(repo):
         repo_path=str(repo), lessons=[system.LessonItem(index=0, strike=1, text="Use uv")]
     )
     return {
-        "get": lambda: system.get_project_lessons(str(repo), _request()),
-        "put": lambda: system.update_project_lessons(body, _request()),
+        "get": lambda: system.get_project_lessons(str(repo), request_for(repo)),
+        "put": lambda: system.update_project_lessons(body, request_for(repo)),
     }
 
 
@@ -435,13 +436,13 @@ def test_project_settings_are_written_off_the_loop_under_their_lock(
     make = {
         "project-permissions": lambda: permissions.set_project_permissions(
             permissions.ProjectPermissionsRequest(repo_path=str(repo), defaultMode="plan"),
-            _request(),
+            request_for(repo),
         ),
         "project-rule": lambda: permissions.add_permission_rule(
             permissions.AddRuleRequest(
                 pattern="Bash(git status:*)", scope="project", repo_path=str(repo)
             ),
-            _request(),
+            request_for(repo),
         ),
     }[route]
 
