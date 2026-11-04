@@ -11,11 +11,14 @@ import os
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from jacked.session_ancestry import session_processes_running
+import pytest
 
-def _row(pid, written=None):
+from jacked.session_ancestry import process_token, session_processes_running
+
+def _row(pid, written=None, token=None):
     written = written or datetime.now(timezone.utc)
-    return {"session_id": f"s-{pid}", "pid": pid, "detected_at": written.isoformat()}
+    return {"session_id": f"s-{pid}", "pid": pid, "detected_at": written.isoformat(),
+            "pid_token": token}
 
 
 def test_no_usable_pid_is_unknown():
@@ -28,10 +31,22 @@ def test_the_current_process_runs_a_row_written_after_it_started():
     assert session_processes_running([_row(os.getpid())]) == [True]
 
 
-def test_a_row_written_before_the_process_started_is_a_reused_pid():
-    """This process started after a row dated a year ago: the id was reused."""
+def test_a_tokenless_row_written_before_the_process_started_is_unknown():
+    """This process started after a row dated a year ago. With no token that
+    can be a wall-clock step as well as a reused id: unknown, never a close."""
     old = datetime.now(timezone.utc) - timedelta(days=365)
-    assert session_processes_running([_row(os.getpid(), old)]) == [False]
+    assert session_processes_running([_row(os.getpid(), old)]) == [None]
+
+
+def test_the_token_decides_on_the_real_process_table():
+    """Reads the real process table: the token of this process confirms the
+    row whatever the row time says, and a different token is a reused id."""
+    token = process_token(os.getpid())
+    if token is None:
+        pytest.skip("this platform gives no process token")
+    old = datetime.now(timezone.utc) - timedelta(days=365)
+    rows = [_row(os.getpid(), old, token), _row(os.getpid(), old, token + "x")]
+    assert session_processes_running(rows) == [True, False]
 
 
 def test_a_dead_pid_does_not_run_the_session():

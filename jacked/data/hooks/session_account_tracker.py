@@ -11,12 +11,14 @@ from hashlib import sha256
 from pathlib import Path
 
 from jacked.resolver_snapshot import SNAPSHOT_FILENAME, read_resolver_snapshot
+from jacked.session_ancestry import process_token
 from jacked.session_tracking_store import (
     end_session,
     heartbeat_session,
     match_snapshot_account,
     record_session,
     tag_subagent,
+    usable_pid,
 )
 
 DB_PATH = Path.home() / ".claude" / "jacked.db"
@@ -72,6 +74,9 @@ def _record_session(
     event_idempotency_key: str | None = None,
     force_new_span: bool = False,
 ) -> str | None:
+    # The token tells the session process apart from a newer process that
+    # reuses its id, whatever the wall clock does (session_ancestry).
+    pid_token = process_token(pid) if usable_pid(pid) else None
     return record_session(
         DB_PATH,
         session_id,
@@ -87,6 +92,7 @@ def _record_session(
         credential_revision=credential_revision,
         launch_nonce=launch_nonce,
         event_idempotency_key=event_idempotency_key,
+        pid_token=pid_token,
         force_new_span=force_new_span,
     )
 
