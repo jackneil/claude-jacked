@@ -136,7 +136,7 @@ def test_chain_of_command_scopes_reviews_and_converges():
     assert "A review loop converges" in text
     assert "split the PR instead of reviewing again" in text
     assert "Exhaustive on the FIRST pass of any task; convergent after that." in text
-    assert "The full-suite gate is per PUSH, not per fix batch" in text
+    assert "The full suite runs ONCE per goal, at the very end" in text
     assert "LOW findings go to the main loop unverified" in text
 
 
@@ -165,3 +165,73 @@ def test_dc_classifies_the_tier_first_and_runs_small_inline():
     assert "same VERDICT format" in text
     # Grill mode stays interactive and agent-free.
     assert "GRILL MODE has no tier: it is always inline." in text
+
+
+def _cadence(text: str) -> str:
+    """The Gate cadence paragraph a forged brief carries, from its label to its last sentence."""
+    start = text.index("Gate cadence:")
+    tail = "Run nothing else heavy while the full suite runs."
+    return text[start : text.index(tail, start) + len(tail)]
+
+
+def test_full_suite_runs_once_per_goal_never_per_milestone():
+    """Jack, 2026-11-03: a 16-milestone goal ran a full local gate plus a hosted
+    CI round per milestone. The full suite and hosted CI run ONCE per goal, at
+    the very end; milestones get targeted tests only. Every brief forger, the
+    behaviors block and both engines say so, and the two forgers carry the same
+    paragraph byte for byte, so no forged brief can bring the per-milestone gate
+    back and the copies cannot drift apart."""
+    for relative in (
+        "rules/jacked_behaviors.md",
+        "commands/goal-maker.md",
+        "skills/whats-next/SKILL.md",
+        "skills/chain-of-command/SKILL.md",
+    ):
+        text = _read(relative)
+        assert "ONCE per goal, at the very end" in text, relative
+        assert "never per milestone" in text, relative
+    # The old wording lived in exactly these two engines.
+    for relative in ("skills/dcr/SKILL.md", "skills/chain-of-command/SKILL.md"):
+        assert "per PUSH" not in _read(relative), relative
+    assert _read("skills/dcr/SKILL.md").count("never per milestone") == 2  # both fix-phase lines
+    goal = _read("commands/goal-maker.md")
+    cadence = _cadence(goal)
+    assert cadence == _cadence(_read("skills/whats-next/SKILL.md"))
+    wrapper = DATA.parents[1] / ".claude" / "skills" / "whats-next" / "SKILL.md"
+    assert cadence in wrapper.read_text(encoding="utf-8")
+    assert "every test file that imports or reads a changed file" in cadence
+    assert "Re-run only the failing tests." in cadence
+    behaviors = _read("rules/jacked_behaviors.md")
+    assert "every test file that imports or reads a changed file" in behaviors
+    assert "In `/bhag` a cell is the merge unit" in behaviors
+    assert "Re-run only the failing tests." in behaviors
+    assert "for a `SKILL.md`, grep its parent directory name" in behaviors
+    assert "(outside a goal, once per push; a /bhag cell is its own batch)" in _read("skills/chain-of-command/SKILL.md")
+    bhag = _read("commands/bhag.md")
+    assert "Run only the targeted tests while building the cell" in bhag
+    assert "every test file that imports or reads a changed file" in bhag
+    assert "run <repo's real test command> ONCE" in bhag and "never after each edit" in bhag
+
+
+def test_merge_mode_stacks_milestones_and_merges_once_at_the_end():
+    """MERGE mode no longer gates, pushes and merges each milestone before the
+    next starts. Every PR opens against main (a stacked base relies on a
+    retarget GitHub performs only when the merged head branch is deleted), the
+    base is confirmed before each merge, and the ledger records a milestone as
+    done at its commit so a resumed run never rebuilds it."""
+    goal = _read("commands/goal-maker.md")
+    assert "milestones stack" in goal
+    assert "no PR, no CI wait and no merge between milestones" in goal
+    assert "every PR against `main`" in goal
+    assert "only when the merged head branch is deleted" in goal
+    assert "`gh pr view <PR#> --json baseRefName` reads `main` (else STOP)" in goal
+    assert "gh pr merge --merge --delete-branch <PR#>" in goal
+    assert "on the branch of the milestone that introduced it" in goal
+    assert "evidence holds the branch name and the commit SHA" in goal
+    assert "the merged PR number in its evidence" in goal
+    assert "until the current one's PR has fully merged" not in goal
+    assert "branches off the branch of the last DONE milestone" in goal
+    assert "A blocked milestone gets no PR and nothing branches off it" in goal
+    assert "gh pr update-branch <PR#>" in goal and "shows BEHIND" in goal
+    assert "At merge time, append the merged PR number" in goal
+    assert "the first done entry with no merged PR number" in goal

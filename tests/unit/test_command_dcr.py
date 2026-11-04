@@ -325,7 +325,7 @@ def test_fix_phase_buckets_findings_by_provenance(dcr: str):
     assert "`gh issue create`" in dcr
     assert "Filing with evidence is not punting" in dcr
     assert "A project or global CLAUDE.md that says otherwise wins over this default." in dcr
-    assert "the full-suite gate is per PUSH, not per fix batch" in dcr
+    assert "the full-suite gate is per GOAL, at the very end" in dcr
     assert "**Pre-existing findings filed, not fixed here:**" in dcr
 
 
