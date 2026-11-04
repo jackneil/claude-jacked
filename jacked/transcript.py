@@ -584,7 +584,7 @@ def extract_agent_summary(agent_file: Path) -> Optional[AgentSummary]:
                         except ValueError:
                             pass
     except (IOError, OSError) as e:
-        logger.warning(f"Failed to read agent file {agent_file}: {e}")
+        logger.warning("Failed to read agent file %s: %s", agent_file, e)
         return None
 
     if not last_assistant_msg:
@@ -659,7 +659,7 @@ def extract_summary_labels(session_path: Path) -> list[SummaryLabel]:
                             timestamp=timestamp,
                         ))
     except (IOError, OSError) as e:
-        logger.warning(f"Failed to read session file {session_path}: {e}")
+        logger.warning("Failed to read session file %s: %s", session_path, e)
 
     return labels
 
@@ -684,7 +684,7 @@ def extract_session_slug(session_path: Path) -> Optional[str]:
                 if data is not None and "slug" in data:
                     return data["slug"]
     except (IOError, OSError) as e:
-        logger.warning(f"Failed to read session file {session_path}: {e}")
+        logger.warning("Failed to read session file %s: %s", session_path, e)
 
     return None
 
@@ -729,7 +729,7 @@ def find_plan_file(slug: str, plans_dir: Optional[Path] = None) -> Optional[Plan
             content=content,
         )
     except (IOError, OSError) as e:
-        logger.warning(f"Failed to read plan file {plan_path}: {e}")
+        logger.warning("Failed to read plan file %s: %s", plan_path, e)
         return None
 
 

@@ -75,7 +75,7 @@ BASELINE: dict[str, int] = {
     "jacked/web/auth.py": 3169,
     "jacked/web/browser_launch.py": 585,
     "jacked/web/database.py": 4078,
-    "jacked/web/oauth.py": 1239,
+    "jacked/web/oauth.py": 1238,
 }
 
 

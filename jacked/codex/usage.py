@@ -224,8 +224,7 @@ async def _send(proc: asyncio.subprocess.Process, obj: dict) -> None:
 async def _read_result(proc: asyncio.subprocess.Process, want_id: int) -> dict:
     """Read newline-delimited JSON-RPC until the message with ``id == want_id``.
 
-    Notifications (no/other id) are skipped. Raises ``CodexUsageError`` on a
-    JSON-RPC ``error`` or if the stream closes first.
+    Skips notifications. Raises ``CodexUsageError`` on an error or an early EOF.
     """
     assert proc.stdout is not None
     while True:
@@ -241,8 +240,9 @@ async def _read_result(proc: asyncio.subprocess.Process, want_id: int) -> dict:
             continue  # tolerate non-JSON log lines
         if msg.get("id") != want_id:
             continue  # a notification or a different request's reply
-        if msg.get("error"):
-            raise CodexUsageError(f"codex app-server error: {msg['error']}")
+        if error := msg.get("error"):  # values-free: its message can echo an HTTP body
+            code = error.get("code") if isinstance(error, dict) else None
+            raise CodexUsageError(f"codex app-server returned JSON-RPC error {code}")
         return msg.get("result") or {}
 
 
