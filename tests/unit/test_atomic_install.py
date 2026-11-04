@@ -49,7 +49,9 @@ def _make_tree(d: Path, files: dict) -> Path:
     for rel, text in files.items():
         p = d / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text, encoding="utf-8")
+        # Bytes, not write_text: Windows text mode writes CRLF, and _tree
+        # compares raw bytes.
+        p.write_bytes(text.encode("utf-8"))
     return d
 
 
@@ -69,7 +71,7 @@ def _builder(files: dict, *, fail_after: int | None = None, err: str = "ENOSPC")
                 raise OSError(*_ERRORS[err])
             p = staging / rel
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(text, encoding="utf-8")
+            p.write_bytes(text.encode("utf-8"))
         return len(files)
 
     return build

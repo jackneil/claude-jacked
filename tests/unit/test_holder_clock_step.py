@@ -185,7 +185,8 @@ def _proc(monkeypatch, btime, ticks="250"):
     real = Path.read_text
 
     def _read(self, *a, **k):
-        name = str(self)
+        # as_posix: on Windows str() of Path("/proc/stat") uses back slashes.
+        name = self.as_posix()
         if name == "/proc/stat":
             return f"cpu 1 2 3\nbtime {btime[0]}\n"
         if name == "/proc/4100/stat":
