@@ -29,6 +29,7 @@ import httpx
 from aiohttp import web
 
 from jacked.web.database import Database, selected_account_id
+from jacked.web.oauth_errors import OAuthIdentityError, OAuthVerificationError, flow_error_text
 
 logger = logging.getLogger("jacked.oauth")
 
@@ -587,15 +588,14 @@ class OAuthFlow:
                 self._result = result
                 self._status = "completed"
             except Exception as e:
-                # The exception text can name emails (the re-auth identity
-                # check does), so the log gets the type only; the UI gets
-                # the text through self._error.
+                # The log gets the type only (the text can name emails); the UI
+                # gets flow_error_text(e), which is written for the user (#289i).
                 logger.error(
                     "OAuth completion failed for flow %s (purpose=%s): %s",
                     self.flow_id, self.purpose, type(e).__name__,
                 )
                 self._status = "error"
-                self._error = str(e)
+                self._error = flow_error_text(e)
         else:
             self._status = "error"
             self._error = "No authorization code received"
@@ -693,7 +693,7 @@ class OAuthFlow:
                     self.flow_id, self.purpose, type(e).__name__,
                 )
                 self._status = "error"
-                self._error = str(e)
+                self._error = flow_error_text(e)
             self._event.set()
             return self.get_status()
 
@@ -1005,13 +1005,13 @@ class OAuthFlow:
             # can change between OAuth sessions, creating duplicates.
             target = self.db.get_account(self._target_account_id)
             if not target:
-                raise ValueError(
+                raise OAuthIdentityError(
                     f"Re-auth target account {self._target_account_id} not found"
                 )
 
             # Identity check: ensure the user logged in with the same Claude account
             if email.lower() != target["email"].lower():
-                raise ValueError(
+                raise OAuthIdentityError(
                     f"Re-auth email ({email}) does not match "
                     f"target account ({target['email']})"
                 )
@@ -1144,7 +1144,7 @@ class OAuthFlow:
         account_id = self._target_account_id
         target = self.db.get_account(account_id)
         if not target:
-            raise ValueError(f"Target account {account_id} not found")
+            raise OAuthIdentityError(f"Target account {account_id} not found")
 
         # Identity validation — try token response first, fall back to profile.
         # CC flows skip API key creation, so _fetch_profile may fail with
@@ -1159,11 +1159,11 @@ class OAuthFlow:
             or profile_account.get("email_address")
         )
         if not cc_email:
-            raise RuntimeError(
+            raise OAuthVerificationError(
                 "Cannot verify CC token identity. No email in token response or profile."
             )
         if cc_email.lower() != target["email"].lower():
-            raise ValueError(
+            raise OAuthIdentityError(
                 f"CC auth email ({cc_email}) does not match "
                 f"target account ({target['email']})"
             )
@@ -1173,12 +1173,12 @@ class OAuthFlow:
         cc_org = tokens.get("organization_uuid", "")
         if target_org:  # non-empty sentinel = real org
             if not cc_org:
-                raise ValueError(
+                raise OAuthIdentityError(
                     "CC auth is missing an org, so jacked cannot verify it against an org-scoped account "
                     f"(target org: {target_org})."
                 )
             if cc_org != target_org:
-                raise ValueError(
+                raise OAuthIdentityError(
                     f"CC auth org ({cc_org}) does not match "
                     f"target account org ({target_org})"
                 )
@@ -1188,14 +1188,14 @@ class OAuthFlow:
             # so a token for another org must not land here.
             stored_org = _stored_profile_org(target)
             if stored_org and stored_org != cc_org:
-                raise ValueError(
+                raise OAuthIdentityError(
                     "CC auth org does not match the organization stored for the "
                     "target account"
                 )
         target_uuid = target.get("account_uuid")
         cc_uuid = tokens.get("account_uuid")
         if target_uuid and cc_uuid and cc_uuid != target_uuid:
-            raise ValueError("CC auth account does not match the target account")
+            raise OAuthIdentityError("CC auth account does not match the target account")
 
         expires_at = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
 

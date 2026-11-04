@@ -22,9 +22,11 @@ from jacked.api.project_paths import (
 )
 from jacked.api.remote_access import REASON_OUTSIDE_SCOPE, REASON_REMOTE_ACCESS_OFF
 from jacked.api.routes.settings_swap import SWAP_SETTING_KEYS
+from jacked.api.upgrade_steps import UpgradeStepError, _drain, _stop_child, _upgrade_run_cmd  # noqa: F401
 from jacked.findbin import find_bin
 from jacked.install_summary import last_install_path
 from jacked.memory.vault import atomic_write_text
+from jacked.public_errors import describe, public_message
 from jacked.service import update_status as _update_status_mod
 from jacked.web.database import SELECTED_ACCOUNT_KEYS, Database
 
@@ -823,65 +825,6 @@ async def _upgrade_broadcast(ws_registry, event: str, payload: dict) -> None:
             logger.exception("Failed to broadcast %s", event)
 
 
-async def _upgrade_run_cmd(cmd: list[str]) -> None:
-    """Run a subprocess command list, raising RuntimeError on failure or timeout.
-
-    On cancellation (the service shutting down mid-upgrade) the child is
-    terminated and awaited BEFORE the cancellation propagates, so the switch
-    lease the caller holds is never released while an installer still runs.
-    """
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
-    except asyncio.TimeoutError:
-        proc.kill()
-        raise RuntimeError(f"{cmd[0]} timed out after 120s")
-    except asyncio.CancelledError:
-        await _stop_child(proc)
-        raise
-    if proc.returncode != 0:
-        raise RuntimeError((stdout or b"").decode()[-500:] or "Unknown error")
-
-
-async def _stop_child(proc) -> None:
-    """Terminate a child and wait for it, escalating to kill after 5 s.
-
-    The cancelled ``communicate()`` no longer drains the child's stdout, and
-    asyncio reports a child as finished only once its pipes close. A noisy
-    child that ignores SIGTERM would fill the pipe and never be seen to
-    exit, so a drain task reads the pipe to EOF while the child is stopped.
-    """
-    if proc.returncode is not None:
-        return
-    drain = asyncio.create_task(_drain(proc.stdout)) if proc.stdout is not None else None
-    try:
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=5)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-    finally:
-        if drain is not None:
-            try:
-                await asyncio.wait_for(drain, timeout=5)
-            except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - best effort
-                drain.cancel()
-
-
-async def _drain(stream) -> None:
-    """Read a pipe to EOF, discarding the data."""
-    while await stream.read(65536):
-        pass
-
-
 # Reason-keyed denial copy for a refused remote upgrade. The two denials
 # have different fixes, so they get different sentences. No em-dashes
 # (user-facing). The codes are the policy reasons themselves.
@@ -967,7 +910,7 @@ async def _run_upgrade_steps(ws_registry) -> None:
             return
         uv_bin = find_bin("uv")
         if not uv_bin:
-            raise RuntimeError("uv not found on PATH. Cannot upgrade.")
+            raise UpgradeStepError("uv not found on PATH. Cannot upgrade.")
         await _upgrade_broadcast(ws_registry, "upgrade_progress",
                                  {"step": "upgrade", "message": "Upgrading claude-jacked\u2026"})
         await _upgrade_run_cmd([uv_bin, "tool", "upgrade", "claude-jacked"])
@@ -975,7 +918,7 @@ async def _run_upgrade_steps(ws_registry) -> None:
         stage = "reinstall"
         jacked_bin = find_bin("jacked")
         if not jacked_bin:
-            raise RuntimeError("jacked not found on PATH. Cannot reinstall.")
+            raise UpgradeStepError("jacked not found on PATH. Cannot reinstall.")
         await _upgrade_broadcast(ws_registry, "upgrade_progress",
                                  {"step": "reinstall", "message": "Reinstalling files\u2026"})
         await _upgrade_run_cmd([jacked_bin, "install", "--force"])
@@ -995,10 +938,11 @@ async def _run_upgrade_steps(ws_registry) -> None:
         os.execv(prog, argv)
 
     except Exception as exc:
-        # Durable, values-free: the stage and the exception type. The raw
-        # text goes to the dashboard modal only.
-        logger.warning("Upgrade failed at stage %s: %s", stage, type(exc).__name__)
-        await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": str(exc)})
+        # Durable, values-free: the stage and the exception type. The dialog gets
+        # an UpgradeStepError's report, else fixed text: str(exc) can name a path.
+        logger.warning("Upgrade failed at stage %s: %s", stage, describe(exc))
+        fixed = f"Upgrade failed at the {stage} step. Check the jacked log on the host machine for the cause."
+        await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": public_message(exc, fixed)})
 
 
 @router.post("/upgrade")

@@ -545,19 +545,27 @@ def test_completed_remote_flow_keeps_local_only_activation_truth():
 
 def test_submit_code_marks_the_flow_errored_when_the_exchange_fails():
     """A rejected code is not a paste mistake — it matches the callback
-    path and errors the flow with the reason attached."""
+    path and errors the flow with the reason attached (the HTTP status, not
+    the response body)."""
+    import httpx
+
+    request = httpx.Request("POST", "https://platform.claude.com/v1/oauth/token")
+    response = httpx.Response(400, request=request, text="body text")
 
     async def _body():
         flow = _pending_flow(state="the-right-state")
         flow._complete_auth = AsyncMock(
-            side_effect=RuntimeError("token exchange HTTP 400")
+            side_effect=httpx.HTTPStatusError(
+                "token exchange HTTP 400", request=request, response=response
+            )
         )
         return flow, await flow.submit_code("auth-code-abc")
 
     flow, result = run_async(_body)
 
     assert result["status"] == "error"
-    assert "token exchange HTTP 400" in result["error"]
+    assert "HTTP 400" in result["error"]
+    assert "body text" not in result["error"]
     assert flow._status == "error"
     assert flow._event.is_set()
 

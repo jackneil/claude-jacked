@@ -942,7 +942,7 @@ async def start_add_account(
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={
-                    "error": {"message": str(exc), "code": exc.code},
+                    "error": {"message": exc.public_message, "code": exc.code},
                     "needs_login": True,
                     "command": "codex login",
                 },
@@ -1651,7 +1651,7 @@ async def refresh_all_usage(
                 # one-pass-at-a-time invariant for any immediate retry.
                 try:
                     return await _refresh_one(acct)
-                except Exception as exc:
+                except Exception:  # the text goes to the log only (#289i)
                     logger.exception(
                         "Bulk refresh: unexpected error for account %d",
                         acct["id"],
@@ -1661,7 +1661,7 @@ async def refresh_all_usage(
                         "account_id": acct["id"],
                         "email": acct["email"],
                         "success": False,
-                        "error": f"internal error during refresh: {exc}",
+                        "error": "An internal error stopped the refresh. Check the jacked log.",
                     }
 
             results = list(
@@ -1882,7 +1882,7 @@ async def use_account(account_id: int, request: Request):
         except CodexSwapError as exc:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                content={"error": {"message": str(exc), "code": "CODEX_SWAP_FAILED"}},
+                content={"error": {"message": exc.public_message, "code": "CODEX_SWAP_FAILED"}},
             )
         return JSONResponse(
             status_code=status.HTTP_200_OK,

@@ -28,6 +28,7 @@ from jacked.api.usage_monitor import (
     full_sweep_loop,
 )
 from jacked.api.log_capture import server_log_buffer
+from jacked.api.error_handlers import not_found_handler, value_error_handler
 from jacked.api.security import (
     HostValidationMiddleware,
     build_allowed_origins,
@@ -562,20 +563,9 @@ app.add_middleware(
 app.add_middleware(HostValidationMiddleware)
 
 
-@app.exception_handler(ValueError)
-async def value_error_handler(request: Request, exc: ValueError):
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content={"error": {"message": str(exc), "code": "VALIDATION_ERROR"}},
-    )
-
-
-@app.exception_handler(FileNotFoundError)
-async def not_found_handler(request: Request, exc: FileNotFoundError):
-    return JSONResponse(
-        status_code=status.HTTP_404_NOT_FOUND,
-        content={"error": {"message": str(exc), "code": "NOT_FOUND"}},
-    )
+# Fixed client text for exceptions no route handled (#289i); see error_handlers.
+app.add_exception_handler(ValueError, value_error_handler)
+app.add_exception_handler(FileNotFoundError, not_found_handler)
 
 
 @app.exception_handler(Exception)

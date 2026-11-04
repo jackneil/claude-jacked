@@ -273,10 +273,15 @@ def test_write_access_error_is_not_confused_with_an_unreadable_config(tmp_path):
 
 
 def test_write_converts_a_replace_failure_and_still_cleans_up_its_tmp(tmp_path):
-    with patch("jacked.atomic_io.os.replace", side_effect=OSError("no space left")):
+    import errno
+
+    failure = OSError(errno.ENOSPC, "No space left on device", "/marker/tmp/path")
+    with patch("jacked.atomic_io.os.replace", side_effect=failure):
         with pytest.raises(DcrSettingsAccessError) as excinfo:
             dcr_settings.write_config(tmp_path, dcr_settings.DEFAULTS)
-    assert "no space left" in str(excinfo.value)
+    # The errno text, not the OSError text (which names a path) (#289i).
+    assert "No space left on device" in str(excinfo.value)
+    assert "/marker/tmp/path" not in str(excinfo.value)
     assert not list((tmp_path / ".claude").glob(".jacked-dcr.json.*.tmp"))
 
 

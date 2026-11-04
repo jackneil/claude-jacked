@@ -17,6 +17,8 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from jacked.public_errors import describe
+
 if TYPE_CHECKING:
     from jacked.api.websocket import WebSocketRegistry
 
@@ -28,8 +30,6 @@ FLUSH_INTERVAL_SEC = 0.15
 # Loggers whose events skip broadcast scheduling (prevents infinite loops
 # where broadcast() → logger.debug() → emit() → broadcast() …)
 _BROADCAST_SKIP_LOGGERS = frozenset({"jacked.api.websocket"})
-
-_formatter = logging.Formatter("%(message)s")
 
 
 class _CaptureHandler(logging.Handler):
@@ -178,8 +178,24 @@ class ServerLogBuffer:
 
 
 def _format_entry(record: logging.LogRecord) -> dict:
-    """Convert a LogRecord into a JSON-serialisable dict."""
-    msg = _formatter.format(record)
+    """Convert a LogRecord into a JSON-serialisable dict.
+
+    The entry goes to every dashboard client, remote ones too. A record with
+    ``exc_info`` gives its message and the exception type only: the
+    traceback contains the exception text, which can name a path or a
+    response body. The host's log file keeps the full traceback (#289i).
+
+    >>> import sys
+    >>> try:
+    ...     raise OSError("detail")
+    ... except OSError:
+    ...     rec = logging.LogRecord("t", logging.ERROR, "", 0, "failed", (), sys.exc_info())
+    >>> _format_entry(rec)["msg"]
+    'failed [OSError]'
+    """
+    msg = record.getMessage()
+    if record.exc_info and record.exc_info[1] is not None:
+        msg = f"{msg} [{describe(record.exc_info[1])}]"
     if len(msg) > MAX_MSG_LENGTH:
         msg = msg[:MAX_MSG_LENGTH] + "…"
     return {

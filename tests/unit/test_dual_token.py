@@ -1114,7 +1114,10 @@ class TestHandleCallback:
         assert status["activation_operation_id"] == "oauth-callback-operation"
 
     def test_exception_returns_error_html(self, tmp_path):
-        """Valid code + _complete_auth raises → 'Authorization Failed' (NOT 'Success!')."""
+        """Valid code + _complete_auth raises → 'Authorization Failed' (NOT 'Success!').
+
+        An unexpected exception's own text stays off the page (#289i): the
+        page gives fixed text that points to the jacked log."""
         flow = self._make_flow(tmp_path)
         flow._complete_auth = AsyncMock(side_effect=RuntimeError("token exchange failed"))
         req = self._make_request({"code": "valid-code", "state": "test-state"})
@@ -1123,7 +1126,8 @@ class TestHandleCallback:
 
         assert flow._status == "error"
         assert "Authorization Failed" in resp.text
-        assert "token exchange failed" in resp.text
+        assert "token exchange failed" not in resp.text
+        assert "Check the jacked log" in resp.text
         assert "Success!" not in resp.text
         assert "window.close()" not in resp.text
 
@@ -1185,8 +1189,11 @@ class TestHandleCallback:
     def test_xss_payload_in_error_is_escaped(self, tmp_path):
         """html.escape prevents XSS in error messages rendered in callback HTML."""
         flow = self._make_flow(tmp_path)
+        from jacked.web.oauth import OAuthIdentityError
+
         xss = '<script>alert(1)</script>'
-        flow._complete_auth = AsyncMock(side_effect=RuntimeError(xss))
+        # A refusal written for the user is the text that reaches the page.
+        flow._complete_auth = AsyncMock(side_effect=OAuthIdentityError(xss))
         req = self._make_request({"code": "valid-code", "state": "test-state"})
 
         resp = asyncio.run(flow._handle_callback(req))

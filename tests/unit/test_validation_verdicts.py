@@ -299,7 +299,8 @@ class TestTheOtherValidationWritesAreGuarded:
         ("http_503", ("unknown", "Validation HTTP 503")),
         ("http_429", ("unknown", "Rate limited during validation")),
         ("timeout", ("unknown", None)),
-        ("error", ("unknown", "boom")),
+        # The exception type only, never its text (#289i).
+        ("error", ("unknown", "Validation error: RuntimeError")),
     ])
     def test_an_unchanged_row_is_recorded_as_before(self, tmp_path, outcome, expected):
         db, account_id = _row(tmp_path)

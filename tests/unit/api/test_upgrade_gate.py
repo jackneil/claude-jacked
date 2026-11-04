@@ -472,7 +472,11 @@ def test_do_upgrade_holds_the_switch_lease_for_its_whole_run(monkeypatch, caplog
         "upgrade_complete",
         "upgrade_failed",
     ]
-    assert "exec stubbed out" in registry.events[-1][1]["error"]
+    # The OSError's own text stays out of the dialog (#289i).
+    assert registry.events[-1][1]["error"] == (
+        "Upgrade failed at the restart step. "
+        "Check the jacked log on the host machine for the cause."
+    )
     # Everything is released after the failure, so a later upgrade can start.
     _assert_lease_is_free()
     assert system._upgrade_lock.locked() is False

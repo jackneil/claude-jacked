@@ -22,6 +22,7 @@ from typing import Literal, Optional
 
 import httpx
 
+from jacked.public_errors import describe
 from jacked.service.pill_text import percent_reading
 from jacked.web.database import Database
 from jacked.web.refresh_verdict import FOREIGN_TOKEN_ERROR as _FOREIGN_TOKEN_ERROR
@@ -1289,7 +1290,6 @@ def usage_cache_updates(data: dict) -> dict:
     return updates
 
 
-
 def compute_urgency_tier(
     usage_5h: float | None,
     usage_7d: float | None,
@@ -1355,8 +1355,6 @@ def compute_urgency_tier(
             tier = _TIER_ORDER[idx + 1]
 
     return tier, _TIER_INTERVALS[tier]
-
-
 
 
 def should_refresh(account: dict, buffer_seconds: int | None = None) -> bool:
@@ -2159,9 +2157,9 @@ async def fetch_usage(
             )
             return None
 
-    except Exception as e:
-        await asyncio.to_thread(db.record_account_error, account_id, f"Usage fetch error: {e}")
-        logger.warning(f"Usage fetch failed for account {account_id}: {e}")
+    except Exception as e:  # the type only: the row and the log reach the dashboard (#289i)
+        await asyncio.to_thread(db.record_account_error, account_id, f"Usage fetch error: {describe(e)}")
+        logger.warning("Usage fetch failed for account %d: %s", account_id, describe(e))
         return None
 
 
@@ -2400,8 +2398,6 @@ def _validate_codex_account(account_id: int, db: Database) -> dict:
         last_error_at=datetime.now(timezone.utc).isoformat(),
     )
     return {"valid": False, "error": "Codex signed out"}
-
-
 
 
 def _begin_validation(account_id: int, db: Database) -> tuple[Optional[dict], Optional[dict]]:
@@ -2655,17 +2651,17 @@ async def validate_account(account_id: int, db: Database) -> dict:
             validation_status=account.get("validation_status", "unknown"),
         )
         return {"valid": False, "error": "Network timeout during validation"}
-    except Exception as e:
-        logger.error(f"Validation error for account {account_id}: {e}")
+    except Exception as e:  # the type only: the row, result and log reach the dashboard
+        logger.error("Validation error for account %d: %s", account_id, describe(e))
         await asyncio.to_thread(
             db.update_account_if_unchanged,
             account_id,
             {"access_token": token},
             validation_status="unknown",
-            last_error=_standing_verdict_or(account, str(e)),
+            last_error=_standing_verdict_or(account, f"Validation error: {describe(e)}"),
             last_error_at=datetime.now(timezone.utc).isoformat(),
         )
-        return {"valid": False, "error": str(e)}
+        return {"valid": False, "error": f"Validation error: {describe(e)}"}
 
 
 async def reset_stale_checking_accounts(
