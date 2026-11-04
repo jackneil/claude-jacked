@@ -845,7 +845,13 @@ class TestLanguageAllowlist:
     def test_create_never_reads_a_template_outside_the_template_folder(self, tmp_path):
         secret = tmp_path / "secret.md"
         secret.write_text("TOP SECRET", encoding="utf-8")
-        traversal = os.path.relpath(secret.with_suffix(""), guardrails.GUARDRAILS_TEMPLATES)
+        try:
+            traversal = os.path.relpath(secret.with_suffix(""), guardrails.GUARDRAILS_TEMPLATES)
+        except ValueError:
+            # Windows: the temp folder and the package are on different
+            # drives, so no relative path exists. An absolute one is the
+            # same attack.
+            traversal = str(secret.with_suffix(""))
         repo = tmp_path / "repo"
         repo.mkdir()
         result = guardrails.create_guardrails(repo, language=traversal)

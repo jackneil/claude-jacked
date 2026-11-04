@@ -603,8 +603,12 @@ def test_a_noisy_child_that_ignores_sigterm_is_killed_and_drained(monkeypatch):
     grace period, its stdout drained to EOF, and the cancellation still
     propagates with the lease released afterwards."""
     child = _FakeChild(ignores_sigterm=True)
+    # Wait for the real start, not a fixed count of loop ticks: the upgrade
+    # runs the #295i refusal check in a thread before it starts the child.
+    child_started = asyncio.Event()
 
     async def _fake_exec(*cmd, **kwargs):
+        child_started.set()
         return child
 
     real_wait_for = asyncio.wait_for
@@ -623,6 +627,7 @@ def test_a_noisy_child_that_ignores_sigterm_is_killed_and_drained(monkeypatch):
         monkeypatch.setattr(system.asyncio, "wait_for", _short_grace)
         try:
             task = asyncio.create_task(system._do_upgrade(registry, "127.0.0.1"))
+            await child_started.wait()
             for _ in range(20):
                 await real_sleep(0)
                 if registry.events and registry.events[-1][0] == "upgrade_progress":
@@ -762,8 +767,12 @@ def test_cancel_running_upgrade_stops_the_child_inside_the_lease(monkeypatch):
     terminated (and killed when it ignores SIGTERM), drained, and only then is
     the lease released."""
     child = _FakeChild(ignores_sigterm=True)
+    # Wait for the real start, not a fixed count of loop ticks: the upgrade
+    # runs the #295i refusal check in a thread before it starts the child.
+    child_started = asyncio.Event()
 
     async def _fake_exec(*cmd, **kwargs):
+        child_started.set()
         return child
 
     real_wait_for = asyncio.wait_for
@@ -783,6 +792,7 @@ def test_cancel_running_upgrade_stops_the_child_inside_the_lease(monkeypatch):
             task = asyncio.create_task(system._do_upgrade(registry, "127.0.0.1"))
             system._upgrade_tasks.add(task)
             task.add_done_callback(system._upgrade_tasks.discard)
+            await child_started.wait()
             for _ in range(20):
                 await real_sleep(0)
                 if registry.events and registry.events[-1][0] == "upgrade_progress":
