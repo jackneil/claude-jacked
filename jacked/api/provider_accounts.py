@@ -50,7 +50,8 @@ async def add_grok(db, remote: bool):
     from jacked.web.pending_profile import adopt_pending_profile, pending_login_account
 
     try:
-        acct = await asyncio.to_thread(import_grok_account, db)
+        # The imported login is the live one, so it is the active Grok account.
+        acct = await asyncio.to_thread(import_grok_account, db, make_active=True)
     except GrokAccountError as exc:
         logger.info("Grok add found no usable login")
         if remote:

@@ -67,6 +67,9 @@ def test_add_imports_the_signed_in_grok_login(client, db, home, logins):
     assert body["provider"] == "grok" and body["imported"] is True
     row = db.get_account(body["account_id"])
     assert row["provider"] == "grok" and row["refresh_token"] in (None, "")
+    # The imported login is the live one, so it is the active Grok account.
+    # Without the pointer the 30-minute slot copy never runs for it.
+    assert db.get_active_account_id("grok") == body["account_id"]
     assert logins == []
 
 
