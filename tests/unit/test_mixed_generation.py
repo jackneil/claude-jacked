@@ -1,12 +1,13 @@
 """An interpreter mid-upgrade keeps importing the new release's modules.
 
-`jacked upgrade` replaces the package on disk under a running process. The
-0.110.2 upgrade to 0.111.0 died at its restart step because the old
-interpreter imported the new `jacked.service.supervisors` package, which
-needs `system_program`, a name 0.111.0 added to `jacked.winproc`, while the
+An upgrade replaces the package on disk under a running process. The
+0.110.2 upgrade to 0.111.0 died twice on the same class: the CLI path at its
+restart step (the new `jacked.service.supervisors` package) and the tray
+path at its settings migration (the new `jacked.proctree`), both needing
+`system_program`, a name 0.111.0 added to `jacked.winproc`, while the
 process still held the 0.110.2 module. These tests pin both halves of the
-fix: the guard that reloads a held module missing a name, and the upgrade
-command that imports its modules before the install.
+fix: `names_from` reloading a held module that lacks a name, and both
+transactions importing their modules before the install.
 """
 
 from __future__ import annotations
@@ -63,47 +64,64 @@ class TestReloadMissing:
         assert callable(winproc.system_program)
 
 
-class TestSupervisorsImportInAStaleInterpreter:
-    def test_the_package_imports_when_the_held_winproc_predates_it(self, monkeypatch):
-        """The exact failure of the 0.110.2 upgrade to 0.111.0, in one process."""
+class TestNamesFrom:
+    def test_a_current_module_is_read_without_a_reload(self, monkeypatch):
+        import jacked.winproc as winproc
+
+        calls = []
+        monkeypatch.setattr(importlib, "reload", lambda module: calls.append(module.__name__))
+        no_window, program = mixed_generation.names_from("jacked.winproc", "NO_WINDOW", "system_program")
+        assert no_window is winproc.NO_WINDOW and program is winproc.system_program
+        assert calls == []
+
+    def test_a_held_module_that_lacks_a_name_is_reloaded_once(self, monkeypatch):
         import jacked.winproc as winproc
 
         monkeypatch.delattr(winproc, "system_program")
-        for name in [n for n in sys.modules if n.startswith("jacked.service.supervisors")]:
+        (program,) = mixed_generation.names_from("jacked.winproc", "system_program")
+        assert callable(program) and winproc.system_program is program
+
+
+@pytest.mark.parametrize("module", ["jacked.service.supervisors", "jacked.proctree", "jacked.service.process"])
+class TestNewModulesImportInAStaleInterpreter:
+    """The three modules an older upgrade process first-imports after the install."""
+
+    def test_the_module_imports_when_the_held_winproc_predates_it(self, monkeypatch, module):
+        import jacked.winproc as winproc
+
+        monkeypatch.delattr(winproc, "system_program")
+        for name in [n for n in sys.modules if n == module or n.startswith(module + ".")]:
             monkeypatch.delitem(sys.modules, name)
-        package = importlib.import_module("jacked.service.supervisors")
-        assert package.system_program is winproc.system_program
+        loaded = importlib.import_module(module)
+        assert loaded.system_program is winproc.system_program
         assert callable(winproc.system_program)
 
-    def test_a_current_interpreter_never_reloads(self, monkeypatch):
+    def test_a_current_interpreter_never_reloads(self, monkeypatch, module):
         calls = []
-        monkeypatch.setattr(importlib, "reload", lambda module: calls.append(module.__name__))
-        for name in [n for n in sys.modules if n.startswith("jacked.service.supervisors")]:
+        monkeypatch.setattr(importlib, "reload", lambda m: calls.append(m.__name__))
+        for name in [n for n in sys.modules if n == module or n.startswith(module + ".")]:
             monkeypatch.delitem(sys.modules, name)
-        importlib.import_module("jacked.service.supervisors")
+        importlib.import_module(module)
         assert calls == []
 
 
-class TestUpgradePreloadsItsModules:
-    MODULES = ("jacked.service.legacy", "jacked.service.lifecycle", "jacked.service.updater")
-
-    def test_the_transaction_modules_are_loaded_before_the_install(self, monkeypatch):
+class TestPreloadUpgradeModules:
+    def test_every_transaction_module_is_loaded_and_named_in_order(self, monkeypatch):
         import jacked.service as service_package
-        from jacked import cli
 
-        for name in self.MODULES:
+        for name in mixed_generation.UPGRADE_MODULES:
             monkeypatch.delitem(sys.modules, name, raising=False)
             monkeypatch.delattr(service_package, name.rsplit(".", 1)[1], raising=False)
-        cli._preload_upgrade_modules()
-        for name in self.MODULES:
+        monkeypatch.delattr(jacked, "proctree", raising=False)
+        assert mixed_generation.preload_upgrade_modules() == mixed_generation.UPGRADE_MODULES
+        for name in mixed_generation.UPGRADE_MODULES:
             assert name in sys.modules, name
 
-    def test_the_inline_upgrade_preloads_before_it_takes_the_lock(self, monkeypatch):
-        """The preload runs first; the lock, the install and the rest never start here."""
+    def test_the_cli_transaction_preloads_before_it_takes_the_lock(self, monkeypatch):
         from jacked import cli
 
         order = []
-        monkeypatch.setattr(cli, "_preload_upgrade_modules", lambda: order.append("preload"))
+        monkeypatch.setattr(mixed_generation, "preload_upgrade_modules", lambda: order.append("preload"))
 
         def _lock(*args, **kwargs):
             order.append("lock")
@@ -116,3 +134,24 @@ class TestUpgradePreloadsItsModules:
                 pid_file=None, host="127.0.0.1", port=0,
             )
         assert order == ["preload", "lock"]
+
+    def test_the_tray_transaction_refuses_before_any_write_when_the_preload_fails(self, monkeypatch, tmp_path):
+        from jacked import install_method
+        from jacked.service import updater
+
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "jacked-update.log")
+        monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "jacked-update-failed.txt")
+
+        def _boom():
+            raise ImportError("cannot import name 'system_program'")
+
+        monkeypatch.setattr(mixed_generation, "preload_upgrade_modules", _boom)
+        gate_calls = []
+        monkeypatch.setattr(install_method, "can_auto_upgrade", lambda: gate_calls.append(1) or (False, "never reached"))
+        updater.run_update(parent_pid=1, extras="tray")
+        assert gate_calls == []
+        assert "REFUSED: the installed jacked cannot import its upgrade modules (ImportError)" in (
+            tmp_path / "jacked-update.log").read_text(encoding="utf-8")
+        recovery = (tmp_path / "jacked-update-failed.txt").read_text(encoding="utf-8")
+        assert "cannot import its upgrade modules (ImportError)" in recovery
+        assert 'uv tool install "claude-jacked[tray]" --force --refresh' in recovery

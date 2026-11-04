@@ -15,7 +15,7 @@ from xml.etree import ElementTree
 
 from jacked.atomic_io import replace_with_retry
 from jacked.service.spec import ServiceSpec
-from jacked.winproc import system_program
+from jacked.service.supervisors._winproc import system_program
 from jacked.service.supervisors._artifacts import (
     ArtifactDisposition,
     SupervisorAction,
