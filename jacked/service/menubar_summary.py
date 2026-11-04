@@ -28,13 +28,28 @@ into the hover text of the Windows and Linux tray icon.
 
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime, timezone
 from typing import Iterable, Mapping, Optional
 
 from jacked.service.pill_text import percent_reading
-from jacked.web.window_keeper import cache_reset_value
+from jacked.service.per_model import (  # noqa: F401  re-exported for callers and tests
+    parse_per_model,
+    binding_model,
+    binding_model_compact,
+)
+from jacked.service.per_model_sources import (  # noqa: F401  re-exported for callers and tests
+    _LEGACY_MODEL_LABELS,
+    _epoch_to_iso,
+    _log_skipped_limit,
+    _claude_scoped_models,
+    _codex_named_models,
+    _legacy_seven_day_models,
+)
+from jacked.service.usage_block import (  # noqa: F401  re-exported for callers and tests
+    USAGE_STALE_SECS,
+    usage_block,
+    usage_block_of_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +60,6 @@ _VIEW_FAILURES_LOGGED: set = set()
 # (account id, reason) pairs whose unreadable model limit was already logged
 # at WARNING in this process, on the same rule.
 _CAP_FAILURES_LOGGED: set = set()
-# (source, model label) pairs whose skipped model limit was already logged
-# at WARNING in this process, on the same rule: every poll and every page
-# load parses the cached payloads again.
-_SKIPPED_LIMITS_LOGGED: set = set()
 _UNSET = object()
 
 
@@ -200,6 +211,7 @@ def summarize_account(acct: dict) -> Optional[dict]:
     an old 5-hour value in the cache is not a reading. Its weekly Fable
     limit is the worst limit, so it sets the color:
 
+    >>> import json
     >>> ultra = {"id": 3, "subscription_type": "max",
     ...          "rate_limit_tier": "default_claude_max_20x",
     ...          "cached_usage_5h": 67.0, "cached_usage_7d": 74.0,
@@ -313,410 +325,3 @@ def compute_worst_account_summary(accounts: Iterable[dict]) -> Optional[dict]:
         if s is not None and (best is None or s["max_pct"] > best["max_pct"]):
             best = s
     return best
-
-
-# ---------------------------------------------------------------------------
-# Per-model usage caps
-# ---------------------------------------------------------------------------
-#
-# Both providers report per-model weekly caps in ``cached_usage_raw``, but in
-# different shapes:
-#   - Claude: a ``limits`` array; model caps are the ``weekly_scoped`` entries
-#     whose ``scope.model.display_name`` names the model (e.g. "Fable"). One
-#     entry may carry ``is_active: true`` — the binding constraint.
-#   - Codex: a ``rateLimitsByLimitId`` map; named limits carry a ``limitName``
-#     (e.g. "GPT-5.3-Codex-Spark"). The bare overall ``codex`` entry has no
-#     ``limitName`` and is already covered by the 5h/7d bars.
-# The legacy ``seven_day_<model>`` keys are a fallback for older cached
-# payloads (Anthropic now leaves them null in favor of ``limits``).
-
-_LEGACY_MODEL_LABELS = {
-    "sonnet": "Sonnet",
-    "opus": "Opus",
-    "oauth_apps": "OAuth Apps",
-    "cowork": "Cowork",
-}
-
-
-def _epoch_to_iso(epoch) -> Optional[str]:
-    """Unix epoch seconds → ISO-8601 UTC string, or None if not convertible.
-
-    Canonical home for this helper; also imported by ``jacked/codex/usage.py``,
-    so keep the name stable (a rename must update that import too).
-
-    >>> _epoch_to_iso(None) is None
-    True
-    >>> _epoch_to_iso(0)
-    '1970-01-01T00:00:00+00:00'
-    >>> _epoch_to_iso("nope") is None, _epoch_to_iso(True) is None
-    (True, True)
-    """
-    if epoch is None or isinstance(epoch, bool):
-        return None
-    try:
-        return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat()
-    except (TypeError, ValueError, OSError, OverflowError):
-        return None
-
-
-def _log_skipped_limit(source: str, key: str) -> None:
-    """Log a model limit that the parser skipped: WARNING once per (source,
-    key) in a process (the service logs at INFO, so a DEBUG-only line would
-    never show), DEBUG after that. The line names the entry key and its
-    source, never the value."""
-    seen = (source, key)
-    level = logging.DEBUG if seen in _SKIPPED_LIMITS_LOGGED else logging.WARNING
-    _SKIPPED_LIMITS_LOGGED.add(seen)
-    logger.log(
-        level,
-        "Model limit entry %s from %s has no finite percent; jacked shows no reading for it",
-        key,
-        source,
-    )
-
-
-def _claude_scoped_models(raw: dict, plan=None) -> list[dict]:
-    """Claude ``weekly_scoped`` model caps from the ``limits`` array.
-
-    An entry whose percent is not a finite number is skipped (no reading,
-    never 0%). A reset that is not a timestamp is no reset, and a severity
-    that is not text is no severity.
-    """
-    from jacked.usage_plans import clean_label, model_window_seconds
-
-    window_secs = model_window_seconds("claude", None, "weekly_model", plan)
-    out: list[dict] = []
-    limits = raw.get("limits")
-    if not isinstance(limits, list):
-        return out
-    for lim in limits:
-        if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
-            continue
-        scope = lim.get("scope")
-        model = scope.get("model") if isinstance(scope, dict) else None
-        # Provider text reaches the dashboard and the terminal: no control
-        # or invisible characters, at most 40 characters.
-        label = clean_label(model.get("display_name")) if isinstance(model, dict) else None
-        if not label:
-            continue
-        utilization = percent_reading(lim.get("percent"))
-        if utilization is None:
-            _log_skipped_limit("limits", str(label).lower())
-            continue
-        severity = lim.get("severity")
-        out.append(
-            {
-                "key": str(label).lower(),
-                "label": label,
-                "utilization": utilization,
-                "resets_at": cache_reset_value(lim.get("resets_at")),
-                "severity": severity if isinstance(severity, str) else None,
-                "is_active": bool(lim.get("is_active")),
-                "window_seconds": window_secs,
-            }
-        )
-    return out
-
-
-def _codex_named_models(raw: dict, plan=None) -> list[dict]:
-    """Codex named per-model limits from ``rateLimitsByLimitId``.
-
-    The weekly (secondary) window gives the percent; when it has no finite
-    percent, the primary (5-hour) window gives it. A limit with no finite
-    percent in either window is skipped (no reading, never 0%).
-    ``window_seconds`` is the chosen window's own ``windowDurationMins`` when
-    it has one, else the length of the slot it came from (``weekly`` for a
-    secondary window, ``session`` for a primary one).
-    """
-    from jacked.usage_plans import clean_label, model_window_seconds
-
-    out: list[dict] = []
-    by_limit = raw.get("rateLimitsByLimitId")
-    if not isinstance(by_limit, dict):
-        return out
-    for limit_id, entry in by_limit.items():
-        if not isinstance(entry, dict):
-            continue
-        label = clean_label(entry.get("limitName"))
-        if not label:
-            continue  # bare overall limit — already the 5h/7d bars
-        # Prefer the weekly (secondary) window; fall back to primary (5h).
-        window = entry.get("secondary")
-        slot = "weekly"
-        utilization = (
-            percent_reading(window.get("usedPercent")) if isinstance(window, dict) else None
-        )
-        if utilization is None:
-            window = (
-                entry.get("primary") if isinstance(entry.get("primary"), dict) else {}
-            )
-            slot = "session"
-            utilization = percent_reading(window.get("usedPercent"))
-        if utilization is None:
-            _log_skipped_limit("rateLimitsByLimitId", str(limit_id).lower())
-            continue
-        out.append(
-            {
-                "key": str(limit_id).lower(),
-                "label": label,
-                "utilization": utilization,
-                "resets_at": _epoch_to_iso(window.get("resetsAt")),
-                "severity": None,
-                "is_active": False,
-                "window_seconds": model_window_seconds("codex", window, slot, plan),
-            }
-        )
-    return out
-
-
-def _legacy_seven_day_models(raw: dict, plan=None) -> list[dict]:
-    """Legacy ``seven_day_<model>`` caps — dict OR bare numeric (old payloads).
-
-    An entry whose percent is not a finite number is skipped (no reading,
-    never 0%), and a reset that is not a timestamp is no reset.
-    """
-    from jacked.usage_plans import model_window_seconds
-
-    window_secs = model_window_seconds("claude", None, "weekly_model", plan)
-    out: list[dict] = []
-    for suffix, label in _LEGACY_MODEL_LABELS.items():
-        val = raw.get(f"seven_day_{suffix}")
-        if isinstance(val, dict):
-            percent, resets_at = val.get("utilization"), val.get("resets_at")
-        elif isinstance(val, (int, float)) and not isinstance(val, bool):
-            percent, resets_at = val, None
-        else:
-            continue
-        utilization = percent_reading(percent)
-        if utilization is None:
-            _log_skipped_limit("seven_day", suffix)
-            continue
-        out.append(
-            {
-                "key": suffix,
-                "label": label,
-                "utilization": utilization,
-                "resets_at": cache_reset_value(resets_at),
-                "severity": None,
-                "is_active": False,
-                "window_seconds": window_secs,
-            }
-        )
-    return out
-
-
-def parse_per_model(raw: Optional[dict], plan=None) -> list[dict]:
-    """Extract per-model usage caps from a raw usage payload (Claude or Codex).
-
-    Returns a list of dicts, each shaped ``{"key", "label", "utilization",
-    "resets_at", "severity", "is_active", "window_seconds"}``, sorted by
-    utilization descending. ``window_seconds`` is the length of the limit's
-    window (the dashboard draws the elapsed marker from it); *plan* (a
-    :class:`jacked.usage_plans.PlanMatch`) supplies plan-specific lengths. Providers are merged with the first
-    source (Claude limits) winning on key collisions; the legacy source only
-    fills keys not already present. Empty list when the payload has no per-model
-    breakdown or is not a dict. A limit whose percent is not a finite number
-    is left out (no reading, never 0%), and every ``resets_at`` is an ISO
-    string or None, so the result is always strict JSON.
-
-    Claude reports model caps as ``weekly_scoped`` entries in ``limits``:
-
-    >>> claude = {"limits": [
-    ...     {"kind": "weekly_all", "percent": 52, "is_active": False},
-    ...     {"kind": "weekly_scoped", "percent": 92, "severity": "critical",
-    ...      "resets_at": "2026-07-06T05:00:00+00:00", "is_active": True,
-    ...      "scope": {"model": {"id": None, "display_name": "Fable"}}},
-    ... ]}
-    >>> [(m["label"], m["utilization"], m["is_active"]) for m in parse_per_model(claude)]
-    [('Fable', 92.0, True)]
-
-    Codex reports them in ``rateLimitsByLimitId`` (named limits only; the bare
-    ``codex`` overall entry is skipped):
-
-    >>> codex = {"rateLimitsByLimitId": {
-    ...     "codex": {"primary": {"usedPercent": 2}},
-    ...     "codex_bengalfox": {"limitName": "GPT-5.3-Codex-Spark",
-    ...                          "primary": {"usedPercent": 7}},
-    ... }}
-    >>> [(m["label"], m["utilization"]) for m in parse_per_model(codex)]
-    [('GPT-5.3-Codex-Spark', 7.0)]
-
-    >>> parse_per_model(None)
-    []
-    """
-    if not isinstance(raw, dict):
-        return []
-
-    out: dict[str, dict] = {}
-    for entry in (
-        *_claude_scoped_models(raw, plan),
-        *_codex_named_models(raw, plan),
-        *_legacy_seven_day_models(raw, plan),
-    ):
-        out.setdefault(entry["key"], entry)  # first source wins per key
-
-    return sorted(out.values(), key=lambda m: m["utilization"], reverse=True)
-
-
-def binding_model(per_model: list[dict]) -> Optional[dict]:
-    """The per-model cap to surface inline (under the 5h/7d bars), or None.
-
-    Shown for every account that reports a per-model cap, regardless of level —
-    users want to always see e.g. their Fable usage, not only when it's near the
-    limit. Selection when an account reports more than one model:
-    1. the entry the provider flags ``is_active`` — THE current binding
-       constraint; else
-    2. the highest-utilization model (``per_model`` is sorted descending).
-
-    None only when the account reports no per-model cap at all.
-
-    >>> binding_model([{"label": "Fable", "utilization": 40, "is_active": True},
-    ...                 {"label": "Sonnet", "utilization": 88, "is_active": False}])["label"]
-    'Fable'
-    >>> binding_model([{"label": "Fable", "utilization": 92, "is_active": False},
-    ...                 {"label": "Sonnet", "utilization": 4, "is_active": False}])["label"]
-    'Fable'
-    >>> binding_model([{"label": "Sonnet", "utilization": 0, "is_active": False}])["label"]
-    'Sonnet'
-    >>> binding_model([]) is None
-    True
-    """
-    for m in per_model:
-        if m.get("is_active"):
-            return m
-    return per_model[0] if per_model else None
-
-
-def binding_model_compact(raw: Optional[dict], plan=None) -> Optional[dict]:
-    """Compact binding-model summary for a raw usage payload, for the inline
-    bar's WebSocket payloads. Returns ``{label, utilization, resets_at,
-    severity, is_active, window_seconds}`` or None. *plan* supplies
-    plan-specific window lengths (see :func:`parse_per_model`).
-
-    >>> binding_model_compact({"limits": [
-    ...     {"kind": "weekly_scoped", "percent": 92, "severity": "critical",
-    ...      "is_active": True, "scope": {"model": {"display_name": "Fable"}}}]})
-    {'label': 'Fable', 'utilization': 92.0, 'resets_at': None, 'severity': 'critical', 'is_active': True, 'window_seconds': 604800}
-    >>> binding_model_compact({}) is None
-    True
-    """
-    bm = binding_model(parse_per_model(raw, plan))
-    if bm is None:
-        return None
-    return {
-        "label": bm["label"],
-        "utilization": bm["utilization"],
-        "resets_at": bm.get("resets_at"),
-        "severity": bm.get("severity"),
-        "is_active": bool(bm.get("is_active")),
-        "window_seconds": bm.get("window_seconds"),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Provider-reported usage block (Codex)
-# ---------------------------------------------------------------------------
-#
-# A Codex ``account/rateLimits/read`` result says outright whether the account
-# may send requests: ``ordinaryUsageAllowed`` is the backend's own verdict, and
-# ``rateLimits.rateLimitReachedType`` / ``spendControlReached`` name why. Only
-# an explicit False blocks: once the included usage runs out, credits can keep
-# ordinary requests allowed while a reached type is still set. The verdict can
-# hold below 100% (a spend control or a workspace limit), so it is surfaced
-# as-is instead of inferred from percents.
-
-# A reading older than this is stale: six 5-minute poll intervals. Mirror of
-# USAGE_STALE_SECS in jacked/data/web/js/components/usage.js.
-USAGE_STALE_SECS = 30 * 60
-
-
-def usage_block(raw: Optional[dict], now: Optional[float] = None) -> Optional[dict]:
-    """The provider's "usage is blocked" verdict from a cached payload, or None.
-
-    Returns ``{"reason": str, "resets_at": iso|None}`` where reason is
-    ``limit_reached``, ``spend_limit`` or ``blocked``. Only a Codex payload
-    with ``ordinaryUsageAllowed: false`` blocks; any other shape returns None.
-    A block whose reset time has passed returns None: the reading is older
-    than the reset, so it no longer says anything about the account.
-
-    >>> usage_block(None) is None
-    True
-    >>> usage_block({"ordinaryUsageAllowed": True,
-    ...              "rateLimits": {"rateLimitReachedType": "rate_limit_reached"}}) is None
-    True
-    >>> usage_block({"ordinaryUsageAllowed": False,
-    ...              "rateLimits": {"rateLimitReachedType": "rate_limit_reached"},
-    ...              "rateLimitUpsell": {"reset_at": 4102444800}}, now=0)
-    {'reason': 'limit_reached', 'resets_at': '2100-01-01T00:00:00+00:00'}
-    >>> usage_block({"ordinaryUsageAllowed": False,
-    ...              "rateLimits": {"spendControlReached": True}}, now=0)
-    {'reason': 'spend_limit', 'resets_at': None}
-    >>> usage_block({"ordinaryUsageAllowed": False, "rateLimits": {},
-    ...              "rateLimitUpsell": {"reset_at": 100}}, now=200) is None
-    True
-    """
-    if not isinstance(raw, dict) or raw.get("ordinaryUsageAllowed") is not False:
-        return None
-    rl = raw.get("rateLimits") if isinstance(raw.get("rateLimits"), dict) else {}
-    if rl.get("spendControlReached") is True:
-        reason = "spend_limit"
-    elif rl.get("rateLimitReachedType"):
-        reason = "limit_reached"
-    else:
-        reason = "blocked"
-    upsell = raw.get("rateLimitUpsell") if isinstance(raw.get("rateLimitUpsell"), dict) else {}
-    reset = upsell.get("reset_at")
-    if not isinstance(reset, (int, float)) or isinstance(reset, bool):
-        # No upsell reset: the latest reset among exhausted windows.
-        resets = [
-            w.get("resetsAt")
-            for w in (rl.get("primary"), rl.get("secondary"))
-            if isinstance(w, dict)
-            and isinstance(w.get("usedPercent"), (int, float))
-            and w["usedPercent"] >= 100
-            and isinstance(w.get("resetsAt"), (int, float))
-        ]
-        reset = max(resets) if resets else None
-    current = datetime.now(timezone.utc).timestamp() if now is None else now
-    if reset is not None and reset <= current:
-        return None
-    return {"reason": reason, "resets_at": _epoch_to_iso(reset)}
-
-
-def usage_block_of_row(row: dict, now: Optional[float] = None) -> Optional[dict]:
-    """:func:`usage_block` for a DB account row (parses ``cached_usage_raw``).
-
-    Adds ``read_at`` (the row's ``usage_cached_at``). A block with no reset
-    time counts only while the reading is fresh (:data:`USAGE_STALE_SECS`):
-    nothing else can end it, and a row the poller no longer reads would
-    otherwise say "blocked" forever. A block with a reset time stands until
-    that reset. A malformed cached payload reads as "no block".
-
-    >>> import json as _j
-    >>> raw = _j.dumps({"ordinaryUsageAllowed": False,
-    ...                 "rateLimits": {"spendControlReached": True}})
-    >>> usage_block_of_row({"cached_usage_raw": raw, "usage_cached_at": 1000}, now=1060)
-    {'reason': 'spend_limit', 'resets_at': None, 'read_at': 1000}
-    >>> usage_block_of_row({"cached_usage_raw": raw, "usage_cached_at": 1000},
-    ...                    now=1000 + USAGE_STALE_SECS + 1) is None
-    True
-    >>> usage_block_of_row({"cached_usage_raw": "not json"}) is None
-    True
-    """
-    text = (row or {}).get("cached_usage_raw")
-    if not text:
-        return None
-    try:
-        block = usage_block(json.loads(text), now=now)
-    except (TypeError, ValueError):
-        return None
-    if block is None:
-        return None
-    read_at = row.get("usage_cached_at")
-    read_at = int(read_at) if isinstance(read_at, (int, float)) and not isinstance(read_at, bool) else None
-    if block["resets_at"] is None:
-        current = datetime.now(timezone.utc).timestamp() if now is None else now
-        if read_at is None or current - read_at > USAGE_STALE_SECS:
-            return None
-    block["read_at"] = read_at
-    return block

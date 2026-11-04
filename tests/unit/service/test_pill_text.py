@@ -27,13 +27,13 @@ from jacked.service.pill_text import (
 @pytest.fixture
 def _fresh_plan_state(monkeypatch):
     from jacked import usage_plans
-    from jacked.service import menubar_summary
+    from jacked.service import menubar_summary, per_model_sources
 
     monkeypatch.setattr(usage_plans, "_catalog_cache", None)
     monkeypatch.setattr(usage_plans, "_drift_logged", set())
     monkeypatch.setattr(menubar_summary, "_VIEW_FAILURES_LOGGED", set())
     monkeypatch.setattr(menubar_summary, "_CAP_FAILURES_LOGGED", set())
-    monkeypatch.setattr(menubar_summary, "_SKIPPED_LIMITS_LOGGED", set())
+    monkeypatch.setattr(per_model_sources, "_SKIPPED_LIMITS_LOGGED", set())
 
 
 def _ultra(**extra):
@@ -267,7 +267,7 @@ class TestUnreadableNumbers:
         # The parser skips the limit; the WARNING names the model, never the value.
         import logging
 
-        with caplog.at_level(logging.WARNING, logger="jacked.service.menubar_summary"):
+        with caplog.at_level(logging.WARNING, logger="jacked.service.per_model_sources"):
             for _ in range(3):
                 summarize_account(_fable_row('"Infinity"'))
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
