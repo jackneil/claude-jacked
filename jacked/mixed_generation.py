@@ -165,7 +165,7 @@ def lazy_imports(module: str, entry: str | None = None) -> set[str]:
 
     >>> "jacked.service.supervisors.launchd" in lazy_imports("jacked.service.supervisors")
     True
-    >>> "jacked.version_check" in lazy_imports("jacked.cli", entry="_run_upgrade_inline")
+    >>> "jacked.upgrade_guard" in lazy_imports("jacked.cli", entry="_run_upgrade_inline")
     True
     >>> lazy_imports("jacked.module_that_does_not_exist")
     set()
