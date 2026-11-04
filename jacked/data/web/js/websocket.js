@@ -513,6 +513,14 @@ jackedWS.on('upgrade_failed', (msg) => {
     if (btn) btn.disabled = false;
 });
 
+jackedWS.on('upgrade_noop', (msg) => {
+    // The package index serves no newer build (#295i). Nothing was installed.
+    const d = msg.payload || msg;
+    if (typeof _showUpgradeNote === 'function') _showUpgradeNote(d.message || 'Nothing to upgrade.');
+    const btn = document.getElementById('version-upgrade-btn');
+    if (btn) btn.disabled = false;
+});
+
 /** Remote-access restart: the server is re-binding the network. Whether this page
  *  can survive the re-bind is decided by the SHARED window.remoteAccessLockout
  *  rule (defined in components/remote-access.js) so this handler and the settings
