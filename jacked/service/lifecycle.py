@@ -58,13 +58,51 @@ def default_service_paths() -> ServicePaths:
     )
 
 
-def _service_runtime_path(executable: str) -> str:
-    """Resolve ancestors while preserving a virtualenv's Python entrypoint."""
+# The venv entry point names that the service contract records, in order of
+# preference. ``uv tool install`` writes ``bin/python3`` into the shebang of
+# every entry point it creates (``jacked``, and the tray through it), so
+# ``python3`` keeps the installed generation of a normal install unchanged.
+_CANONICAL_VENV_ENTRYPOINTS = ("python3", "python")
+
+
+def _canonical_venv_entrypoint(bin_dir: Path, name: str) -> str:
+    """Return one name for every alias of the interpreter at ``bin_dir/name``.
+
+    A venv holds several names for one interpreter (``python``, ``python3``
+    and ``python3.12``). The service generation hashes the runtime path, so
+    each name must map to the same name. This function selects the first
+    name in ``_CANONICAL_VENV_ENTRYPOINTS`` that is in ``bin_dir`` and that
+    resolves to the same file. It keeps ``name`` when no such name exists,
+    because a name for a different interpreter is not an alias.
+    """
+
+    target = os.path.realpath(bin_dir / name)
+    for candidate in _CANONICAL_VENV_ENTRYPOINTS:
+        if candidate == name:
+            return name
+        path = bin_dir / candidate
+        if os.path.lexists(path) and os.path.realpath(path) == target:
+            return candidate
+    return name
+
+
+def _service_runtime_path(executable: str, *, os_name: str = os.name) -> str:
+    """Return the runtime path that the service contract records.
+
+    On POSIX, a venv entry point stays inside the venv: the function resolves
+    the ancestors of the entry point but not the entry point itself.
+    Resolving the entry point selects the base interpreter, which cannot
+    import the tool environment under ``-I``. All the aliases of one venv
+    interpreter give the same path (#293i). Other executables resolve fully.
+    On Windows the function changes nothing: ``python.exe`` and
+    ``pythonw.exe`` are different programs, not aliases.
+    """
 
     absolute = Path(os.path.normpath(os.path.abspath(executable)))
     venv_config = absolute.parent.parent / "pyvenv.cfg"
-    if os.name == "posix" and absolute.is_symlink() and venv_config.is_file():
-        return str(Path(os.path.realpath(absolute.parent)) / absolute.name)
+    if os_name == "posix" and absolute.is_symlink() and venv_config.is_file():
+        bin_dir = Path(os.path.realpath(absolute.parent))
+        return str(bin_dir / _canonical_venv_entrypoint(bin_dir, absolute.name))
     return os.path.realpath(absolute)
 
 
@@ -178,6 +216,8 @@ def provision_service_contract(
     )
     # Preserve the virtualenv entrypoint. Resolving this symlink selects the
     # base interpreter, which cannot import the tool environment under -I.
+    # Every alias of the venv interpreter maps to one name, so the generation
+    # does not depend on the name that started this process (#293i).
     runtime = _service_runtime_path(sys.executable)
     arguments = ("-I", "-m", "jacked", "service", "start")
     install = _launcher_install(

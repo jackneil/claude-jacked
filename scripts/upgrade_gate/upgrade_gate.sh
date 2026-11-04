@@ -31,8 +31,12 @@ case "$MODE" in cli|tray) ;; *) echo "mode must be cli or tray" >&2; exit 64 ;; 
 UID_=$(id -u); LABEL=ai.hank.jacked; PORT="${JACKED_PORT:-8321}"
 # The interpreter the real tray uses: the `jacked` entry point's shebang
 # (bin/python3 in a uv tool env). The service contract records the runtime
-# path, so bin/python here would compute a different generation than the
-# launchd artifact and make every native restart refuse with owned_drift.
+# path. Before #293i each venv alias recorded its own name, so bin/python
+# here computed a different generation than the launchd artifact and every
+# native restart refused with owned_drift. Builds with the #293i fix map
+# every alias to bin/python3, but this gate also drives the PREVIOUS release
+# (the mixed-generation upgrade path), so keep reading the shebang: it is
+# the exact interpreter the tray runs, in every build.
 JACKED_BIN="$(command -v jacked || echo "$HOME/.local/bin/jacked")"
 PY="$(head -1 "$(readlink -f "$JACKED_BIN" 2>/dev/null || echo "$JACKED_BIN")" | sed 's/^#!//')"
 [ -x "$PY" ] || PY="$HOME/.local/share/uv/tools/claude-jacked/bin/python3"
