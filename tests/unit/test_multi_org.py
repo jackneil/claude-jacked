@@ -9,28 +9,19 @@ Covers:
 - Fresh DB with org data
 - Re-auth un-deletes soft-deleted accounts
 - build_oauth_data org field inclusion
-- update_claude_config_email org field writes
+- write_identity org fields across an org-to-personal switch
 - _seed_oauth_account org field seeding
 """
 
 import json
 import sqlite3
-import tempfile
 import time
-from pathlib import Path
-from unittest import mock
 
 import pytest
 
-from jacked.api.credential_helpers import (
-    build_oauth_data,
-    update_claude_config_email,
-)
+from jacked.api.claude_identity import minimal_identity_block, write_identity
+from jacked.api.credential_helpers import build_oauth_data
 from jacked.web.database import Database
-
-
-# Windows holds SQLite file locks
-_WIN = __import__("os").name == "nt"
 
 
 # ---------------------------------------------------------------------------
@@ -613,53 +604,34 @@ class TestBuildOauthDataOrg:
 
 
 # ---------------------------------------------------------------------------
-# update_claude_config_email org fields
+# write_identity org fields across a switch
 # ---------------------------------------------------------------------------
 
 
-class TestUpdateClaudeConfigOrg:
-    """update_claude_config_email writes/clears org fields."""
+class TestClaudeIdentityOrg:
+    """The ~/.claude.json identity carries the org of the active account only."""
 
-    def test_writes_org_fields(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-            tmp_path = Path(tmp)
-            with mock.patch(
-                "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-            ):
-                update_claude_config_email(
-                    "jack@x.com",
-                    organization_uuid="org-123",
-                    organization_name="Acme",
-                )
+    def test_switch_to_the_same_persons_personal_account_drops_the_org_fields(
+        self, tmp_path
+    ):
+        """One email in two accounts: the org account, then the personal one.
 
-            config = json.loads(
-                (tmp_path / ".claude.json").read_text(encoding="utf-8")
-            )
-            assert config["oauthAccount"]["organizationUuid"] == "org-123"
-            assert config["oauthAccount"]["organizationName"] == "Acme"
+        A different org is a different account, so the second write replaces
+        the block and the org fields of the first account do not stay.
+        """
+        config_path = tmp_path / ".claude.json"
+        write_identity(
+            tmp_path, minimal_identity_block(1, "jack@x.com", "org-123", "Acme")
+        )
+        org_block = json.loads(config_path.read_text(encoding="utf-8"))["oauthAccount"]
+        assert org_block["organizationUuid"] == "org-123"
+        assert org_block["organizationName"] == "Acme"
 
-    def test_clears_org_for_personal(self):
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-            tmp_path = Path(tmp)
-            # Pre-seed with org data
-            (tmp_path / ".claude.json").write_text(json.dumps({
-                "oauthAccount": {
-                    "emailAddress": "jack@x.com",
-                    "organizationUuid": "old-org",
-                    "organizationName": "Old Org",
-                }
-            }))
+        result = write_identity(tmp_path, minimal_identity_block(2, "jack@x.com"))
 
-            with mock.patch(
-                "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-            ):
-                update_claude_config_email("jack@x.com")  # no org params
-
-            config = json.loads(
-                (tmp_path / ".claude.json").read_text(encoding="utf-8")
-            )
-            assert "organizationUuid" not in config["oauthAccount"]
-            assert "organizationName" not in config["oauthAccount"]
+        assert (result.status, result.mode) == ("written", "replace")
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        assert config["oauthAccount"] == {"emailAddress": "jack@x.com"}
 
 
 # ---------------------------------------------------------------------------

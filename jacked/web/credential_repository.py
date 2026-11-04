@@ -15,6 +15,25 @@ from jacked.credentials.models import (
 )
 
 
+def _wake_usage_watchers() -> None:
+    """Bump ``jacked.usage_events`` so same-process pill watchers re-render.
+
+    Every switch outcome that moves the active or desired account pointer
+    calls this once, after its DB transaction committed. The counter is the
+    only wake channel the menu-bar agent has for account switches (usage
+    cache writes bump it from ``Database.update_account_usage_cache``).
+
+    >>> from jacked import usage_events
+    >>> before = usage_events.version()
+    >>> _wake_usage_watchers()
+    >>> usage_events.version() == before + 1
+    True
+    """
+    from jacked import usage_events
+
+    usage_events.bump()
+
+
 class DatabaseCredentialSwitchRepository:
     """Persist switch state without ever serializing credential payloads."""
 
@@ -122,6 +141,10 @@ class DatabaseCredentialSwitchRepository:
                     ),
                 ),
             )
+        # The active account changed: wake the in-process menu-bar watcher
+        # (jacked.usage_events) after the transaction commits, so the pill
+        # re-renders within a second instead of waiting out its poll.
+        _wake_usage_watchers()
 
     def record_outcome(self, record: OutcomeSwitchRecord) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -198,6 +221,10 @@ class DatabaseCredentialSwitchRepository:
                     ),
                 ),
             )
+        if record.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED:
+            # The desired account moved (the outcome every macOS build
+            # produces): the pill tracks it, so wake the watcher here too.
+            _wake_usage_watchers()
 
     @staticmethod
     def _pending_from_row(row: dict) -> PendingSwitchRecord:

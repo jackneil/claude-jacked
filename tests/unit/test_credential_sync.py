@@ -1,8 +1,10 @@
-"""Unit tests for the unified credential write path.
+"""Unit tests for the credential write and read paths.
 
-Tests sync_credential_to_all_stores(), build_oauth_data(),
-read/write_platform_credentials(), update_claude_config_email(),
-and the reassign_sessions DB method.
+Covers build_oauth_data(), the engine activation that every account switch
+runs (``jacked.credentials.runtime.activate_account``) through the files it
+writes, the ``~/.claude.json`` identity across switches,
+read/write_platform_credentials(), read_fresh_active_token(), and the
+reassign_sessions DB method.
 """
 
 import json
@@ -14,19 +16,23 @@ from unittest import mock
 import pytest
 
 from jacked import statusline
+from jacked.api.claude_identity import minimal_identity_block, write_identity
 from jacked.api.credential_helpers import (
-    ClaudeConfigUnwritable,
-    _ClaudeConfigAccount,
-    _update_claude_config_account,
     build_oauth_data,
     read_fresh_active_token,
     read_platform_credentials,
-    sync_credential_to_all_stores,
-    update_claude_config_email,
     write_platform_credentials,
 )
 from jacked.credentials.canonical import CredentialPayload
-from jacked.credentials.models import StoreReadResult, StoreStatus, StoreWriteResult
+from jacked.credentials.models import (
+    StoreReadResult,
+    StoreStatus,
+    StoreWriteResult,
+    SwitchContext,
+    SwitchOutcome,
+)
+from jacked.credentials.repository import InMemoryCredentialSwitchRepository
+from jacked.credentials.runtime import activate_account
 from jacked.web.database import Database
 
 # Windows holds SQLite file locks — use ignore_cleanup_errors
@@ -117,123 +123,53 @@ def test_build_oauth_data_with_scopes():
     assert result["scopes"] == ["user:read", "user:write"]
 
 
+def test_build_oauth_data_carries_the_row_tier_on_both_branches():
+    """Claude Code skips its refresh-time profile fetch only when the
+    credential payload has non-null subscriptionType and rateLimitTier."""
+    base = {
+        "access_token": "at",
+        "refresh_token": "rt",
+        "expires_at": 100,
+        "scopes": None,
+        "subscription_type": "max",
+        "rate_limit_tier": "default_claude_max_20x",
+    }
+    primary = build_oauth_data(base)
+    cc = build_oauth_data(
+        {**base, "cc_access_token": "cc", "cc_refresh_token": "ccr", "cc_expires_at": 200}
+    )
+    for payload in (primary, cc):
+        assert payload["subscriptionType"] == "max"
+        assert payload["rateLimitTier"] == "default_claude_max_20x"
+
+
 # ------------------------------------------------------------------
-# sync_credential_to_all_stores
+# Engine activation: the files that one switch writes
 # ------------------------------------------------------------------
 
 
-def test_sync_writes_global_credential_file():
-    """Writes global .credentials.json with stamp and OAuth data.
+def _activate_on_linux(home: Path, account: dict):
+    """Activate ``account`` through the real engine, with ``home`` as HOME.
 
-    >>> test_sync_writes_global_credential_file()
+    The Claude build is a Linux build, so the global credential file is the
+    authority. The identity publisher and the resolver snapshot are real.
     """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        cred_dir = tmp_path / ".claude"
-        cred_dir.mkdir()
+    from tests.unit.test_credential_runtime import _RowDb, _identity
 
-        account = {
-            "id": 1,
-            "email": "alice@test.com",
-            "access_token": "new_access",
-            "refresh_token": "new_refresh",
-            "expires_at": 1800000000,
-            "cc_access_token": "cc_new_access",
-            "cc_refresh_token": "cc_new_refresh",
-            "cc_expires_at": 1800000000,
-            "scopes": None,
-            "subscription_type": "max",
-            "rate_limit_tier": "t1",
-        }
-
-        with (
-            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
-            mock.patch(
-                "jacked.api.credential_helpers.write_platform_credentials",
-                return_value=True,
-            ),
-        ):
-            sync_credential_to_all_stores(1, account)
-
-        cred_path = cred_dir / ".credentials.json"
-        assert cred_path.exists()
-        data = json.loads(cred_path.read_text(encoding="utf-8"))
-        assert data["_jackedAccountId"] == 1
-        # build_oauth_data prefers CC tokens for credential files
-        assert data["claudeAiOauth"]["accessToken"] == "cc_new_access"
-        assert data["claudeAiOauth"]["refreshToken"] == "cc_new_refresh"
-        assert data["claudeAiOauth"]["expiresAt"] == 1800000000000
-
-
-def test_sync_authority_failure_does_not_publish_file_target():
-    """The compatibility path cannot recreate the original split-store bug."""
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        cred_dir = tmp_path / ".claude"
-        cred_dir.mkdir()
-        cred_path = cred_dir / ".credentials.json"
-        cred_path.write_text(
-            json.dumps({"_jackedAccountId": 1, "claudeAiOauth": {"accessToken": "old"}}),
-            encoding="utf-8",
+    with (
+        mock.patch(
+            "jacked.credentials.runtime.detect_claude_identity",
+            return_value=_identity(platform_system="linux", platform_machine="x86_64"),
+        ),
+        mock.patch("jacked.credentials.runtime.Path.home", return_value=home),
+        mock.patch(
+            "jacked.credentials.runtime.DatabaseCredentialSwitchRepository",
+            lambda _db: InMemoryCredentialSwitchRepository(),
+        ),
+    ):
+        return activate_account(
+            _RowDb(account), account, SwitchContext.MANUAL, "op-switch"
         )
-        account = {
-            "email": "new@test.com",
-            "access_token": "new",
-            "expires_at": 1800000000,
-        }
-
-        with (
-            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
-            mock.patch(
-                "jacked.api.credential_helpers.write_platform_credentials",
-                return_value=False,
-            ),
-        ):
-            result = sync_credential_to_all_stores(2, account)
-
-        assert result is False
-        assert json.loads(cred_path.read_text(encoding="utf-8"))["_jackedAccountId"] == 1
-
-
-@pytest.mark.parametrize("rate_limit_tier", ["t1", None])
-def test_sync_writes_initial_claude_json_metadata(rate_limit_tier):
-    """First activation without a stored profile writes the minimal identity."""
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        cred_dir = tmp_path / ".claude"
-        cred_dir.mkdir()
-
-        account = {
-            "id": 1,
-            "email": "alice@test.com",
-            "display_name": "Alice",
-            "access_token": "tok",
-            "refresh_token": "rt",
-            "expires_at": 1800000000,
-            "scopes": None,
-            "subscription_type": "max",
-            "rate_limit_tier": rate_limit_tier,
-        }
-
-        with (
-            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
-            mock.patch(
-                "jacked.api.credential_helpers.write_platform_credentials",
-                return_value=True,
-            ),
-        ):
-            sync_credential_to_all_stores(1, account)
-
-        config_path = tmp_path / ".claude.json"
-        assert config_path.exists()
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        oauth = config["oauthAccount"]
-        assert oauth["emailAddress"] == "alice@test.com"
-        # The minimal block carries identity only; tier and name come with
-        # the stored profile (complete block).
-        assert "userRateLimitTier" not in oauth
-        assert "organizationRateLimitTier" not in oauth
-        assert statusline.render({}, home=str(tmp_path)) == "alice@test.com"
 
 
 def _prime_cached_statusline_account(tmp_path: Path) -> Path:
@@ -276,13 +212,14 @@ def _prime_cached_statusline_account(tmp_path: Path) -> Path:
     return config_path
 
 
-def _sync_statusline_target(
+def _activate_statusline_target(
     tmp_path: Path,
     access_canary: str,
     refresh_canary: str,
-) -> None:
-    """Activate the target through the real shared credential boundary."""
+):
+    """Activate a profiled target through the real credential engine."""
     account = {
+        "id": 20,
         "email": "new@test.com",
         "display_name": "New User",
         "access_token": "primary-access",
@@ -319,178 +256,179 @@ def _sync_statusline_target(
             },
         }),
     }
+    return _activate_on_linux(tmp_path, account)
+
+
+def test_switch_moves_the_cached_statusline_identity_and_tier_together(tmp_path):
+    """A real engine switch cannot mix the target email with the old tier."""
+    config_path = _prime_cached_statusline_account(tmp_path)
+    access_canary = "statusline-access-canary-7b8c"
+    refresh_canary = "statusline-refresh-canary-4d2a"
+
+    result = _activate_statusline_target(tmp_path, access_canary, refresh_canary)
+
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    line = statusline.render({}, home=str(tmp_path))
+    config_text = config_path.read_text(encoding="utf-8")
+    config = json.loads(config_text)
+    oauth = config["oauthAccount"]
+    snapshot_text = (
+        tmp_path / ".claude" / "jacked-resolver-snapshot.json"
+    ).read_text(encoding="utf-8")
+    credentials = json.loads(
+        (tmp_path / ".claude" / ".credentials.json").read_text(encoding="utf-8")
+    )
+
+    assert "new@test.com" in line
+    assert "old@test.com" not in line
+    assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
+    assert "userRateLimitTier" not in oauth
+    assert oauth["accountUuid"] == "b0b0b0b0-0000-4000-8000-000000000020"
+    assert oauth["billingType"] == "stripe_subscription"
+    assert config["topLevelSetting"] == {"preserve": True}
+    # The outgoing person's block is replaced, never merged.
+    assert "unrelatedAccountSetting" not in oauth
+    assert oauth["organizationName"] == "New Org"
+    # The credential file holds the stamp, the Claude Code token pair and
+    # the expiry in milliseconds.
+    assert credentials["_jackedAccountId"] == 20
+    assert credentials["claudeAiOauth"]["accessToken"] == access_canary
+    assert credentials["claudeAiOauth"]["refreshToken"] == refresh_canary
+    assert credentials["claudeAiOauth"]["expiresAt"] == 1_800_000_000_000
+    for public_text in (config_text, snapshot_text, line):
+        assert access_canary not in public_text
+        assert refresh_canary not in public_text
+
+
+@pytest.mark.parametrize("rate_limit_tier", [None, "default_claude_max_5x"])
+def test_switch_to_an_unprofiled_target_clears_both_outgoing_tier_fields(
+    tmp_path, rate_limit_tier
+):
+    """Without a stored profile, the published identity has no tier.
+
+    This is true also when the row knows its tier: the tier comes only with
+    the complete block. So both outgoing tier fields are removed.
+    """
+    (tmp_path / ".claude").mkdir()
+    config_path = tmp_path / ".claude.json"
+    config_path.write_text(
+        json.dumps({
+            "oauthAccount": {
+                "emailAddress": "old@test.com",
+                "userRateLimitTier": "default_claude_max_5x",
+                "organizationRateLimitTier": "default_claude_max_20x",
+                "preserved": {"nested": "value"},
+            },
+        }),
+        encoding="utf-8",
+    )
+    account = {
+        "id": 21,
+        "email": "unknown-tier@test.com",
+        "access_token": "access",
+        "refresh_token": "refresh",
+        "expires_at": 1800000000,
+        "scopes": None,
+        "subscription_type": "max",
+        "rate_limit_tier": rate_limit_tier,
+        "organization_uuid": "org-unknown",
+    }
+
+    result = _activate_on_linux(tmp_path, account)
+
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    oauth = json.loads(config_path.read_text(encoding="utf-8"))["oauthAccount"]
+    assert oauth["emailAddress"] == "unknown-tier@test.com"
+    assert "userRateLimitTier" not in oauth
+    assert "organizationRateLimitTier" not in oauth
+    # Another person's leftovers never survive a switch.
+    assert "preserved" not in oauth
+    line = statusline.render({}, home=str(tmp_path))
+    assert line == "unknown-tier@test.com"
+    assert "Max" not in line
+
+
+def test_switch_keeps_foreign_top_level_keys_in_the_credential_file(tmp_path):
+    """Keys that jacked does not own stay in the credential file.
+
+    The engine merges the account stamp and ``claudeAiOauth`` into the
+    authority it read, so the other top-level keys survive the switch.
+    """
+    (tmp_path / ".claude").mkdir()
+    cred_path = tmp_path / ".claude" / ".credentials.json"
+    cred_path.write_text(json.dumps({"someOtherKey": "preserved"}), encoding="utf-8")
+    account = {
+        "id": 1,
+        "email": "alice@test.com",
+        "access_token": "tok",
+        "refresh_token": "rt",
+        "expires_at": 1800000000,
+        "scopes": None,
+        "subscription_type": "max",
+        "rate_limit_tier": "t1",
+    }
+
+    result = _activate_on_linux(tmp_path, account)
+
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    data = json.loads(cred_path.read_text(encoding="utf-8"))
+    assert data["someOtherKey"] == "preserved"
+    assert data["_jackedAccountId"] == 1
+    assert data["claudeAiOauth"]["accessToken"] == "tok"
+
+
+def test_a_refused_keychain_write_never_publishes_the_file_mirror(tmp_path):
+    """On macOS the Keychain is the authority and the file is its mirror.
+
+    When the Keychain refuses the write, the switch stops before the mirror
+    and before the identity. The two stores never name different accounts.
+    """
+    from jacked.credentials.store import MemoryCredentialStore
+    from tests.unit.test_credential_runtime import _RowDb, _identity
+
+    (tmp_path / ".claude").mkdir()
+    previous = {"_jackedAccountId": 1, "claudeAiOauth": {"accessToken": "old"}}
+    cred_path = tmp_path / ".claude" / ".credentials.json"
+    cred_path.write_text(json.dumps(previous), encoding="utf-8")
+    mirror_before = cred_path.read_bytes()
+    keychain = MemoryCredentialStore(
+        "keychain", CredentialPayload.from_mapping(previous)
+    )
+    keychain.fail_writes = True
+    account = {
+        "id": 2,
+        "email": "new@test.com",
+        "access_token": "new",
+        "expires_at": 1800000000,
+    }
+
     with (
-        mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
         mock.patch(
-            "jacked.api.credential_helpers.write_platform_credentials",
-            return_value=True,
+            "jacked.credentials.runtime.detect_claude_identity",
+            return_value=_identity(),
+        ),
+        mock.patch("jacked.credentials.runtime.Path.home", return_value=tmp_path),
+        mock.patch(
+            "jacked.credentials.runtime.MacOSCredentialStore", return_value=keychain
+        ),
+        mock.patch(
+            "jacked.credentials.runtime.DatabaseCredentialSwitchRepository",
+            lambda _db: InMemoryCredentialSwitchRepository(),
+        ),
+        # No outgoing account to save: this test is about the refused write.
+        mock.patch(
+            "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
     ):
-        sync_credential_to_all_stores(20, account)
-
-
-def test_sync_switches_cached_statusline_identity_and_tier_coherently():
-    """A real credential sync cannot mix the target email with the old tier."""
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        config_path = _prime_cached_statusline_account(tmp_path)
-        access_canary = "statusline-access-canary-7b8c"
-        refresh_canary = "statusline-refresh-canary-4d2a"
-        _sync_statusline_target(tmp_path, access_canary, refresh_canary)
-
-        line = statusline.render({}, home=str(tmp_path))
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        oauth = config["oauthAccount"]
-        config_text = config_path.read_text(encoding="utf-8")
-        snapshot_text = (
-            tmp_path / ".claude" / "jacked-resolver-snapshot.json"
-        ).read_text(encoding="utf-8")
-        credential_text = (
-            tmp_path / ".claude" / ".credentials.json"
-        ).read_text(encoding="utf-8")
-
-        assert "new@test.com" in line
-        assert "old@test.com" not in line
-        assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
-        assert "userRateLimitTier" not in oauth
-        assert oauth["accountUuid"] == "b0b0b0b0-0000-4000-8000-000000000020"
-        assert oauth["billingType"] == "stripe_subscription"
-        assert config["topLevelSetting"] == {"preserve": True}
-        # The outgoing person's block is replaced, never merged.
-        assert "unrelatedAccountSetting" not in oauth
-        assert oauth["organizationName"] == "New Org"
-        assert access_canary in credential_text
-        assert refresh_canary in credential_text
-        for public_text in (config_text, snapshot_text, line):
-            assert access_canary not in public_text
-            assert refresh_canary not in public_text
-
-
-def test_sync_with_unknown_tier_clears_both_outgoing_tier_fields():
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        (tmp_path / ".claude").mkdir()
-        config_path = tmp_path / ".claude.json"
-        config_path.write_text(
-            json.dumps({
-                "oauthAccount": {
-                    "emailAddress": "old@test.com",
-                    "userRateLimitTier": "default_claude_max_5x",
-                    "organizationRateLimitTier": "default_claude_max_20x",
-                    "preserved": {"nested": "value"},
-                },
-            }),
-            encoding="utf-8",
+        result = activate_account(
+            _RowDb(account), account, SwitchContext.MANUAL, "op-refused"
         )
-        account = {
-            "email": "unknown-tier@test.com",
-            "access_token": "access",
-            "refresh_token": "refresh",
-            "expires_at": 1800000000,
-            "scopes": None,
-            "subscription_type": "max",
-            "rate_limit_tier": None,
-            "organization_uuid": "org-unknown",
-        }
 
-        with (
-            mock.patch(
-                "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-            ),
-            mock.patch(
-                "jacked.api.credential_helpers.write_platform_credentials",
-                return_value=True,
-            ),
-        ):
-            sync_credential_to_all_stores(21, account)
-
-        oauth = json.loads(config_path.read_text(encoding="utf-8"))["oauthAccount"]
-        assert oauth["emailAddress"] == "unknown-tier@test.com"
-        assert "userRateLimitTier" not in oauth
-        assert "organizationRateLimitTier" not in oauth
-        # Another person's leftovers never survive a switch.
-        assert "preserved" not in oauth
-        line = statusline.render({}, home=str(tmp_path))
-        assert line == "unknown-tier@test.com"
-        assert "Max" not in line
-
-
-def test_sync_writes_per_account_dir():
-    """Writes to per-account dir when it exists (no stamp).
-
-    >>> test_sync_writes_per_account_dir()
-    """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        cred_dir = tmp_path / ".claude"
-        cred_dir.mkdir()
-        acct_dir = cred_dir / "accounts" / "1"
-        acct_dir.mkdir(parents=True)
-
-        account = {
-            "id": 1,
-            "email": "alice@test.com",
-            "access_token": "tok",
-            "refresh_token": "rt",
-            "expires_at": 1800000000,
-            "scopes": None,
-            "subscription_type": "max",
-            "rate_limit_tier": "t1",
-        }
-
-        with (
-            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
-            mock.patch(
-                "jacked.api.credential_helpers.write_platform_credentials",
-                return_value=True,
-            ),
-        ):
-            sync_credential_to_all_stores(1, account)
-
-        acct_cred = acct_dir / ".credentials.json"
-        assert acct_cred.exists()
-        data = json.loads(acct_cred.read_text(encoding="utf-8"))
-        assert "claudeAiOauth" in data
-        assert data["claudeAiOauth"]["accessToken"] == "tok"
-        # Per-account dir should NOT have _jackedAccountId stamp
-        assert "_jackedAccountId" not in data
-
-
-def test_sync_preserves_existing_keys():
-    """Preserves non-OAuth keys in existing credential file.
-
-    >>> test_sync_preserves_existing_keys()
-    """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        cred_dir = tmp_path / ".claude"
-        cred_dir.mkdir()
-        cred_path = cred_dir / ".credentials.json"
-        cred_path.write_text(json.dumps({"someOtherKey": "preserved"}))
-
-        account = {
-            "id": 1,
-            "email": "alice@test.com",
-            "access_token": "tok",
-            "refresh_token": "rt",
-            "expires_at": 1800000000,
-            "scopes": None,
-            "subscription_type": "max",
-            "rate_limit_tier": "t1",
-        }
-
-        with (
-            mock.patch("jacked.api.credential_helpers.Path.home", return_value=tmp_path),
-            mock.patch(
-                "jacked.api.credential_helpers.write_platform_credentials",
-                return_value=True,
-            ),
-        ):
-            sync_credential_to_all_stores(1, account)
-
-        data = json.loads(cred_path.read_text(encoding="utf-8"))
-        assert data["someOtherKey"] == "preserved"
-        assert data["_jackedAccountId"] == 1
+    assert result.outcome is SwitchOutcome.FAILED_PRESERVED
+    assert keychain.write_count == 1
+    assert keychain.read().payload.identity.account_id == 1
+    assert cred_path.read_bytes() == mirror_before
+    assert not (tmp_path / ".claude.json").exists()
 
 
 # ------------------------------------------------------------------
@@ -668,318 +606,61 @@ def test_get_keychain_username_uses_os_identity_not_environment():
 
 
 # ------------------------------------------------------------------
-# update_claude_config_email
+# ~/.claude.json identity across switches (claude_identity.write_identity)
 # ------------------------------------------------------------------
 
 
-def test_update_claude_config_email_creates_file():
-    """Creates ~/.claude.json when it doesn't exist.
+def test_two_sequential_switches_replace_the_display_name(tmp_path):
+    """The second account's name replaces the first one's, never merges."""
+    config_path = tmp_path / ".claude.json"
 
-    >>> test_update_claude_config_email_creates_file()
-    """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-
-        with mock.patch(
-            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-        ):
-            update_claude_config_email("new@test.com", "New User")
-
-        config_path = tmp_path / ".claude.json"
-        assert config_path.exists()
-        result = json.loads(config_path.read_text(encoding="utf-8"))
-        assert result["oauthAccount"]["emailAddress"] == "new@test.com"
-        assert result["oauthAccount"]["displayName"] == "New User"
-
-
-def test_update_claude_config_email_preserves_unrelated_keys():
-    """Preserves other keys, but never a name that belongs to another account.
-
-    >>> test_update_claude_config_email_preserves_unrelated_keys()
-    """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        config_path = tmp_path / ".claude.json"
-        config_path.write_text(
-            json.dumps({
-                "someOtherKey": "preserved",
-                "oauthAccount": {"emailAddress": "old@test.com", "displayName": "Old"},
-            }),
-            encoding="utf-8",
-        )
-
-        with mock.patch(
-            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-        ):
-            update_claude_config_email("new@test.com")
-
-        result = json.loads(config_path.read_text(encoding="utf-8"))
-        assert result["oauthAccount"]["emailAddress"] == "new@test.com"
-        # The previous account's name must not survive the identity change:
-        # Claude Code would label the new email with the old person's name.
-        assert "displayName" not in result["oauthAccount"]
-        assert result["someOtherKey"] == "preserved"
-
-
-def test_two_sequential_switches_replace_the_display_name():
-    """The second account's name replaces the first one's, never merges.
-
-    >>> test_two_sequential_switches_replace_the_display_name()
-    """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        config_path = tmp_path / ".claude.json"
-
-        with mock.patch(
-            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-        ):
-            update_claude_config_email("first@test.com", "First Person")
-            first = json.loads(config_path.read_text(encoding="utf-8"))
-            update_claude_config_email("second@test.com", "Second Person")
-
-        assert first["oauthAccount"]["displayName"] == "First Person"
-        result = json.loads(config_path.read_text(encoding="utf-8"))
-        assert result["oauthAccount"]["emailAddress"] == "second@test.com"
-        assert result["oauthAccount"]["displayName"] == "Second Person"
-
-
-def test_strict_update_raises_when_the_config_is_a_symlink():
-    """Strict callers must learn that the identity did not land.
-
-    >>> test_strict_update_raises_when_the_config_is_a_symlink()
-    """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        target = tmp_path / "target.json"
-        target.write_text("{}", encoding="utf-8")
-        try:
-            (tmp_path / ".claude.json").symlink_to(target)
-        except OSError:
-            return  # Symlinks may require privileges on Windows
-
-        with pytest.raises(ClaudeConfigUnwritable):
-            update_claude_config_email("evil@test.com", home=tmp_path, strict=True)
-
-        assert json.loads(target.read_text(encoding="utf-8")) == {}
-
-
-def test_strict_update_raises_when_the_config_cannot_be_written():
-    """A directory where the config belongs makes every write fail.
-
-    >>> test_strict_update_raises_when_the_config_cannot_be_written()
-    """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        (tmp_path / ".claude.json").mkdir()
-
-        with pytest.raises(ClaudeConfigUnwritable):
-            update_claude_config_email("blocked@test.com", home=tmp_path, strict=True)
-
-
-def test_a_non_strict_update_still_logs_and_continues():
-    """Existing callers keep the log-and-continue behaviour.
-
-    >>> test_a_non_strict_update_still_logs_and_continues()
-    """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        (tmp_path / ".claude.json").mkdir()
-
-        update_claude_config_email("blocked@test.com", home=tmp_path)  # no raise
-
-
-def test_update_claude_config_account_replaces_tier_field_for_organization():
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        config_path = tmp_path / ".claude.json"
-        config_path.write_text(
-            json.dumps({
-                "topLevel": ["unchanged"],
-                "oauthAccount": {
-                    "emailAddress": "old@test.com",
-                    "userRateLimitTier": "default_claude_max_5x",
-                    "organizationRateLimitTier": "default_claude_pro",
-                    "unrelated": {"unchanged": True},
-                },
-            }),
-            encoding="utf-8",
-        )
-
-        with mock.patch(
-            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-        ):
-            _update_claude_config_account(
-                _ClaudeConfigAccount(
-                    email="org@test.com",
-                    organization_uuid="org-20x",
-                    organization_name="Twenty Org",
-                    rate_limit_tier="default_claude_max_20x",
-                )
-            )
-
-        result = json.loads(config_path.read_text(encoding="utf-8"))
-        oauth = result["oauthAccount"]
-        assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
-        assert "userRateLimitTier" not in oauth
-        assert oauth["organizationUuid"] == "org-20x"
-        assert result["topLevel"] == ["unchanged"]
-        # A different account: the old block is replaced, not merged.
-        assert "unrelated" not in oauth
-
-
-def test_update_claude_config_account_replaces_tier_field_for_personal_account():
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        config_path = tmp_path / ".claude.json"
-        config_path.write_text(
-            json.dumps({
-                "oauthAccount": {
-                    "emailAddress": "org@test.com",
-                    "organizationUuid": "old-org",
-                    "organizationName": "Old Org",
-                    "organizationRateLimitTier": "default_claude_max_20x",
-                    "unrelated": "keep",
-                },
-            }),
-            encoding="utf-8",
-        )
-
-        with mock.patch(
-            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-        ):
-            _update_claude_config_account(
-                _ClaudeConfigAccount(
-                    email="personal@test.com",
-                    rate_limit_tier="default_claude_max_5x",
-                )
-            )
-
-        oauth = json.loads(config_path.read_text(encoding="utf-8"))["oauthAccount"]
-        assert oauth["userRateLimitTier"] == "default_claude_max_5x"
-        assert "organizationRateLimitTier" not in oauth
-        assert "organizationUuid" not in oauth
-        assert "organizationName" not in oauth
-        assert "unrelated" not in oauth
-
-
-def test_update_claude_config_account_explicit_null_clears_tier_fields():
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        config_path = tmp_path / ".claude.json"
-        config_path.write_text(
-            json.dumps({
-                "topLevel": "keep",
-                "oauthAccount": {
-                    "emailAddress": "old@test.com",
-                    "userRateLimitTier": "default_claude_max_5x",
-                    "organizationRateLimitTier": "default_claude_max_20x",
-                    "unrelated": [1, 2, 3],
-                },
-            }),
-            encoding="utf-8",
-        )
-
-        with mock.patch(
-            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-        ):
-            _update_claude_config_account(
-                _ClaudeConfigAccount(
-                    email="unknown@test.com",
-                    rate_limit_tier=None,
-                )
-            )
-
-        result = json.loads(config_path.read_text(encoding="utf-8"))
-        oauth = result["oauthAccount"]
-        assert "userRateLimitTier" not in oauth
-        assert "organizationRateLimitTier" not in oauth
-        assert result["topLevel"] == "keep"
-        assert "unrelated" not in oauth
-
-
-def test_update_claude_config_email_omitted_tier_preserves_existing_fields():
-    """The same account merges: fields the caller does not supply stay."""
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        config_path = tmp_path / ".claude.json"
-        config_path.write_text(
-            json.dumps({
-                "oauthAccount": {
-                    "emailAddress": "Identity-Only@test.com",
-                    "userRateLimitTier": "default_claude_max_5x",
-                    "organizationRateLimitTier": "default_claude_max_20x",
-                },
-            }),
-            encoding="utf-8",
-        )
-
-        with mock.patch(
-            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-        ):
-            update_claude_config_email("identity-only@test.com")
-
-        oauth = json.loads(config_path.read_text(encoding="utf-8"))["oauthAccount"]
-        assert oauth["userRateLimitTier"] == "default_claude_max_5x"
-        assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
-
-
-def test_update_claude_config_email_never_starts_fresh_over_a_torn_config():
-    """A config that is not a JSON object is left byte-identical."""
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        config_path = tmp_path / ".claude.json"
-        config_path.write_text('{"projects": {"/repo": ', encoding="utf-8")
-        before = config_path.read_bytes()
-
-        update_claude_config_email("new@test.com", home=tmp_path)
-        with pytest.raises(ClaudeConfigUnwritable):
-            update_claude_config_email("new@test.com", home=tmp_path, strict=True)
-
-        assert config_path.read_bytes() == before
-
-
-def test_build_oauth_data_carries_the_row_tier_on_both_branches():
-    """Claude Code skips its refresh-time profile fetch only when the
-    credential payload has non-null subscriptionType and rateLimitTier."""
-    base = {
-        "access_token": "at",
-        "refresh_token": "rt",
-        "expires_at": 100,
-        "scopes": None,
-        "subscription_type": "max",
-        "rate_limit_tier": "default_claude_max_20x",
-    }
-    primary = build_oauth_data(base)
-    cc = build_oauth_data(
-        {**base, "cc_access_token": "cc", "cc_refresh_token": "ccr", "cc_expires_at": 200}
+    write_identity(
+        tmp_path,
+        minimal_identity_block(1, "first@test.com", display_name="First Person"),
     )
-    for payload in (primary, cc):
-        assert payload["subscriptionType"] == "max"
-        assert payload["rateLimitTier"] == "default_claude_max_20x"
+    first = json.loads(config_path.read_text(encoding="utf-8"))
+    write_identity(
+        tmp_path,
+        minimal_identity_block(2, "second@test.com", display_name="Second Person"),
+    )
+
+    assert first["oauthAccount"]["displayName"] == "First Person"
+    result = json.loads(config_path.read_text(encoding="utf-8"))
+    assert result["oauthAccount"] == {
+        "emailAddress": "second@test.com",
+        "displayName": "Second Person",
+    }
 
 
-def test_update_claude_config_email_refuses_symlink():
-    """Refuses to write when .claude.json is a symlink.
+def test_a_same_account_write_keeps_the_existing_tier_fields(tmp_path):
+    """The same account merges: the fields that the block omits stay.
 
-    >>> test_update_claude_config_email_refuses_symlink()
+    The stored email differs only in case, so it is the same identity. The
+    write keeps the stored spelling and does not rewrite the file.
     """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=_WIN) as tmp:
-        tmp_path = Path(tmp)
-        target = tmp_path / "target.json"
-        target.write_text("{}", encoding="utf-8")
-        link = tmp_path / ".claude.json"
-        try:
-            link.symlink_to(target)
-        except OSError:
-            return  # Symlinks may require privileges on Windows
+    config_path = tmp_path / ".claude.json"
+    config_path.write_text(
+        json.dumps({
+            "oauthAccount": {
+                "emailAddress": "Identity-Only@test.com",
+                "userRateLimitTier": "default_claude_max_5x",
+                "organizationRateLimitTier": "default_claude_max_20x",
+            },
+        }),
+        encoding="utf-8",
+    )
+    before = config_path.read_bytes()
 
-        with mock.patch(
-            "jacked.api.credential_helpers.Path.home", return_value=tmp_path
-        ):
-            update_claude_config_email("evil@test.com")
+    result = write_identity(
+        tmp_path, minimal_identity_block(1, "identity-only@test.com")
+    )
 
-        result = json.loads(target.read_text(encoding="utf-8"))
-        assert "oauthAccount" not in result
+    assert (result.status, result.mode) == ("unchanged", "merge")
+    assert config_path.read_bytes() == before
+    oauth = json.loads(config_path.read_text(encoding="utf-8"))["oauthAccount"]
+    assert oauth["emailAddress"] == "Identity-Only@test.com"
+    assert oauth["userRateLimitTier"] == "default_claude_max_5x"
+    assert oauth["organizationRateLimitTier"] == "default_claude_max_20x"
 
 
 # ------------------------------------------------------------------

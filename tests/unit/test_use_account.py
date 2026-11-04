@@ -328,10 +328,6 @@ def test_use_account_marks_only_global_sessions_pending_after_readback(client, d
 
     with (
         mock.patch(
-            "jacked.api.credential_helpers.sync_credential_to_all_stores",
-            return_value=True,
-        ),
-        mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
     ):
@@ -382,7 +378,6 @@ def test_use_account_arms_auto_swap_pause(client, db):
     loop cannot silently revert the user's choice."""
     before = datetime.now(timezone.utc)
     with (
-        mock.patch("jacked.api.credential_helpers.sync_credential_to_all_stores"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -411,7 +406,6 @@ def test_use_account_does_not_shorten_longer_pause(client, db):
     db.set_setting("auto_swap_paused_until", existing)
 
     with (
-        mock.patch("jacked.api.credential_helpers.sync_credential_to_all_stores"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -434,7 +428,6 @@ def test_use_account_extends_shorter_pause(client, db):
     before = datetime.now(timezone.utc)
 
     with (
-        mock.patch("jacked.api.credential_helpers.sync_credential_to_all_stores"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -457,7 +450,6 @@ def test_use_account_overwrites_unparseable_pause(client, db):
     before = datetime.now(timezone.utc)
 
     with (
-        mock.patch("jacked.api.credential_helpers.sync_credential_to_all_stores"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
@@ -1577,7 +1569,6 @@ def test_use_account_arms_the_cooldown_before_the_pointer_write(client, db):
         return real_set(key, value)
 
     with (
-        mock.patch("jacked.api.credential_helpers.sync_credential_to_all_stores"),
         mock.patch(
             "jacked.api.usage_monitor._read_active_account_id", return_value=None
         ),
