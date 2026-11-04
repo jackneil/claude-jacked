@@ -444,7 +444,7 @@ jacked upgrade
 
 That's it. One command. Works on macOS, Linux, and Windows. Does all four things `uv tool install --force` alone doesn't do:
 
-1. `uv tool install claude-jacked --force` - new package on disk
+1. `uv tool install "claude-jacked[tray]>=<installed>" --force --refresh` - new package on disk (the `>=<installed>` floor is described in [No upgrade goes back to an older version](#no-upgrade-goes-back-to-an-older-version))
 2. `jacked service preflight` - prove the new version can start its service
 3. `jacked install --force` - migrate `settings.json` hooks to the shim form (`jacked _hook <name>`) so they survive Python version bumps
 4. `jacked service restart` - reload the running service with the new code (only if a service is running)
@@ -456,6 +456,23 @@ That's it. One command. Works on macOS, Linux, and Windows. Does all four things
 An upgrade never leaves you without a service. Step 2 runs before anything replaces the old install: it asks the NEW version to build its service definition and refuses the upgrade if that version cannot. Step 4 then proves the new service comes back up.
 
 If either step fails, jacked reinstalls the exact version that was running, runs `jacked install --force`, restarts that service, and exits with a non-zero code. It writes the reason and the manual recovery commands to `~/.claude/jacked-update-failed.txt`. The tray Update button and the Windows helper follow the same sequence.
+
+### No upgrade goes back to an older version
+
+No upgrade path installs a version that is older than the installed build. This applies to `jacked upgrade`, to the tray **Update** item, and to the dashboard **Upgrade** button. For a short time after a release, the package index can serve only an older version. Before the install, each path reads the package index. If the newest version that the index serves is older than the installed version, the path installs nothing and shows this message:
+
+```text
+Nothing to upgrade. The package index serves vX. The installed version is vY.
+```
+
+`jacked upgrade` then stops with one of these exit codes:
+
+- `0`: the installed version is the newest version that the index names. You do not have to do more.
+- `4`: the index names a newer release, but it does not serve that release yet. Try again in a few minutes.
+
+The upgrade command also has a version floor. The command that `jacked upgrade` prints has the form `uv tool install "claude-jacked[tray]>=<installed>" --force --refresh`, where `<installed>` is the installed version (`pipx install "claude-jacked[tray]>=<installed>" --force` for a pipx install). With this floor, uv cannot install an older version, also when the index changes after the check. The tray **Update** item uses the same floor. The dashboard **Upgrade** button runs `uv tool upgrade claude-jacked`, which keeps the installed version when the index serves only older versions.
+
+A refusal is not a failure. The tray shows the message in a notification, and the service continues to run. If the index changes after the tray check, the updater refuses, the update page shows the message, and the service starts again. No refusal writes the `~/.claude/jacked-update-failed.txt` file, so the tray does not show "Jacked Update Failed Earlier" at its next start. The dashboard **Upgrade** button shows the message too.
 
 ### Check a build before you upgrade
 
