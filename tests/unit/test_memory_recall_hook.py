@@ -1090,6 +1090,32 @@ def test_a_superseded_decision_leaves_key_decisions(env):
     assert (env.vault / old["path"]).is_file()
 
 
+def test_a_winner_that_links_its_loser_stays_in_key_decisions(env):
+    """M13 L3: the current decision can name the note it replaced. Only the
+    line's own note (its first link) is judged for superseded_by."""
+    _seed_group(env)
+    old = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="Old way",
+        group="myrepo", repos=["myrepo"], tags=[], body="Old body.",
+    )
+    new = vault_mod.add_note(
+        env.vault, env.home, note_type="decision", title="New way",
+        group="myrepo", repos=["myrepo"], tags=[], body="New body.",
+    )
+    old_link = PurePath(old["path"]).relative_to(PurePath("groups", "myrepo")).as_posix()
+    new_link = PurePath(new["path"]).relative_to(PurePath("groups", "myrepo")).as_posix()
+    _supersede(env, old, new_link)
+    index = env.vault / "groups" / "myrepo" / "index.md"
+    text = index.read_text(encoding="utf-8")
+    assert f"({new_link})" in text
+    index.write_text(text.replace(f"({new_link})", f"({new_link}) replaces [old]({old_link})"), encoding="utf-8")
+
+    decisions = _section(recall.build_brief(str(_cwd_dir(env, "myrepo"))), "# Key decisions")
+
+    assert "New way" in decisions
+    assert "Old way" not in decisions
+
+
 def test_superseded_is_not_a_candidate_mark_in_search(env):
     """The search marker means "unreviewed"; a superseded note is reviewed."""
     _seed_group(env)
@@ -1110,6 +1136,16 @@ def test_superseded_is_not_a_candidate_mark_in_search(env):
 _LIBRARIAN = (
     Path(__file__).resolve().parents[2] / "jacked" / "data" / "skills" / "memory-librarian" / "SKILL.md"
 )
+
+
+def test_librarian_has_a_path_with_no_vault():
+    """M12 F6: a load budget line says run memory-librarian with the vault off."""
+    text = _LIBRARIAN.read_text(encoding="utf-8")
+    section = text.split("## When the vault is off", 1)[1].split("\n## ", 1)[0]
+    assert "`not initialized` or `disabled`" in section
+    assert "do not run `jacked memory mark-groomed`" in section
+    assert "MEMORY.md" in section
+    assert text.index("## When the vault is off") < text.index("## Orient first")
 
 
 def test_librarian_never_deletes_a_decision_note():

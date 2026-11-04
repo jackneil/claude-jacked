@@ -23,12 +23,12 @@ Vanilla JS (no framework/bundler): emphasize:
 - Tailwind (play CDN): classes must exist at runtime; check responsive classes at 375 / 820 / 1366 px.
 - Dark theme: verify WCAG-AA contrast on pills/cards and catch any dark-on-dark text.
 - Multi-account panels (Claude and Codex providers): exercise 1 / few / many accounts, plus empty / loading / error states and the re-auth flow.
-- Settings > Hooks: the hook and settings integrity panel is read-only (OK line with baseline time, or a list of changes outside jacked; no accept button; the scope note about unwatched scripts renders).
+- Settings > Features, Hooks section: the hook and settings integrity panel is read-only (OK line with baseline time, or a list of changes outside jacked; no accept button; the scope note about unwatched scripts renders).
 - Memory Vault settings panel: verify vault status + the unreadable-settings banner render correctly, and toggles persist.
 - Update pages (`update.html`, `update_bootstrap.html`) and the install summary: phases render and errors read clearly.
 
 <!-- Staleness fingerprint - the engine compares these against the live repo on each run -->
-- **Generated at commit**: 68e95e00cc2ee874418c3fa016919e13152d3f39
+- **Generated at commit**: b3c14640091e7653e438cfcb1c2254f610c29550
 - **Detected stack**: pyproject.toml
 
 ## Config Staleness Check

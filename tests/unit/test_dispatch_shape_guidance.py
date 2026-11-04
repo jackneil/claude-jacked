@@ -200,11 +200,17 @@ def test_full_suite_runs_once_per_goal_never_per_milestone():
     wrapper = DATA.parents[1] / ".claude" / "skills" / "whats-next" / "SKILL.md"
     assert cadence in wrapper.read_text(encoding="utf-8")
     assert "every test file that imports or reads a changed file" in cadence
-    assert "Re-run only the failing tests." in cadence
+    assert (
+        "If it fails: fix with targeted tests, re-run the failing tests, "
+        "then run the full test command once more." in cadence
+    )
     behaviors = _read("rules/jacked_behaviors.md")
     assert "every test file that imports or reads a changed file" in behaviors
     assert "In `/bhag` a cell is the merge unit" in behaviors
-    assert "Re-run only the failing tests." in behaviors
+    assert (
+        "If it fails: fix with targeted tests, re-run the failing tests, "
+        "then run the full suite once more." in behaviors
+    )
     assert "for a `SKILL.md`, grep its parent directory name" in behaviors
     assert "(outside a goal, once per push; a /bhag cell is its own batch)" in _read("skills/chain-of-command/SKILL.md")
     bhag = _read("commands/bhag.md")
@@ -224,7 +230,7 @@ def test_merge_mode_stacks_milestones_and_merges_once_at_the_end():
     assert "no PR, no CI wait and no merge between milestones" in goal
     assert "every PR against `main`" in goal
     assert "only when the merged head branch is deleted" in goal
-    assert "`gh pr view <PR#> --json baseRefName` reads `main` (else STOP)" in goal
+    assert "`gh pr view <PR#> --json baseRefName` reads the repo's default branch (else STOP)" in goal
     assert "gh pr merge --merge --delete-branch <PR#>" in goal
     assert "on the branch of the milestone that introduced it" in goal
     assert "evidence holds the branch name and the commit SHA" in goal
@@ -235,3 +241,89 @@ def test_merge_mode_stacks_milestones_and_merges_once_at_the_end():
     assert "gh pr update-branch <PR#>" in goal and "shows BEHIND" in goal
     assert "At merge time, append the merged PR number" in goal
     assert "the first done entry with no merged PR number" in goal
+
+
+def test_the_second_full_run_is_conditional_on_a_failure():
+    """A green first run is the one gate. The old wording ("Fix what it finds
+    ... Then run the full test command once more") ran a second full suite on a
+    green tree, which contradicts ONCE."""
+    for relative in (
+        "rules/jacked_behaviors.md",
+        "commands/goal-maker.md",
+        "skills/whats-next/SKILL.md",
+    ):
+        text = _read(relative)
+        assert "If it fails: fix with targeted tests" in text, relative
+        assert "Fix what it finds" not in text, relative
+        assert "Then run the full" not in text, relative
+    assert "On a fail: targeted fix" in _read("skills/chain-of-command/SKILL.md")
+
+
+REVIEW_COST = "a review fix that changes code costs one re-gate"
+
+
+def test_reviews_run_beside_the_one_gate_never_before_it():
+    """Gate cadence duty 2: an audit that runs before the first gate cost an
+    hour on 2026-10-12, and the gate then failed on checks no review can see."""
+    for relative in (
+        "rules/jacked_behaviors.md",
+        "commands/goal-maker.md",
+        "skills/whats-next/SKILL.md",
+    ):
+        text = _read(relative)
+        assert "Run any /dcr and /cso review of the combined tree beside that one gate" in text, relative
+        assert "as read-only reviews, not before it" in text, relative
+        assert REVIEW_COST in text, relative
+    dcr = _read("skills/dcr/SKILL.md")
+    assert "run this review beside that one gate over the same combined tree, not before it" in dcr
+    assert "the end-of-goal review runs beside that gate, not before it" in dcr
+    assert dcr.count(REVIEW_COST) == 2  # both fix-phase lines
+    bhag = _read("commands/bhag.md")
+    assert "Run /dcr and /cso beside the step 4 gate over the same tree, not before it" in bhag
+    assert REVIEW_COST in bhag
+    assert "Reviews run beside that gate." in _read("skills/chain-of-command/SKILL.md")
+
+
+def test_verify_item_says_the_test_command_runs_once_at_the_very_end():
+    """Nothing pinned the Verify checklist; a brief could keep the Approach
+    wording and still ask the judge for a full run per milestone."""
+    for relative in ("commands/goal-maker.md", "skills/whats-next/SKILL.md"):
+        text = _read(relative)
+        assert "run ONCE at the very end of the goal over the combined tree (never per milestone)" in text, relative
+
+
+def test_merge_mode_records_the_full_gate_so_a_resume_can_see_it():
+    """Entries go done at commit, so a run resumed after the last done entry
+    could not tell the pre-gate phase from the merge phase. The gate writes a
+    line, the merge rule reads the line, and the boot drill runs the gate when
+    the line is missing or stale."""
+    goal = _read("commands/goal-maker.md")
+    assert "append `full gate green at <sha>` to progress.md" in goal
+    assert "progress.md holds a `full gate green at <sha>` line that is not stale" in goal
+    assert "the local full gate was green" not in goal
+    assert "it is stale when the top of the stack has moved past <sha>" in goal
+    assert "a targeted CI-failure fix or a `gh pr update-branch` merge" in goal
+    assert "that line is missing or stale, the boot drill's next step is the full gate" in goal
+    assert "(entry started, verify result, full gate result, blocker, discovered work)" in goal
+
+
+def test_merge_mode_resolves_the_default_branch_instead_of_assuming_main():
+    goal = _read("commands/goal-maker.md")
+    assert "`main` means the repo's default branch" in goal
+    assert "gh repo view --json defaultBranchRef" in goal
+    assert "baseRefName` reads `main`" not in goal
+
+
+def test_merge_mode_routes_a_done_milestone_the_end_gate_cannot_save():
+    goal = _read("commands/goal-maker.md")
+    assert "a done milestone leaves the stack like a blocked one" in goal
+    assert "never a history rewrite" in goal
+    assert "run the full gate once more over the new top of the stack" in goal
+    assert "appends the new head SHA to the evidence of each entry whose branch moved" in goal
+
+
+def test_readme_unreleased_note_names_the_cadence_change():
+    readme = (DATA.parents[1] / "README.md").read_text(encoding="utf-8")
+    row = next(line for line in readme.splitlines() if line.startswith("| **Unreleased**"))
+    assert "run once per goal" in row
+    assert "`full gate green at <sha>`" in row

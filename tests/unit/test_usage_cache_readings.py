@@ -207,8 +207,8 @@ def test_a_rejected_percent_is_logged_once_without_its_value(caplog):
 # kept window still advanced usage_cached_at (one stamp per row), and the
 # window keeper read that stamp as evidence that a reset-less weekly window
 # was open. cached_5h_read_at and cached_7d_read_at move only when the write
-# ACCEPTED that window's reading: its percent was written, or the window was
-# cleared. usage_cached_at stays the row's display age.
+# ACCEPTED that window's reading: its percent was written. A clear is no
+# reading, so it nulls the stamp. usage_cached_at stays the row's display age.
 # ---------------------------------------------------------------------------
 
 OLD_STAMP = 1_000.0
@@ -248,17 +248,18 @@ def test_a_weekly_reading_that_was_not_accepted_keeps_its_read_stamp(db, value):
         pytest.param({"utilization": None, "resets_at": None}, id="null-percent-no-reset"),
     ],
 )
-def test_a_cleared_window_is_an_accepted_read(db, seven_day):
-    """X3 (c): a null window, or a null percent with no reset, clears the
-    window: no window is open. That is a reading, so the stamp moves."""
+def test_a_cleared_window_nulls_its_read_stamp(db, seven_day):
+    """A null window, or a null percent with no reset, clears the window: no
+    window is open. The stamp is the keeper's evidence that a reset-less week
+    IS open, so a clear must not move it, and an accepted read from before the
+    clear must not survive it."""
     aid = _account(db, seven_day=40.0, seven_day_resets_at=OLD_RESET)
     db.update_account(aid, cached_5h_read_at=OLD_STAMP, cached_7d_read_at=OLD_STAMP)
-    before = time.time()
 
     row = _store_read(db, aid, {"seven_day": seven_day})
 
     assert (row["cached_usage_7d"], row["cached_7d_resets_at"]) == (None, None)
-    assert row["cached_7d_read_at"] >= before
+    assert row["cached_7d_read_at"] is None
     assert row["cached_5h_read_at"] == OLD_STAMP  # a missing key keeps the 5h window
 
 
@@ -275,5 +276,6 @@ def test_the_cache_writer_stamps_only_the_windows_it_accepted(db):
     assert five >= before and seven == OLD_STAMP
     db.update_account(aid, cached_5h_read_at=OLD_STAMP)
     db.update_account_usage_cache(aid, clear_seven_day=True)
-    five, seven = _stamps(db.get_account(aid))
-    assert five == OLD_STAMP and seven >= before
+    assert _stamps(db.get_account(aid)) == (OLD_STAMP, None)
+    db.update_account_usage_cache(aid, clear_five_hour=True)
+    assert _stamps(db.get_account(aid)) == (None, None)

@@ -11,8 +11,10 @@ uses two kinds of evidence. This module holds both:
   who owns a token: the profile endpoint and the shared ownership rule do
   that.
 - A fingerprint of the tokens that the last committed repair of the guard
-  published (the ``last_authority_write_fp`` setting). A payload with these
-  tokens is jacked's own write, so the guard does not examine it again.
+  published (the ``_last_authority_write_fp`` setting). A payload with these
+  tokens is jacked's own write, so the guard does not examine it again. The
+  leading underscore makes it an internal marker that ``list_settings`` and
+  the settings API do not show: it is derived from token values.
 
 Logs contain row ids and field names only. They never contain a token or an
 email address.
@@ -31,7 +33,7 @@ logger = logging.getLogger(__name__)
 OWNER = "owner"
 STAMPED = "stamped"
 AMBIGUOUS = "ambiguous"
-LAST_WRITE_FP_SETTING = "last_authority_write_fp"
+LAST_WRITE_FP_SETTING = "_last_authority_write_fp"
 
 
 # --- the write fingerprint ---------------------------------------------------

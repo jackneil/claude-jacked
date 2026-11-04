@@ -2,6 +2,8 @@
 
 import json
 import time
+import tokenize
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from jacked import version_check as vc
@@ -156,27 +158,72 @@ class TestInstallableVersion:
     TestNewestListedVersion: the upgrade target answers another question.
     """
 
-    def test_a_lagging_json_api_gives_the_simple_index_answer(self):
-        """G3, 2026-11-02: JSON API 0.110.1, simple index 0.110.2, uv got 0.110.2."""
-        assert vc.installable_version("0.110.1", "0.110.2") == "0.110.2"
-
-    def test_a_json_api_ahead_gives_the_simple_index_answer(self):
-        """The phantom-badge case: the index does not serve the new release yet."""
-        assert vc.installable_version("0.111.0", "0.110.2") == "0.110.2"
-
-    def test_agreeing_probes_give_that_version(self):
-        assert vc.installable_version("0.110.2", "0.110.2") == "0.110.2"
-
-    def test_only_the_simple_index_answers(self):
-        assert vc.installable_version(None, "0.110.2") == "0.110.2"
-        assert vc.installable_version("garbage", "0.110.2") == "0.110.2"
+    def test_the_simple_index_answer_is_the_installable_version(self):
+        assert vc.installable_version("0.110.2") == "0.110.2"
 
     def test_no_simple_index_answer_is_none(self):
         """A JSON-only answer is not what uv installs."""
-        assert vc.installable_version("0.110.2", None) is None
-        assert vc.installable_version("0.110.2", "") is None
-        assert vc.installable_version("0.110.2", "garbage") is None
-        assert vc.installable_version(None, None) is None
+        assert vc.installable_version(None) is None
+        assert vc.installable_version("") is None
+        assert vc.installable_version("garbage") is None
+
+
+class TestProbeFailureLog:
+    """A failed probe leaves one DEBUG line; no answer is not a failure."""
+
+    @staticmethod
+    def _lines(caplog):
+        lines = []
+        for record in caplog.records:
+            if record.name == "jacked.version_check":
+                assert record.exc_info is None
+                lines.append(record.getMessage())
+        return lines
+
+    def test_each_probe_logs_its_own_failure_by_class_only(self, caplog):
+        caplog.set_level("DEBUG", logger="jacked.version_check")
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=OSError("https://pypi.org/simple/claude-jacked/ refused"),
+        ):
+            assert vc.get_latest_pypi_version() is None
+            assert vc.get_latest_from_simple_index() is None
+        assert self._lines(caplog) == [
+            "PyPI probe of the JSON API failed: OSError",
+            "PyPI probe of the simple index failed: OSError",
+        ]
+
+    def test_a_probe_with_no_version_logs_nothing(self, caplog):
+        caplog.set_level("DEBUG", logger="jacked.version_check")
+        response = MagicMock()
+        response.read.return_value = b"{}"
+        response.__enter__.return_value = response
+        with patch("urllib.request.urlopen", return_value=response):
+            assert vc.get_latest_pypi_version() is None
+            assert vc.get_latest_from_simple_index() is None
+        assert self._lines(caplog) == []
+
+
+def test_every_simple_assignment_in_the_package_has_spaces_around_the_operator():
+    """The ruff rule set does not check this spacing (M7 LOW 2)."""
+    package = Path(vc.__file__).resolve().parent
+    offenders = []
+    for path in sorted(package.rglob("*.py")):
+        with path.open("rb") as source:
+            tokens = [
+                token
+                for token in tokenize.tokenize(source.readline)
+                if token.type not in (tokenize.ENCODING, tokenize.COMMENT, tokenize.NL)
+            ]
+        for before, name, equals, after in zip(tokens, tokens[1:], tokens[2:], tokens[3:]):
+            if (
+                name.type == tokenize.NAME
+                and before.type in (tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT)
+                and equals.string == "="
+                and (equals.start == name.end or after.start == equals.end)
+            ):
+                offenders.append(f"{path.relative_to(package)}:{name.start[0]}")
+    assert offenders == []
 
 
 class TestNewestListedVersion:
@@ -917,7 +964,7 @@ class TestCheckVersionCachedDualEndpoint:
             "jacked.version_check.installable_version", wraps=vc.installable_version
         ) as helper:
             result = vc.check_version_cached("0.45.1", force=True)
-        helper.assert_called_once_with("0.45.3", "0.45.2")
+        helper.assert_called_once_with("0.45.2")
         assert result["installable_latest"] == "0.45.2"
 
     def test_a_failed_or_garbled_probe_keeps_the_current_version(

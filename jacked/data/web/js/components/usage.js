@@ -338,8 +338,13 @@ function windowReason(acct, windowKey, nowMs) {
     // window yet (#238i): the window is opening. It is not a retry and not
     // a lapsed window, and it holds when the last reading is stale too (a
     // read-back that did not land leaves the reading old): the caption says
-    // what the keeper knows, the stale dim stays.
-    if (ks && (ks.last_status === 'ping_pending' || ks.skip_reason === 'confirming')) {
+    // what the keeper knows, the stale dim stays. The caption is only for a
+    // window that the ping waits for, and it claims progress, so it yields
+    // when the keeper does not run: the sweep cannot settle the ping while
+    // the keeper is off or outside its active hours.
+    const pending = ks && ks.last_status === 'ping_pending'
+        && Array.isArray(ks.pending_windows) && ks.pending_windows.includes(fields.short);
+    if (pending && !['keeper_disabled', 'outside_active_hours'].includes(ks.skip_reason)) {
         return reason('window opening', 'muted', stale, 'opening');
     }
     if (cachedAt > 0 && (acct.provider === 'codex' || stale)) {

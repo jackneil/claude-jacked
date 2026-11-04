@@ -1,6 +1,7 @@
 """Version checking against PyPI."""
 
 import json
+import logging
 import re
 import time
 import urllib.request
@@ -10,7 +11,9 @@ from packaging.version import InvalidVersion, Version
 
 from jacked.atomic_io import atomic_write_text
 
-VERSION_CACHE =Path.home() / ".claude" / "jacked-version-cache.json"
+logger = logging.getLogger(__name__)
+
+VERSION_CACHE = Path.home() / ".claude" / "jacked-version-cache.json"
 CACHE_TTL = 43200  # 12 hours — surfaces the update badge within half a day of a
                    # release; the tray menu also has "Check for updates" on demand
 CACHE_TTL_PROBE_FAILURE = 3600  # 1 hour — retry sooner after a transient PyPI/network failure
@@ -31,6 +34,15 @@ _VERSION_FROM_FILENAME = re.compile(
 # "0.45.3-py3-none" instead of "0.45.3".
 
 
+def _log_probe_failure(probe: str, exc: Exception) -> None:
+    """One DEBUG line for a probe that failed: no answer is not a failure.
+
+    The line has the error class only. The message of a network error can
+    hold the index URL.
+    """
+    logger.debug("PyPI probe of %s failed: %s", probe, type(exc).__name__)
+
+
 def get_latest_pypi_version(package: str = "claude-jacked", timeout: float = 3.0) -> str | None:
     """Query PyPI JSON API for latest version. Returns version string or None on failure.
 
@@ -44,7 +56,8 @@ def get_latest_pypi_version(package: str = "claude-jacked", timeout: float = 3.0
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
             return data.get("info", {}).get("version")
-    except Exception:
+    except Exception as exc:
+        _log_probe_failure("the JSON API", exc)
         return None
 
 
@@ -86,7 +99,8 @@ def get_latest_from_simple_index(package: str = "claude-jacked", timeout: float 
         if not candidates:
             return None
         return str(max(candidates))
-    except Exception:
+    except Exception as exc:
+        _log_probe_failure("the simple index", exc)
         return None
 
 
@@ -141,7 +155,7 @@ def is_newer(latest: str, current: str) -> bool:
         return False
 
 
-def installable_version(pypi_latest: str | None, simple_latest: str | None) -> str | None:
+def installable_version(simple_latest: str | None) -> str | None:
     """What uv installs now: the update badge offers this version.
 
     uv resolves through the simple index (PEP 691), so the simple index's
@@ -150,7 +164,7 @@ def installable_version(pypi_latest: str | None, simple_latest: str | None) -> s
     release, the JSON API can name an older version (it lags) or a version
     that the simple index does not serve yet (it leads). When the simple
     index gives no parseable answer, the installable version is unknown and
-    the result is None. The caller passes both probe answers.
+    the result is None.
 
     This answer differs from newest_listed_version() on purpose. The badge
     must offer only a version that uv can install now. Thus a JSON API that
@@ -159,13 +173,11 @@ def installable_version(pypi_latest: str | None, simple_latest: str | None) -> s
     served 0.110.2: the badge offers 0.110.2, the version that the update
     installs.
 
-    >>> installable_version("0.110.1", "0.110.2")  # the JSON API lags (G3)
+    >>> installable_version("0.110.2")
     '0.110.2'
-    >>> installable_version("0.111.0", "0.110.2")  # the simple index lags
-    '0.110.2'
-    >>> installable_version(None, "0.110.2")  # only the simple index answers
-    '0.110.2'
-    >>> installable_version("0.110.2", None) is None  # a JSON-only answer
+    >>> installable_version(None) is None  # the simple index gave no answer
+    True
+    >>> installable_version("garbage") is None
     True
     """
     if not simple_latest or not _parse_version_tuple(simple_latest):
@@ -295,7 +307,7 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
         # what uv installs, also when the JSON API leads or lags that index.
         installable = current_version
         if pypi_latest and _parse_version_tuple(pypi_latest):
-            installable = installable_version(pypi_latest, simple_latest) or current_version
+            installable = installable_version(simple_latest) or current_version
 
         outdated = is_newer(installable, current_version)
 

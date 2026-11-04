@@ -52,7 +52,7 @@ from jacked.integrity_baseline import (  # noqa: F401 -- re-exported: the public
     log_entry,
     write,
 )
-from jacked.integrity_snapshot import MISSING, describe_command, snapshot
+from jacked.integrity_snapshot import MISSING, describe_command, home_of, snapshot
 from jacked.memory import settings_io
 from jacked.memory.sanitize import fence_safe, one_line
 
@@ -72,7 +72,10 @@ _FENCE = "```"
 COVERAGE_NOTE = (
     "Scope: jacked hashes a hook script, or a file that an option loads, only when the hook command "
     "names it with an absolute path, ~/ or $HOME. A script or file named with ${CLAUDE_PLUGIN_ROOT}, "
-    "another variable or a relative path is watched only through the hook command."
+    "another variable or a relative path is watched only through the hook command. "
+    'jacked reads only the first program of a command, so it hashes no script for cd /r && python3 /h/x.py, '
+    'timeout 5 /h/x.sh or bash -c "/h/x.sh", and only a for a && b. '
+    "A script path with a space is hashed only when the file exists."
 )
 @dataclass(frozen=True)
 class Finding:
@@ -283,7 +286,7 @@ def check(settings_file: Path | str) -> list[Finding] | None:
         return None
     old = doc["baseline"]
     new = snapshot(settings_file)
-    findings = _hook_findings(old, new, settings_file.parent.parent) + _setting_findings(old.get("settings", {}), new["settings"])
+    findings = _hook_findings(old, new, home_of(settings_file)) + _setting_findings(old.get("settings", {}), new["settings"])
     if not findings and old.get("file") != new["file"]:
         findings.append(Finding("settings_changed"))
     # The snapshot holds the state of each script that the hooks name now;
@@ -381,7 +384,8 @@ def session_start_block(cwd, home, env=None) -> str:
     from jacked.memory import claude_paths, quarantine
 
     home = Path(home)
-    settings_file = settings_io.settings_path(home)
+    # The file that Claude Code loads: CLAUDE_CONFIG_DIR can move it.
+    settings_file = claude_paths.config_dir(home, env) / "settings.json"
     lines = []
     # The memory path comes from settings files that a repo can ship, so its
     # resolution runs inside the guard too. The failure line names no
@@ -401,6 +405,14 @@ def session_start_block(cwd, home, env=None) -> str:
         logger.warning("integrity: memory quarantine failed (%s)", type(exc).__name__)
         lines.append(f"jacked integrity: memory quarantine failed ({type(exc).__name__}); MEMORY.md left unchanged")
         found = None
+    # The kept count has its own guard: a failure here never changes what the
+    # quarantine reported, and a quarantine failure never hides a kept line.
+    try:
+        kept = quarantine.kept_marked(memory)
+    except Exception as exc:  # noqa: BLE001 -- the count is a report, never a gate
+        logger.warning("integrity: the kept-line count failed (%s)", type(exc).__name__)
+        lines.append(f"jacked integrity: could not count keep-marked lines in {memory.name} ({type(exc).__name__})")
+        kept = 0
     moved = found if found and found.moved else None
     if moved:
         plural = "" if moved.count == 1 else "s"
@@ -414,13 +426,30 @@ def session_start_block(cwd, home, env=None) -> str:
             f"jacked integrity: suspected injected lines in {memory.name}, {found.reason}; "
             f"not moved ({found.count} line{plural})"
         )
+    if kept:
+        # The keep marker is an opt-out that anyone who can write the file can
+        # add: a kept suspect line is reported every session, never silently.
+        plural = "" if kept == 1 else "s"
+        lines.append(
+            f"jacked integrity: {kept} suspected injected line{plural} in {memory.name} "
+            f"stay{'s' if kept == 1 else ''} by the keep marker; review {'it' if kept == 1 else 'them'}"
+        )
+    # Each step below has its own guard, so a failure can never lose the lines
+    # above: a line that moved is reported only here, and only once.
     try:
         if not ensure_baseline(settings_file):
             lines.extend(f.line() for f in check(settings_file) or [])
-        if moved:
-            record_event(settings_file, "quarantine", file=memory.name, lines=moved.count)
     except settings_io.SettingsUnreadableError:
         lines.append("jacked integrity: settings.json cannot be read, so jacked did not check it")
-    except BaselineUnreadableError:
-        logger.warning("integrity: the quarantine of %s is not in the log: the baseline cannot be read", memory.name)
+    except Exception as exc:  # noqa: BLE001 -- one bad entry must not hide every finding
+        logger.warning("integrity: the settings check failed (%s)", type(exc).__name__)
+        lines.append(f"jacked integrity: the settings check failed ({type(exc).__name__}); run: jacked doctor")
+    if moved:
+        try:
+            record_event(settings_file, "quarantine", file=memory.name, lines=moved.count)
+        except BaselineUnreadableError:
+            logger.warning("integrity: the quarantine of %s is not in the log: the baseline cannot be read", memory.name)
+        except Exception as exc:  # noqa: BLE001 -- the move happened, and the block must say so
+            logger.warning("integrity: the quarantine of %s is not in the log (%s)", memory.name, type(exc).__name__)
+            lines.append(f"jacked integrity: the quarantine is not in the baseline log ({type(exc).__name__})")
     return render_block(lines)

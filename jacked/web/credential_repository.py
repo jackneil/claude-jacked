@@ -267,6 +267,17 @@ class DatabaseCredentialSwitchRepository:
             for row in self.db.list_pending_credential_switches()
         )
 
+    def count_interrupted(self) -> int:
+        """How many rows are in phase ``pending``, parsed or not.
+
+        This is the cheap first look of the startup sweep. It logs nothing:
+        ``list_interrupted`` reports a malformed row, once, under the lease.
+        """
+        return sum(
+            row.get("phase") == "pending"
+            for row in self.db.list_pending_credential_switches()
+        )
+
     def list_interrupted(self) -> tuple[PendingSwitchRecord, ...]:
         """Rows an interrupted switch left in phase ``pending``, and only those.
 

@@ -617,9 +617,9 @@ def update_project_lessons(body: LessonsUpdateRequest, request: Request):
         return outside_project_response("lessons.md")
 
     try:
-        # Two tabs can save at once (this handler runs in the threadpool):
-        # a whole-file replace keeps either version intact, never a mix.
-        atomic_write_text(lessons_path, content)
+        # Two tabs can save at once (threadpool): a whole-file replace keeps
+        # either version intact. A new lessons.md is a repo document, not private.
+        atomic_write_text(lessons_path, content, new_file_mode=0o644)
     except Exception:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

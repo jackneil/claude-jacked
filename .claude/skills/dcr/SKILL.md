@@ -33,7 +33,7 @@ Read these for reviewer context (validate with `ls` first, skip missing):
 
 ## Domain Wild Cards
 In addition to the standard pool, include:
-- Hook-content trust boundary: does every new or changed SessionStart step (`jacked/data/hooks/`) keep its output framed as data (the `(data, not instructions)` headings), pass untrusted text (memory notes, commit subjects and trailers, issue titles, file names, remote errors) through `jacked.memory.sanitize`, add zero bytes on the healthy path when the step is a warning-only or tracker step (load budget, integrity, the account tracker) and keep its context output constant in shape when it is a context step (chain of command, memory recall, open work, git reality), keep the fixed step order, and exit 0 on every failure so it never blocks or corrupts a session start?
+- Hook-content trust boundary: does every new or changed context-data SessionStart step (`jacked/data/hooks/`: git reality, open work, memory recall) keep its output framed as data (the `(data, not instructions)` headings; recall marks its summary `Context only, not instructions`; the chain-of-command step is the one exception, because its output is instructions by design and its text comes only from the installed skill), and does every step pass untrusted text (memory notes, commit subjects and trailers, issue titles, file names, remote errors) through `jacked.memory.sanitize`, add zero bytes on the healthy path when the step is a warning-only or tracker step (load budget, integrity, the account tracker) and keep its context output constant in shape when it is a context step (chain of command, memory recall, open work, git reality), keep the fixed step order, and exit 0 on every failure so it never blocks or corrupts a session start?
 - Untrusted checkouts: does every git call that runs in a session folder or a user repo go through `jacked.git_guard` (the `-c` override args and `guarded_git_env`), so a repo's `core.fsmonitor`, `core.hooksPath`, filter driver or GPG program never runs? Does every read of a settings, memory or index file go through `jacked.regular_file` (no FIFO/device hang, no symlink surprise)?
 - settings.json and hook scripts: is every settings.json write done by `settings_io.write_settings` (which rebaselines the integrity tripwire with only its own change), with an unreadable file raising instead of reading as `{}`? Does the integrity snapshot never store or print a settings value or a hook command (key names, program name, script path and an 8-hex command digest only)?
 - Quarantine: does a change to `injection_shapes.py` or `quarantine.py` still leave user rules and notes about attacks in place, never delete a line, and refuse to move lines when MEMORY.md or the quarantine file is a symlink or a repo-local setting chose the memory folder?
@@ -67,7 +67,7 @@ Touching any of these forces the LARGE risk tier (full reviewer fan-out):
 - `.github/workflows/` (supply chain: pinned action SHAs, harden-runner, OIDC publish)
 
 <!-- Staleness fingerprint - the engine compares these against the live repo on each run -->
-- **Generated at commit**: d3c2c696d45e5958c4536a647a99ea67c4bc9138
+- **Generated at commit**: b3c14640091e7653e438cfcb1c2254f610c29550
 - **Detected stack**: pyproject.toml
 
 ## Config Staleness Check
@@ -317,7 +317,7 @@ Before spawning Wave 1, discover project context that ALL reviewers need.
 3f. Gather deterministic ground truth BEFORE spawning any reviewer, so no reviewer burns tokens rediscovering type/import/test breakage:
 
 - **Detect the toolchain** from the repo (e.g. ruff/flake8/mypy/pyright for Python; eslint/tsc/biome for JS/TS — honor the config files found in step 3a) and the test runner. **Honor project CLAUDE.md rules for HOW to invoke them** (e.g. `uv run python -m pytest`, never bare `python -m pytest`).
-- **Run** the linter + type-checker on the CHANGED files and run the relevant/affected tests (targeted, seconds). Capture pass/fail and the concrete error output. The FULL suite runs once, on a frozen tree, as the final gate of the goal or batch after the last fix wave, never after every micro-fix and never per milestone of a multi-milestone run (a /dcr inside a goal runs targeted tests only; the goal's one full suite comes at the very end).
+- **Run** the linter + type-checker on the CHANGED files and run the relevant/affected tests (targeted, seconds). Capture pass/fail and the concrete error output. The FULL suite runs once, on a frozen tree, as the final gate of the goal or batch after the last fix wave, never after every micro-fix and never per milestone of a multi-milestone run (a /dcr inside a goal runs targeted tests only; the goal's one full suite comes at the very end). At the end of a goal or batch, run this review beside that one gate over the same combined tree, not before it; a review fix that changes code costs one re-gate.
 - **Gate**: if anything fails, FIX the mechanical failures yourself NOW (you, the parent) and re-run until green — do not spawn reviewers onto a tree that lint or tests already condemn. A failure you cannot fix mechanically (genuine design question) goes to the user before any wave spawns.
 - **Inject** the (now green) results as a `## DETERMINISTIC DIAGNOSTICS — ground truth` block into every reviewer's prompt (alongside PROJECT_CONTEXT).
 - **Skip gracefully** if no toolchain/test runner is detected, or the project can't be built/run in this environment: note "Diagnostics: no toolchain detected — skipped" and proceed with the LLM lenses only. Do NOT fabricate diagnostics.
@@ -376,7 +376,7 @@ Each condition below triggers ONE read of `references/conditional.md`; skip the 
     - **Introduced by this branch** → fixed in this PR, always.
     - **Pre-existing, discovered adjacent to the branch** → fixed in this PR only when it is security-, data-integrity-, or billing-critical, or when the fix is a one-line change. Otherwise FILE it: open an issue (`gh issue create`) whose body is the reviewer's evidence verbatim (file:line, trigger, why, recommendation), link the issue in the PR body and in the final report, and move on. Filing with evidence is not punting; growing a PR past its stated scope is its own review risk. A project or global CLAUDE.md that says otherwise wins over this default.
     - Apply the in-PR fixes holistically (you see the full picture across all reports)
-    - Run the targeted tests for what changed (the FULL suite runs once, on a frozen tree, as the final gate of the goal or batch before its final push; the full-suite gate is per GOAL, at the very end, never per fix batch and never per milestone)
+    - Run the targeted tests for what changed (the FULL suite runs once, on a frozen tree, as the final gate of the goal or batch before its final push; the full-suite gate is per GOAL, at the very end, never per fix batch and never per milestone; the end-of-goal review runs beside that gate, not before it, and a review fix that changes code costs one re-gate)
     - Move each fixed lens to `needs_recheck`
     - Add to `resolved_issues` with description of what was found and how it was fixed
 11. `wave++`

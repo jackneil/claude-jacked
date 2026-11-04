@@ -19,14 +19,14 @@ none found: the local dashboard has no login. Only ask the user about creds if a
 ## UX Focus Areas
 - **Multi-account dashboard** (the core surface): exercise the account list/dropdown at 1 / few / many accounts for both Claude and Codex providers; verify the active-account pill, the switch flow, the re-auth flow, and per-account usage cards stay correct and update live (WebSocket push).
 - **Cross-view state**: settings/feature toggles, the actions menu, and usage refresh all touch shared state: confirm one change doesn't leave another view stale.
-- **Settings > Hooks integrity panel**: read-only state (OK with baseline time, or each change outside jacked plus the "run `jacked integrity accept`" guidance); verify it is findable and cannot be mistaken for a control that accepts changes.
+- **Integrity panel (Settings > Features, Hooks section)**: read-only state (OK with baseline time, or each change outside jacked plus the "run `jacked integrity accept`" guidance); verify it is findable and cannot be mistaken for a control that accepts changes.
 - **Memory Vault surfaces**: vault status, settings toggles, and the unreadable-settings banner: verify enable/disable round-trips and error states read clearly.
 - **Remote access, installations, install summary and the update pages**: states and errors read clearly; the update flow shows its phases.
 - **Dark theme contrast** + responsive widths (about 1366 / 820 / 375); empty / loading / error states for every panel.
 - **Discoverability**: common actions (add account, switch, refresh, open settings, find the integrity state) should be reachable without hunting.
 
 <!-- Staleness fingerprint - the engine compares these against the live repo on each run -->
-- **Generated at commit**: 68e95e00cc2ee874418c3fa016919e13152d3f39
+- **Generated at commit**: b3c14640091e7653e438cfcb1c2254f610c29550
 - **Detected stack**: pyproject.toml
 
 ## Config Staleness Check

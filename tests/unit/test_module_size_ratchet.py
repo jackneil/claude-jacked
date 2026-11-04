@@ -20,6 +20,11 @@ When the module is at or under 500 lines, remove the entry. Do not raise an
 entry: split the module. Do not add a module only to make this test pass.
 If a split cannot happen now, add the entry with a comment that gives the
 reason and the issue that tracks the split.
+
+A small fix to a listed module follows the same rule. Make the fix in the
+same number of lines, or remove dead code in that module, or move one block
+to a sibling module in the same change (the module re-exports the moved
+names). Then set the entry to the new count if the count is lower.
 """
 
 from __future__ import annotations
@@ -34,17 +39,17 @@ LIMIT = 500
 # The line count of each module over LIMIT, sorted by path. Lower an entry
 # after each split, and remove it when the module is at or under LIMIT.
 BASELINE: dict[str, int] = {
-    "jacked/api/authority_guard.py": 1039,
+    "jacked/api/authority_guard.py": 1038,
     "jacked/api/claude_config_store.py": 554,
     "jacked/api/claude_identity.py": 601,
-    "jacked/api/credential_helpers.py": 1370,
-    "jacked/api/identity_watcher.py": 819,
+    "jacked/api/credential_helpers.py": 1327,
+    "jacked/api/identity_watcher.py": 799,
     "jacked/api/main.py": 797,
     "jacked/api/routes/auth.py": 2421,
     "jacked/api/routes/features.py": 1464,
     "jacked/api/routes/system.py": 1285,
-    "jacked/api/usage_monitor.py": 2277,
-    "jacked/cli.py": 9382,
+    "jacked/api/usage_monitor.py": 2257,
+    "jacked/cli.py": 9381,
     "jacked/codex/installer.py": 570,
     "jacked/codex/usage.py": 516,
     "jacked/credentials/macos_store.py": 509,
@@ -52,15 +57,14 @@ BASELINE: dict[str, int] = {
     "jacked/credentials/transaction.py": 924,
     "jacked/dcr_settings.py": 755,
     "jacked/install_manifest.py": 602,
-    "jacked/launch.py": 1586,
+    "jacked/launch.py": 1568,
     "jacked/memory/capture.py": 785,
     "jacked/memory/migrate.py": 657,
     "jacked/memory/recall.py": 603,
-    "jacked/memory/vault.py": 1254,
+    "jacked/memory/vault.py": 1249,
     "jacked/packs.py": 807,
     "jacked/recover.py": 554,
     "jacked/service/menubar_mac.py": 846,
-    "jacked/service/platform.py": 525,
     "jacked/service/spec.py": 585,
     "jacked/service/tray.py": 2083,
     "jacked/service/update_status.py": 1034,
@@ -70,7 +74,7 @@ BASELINE: dict[str, int] = {
     "jacked/web/analytics_db.py": 625,
     "jacked/web/auth.py": 3173,
     "jacked/web/browser_launch.py": 585,
-    "jacked/web/database.py": 4105,
+    "jacked/web/database.py": 4096,
     "jacked/web/oauth.py": 1239,
 }
 
@@ -128,6 +132,13 @@ def ratchet_problems(
 def test_every_module_fits_the_ratchet():
     problems = ratchet_problems(module_sizes(PACKAGE), BASELINE)
     assert not problems, "\n".join(problems)
+
+
+def test_the_docstring_gives_a_path_for_a_small_fix_to_a_listed_module():
+    """A fix of three lines in a listed module must not read as "raise the
+    entry" or as "split the whole module first"."""
+    assert "A small fix to a listed module follows the same rule." in __doc__
+    assert "move one block" in __doc__
 
 
 def test_the_baseline_is_sorted_by_path():

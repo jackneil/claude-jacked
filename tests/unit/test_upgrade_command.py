@@ -1351,11 +1351,8 @@ class TestTargetLookup:
 
     @staticmethod
     def _probe(name, answer):
-        """Replace one index probe. An exception answer is raised by it."""
-        target = f"jacked.version_check.{name}"
-        if isinstance(answer, BaseException):
-            return patch(target, side_effect=answer)
-        return patch(target, return_value=answer)
+        """Replace one index probe."""
+        return patch(f"jacked.version_check.{name}", return_value=answer)
 
     def _lookup(self, json_api, simple_index):
         """The real lookup with the JSON API and simple index answers given."""
@@ -1376,9 +1373,36 @@ class TestTargetLookup:
         does not serve it yet instead of "Upgrade complete"."""
         assert self._lookup("0.111.0", "0.110.2") == "0.111.0"
 
+    def _lookup_over_network(self, json_api, simple_index):
+        """The real lookup with the real probes: only the network is replaced.
+
+        An ``OSError`` answer fails that index's request. The probes guard
+        themselves, so this reaches the failure path that production reaches.
+        """
+        import json
+        from unittest.mock import MagicMock
+
+        from jacked import cli
+
+        def urlopen(request, timeout=None):
+            is_json_api = request.full_url.endswith("/json")
+            answer = json_api if is_json_api else simple_index
+            if isinstance(answer, BaseException):
+                raise answer
+            body = {"info": {"version": answer}} if is_json_api else {
+                "files": [{"filename": f"claude_jacked-{answer}.tar.gz"}]
+            }
+            response = MagicMock()
+            response.read.return_value = json.dumps(body).encode()
+            response.__enter__.return_value = response
+            return response
+
+        with patch("urllib.request.urlopen", side_effect=urlopen):
+            return cli._upgrade_target_version_impl()
+
     @staticmethod
     def _probe_failures(caplog):
-        """The DEBUG lines that the probe guard wrote, then clear the capture.
+        """The DEBUG lines that the probes wrote, then clear the capture.
 
         A line names the probe and the error class only. The message of an
         error can hold the index URL, so the line and the record carry no
@@ -1388,38 +1412,38 @@ class TestTargetLookup:
 
         lines = []
         for record in caplog.records:
-            if record.name == "jacked.cli" and record.levelno == logging.DEBUG:
+            if record.name == "jacked.version_check" and record.levelno == logging.DEBUG:
                 assert record.exc_info is None, record.getMessage()
                 lines.append(record.getMessage())
         caplog.clear()
         return sorted(lines)
 
     def test_a_failed_simple_index_does_not_hide_the_json_api_answer(self, caplog):
-        caplog.set_level("DEBUG", logger="jacked.cli")
+        caplog.set_level("DEBUG", logger="jacked.version_check")
         assert self._lookup("0.110.2", None) == "0.110.2"
         assert self._probe_failures(caplog) == []  # no answer is not a failure
-        assert self._lookup("0.110.2", OSError("offline")) == "0.110.2"
+        assert self._lookup_over_network("0.110.2", OSError("offline")) == "0.110.2"
         assert self._probe_failures(caplog) == [
-            "Upgrade target probe get_latest_from_simple_index failed: OSError"
+            "PyPI probe of the simple index failed: OSError"
         ]
 
     def test_a_failed_json_api_does_not_hide_the_simple_index_answer(self, caplog):
-        caplog.set_level("DEBUG", logger="jacked.cli")
-        assert self._lookup(OSError("offline"), "0.110.2") == "0.110.2"
+        caplog.set_level("DEBUG", logger="jacked.version_check")
+        assert self._lookup_over_network(OSError("offline"), "0.110.2") == "0.110.2"
         assert self._probe_failures(caplog) == [
-            "Upgrade target probe get_latest_pypi_version failed: OSError"
+            "PyPI probe of the JSON API failed: OSError"
         ]
         assert self._lookup(None, "0.110.2") == "0.110.2"
         assert self._probe_failures(caplog) == []
 
     def test_both_probes_failing_is_none(self, caplog):
-        caplog.set_level("DEBUG", logger="jacked.cli")
+        caplog.set_level("DEBUG", logger="jacked.version_check")
         assert self._lookup(None, None) is None
         assert self._probe_failures(caplog) == []
-        assert self._lookup(OSError("offline"), OSError("offline")) is None
+        assert self._lookup_over_network(OSError("offline"), OSError("offline")) is None
         assert self._probe_failures(caplog) == [
-            "Upgrade target probe get_latest_from_simple_index failed: OSError",
-            "Upgrade target probe get_latest_pypi_version failed: OSError",
+            "PyPI probe of the JSON API failed: OSError",
+            "PyPI probe of the simple index failed: OSError",
         ]
 
     def test_an_answer_that_is_not_a_version_counts_as_no_answer(self):

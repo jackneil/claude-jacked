@@ -35,8 +35,9 @@ CC_REAUTH_REQUIRED_CODE = "CC_REAUTH_REQUIRED"
 REFRESH_DOWNGRADE_REASON = (
     "not publishing a null refresh token over a live one (cc re-auth required)"
 )
-# The live store holds a refresh token, the target has none, and the owner
-# of the live tokens could not be checked (the profile request failed): a
+# The live store holds a refresh token, the target has none, and nothing names
+# the owner of the live tokens (the profile request failed, the access token
+# expired, or the endpoint answered 401 or 403 with no stamp on the target): a
 # transient refusal, retried by the caller. Fail closed: a refusal is
 # retryable, a lost refresh lineage is not.
 OWNERSHIP_UNCHECKED_CODE = "OWNERSHIP_UNCHECKED"
@@ -107,28 +108,33 @@ def refuses_refresh_downgrade(
     account: dict,
     *,
     lineage_known: LineageFinder | None = None,
+    directory_names_target: bool = False,
 ) -> str | None:
     """The reason to refuse writing ``target_oauth`` over ``live_payload``.
 
-    The function refuses only when all of these are true:
+    A write of a null refresh token over a live one goes ahead only on
+    positive evidence that the live tokens belong to another account. In
+    order:
 
-    1. ``target_oauth`` has no refresh token (None, empty or absent).
-    2. The live payload holds a refresh token that is a non-empty string.
-    3. The live tokens belong to ``account``: ``lineage_known`` names the
-       row that stores the live refresh token (the target row: refused;
-       another row: the write goes ahead; no row: the next step decides),
-       else the shared ownership rule
-       (``credential_helpers.live_payload_ownership``, stamp not required)
-       proves it with no request when the live access or refresh token is
-       the row's, else through the cached profile verdict.
+    1. ``target_oauth`` holds a refresh token, or the live payload holds no
+       refresh token that is a non-empty string: nothing to protect.
+    2. ``lineage_known`` names the row that stores the live refresh token.
+       The target row: refused. Another row: the write goes ahead.
+    3. The shared ownership rule (``credential_helpers.live_payload_ownership``,
+       stamp not required) proves the owner. It costs no request when the
+       live access or refresh token is the row's, else it uses the cached
+       profile verdict. The target: refused. A 200 that names another owner:
+       the write goes ahead. A failed request: refused for now.
+    4. A payload whose expiry is not a real time is not a Claude Code rotation:
+       the write goes ahead.
+    5. Nothing proves the owner (an expired access token, a 401 or a 403). A
+       stamp that names the target, or ``directory_names_target`` (the
+       per-account directory of the target holds the payload), keeps the pair
+       with the final refusal. Any other payload gets the transient refusal.
 
-    A live store with no refresh token and a payload of another owner are not
-    protected: the write goes ahead, as before. A payload whose owner could
-    not be checked (the profile request failed) is refused with
-    ``REFRESH_DOWNGRADE_UNCHECKED_REASON``, a transient refusal the caller
-    retries. The two local checks run first, so only a real downgrade can
-    cost a profile request. Returns None when the write may go ahead. The
-    function never logs: each caller logs the reason once.
+    The transient refusal is ``REFRESH_DOWNGRADE_UNCHECKED_REASON``, which the
+    caller retries. Returns None when the write may go ahead. The function
+    never logs: each caller logs the reason once.
 
     >>> row = {"id": 7, "cc_access_token": "at", "cc_refresh_token": None}
     >>> live = {"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt"}}
@@ -142,6 +148,13 @@ def refuses_refresh_downgrade(
     True
     >>> refuses_refresh_downgrade({"accessToken": "at"}, live, row, lineage_known=lambda rt: 7)
     'not publishing a null refresh token over a live one (cc re-auth required)'
+    >>> expired = {"accessToken": "old", "refreshToken": "rt", "expiresAt": 1000}
+    >>> refuses_refresh_downgrade({"accessToken": "at"}, {"claudeAiOauth": expired}, row) == REFRESH_DOWNGRADE_UNCHECKED_REASON
+    True
+    >>> refuses_refresh_downgrade({"accessToken": "at"}, {"_jackedAccountId": 7, "claudeAiOauth": expired}, row)
+    'not publishing a null refresh token over a live one (cc re-auth required)'
+    >>> refuses_refresh_downgrade({"accessToken": "at"}, {"claudeAiOauth": expired}, row, directory_names_target=True)
+    'not publishing a null refresh token over a live one (cc re-auth required)'
     """
     if _refresh_of(target_oauth) is not None:
         return None
@@ -152,12 +165,25 @@ def refuses_refresh_downgrade(
     owner = _known_owner(lineage_known, live_refresh)
     if owner is not None:
         return REFRESH_DOWNGRADE_REASON if owner == _account_id(account) else None
-    from jacked.api.credential_helpers import live_payload_ownership
+    from jacked.api.credential_helpers import (
+        _malformed_expiry,
+        _stamp_of,
+        live_payload_ownership,
+        ownership_refusal_is_final,
+    )
 
     owned = live_payload_ownership(account, live_payload, require_stamp=False)
+    if owned is True:
+        return REFRESH_DOWNGRADE_REASON
     if owned is None:
         return REFRESH_DOWNGRADE_UNCHECKED_REASON
-    return REFRESH_DOWNGRADE_REASON if owned else None
+    if ownership_refusal_is_final(account, live_oauth.get("accessToken")):
+        return None
+    if _malformed_expiry(live_oauth.get("expiresAt")):
+        return None
+    if directory_names_target or _stamp_of(live_payload) == _account_id(account):
+        return REFRESH_DOWNGRADE_REASON
+    return REFRESH_DOWNGRADE_UNCHECKED_REASON
 
 
 def _account_id(account: dict) -> int | None:

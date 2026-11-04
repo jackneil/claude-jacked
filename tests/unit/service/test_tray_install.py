@@ -4,6 +4,8 @@ import builtins
 import sys
 from unittest import mock
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # _tray_extra_installed
@@ -41,6 +43,7 @@ class TestSetupTrayAutostart:
     def test_noop_without_tray_extra(self, monkeypatch):
         import jacked.cli as cli
 
+        monkeypatch.setattr(cli, "_service_uses_pystray", lambda: True)
         monkeypatch.setattr(cli, "_tray_extra_installed", lambda: False)
         calls = []
         monkeypatch.setattr(
@@ -80,6 +83,32 @@ class TestSetupTrayAutostart:
         )
         cli._setup_tray_autostart()
         assert calls == []  # headless -> no autostart, no tray spawn
+
+
+class TestPystrayGateFollowsTheServiceBackend:
+    """The gate asks what the service will load (``ServiceRunner._run``)."""
+
+    @staticmethod
+    def _can_start(monkeypatch, platform, mac_available, importable=False):
+        import jacked.cli as cli
+        from jacked.service import tray
+
+        monkeypatch.setattr(cli.sys, "platform", platform)
+        monkeypatch.setattr(cli, "_is_headless", lambda: False)
+        monkeypatch.setattr(cli, "_tray_extra_installed", lambda: importable)
+        monkeypatch.setattr(tray, "_mac_menubar_available", lambda: mac_available)
+        return cli._tray_service_can_start_here()
+
+    def test_the_mac_menu_bar_agent_does_not_need_pystray(self, monkeypatch):
+        assert self._can_start(monkeypatch, "darwin", mac_available=True) is True
+
+    def test_a_mac_without_the_agent_falls_back_to_pystray_and_needs_it(self, monkeypatch):
+        assert self._can_start(monkeypatch, "darwin", mac_available=False) is False
+
+    @pytest.mark.parametrize("platform", ["linux", "win32"])
+    def test_other_platforms_need_pystray(self, monkeypatch, platform):
+        assert self._can_start(monkeypatch, platform, mac_available=False) is False
+        assert self._can_start(monkeypatch, platform, mac_available=False, importable=True) is True
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +153,7 @@ def _invoke_with_tray_probes(monkeypatch, tmp_path, argv, *, headless, importabl
     home.mkdir()
     monkeypatch.setenv("JACKED_HOME", str(home))
     monkeypatch.setattr(cli, "_is_headless", lambda: headless)
+    monkeypatch.setattr(cli, "_service_uses_pystray", lambda: True)
     monkeypatch.setattr(cli, "_tray_extra_installed", lambda: importable)
     monkeypatch.setattr(tray, "_PYSTRAY_LOAD_FAILURE", failure)
     starts, settings = [], []

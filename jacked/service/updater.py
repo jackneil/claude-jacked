@@ -463,7 +463,7 @@ def _own_service_holds_port(port: int) -> bool:
     The instance manifest names the process that the service runs as and the
     port that it bound. The holder is ours when that process is live and the
     bind port is *port*. Live means "not proven stale" by `process_is_stale`,
-    the shared rule that `platform.supervision_drift` uses: a probe that
+    the shared rule that `supervision_drift` also uses: a probe that
     proves nothing reads as live. A manifest that is missing, unreadable or
     invalid, a stale one, or one for another port proves nothing, so the
     answer is then False.

@@ -784,9 +784,6 @@ def _block_keychain_writes():
         )
 
     with patch(
-        "jacked.api.credential_helpers.write_platform_credentials",
-        return_value=True,
-    ), patch(
         "jacked.launch._activate_launch_credentials",
         side_effect=launch_result,
     ), patch(
@@ -806,6 +803,17 @@ def _reset_claude_identity_cache():
     clear_identity_cache()
     yield
     clear_identity_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_swap_recommendation_episode():
+    """A recommendation is recorded once per episode; no test may inherit
+    another test's episode."""
+    from jacked.api import swap_recommendation
+
+    swap_recommendation.reset()
+    yield
+    swap_recommendation.reset()
 
 
 @pytest.fixture(autouse=True)

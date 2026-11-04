@@ -2032,11 +2032,11 @@ class Database:
         ``usage_cached_at`` stamps every write: it is the age of the row.
         Each window also has its own read stamp (``cached_5h_read_at``,
         ``cached_7d_read_at``, epoch seconds). A write sets it only when it
-        ACCEPTED the reading of that window: its percent is written, or the
-        window is cleared. A window that the caller keeps (a rejected
-        reading, or a reset with no percent) keeps its stamp. The window
-        keeper reads these stamps as evidence that a window is open
-        (:mod:`jacked.api.keeper_confirmation`).
+        ACCEPTED a reading of that window: its percent is written. A clear
+        is no reading, so it nulls the stamp. A window that the caller keeps
+        (a rejected reading, or a reset with no percent) keeps its stamp.
+        The window keeper reads these stamps as evidence that a window is
+        open (:mod:`jacked.api.keeper_confirmation`).
 
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@t.com", "tok", 9999999999)
@@ -2049,8 +2049,8 @@ class Database:
         True
         >>> db.update_account_usage_cache(acct["id"], clear_five_hour=True)
         True
-        >>> db.get_account(acct["id"])["cached_usage_5h"] is None
-        True
+        >>> [db.get_account(acct["id"])[c] for c in ("cached_usage_5h", "cached_5h_read_at")]
+        [None, None]
         >>> _ = db.update_account_usage_cache(
         ...     acct["id"], five_hour=7.0, five_hour_resets_at="2026-10-17T00:00:00Z")
         >>> _ = db.update_account_usage_cache(
@@ -2090,12 +2090,12 @@ class Database:
             updates["cached_5h_resets_at"] = None
         if clear_seven_day_reset and not clear_seven_day:
             updates["cached_7d_resets_at"] = None
-        for window, accepted in (
-            ("5h", clear_five_hour or five_hour is not None),
-            ("7d", clear_seven_day or seven_day is not None),
+        for window, cleared, percent in (
+            ("5h", clear_five_hour, five_hour),
+            ("7d", clear_seven_day, seven_day),
         ):
-            if accepted:
-                updates[self.WINDOW_READ_STAMPS[window]] = now
+            if cleared or percent is not None:
+                updates[self.WINDOW_READ_STAMPS[window]] = None if cleared else now
         if raw is not None:
             raw_str = json.dumps(raw)
             if len(raw_str) <= _RAW_USAGE_MAX_CHARS:
@@ -2635,17 +2635,13 @@ class Database:
         except (TypeError, ValueError):
             return None
 
-    def get_selected_account_id(
-        self, provider: str = "claude", *, existing_only: bool = False
-    ) -> Optional[int]:
+    def get_selected_account_id(self, provider: str = "claude") -> Optional[int]:
         """The account jacked last selected for new sessions of ``provider``.
 
         Claude: the module rule ``selected_account_id`` (the desired id, else
         the active id). A switch writes the desired id on every successful
         outcome, including ``observed_target_unfenced``, which leaves the
-        active id behind. Codex: its active account id. With
-        ``existing_only``, an id with no account row gives None for Codex, and
-        the next key for Claude.
+        active id behind. Codex: its active account id.
 
         >>> db = Database(":memory:")
         >>> db.set_setting("active_account_id", "3")
@@ -2654,17 +2650,12 @@ class Database:
         >>> db.set_setting("desired_account_id", "5")
         >>> db.get_selected_account_id()
         5
-        >>> db.get_selected_account_id(existing_only=True) is None
-        True
         >>> db.get_selected_account_id("codex") is None
         True
         """
         if provider == "claude":
-            return selected_account_id(self, existing_only=existing_only)
-        account_id = self.get_active_account_id(provider)
-        if existing_only and account_id is not None and self.get_account(account_id) is None:
-            return None
-        return account_id
+            return selected_account_id(self)
+        return self.get_active_account_id(provider)
 
     def find_open_sessions(self, pids) -> dict:
         """The newest open tracked session of each Claude Code process id in

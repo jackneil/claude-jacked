@@ -543,36 +543,20 @@ def test_frontmatter_round_trip():
     assert body.strip() == "The body.\n\nSecond paragraph."
 
 
-def test_frontmatter_round_trip_keeps_extra_keys():
-    """A key outside the fixed set (``superseded_by``, or one a later release
-    adds) survives parse -> serialize -> parse, in a stable sorted order."""
-    text = (
-        "---\ntype: decision\nrepos:\n  - r\ngroup: g\ncreated: d\nupdated: d\n"
-        "tags: []\nzeta_note: a later key\nsuperseded_by: decision/new-way.md\n"
-        "see_also:\n  - decision/a.md\n---\n\nOld way.\n"
-    )
-    meta, body = vault_mod.parse_frontmatter(text)
-    again, body2 = vault_mod.parse_frontmatter(vault_mod.render_note(meta, body))
-    assert again == meta
-    assert again["superseded_by"] == "decision/new-way.md"
-    assert again["zeta_note"] == "a later key"
-    assert again["see_also"] == ["decision/a.md"]
-    assert body2.strip() == "Old way."
-    fm = vault_mod.serialize_frontmatter(meta).splitlines()
-    extra = [ln.split(":", 1)[0] for ln in fm[fm.index("tags: []") + 1:-1] if not ln.startswith(" ")]
-    assert extra == ["see_also", "superseded_by", "zeta_note"]
-
-
-def test_frontmatter_extra_keys_cannot_break_the_block():
-    """An extra value is one line, so it can never end the frontmatter or
-    forge a key; a key that cannot round-trip is refused loudly, not dropped."""
+def test_frontmatter_refuses_a_key_it_would_drop():
+    """M13 L5: jacked renders only new notes, with the fixed keys. A key outside
+    them (a re-render of a parsed note) raises, so it is never dropped silently."""
     meta = {"type": "decision", "repos": ["r"], "group": "g", "created": "d",
-            "updated": "d", "tags": [], "superseded_by": "x\n---\ntype: vision"}
-    parsed, _ = vault_mod.parse_frontmatter(vault_mod.render_note(meta, "B"))
-    assert parsed["type"] == "decision"
-    assert parsed["superseded_by"] == "x --- type: vision"
-    with pytest.raises(ValueError, match="frontmatter key"):
-        vault_mod.serialize_frontmatter({**meta, "bad key: x": "v"})
+            "updated": "d", "tags": [], "superseded_by": "decision/new.md"}
+    with pytest.raises(ValueError, match="superseded_by"):
+        vault_mod.render_note(meta, "B")
+
+
+def test_frontmatter_parse_reads_a_superseded_by_key_written_by_hand():
+    text = ("---\ntype: decision\nrepos:\n  - r\ngroup: g\ncreated: d\nupdated: d\n"
+            "tags: []\nsuperseded_by: decision/new-way.md\n---\n\nOld way.\n")
+    meta, _ = vault_mod.parse_frontmatter(text)
+    assert meta["superseded_by"] == "decision/new-way.md"
 
 
 def test_vault_readme_documents_superseded_by():

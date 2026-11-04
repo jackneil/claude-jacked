@@ -179,7 +179,7 @@ def test_a_status_refusal_is_not_remembered(tmp_path, status):
     _write_credentials(config_dir, "rotated-at", "rotated-rt")
 
     with _patched(_Lookup(ProfileLookup(status))):
-        assert _sync(config_dir, tmp_path) == "refused"
+        assert _sync(config_dir, tmp_path) == "deferred"
 
     assert not (config_dir / MARKER).exists()
 

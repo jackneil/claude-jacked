@@ -243,29 +243,32 @@ def _set_mode(fd: int, tmp_name: str, mode: int, *, strict: bool, name: str) -> 
         secure_windows_path(Path(tmp_name))
 
 
-def _keep_mode(fd: int, tmp_name: str, target: Path) -> None:
+def _keep_mode(fd: int, tmp_name: str, target: Path, new_file_mode: int | None = None) -> None:
     """Give the temp file the permission bits of the file that it replaces (POSIX).
 
     mkstemp makes the temp file 0o600, so without this step each rewrite of a
     0o644 file (a MEMORY.md, a settings file) leaves it 0o600. Only a regular
     file at ``target`` gives its bits (``lstat``: a symlink that the write
     replaces gives none), and only the nine permission bits (never setuid,
-    setgid or sticky). A new file stays 0o600. Windows is not changed here:
-    its protection is the ACL, which the ``mode`` argument sets. A refused
-    chmod is logged at DEBUG and the write goes on; the result is then
-    0o600, never looser.
+    setgid or sticky). A new file gets ``new_file_mode``, and stays 0o600 when
+    that is None. Windows is not changed here: its protection is the ACL,
+    which the ``mode`` argument sets. A refused chmod is logged at DEBUG and
+    the write goes on; the result is then 0o600, never looser.
     """
     if os.name == "nt":
         return
+    bits = new_file_mode
     try:
         st = os.lstat(target)
     except FileNotFoundError:
-        return
+        pass
     except OSError as exc:
         logger.debug("Could not read the mode of %s (%s); it becomes 0o600", target.name, _describe_refusal(exc))
         return
-    bits = stat.S_IMODE(st.st_mode) & 0o777
-    if not stat.S_ISREG(st.st_mode) or bits == 0o600:
+    else:
+        if stat.S_ISREG(st.st_mode):
+            bits = stat.S_IMODE(st.st_mode) & 0o777
+    if bits is None or bits == 0o600:
         return
     try:
         _set_mode_bits(fd, tmp_name, bits)
@@ -284,6 +287,7 @@ def _write_atomically(
     mode_strict: bool,
     retry_budget: float,
     before_replace: Callable[[], None] | None = None,
+    new_file_mode: int | None = None,
 ) -> None:
     # A symlink at ``path`` is replaced by a plain file unless the caller
     # opts in: following it lets a repo-shipped link (lessons.md pointing at
@@ -309,7 +313,7 @@ def _write_atomically(
                     handle.fileno(), tmp_name, mode, strict=mode_strict, name=target.name
                 )
             else:
-                _keep_mode(handle.fileno(), tmp_name, target)
+                _keep_mode(handle.fileno(), tmp_name, target, new_file_mode)
             handle.write(payload)
             if fsync:
                 handle.flush()
@@ -335,6 +339,7 @@ def atomic_write_bytes(
     mode_strict: bool = True,
     retry_budget: float = RETRY_BUDGET_SECONDS,
     before_replace: Callable[[], None] | None = None,
+    new_file_mode: int | None = None,
 ) -> None:
     """Atomically replace ``path`` with ``data``, byte for byte.
 
@@ -343,7 +348,9 @@ def atomic_write_bytes(
     result (0o600 for a credential file); on Windows it also gives the result
     a private ACL (the current user only). With no ``mode``, a rewrite on
     POSIX keeps the permission bits of the regular file that it replaces, and
-    a new file is 0o600. ``follow_symlinks`` writes through a
+    a new file is 0o600. ``new_file_mode`` changes that for a new file on
+    POSIX only, and sets no ACL: use it for a file that others read, such as
+    a document in a repository. ``follow_symlinks`` writes through a
     link at ``path`` to the file it points at; by default the link itself is
     replaced by a plain file. ``retry_budget`` is passed to
     ``replace_with_retry``.
@@ -376,6 +383,7 @@ def atomic_write_bytes(
         mode_strict=mode_strict,
         retry_budget=retry_budget,
         before_replace=before_replace,
+        new_file_mode=new_file_mode,
     )
 
 
@@ -389,6 +397,7 @@ def atomic_write_text(
     mode_strict: bool = True,
     retry_budget: float = RETRY_BUDGET_SECONDS,
     before_replace: Callable[[], None] | None = None,
+    new_file_mode: int | None = None,
 ) -> None:
     """Atomically replace ``path`` with ``text`` encoded as UTF-8.
 
@@ -408,4 +417,5 @@ def atomic_write_text(
         mode_strict=mode_strict,
         retry_budget=retry_budget,
         before_replace=before_replace,
+        new_file_mode=new_file_mode,
     )

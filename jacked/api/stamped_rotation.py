@@ -260,9 +260,21 @@ def _adopt_into_owner(
             reason="the tokens are not proven to belong to the matched account",
         )
     if owner_id != stamp:
-        followed = follow_config(
-            db, payload, digest, stamp, owner, now=now, activate=activate
-        )
+        try:
+            followed = follow_config(
+                db, payload, digest, stamp, owner, now=now, activate=activate
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed read must not lose the follow
+            # The tokens are safe in the row. Keep the repair owed, so that
+            # the next pass follows the block with no second profile request.
+            guard._mark_handled(digest, owner_id, settled=False)
+            logger.info(
+                "Following the Claude config identity for account %d raised %s; "
+                "it is tried again on the next pass",
+                owner_id,
+                type(exc).__name__,
+            )
+            return _skip(owner_id, "the follow failed; tried again next pass")
         if followed is not None:
             return followed
     return guard.HealResult(

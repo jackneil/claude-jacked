@@ -25,6 +25,7 @@ from jacked.api.usage_monitor import (
 )
 from jacked.credentials.models import SwitchOutcome
 from jacked.credentials.transaction import CredentialTransactionEngine
+from jacked.web.auto_swap.selection import REASON_PREFIX_FIVE_H
 
 
 class _TestCertifiedEngine(CredentialTransactionEngine):
@@ -355,8 +356,15 @@ class TestAutoSwapTriggers:
 
 
 class TestNoTarget:
-    def test_no_target_logs_warning(self, caplog):
-        """should_swap=True but no eligible target -> logs warning."""
+    @pytest.mark.parametrize(
+        "wall, expected_why",
+        [
+            pytest.param(None, REASON_PREFIX_FIVE_H, id="the swap reason"),
+            pytest.param("weekly wall test", "weekly wall test", id="the wall"),
+        ],
+    )
+    def test_no_target_logs_warning(self, caplog, wall, expected_why):
+        """should_swap=True but no eligible target -> logs warning that names why."""
         import jacked.api.usage_monitor as mod
 
         mod._last_exhaustion_warning = 0.0
@@ -396,6 +404,10 @@ class TestNoTarget:
                     "jacked.api.credential_helpers.read_fresh_active_token",
                     return_value="tok",
                 ),
+                patch(
+                    "jacked.web.auto_swap.walls.walled_reason",
+                    return_value=wall,
+                ),
             ):
                 with caplog.at_level(
                     logging.WARNING, logger="jacked.api.usage_monitor"
@@ -407,11 +419,16 @@ class TestNoTarget:
                 engine = db._certified_auto_swap_engine
                 assert engine.activations == []
 
-                # Warning should be logged
-                assert any("no eligible target" in r.message for r in caplog.records), (
+                # Warning should be logged, and it says why the swap was wanted
+                warnings = [
+                    r.getMessage() for r in caplog.records
+                    if "no eligible target" in r.getMessage()
+                ]
+                assert warnings, (
                     f"Expected 'no eligible target' warning, "
                     f"got: {[r.message for r in caplog.records]}"
                 )
+                assert warnings[0].split("): ", 1)[1].startswith(expected_why)
 
                 # WebSocket should broadcast exhaustion
                 broadcast_calls = ws_registry.broadcast.call_args_list
@@ -3367,6 +3384,133 @@ def _db_with_rows(accounts, settings=None):
         (dict(a) for a in accounts if a["id"] == aid), None,
     )
     return db
+
+
+class TestRecommendationEpisode:
+    """Production has no certified engine, and a weekly wall holds for days. A
+    row per tick pushed the real swaps out of the recent list and raised a
+    dismissed banner again at each tick (M5 LOW 3)."""
+
+    def _resets(self):
+        return _iso(datetime.now(timezone.utc) + timedelta(hours=72))
+
+    def _walled(self):
+        return _ultra(1, usage_5h=None, usage_7d=100.0, cached_7d_resets_at=self._resets())
+
+    def _healthy(self, id=2):
+        return _ultra(id, usage_5h=None, usage_7d=30.0, cached_7d_resets_at=self._resets())
+
+    def _uncertified_db(self, rows):
+        db = _db_with_rows(rows)
+        # Not a CredentialTransactionEngine, so no engine is certified.
+        db._certified_auto_swap_engine = MagicMock(activations=[])
+        return db
+
+    def _ws(self, subscribers=True):
+        ws = MagicMock()
+        ws.has_subscribers.return_value = subscribers
+        ws.broadcast = AsyncMock()
+        return ws
+
+    def test_a_wall_records_and_announces_once_over_many_ticks(self, caplog):
+        db = self._uncertified_db([self._walled(), self._healthy()])
+        ws = self._ws()
+
+        with caplog.at_level(logging.INFO, logger="jacked.api.usage_monitor"):
+            _run_one_tick(_make_app(db=db, ws_registry=ws), max_sleeps=3)
+
+        assert _decision_actions(db).count("recommend") >= 3  # every tick still decides
+        assert db.record_swap.call_count == 1
+        assert db.record_swap.call_args.kwargs["status"] == "recommendation_only"
+        assert len(_broadcasts(ws, "auto_swap_recommended")) == 1
+        # No line says "switching" when nothing switches.
+        assert not [r for r in caplog.records if "switching from account" in r.getMessage()]
+
+    def test_the_banner_waits_for_a_connected_dashboard(self):
+        db = self._uncertified_db([self._walled(), self._healthy()])
+        ws = self._ws(subscribers=False)
+        app = _make_app(db=db, ws_registry=ws)
+
+        _run_one_tick(app, max_sleeps=1)
+        assert db.record_swap.call_count == 1
+        assert _broadcasts(ws, "auto_swap_recommended") == []
+
+        ws.has_subscribers.return_value = True
+        _run_one_tick(app, max_sleeps=2)
+        assert db.record_swap.call_count == 1
+        assert len(_broadcasts(ws, "auto_swap_recommended")) == 1
+
+    def test_a_new_target_in_the_same_wall_is_a_new_recommendation(self):
+        rows = [self._walled(), self._healthy()]
+        db = self._uncertified_db(rows)
+        ws = self._ws()
+        app = _make_app(db=db, ws_registry=ws)
+
+        _run_one_tick(app)
+        rows[1] = self._healthy(id=3)
+        db.list_accounts.return_value = rows
+        _run_one_tick(app)
+
+        assert [c.kwargs["to_account_id"] for c in db.record_swap.call_args_list] == [2, 3]
+        assert len(_broadcasts(ws, "auto_swap_recommended")) == 2
+
+    def test_a_wall_that_lifted_and_returned_is_a_new_episode(self):
+        from jacked.api import swap_recommendation
+
+        rows = [self._walled(), self._healthy()]
+        db = self._uncertified_db(rows)
+        app = _make_app(db=db, ws_registry=self._ws())
+
+        _run_one_tick(app)
+        assert db.record_swap.call_count == 1
+
+        # The wall lifts at once and comes back: a flap is the same episode.
+        rows[0] = _ultra(1, usage_5h=None, usage_7d=20.0, cached_7d_resets_at=self._resets())
+        rows[1] = _ultra(2, usage_5h=None, usage_7d=90.0, cached_7d_resets_at=self._resets())
+        _run_one_tick(app)
+        assert "recommend" in _decision_actions(db)
+        assert swap_recommendation._episode
+        rows[0], rows[1] = self._walled(), self._healthy()
+        _run_one_tick(app)
+        assert db.record_swap.call_count == 1
+
+        # The wall stays lifted for the gap: the episode ends.
+        for entry in swap_recommendation._episode.values():
+            entry["seen"] -= swap_recommendation._EPISODE_GAP_SECONDS
+        rows[0] = _ultra(1, usage_5h=None, usage_7d=20.0, cached_7d_resets_at=self._resets())
+        rows[1] = _ultra(2, usage_5h=None, usage_7d=90.0, cached_7d_resets_at=self._resets())
+        _run_one_tick(app)
+        assert swap_recommendation._episode == {}
+
+        rows[0], rows[1] = self._walled(), self._healthy()
+        _run_one_tick(app)
+        assert db.record_swap.call_count == 2
+
+    def test_a_failed_row_write_is_tried_again_on_the_next_tick(self):
+        from jacked.api import swap_recommendation
+
+        calls = []
+
+        class _DB:
+            def record_swap(self, **kw):
+                calls.append(kw)
+                if len(calls) == 1:
+                    raise OSError("database is locked")
+
+        target = {"id": 7}
+        with pytest.raises(OSError):
+            asyncio.run(swap_recommendation.recommend(_DB(), 1, target, "r", "t", 1.0, 2.0))
+        assert swap_recommendation._episode == {}
+        asyncio.run(swap_recommendation.recommend(_DB(), 1, target, "r", "t", 1.0, 2.0))
+        asyncio.run(swap_recommendation.recommend(_DB(), 1, target, "r", "t", 1.0, 2.0))
+        assert len(calls) == 2
+
+    def test_reset_locks_forgets_the_episode(self):
+        from jacked.api import swap_recommendation
+
+        swap_recommendation._episode[("t", 1, 2)] = {"seen": time.time(), "announced": True}
+        um.reset_locks()
+        assert swap_recommendation._episode == {}
 
 
 def _tick_with_fetch(app):

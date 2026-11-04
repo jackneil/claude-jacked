@@ -37,8 +37,8 @@ another account, or a refresh by a stale session), the guard:
 ``jacked.api.stamped_evidence`` holds the evidence that it uses. The guard
 state, the repair floor and the settle rule stay in this module.
 
-A re-stamp publishes the row's own tokens. It runs only when these are the
-tokens that the authority holds, so it adds only the stamp.
+A re-stamp republishes the object that the authority holds, so it adds only
+the stamp. With no such object in hand, it publishes the row's own tokens.
 
 All of these repairs obey one retry rule. Only the outcome of an attempt
 settles the payload. The attempts share a floor of one a minute. A held
@@ -388,7 +388,7 @@ def _import_rotated_tokens(
     return ADOPTION_RACE_LOST
 
 
-def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | None:
+def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | str | None:
     """The fields that adopt ``payload`` into ``row``.
 
     Returns None only when the ownership rule refuses the payload. jacked's
@@ -935,10 +935,9 @@ def _heal(
         _restamp_blocker(db.get_account(foreign_account_id), payload) if refusal else ""
     )
     if blocker:
-        # Nothing safe to publish: the holder's row has no Claude Code access
-        # token, or its publication would replace a token that Claude Code
-        # just wrote. Settle it as such, without spending the shared floor or
-        # an attempt on a repair that never ran.
+        # Nothing safe to publish: the row of the holder is gone, or it has no
+        # token and no authority object is in hand. Settle it as such, without
+        # spending the shared floor or an attempt on a repair that never ran.
         _mark_handled(digest, foreign_account_id, settled=True)
         logger.warning(
             "Desired account %d cannot be reasserted (%s) and account %d %s; the "

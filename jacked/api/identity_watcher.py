@@ -45,6 +45,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from jacked.api.identity_config_fresh import (
+    CONFIG_FRESH_SECONDS,  # noqa: F401 - the tests read the name here
+    _config_age_seconds,  # noqa: F401 - the tests read the name here
+    _config_mtime,
+    config_identity_keys,
+    login_in_progress,
+)
 from jacked.credentials.resolver import ResolverState, SnapshotUpdate
 
 logger = logging.getLogger(__name__)
@@ -143,6 +150,9 @@ class _AccountState:
     divergent_since: float | None = None
     long_divergence_warned: bool = False
     last_republish_at: float | None = None
+    # The oauthAccount identity keys last seen, and when they last changed.
+    config_keys: tuple | None = None
+    config_keys_at: float | None = None
 
 
 def _identity_row(row: dict) -> dict:
@@ -320,39 +330,6 @@ def _owner_matches(proof: _OwnerProof, row: dict, block: Any = None) -> bool:
 def _status_name(result: Any) -> str:
     status = getattr(result, "status", None)
     return str(getattr(status, "value", status))
-
-
-# A /login writes the oauthAccount identity a moment before it saves the new
-# tokens. A republish inside that window would put the old account back, and
-# the stamped-rotation guard (#154i) would then read a stale verdict and undo
-# the user's choice. The watcher waits one pass instead.
-CONFIG_FRESH_SECONDS = 15.0
-
-
-def _config_age_seconds(home: Path) -> float | None:
-    """Seconds since the Claude config file was last written, by wall clock.
-
-    None when there is no file or it cannot be read.
-    """
-    from jacked.api.claude_config_store import claude_config_path
-
-    path = claude_config_path(home)
-    if path is None:
-        return None
-    try:
-        return max(0.0, time.time() - path.stat().st_mtime)
-    except OSError:
-        return None
-
-
-def _config_mtime(home: Path) -> str:
-    from jacked.api.claude_config_store import claude_config_path
-
-    path = claude_config_path(home)
-    try:
-        return f"{path.stat().st_mtime:.0f}" if path is not None else "unknown"
-    except OSError:
-        return "unknown"
 
 
 _DISABLED_WARNED = False
@@ -595,6 +572,9 @@ class IdentityWatcher:
             return
         state = self._states.setdefault(account_id, _AccountState())
         now = self._clock()
+        keys = config_identity_keys(config)
+        if keys != state.config_keys or state.config_keys_at is None:
+            state.config_keys, state.config_keys_at = keys, now
         # A matching verdict is reused while the identity columns and the
         # config stay the same, so the builder does not run (and log) on
         # every pass.
@@ -621,6 +601,13 @@ class IdentityWatcher:
             self._mark_in_sync(account_id, state)
             return
         self._note_divergence(account_id, state, diverged, now)
+        if login_in_progress(home, state.config_keys_at, now):
+            # A /login: the identity changed, the tokens follow. Decide on the
+            # next pass. A deferral is not an attempt, so it spends no floor,
+            # and it does not hide the sticky reason a check already gave.
+            if state.last_reason not in _STICKY_EVIDENCE:
+                self._transition(account_id, state, "config-fresh")
+            return
         # Stamped at the attempt: a failure never shortens the floor.
         state.last_attempt = now
         self._attempt(update, db, home, row, block, config, diverged, state, now)
@@ -664,13 +651,6 @@ class IdentityWatcher:
         view = self._resolve(home)
         if view is None or view.account_id != account_id:
             self._transition(account_id, state, "authority-changed")
-            return
-
-        age = _config_age_seconds(home)
-        if age is not None and age < CONFIG_FRESH_SECONDS:
-            # A /login in progress (see CONFIG_FRESH_SECONDS): the identity
-            # was just written, the tokens follow. Decide on the next pass.
-            self._transition(account_id, state, "config-fresh")
             return
 
         desired_id = update.desired.account_id if update.desired is not None else None

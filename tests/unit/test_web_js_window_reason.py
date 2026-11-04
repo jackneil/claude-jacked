@@ -156,8 +156,9 @@ class TestWindowReason:
             {"last_status": "rate_limited"},
             {"last_status": "error", "next_attempt_at": _now() + 600},
             {"last_status": "ok"},
-            {"last_status": "ping_pending"},
-            {"last_status": "ping_pending", "skip_reason": "confirming", "next_attempt_at": _now() + 600},
+            {"last_status": "ping_pending", "pending_windows": ["5h"]},
+            {"last_status": "ping_pending", "pending_windows": ["5h"], "skip_reason": "confirming",
+             "next_attempt_at": _now() + 600},
         ]
         for ks in states:
             r = _reason(tmp_path, _fresh(keeper_state=ks))
@@ -167,14 +168,10 @@ class TestWindowReason:
         "ks",
         [
             # The ping was accepted and waits for a usage read (#238i).
-            {"last_status": "ping_pending"},
+            {"last_status": "ping_pending", "pending_windows": ["5h"]},
             # The sweep holds the account until the confirmation deadline.
-            {"last_status": "ping_pending", "skip_reason": "confirming", "next_attempt_at": "+600"},
-            # A confirmation can land between the sweep's read and its
-            # write: the hold still reads as opening, never as lapsed.
-            {"last_status": "ok", "skip_reason": "confirming", "next_attempt_at": "+600"},
-            # A retry status beside the hold never reads as "retry".
-            {"last_status": "ping_ok_no_window", "skip_reason": "confirming", "next_attempt_at": "+600"},
+            {"last_status": "ping_pending", "pending_windows": ["5h"],
+             "skip_reason": "confirming", "next_attempt_at": "+600"},
         ],
     )
     def test_a_pending_ping_reads_as_window_opening(self, tmp_path, ks):
@@ -191,6 +188,90 @@ class TestWindowReason:
         acct = _fresh(keeper_state=ks, usage_cached_at=_now() - 2 * 3600)
         r = _reason(tmp_path, acct)
         assert r == {"text": "window opening", "short": "opening", "tone": "muted", "muted": True}
+
+    @pytest.mark.parametrize(
+        "skip, extra, text, short",
+        [
+            ("keeper_disabled", {}, "keeper off", "keeper off"),
+            ("outside_active_hours", {"paused_until": "+3h"}, "paused until ", "paused"),
+            ("outside_active_hours", {}, "paused", "paused"),
+        ],
+    )
+    def test_a_keeper_that_does_not_run_wins_over_the_pending_caption(
+        self, tmp_path, skip, extra, text, short,
+    ):
+        """The sweep writes these two reasons and leaves last_status alone, so
+        the ping stays pending. "window opening" would claim progress that no
+        sweep is making, for as long as the keeper stays off."""
+        ks = {"last_status": "ping_pending", "pending_windows": ["5h"], "skip_reason": skip}
+        ks.update({k: _now() + 3 * 3600 for k in extra})
+        r = _reason(tmp_path, _fresh(keeper_state=ks))
+        assert r["text"].startswith(text)
+        assert r["short"] == short
+
+    @pytest.mark.parametrize("skip", ["keeper_disabled", "outside_active_hours"])
+    def test_a_stopped_keeper_with_a_stale_reading_never_reads_as_opening(self, tmp_path, skip):
+        ks = {"last_status": "ping_pending", "pending_windows": ["5h"], "skip_reason": skip}
+        r = _reason(tmp_path, _fresh(keeper_state=ks, usage_cached_at=_now() - 2 * 3600))
+        assert r["text"].startswith("last read ")
+        assert r["muted"] is True
+
+    @pytest.mark.parametrize(
+        "pending, five_hour, seven_day",
+        [
+            (["5h"], "window opening", None),
+            (["7d"], None, "window opening"),
+            (["5h", "7d"], "window opening", "window opening"),
+        ],
+    )
+    def test_only_a_window_the_ping_waits_for_reads_as_opening(
+        self, tmp_path, pending, five_hour, seven_day,
+    ):
+        """A reset-less weekly reading is normal (the API omits the weekly reset
+        for days): the weekly bar must not borrow the 5h window's caption."""
+        acct = _fresh(
+            cached_usage_5h=40.0, cached_5h_resets_at=PAST,
+            cached_usage_7d=30.0, cached_7d_resets_at=None,
+            keeper_state={"last_status": "ping_pending", "pending_windows": pending},
+        )
+        r = _run(tmp_path, f"const a = {json.dumps(acct)};\n"
+                           "out([windowReason(a, 'five_hour'), windowReason(a, 'seven_day')]);")
+        assert [x and x["text"] for x in r] == [five_hour, seven_day]
+
+    @pytest.mark.parametrize("pending", [None, "5h"], ids=["missing", "not-a-list"])
+    def test_a_pending_status_without_a_window_list_claims_nothing(self, tmp_path, pending):
+        """Same rule as keeper_confirmation._pending_windows: the sweep does not
+        treat this state as pending, so the caption does not either."""
+        ks = {"last_status": "ping_pending", "pending_windows": pending}
+        assert _reason(tmp_path, _fresh(keeper_state=ks)) is None
+
+    @pytest.mark.parametrize(
+        "status, text",
+        [("ok", "window lapsed"), ("ping_ok_no_window", "retry ")],
+    )
+    def test_the_confirming_reason_alone_is_not_a_pending_ping(self, tmp_path, status, text):
+        """Every status write clears skip_reason, and the hold is a swap on the
+        pending ping, so this pair is not a state the keeper leaves behind. If
+        it appears, last_status decides, also beside an old window list."""
+        ks = {"last_status": status, "skip_reason": "confirming", "pending_windows": ["5h"],
+              "next_attempt_at": _now() + 600}
+        assert _reason(tmp_path, _fresh(keeper_state=ks))["text"].startswith(text)
+
+    def test_the_server_payload_carries_the_pending_windows(self, tmp_path):
+        """The contract end to end: the stored blob, the API model, the caption."""
+        from jacked.api.routes.auth import _build_keeper_state
+
+        blob = json.dumps({"last_status": "ping_pending", "pending_windows": ["7d"],
+                           "pending_until": _now() + 600, "pending_reason": "no_header",
+                           "token_fp": "not-a-real-fp"})
+        payload = _build_keeper_state(blob).model_dump()
+        assert payload["pending_windows"] == ["7d"]
+        assert "token_fp" not in payload
+        acct = _fresh(cached_usage_5h=40.0, cached_5h_resets_at=PAST,
+                      cached_usage_7d=30.0, cached_7d_resets_at=None, keeper_state=payload)
+        r = _run(tmp_path, f"const a = {json.dumps(acct)};\n"
+                           "out([windowReason(a, 'five_hour'), windowReason(a, 'seven_day')]);")
+        assert [x and x["text"] for x in r] == [None, "window opening"]
 
     def test_rate_limited_without_a_time(self, tmp_path):
         acct = _fresh(keeper_state={"last_status": "rate_limited"})
@@ -284,8 +365,8 @@ class TestRenderUsageBar:
 
     def test_a_pending_ping_renders_window_opening_with_its_hover_title(self, tmp_path):
         acct = _fresh(keeper_state={
-            "last_status": "ping_pending", "skip_reason": "confirming",
-            "next_attempt_at": _now() + 600,
+            "last_status": "ping_pending", "pending_windows": ["5h"],
+            "skip_reason": "confirming", "next_attempt_at": _now() + 600,
         })
         full = self._bar(tmp_path, acct, PAST)
         assert "window opening" in full

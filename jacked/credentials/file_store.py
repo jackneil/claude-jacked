@@ -21,6 +21,18 @@ _REPARSE_POINT = 0x400
 _SEEN_MISSING = ("missing",)
 
 
+def _secure_stage_on_windows(stage_path: Path) -> None:
+    """Give the stage file a private ACL, or raise so that the write refuses.
+
+    On Windows a mode bit does not change who can open the file: mkstemp gives
+    the file the ACL of its folder. The replace keeps the ACL of the stage.
+    """
+    if os.name == "nt":
+        from jacked.service.windows_security import secure_windows_path
+
+        secure_windows_path(stage_path)
+
+
 def _is_reparse_point(path_stat: os.stat_result) -> bool:
     attributes = getattr(path_stat, "st_file_attributes", 0)
     return bool(attributes & _REPARSE_POINT)
@@ -163,8 +175,10 @@ class FileCredentialStore:
                 prefix=".credentials-stage-", dir=self.path.parent
             )
             stage_path = Path(stage_name)
-            os.chmod(stage_path, 0o600)
             with os.fdopen(descriptor, "wb") as stage:
+                # Before the bytes land: tokens never sit in a looser file.
+                os.chmod(stage_path, 0o600)
+                _secure_stage_on_windows(stage_path)
                 stage.write(raw)
                 stage.flush()
                 os.fsync(stage.fileno())

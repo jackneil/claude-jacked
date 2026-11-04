@@ -190,8 +190,22 @@ def filter_drivers(config: str) -> list[str]:
     return drivers
 
 
+def filter_keys(raw: bytes) -> bytes:
+    """Return only the filter keys of the ``git config -z --list`` output ``raw``.
+
+    Only a filter key goes into the environment, so only a filter key must
+    pass through it. Any other entry, and the value of a filter key, stays
+    out: a user.name in Latin-1 must not make a read fail closed.
+
+    >>> filter_keys(b"user.name\\nJos\\xe9\\0filter.a.clean\\n/\\xff\\0filter.a.required\\0")
+    b'filter.a.clean\\x00filter.a.required'
+    """
+    entries = (entry.split(b"\n", 1)[0] for entry in raw.split(b"\0"))
+    return b"\0".join(key for key in entries if key.startswith(b"filter."))
+
+
 def config_text(raw: bytes) -> str | None:
-    """Return the ``git config`` output ``raw`` as text that gives back the same bytes.
+    """Return the filter keys ``raw`` (``filter_keys``) as text that gives back the same bytes.
 
     ``subprocess`` encodes each environment key and value with
     ``os.fsencode``, so the text comes from ``os.fsdecode`` (on POSIX: UTF-8
@@ -275,7 +289,7 @@ def guarded_git_env(
     if code not in (0, 1):  # 1: no filter key in the config
         logger.debug("git guard: git config exited %d", code)
         return None
-    config = config_text(bytes(out.data))
+    config = config_text(filter_keys(bytes(out.data)))
     if config is None:
         logger.debug("git guard: a filter key cannot pass through the environment")
         return None
