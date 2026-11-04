@@ -11,8 +11,9 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from jacked.memory.settings_io import SettingsUnreadableError
-from jacked.memory.vault import atomic_write_text
+from jacked.atomic_io import atomic_write_bytes, atomic_write_text
+from jacked.memory import load_budget
+from jacked.memory.settings_io import SETTINGS_MAX_BYTES, SettingsTooLargeError, SettingsUnreadableError, settings_text
 
 logger = logging.getLogger(__name__)
 
@@ -296,24 +297,21 @@ def _settings_unreadable_response() -> JSONResponse:
     """The 503 a mutation endpoint returns when settings.json exists but can't be
     parsed: refuse to modify it rather than clobber the user's real config with a
     fresh file (mirrors the memory-vault toggle's refusal shape)."""
-    return JSONResponse(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={"error": {
-            "message": "settings.json is unreadable; refusing to modify it",
-            "code": "SETTINGS_UNREADABLE",
-        }},
-    )
+    return _error(status.HTTP_503_SERVICE_UNAVAILABLE,
+                  "settings.json is unreadable; refusing to modify it", "SETTINGS_UNREADABLE")
 
 
 def _write_settings_json(data: dict):
-    """Write ~/.claude/settings.json through the shared atomic writer.
+    """Write the UTF-8 bytes of ~/.claude/settings.json (LF on every platform).
 
     The CLI, the dashboard, and hook processes can all write this same file;
     the shared writer gives each one its own temp file and a Windows-aware
     replace. That replace can pause to retry, so a route calls this in a
     worker thread (``await asyncio.to_thread``) with ``_settings_lock`` held.
+    Settings over the read limit raise ``SettingsTooLargeError`` before the
+    write, so the file stays readable.
     """
-    atomic_write_text(SETTINGS_JSON, json.dumps(data, indent=2))
+    atomic_write_bytes(SETTINGS_JSON, settings_text(data).encode("utf-8"))
 
 
 def _get_valid_agent_names() -> list[str]:
@@ -509,15 +507,14 @@ async def list_features():
     for name in ("sounds", "memory_vault", "statusline"):
         meta = hook_meta[name]
         installed = _detect_hook_installed(settings, name)
-        entry = {
-            "name": name,
-            "display_name": meta["display_name"],
-            "description": meta["description"],
-            "installed": installed,
-            "source_available": True,
-        }
-        if name == "memory_vault" and installed:
-            entry["health"] = _memory_vault_health()
+        entry = {"name": name, **meta, "installed": installed, "source_available": True}
+        if name == "memory_vault":
+            # The session-start load-cap lines (#98i) are read-only, and the
+            # card shows them whether or not the vault is installed, because
+            # Claude Code keeps its own MEMORY.md either way.
+            entry["load_warnings"] = await asyncio.to_thread(load_budget.machine_warnings)
+            if installed:
+                entry["health"] = _memory_vault_health()
         hooks.append(entry)
 
     # Knowledge
@@ -1297,12 +1294,13 @@ class RawSettingsRequest(BaseModel):
 async def set_raw_settings(body: RawSettingsRequest):
     """Overwrite settings.json with raw JSON content. Requires confirm_overwrite."""
     if not body.confirm_overwrite:
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={"error": {"message": "Set confirm_overwrite: true to overwrite settings.json", "code": "CONFIRMATION_REQUIRED"}},
-        )
+        return _error(status.HTTP_422_UNPROCESSABLE_CONTENT,
+                      "Set confirm_overwrite: true to overwrite settings.json", "CONFIRMATION_REQUIRED")
     async with _settings_lock:
-        await asyncio.to_thread(_write_settings_json, body.content)
+        try:
+            await asyncio.to_thread(_write_settings_json, body.content)
+        except SettingsTooLargeError:  # a fixed message: exception text never reaches a response
+            return _error(status.HTTP_413_CONTENT_TOO_LARGE, f"The new settings.json would be larger than the limit of {SETTINGS_MAX_BYTES} bytes; the file is not changed", "SETTINGS_TOO_LARGE")
     return {"ok": True}
 
 

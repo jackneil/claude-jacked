@@ -197,3 +197,40 @@ requires_posix_exec_bit = pytest.mark.skipif(
     not posix_exec_bit_enforced(),
     reason="Windows has no exec bit, so os.access(X_OK) is always True",
 )
+
+requires_fifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a POSIX FIFO")
+
+
+def returns_without_blocking(fn, fifos, seconds: float = 2.0):
+    """Run ``fn()`` in a thread and return ``(finished, result)``.
+
+    A reader that opens a FIFO with no writer blocks forever. When ``fn`` is
+    still running after ``seconds``, each FIFO in ``fifos`` is opened for
+    writing and closed, so the blocked reader sees end of file and the thread
+    ends. Then ``finished`` is False: the test fails instead of hanging the
+    suite.
+    """
+    import threading
+
+    box: dict = {}
+
+    def run():
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001 -- handed back to the test
+            box["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(seconds)
+    finished = not worker.is_alive()
+    if not finished:
+        for fifo in fifos:
+            try:
+                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+        worker.join(seconds)
+    if "error" in box:
+        raise box["error"]
+    return finished, box.get("result")

@@ -3,7 +3,7 @@
 import json
 import os
 import subprocess
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -209,68 +209,89 @@ class TestShouldSuggest:
 
 
 class TestGetChangedFiles:
-    """Test _get_changed_files() subprocess handling."""
+    """Test _get_changed_files() handling of the diff calls.
 
-    def test_returns_file_list(self, tmp_path):
+    The git_guard config read is stubbed here (its own tests are in
+    test_git_guard.py and TestChangedFilesInAnUntrustedRepo), and
+    ``run_git`` is replaced, so the fake sees only the diff calls.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _guard_env(self, monkeypatch):
+        from jacked.data.hooks import qa_suggest
+
+        monkeypatch.setattr(qa_suggest, "guarded_git_env", lambda *a, **k: {"GIT_OPTIONAL_LOCKS": "0"})
+
+    @staticmethod
+    def _fake(monkeypatch, *results):
+        """Replace run_git: each call takes the next (exit code, stdout) or raises it."""
+        from jacked.data.hooks import qa_suggest
+
+        calls = []
+        queue = list(results)
+
+        def run(argv, *, name, env, timeout, consumer, cwd=None):
+            calls.append({"argv": list(argv), "timeout": timeout, "cwd": cwd})
+            result = queue.pop(0) if len(queue) > 1 else queue[0]
+            if isinstance(result, BaseException):
+                raise result
+            code, stdout = result
+            if stdout and not consumer.feed(stdout):
+                return -9
+            consumer.close()
+            return code
+
+        monkeypatch.setattr(qa_suggest, "run_git", run)
+        return calls
+
+    def test_returns_file_list(self, tmp_path, monkeypatch):
         from jacked.data.hooks.qa_suggest import _get_changed_files
 
-        mock_result = MagicMock()
-        mock_result.stdout = "src/app.js\nstyles/main.css\n"
-        mock_result.returncode = 0
-
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
-            files = _get_changed_files(str(tmp_path))
+        calls = self._fake(monkeypatch, (0, b"src/app.js\nstyles/main.css\n"))
+        files = _get_changed_files(str(tmp_path))
 
         assert files == ["src/app.js", "styles/main.css"]
-        # Verify timeout is set
-        call_kwargs = mock_run.call_args
-        assert call_kwargs.kwargs.get("timeout") == 5 or (
-            len(call_kwargs.args) > 0 and "timeout" in str(call_kwargs)
-        )
+        assert calls[0]["timeout"] == 5
+        assert calls[0]["cwd"] == str(tmp_path)
 
-    def test_returns_empty_on_subprocess_error(self, tmp_path):
+    def test_returns_empty_on_subprocess_error(self, tmp_path, monkeypatch):
         from jacked.data.hooks.qa_suggest import _get_changed_files
 
-        with patch(
-            "subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="git", timeout=5)
-        ):
-            files = _get_changed_files(str(tmp_path))
+        self._fake(monkeypatch, subprocess.TimeoutExpired(cmd="git", timeout=5))
+        assert _get_changed_files(str(tmp_path)) == []
 
-        assert files == []
-
-    def test_returns_empty_on_nonzero_exit(self, tmp_path):
+    def test_returns_empty_on_nonzero_exit(self, tmp_path, monkeypatch):
         from jacked.data.hooks.qa_suggest import _get_changed_files
-
-        mock_result = MagicMock()
-        mock_result.stdout = ""
-        mock_result.returncode = 128
 
         # Both HEAD and --cached fail
-        with patch("subprocess.run", return_value=mock_result):
-            files = _get_changed_files(str(tmp_path))
+        self._fake(monkeypatch, (128, b""))
+        assert _get_changed_files(str(tmp_path)) == []
 
-        assert files == []
-
-    def test_falls_back_to_cached_on_head_failure(self, tmp_path):
+    def test_falls_back_to_cached_on_head_failure(self, tmp_path, monkeypatch):
         """When HEAD doesn't exist (zero-commit repo), falls back to --cached."""
         from jacked.data.hooks.qa_suggest import _get_changed_files
 
-        head_fail = MagicMock()
-        head_fail.stdout = ""
-        head_fail.returncode = 128
-
-        cached_ok = MagicMock()
-        cached_ok.stdout = "src/index.tsx\n"
-        cached_ok.returncode = 0
-
-        with patch("subprocess.run", side_effect=[head_fail, cached_ok]) as mock_run:
-            files = _get_changed_files(str(tmp_path))
+        calls = self._fake(monkeypatch, (128, b""), (0, b"src/index.tsx\n"))
+        files = _get_changed_files(str(tmp_path))
 
         assert files == ["src/index.tsx"]
-        assert mock_run.call_count == 2
-        # Second call should use --cached
-        second_call_args = mock_run.call_args_list[1][0][0]
-        assert "--cached" in second_call_args
+        assert len(calls) == 2
+        assert "--cached" in calls[1]["argv"]
+
+    def test_a_list_over_the_output_limit_keeps_its_complete_lines(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        from jacked import git_guard
+        from jacked.data.hooks.qa_suggest import _get_changed_files
+
+        monkeypatch.setattr(git_guard, "OUTPUT_LIMIT", 20)
+        self._fake(monkeypatch, (0, b"src/a.js\nsrc/b.css\nsrc/c.tsx\n"))
+        caplog.set_level(logging.DEBUG, logger="jacked.data.hooks.qa_suggest")
+
+        assert _get_changed_files(str(tmp_path)) == ["src/a.js", "src/b.css"]
+        assert any("cut at 20 bytes" in r.getMessage() for r in caplog.records)
 
 
 class TestSuggestionMessageRuntime:
@@ -478,3 +499,122 @@ class TestMainEndToEnd:
 
         captured = capsys.readouterr()
         assert captured.out.strip() == ""
+
+
+# --------------------------------------------------------------------------- #
+# _get_changed_files() reads an untrusted checkout through jacked.git_guard
+# --------------------------------------------------------------------------- #
+
+requires_git = pytest.mark.skipif(
+    __import__("shutil").which("git") is None, reason="drives the real git binary"
+)
+
+
+@pytest.fixture
+def git_root(tmp_path, monkeypatch):
+    """A folder for throwaway repos, with a hermetic git config."""
+    (tmp_path / "gitconfig").write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    for key in ("GIT_AUTHOR", "GIT_COMMITTER"):
+        monkeypatch.setenv(f"{key}_NAME", "test")
+        monkeypatch.setenv(f"{key}_EMAIL", "test@example.com")
+    return tmp_path
+
+
+def _git(repo, *args):
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+
+def _repo_with(root, files):
+    repo = root / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    for name, text in files.items():
+        (repo / name).write_text(text, encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    return repo
+
+
+@requires_git
+class TestChangedFilesInAnUntrustedRepo:
+    def test_a_real_ui_change_is_found(self, git_root):
+        from jacked.data.hooks.qa_suggest import _get_changed_files
+
+        repo = _repo_with(git_root, {"app.js": "one\n", "server.py": "x\n"})
+        (repo / "app.js").write_text("two\n", encoding="utf-8")
+        assert _get_changed_files(str(repo)) == ["app.js"]
+
+    def test_a_repo_with_no_commits_lists_the_staged_files(self, git_root):
+        from jacked.data.hooks.qa_suggest import _get_changed_files
+
+        repo = git_root / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-q", "-b", "main")
+        (repo / "new.css").write_text("a{}\n", encoding="utf-8")
+        _git(repo, "add", "new.css")
+        assert _get_changed_files(str(repo)) == ["new.css"]
+
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32", reason="the fake clean filter is a shebang script"
+    )
+    def test_a_repo_config_cannot_make_the_diff_run_a_clean_filter(self, git_root):
+        from jacked.data.hooks.qa_suggest import _get_changed_files
+        from tests._platform import write_python_shim
+
+        repo = _repo_with(git_root, {"app.js": "same\n"})
+        marker = git_root / "clean-ran.txt"
+        shim = write_python_shim(
+            git_root, "fake-clean",
+            "import pathlib, shutil, sys\n"
+            f"pathlib.Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+            "shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)\n",
+        )
+        _git(repo, "config", "filter.evil.clean", str(shim))
+        _git(repo, "config", "filter.evil.required", "true")
+        (repo / ".git" / "info" / "attributes").write_text("* filter=evil\n", encoding="utf-8")
+        stamp = os.stat(repo / "app.js").st_mtime + 120
+        os.utime(repo / "app.js", (stamp, stamp))  # same content, new mtime
+        # Precondition: a plain git diff in this repo runs the filter.
+        subprocess.run(
+            ["git", "-C", str(repo), "diff", "--name-only", "HEAD"], capture_output=True,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}, check=False, timeout=60,
+        )
+        assert marker.exists(), "git did not run the filter; the test cannot prove anything"
+        marker.unlink()
+
+        assert _get_changed_files(str(repo)) == []
+        assert not marker.exists(), "the hook ran the repository's clean filter"
+
+    def test_no_diff_runs_when_the_filter_drivers_cannot_be_read(self, git_root, monkeypatch):
+        from jacked.data.hooks import qa_suggest
+
+        repo = _repo_with(git_root, {"app.js": "one\n"})
+        (repo / "app.js").write_text("two\n", encoding="utf-8")
+        monkeypatch.setattr(qa_suggest, "guarded_git_env", lambda *a, **k: None)
+        assert qa_suggest._get_changed_files(str(repo)) == []
+
+    def test_the_diff_carries_the_guard_arguments(self, git_root, monkeypatch):
+        from jacked import git_guard
+        from jacked.data.hooks import qa_suggest
+
+        repo = _repo_with(git_root, {"app.js": "one\n"})
+        seen = []
+        real_run = qa_suggest.run_git
+
+        def spy(argv, **kwargs):
+            seen.append((list(argv), kwargs.get("env") or {}))
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(qa_suggest, "run_git", spy)
+        qa_suggest._get_changed_files(str(repo))
+        diffs = [(argv, env) for argv, env in seen if "diff" in argv]
+        assert diffs
+        for argv, env in diffs:
+            assert tuple(argv[1:1 + len(git_guard.GIT_CONFIG_OVERRIDE_ARGS)]) == (
+                git_guard.GIT_CONFIG_OVERRIDE_ARGS
+            )
+            assert "--ignore-submodules=dirty" in argv
+            assert env.get("GIT_OPTIONAL_LOCKS") == "0"

@@ -10,6 +10,7 @@ from there so a middleware regression fails here too. Engine tests run the real
 ``setup.enable`` / ``setup.disable`` against tmp vaults + repos.
 """
 import json
+import shutil
 import subprocess
 from io import StringIO
 from pathlib import Path
@@ -691,3 +692,128 @@ def test_detect_diverts_to_jacked_home_when_settings_json_is_stock(tmp_path, mon
     monkeypatch.setenv("JACKED_HOME", str(engine_home))
 
     assert features._detect_hook_installed({}, "memory_vault") is True
+
+
+# --------------------------------------------------------------------------- #
+# #98i: the Memory Vault card shows the session-start load-cap lines
+# --------------------------------------------------------------------------- #
+
+FEATURES_MEMORY_230_LINE = (
+    "MEMORY.md (~/.claude/projects/-Users-someone-Github-claude-jacked/memory) is 230 lines"
+    " / 27.0 KB; Claude Code loads only the first 200 lines / 25 KB; run memory-librarian"
+)
+
+
+def _seed_project_memory(menv, monkeypatch):
+    """An over-cap native MEMORY.md for one project, with a transcript. The
+    card names the index by its folder, so the transcript does not change it."""
+    for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_DISABLE_AUTO_MEMORY"):
+        monkeypatch.delenv(var, raising=False)
+    project = menv.home / ".claude" / "projects" / "-Users-someone-Github-claude-jacked"
+    memory = project / "memory" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_bytes((b"x" * 116 + b"\n") * 229 + b"y" * 206 + b"\n")
+    (project / "s1.jsonl").write_text(
+        json.dumps({"cwd": "/Users/someone/Github/claude-jacked"}) + "\n", encoding="utf-8"
+    )
+    return memory
+
+
+def _memory_card(client):
+    feats = client.get("/api/features").json()
+    return feats, next(h for h in feats["hooks"] if h["name"] == "memory_vault")
+
+
+def test_get_features_carries_load_warnings_without_the_vault(menv, monkeypatch):
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    _seed_project_memory(menv, monkeypatch)
+
+    feats, mv = _memory_card(TestClient(_make_app()))
+
+    assert mv["installed"] is False
+    assert mv["load_warnings"] == [FEATURES_MEMORY_230_LINE]
+    assert "health" not in mv
+    assert all("load_warnings" not in h for h in feats["hooks"] if h["name"] != "memory_vault")
+
+
+def test_get_features_carries_load_warnings_beside_the_health(menv, monkeypatch):
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    client = TestClient(_make_app())
+    client.put("/api/features/hooks/memory_vault", json={"enabled": True})
+    _seed_project_memory(menv, monkeypatch)
+
+    _feats, mv = _memory_card(client)
+
+    assert mv["installed"] is True
+    assert mv["health"] is not None
+    assert mv["load_warnings"] == [FEATURES_MEMORY_230_LINE]
+
+
+def test_get_features_load_warnings_are_empty_on_a_clean_machine(menv, monkeypatch):
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    _feats, mv = _memory_card(TestClient(_make_app()))
+
+    assert mv["load_warnings"] == []
+
+
+def test_get_features_load_warnings_never_change_the_measured_file(menv, monkeypatch):
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+    memory = _seed_project_memory(menv, monkeypatch)
+    before = (memory.read_bytes(), memory.stat().st_mtime_ns)
+
+    _memory_card(TestClient(_make_app()))
+
+    assert (memory.read_bytes(), memory.stat().st_mtime_ns) == before
+
+
+def test_get_features_hook_entries_keep_their_shape(menv, monkeypatch):
+    monkeypatch.setattr(features, "SETTINGS_JSON", menv.home / ".claude" / "settings.json")
+
+    feats, _mv = _memory_card(TestClient(_make_app()))
+
+    for hook in feats["hooks"]:
+        expected = ["name", "display_name", "description", "installed", "source_available"]
+        if hook["name"] == "memory_vault":
+            expected.append("load_warnings")
+        assert list(hook) == expected, hook["name"]
+
+
+requires_node = pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+
+
+@requires_node
+def test_settings_js_renders_each_load_warning_as_one_plain_line(tmp_path):
+    from tests.unit.test_web_js_features_split import _eval_in_settings
+
+    html = _eval_in_settings(
+        tmp_path,
+        "_memoryLoadNotes({name: 'memory_vault', installed: false, "
+        "load_warnings: ['MEMORY.md is <b>big</b>', 'second line']})",
+    )
+    # break-words: a label names a folder such as
+    # ~/.claude/projects/-Users-someone-Github-repo/memory, one long word.
+    assert html.count('<div class="text-xs text-yellow-400 mt-1 break-words">') == 2
+    assert "MEMORY.md is &lt;b&gt;big&lt;/b&gt;" in html
+    assert "second line" in html
+    assert "border-l" not in html and "<button" not in html
+
+
+@requires_node
+def test_settings_js_load_notes_only_for_the_memory_card(tmp_path):
+    from tests.unit.test_web_js_features_split import _eval_in_settings
+
+    assert _eval_in_settings(
+        tmp_path,
+        "[_memoryLoadNotes({name: 'sounds', load_warnings: ['x']}), "
+        "_memoryLoadNotes({name: 'memory_vault'}), _memoryLoadNotes(null)]",
+    ) == ["", "", ""]
+
+
+def test_settings_js_puts_the_load_notes_in_the_hook_row():
+    js = (DATA / "web" / "js" / "components" / "settings.js").read_text(encoding="utf-8")
+    assert "const loadNotes = _memoryLoadNotes(h);" in js
+    assert "${loadNotes}" in js
+    helper = js.split("function _memoryLoadNotes", 1)[1].split("\n}\n", 1)[0]
+    assert "—" not in helper

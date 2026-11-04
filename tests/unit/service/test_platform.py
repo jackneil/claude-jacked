@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+import ntpath
 
 
 class TestGenerateLaunchdPlist:
@@ -482,7 +483,7 @@ class _NativeManager:
             )
         if argv[:3] == ["systemctl", "--user", "is-enabled"]:
             return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
-        if argv and argv[0] == "powershell.exe" and self.task_xml is not None:
+        if argv and ntpath.basename(argv[0]).lower() == "powershell.exe" and self.task_xml is not None:
             return SimpleNamespace(returncode=0, stdout=self.task_xml, stderr=b"")
         raise AssertionError(f"unexpected native manager call: {argv}")
 

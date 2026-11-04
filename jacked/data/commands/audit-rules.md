@@ -128,12 +128,14 @@ Output a structured report:
 
 ### Summary
 - Total rules: X (project: Y, global: Z)
-- Always-loaded size: P lines (project CLAUDE.md), G lines (global) - flag any file materially over ~200 lines
+- Always-loaded size: P lines (project CLAUDE.md), G lines (global) - flag any file over `CLAUDE_MD_ADVISED_LINES` (200 lines)
 - Issues found: N
 - Health: CLEAN / NEEDS CLEANUP / OVERDUE FOR CONSOLIDATION
 ```
 
-If 50+ total rules across all files, OR any always-loaded file materially exceeds ~200 lines, add:
+The size thresholds are constants in `jacked/memory/load_budget.py`, so this report and the jacked warnings use the same numbers. Claude Code loads each CLAUDE.md in full, and its docs advise under `CLAUDE_MD_ADVISED_LINES` (200 lines) per file. The auto memory index MEMORY.md is different: Claude Code loads only its first `LINE_CAP` (200 lines) or `BYTE_CAP` (25,000 bytes). `jacked memory status` flags a MEMORY.md or a CLAUDE.md over `WARN_RATIO` (0.9) of its cap. When it flags MEMORY.md, suggest the memory-librarian skill.
+
+If 50+ total rules across all files, OR any always-loaded file is over its size threshold above, add:
 "This config is getting heavy. Every line in an always-loaded file is paid for on every request (roughly a 20-23% inference tax across the file), and bloat makes the agent start ignoring the real instructions. Run a consolidation pass with Anthropic's per-line keep/cut test: 'would removing this line cause the agent to make mistakes? If not, cut it.' Then group related rules, merge duplicates, and move task-specific runbooks to skills."
 
 If no issues found:

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from jacked.winproc import system_program
 
 
 class TestWritePid:
@@ -362,7 +363,7 @@ class TestStopProcess:
         )
 
         assert process.stop_process(pid_file) is True
-        assert spawned == [["taskkill", "/PID", str(os.getpid()), "/F"]]
+        assert spawned == [[system_program("taskkill"), "/PID", str(os.getpid()), "/F"]]
         assert forbidden == [], "os.kill must not signal a process on Windows"
 
 

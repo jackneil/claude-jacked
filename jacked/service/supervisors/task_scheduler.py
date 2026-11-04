@@ -15,6 +15,7 @@ from xml.etree import ElementTree
 
 from jacked.atomic_io import replace_with_retry
 from jacked.service.spec import ServiceSpec
+from jacked.winproc import system_program
 from jacked.service.supervisors._artifacts import (
     ArtifactDisposition,
     SupervisorAction,
@@ -170,7 +171,7 @@ def _activate_task(transition: _Transition) -> SupervisorAction:
     try:
         created = request.run(
             [
-                "schtasks.exe",
+                system_program("schtasks"),
                 "/Create",
                 "/TN",
                 request.spec.service_id,
@@ -184,14 +185,14 @@ def _activate_task(transition: _Transition) -> SupervisorAction:
             return _failed_transition(transition, _step_failed("/Create", created), True)
         if transition.evidence.previous_task is not None:
             ended = request.run(
-                ["schtasks.exe", "/End", "/TN", request.spec.service_id],
+                [system_program("schtasks"), "/End", "/TN", request.spec.service_id],
                 **_RUN_OPTIONS,
             )
             if ended.returncode not in {0, 1}:
                 return _failed_transition(transition, _step_failed("/End", ended), True)
             transition = replace(transition, prior_running=ended.returncode == 0)
         started = request.run(
-            ["schtasks.exe", "/Run", "/TN", request.spec.service_id],
+            [system_program("schtasks"), "/Run", "/TN", request.spec.service_id],
             **_RUN_OPTIONS,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -375,7 +376,7 @@ def _rollback_new_task(transition: _Transition) -> bool:
         ) or task_action(registered) != task_action(request.expected.content):
             return False
         deleted = request.run(
-            ["schtasks.exe", "/Delete", "/TN", request.spec.service_id, "/F"],
+            [system_program("schtasks"), "/Delete", "/TN", request.spec.service_id, "/F"],
             **_RUN_OPTIONS,
         )
         return deleted.returncode == 0
@@ -402,7 +403,7 @@ def _restore_previous_task(transition: _Transition) -> bool:
     try:
         restored = request.run(
             [
-                "schtasks.exe",
+                system_program("schtasks"),
                 "/Create",
                 "/TN",
                 request.spec.service_id,
@@ -415,7 +416,7 @@ def _restore_previous_task(transition: _Transition) -> bool:
         if restored.returncode != 0 or not transition.prior_running:
             return restored.returncode == 0
         started = request.run(
-            ["schtasks.exe", "/Run", "/TN", request.spec.service_id],
+            [system_program("schtasks"), "/Run", "/TN", request.spec.service_id],
             **_RUN_OPTIONS,
         )
         return started.returncode == 0

@@ -30,6 +30,23 @@ os.environ["HOME"] = str(_IMPORT_HOME)
 os.environ["USERPROFILE"] = str(_IMPORT_HOME)
 atexit.register(shutil.rmtree, _IMPORT_HOME, True)
 
+# The developer's Claude Code session sets variables that move the files
+# Claude Code loads (CLAUDE_CONFIG_DIR, CLAUDE_CODE_PROJECT_DIR_NAME,
+# CLAUDE_PROJECTS_DIR), turn auto memory off, or mark a subagent session. The
+# load-budget and session-start code reads them, so a test that inherits them
+# reads the developer's real settings and CLAUDE.md, and a byte-identical test
+# fails only on that machine (found 2026-11-03). A test that needs one sets it.
+CLAUDE_SESSION_ENV = (
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_PROJECT_DIR_NAME",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+    "CLAUDE_PROJECTS_DIR",
+    "CLAUDE_CODE_AGENT_TYPE",
+    "CLAUDE_CODE_PARENT_SESSION_ID",
+)
+for _var in CLAUDE_SESSION_ENV:
+    os.environ.pop(_var, None)
+
 # Any jacked.db query that jacked code makes on an event-loop thread raises
 # in tests (jacked/web/database.py, #162): a blocking query on the service
 # loop freezes every route, whatever form the call takes.
@@ -146,6 +163,15 @@ def _isolate_home(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("JACKED_HOME", raising=False)
+    for var in CLAUDE_SESSION_ENV:
+        monkeypatch.delenv(var, raising=False)
+    # The load-budget walk reads CLAUDE.md files up to the filesystem root.
+    # It stops at the pytest base folder here, so a real over-budget file
+    # above the pytest tree (a developer HOME, a Windows temp folder) cannot
+    # change a test result. A test of the walk itself sets the stop itself.
+    from jacked.memory import load_budget
+
+    monkeypatch.setattr(load_budget, "ANCESTOR_STOP", tmp_path_factory.getbasetemp())
     yield home
 
 

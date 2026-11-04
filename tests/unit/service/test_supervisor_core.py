@@ -4,6 +4,8 @@ from unittest.mock import Mock
 from xml.etree import ElementTree
 
 import pytest
+import ntpath
+from jacked.winproc import system_program
 
 from jacked.service.spec import SupervisorKind
 from jacked.service.supervisors import (
@@ -336,14 +338,14 @@ def test_task_restart_recognizes_its_own_task_read_back_as_utf8(tmp_path, bom):
 
     def run(argv, **kwargs):
         calls.append(argv)
-        if argv[0] == "powershell.exe":
+        if ntpath.basename(argv[0]).lower() == "powershell.exe":
             return SimpleNamespace(returncode=0, stdout=printed, stderr=b"")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     result = restart_owned_supervisor(spec, path, environment=environment, run=run)
 
     assert result.ok is True, result.reason
-    assert calls[-1] == ["schtasks.exe", "/Run", "/TN", spec.service_id]
+    assert calls[-1] == [system_program("schtasks"), "/Run", "/TN", spec.service_id]
 
 
 @pytest.mark.parametrize(

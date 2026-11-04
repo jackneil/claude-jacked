@@ -13,11 +13,17 @@ suggestion reads `$qa` (the Codex skill invocation) instead of `/qa`.
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
 import threading
 from pathlib import Path
+
+from jacked.findbin import require_bin
+from jacked.git_guard import GIT_CONFIG_OVERRIDE_ARGS, Capture, guarded_git_env, run_git
+
+logger = logging.getLogger(__name__)
 
 DEDUP_DIR = "/tmp"
 
@@ -77,31 +83,44 @@ def _get_changed_files(cwd: str) -> list[str]:
 
     Falls back to --cached when HEAD doesn't exist (zero-commit repos).
 
+    The checkout can be untrusted, so the reads go through ``jacked.git_guard``:
+    its ``-c`` overrides, ``GIT_OPTIONAL_LOCKS=0``, every filter driver turned
+    off, and no look inside a submodule. When the filter drivers cannot be
+    read, no diff runs and the list is empty. The diff output is read up to
+    ``git_guard.OUTPUT_LIMIT`` bytes (about 20,000 paths). A longer list
+    keeps its complete lines, and the cut goes to the DEBUG log.
+
     >>> # Returns empty list on error
     >>> _get_changed_files("/nonexistent")
     []
     """
     try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            # HEAD may not exist (fresh repo, no commits) — try staged files
-            result = subprocess.run(
-                ["git", "diff", "--name-only", "--cached"],
-                capture_output=True,
-                text=True,
-                cwd=cwd,
-                timeout=5,
+        git = require_bin("git")
+        env = guarded_git_env(git, cwd, timeout=5)
+        if env is None:
+            return []
+
+        def diff(*rev: str) -> Capture | None:
+            out = Capture()
+            code = run_git(
+                [git, *GIT_CONFIG_OVERRIDE_ARGS, "diff", "--name-only", "--no-ext-diff",
+                 "--ignore-submodules=dirty", *rev],
+                name="diff", env=env, timeout=5, consumer=out, cwd=cwd,
             )
-            if result.returncode != 0:
+            return out if out.truncated or code == 0 else None
+
+        out = diff("HEAD")
+        if out is None:
+            # HEAD may not exist (a fresh repo with no commits): try the staged files
+            out = diff("--cached")
+            if out is None:
                 return []
-        return [f for f in result.stdout.strip().splitlines() if f]
-    except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        text = bytes(out.data).decode("utf-8", errors="replace")
+        if out.truncated:
+            text = text.rpartition("\n")[0]  # the cut line is not a whole path
+            logger.debug("qa suggest: the changed-file list was cut at %d bytes", out.limit)
+        return [f for f in text.strip().splitlines() if f]
+    except (subprocess.TimeoutExpired, OSError):
         return []
 
 

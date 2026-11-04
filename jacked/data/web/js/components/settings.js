@@ -602,6 +602,17 @@ function _isSkillFeature(k) {
     return !!k && typeof k.name === 'string' && k.name.startsWith('skill_');
 }
 
+// The Memory Vault card's session-start load-cap lines (#98i): one muted
+// warning line for each file that is near or over the size Claude Code loads
+// at session start. Read-only, and shown whether or not the vault is on,
+// because Claude Code keeps its own MEMORY.md either way.
+function _memoryLoadNotes(h) {
+    if (!h || h.name !== 'memory_vault' || !Array.isArray(h.load_warnings)) return '';
+    return h.load_warnings
+        .map(w => `<div class="text-xs text-yellow-400 mt-1 break-words">${escapeHtml(w)}</div>`)
+        .join('');
+}
+
 function _renderFeatureFilter(placeholder) {
     return `
         <div class="mb-4">
@@ -714,12 +725,14 @@ async function renderFeaturesTab(container) {
                     healthNote = `<div class="text-xs text-yellow-400 mt-1">sync failing: ${escapeHtml(h.health.last_sync_error)}</div>`;
                 }
             }
+            const loadNotes = _memoryLoadNotes(h);
             return `
             <div class="flex items-center justify-between p-3 bg-slate-900/50 rounded border border-slate-700/50" data-feature-row data-display-name="${escapeHtml(h.display_name)}">
                 <div class="min-w-0 flex-1">
                     <div class="text-sm text-white">${escapeHtml(h.display_name)}</div>
                     <div class="text-xs text-slate-400">${escapeHtml(h.description || '')}</div>
                     ${healthNote}
+                    ${loadNotes}
                 </div>
                 ${renderToggle(h.name, 'hooks', h.installed, h.source_available)}
             </div>

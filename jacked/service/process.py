@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 
 from jacked.service import DEFAULT_PORT
-from jacked.winproc import NO_WINDOW
+from jacked.winproc import NO_WINDOW, system_program
 
 
 @dataclass(frozen=True)
@@ -393,7 +393,7 @@ def stop_process(pid_file: Path) -> bool:
         import subprocess
 
         subprocess.run(
-            ["taskkill", "/PID", str(pid), "/F"],
+            [system_program("taskkill"), "/PID", str(pid), "/F"],
             capture_output=True,
             creationflags=NO_WINDOW,
         )
@@ -451,7 +451,7 @@ def stop_process_graceful(
 
         # Graceful first — no /F. Sends WM_CLOSE to GUI procs / CTRL_BREAK to consoles.
         subprocess.run(
-            ["taskkill", "/PID", str(pid)],
+            [system_program("taskkill"), "/PID", str(pid)],
             capture_output=True,
             creationflags=NO_WINDOW,
         )
@@ -471,7 +471,7 @@ def stop_process_graceful(
         import subprocess
 
         subprocess.run(
-            ["taskkill", "/PID", str(pid), "/F", "/T"],
+            [system_program("taskkill"), "/PID", str(pid), "/F", "/T"],
             capture_output=True,
             creationflags=NO_WINDOW,
         )

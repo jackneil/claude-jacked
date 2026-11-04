@@ -25,7 +25,7 @@ import sys
 import threading
 from typing import IO, Any
 
-from jacked.winproc import NO_WINDOW
+from jacked.winproc import NO_WINDOW, system_program
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +208,7 @@ def _stop_tree(
     if sys.platform == "win32":
         try:
             subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                [system_program("taskkill"), "/PID", str(proc.pid), "/T", "/F"],
                 capture_output=True,
                 check=False,
                 timeout=30,

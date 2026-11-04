@@ -2339,8 +2339,7 @@ def _spawn_windows_upgrade_helper(
     # launching terminal closing (modern terminals kill their job on close).
     # Fall back to CREATE_NO_WINDOW alone if the job forbids breakaway — never
     # back to DETACHED_PROCESS, or the windows come right back.
-    NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-    BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    from jacked.winproc import run_batch_detached
     # Capture the batch's stdout/stderr into the update log by handing cmd.exe
     # an inherited handle on it — the same pattern the tray updater uses. This
     # is what makes the batch's bare `echo`/command output land in the log, and
@@ -2356,18 +2355,7 @@ def _spawn_windows_upgrade_helper(
         close_fds=True,
     )
     try:
-        try:
-            subprocess.Popen(
-                ["cmd.exe", "/c", batch_path],
-                creationflags=NO_WINDOW | BREAKAWAY,
-                **_helper_kwargs,
-            )
-        except OSError:
-            subprocess.Popen(
-                ["cmd.exe", "/c", batch_path],
-                creationflags=NO_WINDOW,
-                **_helper_kwargs,
-            )
+        run_batch_detached(batch_path, **_helper_kwargs)
     finally:
         # cmd.exe holds its own inherited copy of the handle; close ours.
         if _lf is not subprocess.DEVNULL:
@@ -2853,15 +2841,15 @@ def _rotate_backups(dir_path: Path, prefix: str, keep: int = 5) -> None:
 
 
 def _write_settings_atomic(settings_path: Path, data: dict) -> None:
-    """Atomically write settings.json through the shared atomic writer.
+    """Atomically write the UTF-8 bytes of settings.json, LF on every platform.
 
-    Prevents half-written JSON if the process is killed mid-install.
+    Prevents half-written JSON if the process is killed mid-install. Settings
+    over the read limit raise ``SettingsTooLargeError`` before the write.
     """
-    import json as _json
+    from jacked.atomic_io import atomic_write_bytes
+    from jacked.memory.settings_io import settings_text
 
-    from jacked.atomic_io import atomic_write_text
-
-    atomic_write_text(settings_path, _json.dumps(data, indent=2))
+    atomic_write_bytes(settings_path, settings_text(data).encode("utf-8"))
 
 
 def _link_or_copy(src: Path, dst: Path) -> str:
@@ -7362,26 +7350,26 @@ def memory_status(quiet: bool):
         console.print(
             "\n[yellow]Run `jacked memory init` to create the vault.[/yellow]"
         )
-        return
-
-    if not st["groups"]:
+    elif not st["groups"]:
         console.print("\n[dim]No groups yet.[/dim]")
-        return
-
-    table = Table(title="Groups")
-    table.add_column("Group", style="cyan", no_wrap=True)
-    table.add_column("Repos", justify="right", no_wrap=True)
-    for t in _memory.VALID_TYPES:
-        table.add_column(t, justify="right", no_wrap=True)
-    for group in sorted(st["groups"]):
-        info = st["groups"][group]
-        counts = info.get("counts", {})
-        table.add_row(
-            group,
-            str(len(info.get("repos", []))),
-            *[str(counts.get(t, 0)) for t in _memory.VALID_TYPES],
-        )
-    console.print(table)
+    else:
+        table = Table(title="Groups")
+        table.add_column("Group", style="cyan", no_wrap=True)
+        table.add_column("Repos", justify="right", no_wrap=True)
+        for t in _memory.VALID_TYPES:
+            table.add_column(t, justify="right", no_wrap=True)
+        for group in sorted(st["groups"]):
+            info = st["groups"][group]
+            counts = info.get("counts", {})
+            table.add_row(
+                group,
+                str(len(info.get("repos", []))),
+                *[str(counts.get(t, 0)) for t in _memory.VALID_TYPES],
+            )
+        console.print(table)
+    from jacked.memory import load_budget as _load_budget  # session-start load caps (#98i)
+    for line in _load_budget.warnings(None, home):  # one line each: soft_wrap, no hard breaks
+        console.print(f"[yellow]{_rich_escape(line)}[/yellow]", soft_wrap=True)
 
 
 @memory_group.command(name="add")

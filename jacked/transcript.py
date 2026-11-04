@@ -5,13 +5,14 @@ Handles parsing Claude's JSONL session format and extracting
 user messages and conversation chunks.
 """
 
-import json
 import re
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Iterator
+
+from jacked.jsonl_lines import iter_objects
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,9 @@ def parse_jsonl_file(filepath: Path) -> ParsedTranscript:
 
     Raises:
         FileNotFoundError: If file doesn't exist
-        json.JSONDecodeError: If file has invalid JSON
+
+    A line that is too long, not UTF-8, not JSON or not a JSON object is
+    skipped with a warning that gives its line number (jacked.jsonl_lines).
 
     Examples:
         # transcript = parse_jsonl_file(Path('session.jsonl'))
@@ -83,16 +86,10 @@ def parse_jsonl_file(filepath: Path) -> ParsedTranscript:
     user_messages = []
     latest_timestamp = None
 
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Skipping invalid JSON at line {line_num}: {e}")
+    with open(filepath, "rb") as f:
+        for line_num, data in iter_objects(f):
+            if data is None:
+                logger.warning("Skipping invalid line %d", line_num)
                 continue
 
             msg_type = data.get("type")
@@ -576,17 +573,9 @@ def extract_agent_summary(agent_file: Path) -> Optional[AgentSummary]:
     timestamp = None
 
     try:
-        with open(agent_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                if data.get("type") == "assistant":
+        with open(agent_file, "rb") as f:
+            for _, data in iter_objects(f):
+                if data is not None and data.get("type") == "assistant":
                     last_assistant_msg = data
                     ts_str = data.get("timestamp")
                     if ts_str:
@@ -651,17 +640,9 @@ def extract_summary_labels(session_path: Path) -> list[SummaryLabel]:
     labels = []
 
     try:
-        with open(session_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                if data.get("type") == "summary":
+        with open(session_path, "rb") as f:
+            for _, data in iter_objects(f):
+                if data is not None and data.get("type") == "summary":
                     label_text = data.get("summary", "")
                     if label_text:
                         timestamp = None
@@ -698,17 +679,9 @@ def extract_session_slug(session_path: Path) -> Optional[str]:
         # slug = extract_session_slug(Path('session.jsonl'))
     """
     try:
-        with open(session_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                if "slug" in data:
+        with open(session_path, "rb") as f:
+            for _, data in iter_objects(f):
+                if data is not None and "slug" in data:
                     return data["slug"]
     except (IOError, OSError) as e:
         logger.warning(f"Failed to read session file {session_path}: {e}")

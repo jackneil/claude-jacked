@@ -31,7 +31,8 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from jacked.findbin import find_bin
+from jacked.findbin import find_bin, require_bin
+from jacked.git_guard import GIT_CONFIG_OVERRIDE_ARGS
 from jacked.memory import capture
 from jacked.memory import vault as vault_mod
 
@@ -432,7 +433,7 @@ def _git(repo: Path, args: list[str]) -> subprocess.CompletedProcess | None:
     """Run ``git -C repo <args>``; None on launch failure/timeout."""
     try:
         return subprocess.run(
-            ["git", "-C", str(repo), *args],
+            [require_bin("git"), "-C", str(repo), *GIT_CONFIG_OVERRIDE_ARGS, *args],
             capture_output=True, text=True, timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )

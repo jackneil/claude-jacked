@@ -977,3 +977,117 @@ def test_a_traversing_group_argument_cannot_hide_the_mark(env, group):
         assert r.exit_code == 0, r.output
     hits = memory.search(env.vault, "Pangolin", group=group)
     assert hits and all(line.startswith(CANDIDATE_MARK) for _, _, line in hits)
+
+
+# --------------------------------------------------------------------------- #
+# status: the session-start load caps (#98i), printed after everything else
+# --------------------------------------------------------------------------- #
+
+STATUS_MEMORY_230_TAIL = (
+    "is 230 lines / 27.0 KB; Claude Code loads only the first "
+    "200 lines / 25 KB; run memory-librarian"
+)
+
+
+def _status_230_line(memory) -> str:
+    """The status line for a 230-line index: its folder, with home as ``~``."""
+    return f"MEMORY.md (~/.claude/projects/{memory.parent.parent.name}/memory) {STATUS_MEMORY_230_TAIL}"
+
+
+def _budget_memory(env):
+    """Run from a session folder outside git; return its native MEMORY.md path."""
+    from jacked.memory import load_budget
+
+    for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_PROJECT_DIR_NAME", "CLAUDE_CODE_DISABLE_AUTO_MEMORY"):
+        env.monkeypatch.delenv(var, raising=False)
+    cwd = env.tmp / "session"
+    cwd.mkdir()
+    env.monkeypatch.chdir(cwd)
+    memory = load_budget.native_memory_path(cwd, env.home, {})
+    memory.parent.mkdir(parents=True)
+    return memory
+
+
+def _seed_over_cap(memory):
+    memory.write_bytes((b"x" * 116 + b"\n") * 229 + b"y" * 206 + b"\n")
+
+
+def _status_lines(env):
+    env.buf.truncate(0)
+    env.buf.seek(0)
+    r = CliRunner().invoke(main, ["memory", "status"])
+    assert r.exit_code == 0, r.output
+    return [line for line in env.buf.getvalue().splitlines() if line.strip()]
+
+
+def test_status_prints_the_budget_line_last_before_init(env):
+    memory = _budget_memory(env)
+    _seed_over_cap(memory)
+    lines = _status_lines(env)
+    assert lines[-1] == _status_230_line(memory)
+    assert any("jacked memory init" in line for line in lines[:-1])
+
+
+def test_status_prints_the_budget_line_after_the_no_groups_note(env):
+    _init_empty(env)
+    memory = _budget_memory(env)
+    _seed_over_cap(memory)
+    lines = _status_lines(env)
+    assert lines[-1] == _status_230_line(memory)
+    assert lines[-2] == "No groups yet."
+
+
+def test_status_prints_the_budget_line_after_the_groups_table(env):
+    _init_empty(env)
+    CliRunner().invoke(main, [
+        "memory", "add", "--type", "decision", "--title", "One",
+        "--group", "hank", "--body", "Body.",
+    ])
+    memory = _budget_memory(env)
+    _seed_over_cap(memory)
+    lines = _status_lines(env)
+    assert lines[-1] == _status_230_line(memory)
+    assert any("hank" in line for line in lines[:-1])
+
+
+def test_status_prints_no_budget_line_under_the_cap(env):
+    _budget_memory(env).write_bytes((b"x" * 59 + b"\n") * 150)
+    lines = _status_lines(env)
+    assert not any("Claude Code loads" in line for line in lines)
+
+
+def test_status_quiet_prints_nothing_even_over_the_cap(env):
+    _seed_over_cap(_budget_memory(env))
+    r = CliRunner().invoke(main, ["memory", "status", "--quiet"])
+    assert r.exit_code == 1
+    assert env.buf.getvalue() == ""
+
+
+def test_status_keeps_each_budget_line_whole_on_a_narrow_console(env):
+    """A pipe or a narrow terminal must still get one line per warning."""
+    narrow = StringIO()
+    env.monkeypatch.setattr(cli, "console", Console(file=narrow, width=60, highlight=False))
+    memory = _budget_memory(env)
+    _seed_over_cap(memory)
+    r = CliRunner().invoke(main, ["memory", "status"])
+    assert r.exit_code == 0, r.output
+    assert _status_230_line(memory) in narrow.getvalue().splitlines()
+
+
+@pytest.mark.parametrize("ch", [
+    "\x80", "\x85", "\x9b", "\x9f",  # C1 controls (U+009B is CSI)
+    "\u200e", "\u200f", "\u202a", "\u202e", "\u2066", "\u2069",  # bidi marks and overrides
+])
+def test_strip_control_removes_c1_controls_and_bidi_overrides(ch):
+    assert vault_mod.strip_control(f"a{ch}b") == "ab"
+
+
+def test_one_line_reads_a_line_break_control_as_a_space():
+    """NEL and CR end a line; one_line keeps the words apart, then strips."""
+    assert vault_mod.one_line("a\x85b\rc\u2028d\x9be") == "a b c de"
+
+
+def test_strip_control_keeps_tab_and_newline_and_strips_cr():
+    """The regex strips CR too (the safer behavior), as its docs now say."""
+    text = "a" + chr(9) + "b" + chr(10) + "c" + chr(13) + "d" + chr(27) + "[0m" + chr(127)
+    assert vault_mod.strip_control(text) == "a" + chr(9) + "b" + chr(10) + "cd[0m"
