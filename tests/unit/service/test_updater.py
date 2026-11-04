@@ -130,7 +130,7 @@ def _script_port_mock(mock, results, run_mock) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _stub_native_restart():
+def _stub_native_restart(monkeypatch):
     """Keep the real native lifecycle adapter out of every test in this file.
 
     The final guard of run_update calls native_restart when a run ends
@@ -139,12 +139,16 @@ def _stub_native_restart():
     temporary HOME. Only the missing supervisor artifact and the conftest
     launchctl tripwire stopped it. A test that asserts on native_restart
     patches its own mock, and that patch replaces this stub for the test.
+
+    The stub goes through the test's own ``monkeypatch``. A ``patch()``
+    context here was undone BEFORE ``monkeypatch`` (conftest fixtures set
+    ``monkeypatch`` up first), so a test that set native_restart with
+    ``monkeypatch.setattr`` put this stub back for every later test file
+    (test_native_restart.py then read "stubbed native_restart").
     """
-    with patch(
-        "jacked.service.platform.native_restart",
-        return_value=(True, "stubbed native_restart"),
-    ) as stub:
-        yield stub
+    stub = MagicMock(return_value=(True, "stubbed native_restart"))
+    monkeypatch.setattr("jacked.service.platform.native_restart", stub)
+    return stub
 
 
 def test_no_test_in_this_file_runs_the_real_native_restart():
@@ -2927,18 +2931,45 @@ class TestTrayUpdaterNeverDowngrades:
 
         # The tray writes the status record before it spawns the updater.
         us.init_status(us.UPDATE_STATUS_FILE, from_version="0.111.2",
-                       to_version="0.111.2", method="uv", preinit=True)
+                       to_version="0.111.3", method="uv", preinit=True)
 
-        updater.run_update(4242, "tray", target_version="0.111.2", port=8321)
+        updater.run_update(4242, "tray", target_version="0.111.3", port=8321)
 
         assert ran == []
-        assert self.REFUSAL in updater.RECOVERY_FILE.read_text()
         assert f"REFUSED: {self.REFUSAL}" in updater.UPDATE_LOG.read_text()
+        # UG-1: nothing failed, so the next tray start shows no
+        # "Jacked Update Failed Earlier" toast.
+        assert not updater.RECOVERY_FILE.exists()
         data = us.read_status(us.UPDATE_STATUS_FILE)
-        assert data["overall"] == "failed"
-        assert self.REFUSAL in data["error"]
+        assert data["overall"] == "succeeded"
+        assert data["to_version"] == "0.111.2"
+        assert data["note"] == self.REFUSAL
+        assert "preinit" not in data and not data.get("error")
         # The tray stopped the service for the update: the refusal starts it again.
         assert restarts == [1]
+
+    def test_a_no_op_leaves_an_earlier_closed_record_and_recovery_file_alone(
+        self, monkeypatch
+    ):
+        """Only the record of THIS click (the tray pre-init) closes as a no-op.
+        A record and a recovery file from an earlier real failure stay."""
+        from jacked.service import update_status as us
+        from jacked.service import updater
+
+        self._setup(monkeypatch, installable="0.111.1")
+        monkeypatch.setattr(
+            "jacked.service.platform.native_restart", lambda: (True, "stubbed")
+        )
+        us.init_status(us.UPDATE_STATUS_FILE, from_version="0.111.0",
+                       to_version="0.111.2", method="uv")
+        us.mark_failed(us.UPDATE_STATUS_FILE, error="an earlier failure")
+        updater.RECOVERY_FILE.write_text("an earlier failure\n")
+
+        updater.run_update(4242, "tray", target_version="0.111.3", port=8321)
+
+        data = us.read_status(us.UPDATE_STATUS_FILE)
+        assert data["overall"] == "failed" and data["error"] == "an earlier failure"
+        assert updater.RECOVERY_FILE.read_text() == "an earlier failure\n"
 
     def test_same_version_reinstalls_with_the_floor(self, monkeypatch):
         from jacked.service import updater

@@ -95,6 +95,7 @@
         haveRecord: false,
         error: null,
         recovery: null,
+        note: null,
         phases: {},
         serviceDownSince: null,
     };
@@ -203,7 +204,8 @@
 
     function renderHeading(done) {
         const heading = document.getElementById("heading");
-        if (done) heading.textContent = "Jacked is updated";
+        if (done && state.note) heading.textContent = "Jacked is up to date";
+        else if (done) heading.textContent = "Jacked is updated";
         else if (state.overall === "failed") heading.textContent = "Jacked update failed";
         else heading.textContent = "Jacked is updating\u2026";
     }
@@ -261,7 +263,10 @@
         if (done) {
             banner.classList.add("succeeded");
             const v = state.currentVersion || state.targetVersion || "";
-            banner.appendChild(makeEl("div", null, "Update complete. jacked is now v" + v + "."));
+            // A no-op (#295i): the updater refused an older version, and its
+            // note says why nothing changed.
+            banner.appendChild(makeEl("div", null,
+                state.note || ("Update complete. jacked is now v" + v + ".")));
             renderWarnings(banner);
             const a = makeEl("a", "button", "Open dashboard");
             a.href = "/";
@@ -270,7 +275,8 @@
             banner.appendChild(a);
             banner.style.display = "block";
             // Append the added/changed/removed lists below the banner (once).
-            renderChangeSummary();
+            // A no-op installed nothing, so the last install is not its change.
+            if (!state.note) renderChangeSummary();
         } else if (state.overall === "failed") {
             banner.classList.add("failed");
             banner.appendChild(makeEl("div", null, "Update failed."));
@@ -329,6 +335,7 @@
                     state.currentPhase = body.status.current_phase || null;
                     state.error = body.status.error;
                     state.recovery = body.status.recovery;
+                    state.note = typeof body.status.note === "string" ? body.status.note : null;
                     state.phases = {};
                     for (const p of body.status.phases || []) {
                         state.phases[p.name] = p;

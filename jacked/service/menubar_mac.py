@@ -699,11 +699,7 @@ if RUMPS_AVAILABLE:
             """User clicked the 'update available' line — run the existing
             tray updater off the main thread (it spawns the detached updater and
             stops the service; our stop-watch timer then quits the app)."""
-            threading.Thread(
-                target=self._runner._on_update_click,
-                name="jacked-mac-update",
-                daemon=True,
-            ).start()
+            self._runner._on_update_click_in_background()
 
         @staticmethod
         def _osa_quote(s):
