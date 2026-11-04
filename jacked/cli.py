@@ -802,14 +802,9 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
     a running .exe, so we have to step out of the way. This process
     exits cleanly and the helper takes over.
     """
-    from jacked import __version__
+    from jacked import __version__, upgrade_guard
     from jacked.findbin import find_bin
-    from jacked.install_method import (
-        can_auto_upgrade,
-        detect_install_method,
-        upgrade_command,
-        upgrade_command_label,
-    )
+    from jacked.install_method import can_auto_upgrade, detect_install_method
     from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
 
     # Pre-flight: refuse editable / pip installs before touching the service.
@@ -829,8 +824,20 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
         sys.exit(2)
 
     method = detect_install_method()
-    cmd = upgrade_command(extras)
-    label = upgrade_command_label(extras)
+    # No install moves to an older version than the build on disk (#295i):
+    # the index check refuses first, and the command carries a version floor.
+    # The target names the newest release either index lists, so a lagging
+    # simple index (#166i) or JSON API (G3) is reported truthfully.
+    installed = _installed_package_version() or __version__
+    versions, refusal = upgrade_guard.preinstall_check(installed)
+    target_version = versions.target
+    if target_version:
+        console.print(f"[dim]Target version: v{target_version} (PyPI)[/dim]")
+    if refusal:
+        _refuse_downgrade(refusal, installed, target_version)
+
+    cmd = upgrade_guard.guarded_upgrade_command(extras, installed)
+    label = upgrade_guard.guarded_upgrade_command_label(extras, installed)
 
     # uv-based flow requires `uv` on PATH; pip/pipx flows don't.
     if method == "uv":
@@ -847,16 +854,6 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
         f"[bold]Upgrading claude-jacked from v{__version__}...[/bold]  "
         f"[dim](install method: {method})[/dim]\n"
     )
-
-    # The version this upgrade should reach: the newest release that PyPI's
-    # JSON API or its simple index names. The install resolves through the
-    # simple index, and either source can lag the other for minutes after a
-    # release. When the JSON API lags (G3), the simple index's answer is the
-    # target and uv installs it. When the simple index lags (#166i), knowing
-    # the target is how a reinstall of the old build gets reported truthfully.
-    target_version = _upgrade_target_version()
-    if target_version:
-        console.print(f"[dim]Target version: v{target_version} (PyPI)[/dim]")
 
     # Windows can't overwrite a running .exe. Spawn a detached cmd.exe that
     # waits for this process to die, then does the install + migrate + restart.
@@ -884,42 +881,20 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
 EXIT_INDEX_LAG = 4
 
 
-def _upgrade_target_version() -> str | None:
-    """The claude-jacked version that this upgrade aims for, or None when unknown.
+def _refuse_downgrade(refusal: str, installed: str, target: str | None) -> None:
+    """Stop before any install, lock or status write: the install would go back.
 
-    The target is the newest release that PyPI's JSON API or its simple index
-    names (see version_check.newest_listed_version, which also says why the
-    target differs from the version that uv installs now). Best effort with a
-    short timeout: offline, the upgrade proceeds exactly as before and
-    reports what it installed.
+    Exit 0 (the installed build is the newest that the index serves), or
+    EXIT_INDEX_LAG when the index also names a newer release it does not serve.
     """
-    from concurrent.futures import ThreadPoolExecutor
-
-    from jacked.install_method import safe_version_label
-    from jacked.version_check import (
-        get_latest_from_simple_index,
-        get_latest_pypi_version,
-        newest_listed_version,
-    )
-
-    # Two independent network reads at the same time: an unreachable index
-    # costs one timeout, not two. Each probe logs its own failure and returns
-    # None, so one failure never hides the other answer or blocks an upgrade.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        pypi_latest, simple_latest = pool.map(
-            lambda probe: probe(timeout=5.0),
-            (get_latest_pypi_version, get_latest_from_simple_index),
+    console.print(f"\n[yellow]{refusal}[/yellow]")
+    if _index_lag(installed, target):
+        console.print(
+            f"[yellow]The package index does not serve v{target} yet. "
+            "Try again in a few minutes.[/yellow]"
         )
-    target = newest_listed_version(pypi_latest, simple_latest)
-    if not target:
-        return None
-    # The label reaches a generated Windows batch: allow a version shape only.
-    return safe_version_label(target, fallback="") or None
-
-
-# The real lookup, for tests: tests/conftest.py replaces _upgrade_target_version
-# so no test reaches PyPI, and this name lets the lookup itself be tested.
-_upgrade_target_version_impl = _upgrade_target_version
+        sys.exit(EXIT_INDEX_LAG)
+    sys.exit(0)
 
 
 def _status_target(previous: str, target: str | None) -> str:
@@ -946,17 +921,10 @@ def _index_lag(installed: str, target: str | None) -> bool:
     >>> _index_lag("0.109.0.dev3", "0.109.0"), _index_lag("0.109.0rc1", "0.109.0")
     (True, True)
     """
-    if not target or not installed:
-        return False
     # PEP 440 ordering (pre-releases and dev builds sort before the release).
-    from packaging.version import InvalidVersion, Version
+    from jacked.upgrade_guard import is_older
 
-    try:
-        return Version(installed) < Version(target)
-    except InvalidVersion:
-        from jacked.version_check import _parse_version_tuple
-
-        return _parse_version_tuple(installed) < _parse_version_tuple(target)
+    return is_older(installed, target)
 
 
 def _index_lag_message(installed: str, target: str, changed: bool) -> str:
@@ -1762,6 +1730,27 @@ def _run_upgrade_inline_locked(request: "_UpgradeRequest") -> None:
     # Step 1: package upgrade (uv / pipx, auto-detected).
     jacked = _upgrade_install_package(request.cmd, request.label)
     new_version = _installed_package_version()
+    plan = _RollbackPlan(
+        jacked=jacked,
+        previous_version=request.previous_version,
+        extras=request.extras,
+        skip_service=request.skip_service,
+        reason="",
+    )
+    if _index_lag(new_version, request.previous_version):
+        # The version floor in the install command makes this unreachable
+        # with uv and pipx. If an installer ever ignores the floor, the older
+        # build is a failed upgrade, never "Upgraded to" (#295i). The service
+        # was not touched yet: roll back before the preflight. The rollback
+        # records the failure in the status file.
+        _upgrade_rollback_and_exit(
+            plan=replace(
+                plan, reason=f"the install is older than v{request.previous_version}"
+            ),
+            new_version=new_version,
+            detail="",
+            no_rollback=request.no_rollback,
+        )
     lagging = _index_lag(new_version, request.target_version)
     if lagging and new_version == request.previous_version:
         # The index served the build that is already installed. Nothing on
@@ -1778,13 +1767,6 @@ def _run_upgrade_inline_locked(request: "_UpgradeRequest") -> None:
             logger.debug("Could not mark the update status failed", exc_info=True)
         console.print(f"\n[yellow]{message}[/yellow]")
         sys.exit(EXIT_INDEX_LAG)
-    plan = _RollbackPlan(
-        jacked=jacked,
-        previous_version=request.previous_version,
-        extras=request.extras,
-        skip_service=request.skip_service,
-        reason="",
-    )
     # Step 2: the transaction gate. Runs even with --skip-service.
     _upgrade_preflight_or_rollback(plan, new_version, request.no_rollback)
     # Step 3: settings migration; a failure rolls back to the running build.
@@ -2516,6 +2498,19 @@ def _update_status_succeed_shim(target, previous):
 
     path = us_mod.UPDATE_STATUS_FILE
     installed = _installed_package_version()
+    if previous and _index_lag(installed, previous):
+        # The version floor in the install command makes this unreachable.
+        # If an installer ever ignores it, an older build is a failure, never
+        # "Upgraded to" and never "succeeded" (#295i).
+        error = f"the install is v{installed}, which is older than v{previous}"
+        us_mod.with_update_lock(
+            path,
+            lambda: us_mod.mark_failed(
+                path, error=error, recovery=f"jacked upgrade (from v{installed})"
+            ),
+        )
+        click.echo(f"The install is v{installed}, which is older than v{previous}.")
+        sys.exit(1)
     if _index_lag(installed, target):
         message = _index_lag_message(installed, target, changed=installed != previous)
         us_mod.with_update_lock(

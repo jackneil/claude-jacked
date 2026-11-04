@@ -631,15 +631,18 @@ def run_update(
         detect_install_method as _detect,
         rollback_command,
         rollback_command_label,
-        upgrade_command,
-        upgrade_command_label,
     )
     from jacked.service import update_status as _us
-    from jacked import __version__ as _current_version
+    from jacked import __version__ as _current_version, upgrade_guard
 
     _ok, _reason = _can_upgrade()
     if not _ok:
         _refuse(_reason, f"Jacked auto-update refused:\n{_reason}\n")
+        return
+
+    # #295i: never an older version. The refusal restarts the stopped service.
+    if _downgrade := upgrade_guard.current_refusal():
+        _refuse(_downgrade, f"Jacked auto-update did nothing. {_downgrade}\n")
         return
 
     # --- Status file lifecycle
@@ -805,8 +808,7 @@ def run_update(
 
         method = _method
         try:
-            cmd = upgrade_command(extras)
-            label = upgrade_command_label(extras)
+            cmd, label = upgrade_guard.guarded_upgrade_commands(extras)  # #295i floor
         except ValueError as exc:
             # Defense in depth: _can_upgrade() gate above should already
             # refuse pip/editable, but if a future code path skips the gate
@@ -1741,7 +1743,9 @@ def _tray_package_failed_block(
     block = (
         ":package_failed\r\n"
         'jacked _update_status installing_package failed --error "'
-        + PACKAGE_FAILED_REASON + '" --recovery "' + label + '"\r\n'
+        # Inside a quoted argument a " would end it: swap it for '. An echo
+        # keeps the " quotes, which hold the floor's ">" (#295i).
+        + PACKAGE_FAILED_REASON + '" --recovery "' + label.replace('"', "'") + '"\r\n'
         + drift_guard
         + "echo [%date% %time%] ERROR: " + PACKAGE_FAILED_REASON + "\r\n"
         "set FAILREASON=" + PACKAGE_FAILED_REASON + "\r\n"
@@ -1819,14 +1823,13 @@ def _spawn_windows_tray_updater(
     import tempfile
 
     from jacked.findbin import find_bin
+    from jacked import upgrade_guard
     from jacked.install_method import (
         can_auto_upgrade,
         detect_install_method,
         rollback_command,
         rollback_command_label,
         safe_version_label,
-        upgrade_command,
-        upgrade_command_label,
     )
 
     # Gate: same refusal as run_update / jacked upgrade.  Prevents
@@ -1843,17 +1846,13 @@ def _spawn_windows_tray_updater(
         return
 
     method = detect_install_method()
-    cmd = upgrade_command(extras)
+    cmd, label = upgrade_guard.guarded_upgrade_commands(extras)  # #295i floor
 
     if method in _TOOL_INSTALL_HINTS:
         resolved_tool = find_bin(method)
         if resolved_tool:
             cmd[0] = resolved_tool
 
-    label = upgrade_command_label(extras)
-    # Recovery string goes inside a cmd.exe argument between double quotes;
-    # internal " (present in uv's label) would terminate the arg. Swap for '.
-    label_for_batch = label.replace('"', "'")
     upgrade_line = " ".join(f'"{arg}"' for arg in cmd)
     to_version = safe_version_label(target_version or "next", fallback="next")
     # Read the tray's creation identity NOW, while the tray is alive: the
@@ -1931,7 +1930,7 @@ def _spawn_windows_tray_updater(
     # it into the shared rollback, naming its own step for the failed file.
     package_failed_block = _tray_package_failed_block(
         port=port,
-        label=label_for_batch,
+        label=label,
         drift_guard=DRIFT_GUARD,
         has_rollback=bool(rollback_line),
     )

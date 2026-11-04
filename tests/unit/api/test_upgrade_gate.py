@@ -852,3 +852,45 @@ def test_upgrade_denial_copy_is_user_facing_clean():
         assert "--" not in message
         assert "Settings > Advanced" in message
         assert "host machine" in message
+
+
+def test_pin_295i_the_dashboard_upgrade_never_installs_an_older_version(monkeypatch):
+    """#295i: the Upgrade button asks the shared guard before it runs uv.
+    When the index serves an older version than the one on disk, no command
+    runs, the service is not replaced, and the page shows why."""
+    from jacked import upgrade_guard
+
+    refusal = (
+        "Nothing to upgrade. The package index serves v0.111.1. "
+        "The installed version is v0.111.2."
+    )
+    commands: list[list[str]] = []
+
+    async def _forbidden_command(cmd):
+        commands.append(cmd)
+        raise AssertionError("an install command ran for a downgrade")
+
+    def _forbidden_execv(prog, argv):
+        raise AssertionError("the service was replaced for a downgrade")
+
+    monkeypatch.setattr(upgrade_guard, "installed_version", lambda: "0.111.2")
+    monkeypatch.setattr(
+        upgrade_guard,
+        "probe_index_versions",
+        lambda timeout=5.0: upgrade_guard.IndexVersions("0.111.2", "0.111.1"),
+    )
+    monkeypatch.setattr(jacked.findbin, "find_bin", lambda name, *a, **k: f"/stub/bin/{name}")
+    monkeypatch.setattr(system, "find_bin", lambda name, *a, **k: f"/stub/bin/{name}")
+    monkeypatch.setattr(system, "_upgrade_run_cmd", _forbidden_command)
+    monkeypatch.setattr(system.os, "execv", _forbidden_execv)
+    registry = _Registry()
+
+    asyncio.run(system._do_upgrade(registry, LOOPBACK))
+
+    assert commands == []
+    assert registry.events == [
+        ("upgrade_started", {}),
+        ("upgrade_failed", {"error": refusal}),
+    ]
+    _assert_lease_is_free()
+    assert system._upgrade_lock.locked() is False

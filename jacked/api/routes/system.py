@@ -12,6 +12,7 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from jacked import upgrade_guard
 from jacked.api.mutation_gate import denied_response, mutation_decision
 from jacked.api.project_paths import first_outside_project, outside_project_response
 from jacked.api.remote_access import REASON_OUTSIDE_SCOPE, REASON_REMOTE_ACCESS_OFF
@@ -976,7 +977,10 @@ async def _run_upgrade_steps(ws_registry) -> None:
     stage = "upgrade"
     try:
         await _upgrade_broadcast(ws_registry, "upgrade_started", {})
-
+        # #295i: never install an older version (`uv tool upgrade` keeps it too).
+        if refusal := await asyncio.to_thread(upgrade_guard.current_refusal):
+            await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": refusal})
+            return
         uv_bin = find_bin("uv")
         if not uv_bin:
             raise RuntimeError("uv not found on PATH. Cannot upgrade.")
@@ -1056,8 +1060,6 @@ async def system_upgrade(request: Request):
     return {"status": "started"}
 
 
-
-
 @router.get("/logs/hooks")
 def list_hook_logs(
     request: Request,
@@ -1101,8 +1103,6 @@ def list_version_check_logs(
         "limit": clamped_limit,
         "offset": clamped_offset,
     }
-
-
 
 
 @router.get("/settings", response_model=list[SettingResponse])

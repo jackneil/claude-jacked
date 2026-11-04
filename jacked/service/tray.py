@@ -1453,20 +1453,20 @@ class ServiceRunner:
         # Breadcrumb FIRST — proves the click reached us even if everything
         # downstream fails. Uses the same log file the detached updater
         # appends to.
-        try:
-            import time as _time_mod
-            from jacked.service.updater import UPDATE_LOG as _bc_log
-
-            _bc_log.parent.mkdir(parents=True, exist_ok=True)
-            with open(_bc_log, "a", encoding="utf-8") as _lf:
-                _lf.write(
-                    f"[{_time_mod.strftime('%Y-%m-%d %H:%M:%S')}] tray: update clicked "
-                    f"(tray PID {os.getpid()}, target v{latest})\n"
-                )
-        except Exception:
-            logger.exception("Could not write tray-click breadcrumb")
+        from jacked import upgrade_guard
+        upgrade_guard.append_update_log(
+            f"tray: update clicked (tray PID {os.getpid()}, target v{latest})"
+        )
 
         try:
+            # #295i: ask the index BEFORE the tray stops the service.
+            if refusal := upgrade_guard.current_refusal(log_source="tray"):
+                if self._icon:
+                    try:
+                        self._notify(self._icon, "Jacked Update", refusal)
+                    except Exception:
+                        logger.exception("Could not notify the update refusal")
+                return
             if self._icon:
                 try:
                     self._apply_icon("starting")
