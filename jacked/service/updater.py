@@ -607,18 +607,21 @@ def run_update(
     # its settings migration that way on `jacked.proctree`). A package
     # that cannot import its own upgrade modules refuses before any write.
     from jacked.mixed_generation import preload_upgrade_modules
+    from jacked.service.update_refusal import refuser
+
+    _refuse = refuser(parent_pid, log, _write_recovery, wait_for_exit, close=log_fh.close, start_fallback=lambda: _spawn_detached(
+        [find_bin("jacked") or "jacked", "service", "start"], log_fh=log_fh))
 
     try:
-        preload_upgrade_modules()
+        preload_upgrade_modules(log=log)
     except Exception as exc:
         logger.exception("The installed jacked cannot import its upgrade modules")
-        log(f"REFUSED: the installed jacked cannot import its upgrade modules ({type(exc).__name__})")
-        _write_recovery(
+        _refuse(
+            f"the installed jacked cannot import its upgrade modules ({type(exc).__name__})",
             "Jacked auto-update refused: the installed jacked cannot import its "
             f"upgrade modules ({type(exc).__name__}). Reinstall with "
-            'uv tool install "claude-jacked[tray]" --force --refresh, then retry.\n'
+            'uv tool install "claude-jacked[tray]" --force --refresh, then retry.\n',
         )
-        log_fh.close()
         return
 
     # Defense-in-depth: refuse non-upgradable installs even here, in case
@@ -636,9 +639,7 @@ def run_update(
 
     _ok, _reason = _can_upgrade()
     if not _ok:
-        log(f"REFUSED: {_reason}")
-        _write_recovery(f"Jacked auto-update refused:\n{_reason}\n")
-        log_fh.close()
+        _refuse(_reason, f"Jacked auto-update refused:\n{_reason}\n")
         return
 
     # --- Status file lifecycle
@@ -654,12 +655,11 @@ def run_update(
         # Same posture as the CLI: a machine that cannot take the lock must
         # not start a package install.
         logger.exception("Could not take the update lock")
-        log(f"REFUSED: could not take the update lock ({type(exc).__name__})")
-        _write_recovery(
+        _refuse(
+            f"could not take the update lock ({type(exc).__name__})",
             "Jacked auto-update refused: the update lock could not be taken "
-            f"({type(exc).__name__}). Check ~/.claude is writable, then retry.\n"
+            f"({type(exc).__name__}). Check ~/.claude is writable, then retry.\n",
         )
-        log_fh.close()
         return
     else:
         if _update_lock is None:

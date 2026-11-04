@@ -24,14 +24,25 @@ names too.
 
 Only modules without import-time side effects and without state are safe
 to reload this way.
+
+From 0.111.1 on, every upgrade process holds this module (``jacked.service.
+process`` imports it), and :func:`names_from` cannot guard a name added to
+its own module. Other modules therefore import only :data:`STABLE_NAMES`
+from it. Do not remove or rename one of them; a new name needs a ``getattr``
+fallback at each call site, and a unit test holds the set.
 """
 
 from __future__ import annotations
 
+import ast
 import importlib
+import importlib.util
 import re
 import sys
 from pathlib import Path
+
+# The names other jacked modules import from this module (see the docstring).
+STABLE_NAMES = frozenset({"names_from", "preload_upgrade_modules"})
 
 _VERSION_LINE = re.compile(r'^__version__ = "([^"]+)"', re.MULTILINE)
 
@@ -105,23 +116,33 @@ def names_from(module: str, *names: str) -> tuple:
 
     The caller is a module of this release that needs a name this release
     added to ``module``; an interpreter mid-upgrade from an older release
-    holds the older ``module``. Returns the attributes in order.
+    holds the older ``module``. Returns the attributes in order. A name that
+    the file on disk does not have either raises ImportError, as
+    ``from module import name`` does.
 
     >>> (no_window,) = names_from("jacked.winproc", "NO_WINDOW")
     >>> isinstance(no_window, int)
     True
+    >>> names_from("jacked.winproc", "no_such_name")
+    Traceback (most recent call last):
+    ImportError: cannot import name 'no_such_name' from 'jacked.winproc'
     """
     importlib.import_module(module)
     reload_missing(module, *names)
-    return tuple(getattr(sys.modules[module], name) for name in names)
+    held = sys.modules[module]
+    for name in names:
+        if not hasattr(held, name):
+            raise ImportError(f"cannot import name {name!r} from {module!r}", name=module)
+    return tuple(getattr(held, name) for name in names)
 
 
-# Every module an upgrade transaction imports lazily after its install step,
-# on the CLI path (``jacked upgrade``) and on the tray path
-# (``jacked.service.updater.run_update``): the process tree runner, the
-# legacy-tray resolver, the service platform and lifecycle with the
-# supervisors package under them, the service process helpers, and the
-# updater itself (the CLI path's migration and restart helpers live there).
+# The roots of an upgrade transaction, on the CLI path (``jacked upgrade``)
+# and on the tray path (``jacked.service.updater.run_update``): the process
+# tree runner, the legacy-tray resolver, the service platform and lifecycle
+# with the supervisors package under them, the service process helpers, and
+# the updater itself (the CLI path's migration and restart helpers live
+# there). :func:`preload_upgrade_modules` imports these, then every module
+# they import lazily, until no new module appears.
 UPGRADE_MODULES = (
     "jacked.proctree",
     "jacked.service.legacy",
@@ -132,16 +153,169 @@ UPGRADE_MODULES = (
 )
 
 
-def preload_upgrade_modules() -> tuple[str, ...]:
-    """Import every module an upgrade transaction needs, before the install.
+def lazy_imports(module: str, entry: str | None = None) -> set[str]:
+    """The ``jacked`` modules that ``module`` imports inside its functions.
 
-    Returns the module names in order. Raises what the import raises: a
-    package that cannot import its own upgrade modules must refuse the
-    transaction before anything changes on disk.
+    Reads the source file of ``module``; a lazy import runs only when its
+    function runs, which in an upgrade transaction can be after the install.
+    ``from jacked.pkg import name`` counts ``jacked.pkg.name`` too when that
+    is a submodule. With ``entry``, only the module-level function ``entry``
+    and the module-level functions it names, directly or through each other,
+    count. A module without a source file gives an empty set.
 
-    >>> preload_upgrade_modules() == UPGRADE_MODULES
+    >>> "jacked.service.supervisors.launchd" in lazy_imports("jacked.service.supervisors")
+    True
+    >>> "jacked.version_check" in lazy_imports("jacked.cli", entry="_run_upgrade_inline")
+    True
+    >>> lazy_imports("jacked.module_that_does_not_exist")
+    set()
+    """
+    tree = _source_tree(module)
+    if tree is None:
+        return set()
+    if entry is None:
+        bodies = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    else:
+        top = _top_functions(tree)
+        bodies = [top[name] for name in sorted(reachable_functions(tree, entry))]
+    package = module if Path(_origin(module) or "").name == "__init__.py" else module.rpartition(".")[0]
+    found: set[str] = set()
+    for function in bodies:
+        for node in ast.walk(function):
+            if isinstance(node, ast.Import):
+                found.update(a.name for a in node.names if _is_jacked(a.name))
+            elif isinstance(node, ast.ImportFrom):
+                base = _absolute(node, package)
+                if not _is_jacked(base):
+                    continue
+                if node.module:
+                    found.add(base)
+                found.update(f"{base}.{a.name}" for a in node.names if _is_submodule(f"{base}.{a.name}"))
+    return found
+
+
+def _absolute(node: ast.ImportFrom, package: str) -> str | None:
+    """The absolute module name of ``from ... import``, relative ones too."""
+    if node.level == 0:
+        return node.module
+    try:
+        return importlib.util.resolve_name("." * node.level + (node.module or ""), package)
+    except (ImportError, ValueError):
+        return None
+
+
+def reachable_functions(tree: ast.Module, entry: str) -> set[str]:
+    """The module-level functions that ``entry`` names, directly or in a chain.
+
+    A name counts when the function body loads it (a call, or a callback
+    passed on), so the set errs on the side of more functions.
+    """
+    top = _top_functions(tree)
+    if entry not in top:
+        return set()
+    seen, todo = set(), [entry]
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        todo.extend(
+            node.id for node in ast.walk(top[name])
+            if isinstance(node, ast.Name) and node.id in top and node.id not in seen
+        )
+    return seen
+
+
+def _top_functions(tree: ast.Module) -> dict:
+    return {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def _origin(module: str) -> str | None:
+    try:
+        spec = importlib.util.find_spec(module)
+    except Exception:  # find_spec imports the parent package
+        return None
+    origin = getattr(spec, "origin", None) if spec else None
+    return origin if origin and origin.endswith(".py") else None
+
+
+def _source_tree(module: str) -> ast.Module | None:
+    origin = _origin(module)
+    if origin is None:
+        return None
+    try:
+        return ast.parse(Path(origin).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return None
+
+
+def _is_jacked(name: str | None) -> bool:
+    return bool(name) and (name == "jacked" or name.startswith("jacked."))
+
+
+def _is_submodule(name: str) -> bool:
+    # find_spec imports the parent package, which can raise anything.
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
+# Loaded modules the walk does not read: the CLI module imports every command
+# lazily, so reading all of it would load the whole application. The CLI
+# transaction passes its entry function instead (``entry`` below).
+_WALK_SKIP = frozenset({"jacked.cli"})
+
+
+def preload_upgrade_modules(log=None, entry: tuple[str, str] | None = None) -> tuple[str, ...]:
+    """Import every module an upgrade transaction can import, before the install.
+
+    First the :data:`UPGRADE_MODULES` roots: an import error there raises,
+    because a package that cannot import its own upgrade modules must refuse
+    the transaction before anything changes on disk. Then every ``jacked``
+    module that a loaded ``jacked`` module (except ``jacked.cli``) imports
+    inside a function, again
+    and again until no new module appears. A lazy module that does not
+    import on this system is skipped and named to ``log``: its call site
+    meets the same error with or without an upgrade. ``entry`` is
+    ``(module, function)`` for a transaction that runs in a module the walk
+    skips: the lazy imports of that function and the functions it names are
+    loaded the same way. Returns the sorted names of the ``jacked`` modules
+    that this call loaded.
+
+    >>> imported = preload_upgrade_modules()
+    >>> import sys
+    >>> all(name in sys.modules for name in UPGRADE_MODULES)
+    True
+    >>> "jacked.service.supervisors.launchd" in sys.modules
     True
     """
+    before = {m for m in sys.modules if _is_jacked(m)}
     for name in UPGRADE_MODULES:
         importlib.import_module(name)
-    return UPGRADE_MODULES
+    walked: set[str] = set()
+    skipped: set[str] = set()
+    pending = sorted(lazy_imports(*entry)) if entry else []
+    while True:
+        for target in pending:
+            _import_or_skip(target, skipped, log)
+        pending = []
+        loaded = sorted(m for m in sys.modules if _is_jacked(m) and m not in walked and m not in _WALK_SKIP)
+        if not loaded:
+            break
+        for name in loaded:
+            walked.add(name)
+            for target in sorted(lazy_imports(name)):
+                _import_or_skip(target, skipped, log)
+    return tuple(sorted(m for m in sys.modules if _is_jacked(m) and m not in before))
+
+
+def _import_or_skip(target: str, skipped: set, log) -> None:
+    if target in sys.modules or target in skipped:
+        return
+    try:
+        importlib.import_module(target)
+    except Exception as exc:  # the call site meets this error too
+        skipped.add(target)
+        if log is not None:
+            log(f"preload: skipped {target} ({type(exc).__name__})")

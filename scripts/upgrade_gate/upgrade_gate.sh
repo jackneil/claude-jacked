@@ -29,7 +29,13 @@ if [ -z "$MODE" ] || [ -z "$EXPECT" ]; then
 fi
 case "$MODE" in cli|tray) ;; *) echo "mode must be cli or tray" >&2; exit 64 ;; esac
 UID_=$(id -u); LABEL=ai.hank.jacked; PORT="${JACKED_PORT:-8321}"
-PY="$HOME/.local/share/uv/tools/claude-jacked/bin/python"
+# The interpreter the real tray uses: the `jacked` entry point's shebang
+# (bin/python3 in a uv tool env). The service contract records the runtime
+# path, so bin/python here would compute a different generation than the
+# launchd artifact and make every native restart refuse with owned_drift.
+JACKED_BIN="$(command -v jacked || echo "$HOME/.local/bin/jacked")"
+PY="$(head -1 "$(readlink -f "$JACKED_BIN" 2>/dev/null || echo "$JACKED_BIN")" | sed 's/^#!//')"
+[ -x "$PY" ] || PY="$HOME/.local/share/uv/tools/claude-jacked/bin/python3"
 RECOVERY="$HOME/.claude/jacked-update-failed.txt"
 LOG_DIR="${TMPDIR:-/tmp}/jacked-upgrade-gate"; mkdir -p "$LOG_DIR"
 RUN_LOG="$LOG_DIR/$MODE-run.log"
