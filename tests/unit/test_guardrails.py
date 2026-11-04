@@ -798,3 +798,105 @@ class TestTemplateContent:
         )
         assert "/dc" in content
         assert "linter" in content
+
+
+class TestLanguageAllowlist:
+    """The language names a bundled template, so only a supported language
+    may reach a template path (CodeQL py/path-injection, #289i)."""
+
+    def test_supported_languages_cover_every_detected_language(self):
+        detected = {language for _, language in guardrails._LANGUAGE_INDICATORS}
+        assert detected <= set(guardrails.SUPPORTED_LANGUAGES)
+
+    def test_every_supported_language_has_both_bundled_templates(self):
+        for language in guardrails.SUPPORTED_LANGUAGES:
+            doc, hook = guardrails._LANGUAGE_TEMPLATES[language]
+            assert (guardrails.GUARDRAILS_TEMPLATES / doc).is_file()
+            assert (guardrails.HOOK_TEMPLATES / hook).is_file()
+
+    def test_cli_and_dashboard_offer_exactly_the_supported_languages(self):
+        import typing
+
+        from jacked.api.routes.system import ProjectInitRequest
+        from jacked.cli import guardrails_init, init_project, lint_hook_init
+
+        supported = set(guardrails.SUPPORTED_LANGUAGES)
+        for command in (guardrails_init, lint_hook_init, init_project):
+            option = next(p for p in command.params if p.name == "language")
+            assert set(option.type.choices) == supported, command.name
+        annotation = ProjectInitRequest.model_fields["language"].annotation
+        literal = next(a for a in typing.get_args(annotation) if a is not type(None))
+        assert set(typing.get_args(literal)) == supported
+
+    @pytest.mark.parametrize("language", ["../../../etc/passwd", "cobol", "python/../base", ""])
+    def test_create_refuses_an_unsupported_language(self, tmp_path, language):
+        result = guardrails.create_guardrails(tmp_path, language=language)
+        assert result["created"] is False
+        assert "Unknown language" in result["reason"]
+        assert not (tmp_path / "JACKED_GUARDRAILS.md").exists()
+
+    def test_create_refuses_before_force_removes_old_variants(self, tmp_path):
+        old = tmp_path / "DESIGN_GUARDRAILS.md"
+        old.write_text("keep me", encoding="utf-8")
+        result = guardrails.create_guardrails(tmp_path, language="../x", force=True)
+        assert result["created"] is False
+        assert old.read_text(encoding="utf-8") == "keep me"
+
+    def test_create_never_reads_a_template_outside_the_template_folder(self, tmp_path):
+        secret = tmp_path / "secret.md"
+        secret.write_text("TOP SECRET", encoding="utf-8")
+        traversal = os.path.relpath(secret.with_suffix(""), guardrails.GUARDRAILS_TEMPLATES)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        result = guardrails.create_guardrails(repo, language=traversal)
+        assert result["created"] is False
+        assert not (repo / "JACKED_GUARDRAILS.md").exists()
+
+    @pytest.mark.parametrize("language", ["../../../etc/passwd", "cobol", ""])
+    def test_install_hook_refuses_an_unsupported_language(self, tmp_path, language):
+        (tmp_path / ".git" / "hooks").mkdir(parents=True)
+        result = guardrails.install_hook(tmp_path, language=language)
+        assert result["installed"] is False
+        assert "Unknown language" in result["reason"]
+        assert not (tmp_path / ".git" / "hooks" / "pre-push").exists()
+
+
+class TestHookWriteReplacesLinks:
+    """A link at .git/hooks/pre-push is replaced, never written through."""
+
+    @requires_symlinks
+    def test_force_replaces_a_linked_hook_and_keeps_the_link_target(self, tmp_path):
+        repo = tmp_path / "repo"
+        (repo / ".git" / "hooks").mkdir(parents=True)
+        outside = tmp_path / "bashrc"
+        outside.write_text("export SAFE=1\n", encoding="utf-8")
+        outside.chmod(0o644)
+        (repo / ".git" / "hooks" / "pre-push").symlink_to(outside)
+
+        result = guardrails.install_hook(repo, language="python", force=True)
+
+        assert result["installed"] is True
+        assert outside.read_text(encoding="utf-8") == "export SAFE=1\n"
+        if os.name == "posix":
+            assert outside.stat().st_mode & 0o111 == 0
+        hook = repo / ".git" / "hooks" / "pre-push"
+        assert not hook.is_symlink()
+        assert guardrails.HOOK_MARKER in hook.read_text(encoding="utf-8")
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+    def test_the_installed_hook_is_executable_and_byte_identical(self, tmp_path):
+        (tmp_path / ".git" / "hooks").mkdir(parents=True)
+        result = guardrails.install_hook(tmp_path, language="rust")
+        hook = Path(result["path"])
+        assert os.access(hook, os.X_OK)
+        template = guardrails.HOOK_TEMPLATES / "pre-push-rust.sh"
+        assert hook.read_bytes() == template.read_bytes()
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+    def test_force_over_a_non_executable_foreign_hook_makes_it_executable(self, tmp_path):
+        hook = tmp_path / ".git" / "hooks" / "pre-push"
+        hook.parent.mkdir(parents=True)
+        hook.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+        hook.chmod(0o644)
+        guardrails.install_hook(tmp_path, language="python", force=True)
+        assert os.access(hook, os.X_OK)

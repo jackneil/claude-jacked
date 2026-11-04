@@ -4566,10 +4566,15 @@ def _validate_env_path(env_path: str) -> str | None:
     True
     >>> _validate_env_path("relative/path") is not None
     True
+    >>> _validate_env_path("/opt/env\\n/other")
+    'Path contains invalid characters'
     """
     if not env_path or len(env_path) > 500:
         return "Invalid path length"
-    if "\x00" in env_path or ".." in env_path:
+    # The pre-push hook reads only the first line of .git/jacked/env, so a
+    # line break (or any other control character) would let the hook use a
+    # path that this check never saw.
+    if ".." in env_path or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in env_path):
         return "Path contains invalid characters"
     p = Path(env_path)
     if not p.is_absolute():
@@ -4582,16 +4587,18 @@ def _validate_env_path(env_path: str) -> str | None:
 def _write_project_env(repo_path: str, env_path: str) -> bool:
     """Write env path to .git/jacked/env for hook consumption.
 
-    Returns True if written, False if repo has no .git directory.
+    Returns True if written, False if repo has no .git directory. The shared
+    atomic writer replaces a link at the env file with a plain file, so the
+    write never goes through the link to the file that it points at.
 
     >>> # Only writes when .git exists
     """
+    from jacked.atomic_io import atomic_write_text
+
     git_dir = Path(repo_path) / ".git"
     if not git_dir.is_dir():
         return False
-    jacked_dir = git_dir / "jacked"
-    jacked_dir.mkdir(parents=True, exist_ok=True)
-    (jacked_dir / "env").write_text(env_path + "\n", encoding="utf-8")
+    atomic_write_text(git_dir / "jacked" / "env", env_path + "\n", new_file_mode=0o644)
     return True
 
 
