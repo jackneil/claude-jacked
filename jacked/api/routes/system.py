@@ -896,9 +896,9 @@ async def _run_upgrade_steps(ws_registry) -> None:
     stage = "upgrade"
     try:
         await _upgrade_broadcast(ws_registry, "upgrade_started", {})
-        # #295i: never install an older version (`uv tool upgrade` keeps it too).
+        # #295i: never install an older version. A refusal is a no-op, not a failure.
         if refusal := await asyncio.to_thread(upgrade_guard.current_refusal):
-            await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": refusal})
+            await _upgrade_broadcast(ws_registry, "upgrade_noop", {"message": refusal})
             return
         uv_bin = find_bin("uv")
         if not uv_bin:

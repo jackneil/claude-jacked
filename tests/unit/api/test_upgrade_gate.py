@@ -900,7 +900,8 @@ def test_pin_295i_the_dashboard_upgrade_never_installs_an_older_version(monkeypa
     assert commands == []
     assert registry.events == [
         ("upgrade_started", {}),
-        ("upgrade_failed", {"error": refusal}),
+        # A no-op is not a failure: the page shows a note, not an error.
+        ("upgrade_noop", {"message": refusal}),
     ]
     _assert_lease_is_free()
     assert system._upgrade_lock.locked() is False
