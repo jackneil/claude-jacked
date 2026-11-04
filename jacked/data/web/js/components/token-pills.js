@@ -78,37 +78,46 @@ function _renderSinglePill(cfg) {
     return `<span class="token-pill"><span class="pill-dot ${dotClass}"></span><span class="pill-label">${label}</span>${statusHtml}</span>`;
 }
 
+// The signed-out hint for each provider whose CLI owns the login.
+const MANAGED_CLI_SIGNED_OUT = {
+    codex: 'Signed out of Codex. Run `codex login`, then select Add Account > Codex.',
+    grok: 'Signed out of Grok. Open the account menu and select Re-auth.',
+};
+
 /**
- * Codex accounts have no Anthropic "Usage Token" and no Claude Code "CC Token" —
- * those pills are meaningless here. Show a single signed-in/re-login status
- * instead (validity = logged in to Codex + the app-server usage works).
+ * Codex and Grok accounts have no Anthropic "Usage Token" and no Claude Code
+ * "CC Token". Those pills are meaningless here. Show a single
+ * signed-in/re-login status instead (for Codex, validity = logged in to Codex
+ * + the app-server usage works).
  */
-function _renderCodexPill(acct) {
+
+function _renderManagedCliPill(acct, name) {
     const vs = acct.validation_status;
     let dot, text, title;
     if (vs === 'invalid') {
         dot = 'triangle';
         text = 're-login';
-        title = 'Signed out of Codex. Run `codex login`, then select Add Account > Codex.';
+        title = MANAGED_CLI_SIGNED_OUT[acct.provider] || ('Signed out of ' + name + '.');
     } else if (vs === 'checking') {
         dot = 'pulse';
         text = 'checking…';
-        title = 'Checking Codex sign-in';
+        title = 'Checking ' + name + ' sign-in';
     } else {
         dot = 'filled green';
         text = 'signed in';
-        title = 'Signed in to Codex';
+        title = 'Signed in to ' + name;
     }
     return `<span class="token-pills-container"><span class="token-pill" title="${escapeHtml(title)}"><span class="pill-dot ${dot}"></span><span class="pill-label">${text}</span></span></span>`;
 }
 
 /**
- * Render the token pills for an account card. Codex accounts get a single
- * signed-in pill; Claude accounts get the Usage Token (+ CC Token) pills.
+ * Render the token pills for an account card. A Codex or Grok account gets a
+ * single signed-in pill; Claude accounts get the Usage Token (+ CC Token) pills.
  */
 function renderTokenPills(acct) {
-    if ((acct.provider || 'claude') === 'codex') {
-        return _renderCodexPill(acct);
+    const provider = acct.provider || 'claude';
+    if (provider !== 'claude') {
+        return _renderManagedCliPill(acct, provider === 'codex' ? 'Codex' : (provider === 'grok' ? 'Grok' : provider));
     }
     const primaryPill = _renderSinglePill({
         label: PRIMARY_LABEL,

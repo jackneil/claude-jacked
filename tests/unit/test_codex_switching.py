@@ -365,3 +365,67 @@ def test_use_account_route_swaps_codex(tmp_path, db, monkeypatch):
     # root now holds account A
     root = json.loads((base / "auth.json").read_text())
     assert root["tokens"]["account_id"] == "acct-A"
+
+
+# --------------------------------------------------------------------------
+# sync_active_slot_from_live: the timer copy of a rotated live login
+# --------------------------------------------------------------------------
+
+def _active_codex(db, base, org="acct-A", email="a@x.com"):
+    a = db.create_account(email, "t", 9999999999, provider="codex", organization_uuid=org)
+    db.set_active_account_id(a["id"], provider="codex")
+    _write(sw.codex_slot_auth_path(a["id"], base), _auth(org, email))
+    return a
+
+
+def test_sync_copies_a_rotated_live_login_into_the_active_slot(tmp_path, db):
+    """Codex spends its refresh token and writes a new one into auth.json. The
+    slot is then the spent copy, and a later switch back would replay it."""
+    base = tmp_path / ".codex"
+    a = _active_codex(db, base)
+    rotated = _auth("acct-A", "a@x.com", last_refresh="2026-07-01T00:00:00Z")
+    rotated["tokens"]["refresh_token"] = "refresh-rotated"
+    _write(base / "auth.json", rotated)
+
+    assert sw.sync_active_slot_from_live(db, base) is True
+    slot = json.loads(sw.codex_slot_auth_path(a["id"], base).read_text())
+    assert slot["tokens"]["refresh_token"] == "refresh-rotated"
+    assert sw.sync_active_slot_from_live(db, base) is False
+
+
+def test_sync_never_copies_another_account_into_the_active_slot(tmp_path, db):
+    base = tmp_path / ".codex"
+    a = _active_codex(db, base)
+    _write(base / "auth.json", _auth("acct-STRANGER", "s@x.com"))
+
+    assert sw.sync_active_slot_from_live(db, base) is False
+    slot = json.loads(sw.codex_slot_auth_path(a["id"], base).read_text())
+    assert slot["tokens"]["account_id"] == "acct-A"
+
+
+def test_sync_skips_while_a_swap_holds_the_lock(tmp_path, db):
+    base = tmp_path / ".codex"
+    a = _active_codex(db, base)
+    rotated = _auth("acct-A", "a@x.com", last_refresh="2026-07-01T00:00:00Z")
+    rotated["tokens"]["refresh_token"] = "refresh-rotated"
+    _write(base / "auth.json", rotated)
+
+    with sw._codex_swap_lock(base):
+        assert sw.sync_active_slot_from_live(db, base) is False
+    slot = json.loads(sw.codex_slot_auth_path(a["id"], base).read_text())
+    assert slot["tokens"]["refresh_token"] == "refresh-acct-A"
+
+
+def test_sync_does_nothing_under_keyring_storage(tmp_path, db):
+    """Under the keyring the file is not the live credential. Copying it would
+    store a login that Codex no longer uses."""
+    base = tmp_path / ".codex"
+    a = _active_codex(db, base)
+    (base / "config.toml").write_text('cli_auth_credentials_store = "keyring"\n')
+    rotated = _auth("acct-A", "a@x.com", last_refresh="2026-07-01T00:00:00Z")
+    rotated["tokens"]["refresh_token"] = "refresh-rotated"
+    _write(base / "auth.json", rotated)
+
+    assert sw.sync_active_slot_from_live(db, base) is False
+    slot = json.loads(sw.codex_slot_auth_path(a["id"], base).read_text())
+    assert slot["tokens"]["refresh_token"] == "refresh-acct-A"

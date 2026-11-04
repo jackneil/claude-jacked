@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from jacked.web import browser_launch as bl
+from jacked.web import pending_profile
 from jacked.web import window_focus
 from jacked.web.browser_launch import (
     DEFAULT_MODE,
@@ -176,6 +177,43 @@ def test_different_emails_get_different_profiles(profile_root):
 def test_profile_dir_for_unknown_identity_is_none():
     assert profile_dir_for(None) is None
     assert profile_dir_for({"email": ""}) is None
+
+
+def test_a_claude_profile_keeps_its_existing_directory(profile_root):
+    """Existing Claude cookie jars live at PROFILE_ROOT/<email>. They stay there."""
+    bare = profile_dir_for({"email": "j@x.com"})
+    claude = profile_dir_for({"email": "j@x.com", "provider": "claude"})
+    assert bare == claude == profile_root / "j@x.com"
+
+
+@pytest.mark.parametrize("provider", ["codex", "grok"])
+def test_another_provider_gets_its_own_profile(profile_root, provider):
+    """claude.ai, auth.openai.com and auth.x.ai are different logins. One email
+    must not share a cookie jar across them."""
+    path = profile_dir_for({"email": "j@x.com", "provider": provider})
+    assert path == profile_root / provider / "j@x.com"
+    assert path != profile_dir_for({"email": "j@x.com"})
+
+
+def test_a_pending_profile_moves_onto_the_imported_email(profile_root):
+    pending = profile_dir_for(pending_profile.pending_login_account("grok"))
+    pending.mkdir(parents=True)
+    (pending / "Cookies").write_text("c")
+    pending_profile.adopt_pending_profile("grok", "g@x.com")
+    real = profile_dir_for({"email": "g@x.com", "provider": "grok"})
+    assert (real / "Cookies").read_text() == "c"
+    assert not pending.exists()
+
+
+def test_a_pending_profile_never_replaces_an_existing_profile(profile_root):
+    pending = profile_dir_for(pending_profile.pending_login_account("grok"))
+    pending.mkdir(parents=True)
+    real = profile_dir_for({"email": "g@x.com", "provider": "grok"})
+    real.mkdir(parents=True)
+    (real / "Cookies").write_text("keep")
+    pending_profile.adopt_pending_profile("grok", "g@x.com")
+    assert (real / "Cookies").read_text() == "keep"
+    assert pending.exists()
 
 
 # ---------------------------------------------------------------------------

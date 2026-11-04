@@ -30,6 +30,34 @@ observations do not fall back to a database preference or a guessed file stamp.
 
 ## 2. OAuth token model
 
+Credentials for Claude, Codex, and Grok stay on the one machine that runs
+jacked. Jacked does not copy them to another machine, and it does not have to
+survive two machines refreshing one login. The race that matters is two
+processes on this machine: a Claude session and jacked, or the Codex or Grok
+CLI and jacked. The live credential file or keychain on this machine is the
+authority. A stored copy is refreshed only by reading that local credential
+again, never by calling the token endpoint with the copy.
+
+A Grok sign-in (Add Account or Re-auth) runs `grok login --device-auth` with
+`GROK_HOME` set to a private folder (`<grok home>/jacked-accounts/.sign-in`)
+and `--leader-socket` inside it, so the sign-in never replaces the live login
+(`jacked/grok/login_import.py`). One sign-in runs at a time; a second request
+gets 409 `GROK_LOGIN_IN_PROGRESS`. A watcher thread reads the CLI output to
+its end and stops the CLI after 16 minutes (the device code lives 15). When
+the CLI exits 0, jacked stores the login in the account slot. It writes the
+live `auth.json` only when no usable login is live, or when the live login is
+the same account. A re-auth refuses a login of a different account. The result
+goes to the dashboard as the `provider_login_finished` WebSocket event, and
+the private folder is removed.
+
+Every account route that changes credentials runs the same remote-access gate
+as `/use` (`_account_change_refusal` in `jacked/api/routes/auth.py`): Codex
+and Grok add, Grok re-auth, token refresh, edit, reorder and delete. The
+Claude OAuth add and re-auth only store a login that the user finished; the
+gate result decides whether the flow may activate it.
+`tests/unit/test_account_change_gate.py` fails for a new write route that is
+neither gated nor listed as exempt.
+
 Each Claude account row keeps two token sets:
 
 | Fields | Consumer | Publication rule |

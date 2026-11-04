@@ -168,6 +168,7 @@ def _isolate_home(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("GROK_HOME", raising=False)
     monkeypatch.delenv("JACKED_HOME", raising=False)
     for var in CLAUDE_SESSION_ENV:
         monkeypatch.delenv(var, raising=False)

@@ -1,5 +1,5 @@
 /**
- * jacked — provider visual identity (Claude vs Codex).
+ * jacked — provider visual identity (Claude, Codex, Grok).
  *
  * Single source of truth for the per-account provider mark so the dashboard
  * cards, the menu-bar panel rows, and any future surface render the same
@@ -11,6 +11,21 @@
 
 function providerMeta(provider) {
     const p = String(provider || 'claude').toLowerCase();
+    if (p === 'grok') {
+        return {
+            key: 'grok',
+            label: 'Grok',
+            color: '#e7e5e4',
+            labelColor: '#f5f5f4',
+            // Two strokes crossing. Not Claude's spokes, not Codex's hexagon.
+            svg:
+                '<svg viewBox="0 0 16 16" width="100%" height="100%" fill="none" ' +
+                'stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">' +
+                '<path d="M3.2 3.2 L12.8 12.8"/>' +
+                '<path d="M12.8 3.2 L3.2 12.8"/>' +
+                '</svg>',
+        };
+    }
     if (p === 'codex') {
         return {
             key: 'codex',

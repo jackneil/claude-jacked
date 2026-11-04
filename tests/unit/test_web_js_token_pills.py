@@ -62,3 +62,19 @@ def test_claude_still_renders_usage_and_cc_pills(tmp_path):
         "has_cc_refresh_token": True, "cc_needs_auth": False,
     })
     assert "Usage Token" in html and "CC Token" in html
+
+
+def test_grok_renders_its_own_signed_in_pill(tmp_path):
+    """A Grok row stores a far-future marker expiry. The Claude pills would
+    read it as a usage token valid for decades."""
+    html = _render(tmp_path, {"provider": "grok", "validation_status": "valid",
+                              "id": 3, "email": "g@x.com", "expires_in_seconds": 2_000_000_000})
+    assert "signed in" in html and "Signed in to Grok" in html
+    assert "Usage Token" not in html and "CC Token" not in html
+    assert "Codex" not in html
+
+
+def test_grok_invalid_points_at_the_grok_reauth(tmp_path):
+    html = _render(tmp_path, {"provider": "grok", "validation_status": "invalid",
+                              "id": 3, "email": "g@x.com"})
+    assert "re-login" in html and "Grok" in html and "codex login" not in html

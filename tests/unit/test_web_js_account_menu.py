@@ -243,6 +243,26 @@ class TestMenuItems:
         for cls in ("btn-copy-cmd", "btn-edit-label", "btn-toggle", "btn-delete"):
             assert cls in panel
 
+    def test_codex_copies_the_codex_launch_command(self, tmp_path):
+        """`jacked claude <id>` refuses a Codex account. Copy the command that works."""
+        panel = _menu_panel(_actions(tmp_path, provider="codex", id=4))
+        assert 'data-cmd="jacked codex launch 4"' in panel
+        assert "jacked claude" not in panel
+
+    def test_grok_menu_has_its_own_reauth_and_no_claude_rows(self, tmp_path):
+        """Grok has no launch command and no Claude Code token. Its re-auth opens
+        the Grok sign-in, so it is a different control from the Claude re-auth."""
+        panel = _menu_panel(_actions(tmp_path, provider="grok", id=6, email="g@x.com"))
+        assert "btn-copy-cmd" not in panel
+        assert "btn-authorize-cc" not in panel
+        assert "Claude Code" not in panel
+        assert "btn-reauth " not in panel and 'btn-reauth"' not in panel
+        row = _item(panel, "btn-reauth-grok")
+        assert row is not None
+        assert 'data-id="6"' in row and ">Re-auth<" in row
+        for cls in ("btn-edit-label", "btn-toggle", "btn-delete"):
+            assert cls in panel
+
     def test_items_carry_legacy_handler_classes_and_data(self, tmp_path):
         html = _actions(tmp_path, id=12, email="z@x.com", display_name="Personal")
         copy_item = _item(html, "btn-copy-cmd")
