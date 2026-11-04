@@ -1496,6 +1496,22 @@ def _upgrade_restart_or_rollback(
     )
 
 
+def _preload_upgrade_modules() -> None:
+    """Import every module the upgrade transaction needs before the install.
+
+    The package install replaces jacked on disk while this process keeps
+    the modules it already imported. A module imported for the first time
+    after that point is the NEW release's file, and when it needs a name the
+    new release added to a module this process already holds, the import
+    fails and the transaction is lost at its restart step (the 0.110.2
+    upgrade to 0.111.0 stopped on `jacked.service.supervisors` importing a
+    `jacked.winproc` name that 0.110.2 did not have). With every module in
+    place before the install, the transaction runs on one release end to end;
+    the new build's own code runs only in the child processes it spawns.
+    """
+    from jacked.service import legacy, lifecycle, updater  # noqa: F401
+
+
 def _run_upgrade_inline(
     cmd: list[str], label: str, extras: str, skip_service: bool,
     pid_file, host: str, port: int,
@@ -1509,6 +1525,7 @@ def _run_upgrade_inline(
     service contract. Any failure after that gate rolls the machine back to
     `previous_version`.
     """
+    _preload_upgrade_modules()
     request = _UpgradeRequest(
         cmd=list(cmd),
         label=label,
