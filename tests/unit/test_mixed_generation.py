@@ -13,7 +13,9 @@ transactions importing their modules before the install.
 from __future__ import annotations
 
 import importlib
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -106,22 +108,108 @@ class TestNewModulesImportInAStaleInterpreter:
 
 
 class TestPreloadUpgradeModules:
-    def test_every_transaction_module_is_loaded_and_named_in_order(self, monkeypatch):
+    def test_the_roots_and_the_supervisor_submodules_are_loaded(self, monkeypatch):
         import jacked.service as service_package
 
         for name in mixed_generation.UPGRADE_MODULES:
             monkeypatch.delitem(sys.modules, name, raising=False)
             monkeypatch.delattr(service_package, name.rsplit(".", 1)[1], raising=False)
         monkeypatch.delattr(jacked, "proctree", raising=False)
-        assert mixed_generation.preload_upgrade_modules() == mixed_generation.UPGRADE_MODULES
-        for name in mixed_generation.UPGRADE_MODULES:
+        loaded = mixed_generation.preload_upgrade_modules()
+        assert loaded == tuple(sorted(loaded))
+        for name in mixed_generation.UPGRADE_MODULES + (
+            "jacked.service.supervisors.launchd",
+            "jacked.service.supervisors.systemd",
+            "jacked.service.supervisors.task_scheduler",
+            "jacked.service.supervisors.uninstall",
+            "jacked.service.update_status",
+            "jacked.service.ipc",
+        ):
             assert name in sys.modules, name
+
+    def test_lazy_imports_reads_function_bodies_and_named_submodules(self):
+        found = mixed_generation.lazy_imports("jacked.service.supervisors")
+        assert "jacked.service.supervisors.launchd" in found
+        assert "jacked.service.supervisors.systemd" in found
+        assert "jacked.service.supervisors._winproc" not in found  # a top-level import
+        assert mixed_generation.lazy_imports("jacked.module_that_does_not_exist") == set()
+
+    def test_a_root_that_does_not_import_raises(self, monkeypatch):
+        monkeypatch.setattr(mixed_generation, "UPGRADE_MODULES", ("jacked.module_that_does_not_exist",))
+        with pytest.raises(ModuleNotFoundError):
+            mixed_generation.preload_upgrade_modules()
+
+    def test_a_lazy_module_that_does_not_import_is_skipped_and_named(self, monkeypatch):
+        real = mixed_generation.lazy_imports
+        monkeypatch.setattr(
+            mixed_generation,
+            "lazy_imports",
+            lambda name: real(name) | ({"jacked.module_that_does_not_exist"} if name == "jacked.proctree" else set()),
+        )
+        lines = []
+        mixed_generation.preload_upgrade_modules(log=lines.append)
+        assert lines == ["preload: skipped jacked.module_that_does_not_exist (ModuleNotFoundError)"]
+
+    @pytest.mark.parametrize("context", ["jacked.service.updater", "jacked.cli"])
+    def test_after_the_preload_no_lazy_import_is_left_to_read_a_new_file(self, context):
+        """In a fresh interpreter in the tray context (the updater) and the CLI
+        context, every lazy ``jacked`` import of every loaded module (the CLI
+        module aside) is loaded after the preload, or does not import here."""
+        code = f"""
+import importlib, sys
+import {context}
+from jacked import mixed_generation as mg
+mg.preload_upgrade_modules()
+missing = set()
+for name in [m for m in sys.modules if m.startswith("jacked") and m != "jacked.cli"]:
+    for target in mg.lazy_imports(name):
+        if target in sys.modules:
+            continue
+        try:
+            importlib.util.find_spec(target)
+            importlib.import_module(target)
+        except Exception:
+            continue
+        missing.add(target)
+print(sorted(missing))
+"""
+        out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120)
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip() == "[]", out.stdout
+
+    def test_the_cli_entry_reaches_every_step_of_the_transaction(self):
+        """The CLI transaction walks cli.py from ``_run_upgrade_inline``; the
+        steps that run after the install must be on that graph."""
+        import ast
+        import jacked.cli as cli_module
+
+        tree = ast.parse(Path(cli_module.__file__).read_text(encoding="utf-8"))
+        reached = mixed_generation.reachable_functions(tree, "_run_upgrade_inline")
+        for step in (
+            "_run_upgrade_inline_locked", "_upgrade_install_package", "_upgrade_run_preflight",
+            "_upgrade_migrate_settings", "_upgrade_restart_service", "_upgrade_rollback_and_exit",
+            "_index_lag", "_restart_after_interrupt",
+        ):
+            assert step in reached, step
+        assert mixed_generation.reachable_functions(tree, "no_such_function") == set()
+
+    def test_after_the_cli_preload_every_lazy_import_of_its_transaction_is_loaded(self):
+        code = (
+            "import sys, jacked.cli\nfrom jacked import mixed_generation as mg\n"
+            "mg.preload_upgrade_modules(entry=('jacked.cli', '_run_upgrade_inline'))\n"
+            "print(sorted(t for t in mg.lazy_imports('jacked.cli', entry='_run_upgrade_inline') if t not in sys.modules))"
+        )
+        out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120)
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert out.stdout.strip() == "[]", out.stdout
 
     def test_the_cli_transaction_preloads_before_it_takes_the_lock(self, monkeypatch):
         from jacked import cli
 
         order = []
-        monkeypatch.setattr(mixed_generation, "preload_upgrade_modules", lambda: order.append("preload"))
+        monkeypatch.setattr(
+            mixed_generation, "preload_upgrade_modules", lambda **kw: order.append(("preload", kw.get("entry")))
+        )
 
         def _lock(*args, **kwargs):
             order.append("lock")
@@ -133,25 +221,80 @@ class TestPreloadUpgradeModules:
                 cmd=["false"], label="x", extras="tray", skip_service=True,
                 pid_file=None, host="127.0.0.1", port=0,
             )
-        assert order == ["preload", "lock"]
+        assert order == [("preload", ("jacked.cli", "_run_upgrade_inline")), "lock"]
 
-    def test_the_tray_transaction_refuses_before_any_write_when_the_preload_fails(self, monkeypatch, tmp_path):
+    def test_a_failed_preload_refuses_and_restarts_the_stopped_service(self, monkeypatch, tmp_path):
         from jacked import install_method
-        from jacked.service import updater
+        from jacked.service import platform, update_status, updater
 
         monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "jacked-update.log")
         monkeypatch.setattr(updater, "RECOVERY_FILE", tmp_path / "jacked-update-failed.txt")
 
-        def _boom():
+        def _boom(**_):
             raise ImportError("cannot import name 'system_program'")
 
         monkeypatch.setattr(mixed_generation, "preload_upgrade_modules", _boom)
-        gate_calls = []
+        gate_calls, marked, restarts = [], [], []
         monkeypatch.setattr(install_method, "can_auto_upgrade", lambda: gate_calls.append(1) or (False, "never reached"))
+        monkeypatch.setattr(updater, "wait_for_exit", lambda pid, timeout=30.0: True)
+        monkeypatch.setattr(update_status, "mark_failed", lambda path, error, recovery=None: marked.append(error))
+        monkeypatch.setattr(platform, "native_restart", lambda: restarts.append(1) or (True, "kickstarted"))
         updater.run_update(parent_pid=1, extras="tray")
         assert gate_calls == []
-        assert "REFUSED: the installed jacked cannot import its upgrade modules (ImportError)" in (
-            tmp_path / "jacked-update.log").read_text(encoding="utf-8")
+        log = (tmp_path / "jacked-update.log").read_text(encoding="utf-8")
+        assert "REFUSED: the installed jacked cannot import its upgrade modules (ImportError)" in log
+        assert "Refusal: service restart OK (kickstarted)" in log
+        assert restarts == [1]
+        assert marked == ["update refused: the installed jacked cannot import its upgrade modules (ImportError)"]
         recovery = (tmp_path / "jacked-update-failed.txt").read_text(encoding="utf-8")
         assert "cannot import its upgrade modules (ImportError)" in recovery
-        assert 'uv tool install "claude-jacked[tray]" --force --refresh' in recovery
+        assert "uv tool install" in recovery
+
+
+class TestRefuseAndRestore:
+    def _run(self, *, alive=False, restart=(True, "ok"), mark_status=True, monkeypatch):
+        from jacked.service import platform, update_status
+        from jacked.service.update_refusal import refuser
+
+        lines, recovery, marked, closed = [], [], [], []
+        monkeypatch.setattr(update_status, "mark_failed", lambda path, error, recovery=None: marked.append(error))
+
+        def _restart():
+            if isinstance(restart, Exception):
+                raise restart
+            return restart
+
+        monkeypatch.setattr(platform, "native_restart", _restart)
+        refuse = refuser(4242, lines.append, recovery.append, lambda pid, timeout: not alive, close=lambda: closed.append(1))
+        result = refuse("a reason", "recovery text", mark_status=mark_status)
+        return result, lines, recovery, marked, closed
+
+    def test_a_refusal_closes_the_record_and_restarts_the_service(self, monkeypatch):
+        result, lines, recovery, marked, closed = self._run(monkeypatch=monkeypatch)
+        assert result is True
+        assert lines == ["REFUSED: a reason", "Refusal: service restart OK (ok)"]
+        assert recovery == ["recovery text"]
+        assert marked == ["update refused: a reason"]
+        assert closed == [1]
+
+    def test_a_live_old_service_is_left_alone(self, monkeypatch):
+        result, lines, _, _, closed = self._run(alive=True, monkeypatch=monkeypatch)
+        assert result is False
+        assert lines[-1] == "Refusal: the old service did not exit; nothing restarted"
+        assert closed == [1]
+
+    def test_without_the_lock_the_status_record_is_not_changed(self, monkeypatch):
+        _, _, _, marked, _ = self._run(mark_status=False, monkeypatch=monkeypatch)
+        assert marked == []
+
+    def test_a_restart_that_raises_is_logged_and_the_log_still_closes(self, monkeypatch):
+        result, lines, _, _, closed = self._run(restart=RuntimeError("no"), monkeypatch=monkeypatch)
+        assert result is False
+        assert lines[-1] == "Refusal: service restart raised RuntimeError"
+        assert closed == [1]
+
+
+class TestNamesFromMissingOnDisk:
+    def test_a_name_missing_from_the_disk_too_raises_import_error(self):
+        with pytest.raises(ImportError, match="cannot import name 'no_such_name' from 'jacked.winproc'"):
+            mixed_generation.names_from("jacked.winproc", "no_such_name")

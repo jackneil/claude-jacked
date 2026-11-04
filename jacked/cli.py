@@ -1502,11 +1502,11 @@ def _preload_upgrade_modules() -> None:
     The package install replaces jacked on disk while this process keeps
     the modules it already imported; a module first imported after that
     point is the NEW release's file (see jacked.mixed_generation). The
-    list is shared with the tray updater.
+    walk is shared with the tray updater.
     """
     from jacked.mixed_generation import preload_upgrade_modules
 
-    preload_upgrade_modules()
+    preload_upgrade_modules(entry=("jacked.cli", "_run_upgrade_inline"))
 
 
 def _run_upgrade_inline(
