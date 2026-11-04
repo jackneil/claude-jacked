@@ -20,8 +20,14 @@ class KnownProjects:
     def __init__(self, *repos):
         self.rows = [{"repo_path": str(r).replace("\\", "/")} for r in repos]
 
-    def get_project_activity_summary(self, limit=20):
-        return self.rows[:limit]
+    def find_recorded_project(self, candidates):
+        """The exact lookup of ``Database.find_recorded_project``, at any age."""
+        recorded = {row["repo_path"] for row in self.rows}
+        for candidate in candidates:
+            forward = candidate.replace("\\", "/")
+            if forward in recorded:
+                return forward
+        return None
 
     def get_installation_by_repo(self, repo_path):
         return None

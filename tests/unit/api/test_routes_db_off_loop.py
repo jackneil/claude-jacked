@@ -50,9 +50,10 @@ class _RecordingDB:
         self._mark("get_settings:" + ",".join(keys))
         return {key: self.settings.get(key) for key in keys}
 
-    def get_project_activity_summary(self, limit=100):
-        self._mark("get_project_activity_summary")
-        return self._activity
+    def find_recorded_project(self, candidates):
+        self._mark("find_recorded_project")
+        recorded = {row["repo_path"] for row in self._activity}
+        return next((c for c in candidates if c in recorded), None)
 
     def claude_identity_coverage(self):
         self._mark("claude_identity_coverage")
@@ -234,7 +235,7 @@ def test_set_project_permissions_validates_the_repo_off_the_loop(tmp_path):
     result, loop_thread = _run_on_loop(lambda: set_project_permissions(body, _request(db)))
 
     assert result == {"ok": True}
-    assert [name for name, _ in db.threads] == ["get_project_activity_summary"]
+    assert [name for name, _ in db.threads] == ["find_recorded_project"]
     assert db.threads[0][1] != loop_thread
 
 
@@ -248,7 +249,7 @@ def test_add_project_rule_validates_the_repo_off_the_loop(tmp_path):
     result, loop_thread = _run_on_loop(lambda: add_permission_rule(body, _request(db)))
 
     assert result.status_code == 422
-    assert [name for name, _ in db.threads] == ["get_project_activity_summary"]
+    assert [name for name, _ in db.threads] == ["find_recorded_project"]
     assert db.threads[0][1] != loop_thread
 
 

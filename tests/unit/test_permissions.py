@@ -74,7 +74,7 @@ class TestValidateRepoPath:
         """DB errors reject (fail closed)."""
         (tmp_path / ".git").mkdir()
         mock_db = MagicMock()
-        mock_db.get_project_activity_summary.side_effect = Exception("DB down")
+        mock_db.find_recorded_project.side_effect = Exception("DB down")
         assert _refusal(str(tmp_path), mock_db) == (503, "DB_ERROR")
 
 

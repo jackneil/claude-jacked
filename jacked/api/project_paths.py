@@ -25,12 +25,6 @@ from fastapi.responses import JSONResponse
 
 LINK_OUTSIDE_PROJECT = "LINK_OUTSIDE_PROJECT"
 
-# The number of recent projects that a request can name. The dashboard shows
-# the 20 most recent projects, so every project that it can send is in this
-# set.
-KNOWN_PROJECT_LIMIT = 100
-
-
 class ProjectRefused(Exception):
     """A route does not open the project that a request names.
 
@@ -68,17 +62,19 @@ def known_project_path(repo_path, db) -> str:
     """Return the path that jacked recorded for the project ``repo_path``.
 
     The request text is attacker input when the dashboard serves a remote
-    client. This function compares the text with the projects that jacked
-    recorded from its own session activity, before any disk access at the
-    path. It returns the recorded text, so the route opens files only at a
-    recorded path. ``..`` in the request does not match a recorded path.
+    client. This function looks for the text in the projects that jacked
+    recorded from its own session activity (``find_recorded_project``), at
+    any age, before any disk access at the path. It returns the recorded
+    text, so the route opens files only at a recorded path. ``..`` in the
+    request does not match a recorded path.
 
-    Raise ``ProjectRefused`` when the value is empty, when the project list
-    cannot be read (fail closed), or when jacked did not record the project.
+    Raise ``ProjectRefused`` when the value is empty, when there is no
+    database or the lookup fails (fail closed), or when jacked did not record
+    the project.
 
     >>> class Db:
-    ...     def get_project_activity_summary(self, limit=20):
-    ...         return [{"repo_path": "/work/repo"}]
+    ...     def find_recorded_project(self, candidates):
+    ...         return "/work/repo" if "/work/repo" in candidates else None
     >>> known_project_path("/work/repo/", Db())
     '/work/repo'
     >>> try:
@@ -101,18 +97,15 @@ def known_project_path(repo_path, db) -> str:
             "start. The dashboard does not open project files without it.",
         )
     try:
-        rows = db.get_project_activity_summary(limit=KNOWN_PROJECT_LIMIT)
+        recorded = db.find_recorded_project(sorted(_spellings(repo_path)))
     except Exception:
         raise ProjectRefused(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "DB_ERROR",
             "The dashboard cannot read the project list from the database.",
         ) from None
-    requested = _spellings(repo_path)
-    for row in rows:
-        recorded = row.get("repo_path")
-        if recorded and recorded in requested:
-            return recorded
+    if isinstance(recorded, str) and recorded:
+        return recorded
     raise ProjectRefused(
         status.HTTP_422_UNPROCESSABLE_CONTENT,
         "UNKNOWN_PROJECT",

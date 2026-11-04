@@ -372,24 +372,16 @@ def get_project_env(repo_path: str, request: Request):
 
     >>> # GET /api/project/env?repo_path=/some/repo
     """
-    from pathlib import Path
+    from jacked.guardrails import read_project_env
 
     try:
         project = _validate_project_path(repo_path, request)
     except ProjectRefused as refused:
         return refused.response()
 
-    env_path = None
-    source = None
-
-    # Read from .git/jacked/env
-    env_file = Path(project) / ".git" / "jacked" / "env"
-    if env_file.exists():
-        try:
-            env_path = env_file.read_text(encoding="utf-8").strip()
-            source = "file"
-        except Exception:
-            pass
+    # The first line of .git/jacked/env, the line that the pre-push hook uses.
+    env_path = read_project_env(project)
+    source = "file" if env_path else None
 
     # Also check DB
     db = getattr(request.app.state, "db", None)

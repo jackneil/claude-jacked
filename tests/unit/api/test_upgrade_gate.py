@@ -556,8 +556,13 @@ def test_cancellation_stops_the_installer_before_the_lease_is_released(monkeypat
     awaited inside the lease, so no switch can start beside a live installer."""
     child = _FakeChild()
     lease_held_when_child_stopped: list[bool] = []
+    # Set when the upgrade starts the installer. A fixed count of loop ticks
+    # was not enough on a loaded machine: the upgrade does thread work before
+    # the start, and a cancel before the start has no child to stop.
+    child_started = asyncio.Event()
 
     async def _fake_exec(*cmd, **kwargs):
+        child_started.set()
         return child
 
     original_terminate = child.terminate
@@ -575,7 +580,8 @@ def test_cancellation_stops_the_installer_before_the_lease_is_released(monkeypat
 
     async def _run():
         task = asyncio.create_task(system._do_upgrade(registry, "127.0.0.1"))
-        for _ in range(20):  # let the upgrade reach the child
+        await child_started.wait()
+        for _ in range(20):  # let the upgrade read from the child
             await asyncio.sleep(0)
             if registry.events and registry.events[-1][0] == "upgrade_progress":
                 break

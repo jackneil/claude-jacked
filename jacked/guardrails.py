@@ -7,12 +7,15 @@ hook installation for jacked-managed projects.
 
 from __future__ import annotations
 
+import logging
 import stat
 from pathlib import Path
 from typing import Optional
 
 from jacked.atomic_install import atomic_copy_file
 from jacked.atomic_io import atomic_write_bytes, atomic_write_text
+
+logger = logging.getLogger(__name__)
 
 # Where bundled templates live inside the package
 _DATA_DIR = Path(__file__).parent / "data"
@@ -314,6 +317,57 @@ def write_hook(target: Path, data: bytes) -> None:
         pass
 
 
+def read_project_env(repo_path: str | Path) -> Optional[str]:
+    """Return the Python env path that ``.git/jacked/env`` sets for a project.
+
+    The pre-push hook uses only the first line of the file, so this function
+    returns only the first line, with the spaces at each end removed. It
+    returns ``None`` when the file is missing, empty or not readable.
+
+    A repository can make the file a link, or make a folder above it a link.
+    A read through the link shows the content of a different file. So the
+    function also returns ``None``, and logs a line that has no path or
+    content, when the file is a link, when it is not a regular file (a pipe
+    can stop the read), or when its real path is not in the ``.git`` folder
+    of the project (a ``.git`` link to a different folder is outside).
+
+    >>> import tempfile
+    >>> repo = Path(tempfile.mkdtemp())
+    >>> (repo / ".git" / "jacked").mkdir(parents=True)
+    >>> _ = (repo / ".git" / "jacked" / "env").write_text("/opt/env \\n/other\\n")
+    >>> read_project_env(repo)
+    '/opt/env'
+    >>> read_project_env(Path(tempfile.mkdtemp())) is None
+    True
+    """
+    git_dir = Path(repo_path) / ".git"
+    env_file = git_dir / "jacked" / "env"
+    try:
+        info = env_file.lstat()
+    except OSError:
+        return None
+    reason = None
+    if stat.S_ISLNK(info.st_mode):
+        reason = "the file is a link"
+    elif not stat.S_ISREG(info.st_mode):
+        reason = "the file is not a regular file"
+    else:
+        try:
+            inside = Path(repo_path).resolve(strict=True) / ".git"
+            env_file.resolve(strict=True).relative_to(inside)
+        except (OSError, RuntimeError, ValueError):
+            reason = "the real path of the file is not in the .git folder"
+    if reason:
+        logger.warning("The project env file is not used: %s.", reason)
+        return None
+    try:
+        with env_file.open(encoding="utf-8") as handle:
+            first_line = handle.readline().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return first_line or None
+
+
 def check_project_setup(repo_path: str | Path) -> dict:
     """Check if a project has guardrails and lint hook configured.
 
@@ -370,15 +424,7 @@ def check_project_setup(repo_path: str | Path) -> dict:
         except Exception:
             pass
 
-    # Read .git/jacked/env if present
-    env_file = repo / ".git" / "jacked" / "env"
-    if env_file.exists():
-        try:
-            env_path = env_file.read_text(encoding="utf-8").strip()
-            if env_path:
-                result["env_path"] = env_path
-        except Exception:
-            pass
+    result["env_path"] = read_project_env(repo)
 
     # Detect language
     result["detected_language"] = detect_language(repo)

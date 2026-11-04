@@ -22,6 +22,8 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from pydantic import BaseModel, computed_field
 
+from jacked.web import project_activity
+
 logger = logging.getLogger(__name__)
 
 # Upper bound on the JSON text of a stored raw usage payload, in characters.
@@ -3853,43 +3855,23 @@ class Database:
         2
         """
         with self._reader() as conn:
-            cursor = conn.execute(
-                """
-                SELECT
-                    repo_path,
-                    SUM(cmd_total) as commands_run,
-                    SUM(hook_total) as hook_executions,
-                    MAX(last_ts) as last_activity,
-                    MIN(first_ts) as first_seen,
-                    unique_sessions
-                FROM (
-                    SELECT REPLACE(repo_path, char(92), '/') as repo_path,
-                           COUNT(*) as cmd_total, 0 as hook_total,
-                           MAX(timestamp) as last_ts,
-                           MIN(timestamp) as first_ts,
-                           COUNT(DISTINCT session_id) as unique_sessions
-                    FROM command_usage
-                    WHERE repo_path IS NOT NULL AND repo_path != ''
-                    GROUP BY REPLACE(repo_path, char(92), '/')
+            return project_activity.activity_summary(conn, limit)
 
-                    UNION ALL
+    def find_recorded_project(self, candidates: Iterable[str]) -> Optional[str]:
+        """Return the recorded project path that is equal to one of ``candidates``.
 
-                    SELECT REPLACE(repo_path, char(92), '/') as repo_path,
-                           0 as cmd_total, COUNT(*) as hook_total,
-                           MAX(timestamp) as last_ts,
-                           MIN(timestamp) as first_ts,
-                           COUNT(DISTINCT session_id) as unique_sessions
-                    FROM hook_executions
-                    WHERE repo_path IS NOT NULL AND repo_path != ''
-                    GROUP BY REPLACE(repo_path, char(92), '/')
-                )
-                GROUP BY repo_path
-                ORDER BY last_activity DESC
-                LIMIT ?
-                """,
-                (limit,),
-            )
-            return [dict(row) for row in cursor.fetchall()]
+        The lookup is exact, for each project that jacked recorded, at any age
+        (``project_activity.recorded_project``). ``None`` means no match.
+
+        >>> db = Database(":memory:")
+        >>> _ = db.record_hook_execution("Stop", hook_name="h", repo_path="/repo/a")
+        >>> db.find_recorded_project(["/repo/a/", "/repo/a"])
+        '/repo/a'
+        >>> db.find_recorded_project(["/repo"]) is None
+        True
+        """
+        with self._reader() as conn:
+            return project_activity.recorded_project(conn, candidates)
 
     def list_command_usage(
         self,
