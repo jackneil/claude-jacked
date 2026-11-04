@@ -34,12 +34,21 @@ const OAUTH_CODE_BUTTON_CLASS = 'px-3 py-1 bg-blue-600 hover:bg-blue-500 text-wh
 // Manual mode: no server-side browser, no localhost callback — the user opens
 // the link themselves and pastes back the code Claude shows.
 const OAUTH_SUBTITLE_MANUAL = 'Click the link and approve. Claude then shows a code. Copy the code and paste it below.';
+// Activation outcomes after a sign-in that need no notice: the account became
+// active (three truthful outcomes), or no activation was attempted because the
+// dashboard runs on another machine (local_only).
+const ACTIVATION_OK = ['committed', 'committed_degraded', 'observed_target_unfenced', 'local_only'];
 const OAUTH_SUBTITLE_BROWSER = 'A browser window should open on this machine. If it does not open, use the link.';
+// The launcher found no supported browser, or the browser did not start.
+// jacked does not fall back to the system browser (it can hold a different
+// account), so the user opens the link in the right profile, or pastes the code.
+const OAUTH_SUBTITLE_NO_WINDOW = 'jacked could not open a browser window for this account. Open the link in the browser profile for this account, or paste the code below.';
 
 // Every chained-step failure ends the same way: the sign-in is stored, only
 // the token is missing, and there is a way to get it. Reasons are written
-// without trailing punctuation so this reads as one sentence after them.
-const OAUTH_CHAINED_RETRY_HINT = '. You can authorize the Claude Code token from the account menu.';
+// without trailing punctuation so this reads as one sentence after them. The
+// hint names the account menu row exactly (accounts.js renderAccountMenu).
+const OAUTH_CHAINED_RETRY_HINT = '. To get the token, click Authorize Claude Code Token in the account menu.';
 
 // Poll every 1s. Manual flows get the longer window because a human is copying
 // a code between machines (mirrors MANUAL_TIMEOUT_SECONDS server-side).
@@ -101,7 +110,9 @@ function buildOAuthCodeEntry(textDiv, accent, authUrl, manual, identity) {
     const subtitle = document.createElement('div');
     subtitle.className = accent.subtitle;
     let subtitleText = manual ? OAUTH_SUBTITLE_MANUAL : OAUTH_SUBTITLE_BROWSER;
-    if (browserMode === 'profile') {
+    if (!manual && browserMode === 'manual') {
+        subtitleText = OAUTH_SUBTITLE_NO_WINDOW;
+    } else if (browserMode === 'profile') {
         subtitleText += ' A dedicated ' + (browserName || 'browser') + ' window opened for '
             + (email || 'this login') + '. It may be behind this window or on the taskbar.';
     } else if (browserMode === 'incognito') {
@@ -164,6 +175,13 @@ function buildOAuthCodeEntry(textDiv, accent, authUrl, manual, identity) {
         link.rel = 'noopener';
         link.href = authUrl;
         textDiv.appendChild(link);
+        if (browserMode === 'manual') {
+            // The link opens in the dashboard's own browser, which may hold
+            // another account; the caveat the reopen path shows applies here.
+            textDiv.appendChild(
+                document.createTextNode(' (uses whatever account this browser is already signed in to)')
+            );
+        }
     }
 
     const codeRow = document.createElement('div');
@@ -228,6 +246,11 @@ async function runOAuthFlow(opts) {
     // Set once this flow has followed a primary sign-in into the chained
     // Claude Code token flow; the copy at the end depends on it.
     let chainedFlowId = null;
+    // The chained banner's text column, and whether its code entry is drawn.
+    // The entry waits for the chained flow's first poll: only that poll says
+    // where to sign in (auth_url) and whether a window opened (browser_mode).
+    let chainedTextDiv = null;
+    let chainedEntryShown = false;
     // The primary flow's own success message, kept because every chained
     // banner hangs off it: the sign-in it describes has already happened.
     let primaryResult = null;
@@ -258,7 +281,7 @@ async function runOAuthFlow(opts) {
         primaryResult = primary;
         flowId = ccFlowId;
         const slot = document.getElementById('oauth-flow-status') || statusEl;
-        const chainedTextDiv = buildOAuthBanner(slot, OAUTH_ACCENT_ORANGE,
+        chainedTextDiv = buildOAuthBanner(slot, OAUTH_ACCENT_ORANGE,
             primary.text + ' Authorizing the Claude Code token in the browser...');
         // The refresh that just ran re-rendered the route, taking the primary
         // banner's Cancel button with it, so the chained wait needs its own.
@@ -268,6 +291,32 @@ async function runOAuthFlow(opts) {
         // window.jackedState.flowPolling and with it our interval, so the
         // chained flow would be polled only when the tab regains focus.
         startPolling();
+    }
+
+    // The chained step's link, window copy and code field: the same entry the
+    // primary step shows, built from the chained flow's own poll. Without it,
+    // a step whose window never opened (browser_mode "manual") left the user
+    // with a spinner, Cancel and no way to finish.
+    function showChainedEntry(poll) {
+        if (!chainedFlowId || chainedEntryShown || !chainedTextDiv) return;
+        if (!poll || poll.flow_id !== chainedFlowId || !poll.auth_url) return;
+        chainedEntryShown = true;
+        const entry = buildOAuthCodeEntry(chainedTextDiv, OAUTH_ACCENT_ORANGE,
+            poll.auth_url, poll.mode === 'manual', {
+                email: poll.target_email,
+                orgName: poll.target_org_name,
+                browserMode: poll.browser_mode,
+                browserName: poll.browser_name,
+                flowId: chainedFlowId,
+            });
+        wireCodeEntry(entry, chainedFlowId);
+    }
+
+    // A verdict for the primary flow that lands after the chain started (a
+    // code submission that raced the poller). The sign-in it reports is
+    // already handled, so it must not end the token step or draw its link.
+    function isStaleVerdict(poll) {
+        return !!(chainedFlowId && poll && poll.flow_id && poll.flow_id !== chainedFlowId);
     }
 
     // Copy for the chained step, built from the flow's own success line so an
@@ -404,19 +453,36 @@ async function runOAuthFlow(opts) {
     const maxWait = manual ? OAUTH_MANUAL_MAX_WAIT : OAUTH_BROWSER_MAX_WAIT;
     const waitLabel = Math.round(maxWait / 60) + ' minutes';
 
-    const { codeInput, submitBtn, submitError } =
-        buildOAuthCodeEntry(textDiv, opts.accent, start.auth_url, manual, {
-            email: start.target_email,
-            orgName: start.target_org_name,
-            browserMode: start.browser_mode,
-            browserName: start.browser_name,
-            flowId: flowId,
-        });
+    wireCodeEntry(buildOAuthCodeEntry(textDiv, opts.accent, start.auth_url, manual, {
+        email: start.target_email,
+        orgName: start.target_org_name,
+        browserMode: start.browser_mode,
+        browserName: start.browser_name,
+        flowId: flowId,
+    }), flowId);
+
+    // The sign-in is stored either way; the activation that follows it can
+    // still be refused (for example CC_REAUTH_REQUIRED: a running session
+    // holds a working token that jacked does not replace). Say so, instead
+    // of a success banner over an account that did not become active.
+    function noticeRefusedActivation(poll) {
+        const status = poll && poll.activation_status;
+        if (!status || ACTIVATION_OK.includes(status)) return;
+        showToast(
+            'The account was saved, but it was not made active: '
+                + (poll.activation_message || status) + '.',
+            'warning',
+            10000,
+        );
+    }
 
     // Server verdict, shared by the poller and the code submission.
     // Returns true once the flow is done and the banner has been replaced.
     async function handleFlowResult(poll) {
+        // Nothing to show and nothing to retry: report it as handled.
+        if (isStaleVerdict(poll)) return true;
         if (!['completed', 'error', 'not_found'].includes(poll.status)) {
+            showChainedEntry(poll);
             return false;  // status === 'pending' — keep polling
         }
         if (terminal) return true;
@@ -447,6 +513,7 @@ async function runOAuthFlow(opts) {
             // which would wipe a banner drawn before it. Render the success
             // message into the fresh slot afterwards.
             await refreshAndRender();
+            noticeRefusedActivation(poll);
             renderBanner(OAUTH_SUCCESS_CLASS, success.text, success.duration);
         } else if (poll.status === 'error') {
             const reason = poll.error || 'Unknown error';
@@ -458,17 +525,21 @@ async function runOAuthFlow(opts) {
         return true;
     }
 
-    async function submitCode() {
+    // Each entry posts to the flow it was drawn for: the primary entry to
+    // the primary flow, the chained entry to the chained flow.
+    async function submitCode(entry, entryFlowId) {
+        const { codeInput, submitBtn, submitError } = entry;
         submitError.hidden = true;
         submitBtn.disabled = true;
         try {
-            const result = await api.post(`/api/auth/flow/${flowId}/code`, { code: codeInput.value });
+            const result = await api.post(`/api/auth/flow/${entryFlowId}/code`, { code: codeInput.value });
             if (await handleFlowResult(result)) return;
             // Recoverable paste problem: stay pending and let the user retry.
             submitError.textContent = result.submit_error || 'That code was not accepted. Please try again.';
             submitError.hidden = false;
         } catch (e) {
-            if (e.status === 404) {
+            // Only the flow being polled can expire the banner's step.
+            if (e.status === 404 && entryFlowId === flowId) {
                 await endWith(OAUTH_WARN_CLASS,
                     terminalCopy(msgs.expired, 'the token authorization flow expired'));
                 return;
@@ -480,13 +551,15 @@ async function runOAuthFlow(opts) {
         }
     }
 
-    submitBtn.addEventListener('click', submitCode);
-    codeInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-            e.preventDefault();
-            submitCode();
-        }
-    });
+    function wireCodeEntry(entry, entryFlowId) {
+        entry.submitBtn.addEventListener('click', () => submitCode(entry, entryFlowId));
+        entry.codeInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                submitCode(entry, entryFlowId);
+            }
+        });
+    }
 
     // One poll of the server verdict. Shared by the interval and the
     // visibility hook; overlapping calls collapse into the one in flight.
@@ -601,41 +674,4 @@ async function startCcAuthFlow(accountId, email) {
             success: () => ({ text: 'CC token authorized successfully!', duration: 3000 }),
         },
     });
-}
-
-// ---------------------------------------------------------------------------
-// Codex add flow — imports the signed-in ~/.codex account (no browser OAuth;
-// Codex sign-in happens via `codex login` in a terminal).
-// ---------------------------------------------------------------------------
-async function startAddCodexFlow() {
-    window.jackedState._accountActionInFlight = true;
-    const statusEl = document.getElementById('oauth-flow-status');
-    if (statusEl) {
-        statusEl.innerHTML = `
-            <div class="bg-blue-900/30 border border-blue-700 rounded-lg px-4 py-3 text-sm text-blue-200 flex items-center gap-3">
-                <div class="spinner"></div>
-                <div>Importing your signed-in Codex account…</div>
-            </div>`;
-    }
-    try {
-        const result = await api.post('/api/auth/accounts/add?provider=codex');
-        if (statusEl) statusEl.innerHTML = '';
-        showToast(`Added Codex account ${result.email || ''}`.trim(), 'success');
-        await refreshAndRender();
-    } catch (e) {
-        const needsLogin = e && e.code === 'CODEX_LOGIN_REQUIRED';
-        const msg = needsLogin
-            ? 'Not signed in to Codex. Run `codex login` in a terminal, then click Add Account → Codex again.'
-            : (e && e.message) || 'Failed to add Codex account';
-        if (statusEl) {
-            statusEl.innerHTML = `
-                <div class="bg-amber-900/30 border border-amber-700 rounded-lg px-4 py-3 text-sm text-amber-200">
-                    ${escapeHtml(msg)}
-                </div>`;
-        } else {
-            showToast(msg, needsLogin ? 'warning' : 'error');
-        }
-    } finally {
-        window.jackedState._accountActionInFlight = false;
-    }
 }

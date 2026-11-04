@@ -29,6 +29,11 @@ from .models import (
     SwitchResult,
 )
 from .oauth_extra import PASSTHROUGH_KEYS
+from .refresh_guard import (
+    CC_REAUTH_REQUIRED_CODE,
+    OWNERSHIP_UNCHECKED_CODE,
+    REFRESH_DOWNGRADE_UNCHECKED_REASON,
+)
 from .repository import CredentialSwitchRepository
 from .resolver import ResolverSnapshotSink, ResolverState, SnapshotUpdate
 from .store import CredentialStore
@@ -68,6 +73,18 @@ class SwitchRequest:
     # None when the store must not be overwritten yet: the outgoing account's
     # newest tokens could not be saved to its row. None refuses with BUSY.
     preflight: Callable[[], SwitchRequest | None] | None = None
+    # When set, the authority read inside the lease must still hold a payload
+    # with this digest, else the engine refuses with CONCURRENT_WRITE and
+    # writes nothing. The authority guard's re-stamp republishes exactly the
+    # payload it adopted; a rotation that landed meanwhile must be adopted
+    # first, not overwritten.
+    expected_authority_digest: str | None = None
+    # Runs inside the switch lease, after the authority read and before any
+    # write. It gets the payload the authority holds now (None when there is
+    # none) and returns a reason when this write would put a null refresh
+    # token over the account's live one (refresh_guard). The engine then
+    # refuses with UNUSABLE and code CC_REAUTH_REQUIRED, and writes nothing.
+    refresh_downgrade_check: Callable[[CredentialPayload | None], str | None] | None = None
 
 
 IdentityPublisher = Callable[[SwitchRequest], None]
@@ -254,6 +271,7 @@ def _result(
     message: str = "",
     sessions_follow: bool | None = None,
     code: str = "",
+    published_fingerprint: str = "",
 ) -> SwitchResult:
     observed = _enrich_identity(request, observed)
     storage_state = "committed" if is_committed else outcome.value
@@ -286,7 +304,25 @@ def _result(
         observed_identity=observed,
         message=message,
         code=code,
+        published_fingerprint=published_fingerprint,
     )
+
+
+_PUBLISHED_OUTCOMES = frozenset({
+    SwitchOutcome.COMMITTED,
+    SwitchOutcome.COMMITTED_DEGRADED,
+    SwitchOutcome.OBSERVED_TARGET_UNFENCED,
+})
+
+
+def _published_fingerprint(request: SwitchRequest, outcome: SwitchOutcome) -> str:
+    """The fingerprint of the pair this request published, for an outcome
+    that published it; empty for every other outcome."""
+    if outcome not in _PUBLISHED_OUTCOMES:
+        return ""
+    from jacked.credentials.fingerprint import payload_fingerprint
+
+    return payload_fingerprint(request.payload.to_mapping().get("claudeAiOauth"))
 
 
 def _enrich_identity(
@@ -365,6 +401,12 @@ class CredentialTransactionEngine:
             return self._record(request, outcome, message=reason)
         assert prepared is not None
         request = prepared
+        refused = self._refuse_changed_authority(request, before)
+        if refused is not None:
+            return refused
+        refused = self._refuse_refresh_downgrade(request, before)
+        if refused is not None:
+            return refused
         _warn_on_schema_drift(before, request)
         # Even though this mode has no recovery key and can never commit an
         # active pointer, persist the operation before the native write. A
@@ -574,6 +616,12 @@ class CredentialTransactionEngine:
         assert before.payload is not None
         assert prepared is not None
         request = prepared
+        refused = self._refuse_changed_authority(request, before)
+        if refused is not None:
+            return refused
+        refused = self._refuse_refresh_downgrade(request, before)
+        if refused is not None:
+            return refused
         key = self._deps.install_key.get_key()
         if not key:
             return _result(
@@ -782,6 +830,69 @@ class CredentialTransactionEngine:
         )
         return self._record(request, outcome, message=reason)
 
+    def _refuse_changed_authority(
+        self, request: SwitchRequest, before: StoreReadResult
+    ) -> SwitchResult | None:
+        """Refuse a write whose expected authority payload is gone.
+
+        A request that republishes the payload it read (the guard's re-stamp)
+        names that payload's digest. When the authority holds something else
+        now (Claude Code rotated meanwhile), the write would overwrite a
+        rotation nobody saved: refuse with CONCURRENT_WRITE, a transient
+        outcome the caller retries after it adopts the new payload.
+        """
+        expected = request.expected_authority_digest
+        if expected is None:
+            return None
+        held = before.payload.digest if before.payload is not None else None
+        if held == expected:
+            return None
+        logger.warning(
+            "Account %d: the authority changed before the write; not republishing",
+            request.account_id,
+        )
+        observed = (
+            before.payload.identity if before.payload is not None else CredentialIdentity()
+        )
+        return self._record(
+            request,
+            SwitchOutcome.CONCURRENT_WRITE,
+            observed,
+            "the authority changed before the write",
+        )
+
+    def _refuse_refresh_downgrade(
+        self, request: SwitchRequest, before: StoreReadResult
+    ) -> SwitchResult | None:
+        """Refuse a write that puts a null refresh token over a live one.
+
+        The request's check compares its target with the authority read
+        (``before``). A refusal happens before the pending row and before any
+        store write, so the authority stays byte-identical. The log line
+        names the account id and the reason, never a token.
+        """
+        check = request.refresh_downgrade_check
+        reason = check(before.payload) if check is not None else None
+        if not reason:
+            return None
+        logger.warning("Account %d: %s", request.account_id, reason)
+        observed = (
+            before.payload.identity if before.payload is not None else CredentialIdentity()
+        )
+        if reason == REFRESH_DOWNGRADE_UNCHECKED_REASON:
+            # The owner could not be checked: a transient refusal, not a
+            # verdict on the lineage. BUSY is retried by every caller.
+            return self._record(
+                request, SwitchOutcome.BUSY, observed, reason, code=OWNERSHIP_UNCHECKED_CODE
+            )
+        return self._record(
+            request,
+            SwitchOutcome.UNUSABLE,
+            observed,
+            reason,
+            code=CC_REAUTH_REQUIRED_CODE,
+        )
+
     def _record(
         self,
         request: SwitchRequest,
@@ -789,6 +900,7 @@ class CredentialTransactionEngine:
         observed: CredentialIdentity = CredentialIdentity(),
         message: str = "",
         sessions_follow: bool | None = None,
+        code: str = "",
     ) -> SwitchResult:
         self._deps.repository.record_outcome(
             OutcomeSwitchRecord(
@@ -807,4 +919,6 @@ class CredentialTransactionEngine:
             observed=observed,
             message=message,
             sessions_follow=sessions_follow,
+            code=code,
+            published_fingerprint=_published_fingerprint(request, outcome),
         )

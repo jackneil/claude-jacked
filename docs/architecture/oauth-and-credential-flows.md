@@ -56,32 +56,74 @@ Each token set is a separate refresh lineage, called a chain: `primary` and
 
 A failure or a success on one chain never changes the other chain's tokens or
 breaker. The guards that protect the Claude Code lineage read only the `cc`
-breaker. These guards are the reconcile refresh-token import, the authority
-guard import, and `build_oauth_data()`.
+breaker. These guards are the reconcile refresh-token import, the launch token
+sync, the authority guard import, and `build_oauth_data()`.
 
-`_refresh_token_flow()` resolves the chain once, under the lock of that chain.
-It uses the chain for the columns it writes, for the `invalid_grant` branch,
-for the log text, and for the token it returns. `CC_OR_PRIMARY_429` uses the
-`cc` chain while that chain has a refresh token and no recorded
-`invalid_grant`. Otherwise it uses the `primary` chain. If the chain changes
-while the flow waits for the lock, the flow releases that lock and runs again
-under the correct lock.
+Each refresh mode names one chain. `_refresh_token_flow()` uses that chain
+under the lock of that chain. It uses the chain for the columns it writes, for
+the `invalid_grant` branch, for the log text, and for the token it returns.
 
 The dead-chain rule:
 
 - An `invalid_grant` on the `cc` chain kills the chain. The flow removes
   `cc_refresh_token` and records `invalid_grant` on the `cc` breaker.
-- The flow keeps a live access token only when the live store holds an
-  unexpired token that the shared ownership rule proves (section 11). It never
-  imports the live refresh token, because that token belongs to the running
-  Claude Code session.
+- The flow reads the live store when the chain dies. The shared ownership
+  rule (section 11) must prove that the live tokens belong to the row.
+- A live refresh token is new when it is a non-empty string, it is not the
+  failed token, and it is not the row's primary refresh token. Its
+  fingerprint must also not be in `cc_refresh_failed_token_fp`.
+- The row adopts a new live refresh token as its `cc` lineage. One
+  compare-and-swap write stores that token, its pass-through fields, the
+  access token and its expiry. The same write clears the `cc` breaker.
+- Any other live refresh token gives the row only the live access token and
+  its expiry. The `cc` breaker keeps `invalid_grant`.
+- Reconcile and the launch token sync apply this rule through
+  `dead_chain_adoption()` in `credential_helpers.py`. When the `cc` chain
+  dies, the rule reads the failed token as `cc_refresh_token`. It reads the
+  stored fingerprints as they are. Thus the rule refuses the failed token
+  and each `cc` token that died before it.
+- jacked does not exchange an adopted refresh token while a session can hold
+  it. `cc_rotation_block()` refuses that exchange (section 11).
 - Otherwise the flow also removes `cc_access_token` and `cc_expires_at`. No
   consumer can then send a dead token.
+- The flow adds the fingerprint of the failed `cc` refresh token to
+  `cc_refresh_failed_token_fp`. It also does this when it adopts a new live
+  lineage, and when a re-authorization stored a new `cc` lineage before the
+  clean-up ran: the clean-up keeps the new lineage and still records the
+  token that died. The column keeps the fingerprint of each condemned `cc` token. The
+  newest fingerprint is first, and a space separates two fingerprints. A dead
+  token stays dead, so the flow never removes an earlier fingerprint.
+- No importer adopts a `cc` refresh token with one of these fingerprints.
+  This applies to a dead chain and to a live chain, because a cleared
+  breaker does not release a condemned token. Reconcile, the launch token
+  sync and the authority guard use `refresh_token_importable()` in
+  `credential_helpers.py`. An importer that refuses a condemned token also
+  takes none of its pass-through fields: they describe the refused lineage,
+  and the row keeps its own.
+- The `cc` flow never sends a condemned `cc` refresh token. When an importer
+  brought one back, the flow runs the `invalid_grant` clean-up with no
+  request. jacked logs `Account N: not sending the Claude Code refresh token;
+  an earlier invalid_grant condemned it (caller cc)`.
 - An `invalid_grant` on the `primary` chain records the failure on the
   `primary` breaker only. The `cc` tokens do not change.
 - A new Claude Code authorization clears the `cc` breaker. A primary
   re-authorization clears the `primary` breaker.
 - A background auto-swap never selects an account with a dead `cc` chain.
+- The flow records the fingerprint of the failed primary refresh token in
+  `refresh_failed_token_fp`. The verdict is the fingerprint alone. The
+  breaker columns do not change it, so a writer that clears the primary
+  breaker does not release the token.
+- While the row holds a refresh token with that fingerprint, no path sends
+  the token. The flow refuses the exchange and logs one line with the
+  account id and the caller. The row shows the error `Sign-in required: the
+  refresh token was revoked`.
+- Only a new stored refresh token releases the primary verdict. A database
+  trigger clears the fingerprint for each writer: a re-authorization, an
+  imported rotation, or a new add of the account.
+
+`build_oauth_data()` never publishes the refresh token of a dead chain. A
+writer must not put that null refresh token over a working refresh token of
+the same account. Section 7 describes the refusal.
 
 The token chooser:
 
@@ -104,11 +146,15 @@ A rejected token renews only the chain that owns it:
   `auth_rejected`.
 - A 401 on the primary token renews the primary chain through the circuit
   breaker.
-- A 429 backs off and does not rotate a chain. The backoff honors
-  `Retry-After` up to 6 hours, else it uses the escalating per-account step.
-- A rotation is allowed only after 3 consecutive 429s on the same token. It is
-  allowed at most once in 3 poll periods (the `usage_check_interval` setting,
-  at least 600 seconds), read at call time.
+- A 429 backs off. The backoff honors `Retry-After` up to 6 hours. Otherwise
+  it uses the escalating per-account step.
+- A 429 on the `cc` access token never rotates a chain. A `cc` rotation uses
+  a single-use refresh token that a running session can hold. The flow logs
+  one line, and the caller backs off.
+- A 429 on the primary token can rotate the primary chain. This rotation is
+  allowed only after 3 consecutive 429s on the same token. It is allowed at
+  most once in 3 poll periods (the `usage_check_interval` setting, at least
+  600 seconds), read at call time.
 
 Token exchange outcomes:
 
@@ -122,6 +168,87 @@ The heal sweep does not clear a network breaker while its cooldown runs. It
 probes the token endpoint host once for each pass, with a 5 second HEAD
 request, before it forces a renewal. When the probe fails, the sweep defers
 the account to a later pass.
+
+The heal sweep never clears an `invalid_grant` breaker. When the fingerprint
+matches the stored refresh token, the sweep does not send the token. It logs
+one line for the account in each pass. Then it validates the access token
+with a profile request. An access token that works heals the account.
+Otherwise the account counts as `confirmed_invalid`. A breaker from an older
+version has no fingerprint. That account gets one exchange, and the exchange
+records the fingerprint. A row whose last error says that its token belongs
+to a different account gets no exchange either: the validation leg keeps it
+invalid until a re-authorization replaces the token.
+
+The sweep reads each row one time in each pass. Before it forces a renewal,
+it clears a breaker that is not `invalid_grant`. This write is a
+compare-and-swap on `refresh_token`, `refresh_failure_type`,
+`refresh_last_failed_at` and `refresh_failed_token_fp`, as the sweep read
+them. Another writer can record a verdict or store a new refresh token while
+the sweep waits for the probe. Then the write does not occur, the sweep sends
+no request, and the account goes to the next pass. jacked logs `Account N:
+heal deferred; the refresh state changed while the heal checks ran`.
+
+Validation sends one profile request with the access token. A 200 proves that
+the token works. It does not prove that the token belongs to the row. When
+the profile names another account (another email, organization, or account
+uuid), validation applies nothing from the profile. It marks the row
+`invalid` with the error `Token belongs to a different account`. It writes
+this mark only while the row holds the token that it checked. The `valid`
+mark follows the same rule: validation records it only while the row holds
+the access token that it checked. When a re-authorization stored another
+token meanwhile, validation records nothing and asks for a new check. A
+profile with no owner value (no account object or no email) is not evidence
+of another owner. While `foreign_token_fp` binds the row's primary refresh
+token, such a profile proves no owner: the verdict stands, and validation
+does not mark the row valid. The request after a token renewal uses the same
+rule.
+
+The mark also binds the verdict to the row's primary refresh token:
+`foreign_token_fp` holds the fingerprint of that token. While the row holds a
+refresh token with this fingerprint, its primary tokens belong to another
+account. No path sends that refresh token, because the exchange spends a
+single-use token of the other account under this row. No usage request
+sends the access token beside it, so the usage of another account never
+goes into this row. The usage request uses the row's own Claude Code token,
+or it does not run. A usage success through the row's own Claude Code token
+does not mark the row valid while the verdict stands. The refresh flow
+refuses the exchange and logs one line with the account id and the caller.
+The heal sweep skips the exchange and logs one line in each pass. Then the
+profile check keeps the row `invalid`. The verdict is the binding alone. A
+usage success, the watchdog and other error writers can change the error
+text or the status, but they do not release the verdict. A path that writes
+an error after a failed refresh or validation keeps the text of the verdict.
+Only two events release the verdict: a new stored refresh token (a database
+trigger clears the fingerprint), or a validation that proves the row's own
+account. That validation clears the fingerprint only while the row holds the
+access token that it checked. A row that carries the text of the verdict
+with no fingerprint (a mark from before the column) is bound one time when
+the schema opens, before any refresh path runs.
+
+No publisher writes the primary tokens of a bound row to a credential store.
+`build_oauth_data()` in `jacked/api/credential_helpers.py` builds the payload
+for every publisher. It refuses (`ForeignPrimaryTokens`) when
+`foreign_token_fp` binds the row's primary refresh token and the row has no
+usable Claude Code chain of its own. Each publisher then fails closed. The
+switch engine answers `unusable` with code `FOREIGN_PRIMARY_TOKENS` before it
+resolves the platform, and its preflight refuses inside the lease when a
+validation bound the row after that check. The auto-swap skips the target and
+logs one line. The launch stops with the message of the use route, in the
+resolver and again before it writes the per-account file. A re-stamp
+publishes the authority's own payload, so the verdict does not apply to it.
+The window keeper sends no bound primary token: a ping is a usage request,
+and it would open the other account's window under this row. A bound row with
+a usable Claude Code chain publishes that chain, which is the row's own
+lineage.
+
+Each write that validation makes after a request is a compare-and-swap on
+the access token that the request sent. Thus a re-authorization that lands
+during the request keeps its own status. This applies to a 401 or 403, to a
+5xx or 429 answer, to a timeout, and to an error. When the row identity
+changes during the check, validation records nothing. The result is `The
+account changed during validation. Validate the account again.`, and the
+heal sweep counts the account as `deferred`. A profile for a row that is
+gone records nothing.
 
 The background refresh loop counts only real token exchanges as `refreshed`.
 A token inside the 4 hour buffer but outside the 5 minute refresh window is
@@ -213,9 +340,11 @@ jacked's own refresh of the Claude Code chain applies the same rules:
   Otherwise, it removes the timestamp and keeps `subscriptionTypeSource`.
 
 After an invalid_grant, jacked can keep a live access token that it proves
-belongs to the account. This recovery stores the pass-through fields of the
-live object with no refresh token. It does not keep `refreshTokenExpiresAt`.
-It binds `subscriptionTypeVerifiedAt` to the tier in the live object.
+belongs to the account. When it adopts a live refresh token, it binds the
+pass-through fields to that token, `refreshTokenExpiresAt` included. When it
+keeps only the access token, it stores the pass-through fields with no
+refresh token and does not keep `refreshTokenExpiresAt`. It binds
+`subscriptionTypeVerifiedAt` to the tier in the live object.
 
 ## 4. Capability resolution fails closed
 
@@ -444,6 +573,49 @@ observed-only journal outcome, but it does not advance the committed
 The result reports `existing_sessions=restart_required` because a store
 readback cannot prove what an already-running Claude process cached.
 
+### Refresh downgrade refusal (#149i)
+
+- Before the pending row and before any write, the engine asks the request's
+  `refresh_downgrade_check`. It asks inside the switch lease, after it reads
+  the authority.
+- The check is `refuses_refresh_downgrade()` in
+  `jacked/credentials/refresh_guard.py`. It refuses the write when all three
+  conditions are true:
+  1. The target payload has no refresh token: null, empty or absent.
+  2. The authority holds a refresh token that is a non-empty string.
+  3. The shared ownership rule proves that the authority tokens belong to the
+     target row. The rule does not require a stamp.
+- Before the rule costs a profile request, the writer asks the database which
+  row stores the authority's refresh token (`account_id_for_refresh_token()`
+  in `jacked/web/database.py`, passed as `lineage_known`). A refresh token is
+  issued to one account. The target row: the write is refused. Another row:
+  the write goes ahead. No row, or a failed lookup: the ownership rule
+  decides. A primary refresh token that `foreign_token_fp` binds names no
+  row. The engine preflight, the auto-swap request and the launch's
+  scoped-file check pass the finder.
+- An empty store and a payload of another owner do not stop the write. A
+  payload whose owner could not be checked (the profile request failed) is
+  refused with `busy` and code `OWNERSHIP_UNCHECKED`: a transient refusal
+  that every caller retries. A refusal is retryable, a lost refresh lineage
+  is not.
+- A refusal writes nothing. The engine creates no pending row, writes no
+  store, and leaves the authority byte-identical.
+- The result is `unusable` with code `CC_REAUTH_REQUIRED`. Its message is
+  `not publishing a null refresh token over a live one (cc re-auth required)`.
+- The engine logs one WARNING line with the account id and that message. The
+  line holds no token value.
+- `activate_account()` builds the check for the object the request
+  publishes: the row's pair, or the authority's own object for a re-stamp.
+  The preflight builds it again inside the lease, for the object it keeps or
+  rebuilds. The auto-swap request carries the same check.
+- Usually the preflight reconcile adopts the live lineage first (section 11),
+  and the write then publishes it. The refusal protects a row that the
+  adoption cannot repair. An example is a row that stores the live refresh
+  token while its breaker still records `invalid_grant`.
+- The switch route answers the refusal with HTTP 422. The body holds the
+  message and the code. The dashboard shows a notice that names the fix: a
+  new Claude Code authorization for that account.
+
 ### Outcome contract
 
 | Outcome | Claim |
@@ -456,7 +628,7 @@ readback cannot prove what an already-running Claude process cached.
 | `failed_preserved` | Failure occurred and the previous authority value was observed intact |
 | `indeterminate` | The authority cannot be classified safely as before or target |
 | `restart_required` | The requested background operation cannot safely activate an uncooperative topology |
-| `unusable` | The request or store state cannot form a safe transaction |
+| `unusable` | The request or store state cannot form a safe transaction. Code `CC_REAUTH_REQUIRED` means the write would put a null refresh token over a live one. Code `FOREIGN_PRIMARY_TOKENS` means the row's primary tokens belong to a different account and the row has no Claude Code chain to publish |
 | `unsupported` | A certified capability, complete writer evidence, or platform support is absent |
 | `diverged` | Pre-write stores conflict in a mode that cannot repair safely, including a missing authority with a readable required mirror |
 
@@ -589,6 +761,14 @@ Consequences for `jacked claude <id>` today:
 - an unknown or unsupported build aborts before Claude starts;
 - a truthful activation must observe the selected account in the global
   authority and required mirror;
+- on a Keychain build, the engine can refuse the global activation with code
+  `CC_REAUTH_REQUIRED`. When the authority still names the selected account,
+  the launch continues: the authority holds that account's own working
+  tokens, and Claude starts with them. The launch prints
+  `Note: account N: <message>. Claude starts with the current credentials of
+  this account.` to stderr, and the snapshot evidence is
+  `launch:global-authority:live-refresh-kept`. Any other refusal stops the
+  launch, as before;
 - the launch also changes the global credential stores used by future default
   sessions;
 - already-running sessions keep their current credentials;
@@ -626,6 +806,22 @@ sync does not read that file. The sync uses the import rules of reconcile
   because that merges the two chains.
 - A pair that expires before the pair in the row does not replace that pair.
   The exception is a row token that is known to be dead (#179i).
+- A dead chain (`invalid_grant`) follows the dead-chain rule of section 2.1.
+  A new refresh token in the file is adopted, and the same write clears the
+  `cc` breaker. The failed token, an empty token or the row's primary refresh
+  token gives only the access token and its expiry, and the breaker keeps
+  `invalid_grant`. The rule also applies when the row already holds the
+  file's access token: the sync then takes no pass-through fields for the
+  failed token. An adoption logs `Account N: adopted the live Claude Code
+  refresh lineage after invalid_grant (ownership proven)`. The sync reads
+  `cc_refresh_failed_token_fp` with the row. Thus the rule refuses the failed
+  token also after the clean-up removed it from the row. A database from
+  before the fingerprint column syncs as before.
+- A live chain never takes a refresh token whose fingerprint is in
+  `cc_refresh_failed_token_fp`. The file then gives the access token and its
+  expiry only, and the row keeps its own refresh token. jacked logs `Account
+  N: the per-account file holds a Claude Code refresh token that an earlier
+  invalid_grant condemned; only the access token is imported`.
 - The shared ownership rule (`live_payload_ownership`) must prove the owner.
   The per-account file has no `_jackedAccountId` stamp, so the rule does not
   require one. A token that the row holds proves the owner with no request.
@@ -698,7 +894,19 @@ Two steps keep a rotation that the loop could not prove from being lost:
   on the identity the proof was made against (email, organization uuid,
   account uuid). A writer that changed either during the profile request wins,
   and the sync forgets its cached verdict for that row, so the next attempt
-  proves the token against the new identity.
+  proves the token against the new identity. The write also compares
+  `cc_refresh_token`, `cc_refresh_failure_type` and
+  `cc_refresh_failed_token_fp`, because the dead-chain rule reads them. Thus
+  a chain that dies during the profile request never gets a refresh token
+  beside a standing `invalid_grant` (#244i). A token that an `invalid_grant`
+  condemns during the request is not adopted either.
+- The launch never writes a null refresh token over a live one of the same
+  account (#149i). A dead-chain row publishes no refresh token. When the
+  per-account file holds a working refresh token of the same account, the
+  launch keeps the file's tokens, logs `Account N: not publishing a null
+  refresh token over a live one (cc re-auth required)`, and starts Claude.
+  The shared ownership rule proves the owner; the file has no stamp, so the
+  rule does not require one.
 
 ## 11. Foreign authority writes
 
@@ -774,14 +982,60 @@ The guard therefore also examines a stamped payload:
 - Otherwise the guard identifies the payload once through the profile
   endpoint. It adopts the tokens into the row that the shared ownership rule
   proves. That row can differ from the stamp.
-- The guard does not reassert over a stamped payload (#154). It logs a warning
-  when the owner differs from the stamp.
+- When the owner differs from the stamp, the guard logs a warning. Then it
+  reads the `oauthAccount` block of `~/.claude.json` (#154i). The block is
+  evidence of the account that the user chose. It does not prove who owns
+  the tokens.
+  - When the block names the owner, the user chose that account with
+    `/login`. The guard makes the owner the desired and the active account
+    in one settings write, arms the auto-swap cooldown and marks the open
+    sessions pending, as a manual switch does. Then it re-stamps the
+    authority for the owner with the same tokens. An owner that jacked has
+    disabled or deleted is not followed: the guard adopts the tokens, logs
+    one WARNING, and leaves the pointers alone.
+  - When the block names the stamped account, a stale session refreshed the
+    tokens of another account. The guard reasserts the stamped account when
+    it is also the desired account and the guard can reassert it.
+  - When the block is missing or unreadable, or names neither account or
+    both accounts, the guard only adopts the tokens. It logs one INFO line
+    with the reason.
+- The block names a row by the account uuid when the row records one, and by
+  the email otherwise. The organization uuid must also match when both sides
+  record it, because the rows of one person in two organizations share one
+  account uuid.
+- Claude Code 2.1.316 writes the identity keys of `oauthAccount` at `/login`
+  before it saves the new tokens. A token refresh merges only display fields
+  into the block. Thus the block names the new account after a `/login`, and
+  a stale refresh does not change it.
+- The re-stamp and the reassert use the same floor and settle rule as the
+  repairs of an unstamped payload.
+- A re-stamp republishes exactly the payload that the authority holds, with
+  the stamp of the owner. It adds the stamp and the config identity, nothing
+  else, so a row that cannot publish the live pair (for example, the `cc`
+  breaker kept a condemned refresh token out of the row) is still re-stamped
+  without a loss. The request names the digest of that payload. When the
+  authority holds another payload by the time the engine reads it inside the
+  lease (Claude Code rotated meanwhile), the engine refuses with
+  `concurrent_write` and writes nothing, and the guard adopts the new payload
+  on its next pass. This rule also applies to the re-stamp of an unstamped
+  payload.
+- After a committed repair, the guard keeps the 16-character fingerprint of
+  the refresh and access tokens that the engine reports it published
+  (`SwitchResult.published_fingerprint`, from the exact payload written) in
+  the setting `last_authority_write_fp`. A stamped payload with these tokens
+  is jacked's own write, so the guard does not examine it again.
 
 The identity watcher refuses to publish an identity for a stamped payload
-whose token belongs to a different account.
+whose token belongs to a different account. Its stamp-mismatch evidence
+describes only the account that the authority holds now. The evidence stops
+when a re-stamp or a reassert makes the stamp and the tokens agree. The
+watcher also skips a pass while the config file is younger than 15 seconds,
+because a `/login` writes the identity a moment before it saves the tokens,
+and a republish in that window would undo the user's choice.
 
-`live_payload_belongs_to()` is the one shared stamp and ownership rule. Three
-paths use it: reconcile, the authority guard import, and the `invalid_grant`
+`live_payload_belongs_to()` is the one shared stamp and ownership rule. Four
+paths use it: reconcile, the authority guard import, the refresh downgrade
+check (section 7), and the `invalid_grant`
 live recovery. When the caller requires a stamp, the stamp must name the row.
 A token that the row already holds proves the owner. A profile that the caller
 already fetched proves the owner when `profile_owner_mismatch()` accepts it.
@@ -816,6 +1070,13 @@ row only when it can prove the owner:
   the credentials file is a mirror that Claude Code does not update.
 - Reconcile never imports the row's own primary access token into the `cc`
   columns. That payload is the primary fallback of `build_oauth_data()`.
+- While the `cc` breaker records `invalid_grant`, reconcile and the authority
+  guard import follow the dead-chain rule of section 2.1. They never import
+  the failed token. Reconcile
+  adopts a proven new live refresh token and clears the breaker in the same
+  compare-and-swap write. After the write lands, it logs `Account N: adopted
+  the live Claude Code refresh lineage after invalid_grant (ownership
+  proven)`.
 
 Every activation path (a switch, a launch, an OAuth activation) goes through
 `activate_account()`. Inside the switch lease, before the engine writes the
@@ -827,7 +1088,22 @@ is then built again from the row, so the activation writes the rotation that
 it just saved. When the outgoing row keeps changing, or the step fails, the
 activation stops with `busy` and code `outgoing_account_busy`, and writes
 nothing. The switch route answers that code with `OUTGOING_ACCOUNT_BUSY`
-(409).
+(409). After the preflight, the engine refuses a write that would put a null
+refresh token over a live one of the same account (section 7). That refusal
+writes nothing.
+
+`cc_rotation_block()` refuses to exchange a `cc` refresh token that a running
+session can hold. `live_holder_account_ids()` names those rows. A row is a
+holder when the live authority holds its tokens. A row is also a holder when a
+tracked session used it in the last 480 minutes (`HOLDER_WINDOW_MINUTES`).
+That window is the life of a Claude Code access token: an idle session keeps
+its refresh token in memory and spends it when its access token expires. When
+an active session has no account id, the holders are unknown. Then the
+function returns None, `cc_rotation_block()` reports `holders_unknown`, and
+jacked refuses every rotation; one INFO line names the cause until the
+holders are known again. A live-chain import never adopts a refresh token
+that the endpoint condemned for the row (`cc_refresh_failed_token_fp`),
+even after a new authorization revived the chain.
 
 One case still loses a refresh lineage. Claude Code rotates the token, and the
 access token expires before any reconcile pass sees it (for example, the
@@ -882,6 +1158,11 @@ every switch reports `observed_target_unfenced`, so a rule that acted only on
 | `jacked/launch.py` | Per-account launch preparation and current scoped limitation |
 | `jacked/api/session_observer.py` | Off-hook authority observation and snapshot refresh |
 | `jacked/api/authority_guard.py` | Foreign-write and stamped-rotation adoption, desired-account reassertion |
+| `jacked/api/stamped_rotation.py` | Stamped path of the authority guard: adoption and the `oauthAccount` repairs (#154i) |
+| `jacked/api/stamped_evidence.py` | The `oauthAccount` verdict and the fingerprint of jacked's own writes |
+| `jacked/credentials/refresh_guard.py` | The refresh downgrade refusal (#149i) |
+| `jacked/credentials/fingerprint.py` | The fingerprint of a published token pair |
+| `jacked/web/refresh_verdict.py` | Token fingerprints and the revoked-token verdicts (#152i) |
 | `jacked/api/credential_helpers.py` | Credential payload builder, reconcile, shared ownership rule |
 | `jacked/web/auth.py` | Chain-aware refresh flow, token chooser, usage fetch, heal sweep |
 | `jacked/data/hooks/session_account_tracker.py` | Snapshot-only session spans without relabelling |

@@ -273,8 +273,9 @@ def test_reopen_relaunches_the_browser_and_reports_which_one(monkeypatch):
 
 
 def test_reopen_reports_the_fallback_mode_it_actually_got(monkeypatch):
-    """No installed browser means the system default opened, and the banner
-    must stop claiming a dedicated window exists."""
+    """A re-open that got the system default browser (the "default" setting)
+    reports "default", and the banner must stop claiming a dedicated window
+    exists."""
     db, account = _make_db()
     flow = _pending_browser_flow(db, account["id"])
     flow._browser_mode = "profile"
@@ -289,6 +290,31 @@ def test_reopen_reports_the_fallback_mode_it_actually_got(monkeypatch):
 
     assert status["browser_mode"] == "default"
     assert "browser_name" not in status
+
+
+def test_reopen_reports_when_no_window_opened(monkeypatch):
+    """In profile or incognito mode the launcher opens nothing when no
+    supported browser is found or the launch fails (it never falls back to
+    the system browser, which can hold another account). The click must
+    say so instead of doing nothing."""
+    db, account = _make_db()
+    flow = _pending_browser_flow(db, account["id"])
+    flow._browser_mode = "profile"
+    flow._browser_name = "Chrome"
+    monkeypatch.setattr(
+        browser_launch,
+        "open_auth_url",
+        lambda *a: browser_launch.LaunchResult("manual", None),
+    )
+
+    status = run_async(flow.reopen_browser)
+
+    assert status["browser_mode"] == "manual"
+    assert "browser_name" not in status
+    assert status["reopen_error"] == (
+        "jacked could not open the sign-in window. Use the link in the banner."
+    )
+    assert status["status"] == "pending"  # the flow itself is untouched
 
 
 def test_reopen_refuses_a_manual_flow(monkeypatch):

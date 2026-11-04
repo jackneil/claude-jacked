@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Mapping
+
 import logging
 import os
 import re
@@ -17,8 +19,12 @@ from jacked.api.claude_identity import (
     write_identity,
 )
 from jacked.api.credential_helpers import (
+    FOREIGN_PRIMARY_CODE,
+    FOREIGN_PRIMARY_MESSAGE,
     ClaudeConfigUnwritable,
+    ForeignPrimaryTokens,
     build_oauth_data,
+    publishes_foreign_primary,
     reconcile_outgoing_before_activation,
 )
 from jacked.findbin import find_bin
@@ -51,6 +57,7 @@ from .models import (
     SwitchOutcome,
     SwitchResult,
 )
+from .refresh_guard import downgrade_check_for, lineage_finder
 from .resolver import (
     CanonicalCredentialResolver,
     FileResolverSnapshotSink,
@@ -240,6 +247,23 @@ def _unsupported(operation_id: str, account: dict, reason: str) -> SwitchResult:
     )
 
 
+def _unusable(operation_id: str, account: dict, reason: str, code: str) -> SwitchResult:
+    """A refusal before the engine: the request cannot form a safe transaction."""
+    account_id = int(account["id"])
+    return SwitchResult(
+        operation_id=operation_id,
+        outcome=SwitchOutcome.UNUSABLE,
+        desired_default=IdentityAxis(account_id, "desired"),
+        storage=IdentityAxis(None, "unchanged"),
+        committed_authority=IdentityAxis(None, "unchanged"),
+        existing_session_activation=SessionActivationState.UNCHANGED,
+        provider_verification=ProviderVerificationState.UNVERIFIED,
+        observed_identity=CredentialIdentity(),
+        message=reason,
+        code=code,
+    )
+
+
 def _engine_for(
     db, resolution: CapabilityResolution, home: Path
 ) -> CredentialTransactionEngine | str:
@@ -357,44 +381,26 @@ def claude_config_identity_publisher(home: Path, db=None):
     return publish
 
 
-def activate_account(db, account: dict, context: SwitchContext, operation_id: str) -> SwitchResult:
-    """Resolve the exact runtime contract and activate one local account."""
-    home = Path.home()
-    try:
-        identity = detect_claude_identity(home)
-    except OSError as exc:
-        return _unsupported(operation_id, account, str(exc))
-    resolution = SHIPPED_REGISTRY.resolve(identity)
-    if not resolution.can_mutate:
-        return _unsupported(operation_id, account, resolution.reason)
-    engine = _engine_for(db, resolution, home)
-    if isinstance(engine, str):
-        return _unsupported(operation_id, account, engine)
-    target_id = int(account["id"])
-
-    def _payload(row: dict) -> CredentialPayload:
-        return CredentialPayload.from_mapping(
-            {"_jackedAccountId": target_id, "claudeAiOauth": build_oauth_data(row)}
-        )
-
-    request = SwitchRequest(
-        operation_id=operation_id,
-        account_id=target_id,
-        email=account.get("email") or "",
-        organization_id=account.get("organization_uuid") or None,
-        payload=_payload(account),
-        context=context,
-        interaction=InteractionMode.FOREGROUND,
-        display_name=account.get("display_name") or None,
-        organization_name=account.get("organization_name") or None,
+def _row_payload(target_id: int, row: dict) -> CredentialPayload:
+    """The payload an activation of ``target_id`` publishes from ``row``."""
+    return CredentialPayload.from_mapping(
+        {"_jackedAccountId": target_id, "claudeAiOauth": build_oauth_data(row)}
     )
 
+
+def _activation_preflight(db, request: SwitchRequest, *, rebuild_payload: bool = True):
+    """The preflight of one activation, run inside the switch lease.
+
+    It saves the active account's newest live tokens before they are
+    overwritten, then rebuilds the payload and the downgrade check from the
+    row as it is now (a same-account activation may just have imported a
+    rotation). A republish (``rebuild_payload`` False) keeps its payload: it
+    publishes what the authority holds, with a new stamp. Fail closed: a
+    refusal is retryable, a lost refresh lineage is not.
+    """
+    target_id = request.account_id
+
     def preflight() -> SwitchRequest | None:
-        # Inside the switch lease: save the active account's newest live
-        # tokens before they are overwritten, then build the payload from the
-        # row as it is now (a same-account activation may just have imported
-        # a rotation). Fail closed: a refusal is retryable, a lost refresh
-        # lineage is not.
         try:
             if not reconcile_outgoing_before_activation(db, target_id):
                 return None
@@ -409,8 +415,106 @@ def activate_account(db, account: dict, context: SwitchContext, operation_id: st
                 exc_info=True,
             )
             return None
-        return replace(request, payload=_payload(row), preflight=None)
+        try:
+            payload = _row_payload(target_id, row) if rebuild_payload else request.payload
+        except ForeignPrimaryTokens as exc:
+            # The row was bound to another account's tokens after the early
+            # check (writers run on threads): refuse inside the lease too.
+            logger.warning("Account %d: activation refused; %s", target_id, exc)
+            return None
+        return replace(
+            request,
+            payload=payload,
+            preflight=None,
+            # The check sees the object this request publishes: the row's
+            # pair, or the authority's own object for a re-stamp. The
+            # database names the owner of a live refresh token first.
+            refresh_downgrade_check=downgrade_check_for(
+                row, _oauth_of(payload), lineage_known=lineage_finder(db)
+            ),
+        )
 
+    return preflight
+
+
+def _oauth_of(payload: CredentialPayload) -> dict:
+    """The ``claudeAiOauth`` object of ``payload`` (an empty dict when absent)."""
+    oauth = payload.to_mapping().get("claudeAiOauth")
+    return oauth if isinstance(oauth, dict) else {}
+
+
+def _republished_payload(target_id: int, republish: Mapping) -> CredentialPayload:
+    """The payload a re-stamp publishes: the authority's own object, stamped
+    for ``target_id``.
+
+    >>> p = _republished_payload(4, {"claudeAiOauth": {"accessToken": "a"}, "_jackedAccountId": 1})
+    >>> p.identity.account_id
+    4
+    """
+    return CredentialPayload.from_mapping({**dict(republish), "_jackedAccountId": target_id})
+
+
+def activate_account(
+    db,
+    account: dict,
+    context: SwitchContext,
+    operation_id: str,
+    *,
+    republish: Mapping | None = None,
+    expected_digest: str | None = None,
+) -> SwitchResult:
+    """Resolve the exact runtime contract and activate one local account.
+
+    The engine refuses (UNUSABLE, code CC_REAUTH_REQUIRED) a write that would
+    put a null refresh token over a live one of this account, and leaves the
+    authority unchanged (#149i). A row whose primary tokens belong to another
+    account, with no usable Claude Code chain of its own, is refused before
+    the engine (UNUSABLE, code FOREIGN_PRIMARY_TOKENS): nothing publishes
+    another account's token under this row's stamp.
+
+    ``republish`` is the authority's own payload: the write publishes it with
+    the account's stamp (a re-stamp adds the stamp and the config identity,
+    nothing else), and ``expected_digest`` names the payload the authority
+    must still hold, else the engine refuses with CONCURRENT_WRITE (#154i).
+
+    >>> # Tested via test_credential_runtime.py and test_refresh_downgrade_guard.py
+    """
+    if republish is None and publishes_foreign_primary(account):
+        logger.warning(
+            "Account %d: activation refused; %s", int(account["id"]), FOREIGN_PRIMARY_MESSAGE
+        )
+        return _unusable(operation_id, account, FOREIGN_PRIMARY_MESSAGE, FOREIGN_PRIMARY_CODE)
+    home = Path.home()
+    try:
+        identity = detect_claude_identity(home)
+    except OSError as exc:
+        return _unsupported(operation_id, account, str(exc))
+    resolution = SHIPPED_REGISTRY.resolve(identity)
+    if not resolution.can_mutate:
+        return _unsupported(operation_id, account, resolution.reason)
+    engine = _engine_for(db, resolution, home)
+    if isinstance(engine, str):
+        return _unsupported(operation_id, account, engine)
+    target_id = int(account["id"])
+    payload = (
+        _republished_payload(target_id, republish)
+        if republish is not None
+        else _row_payload(target_id, account)
+    )
+    request = SwitchRequest(
+        operation_id=operation_id,
+        account_id=target_id,
+        email=account.get("email") or "",
+        organization_id=account.get("organization_uuid") or None,
+        payload=payload,
+        context=context,
+        interaction=InteractionMode.FOREGROUND,
+        display_name=account.get("display_name") or None,
+        organization_name=account.get("organization_name") or None,
+        refresh_downgrade_check=downgrade_check_for(account, _oauth_of(payload)),
+        expected_authority_digest=expected_digest,
+    )
+    preflight = _activation_preflight(db, request, rebuild_payload=republish is None)
     return engine.activate(replace(request, preflight=preflight))
 
 

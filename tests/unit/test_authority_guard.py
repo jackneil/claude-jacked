@@ -60,6 +60,10 @@ class FakeDatabase:
     def get_setting(self, key: str):
         return self.settings.get(key)
 
+    def mark_global_sessions_pending(self) -> int:
+        self.pending_marks = getattr(self, "pending_marks", 0) + 1
+        return 0
+
 
 def _account(account_id: int, email: str, **overrides) -> dict:
     row = {
@@ -129,9 +133,11 @@ class _Activator:
     def __init__(self, outcome=SwitchOutcome.OBSERVED_TARGET_UNFENCED) -> None:
         self.outcome = outcome
         self.calls: list[tuple] = []
+        self.republished: list[tuple] = []
 
-    def __call__(self, db, account, context, operation_id):
+    def __call__(self, db, account, context, operation_id, **repair):
         self.calls.append((account, context, operation_id))
+        self.republished.append((repair.get("republish"), repair.get("expected_digest")))
         return _switch_result(self.outcome, int(account["id"]))
 
 
@@ -475,7 +481,10 @@ def test_second_reassert_within_the_rate_limit_is_skipped():
     assert db.accounts[3]["cc_access_token"] == "live_at_3c"
 
 
-def test_invalid_grant_keeps_the_refresh_token_out_of_the_database():
+def test_invalid_grant_adopts_a_new_live_lineage():
+    """The settled #149i rule (credential_helpers.dead_chain_adoption): a
+    proven live refresh token that is not the failed one is a new lineage.
+    The guard adopts it and clears the cc breaker, like reconcile."""
     db = _db()
     db.accounts[3]["cc_refresh_failure_type"] = "invalid_grant"
     activate = _Activator()
@@ -486,6 +495,27 @@ def test_invalid_grant_keeps_the_refresh_token_out_of_the_database():
         profile_lookup=_profile("carol@test.com", "org-3"),
         activate=activate,
         read_authority=lambda: _foreign_payload(),
+    )
+
+    assert result.action == "reasserted"
+    assert db.accounts[3]["cc_access_token"] == "live_at_3"
+    assert db.accounts[3]["cc_refresh_token"] == "live_rt_3"
+    assert db.accounts[3]["cc_refresh_failure_type"] is None
+
+
+def test_invalid_grant_keeps_the_failed_token_out_of_the_database():
+    """The live store still holds the token that failed: only the access
+    token moves, and the breaker stands."""
+    db = _db()
+    db.accounts[3]["cc_refresh_failure_type"] = "invalid_grant"
+    activate = _Activator()
+
+    result = heal_foreign_authority(
+        db,
+        now=100.0,
+        profile_lookup=_profile("carol@test.com", "org-3"),
+        activate=activate,
+        read_authority=lambda: _foreign_payload(refresh="db_rt_3"),
     )
 
     assert result.action == "reasserted"
@@ -856,17 +886,22 @@ def test_adoption_logs_a_values_free_info_line(caplog):
 def test_adoption_decides_again_when_the_row_changed_during_the_lookup():
     """With no profile supplied the adoption reads the row, then runs the
     profile lookup itself (seconds). A refresh that burned the lineage meanwhile
-    (invalid_grant recorded) must be seen: the decision is made again from the
-    new row, so the single-use refresh token is NOT imported."""
+    (invalid_grant recorded, and the live token condemned by its fingerprint)
+    must be seen: the decision is made again from the new row, so the dead
+    single-use refresh token is NOT imported."""
     from unittest.mock import patch
 
     from jacked.api.authority_guard import ProfileLookup, _import_rotated_tokens
+    from jacked.web.refresh_verdict import token_fingerprint
 
     db = _db()
     row = db.get_account(3)
 
     def lookup_while_the_lineage_dies(token):
-        db.accounts[3].update(cc_refresh_failure_type="invalid_grant")
+        db.accounts[3].update(
+            cc_refresh_failure_type="invalid_grant",
+            cc_refresh_failed_token_fp=token_fingerprint("live_rt_3"),
+        )
         return ProfileLookup(200, {"account": {"email": row["email"], "uuid": None},
                                    "organization": {"uuid": row.get("organization_uuid")}})
 

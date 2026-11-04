@@ -206,7 +206,9 @@ def test_the_invalid_grant_recovery_binds_the_timestamp_to_the_live_tier(tmp_pat
     from jacked.web import auth
 
     db, aid = _account(tmp_path, cc_refresh_token="cc-rt-dead")
-    live_oauth = {"accessToken": "live-at", "refreshToken": "live-rt",
+    # The live store still holds the token that failed: the access-only
+    # path (a different live token is adopted; test_dual_token covers that).
+    live_oauth = {"accessToken": "live-at", "refreshToken": "cc-rt-dead",
                   "expiresAt": (int(time.time()) + 3600) * 1000,
                   "refreshTokenExpiresAt": RT_EXPIRES, **VERIFIED_MAX}
     with patch("jacked.web.auth._live_recovery_payload", return_value=live_oauth):

@@ -7,8 +7,9 @@ re-auth is a single Authorize click. Three properties matter enough to pin:
 * the argv is right for each browser family and mode (a wrong private-window
   flag silently opens a normal window in the wrong profile);
 * an unknown identity (Add Account) never reuses a shared profile;
-* every failure path still gets the user to a browser, because the alternative
-  is an OAuth flow with no way to finish.
+* a failure in profile or private-window mode never opens the system default
+  browser, which can hold another Claude account; the result is "manual" and
+  the dashboard link finishes the flow (test_browser_launch_manual.py).
 
 subprocess.Popen and webbrowser.open are patched in every test that reaches
 them: this module's whole job is spawning a real browser.
@@ -254,16 +255,6 @@ def test_default_mode_hands_the_url_to_the_os(profile_root):
     popen.assert_not_called()
 
 
-def test_no_supported_browser_falls_back_to_the_os(profile_root):
-    """find_browser is None here courtesy of the conftest guard."""
-    with patch.object(bl.subprocess, "Popen") as popen, \
-            patch.object(bl.webbrowser, "open") as wb:
-        result = open_auth_url(URL, {"email": "j@x.com"}, FakeDb("profile"))
-    assert result == LaunchResult("default", None)
-    wb.assert_called_once_with(URL)
-    popen.assert_not_called()
-
-
 def test_profile_mode_spawns_the_browser_in_the_accounts_profile(profile_root):
     account = {"id": 4, "email": "Jack@Example.com"}
     with patch.object(bl, "find_browser", return_value=CHROME), \
@@ -316,17 +307,6 @@ def test_incognito_mode_never_creates_a_profile(profile_root):
     assert result == LaunchResult("incognito", "Chrome")
     assert "--incognito" in popen.call_args.args[0]
     assert not profile_root.exists()
-
-
-def test_a_failed_spawn_still_opens_a_browser(profile_root):
-    """A missing DLL or a browser mid-upgrade must not strand the flow."""
-    with patch.object(bl, "find_browser", return_value=CHROME), \
-            patch.object(bl.subprocess, "Popen", side_effect=OSError("boom")), \
-            patch.object(bl.webbrowser, "open") as wb:
-        result = open_auth_url(URL, {"email": "j@x.com"}, FakeDb("profile"))
-
-    assert result == LaunchResult("default", None)
-    wb.assert_called_once_with(URL)
 
 
 def test_the_authorize_url_is_never_logged(profile_root, caplog):
@@ -458,21 +438,6 @@ def test_non_windows_platforms_start_no_focus_thread(profile_root, monkeypatch):
     assert result == LaunchResult("profile", "Chrome")
     thread.assert_not_called()
     focus.assert_not_called()
-
-
-def test_a_failed_spawn_starts_no_focus_thread(profile_root, monkeypatch):
-    """There is no window to raise when nothing launched."""
-    monkeypatch.setattr(bl.sys, "platform", "win32")
-    # subprocess.DETACHED_PROCESS only exists on Windows; the platform is
-    # faked here so the Popen kwargs must be too, or Linux CI takes the
-    # launch-failed fallback path instead of the one under test.
-    monkeypatch.setattr(bl, "_detach_kwargs", lambda: {})
-    with patch.object(bl, "find_browser", return_value=CHROME),             patch.object(bl.subprocess, "Popen", side_effect=OSError("boom")),             patch.object(bl.threading, "Thread") as thread,             patch.object(bl.webbrowser, "open") as wb:
-        result = open_auth_url(URL, {"email": "j@x.com"}, FakeDb("profile"))
-
-    assert result == LaunchResult("default", None)
-    wb.assert_called_once_with(URL)
-    thread.assert_not_called()
 
 
 def test_bring_to_front_is_a_no_op_off_windows(monkeypatch):

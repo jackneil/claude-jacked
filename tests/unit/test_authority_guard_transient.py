@@ -55,9 +55,11 @@ class _Sequence:
     def __init__(self, *outcomes: SwitchOutcome) -> None:
         self.outcomes = list(outcomes)
         self.calls: list[tuple] = []
+        self.republished: list[tuple] = []
 
-    def __call__(self, db, account, context, operation_id):
+    def __call__(self, db, account, context, operation_id, **repair):
         self.calls.append((account, context, operation_id))
+        self.republished.append((repair.get("republish"), repair.get("expected_digest")))
         outcome = self.outcomes[min(len(self.calls), len(self.outcomes)) - 1]
         return _switch_result(outcome, int(account["id"]))
 
@@ -211,7 +213,11 @@ def _primary_only_holder_db():
     return db
 
 
-def test_a_holder_without_a_claude_code_token_settles_without_the_floor(caplog):
+def test_a_holder_without_a_claude_code_token_is_restamped_by_republishing(caplog):
+    """The holder's row has no Claude Code token, and the authority holds
+    jacked's own primary-fallback publication of it, unstamped. A re-stamp
+    republishes exactly that payload with the holder's stamp (#154i rule):
+    nothing to strip, nothing to lose, and the stamp becomes right."""
     db = _primary_only_holder_db()
     activate = _Sequence(SwitchOutcome.COMMITTED)
     payload = _foreign_payload(access="primary_at_3", refresh=None)
@@ -219,13 +225,14 @@ def test_a_holder_without_a_claude_code_token_settles_without_the_floor(caplog):
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         result = _heal(db, activate, now=100.0, payload=payload)
 
-    assert result.action == "skipped"
-    assert result.reason == "desired account has no Claude Code tokens"
+    assert result.action == "adopted"
     assert (result.foreign_account_id, result.desired_account_id) == (3, 11)
-    assert activate.calls == []
-    assert authority_guard._last_reassert_at == 0.0  # the floor was not spent
-    assert authority_guard._handled["attempts"] == 0
-    assert "account 3 holds no Claude Code token to re-stamp with" in caplog.text
+    assert [call[0]["id"] for call in activate.calls] == [3]
+    republished, digest = activate.republished[0]
+    assert republished["claudeAiOauth"] == payload["claudeAiOauth"]
+    assert digest  # the engine must find this exact payload in the authority
+    assert authority_guard._last_reassert_at == 100.0  # a real repair spends the floor
+    assert "holds no Claude Code token" not in caplog.text
     assert "primary_at_3" not in caplog.text
     assert "carol@test.com" not in caplog.text
 
@@ -239,9 +246,9 @@ def test_a_holder_without_a_claude_code_token_is_handled_once():
     again = _heal(db, activate, now=101.0, payload=payload)
 
     assert again.reason == "foreign payload already handled"
-    assert activate.calls == []
-    # Another payload is not held back by that settled one.
-    db.accounts[3].update({"cc_access_token": "live_at_3", "cc_refresh_token": "live_rt_3"})
-    later = _heal(db, activate, now=102.0)
-    assert later.action == "adopted"
     assert len(activate.calls) == 1
+    # Another payload is not held back by that settled one (after the floor).
+    db.accounts[3].update({"cc_access_token": "live_at_3", "cc_refresh_token": "live_rt_3"})
+    later = _heal(db, activate, now=161.0)
+    assert later.action == "adopted"
+    assert len(activate.calls) == 2

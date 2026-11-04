@@ -19,6 +19,7 @@ from typing import Callable, Mapping, Optional
 from jacked.findbin import find_bin
 
 from .credentials import (
+    CodexCredentialStatus,
     codex_home,
     detect_codex_account,
     ensure_file_storage,
@@ -35,7 +36,33 @@ CODEX_EXPIRES_SENTINEL = 4102444800  # 2100-01-01T00:00:00Z
 
 
 class CodexImportError(Exception):
-    """A Codex account could not be added (not logged in / keyring-only / no CLI)."""
+    """A Codex account could not be added (not logged in / keyring-only / no CLI).
+
+    ``code`` is the stable reason the dashboard keys on. The fix for this
+    class is a ``codex login`` on the machine that runs jacked.
+
+    >>> CodexImportError("no Codex account").code
+    'CODEX_LOGIN_REQUIRED'
+    """
+
+    code = "CODEX_LOGIN_REQUIRED"
+
+
+class CodexStoreUnswitchableError(CodexImportError):
+    """The Codex store is one jacked cannot manage, and no login follows.
+
+    Codex keeps the live credential in the OS keyring (``"keyring"``, or
+    ``"auto"`` with no usable ``auth.json``), so ``auth.json`` is missing or
+    a leftover. A ``codex login`` alone writes the keyring again. The fix is
+    a config change first: set ``cli_auth_credentials_store = "file"``, then
+    run ``codex login``, then add the account again.
+
+    >>> err = CodexStoreUnswitchableError("keyring")
+    >>> isinstance(err, CodexImportError), err.code
+    (True, 'CODEX_STORE_UNSWITCHABLE')
+    """
+
+    code = "CODEX_STORE_UNSWITCHABLE"
 
 
 def import_codex_account(
@@ -125,18 +152,111 @@ def add_codex_account(
     make_active: bool = False,
     login_runner: Optional[Callable[[Path, Optional[Mapping[str, str]]], None]] = None,
 ) -> dict:
-    """Force file storage, optionally drive ``codex login``, then import.
+    """Check the Codex store, force file storage, optionally drive
+    ``codex login``, then import.
 
-    ``run_login`` (CLI) drives the interactive login when no account is present;
-    the web route passes ``run_login=False`` and reports that login is needed.
+    ``run_login`` (CLI) drives the interactive login when one is needed; the
+    web route passes ``run_login=False`` and reports that login is needed.
     ``login_runner`` is injectable for tests.
+
+    The checks run before any write. Forcing file storage flips Codex to read
+    ``auth.json``. Under ``"keyring"``, or ``"auto"`` with no usable
+    ``auth.json``, the live credential is in the keyring and any
+    ``auth.json`` is a leftover, so importing it would replace a working
+    sign-in with stale credentials. Such a store needs a login, the same as
+    a missing sign-in:
+
+    - With a login to follow (``jacked codex add``), the store is set to
+      ``"file"`` first, then ``codex login`` writes a fresh ``auth.json``,
+      then that is imported.
+    - With no login to follow (the web route, ``--no-login``), the call
+      refuses first (``CodexStoreUnswitchableError``) and changes nothing.
     """
     home = home if home is not None else codex_home(env)
-    ensure_file_storage(home, env)
 
     status = detect_codex_account(home, env)
-    needs_login = status.identity is None or not status.identity.email
-    if needs_login and run_login:
-        (login_runner or _run_codex_login)(home, env)
+    if not run_login:
+        _refuse_unless_importable(status)
+    needs_login = _needs_login(status)
+    if needs_login and login_runner is None and not find_bin("codex"):
+        # Refuse before the store flip: without the CLI no login can write
+        # the auth.json that a "file" store needs.
+        raise CodexImportError("the `codex` CLI is not installed or not on PATH")
+    config_path = home / "config.toml"
+    before = config_path.read_bytes() if config_path.exists() else None
+    ensure_file_storage(home, env)
+    if needs_login:
+        try:
+            (login_runner or _run_codex_login)(home, env)
+        except BaseException:
+            # The login did not write auth.json: put the store back the way
+            # it was, or Codex would read an absent file.
+            _restore_config(config_path, before)
+            raise
 
     return import_codex_account(db, home=home, env=env, make_active=make_active)
+
+
+def _restore_config(config_path: Path, before: Optional[bytes]) -> None:
+    """Restore ``config.toml`` to ``before`` (None: it did not exist)."""
+    try:
+        if before is None:
+            config_path.unlink(missing_ok=True)
+        else:
+            config_path.write_bytes(before)
+    except OSError as exc:
+        logger.warning(
+            "Could not restore config.toml after a failed Codex login (%s); "
+            "cli_auth_credentials_store may now read \"file\"",
+            type(exc).__name__,
+        )
+
+
+_NO_SIGN_IN = "no Codex account is signed in. Run `codex login` first."
+
+
+def _identity_missing(status: CodexCredentialStatus) -> bool:
+    return status.identity is None or not status.identity.email
+
+
+def _needs_login(status: CodexCredentialStatus) -> bool:
+    """A login must write ``auth.json`` before the import: no identity, or a
+    store jacked cannot switch (its ``auth.json`` is a leftover).
+
+    >>> from types import SimpleNamespace as NS
+    >>> who = NS(email="dev@example.com")
+    >>> _needs_login(NS(swappable=True, identity=who))
+    False
+    >>> _needs_login(NS(swappable=False, identity=who))
+    True
+    >>> _needs_login(NS(swappable=True, identity=None))
+    True
+    """
+    return not status.swappable or _identity_missing(status)
+
+
+def _refuse_unless_importable(status: CodexCredentialStatus) -> None:
+    """Raise unless the live ``auth.json`` can be imported with no login.
+
+    The verdict is the store's, not "an identity parses": a keyring store
+    with a leftover ``auth.json`` parses fine and is still refused. The log
+    line names the store mode and the code, never an email or a token.
+    """
+    if not status.swappable:
+        error_cls = (
+            CodexImportError
+            if status.store_mode == "file"  # file store, credential missing
+            else CodexStoreUnswitchableError
+        )
+        why, message = "swappable=False", status.reason or _NO_SIGN_IN
+    elif _identity_missing(status):
+        error_cls, why, message = CodexImportError, "identity=missing", _NO_SIGN_IN
+    else:
+        return
+    logger.info(
+        "Codex add refused before any write: store_mode=%s %s code=%s",
+        status.store_mode,
+        why,
+        error_cls.code,
+    )
+    raise error_cls(message)

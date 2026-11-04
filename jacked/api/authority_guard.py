@@ -19,7 +19,28 @@ when the payload is unstamped it:
 An account jacked cannot identify is never overwritten: reasserting over it
 would destroy a refresh lineage jacked does not hold.
 
-Both repairs in step 3 obey one retry rule. Only the outcome of an attempt
+Claude Code keeps the stamp when it rewrites the authority. When the payload
+is stamped but the stamped row does not hold its tokens (a ``/login`` to
+another account, or a refresh by a stale session), the guard:
+
+1. identifies the payload one time through the profile endpoint, unless the
+   payload holds the tokens of jacked's last committed repair,
+2. adopts the tokens into the row of the proven owner, which can differ from
+   the stamp,
+3. when the owner differs from the stamp, follows the account that the
+   ``oauthAccount`` block of ``~/.claude.json`` names. It makes the owner
+   the active account and re-stamps the authority for it, or it reasserts
+   the stamped account. When the block cannot decide, the guard only adopts
+   the tokens.
+
+``jacked.api.stamped_rotation`` holds this stamped path, and
+``jacked.api.stamped_evidence`` holds the evidence that it uses. The guard
+state, the repair floor and the settle rule stay in this module.
+
+A re-stamp publishes the row's own tokens. It runs only when these are the
+tokens that the authority holds, so it adds only the stamp.
+
+All of these repairs obey one retry rule. Only the outcome of an attempt
 settles the payload. The attempts share a floor of one a minute. A held
 switch lease is retried, and any other failure is tried at most
 ``RESTAMP_MAX_ATTEMPTS`` times for one payload.
@@ -375,10 +396,13 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
     in the primary columns, so there is nothing to adopt and nothing to lose.
     """
     from jacked.api.credential_helpers import (
+        cc_chain_dead,
+        dead_chain_adoption,
         expiry_seconds,
         is_primary_publication,
         live_payload_belongs_to,
         live_payload_ownership,
+        refresh_token_importable,
     )
 
     account_id = int(row["id"])
@@ -416,24 +440,35 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
         updates["cc_expires_at"] = expires_at
 
     refresh_token = oauth.get("refreshToken")
-    if refresh_token:
-        # The invalid_grant breaker means jacked and Claude Code are already
-        # competing for one single-use refresh token. Importing it here would
-        # let jacked exchange the token Claude Code still needs.
-        # The Claude Code chain breaker guards this import; the primary
-        # chain's breaker says nothing about this lineage.
-        if row.get("cc_refresh_failure_type") == "invalid_grant":
-            logger.debug(
-                "Account %d: skipping cc_refresh_token import (invalid_grant active)",
-                account_id,
-            )
-        elif refresh_token != row.get("cc_refresh_token"):
-            updates["cc_refresh_token"] = refresh_token
-            # A live rotation proves the lineage is healthy, so clear the same
-            # breaker fields a successful cc refresh clears.
-            if row.get("cc_refresh_failure_type") or row.get("cc_refresh_last_failed_at"):
-                updates["cc_refresh_failure_type"] = None
-                updates["cc_refresh_last_failed_at"] = None
+    adoption = dead_chain_adoption(row, oauth)
+    refused_condemned = bool(
+        refresh_token
+        and refresh_token != row.get("cc_refresh_token")
+        and not refresh_token_importable(row, refresh_token)
+    )
+    if adoption is not None:
+        # The settled #149i rule, shared with reconcile and the launch sync:
+        # a proven new lineage over a dead chain is adopted, with its
+        # pass-through fields bound to it, and the cc breaker clears.
+        updates.update(adoption)
+    elif refresh_token and cc_chain_dead(row):
+        # The failed token, a condemned one, or the primary token: nothing
+        # beyond the access token and its expiry is taken.
+        logger.debug(
+            "Account %d: not adopting the Claude Code refresh token over a dead chain",
+            account_id,
+        )
+    elif (
+        refresh_token
+        and refresh_token != row.get("cc_refresh_token")
+        and refresh_token_importable(row, refresh_token)
+    ):
+        updates["cc_refresh_token"] = refresh_token
+        # A live rotation proves the lineage is healthy, so clear the same
+        # breaker fields a successful cc refresh clears.
+        if row.get("cc_refresh_failure_type") or row.get("cc_refresh_last_failed_at"):
+            updates["cc_refresh_failure_type"] = None
+            updates["cc_refresh_last_failed_at"] = None
     if (
         "cc_access_token" in updates
         and row.get("cc_refresh_failure_type") == "auth_rejected"
@@ -441,9 +476,11 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
         # A newer access token replaces the one the API refused.
         updates["cc_refresh_failure_type"] = None
         updates["cc_refresh_last_failed_at"] = None
-    # Claude Code's pass-through fields (#174i), unless the lineage they
-    # describe is the dead one jacked does not take.
-    if row.get("cc_refresh_failure_type") != "invalid_grant":
+    # Claude Code's pass-through fields (#174i). An adoption carries them,
+    # bound to the adopted token; a dead chain that adopts nothing, and a
+    # live chain that refused a condemned token, take none, because they
+    # describe the lineage jacked does not take.
+    if adoption is None and not cc_chain_dead(row) and not refused_condemned:
         from jacked.credentials.oauth_extra import capture_oauth_extra
 
         row_refresh = updates.get("cc_refresh_token", row.get("cc_refresh_token"))
@@ -453,152 +490,19 @@ def _adoption_updates(row: dict, payload: dict, profile: dict | None) -> dict | 
     return updates
 
 
-def _holds_payload_tokens(row: dict | None, payload: dict) -> bool:
-    """True when ``row`` already holds the payload's access and refresh tokens."""
-    if not row:
-        return False
-    oauth = _oauth_section(payload)
-    access_token = oauth.get("accessToken")
-    refresh_token = oauth.get("refreshToken")
-    if access_token and access_token == row.get("access_token"):
-        # jacked's own primary-fallback publication (build_oauth_data). It
-        # belongs to the primary lineage and must never enter the cc_* columns.
-        return True
-    if not access_token or access_token != row.get("cc_access_token"):
-        return False
-    return not refresh_token or refresh_token == row.get("cc_refresh_token")
+def _profile_identity(profile: dict) -> tuple[str | None, Any]:
+    """Return the email and the organization uuid that a profile names.
 
-
-def _adopt_stamped_rotation(
-    db, payload: dict, stamp: int, profile_lookup: Callable[[str], dict | None]
-) -> HealResult:
-    """Keep jacked's copy of a lineage in sync after a stamped rotation.
-
-    Claude Code keeps the top-level ``_jackedAccountId`` when it rewrites the
-    authority, so a session refresh, or a ``/login`` to another account,
-    leaves a STAMPED payload with tokens jacked does not hold. This path is
-    the one that adopts those rotations. It never writes the authority.
-
-    The stamped row holding the tokens is the common case and costs no
-    network call. Otherwise the payload is identified once through the
-    profile endpoint, the matching row is proven with the shared ownership
-    rule, and the tokens go into THAT row, which may differ from the stamp.
+    >>> _profile_identity({"account": {"email": "e"}, "organization": {"uuid": "o"}})
+    ('e', 'o')
+    >>> _profile_identity({"account": "bad", "organization": None})
+    (None, None)
     """
-    stamped_row = db.get_account(stamp)
-    if _holds_payload_tokens(stamped_row, payload):
-        return HealResult(ACTION_NONE, foreign_account_id=stamp)
-    access_token = _oauth_section(payload).get("accessToken")
-    if not isinstance(access_token, str) or not access_token:
-        return HealResult(ACTION_NONE, foreign_account_id=stamp)
-
-    digest = _payload_digest(payload)
-    with _state_lock:
-        if _stamped_handled["digest"] == digest:
-            retry_at = _stamped_handled.get("retry_at")
-            if retry_at is None or retry_at > time.time():
-                return HealResult(ACTION_NONE, foreign_account_id=stamp)
-
-    def _settle(retry_after: float | None = None) -> None:
-        # A settled verdict retires the payload for good. A transient profile
-        # failure parks it for a retry cooldown instead, and a failed
-        # database write (which raises past this point) leaves it unset: a
-        # rotated single-use refresh token that is never adopted dies with
-        # the next authority overwrite, so the retry matters.
-        with _state_lock:
-            _stamped_handled["digest"] = digest
-            _stamped_handled["retry_at"] = (
-                time.time() + retry_after if retry_after is not None else None
-            )
-
-    profile = profile_lookup(access_token)
-    if profile is None:
-        _settle(retry_after=_STAMPED_LOOKUP_RETRY_SECONDS)
-        logger.info(
-            "Stamped authority payload for account %d carries tokens jacked does "
-            "not hold; the profile lookup did not complete, so nothing was "
-            "adopted yet (payload %s); it is retried in %d s",
-            stamp,
-            digest[:8],
-            int(_STAMPED_LOOKUP_RETRY_SECONDS),
-        )
-        return HealResult(
-            ACTION_SKIPPED, foreign_account_id=stamp, reason="profile lookup failed"
-        )
-    if not isinstance(profile, dict) or not profile:
-        # The endpoint refused the token: a verdict, not a hiccup.
-        _settle()
-        logger.info(
-            "Stamped authority payload for account %d carries tokens the profile "
-            "endpoint refused; nothing adopted (payload %s)",
-            stamp,
-            digest[:8],
-        )
-        return HealResult(
-            ACTION_SKIPPED, foreign_account_id=stamp, reason="profile refused the token"
-        )
-    account_section = profile.get("account") or {}
-    organization_section = profile.get("organization") or {}
-    email = account_section.get("email") if isinstance(account_section, dict) else None
-    organization_uuid = (
-        organization_section.get("uuid")
-        if isinstance(organization_section, dict)
-        else None
-    )
-    if not isinstance(email, str) or not email:
-        _settle()
-        return HealResult(
-            ACTION_SKIPPED, foreign_account_id=stamp, reason="profile carries no email"
-        )
-    owner = _match_account(db, email, organization_uuid)
-    if owner is None:
-        _settle()
-        logger.warning(
-            "Stamped authority payload for account %d holds tokens of an account "
-            "that is not a known jacked account (organization %s, payload %s); "
-            "nothing was adopted",
-            stamp,
-            _uuid_prefix(organization_uuid),
-            digest[:8],
-        )
-        return HealResult(
-            ACTION_UNKNOWN_ACCOUNT, foreign_account_id=stamp, reason="unknown account"
-        )
-    owner_id = int(owner["id"])
-    if owner_id != stamp:
-        logger.warning(
-            "The credential authority carries account %d's tokens under account "
-            "%d's stamp; adopting them into account %d only",
-            owner_id,
-            stamp,
-            owner_id,
-        )
-    adopted = _import_rotated_tokens(db, owner, payload, profile=profile)
-    if adopted == ADOPTION_RACE_LOST:
-        # Not settled: the next pass adopts the rotation once the row is quiet.
-        return HealResult(
-            ACTION_NONE,
-            foreign_account_id=owner_id,
-            reason="the row kept changing; adoption retried next pass",
-        )
-    if adopted == ADOPTION_DEFERRED:
-        _settle(retry_after=_STAMPED_LOOKUP_RETRY_SECONDS)
-        return HealResult(
-            ACTION_SKIPPED,
-            foreign_account_id=owner_id,
-            reason="ownership lookup failed; adoption retried next pass",
-        )
-    _settle()
-    if adopted == ADOPTION_REFUSED:
-        return HealResult(
-            ACTION_NONE,
-            foreign_account_id=stamp,
-            reason="the tokens are not proven to belong to the matched account",
-        )
-    return HealResult(
-        ACTION_ROTATION_ADOPTED if adopted else ACTION_NONE,
-        foreign_account_id=owner_id,
-        reason="" if adopted else "nothing new to adopt",
-    )
+    account = profile.get("account") or {}
+    organization = profile.get("organization") or {}
+    email = account.get("email") if isinstance(account, dict) else None
+    org = organization.get("uuid") if isinstance(organization, dict) else None
+    return (email if isinstance(email, str) and email else None), org
 
 
 def _desired_account_id(db) -> int | None:
@@ -652,44 +556,123 @@ def _outcome_label(outcome: Any) -> str:
 
 
 def _attempt_repair(
-    db, row: dict, activate: Callable[..., Any] | None, kind: str
+    db,
+    row: dict,
+    activate: Callable[..., Any] | None,
+    kind: str,
+    *,
+    republish: dict | None = None,
+    expected_digest: str | None = None,
 ) -> SwitchOutcome | None:
-    """Run one repair transaction that publishes ``row``; return its outcome.
+    """Run one repair transaction; return its outcome.
 
-    Returns None when the activator raised: the observer pass never breaks
-    over a repair, and the settle rule counts None as a failed attempt.
+    A reassert publishes ``row``. A re-stamp (``republish``) publishes the
+    authority's own payload with the row's stamp, and names the digest the
+    authority must still hold (``expected_digest``). Returns None when the
+    activator raised: the observer pass never breaks over a repair, and the
+    settle rule counts None as a failed attempt.
     """
     from jacked.credentials.models import SwitchContext
     from jacked.credentials.runtime import activate_account
 
     activator = activate or activate_account
+    operation_id = f"{kind}-{uuid.uuid4().hex}"
     try:
-        result = activator(
-            db, row, SwitchContext.REASSERT, f"{kind}-{uuid.uuid4().hex}"
-        )
+        if republish is None:
+            result = activator(db, row, SwitchContext.REASSERT, operation_id)
+        else:
+            result = activator(
+                db, row, SwitchContext.REASSERT, operation_id,
+                republish=republish, expected_digest=expected_digest,
+            )
     except Exception:  # noqa: BLE001 - never break the observer pass
         logger.debug(
             "The authority %s of account %d failed", kind, int(row["id"]),
             exc_info=True,
         )
         return None
-    return getattr(result, "outcome", None)
+    outcome = getattr(result, "outcome", None)
+    if _repair_committed(outcome):
+        from jacked.api.stamped_evidence import record_publication
+
+        # The next pass then knows this payload as jacked's own write. The
+        # engine reports the fingerprint of the pair it published; an
+        # activator that reports none (a test double) gets the pair this
+        # repair asked it to publish.
+        record_publication(
+            db,
+            getattr(result, "published_fingerprint", "")
+            or _requested_fingerprint(row, republish),
+        )
+    return outcome
+
+
+def _requested_fingerprint(row: dict, republish: dict | None) -> str:
+    """The fingerprint of the pair a repair asked the engine to publish."""
+    from jacked.api.credential_helpers import ForeignPrimaryTokens, build_oauth_data
+    from jacked.credentials.fingerprint import payload_fingerprint
+
+    if republish is not None:
+        oauth = republish.get("claudeAiOauth")
+    else:
+        try:
+            oauth = build_oauth_data(row)
+        except ForeignPrimaryTokens:
+            return ""  # nothing publishable was requested
+    return payload_fingerprint(oauth)
+
+
+def _restamp_blocker(row: dict | None, payload: dict | None) -> str:
+    """Say why a re-stamp of ``row`` cannot run, or return an empty string.
+
+    With the authority's ``payload`` in hand, a re-stamp republishes exactly
+    that payload with the row's stamp: it adds the stamp and the config
+    identity, nothing else, so nothing blocks it but a missing row. Without
+    a payload, the re-stamp publishes the row's own tokens, which needs a
+    Claude Code access token in the row. The reason names fields only.
+
+    >>> _restamp_blocker({"cc_access_token": None}, None)
+    'holds no Claude Code token to re-stamp with'
+    >>> _restamp_blocker({"cc_access_token": None}, {"claudeAiOauth": {"accessToken": "a"}})
+    ''
+    >>> _restamp_blocker(None, {"claudeAiOauth": {"accessToken": "a"}})
+    'row is missing'
+    """
+    if not row:
+        return "row is missing"
+    if payload is not None:
+        return ""
+    if not row.get("cc_access_token"):
+        return "holds no Claude Code token to re-stamp with"
+    return ""
 
 
 def _restamp_foreign_holder(
-    db, row: dict, activate: Callable[..., Any] | None
+    db, row: dict, activate: Callable[..., Any] | None, payload: dict | None = None
 ) -> SwitchOutcome | None:
-    """Republish the foreign holder's own credentials through the engine.
+    """Re-stamp the authority for the account that holds it.
 
-    The tokens are identical to what Claude Code just wrote, so running
-    sessions are unaffected; the write only adds the stamp and the config
-    identity. Returns the engine's outcome, or None when the row holds no
-    Claude Code access token or the activator raised.
+    With the authority's ``payload`` the write republishes exactly that
+    payload with the row's stamp (the engine refuses when the authority
+    changed meanwhile, and the guard adopts the new payload on its next
+    pass). Without a payload it publishes the row's own tokens, which are
+    the ones Claude Code wrote. Either way running sessions are unaffected:
+    the write only adds the stamp and the config identity. Returns the
+    engine's outcome, or None when the re-stamp cannot run or the activator
+    raised.
     """
     fresh = db.get_account(int(row["id"])) or row
-    if not fresh.get("cc_access_token"):
+    if _restamp_blocker(fresh, payload):
         return None
-    return _attempt_repair(db, fresh, activate, "restamp")
+    if payload is None:
+        return _attempt_repair(db, fresh, activate, "restamp")
+    from jacked.credentials.canonical import CredentialPayload
+
+    return _attempt_repair(
+        db, fresh, activate, "restamp",
+        republish=payload,
+        expected_digest=CredentialPayload.from_mapping(payload).digest,
+    )
 
 
 def _claim_repair_slot(digest: str, account_id: int, now: float) -> bool:
@@ -852,12 +835,15 @@ def _heal(
 
     stamp = _stamped_account_id(payload)
     if stamp is not None:
-        # A stamped payload is treated as a jacked write for reassert
-        # purposes: jacked itself may have chosen another account (a scoped
-        # launch, for example), and the credential repository already tracks
-        # that choice. The stamp survives Claude Code's own rotations, so
-        # adopt any rotated tokens before anything overwrites the authority.
-        return _adopt_stamped_rotation(db, payload, stamp, profile_lookup)
+        # The stamp survives Claude Code's own rotations, so adopt any
+        # rotated tokens before anything overwrites the authority. A stamp
+        # is not the user's choice: when the tokens belong to another
+        # account, the stamped path follows ``oauthAccount`` (#154i).
+        from jacked.api.stamped_rotation import adopt_stamped_rotation
+
+        return adopt_stamped_rotation(
+            db, payload, stamp, profile_lookup, now=now, activate=activate
+        )
 
     digest = _payload_digest(payload)
     with _state_lock:
@@ -880,17 +866,8 @@ def _heal(
         if not isinstance(profile, dict) or not profile:
             _mark_handled(digest, None, settled=True)
             return HealResult(ACTION_SKIPPED, reason="profile lookup failed")
-        account_section = profile.get("account") or {}
-        organization_section = profile.get("organization") or {}
-        email = (
-            account_section.get("email") if isinstance(account_section, dict) else None
-        )
-        organization_uuid = (
-            organization_section.get("uuid")
-            if isinstance(organization_section, dict)
-            else None
-        )
-        if not isinstance(email, str) or not email:
+        email, organization_uuid = _profile_identity(profile)
+        if email is None:
             _mark_handled(digest, None, settled=True)
             return HealResult(ACTION_SKIPPED, reason="profile carries no email")
 
@@ -966,17 +943,22 @@ def _heal(
         )
     desired_row = db.get_account(desired_id)
     refusal = _desired_row_refusal(desired_row)
-    if refusal and not (db.get_account(foreign_account_id) or {}).get("cc_access_token"):
-        # Nothing to publish: the holder's row has no Claude Code access
-        # token, so a re-stamp cannot run. Settle it as such, without
-        # spending the shared floor or an attempt on a repair that never ran.
+    blocker = (
+        _restamp_blocker(db.get_account(foreign_account_id), payload) if refusal else ""
+    )
+    if blocker:
+        # Nothing safe to publish: the holder's row has no Claude Code access
+        # token, or its publication would replace a token that Claude Code
+        # just wrote. Settle it as such, without spending the shared floor or
+        # an attempt on a repair that never ran.
         _mark_handled(digest, foreign_account_id, settled=True)
         logger.warning(
-            "Desired account %d cannot be reasserted (%s) and account %d holds no "
-            "Claude Code token to re-stamp with; the authority stays unstamped",
+            "Desired account %d cannot be reasserted (%s) and account %d %s; the "
+            "authority stays unstamped",
             desired_id,
             refusal,
             foreign_account_id,
+            blocker,
         )
         return HealResult(
             ACTION_SKIPPED,
@@ -1007,7 +989,7 @@ def _heal(
                 refusal,
                 foreign_account_id,
             )
-        outcome = _restamp_foreign_holder(db, row, activate)
+        outcome = _restamp_foreign_holder(db, row, activate, payload)
         _settle_after(
             digest,
             foreign_account_id,

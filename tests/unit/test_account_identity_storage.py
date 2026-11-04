@@ -651,11 +651,17 @@ class TestValidateKeepsUsageErrors:
 
         db, acct = _make_db(tmp_path)
         db.record_account_error(acct["id"], "Usage fetch failed (HTTP 500)")
+
+        async def renew(account_id, db_, stale_token=None):
+            # The real renewal stores the new token before it returns it;
+            # the validated mark is bound to the token the row holds.
+            db_.update_account(account_id, access_token="fresh-token")
+            return "fresh-token"
+
         with patch.object(auth.httpx, "AsyncClient",
                           return_value=_client_returning(
                               _resp(401), _resp(200, _profile()))), \
-             patch.object(auth, "_try_refresh_primary_token",
-                          AsyncMock(return_value="fresh-token")):
+             patch.object(auth, "_try_refresh_primary_token", renew):
             result = asyncio.run(auth.validate_account(acct["id"], db))
         assert result == {"valid": True, "error": None}
         row = db.get_account(acct["id"])

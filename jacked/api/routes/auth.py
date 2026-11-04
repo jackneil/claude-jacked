@@ -561,6 +561,10 @@ def _switch_content(result, email: str) -> dict:
         "existing_sessions": result.existing_session_activation.value,
         "provider_verification": result.provider_verification.value,
         "message": result.message,
+        # The stable reason behind a refusal (OUTGOING_ACCOUNT_BUSY,
+        # CC_REAUTH_REQUIRED), so the dashboard can act on it, not only show
+        # the message.
+        "code": result.code or None,
     }
 
 
@@ -916,9 +920,12 @@ async def start_add_account(
 
     Claude (default): starts the Anthropic OAuth flow, returns a flow_id to poll.
     Codex (``?provider=codex``): forces file-based credential storage and imports
-    the already-logged-in ``~/.codex/auth.json``. If no Codex account is logged
-    in, returns 400 ``needs_login`` so the UI can prompt the user to run
-    ``codex login`` (the browser OAuth can't be driven from the background API).
+    the already-logged-in ``~/.codex/auth.json``. A refusal returns 400
+    ``needs_login`` (the browser OAuth can't be driven from the background API)
+    with the error's own code: ``CODEX_LOGIN_REQUIRED`` when a ``codex login``
+    fixes it, ``CODEX_STORE_UNSWITCHABLE`` when the store must first be set to
+    ``"file"`` (a login alone writes the keyring again). The message is the
+    backend reason, so the dashboard can show it as it is.
     """
     db = _get_db(request)
     if db is None:
@@ -930,10 +937,11 @@ async def start_add_account(
         try:
             acct = await asyncio.to_thread(add_codex_account, db, run_login=False)
         except CodexImportError as exc:
+            logger.info("Codex add refused: code=%s", exc.code)
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={
-                    "error": {"message": str(exc), "code": "CODEX_LOGIN_REQUIRED"},
+                    "error": {"message": str(exc), "code": exc.code},
                     "needs_login": True,
                     "command": "codex login",
                 },

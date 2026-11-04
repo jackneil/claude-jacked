@@ -11,7 +11,10 @@ Firefox all accept a profile directory on the command line, so the cookies for
 one Claude account stay in one place and a later re-auth is a single Authorize
 click. A flow with no known identity yet (Add Account) has no profile to reuse,
 so it falls back to a private window. The system default browser stays
-available as the opt-out.
+available as the opt-out. When jacked cannot open the profile or the private
+window, it does not use the system default browser, because that browser can
+hold a different Claude account. It opens nothing and reports "manual", so the
+dashboard shows the sign-in link.
 
 The authorize URL carries PKCE state, so it is never logged.
 """
@@ -482,12 +485,27 @@ def launch_argv(
 class LaunchResult:
     """What the launch actually did: the mode used, and the browser driven.
 
-    ``browser`` is None whenever no controlled browser was involved, which is
-    every path that fell back to the system default.
+    ``mode`` is "profile", "incognito", "default" or "manual". "manual" means
+    that jacked opened no window, and the user opens the sign-in link from the
+    dashboard. ``browser`` is None when jacked drove no browser of its own,
+    which is the "default" and the "manual" result.
     """
 
     mode: str
     browser: Optional[str] = None
+
+
+def _manual(mode: str, reason: str) -> LaunchResult:
+    """Open no window; report "manual". The log has no URL, path or email.
+
+    >>> _manual("profile", "no supported browser")
+    LaunchResult(mode='manual', browser=None)
+    """
+    logger.warning(
+        "OAuth browser: no window opened (mode=%s, reason: %s). "
+        "The dashboard shows the sign-in link.", mode, reason,
+    )
+    return LaunchResult("manual")
 
 
 def _detach_kwargs() -> dict:
@@ -505,7 +523,9 @@ def open_auth_url(url: str, account: Optional[dict], db) -> LaunchResult:
 
     The result is what the dashboard tells the user, so it reports the
     fallback that happened rather than the mode that was asked for, and names
-    the browser so the banner can say which window to look for.
+    the browser so the banner can say which window to look for. Only the
+    "default" mode uses the system default browser. A profile or a private
+    window that cannot open gives "manual", and jacked opens nothing.
     """
     mode = read_mode(db)
     if mode == "default":
@@ -514,9 +534,7 @@ def open_auth_url(url: str, account: Optional[dict], db) -> LaunchResult:
 
     spec = find_browser()
     if spec is None:
-        logger.info("OAuth browser: no supported browser found, using system default")
-        webbrowser.open(url)
-        return LaunchResult("default")
+        return _manual(mode, "no supported browser")
 
     profile_dir = profile_dir_for(account)
     effective = mode
@@ -544,15 +562,14 @@ def open_auth_url(url: str, account: Optional[dict], db) -> LaunchResult:
             **_detach_kwargs(),
         )
     except Exception as e:
-        logger.warning("OAuth browser launch failed (%s), using system default: %s", spec.name, e)
-        webbrowser.open(url)
-        return LaunchResult("default")
+        # The type only: the error text can name the profile path (the email).
+        return _manual(effective, f"launch failed with {type(e).__name__}")
 
     logger.info(
-        "OAuth browser: mode=%s browser=%s profile=%s",
+        "OAuth browser: mode=%s browser=%s account=%s",
         effective,
         spec.name,
-        str(profile_dir) if profile_dir else "-",
+        (account or {}).get("id") or "-",  # never the profile path: it holds the email
     )
     if sys.platform == "win32":
         # Windows denies foreground activation to a window opened by a

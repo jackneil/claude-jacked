@@ -16,7 +16,13 @@ clean clone of jacked's Claude swap. Two mechanisms, both file-based:
      - write the incoming slot field-complete (keep ``auth_mode`` +
        ``last_refresh`` — a partial auth.json breaks Codex, cockpit-tools#666)
      - REFUSE replaying a stale snapshot over a newer live one for the same
-       account (would invalidate the rotated refresh token)
+       account (would invalidate the rotated refresh token), and a snapshot
+       with a different refresh token that is not provably newer
+     - REFUSE a keyring store (or "auto" with no credential in auth.json):
+       jacked switches only file-stored credentials
+     - every refusal runs before the first write, so a refused swap leaves
+       config.toml and every auth.json unchanged (the rules live in
+       ``swap_guards``)
      - single-writer lock; a restart is required (stock Codex caches auth at
        startup)
 
@@ -33,7 +39,6 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Mapping, Optional
 
@@ -42,11 +47,16 @@ from jacked.service.process import process_liveness
 
 from .credentials import codex_home, ensure_file_storage, extract_identity
 
+# CodexSwapError is re-exported: callers import it from this module.
+from .swap_guards import (
+    UNREADABLE_ROOT_REFUSAL,
+    CodexSwapError,
+    refuse_stale_replay,
+    refuse_unswitchable_store,
+    validate_field_complete,
+)
+
 logger = logging.getLogger(__name__)
-
-
-class CodexSwapError(Exception):
-    """A Codex account swap was refused or failed (guardrail tripped)."""
 
 
 @dataclass
@@ -182,27 +192,19 @@ def _codex_swap_lock(base: Path, retries: int = 340) -> Iterator[bool]:
 # Guards
 # ---------------------------------------------------------------------------
 
-def _validate_field_complete(data: Optional[dict]) -> None:
-    """A slot we're about to make active must be a complete auth.json.
+def _read_live_root(root_path: Path) -> Optional[dict]:
+    """The live root auth.json, or None when there is no file.
 
-    Writing one missing ``auth_mode`` (or with no credential) breaks Codex and
-    browser-use auth (cockpit-tools#666).
+    A file that exists but does not parse (a Codex write in progress, or a
+    damaged file) is a refusal: without it the swap can neither save the
+    outgoing tokens nor run the stale-replay check.
     """
-    if not data:
-        raise CodexSwapError("stored Codex credentials are missing or unreadable")
-    if not data.get("auth_mode"):
-        raise CodexSwapError("stored Codex auth.json is missing 'auth_mode' (would break Codex)")
-    if not (data.get("tokens") or data.get("OPENAI_API_KEY")):
-        raise CodexSwapError("stored Codex auth.json has no credential")
-
-
-def _parse_refresh(ts: Optional[str]) -> Optional[datetime]:
-    if not ts:
+    if not root_path.exists():
         return None
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        return None
+    live = _read_json(root_path)
+    if live is None:
+        raise CodexSwapError(UNREADABLE_ROOT_REFUSAL, reason="live_root_unreadable")
+    return live
 
 
 def find_codex_account_id(db, identity) -> Optional[int]:
@@ -225,37 +227,6 @@ def find_codex_account_id(db, identity) -> Optional[int]:
     return by_email
 
 
-def _same_codex_identity(a, b) -> bool:
-    """Same account across two auth blobs — by account_id when present, else email."""
-    ia, ib = extract_identity(a), extract_identity(b)
-    if ia.account_id and ib.account_id:
-        return ia.account_id == ib.account_id
-    if ia.email and ib.email:
-        return ia.email.lower() == ib.email.lower()
-    return False
-
-
-def _refuse_stale_replay(target: dict, live: Optional[dict]) -> None:
-    """Refuse writing ``target`` over ``live`` when it's an OLDER snapshot of the
-    SAME account — Codex would reject the already-rotated refresh token.
-
-    "Same account" is matched by account_id when present, else by email, so
-    personal accounts (account_id == "") are still protected. API-key creds
-    (no email/id_token, no token rotation) have no stale-replay hazard."""
-    if not live:
-        return
-    if not _same_codex_identity(target, live):
-        return  # different account → a normal switch, not a replay
-    t_ref = _parse_refresh(target.get("last_refresh"))
-    l_ref = _parse_refresh(live.get("last_refresh"))
-    if t_ref is not None and l_ref is not None and t_ref < l_ref:
-        raise CodexSwapError(
-            "refusing to replay a stale Codex snapshot: the live credential "
-            "for this account is newer; replaying the old one would invalidate "
-            "the rotated refresh token (run `codex login` to re-capture)"
-        )
-
-
 # ---------------------------------------------------------------------------
 # The swap
 # ---------------------------------------------------------------------------
@@ -270,54 +241,19 @@ def swap_codex_account(
 ) -> CodexSwapResult:
     """Make ``target_id`` the active Codex account in the shared root.
 
-    Captures the outgoing account's live tokens first, refuses a stale replay,
-    writes the target field-complete, updates the per-provider active setting,
-    and reports that a Codex restart is required.
+    Runs every refusal check before the first write, so a refused swap leaves
+    config.toml and every auth.json unchanged. Captures the outgoing account's
+    live tokens first, refuses a stale replay, writes the target
+    field-complete, updates the per-provider active setting, and reports that
+    a Codex restart is required.
     """
     base = base or codex_home(env)
-    ensure_file_storage(base, env)
-
-    root_path = base / "auth.json"
-    target_slot = codex_slot_auth_path(target_id, base)
-    target_data = _read_json(target_slot)
-    _validate_field_complete(target_data)
-
-    lock_cm = _codex_swap_lock(base) if lock else contextlib.nullcontext(True)
-    with lock_cm as locked:
-        if lock and not locked:
-            raise CodexSwapError(
-                "could not acquire the Codex swap lock (another swap or usage "
-                "poll is in progress). Retry in a moment."
-            )
-
-        # Read the live root INSIDE the lock: a concurrent usage poll boots
-        # `codex app-server` against the root and can rotate the refresh token,
-        # so reading pre-lock risked snapshotting a stale token and losing the
-        # rotation (#15502). The usage poll takes this same lock, so the two are
-        # mutually exclusive on the shared root.
-        live = _read_json(root_path)
-
-        # The outgoing account is whoever the LIVE root actually belongs to,
-        # resolved from the file's own identity by org OR email (handles
-        # personal/empty-org accounts and an out-of-band `codex login`). If that
-        # identity isn't a known Codex account, there is NO correct slot to
-        # capture into — skip the capture rather than clobber a tracked
-        # account's slot with a stranger's tokens (losing an untracked account's
-        # tokens is acceptable; corrupting a tracked slot is not).
-        outgoing_id = find_codex_account_id(db, extract_identity(live)) if live else None
-
-        # Stale-replay guard BEFORE any write.
-        _refuse_stale_replay(target_data, live)
-
-        # 1. CAPTURE the live root into the outgoing account's slot FIRST, so the
-        #    tokens Codex rotated while it was active are not lost.
-        captured = False
-        if live and outgoing_id is not None and outgoing_id != target_id:
-            _atomic_write_json(codex_slot_auth_path(outgoing_id, base), live)
-            captured = True
-
-        # 2. Write the target field-complete into the shared root.
-        _atomic_write_json(root_path, target_data)
+    try:
+        outgoing_id, captured = _swap_root(db, target_id, base, env, lock)
+    except CodexSwapError as exc:
+        # Values-free: the account id and a reason code, never a token or email.
+        logger.warning("Codex swap to account %s refused: %s", target_id, exc.reason)
+        raise
 
     db.set_active_account_id(target_id, provider="codex")
     logger.info(
@@ -335,6 +271,63 @@ def swap_codex_account(
         restart_required=True,
         captured_outgoing=captured,
     )
+
+
+def _swap_root(
+    db, target_id: int, base: Path, env: Optional[Mapping[str, str]], lock: bool
+) -> tuple[Optional[int], bool]:
+    """Run every refusal check, then write the shared root.
+
+    Returns ``(outgoing_id, captured)``. The first write (config.toml) comes
+    after the last check: forcing file storage first rewrote the user's
+    config even for a swap that a later guard then refused.
+
+    The store check runs twice. Before the lock, it refuses a keyring user
+    at once instead of after a lock wait. Inside the lock, right before the
+    first write, it catches a store that changed while the swap waited (up to
+    ~17 s): a concurrent ``codex login`` or a config.toml edit can switch to
+    "keyring", or remove the only file credential under "auto". Codex itself
+    does not take this lock, so the second check makes that window as small
+    as the check-to-write gap; it cannot close it completely.
+    """
+    refuse_unswitchable_store(base, env)
+    target_data = _read_json(codex_slot_auth_path(target_id, base))
+    validate_field_complete(target_data)
+
+    lock_cm = _codex_swap_lock(base) if lock else contextlib.nullcontext(True)
+    with lock_cm as locked:
+        if lock and not locked:
+            raise CodexSwapError(
+                "could not acquire the Codex swap lock (another swap or usage "
+                "poll is in progress). Retry in a moment.",
+                reason="lock_busy",
+            )
+        root_path = base / "auth.json"
+        # Read the live root INSIDE the lock: a concurrent usage poll boots
+        # `codex app-server` against the root and can rotate the refresh token,
+        # so reading pre-lock risked snapshotting a stale token and losing the
+        # rotation (#15502). The usage poll takes this same lock.
+        live = _read_live_root(root_path)
+        # The outgoing account is whoever the LIVE root belongs to, by org OR
+        # email (personal/empty-org accounts, an out-of-band `codex login`).
+        # An unknown identity has NO correct slot: skip the capture rather than
+        # clobber a tracked account's slot with a stranger's tokens.
+        outgoing_id = find_codex_account_id(db, extract_identity(live)) if live else None
+        refuse_stale_replay(target_data, live)
+        # The last refusal, right before the first write: the store as it is
+        # now, not as it was before the lock wait.
+        refuse_unswitchable_store(base, env)
+
+        ensure_file_storage(base, env)
+        # 1. CAPTURE the live root into the outgoing account's slot FIRST, so
+        #    the tokens Codex rotated while it was active are not lost.
+        captured = False
+        if live and outgoing_id is not None and outgoing_id != target_id:
+            _atomic_write_json(codex_slot_auth_path(outgoing_id, base), live)
+            captured = True
+        # 2. Write the target field-complete into the shared root.
+        _atomic_write_json(root_path, target_data)
+    return outgoing_id, captured
 
 
 # ---------------------------------------------------------------------------

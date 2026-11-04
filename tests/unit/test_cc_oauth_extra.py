@@ -155,19 +155,43 @@ def test_the_drift_warning_no_longer_fires_for_carried_fields(caplog):
     assert "someFutureKey" in caplog.text
 
 
-def test_a_dead_lineage_does_not_take_the_fields(tmp_path):
-    """Under invalid_grant the live refresh token is not imported, so the
-    expiry that describes it is not taken either."""
+def _dead_chain_row(tmp_path):
     db = Database(str(tmp_path / "t.db"))
     aid = db.create_account("owner@test.com", "primary-at", int(time.time()) + 3600)["id"]
     db.update_account(aid, cc_access_token="cc-at", cc_refresh_token="cc-rt",
                       cc_expires_at=int(time.time()) + 600, cc_refresh_failure_type="invalid_grant",
+                      cc_refresh_last_failed_at=int(time.time()),
                       organization_uuid="org-a", account_uuid="uuid-a")
+    return db, aid
+
+
+def test_a_new_live_lineage_takes_the_fields_bound_to_the_adopted_token(tmp_path):
+    """Under invalid_grant a proven live refresh token that is NOT the failed
+    one is adopted (the settled #149i rule), and the pass-through fields
+    that describe it come along, bound to that token."""
+    db, aid = _dead_chain_row(tmp_path)
     live = {"_jackedAccountId": aid, "claudeAiOauth": {
         "accessToken": "cc-at-2", "refreshToken": "cc-rt-2",
         "expiresAt": (int(time.time()) + 7200) * 1000, "refreshTokenExpiresAt": RT_EXPIRES}}
     _reconcile(db, aid, live)
-    assert db.get_account(aid)["cc_oauth_extra"] is None
+    row = db.get_account(aid)
+    assert row["cc_refresh_token"] == "cc-rt-2"
+    assert row["cc_refresh_failure_type"] is None
+    assert parse_oauth_extra(row["cc_oauth_extra"], "cc-rt-2") == {"refreshTokenExpiresAt": RT_EXPIRES}
+
+
+def test_the_failed_lineage_takes_no_fields(tmp_path):
+    """The live store still holds the token that failed: only the access
+    token moves, and the fields that describe the dead lineage stay out."""
+    db, aid = _dead_chain_row(tmp_path)
+    live = {"_jackedAccountId": aid, "claudeAiOauth": {
+        "accessToken": "cc-at-2", "refreshToken": "cc-rt",
+        "expiresAt": (int(time.time()) + 7200) * 1000, "refreshTokenExpiresAt": RT_EXPIRES}}
+    _reconcile(db, aid, live)
+    row = db.get_account(aid)
+    assert row["cc_refresh_token"] == "cc-rt"
+    assert row["cc_refresh_failure_type"] == "invalid_grant"
+    assert row["cc_oauth_extra"] is None
 
 
 # ---------------------------------------------------------------------------

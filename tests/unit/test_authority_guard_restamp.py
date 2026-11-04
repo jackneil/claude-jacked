@@ -49,9 +49,11 @@ class _SequenceActivator:
     def __init__(self, *outcomes: SwitchOutcome) -> None:
         self.outcomes = list(outcomes)
         self.calls: list[tuple] = []
+        self.republished: list[tuple] = []
 
-    def __call__(self, db, account, context, operation_id):
+    def __call__(self, db, account, context, operation_id, **repair):
         self.calls.append((account, context, operation_id))
+        self.republished.append((repair.get("republish"), repair.get("expected_digest")))
         outcome = self.outcomes[min(len(self.calls), len(self.outcomes)) - 1]
         return _switch_result(outcome, int(account["id"]))
 
@@ -61,9 +63,11 @@ class _RaisingActivator:
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.republished: list[tuple] = []
 
-    def __call__(self, db, account, context, operation_id):
+    def __call__(self, db, account, context, operation_id, **repair):
         self.calls.append((account, context, operation_id))
+        self.republished.append((repair.get("republish"), repair.get("expected_digest")))
         raise RuntimeError("engine failed while it held live_at_3")
 
 

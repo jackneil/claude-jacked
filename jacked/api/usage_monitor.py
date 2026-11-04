@@ -885,13 +885,18 @@ def _certified_auto_swap_engine(db):
     return engine if isinstance(engine, CredentialTransactionEngine) else None
 
 
-def _auto_swap_request(target: dict):
-    """Build a background transaction request from one database account."""
+def _auto_swap_request(target: dict, db=None):
+    """Build a background transaction request from one database account.
+
+    Raises ``ForeignPrimaryTokens`` for a target whose primary tokens belong
+    to another account (``build_oauth_data``): the caller skips the target.
+    """
     import uuid
 
     from jacked.api.credential_helpers import build_oauth_data
     from jacked.credentials.canonical import CredentialPayload
     from jacked.credentials.models import InteractionMode, SwitchContext
+    from jacked.credentials.refresh_guard import downgrade_check_for, lineage_finder
     from jacked.credentials.transaction import SwitchRequest
 
     payload = CredentialPayload.from_mapping(
@@ -908,6 +913,10 @@ def _auto_swap_request(target: dict):
         payload=payload,
         context=SwitchContext.AUTO_SWAP,
         interaction=InteractionMode.BACKGROUND,
+        # Every engine activation carries the check (#149i): a target row
+        # whose cc chain is dead must not put a null refresh token over a
+        # live one of the same account.
+        refresh_downgrade_check=downgrade_check_for(target, lineage_known=lineage_finder(db)),
         display_name=target.get("display_name") or None,
         organization_name=target.get("organization_name") or None,
     )
@@ -934,7 +943,10 @@ async def _execute_swap(
     global _last_swap_time, _last_committed_swap_time
     global _swap_failure_count, _last_swap_failure_at
 
-    from jacked.api.credential_helpers import invalidate_live_cred_cache
+    from jacked.api.credential_helpers import (
+        ForeignPrimaryTokens,
+        invalidate_live_cred_cache,
+    )
     from jacked.web.auto_swap import format_account_label
 
     # 1. TOCTOU guard
@@ -990,9 +1002,15 @@ async def _execute_swap(
     # writers and atomically finalizes journal + active/desired pointers.
     from jacked.credentials.models import SwitchOutcome
 
-    result = await asyncio.to_thread(
-        transaction_engine.activate, _auto_swap_request(target)
-    )
+    try:
+        request = _auto_swap_request(target, db)
+    except ForeignPrimaryTokens as exc:
+        # The payload builder refused: the target's primary tokens belong to
+        # another account and it has no Claude Code chain of its own. Nothing
+        # was written; the target is skipped until a re-authorization.
+        logger.warning("Auto-swap to account %d refused; %s", int(target["id"]), exc)
+        return False
+    result = await asyncio.to_thread(transaction_engine.activate, request)
     credential_ok = result.outcome in {
         SwitchOutcome.COMMITTED,
         SwitchOutcome.COMMITTED_DEGRADED,
@@ -2405,7 +2423,7 @@ class _LadderOutcome:
 
 # Exchange errors that say the refresh token itself is dead or refused. Any
 # other FAILED outcome (not_sent, reply_lost, http_5xx, circuit_breaker,
-# lock_timeout, chain_changed, db_write_failed, ...) is transient.
+# lock_timeout, db_write_failed, ...) is transient.
 _ROTATION_TERMINAL_ERRORS = frozenset(
     {
         "invalid_grant", "http_400", "http_401", "http_403", "account_not_found",
@@ -2430,7 +2448,26 @@ def _keeper_candidates(acct: dict) -> tuple[str | None, str | None]:
     cc = acct.get("cc_access_token")
     if acct.get("cc_refresh_failure_type") in CC_TOKEN_UNUSABLE_FAILURES:
         cc = None
-    return (cc or None), (acct.get("access_token") or None)
+    return (cc or None), _keeper_primary(acct)
+
+
+def _keeper_primary(acct: dict) -> str | None:
+    """The primary token the keeper may send, or None while a cross-account
+    verdict binds it: a ping is a usage request, and it would open the other
+    account's window and record its reset under this row.
+
+    >>> from jacked.web.refresh_verdict import token_fingerprint
+    >>> _keeper_primary({"access_token": "p", "refresh_token": "rt"})
+    'p'
+    >>> _keeper_primary({"access_token": "p", "refresh_token": "rt",
+    ...                  "foreign_token_fp": token_fingerprint("rt")}) is None
+    True
+    """
+    from jacked.web.refresh_verdict import primary_tokens_foreign
+
+    if primary_tokens_foreign(acct):
+        return None
+    return acct.get("access_token") or None
 
 
 def _candidate_fingerprint(cc: str | None, primary: str | None) -> str | None:
@@ -2576,7 +2613,7 @@ async def _keeper_auth_ladder(
             return out
 
     row = await asyncio.to_thread(db.get_account, account_id) or acct
-    primary = row.get("access_token")
+    primary = _keeper_primary(row)
     if primary and primary not in tried:
         tried.add(primary)
         logger.info(

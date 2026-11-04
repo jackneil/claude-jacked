@@ -24,8 +24,9 @@ watcher republishes that block. It writes only when all of these are true:
 
 The watcher makes at most one attempt per account per minute. A breaker stops
 the writes when one account needs more than three republishes in fifteen
-minutes. A tripped breaker, an unproven owner and a stamp mismatch stay in
-every snapshot while they last, a divergence older than five minutes logs a
+minutes. A tripped breaker, an unproven owner and a stamp mismatch of the
+account that holds the authority stay in every snapshot while they last
+(they stop when another account holds it), a divergence older than five minutes logs a
 WARNING, and ``status()`` reports each account for diagnostics. Logs carry row ids, 8-character uuid prefixes and field names only,
 never emails or tokens.
 """
@@ -321,6 +322,29 @@ def _status_name(result: Any) -> str:
     return str(getattr(status, "value", status))
 
 
+# A /login writes the oauthAccount identity a moment before it saves the new
+# tokens. A republish inside that window would put the old account back, and
+# the stamped-rotation guard (#154i) would then read a stale verdict and undo
+# the user's choice. The watcher waits one pass instead.
+CONFIG_FRESH_SECONDS = 15.0
+
+
+def _config_age_seconds(home: Path) -> float | None:
+    """Seconds since the Claude config file was last written, by wall clock.
+
+    None when there is no file or it cannot be read.
+    """
+    from jacked.api.claude_config_store import claude_config_path
+
+    path = claude_config_path(home)
+    if path is None:
+        return None
+    try:
+        return max(0.0, time.time() - path.stat().st_mtime)
+    except OSError:
+        return None
+
+
 def _config_mtime(home: Path) -> str:
     from jacked.api.claude_config_store import claude_config_path
 
@@ -379,6 +403,10 @@ class IdentityWatcher:
         self._evidence_lock = threading.Lock()
         self._evidence: list[str] = []
         self._states: dict[int, _AccountState] = {}
+        # The account of the last resolved global observation. Only its state
+        # gives sticky evidence: no check runs for an account that left the
+        # authority, so its last reason would otherwise stay forever.
+        self._observed_id: int | None = None
         self._owner_cache: OrderedDict[str, _OwnerProof] = OrderedDict()
         self._disabled = False
         # One long-lived daemon worker with a queue of one: a submit while a
@@ -392,17 +420,19 @@ class IdentityWatcher:
 
         One-shot evidence of the previous runs is cleared. Sticky evidence
         (a tripped breaker, a stamp mismatch, an unproven owner, a disabled
-        watcher) is returned again on every call while it lasts.
+        watcher) is returned again on every call while it lasts. The sticky
+        reason is that of the account that the authority holds now.
         """
         with self._evidence_lock:
             items = list(self._evidence)
             self._evidence.clear()
         if self._disabled:
             items.append(EVIDENCE_DISABLED)
-        for state in list(self._states.values()):
-            sticky = _STICKY_EVIDENCE.get(state.last_reason or "")
-            if sticky:
-                items.append(sticky)
+        observed = self._observed_id
+        state = self._states.get(observed) if observed is not None else None
+        sticky = _STICKY_EVIDENCE.get(state.last_reason or "") if state else None
+        if sticky:
+            items.append(sticky)
         return tuple(dict.fromkeys(items))
 
     def status(self) -> dict:
@@ -552,7 +582,7 @@ class IdentityWatcher:
         observed = update.observed
         if db is None or observed is None or observed.account_id is None:
             return
-        account_id = int(observed.account_id)
+        account_id = self._observed_id = int(observed.account_id)
         row = db.get_account(account_id)
         if (
             not row
@@ -634,6 +664,13 @@ class IdentityWatcher:
         view = self._resolve(home)
         if view is None or view.account_id != account_id:
             self._transition(account_id, state, "authority-changed")
+            return
+
+        age = _config_age_seconds(home)
+        if age is not None and age < CONFIG_FRESH_SECONDS:
+            # A /login in progress (see CONFIG_FRESH_SECONDS): the identity
+            # was just written, the tokens follow. Decide on the next pass.
+            self._transition(account_id, state, "config-fresh")
             return
 
         desired_id = update.desired.account_id if update.desired is not None else None

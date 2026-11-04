@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -745,6 +747,9 @@ def test_logs_never_carry_an_email_or_a_token(tmp_path, caplog):
         config=_config(emailAddress="old@example.com"),
     )
     (tmp_path / ".claude.json").write_text("{}")
+    # A settled config, not a /login in progress (see CONFIG_FRESH_SECONDS).
+    old = time.time() - 600
+    os.utime(tmp_path / ".claude.json", (old, old))
 
     with caplog.at_level(logging.DEBUG, logger="jacked.api.identity_watcher"):
         harness.run()
