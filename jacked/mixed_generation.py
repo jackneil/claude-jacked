@@ -1,23 +1,26 @@
 """Keep an interpreter that is mid-upgrade importable.
 
-``jacked upgrade`` replaces the package on disk while the process that runs
-it keeps every module it imported before the install. A module of this
-release that the process imports for the first time after that point reads
-the new file. When that module needs a name that this release ADDED to a
-module the process already holds, the import fails: a 0.110.2 interpreter
-importing the 0.111.0 ``jacked.service.supervisors`` package stopped on
+``jacked upgrade`` and the tray updater (``python -m jacked.service.updater``)
+replace the package on disk while the process that runs them keeps every
+module it imported before the install. A module of this release that the
+process imports for the first time after that point reads the new file.
+When that module needs a name that this release ADDED to a module the
+process already holds, the import fails: a 0.110.2 interpreter importing
+the 0.111.0 ``jacked.service.supervisors`` package (the CLI path) or the
+0.111.0 ``jacked.proctree`` (the tray path) stopped on
 ``from jacked.winproc import system_program``, because its ``jacked.winproc``
-was the 0.110.2 module, and the upgrade's restart step was lost.
+was the 0.110.2 module, and the upgrade transaction was lost.
 
-The upgrade command imports every module it needs before the install, so a
-build from this release onward never reaches that state. The helpers here
-cover the interpreters that are already out there: a module that needs a
-name added to a module an older release may hold imports it in a
-``try``/``except ImportError`` and calls :func:`reload_missing` in the
-``except`` branch. The missing name is the evidence: the import of the new
+Two halves. Forward: both transactions call :func:`preload_upgrade_modules`
+before the install, so a build from this release onward runs the whole
+transaction on one release and the new build's code runs only in the child
+processes it spawns. Backward, for the interpreters already out there: a
+module that needs a name added to a module an older release may hold takes
+it through :func:`names_from`, which reloads the held module from disk when
+a name is missing. The missing name is the evidence: the import of the new
 module proves the new release is on disk, so the held module is reloaded
-from it, into the same module object, and every earlier import of that
-module sees the new names too.
+into the same module object, and every earlier import of it sees the new
+names too.
 
 Only modules without import-time side effects and without state are safe
 to reload this way.
@@ -95,3 +98,50 @@ def reload_missing(name: str, *attributes: str) -> bool:
         return False
     importlib.reload(module)
     return True
+
+
+def names_from(module: str, *names: str) -> tuple:
+    """Import ``names`` from ``module``, reloading a held copy that lacks one.
+
+    The caller is a module of this release that needs a name this release
+    added to ``module``; an interpreter mid-upgrade from an older release
+    holds the older ``module``. Returns the attributes in order.
+
+    >>> (no_window,) = names_from("jacked.winproc", "NO_WINDOW")
+    >>> isinstance(no_window, int)
+    True
+    """
+    importlib.import_module(module)
+    reload_missing(module, *names)
+    return tuple(getattr(sys.modules[module], name) for name in names)
+
+
+# Every module an upgrade transaction imports lazily after its install step,
+# on the CLI path (``jacked upgrade``) and on the tray path
+# (``jacked.service.updater.run_update``): the process tree runner, the
+# legacy-tray resolver, the service platform and lifecycle with the
+# supervisors package under them, the service process helpers, and the
+# updater itself (the CLI path's migration and restart helpers live there).
+UPGRADE_MODULES = (
+    "jacked.proctree",
+    "jacked.service.legacy",
+    "jacked.service.lifecycle",
+    "jacked.service.platform",
+    "jacked.service.process",
+    "jacked.service.updater",
+)
+
+
+def preload_upgrade_modules() -> tuple[str, ...]:
+    """Import every module an upgrade transaction needs, before the install.
+
+    Returns the module names in order. Raises what the import raises: a
+    package that cannot import its own upgrade modules must refuse the
+    transaction before anything changes on disk.
+
+    >>> preload_upgrade_modules() == UPGRADE_MODULES
+    True
+    """
+    for name in UPGRADE_MODULES:
+        importlib.import_module(name)
+    return UPGRADE_MODULES

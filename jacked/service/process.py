@@ -11,7 +11,9 @@ from enum import Enum
 from pathlib import Path
 
 from jacked.service import DEFAULT_PORT
-from jacked.winproc import NO_WINDOW, system_program
+from jacked.mixed_generation import names_from
+# `system_program` is new in 0.111.0; an older interpreter mid-upgrade holds a winproc without it.
+NO_WINDOW, system_program = names_from("jacked.winproc", "NO_WINDOW", "system_program")
 
 
 @dataclass(frozen=True)

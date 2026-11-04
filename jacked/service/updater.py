@@ -599,6 +599,28 @@ def run_update(
     def log(msg: str) -> None:
         log_fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
+    # Every module this transaction imports after the install step is
+    # imported now, while the package on disk is still this release: a
+    # module first imported after `uv tool install` is the NEW release's
+    # file, and a name the new release added to a module this process
+    # already holds would fail that import (the 0.110.2 tray updater lost
+    # its settings migration that way on `jacked.proctree`). A package
+    # that cannot import its own upgrade modules refuses before any write.
+    from jacked.mixed_generation import preload_upgrade_modules
+
+    try:
+        preload_upgrade_modules()
+    except Exception as exc:
+        logger.exception("The installed jacked cannot import its upgrade modules")
+        log(f"REFUSED: the installed jacked cannot import its upgrade modules ({type(exc).__name__})")
+        _write_recovery(
+            "Jacked auto-update refused: the installed jacked cannot import its "
+            f"upgrade modules ({type(exc).__name__}). Reinstall with "
+            'uv tool install "claude-jacked[tray]" --force --refresh, then retry.\n'
+        )
+        log_fh.close()
+        return
+
     # Defense-in-depth: refuse non-upgradable installs even here, in case
     # someone invokes this entrypoint directly without tray/CLI pre-flight.
     from jacked.install_method import (

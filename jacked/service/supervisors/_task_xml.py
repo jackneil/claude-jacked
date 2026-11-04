@@ -22,7 +22,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-from jacked.winproc import system_program
+from jacked.service.supervisors._winproc import system_program
 
 TASK_XML_DECLARATION = '<?xml version="1.0" encoding="UTF-16"?>\r\n'
 

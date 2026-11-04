@@ -1500,16 +1500,13 @@ def _preload_upgrade_modules() -> None:
     """Import every module the upgrade transaction needs before the install.
 
     The package install replaces jacked on disk while this process keeps
-    the modules it already imported. A module imported for the first time
-    after that point is the NEW release's file, and when it needs a name the
-    new release added to a module this process already holds, the import
-    fails and the transaction is lost at its restart step (the 0.110.2
-    upgrade to 0.111.0 stopped on `jacked.service.supervisors` importing a
-    `jacked.winproc` name that 0.110.2 did not have). With every module in
-    place before the install, the transaction runs on one release end to end;
-    the new build's own code runs only in the child processes it spawns.
+    the modules it already imported; a module first imported after that
+    point is the NEW release's file (see jacked.mixed_generation). The
+    list is shared with the tray updater.
     """
-    from jacked.service import legacy, lifecycle, updater  # noqa: F401
+    from jacked.mixed_generation import preload_upgrade_modules
+
+    preload_upgrade_modules()
 
 
 def _run_upgrade_inline(

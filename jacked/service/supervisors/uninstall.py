@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from jacked.service.spec import ServiceSpec, SupervisorKind
-from jacked.winproc import system_program
+from jacked.service.supervisors._winproc import system_program
 
 from ._artifacts import (
     ArtifactDisposition,
