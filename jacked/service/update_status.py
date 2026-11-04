@@ -32,6 +32,7 @@ from packaging.version import InvalidVersion, Version
 from jacked.atomic_io import atomic_write_text
 from jacked.process_identity import creation_id as _creation_id
 from jacked.service import CLAUDE_DIR
+from jacked.service.update_noop import is_unclaimed_preinit
 
 logger = logging.getLogger(__name__)
 
@@ -846,11 +847,7 @@ def init_or_adopt_status(
         return "initialized"
     except LockBusy:
         prior = _read_raw(path) or {}
-        if (
-            prior.get("preinit") is True
-            and not (prior.get("phases") or [])
-            and prior.get("current_phase") is None
-        ):
+        if is_unclaimed_preinit(prior):
             # Claim the record for THIS process. The tray that pre-created it
             # is about to exit, and a record naming a dead pid would read as
             # abandoned the moment this update runs longer than the mtime rule.
