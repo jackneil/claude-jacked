@@ -3,7 +3,6 @@
 import asyncio
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,56 +15,67 @@ from jacked.api.routes.permissions import (
     _validate_repo_path,
     _write_project_settings,
 )
+from jacked.api.project_paths import ProjectRefused
+from tests._known_projects import KnownProjects, request_for
 from tests._platform import requires_symlinks
+
+
+def _refusal(repo_path, db):
+    with pytest.raises(ProjectRefused) as refused:
+        _validate_repo_path(repo_path, db)
+    return refused.value.status_code, refused.value.code
 
 
 class TestValidateRepoPath:
     def test_rejects_none(self):
-        assert _validate_repo_path(None) is None
+        assert _refusal(None, KnownProjects()) == (422, "INVALID_REPO_PATH")
 
     def test_rejects_empty(self):
-        assert _validate_repo_path("") is None
+        assert _refusal("", KnownProjects()) == (422, "INVALID_REPO_PATH")
 
     def test_rejects_root(self):
-        assert _validate_repo_path("/") is None
+        root = Path.cwd().anchor
+        assert _refusal(root, KnownProjects(root)) == (422, "INVALID_REPO_PATH")
 
     def test_rejects_home(self):
-        assert _validate_repo_path(str(Path.home())) is None
+        """``.claude`` in the home folder is the global settings folder."""
+        home = str(Path.home())
+        assert _refusal(home, KnownProjects(home)) == (422, "INVALID_REPO_PATH")
 
     def test_rejects_non_dir(self, tmp_path):
         f = tmp_path / "file.txt"
         f.write_text("x")
-        assert _validate_repo_path(str(f)) is None
+        assert _refusal(str(f), KnownProjects(f)) == (422, "NOT_DIRECTORY")
 
     def test_rejects_non_git_dir(self, tmp_path):
-        assert _validate_repo_path(str(tmp_path)) is None
+        assert _refusal(str(tmp_path), KnownProjects(tmp_path)) == (422, "NOT_GIT_REPO")
 
-    def test_accepts_git_dir_no_db(self, tmp_path):
+    def test_rejects_a_git_dir_without_a_db(self, tmp_path):
+        """No project list: refuse, never open any git folder (fail closed)."""
         (tmp_path / ".git").mkdir()
-        assert _validate_repo_path(str(tmp_path)) == tmp_path
+        assert _refusal(str(tmp_path), None) == (503, "DB_UNAVAILABLE")
 
     def test_rejects_unknown_project_with_db(self, tmp_path):
         """DB check rejects git dirs not known to jacked."""
         (tmp_path / ".git").mkdir()
-        mock_db = MagicMock()
-        mock_db.get_project_activity_summary.return_value = []
-        assert _validate_repo_path(str(tmp_path), db=mock_db) is None
+        assert _refusal(str(tmp_path), KnownProjects()) == (422, "UNKNOWN_PROJECT")
 
     def test_accepts_known_project_with_db(self, tmp_path):
         """DB check passes for projects with jacked activity."""
         (tmp_path / ".git").mkdir()
-        mock_db = MagicMock()
-        mock_db.get_project_activity_summary.return_value = [
-            {"repo_path": str(tmp_path)}
-        ]
-        assert _validate_repo_path(str(tmp_path), db=mock_db) == tmp_path
+        assert _validate_repo_path(str(tmp_path), KnownProjects(tmp_path)) == tmp_path
+
+    def test_accepts_a_git_worktree(self, tmp_path):
+        """A linked worktree has a ``.git`` file, not a folder."""
+        (tmp_path / ".git").write_text("gitdir: /elsewhere\n")
+        assert _validate_repo_path(str(tmp_path), KnownProjects(tmp_path)) == tmp_path
 
     def test_fails_closed_on_db_error(self, tmp_path):
         """DB errors reject (fail closed)."""
         (tmp_path / ".git").mkdir()
         mock_db = MagicMock()
         mock_db.get_project_activity_summary.side_effect = Exception("DB down")
-        assert _validate_repo_path(str(tmp_path), db=mock_db) is None
+        assert _refusal(str(tmp_path), mock_db) == (503, "DB_ERROR")
 
 
 class TestProjectSettings:
@@ -96,13 +106,12 @@ class TestProjectSettings:
         assert not (tmp_path / ".claude" / "settings.local.json.tmp").exists()
 
 
-def _request():
-    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db=None)))
-
-
 def _project_routes(repo: Path) -> dict:
     """Each project-settings route, called as the dashboard calls it."""
     from jacked.api.routes import permissions as p
+
+    def _request():
+        return request_for(repo)
 
     async def put():
         return await p.set_project_permissions(

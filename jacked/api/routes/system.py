@@ -14,7 +14,12 @@ from pydantic import BaseModel
 
 from jacked import upgrade_guard
 from jacked.api.mutation_gate import denied_response, mutation_decision
-from jacked.api.project_paths import first_outside_project, outside_project_response
+from jacked.api.project_paths import (
+    ProjectRefused,
+    first_outside_project,
+    known_project_path,
+    outside_project_response,
+)
 from jacked.api.remote_access import REASON_OUTSIDE_SCOPE, REASON_REMOTE_ACCESS_OFF
 from jacked.api.routes.settings_swap import SWAP_SETTING_KEYS
 from jacked.findbin import find_bin
@@ -257,59 +262,31 @@ class ProjectInitRequest(BaseModel):
     force: bool = False
 
 
-def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONResponse]:
-    """Validate repo_path for init endpoints: exists, has .git, is known."""
-    from pathlib import Path
+def _validate_project_path(repo_path: str, request: Request) -> str:
+    """Return the recorded project path for ``repo_path``.
 
-    p = Path(repo_path)
+    The project must be one that jacked recorded (``known_project_path``),
+    and the route uses the recorded text, not the request text. The disk
+    checks run only after that match: the folder must exist and must hold a
+    ``.git`` folder. Raise ``ProjectRefused`` for each refusal; the route
+    answers it with ``ProjectRefused.response``.
+    """
+    db = getattr(request.app.state, "db", None)
+    recorded = known_project_path(repo_path, db)
+    p = Path(recorded)
     if not p.is_dir():
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={
-                "error": {
-                    "message": f"Not a directory: {repo_path}",
-                    "code": "NOT_DIRECTORY",
-                }
-            },
+        raise ProjectRefused(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "NOT_DIRECTORY",
+            f"The project folder {recorded} does not exist.",
         )
     if not (p / ".git").is_dir():
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={
-                "error": {
-                    "message": f"No .git directory in: {repo_path}",
-                    "code": "NOT_GIT_REPO",
-                }
-            },
+        raise ProjectRefused(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "NOT_GIT_REPO",
+            f"The project folder {recorded} has no .git folder.",
         )
-    # Verify project is known to jacked (has activity in DB)
-    db = getattr(request.app.state, "db", None)
-    if db is not None:
-        try:
-            rows = db.get_project_activity_summary(limit=100)
-            known_paths = {r["repo_path"] for r in rows if r.get("repo_path")}
-            normalized = str(p).replace("\\", "/")
-            if normalized not in known_paths and str(p) not in known_paths:
-                return JSONResponse(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    content={
-                        "error": {
-                            "message": f"Unknown project: {repo_path}. Must have jacked activity.",
-                            "code": "UNKNOWN_PROJECT",
-                        }
-                    },
-                )
-        except Exception:
-            return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={
-                    "error": {
-                        "message": "Database unavailable for project verification",
-                        "code": "DB_ERROR",
-                    }
-                },
-            )
-    return None
+    return recorded
 
 
 @router.get("/update/status")
@@ -354,26 +331,28 @@ async def get_install_summary():
 @router.post("/project/guardrails-init")
 def project_guardrails_init(body: ProjectInitRequest, request: Request):
     """Create JACKED_GUARDRAILS.md in a project from templates."""
-    error = _validate_project_path(body.repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(body.repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
 
     from jacked.guardrails import create_guardrails
 
-    result = create_guardrails(body.repo_path, language=body.language, force=body.force)
+    result = create_guardrails(project, language=body.language, force=body.force)
     return result
 
 
 @router.post("/project/lint-hook-init")
 def project_lint_hook_init(body: ProjectInitRequest, request: Request):
     """Install a pre-push lint hook in a project's .git/hooks/."""
-    error = _validate_project_path(body.repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(body.repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
 
     from jacked.guardrails import install_hook
 
-    result = install_hook(body.repo_path, language=body.language, force=body.force)
+    result = install_hook(project, language=body.language, force=body.force)
     return result
 
 
@@ -393,15 +372,16 @@ def get_project_env(repo_path: str, request: Request):
     """
     from pathlib import Path
 
-    error = _validate_project_path(repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
 
     env_path = None
     source = None
 
     # Read from .git/jacked/env
-    env_file = Path(repo_path) / ".git" / "jacked" / "env"
+    env_file = Path(project) / ".git" / "jacked" / "env"
     if env_file.exists():
         try:
             env_path = env_file.read_text(encoding="utf-8").strip()
@@ -413,7 +393,7 @@ def get_project_env(repo_path: str, request: Request):
     db = getattr(request.app.state, "db", None)
     if db and not env_path:
         try:
-            inst = db.get_installation_by_repo(repo_path)
+            inst = db.get_installation_by_repo(project)
             if inst and inst.get("env_path"):
                 env_path = inst["env_path"]
                 source = "db"
@@ -431,9 +411,10 @@ def update_project_env(body: EnvUpdateRequest, request: Request):
     """
     from jacked.cli import _validate_env_path, _write_project_env
 
-    error = _validate_project_path(body.repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(body.repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
 
     # Validate the env path
     validation_error = _validate_env_path(body.env_path)
@@ -446,13 +427,13 @@ def update_project_env(body: EnvUpdateRequest, request: Request):
         )
 
     # Write to .git/jacked/env
-    _write_project_env(body.repo_path, body.env_path)
+    _write_project_env(project, body.env_path)
 
     # Write to DB
     db = getattr(request.app.state, "db", None)
     if db:
         try:
-            db.update_installation_env(body.repo_path, body.env_path)
+            db.update_installation_env(project, body.env_path)
         except Exception:
             pass
 
@@ -467,9 +448,10 @@ def detect_project_env(body: ProjectInitRequest, request: Request):
     """
     from jacked.cli import _detect_project_env, _validate_env_path, _write_project_env
 
-    error = _validate_project_path(body.repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(body.repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
 
     env_path = _detect_project_env()
     if not env_path:
@@ -492,12 +474,12 @@ def detect_project_env(body: ProjectInitRequest, request: Request):
             },
         )
 
-    _write_project_env(body.repo_path, env_path)
+    _write_project_env(project, env_path)
 
     db = getattr(request.app.state, "db", None)
     if db:
         try:
-            db.update_installation_env(body.repo_path, env_path)
+            db.update_installation_env(project, env_path)
         except Exception:
             pass
 
@@ -523,14 +505,15 @@ def get_project_lessons(repo_path: str, request: Request):
     from pathlib import Path
     import re
 
-    error = _validate_project_path(repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
     # A repository can ship lessons.md as a link to a private file.
-    if first_outside_project(repo_path, "lessons.md"):
+    if first_outside_project(project, "lessons.md"):
         return outside_project_response("lessons.md")
 
-    lessons_path = Path(repo_path) / "lessons.md"
+    lessons_path = Path(project) / "lessons.md"
     if not lessons_path.exists():
         return {"exists": False, "lessons": []}
 
@@ -572,15 +555,16 @@ def update_project_lessons(body: LessonsUpdateRequest, request: Request):
             },
         )
 
-    error = _validate_project_path(body.repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(body.repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
     # The save keeps the file's header lines, so a lessons.md that links to
     # a private file would copy that file's text into the project.
-    if first_outside_project(body.repo_path, "lessons.md"):
+    if first_outside_project(project, "lessons.md"):
         return outside_project_response("lessons.md")
 
-    lessons_path = Path(body.repo_path) / "lessons.md"
+    lessons_path = Path(project) / "lessons.md"
 
     # Preserve any header content (lines before the first lesson bullet)
     header_lines = []
@@ -614,7 +598,7 @@ def update_project_lessons(body: LessonsUpdateRequest, request: Request):
     # The link check runs again right before the write: this handler runs in
     # the threadpool, and a link made after the check above would move the
     # write outside the project.
-    if first_outside_project(body.repo_path, "lessons.md"):
+    if first_outside_project(project, "lessons.md"):
         return outside_project_response("lessons.md")
 
     try:
