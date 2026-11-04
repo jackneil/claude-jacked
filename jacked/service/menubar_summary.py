@@ -30,11 +30,11 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from datetime import datetime, timezone
 from typing import Iterable, Mapping, Optional
 
-from jacked.service.pill_text import finite_number
+from jacked.service.pill_text import percent_reading
+from jacked.web.window_keeper import cache_reset_value
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,10 @@ _VIEW_FAILURES_LOGGED: set = set()
 # (account id, reason) pairs whose unreadable model limit was already logged
 # at WARNING in this process, on the same rule.
 _CAP_FAILURES_LOGGED: set = set()
+# (source, model label) pairs whose skipped model limit was already logged
+# at WARNING in this process, on the same rule: every poll and every page
+# load parses the cached payloads again.
+_SKIPPED_LIMITS_LOGGED: set = set()
 _UNSET = object()
 
 
@@ -134,20 +138,17 @@ def _model_cap(acct: Mapping, view, raw) -> Optional[dict]:
     The selection is the selection of the dashboard (:func:`binding_model`):
     the limit that the provider marks active, else the limit with the
     highest use. *raw* is the row's parsed payload. A payload that jacked
-    cannot read, or a percent that is not a finite number, gives None (no
-    reading, never 0%), so one bad row cannot stop the pill. The result
-    holds only the cleaned name and the finite percent: every field of the
-    summary must be JSON-safe, because /api/menubar-summary refuses NaN.
+    cannot read gives None, so one bad row cannot stop the pill. The parser
+    skips a limit whose percent is not a finite number (no reading, never
+    0%). The result holds only the cleaned name and the finite percent:
+    every field of the summary must be JSON-safe, because
+    /api/menubar-summary refuses NaN.
     """
     try:
         cap = binding_model_compact(raw, view.plan if view is not None else None)
         if cap is None:
             return None
-        utilization = finite_number(cap["utilization"])
-        if utilization is None:
-            _log_cap_failure(acct.get("id"), "non-finite percent")
-            return None
-        return {"label": cap["label"], "utilization": round(utilization, 1)}
+        return {"label": cap["label"], "utilization": round(cap["utilization"], 1)}
     except Exception as exc:  # noqa: BLE001 - one bad payload must not stop the pill
         _log_cap_failure(acct.get("id"), type(exc).__name__, with_traceback=True)
         return None
@@ -160,11 +161,8 @@ def _reading(value) -> Optional[float]:
     >>> _reading(41.26), _reading("9"), _reading(float("inf")), _reading("x")
     (41.3, 9.0, None, None)
     """
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return round(number, 1) if math.isfinite(number) else None
+    number = percent_reading(value)
+    return None if number is None else round(number, 1)
 
 
 def summarize_account(acct: dict) -> Optional[dict]:
@@ -350,10 +348,10 @@ def _epoch_to_iso(epoch) -> Optional[str]:
     True
     >>> _epoch_to_iso(0)
     '1970-01-01T00:00:00+00:00'
-    >>> _epoch_to_iso("nope") is None
-    True
+    >>> _epoch_to_iso("nope") is None, _epoch_to_iso(True) is None
+    (True, True)
     """
-    if epoch is None:
+    if epoch is None or isinstance(epoch, bool):
         return None
     try:
         return datetime.fromtimestamp(int(epoch), tz=timezone.utc).isoformat()
@@ -361,30 +359,29 @@ def _epoch_to_iso(epoch) -> Optional[str]:
         return None
 
 
-def _as_num(v) -> float | int:
-    """Coerce a utilization value to a number; unparseable → 0.
-
-    Provider payloads are external input — a stray string percent ("92") or a
-    null must never reach the ``sorted``/``>=`` comparisons below as a
-    non-number (that would raise TypeError and, on the API path, 500 the
-    accounts endpoint). ``bool`` maps to 0 (it is an int subclass but is never a
-    real utilization).
-
-    >>> _as_num(92), _as_num(42.5), _as_num("92"), _as_num(None), _as_num(True)
-    (92, 42.5, 92.0, 0, 0)
-    """
-    if isinstance(v, bool):
-        return 0
-    if isinstance(v, (int, float)):
-        return v
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return 0
+def _log_skipped_limit(source: str, key: str) -> None:
+    """Log a model limit that the parser skipped: WARNING once per (source,
+    key) in a process (the service logs at INFO, so a DEBUG-only line would
+    never show), DEBUG after that. The line names the entry key and its
+    source, never the value."""
+    seen = (source, key)
+    level = logging.DEBUG if seen in _SKIPPED_LIMITS_LOGGED else logging.WARNING
+    _SKIPPED_LIMITS_LOGGED.add(seen)
+    logger.log(
+        level,
+        "Model limit entry %s from %s has no finite percent; jacked shows no reading for it",
+        key,
+        source,
+    )
 
 
 def _claude_scoped_models(raw: dict, plan=None) -> list[dict]:
-    """Claude ``weekly_scoped`` model caps from the ``limits`` array."""
+    """Claude ``weekly_scoped`` model caps from the ``limits`` array.
+
+    An entry whose percent is not a finite number is skipped (no reading,
+    never 0%). A reset that is not a timestamp is no reset, and a severity
+    that is not text is no severity.
+    """
     from jacked.usage_plans import clean_label, model_window_seconds
 
     window_secs = model_window_seconds("claude", None, "weekly_model", plan)
@@ -402,13 +399,18 @@ def _claude_scoped_models(raw: dict, plan=None) -> list[dict]:
         label = clean_label(model.get("display_name")) if isinstance(model, dict) else None
         if not label:
             continue
+        utilization = percent_reading(lim.get("percent"))
+        if utilization is None:
+            _log_skipped_limit("limits", str(label).lower())
+            continue
+        severity = lim.get("severity")
         out.append(
             {
                 "key": str(label).lower(),
                 "label": label,
-                "utilization": _as_num(lim.get("percent")),
-                "resets_at": lim.get("resets_at"),
-                "severity": lim.get("severity"),
+                "utilization": utilization,
+                "resets_at": cache_reset_value(lim.get("resets_at")),
+                "severity": severity if isinstance(severity, str) else None,
                 "is_active": bool(lim.get("is_active")),
                 "window_seconds": window_secs,
             }
@@ -419,6 +421,9 @@ def _claude_scoped_models(raw: dict, plan=None) -> list[dict]:
 def _codex_named_models(raw: dict, plan=None) -> list[dict]:
     """Codex named per-model limits from ``rateLimitsByLimitId``.
 
+    The weekly (secondary) window gives the percent; when it has no finite
+    percent, the primary (5-hour) window gives it. A limit with no finite
+    percent in either window is skipped (no reading, never 0%).
     ``window_seconds`` is the chosen window's own ``windowDurationMins`` when
     it has one, else the length of the slot it came from (``weekly`` for a
     secondary window, ``session`` for a primary one).
@@ -438,16 +443,23 @@ def _codex_named_models(raw: dict, plan=None) -> list[dict]:
         # Prefer the weekly (secondary) window; fall back to primary (5h).
         window = entry.get("secondary")
         slot = "weekly"
-        if not isinstance(window, dict) or window.get("usedPercent") is None:
+        utilization = (
+            percent_reading(window.get("usedPercent")) if isinstance(window, dict) else None
+        )
+        if utilization is None:
             window = (
                 entry.get("primary") if isinstance(entry.get("primary"), dict) else {}
             )
             slot = "session"
+            utilization = percent_reading(window.get("usedPercent"))
+        if utilization is None:
+            _log_skipped_limit("rateLimitsByLimitId", str(limit_id).lower())
+            continue
         out.append(
             {
                 "key": str(limit_id).lower(),
                 "label": label,
-                "utilization": _as_num(window.get("usedPercent")),
+                "utilization": utilization,
                 "resets_at": _epoch_to_iso(window.get("resetsAt")),
                 "severity": None,
                 "is_active": False,
@@ -458,7 +470,11 @@ def _codex_named_models(raw: dict, plan=None) -> list[dict]:
 
 
 def _legacy_seven_day_models(raw: dict, plan=None) -> list[dict]:
-    """Legacy ``seven_day_<model>`` caps — dict OR bare numeric (old payloads)."""
+    """Legacy ``seven_day_<model>`` caps — dict OR bare numeric (old payloads).
+
+    An entry whose percent is not a finite number is skipped (no reading,
+    never 0%), and a reset that is not a timestamp is no reset.
+    """
     from jacked.usage_plans import model_window_seconds
 
     window_secs = model_window_seconds("claude", None, "weekly_model", plan)
@@ -466,29 +482,26 @@ def _legacy_seven_day_models(raw: dict, plan=None) -> list[dict]:
     for suffix, label in _LEGACY_MODEL_LABELS.items():
         val = raw.get(f"seven_day_{suffix}")
         if isinstance(val, dict):
-            out.append(
-                {
-                    "key": suffix,
-                    "label": label,
-                    "utilization": _as_num(val.get("utilization")),
-                    "resets_at": val.get("resets_at"),
-                    "severity": None,
-                    "is_active": False,
-                    "window_seconds": window_secs,
-                }
-            )
+            percent, resets_at = val.get("utilization"), val.get("resets_at")
         elif isinstance(val, (int, float)) and not isinstance(val, bool):
-            out.append(
-                {
-                    "key": suffix,
-                    "label": label,
-                    "utilization": val,
-                    "resets_at": None,
-                    "severity": None,
-                    "is_active": False,
-                    "window_seconds": window_secs,
-                }
-            )
+            percent, resets_at = val, None
+        else:
+            continue
+        utilization = percent_reading(percent)
+        if utilization is None:
+            _log_skipped_limit("seven_day", suffix)
+            continue
+        out.append(
+            {
+                "key": suffix,
+                "label": label,
+                "utilization": utilization,
+                "resets_at": cache_reset_value(resets_at),
+                "severity": None,
+                "is_active": False,
+                "window_seconds": window_secs,
+            }
+        )
     return out
 
 
@@ -502,7 +515,9 @@ def parse_per_model(raw: Optional[dict], plan=None) -> list[dict]:
     :class:`jacked.usage_plans.PlanMatch`) supplies plan-specific lengths. Providers are merged with the first
     source (Claude limits) winning on key collisions; the legacy source only
     fills keys not already present. Empty list when the payload has no per-model
-    breakdown or is not a dict.
+    breakdown or is not a dict. A limit whose percent is not a finite number
+    is left out (no reading, never 0%), and every ``resets_at`` is an ISO
+    string or None, so the result is always strict JSON.
 
     Claude reports model caps as ``weekly_scoped`` entries in ``limits``:
 
@@ -513,7 +528,7 @@ def parse_per_model(raw: Optional[dict], plan=None) -> list[dict]:
     ...      "scope": {"model": {"id": None, "display_name": "Fable"}}},
     ... ]}
     >>> [(m["label"], m["utilization"], m["is_active"]) for m in parse_per_model(claude)]
-    [('Fable', 92, True)]
+    [('Fable', 92.0, True)]
 
     Codex reports them in ``rateLimitsByLimitId`` (named limits only; the bare
     ``codex`` overall entry is skipped):
@@ -524,7 +539,7 @@ def parse_per_model(raw: Optional[dict], plan=None) -> list[dict]:
     ...                          "primary": {"usedPercent": 7}},
     ... }}
     >>> [(m["label"], m["utilization"]) for m in parse_per_model(codex)]
-    [('GPT-5.3-Codex-Spark', 7)]
+    [('GPT-5.3-Codex-Spark', 7.0)]
 
     >>> parse_per_model(None)
     []
@@ -581,7 +596,7 @@ def binding_model_compact(raw: Optional[dict], plan=None) -> Optional[dict]:
     >>> binding_model_compact({"limits": [
     ...     {"kind": "weekly_scoped", "percent": 92, "severity": "critical",
     ...      "is_active": True, "scope": {"model": {"display_name": "Fable"}}}]})
-    {'label': 'Fable', 'utilization': 92, 'resets_at': None, 'severity': 'critical', 'is_active': True, 'window_seconds': 604800}
+    {'label': 'Fable', 'utilization': 92.0, 'resets_at': None, 'severity': 'critical', 'is_active': True, 'window_seconds': 604800}
     >>> binding_model_compact({}) is None
     True
     """

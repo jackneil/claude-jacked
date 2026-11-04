@@ -14,7 +14,7 @@ from jacked.web import auth
 
 @pytest.fixture(autouse=True)
 def _fresh_log_state(monkeypatch):
-    monkeypatch.setattr(auth, "_UNREADABLE_RESETS_LOGGED", set())
+    monkeypatch.setattr(auth, "_UNREADABLE_LOGGED", set())
 
 
 @pytest.mark.parametrize("value", ["", "   ", "soon", {}, [], True, float("nan")])

@@ -35,6 +35,7 @@ from typing import Mapping, Optional
 
 from jacked.findbin import find_bin
 from jacked.service.menubar_summary import _epoch_to_iso
+from jacked.service.pill_text import percent_reading
 
 from .credentials import codex_home
 
@@ -147,7 +148,10 @@ def normalize_rate_limits(result: Mapping) -> dict:
     Returns ``{"five_hour": {"utilization", "resets_at", "reported",
     "window_minutes"}, "seven_day": {...}, "windows_complete", "plan_type",
     "credits", "reset_credits", "by_limit"}``. Utilization is the app-server
-    ``usedPercent``; resets_at is an ISO string; window_minutes is the
+    ``usedPercent`` as a finite float; a ``usedPercent`` that is not a finite
+    number is None, no reading
+    (:func:`jacked.service.pill_text.percent_reading`), and its window stays
+    reported. resets_at is an ISO string; window_minutes is the
     selected window's own ``windowDurationMins`` (None when unusable). A
     window Codex did not report comes back as ``{"utilization": None,
     "resets_at": None, "reported": False, "window_minutes": None}``.
@@ -170,15 +174,30 @@ def normalize_rate_limits(result: Mapping) -> dict:
         dur = window.get("windowDurationMins")
         return dur if _usable_duration(dur) else None
 
+    def _percent(slot: str, window: Mapping) -> Optional[float]:
+        value = window.get("usedPercent")
+        pct = percent_reading(value)
+        if pct is None and value is not None:
+            # WARNING once per slot and value type, DEBUG after: the plan
+            # resolver reads the cached payload on every account view.
+            key = f"percent:{slot}:{type(value).__name__}"
+            (logger.debug if key in _warned_shapes else logger.warning)(
+                "codex rate-limit %s window has no finite usedPercent (a %s "
+                "value); the cache keeps the last reading and reset of the window",
+                slot, type(value).__name__,
+            )
+            _warned_shapes.add(key)
+        return pct
+
     return {
         "five_hour": {
-            "utilization": five.get("usedPercent"),
+            "utilization": _percent("five_hour", five),
             "resets_at": _epoch_to_iso(five.get("resetsAt")),
             "reported": slots["five_hour"] is not None,
             "window_minutes": _minutes(five),
         },
         "seven_day": {
-            "utilization": seven.get("usedPercent"),
+            "utilization": _percent("seven_day", seven),
             "resets_at": _epoch_to_iso(seven.get("resetsAt")),
             "reported": slots["seven_day"] is not None,
             "window_minutes": _minutes(seven),

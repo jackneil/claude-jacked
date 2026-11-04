@@ -68,7 +68,7 @@ def _model_limits(account: dict) -> list[dict]:
     >>> raw = '{"limits": [{"kind": "weekly_scoped", "percent": 99, "is_active": true,'
     >>> raw += ' "scope": {"model": {"display_name": "Fable"}}}]}'
     >>> [(m["key"], m["utilization"]) for m in _model_limits({"cached_usage_raw": raw})]
-    [('fable', 99)]
+    [('fable', 99.0)]
     >>> _model_limits({})
     []
     """

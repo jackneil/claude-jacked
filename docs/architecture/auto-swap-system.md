@@ -304,14 +304,35 @@ plan has none (keeper skip reason `no_session_window`); it can still ping such
 an account when its weekly window turned over. A ping is a success only when
 each window that caused it is open after the ping. A reset time in the future
 shows that a window is open. The API can omit the weekly reset time. A weekly
-window without a reset time is open when the usage read after the ping
-succeeds, or when the ping reply has window headers. Otherwise the keeper
-records `ping_ok_no_window` and doubles the retry delay, up to one hour. The
-keeper stores the count of failures, so a restart does not reset the delay. A
+window without a reset time is open when a usage read after the ping accepted
+the weekly reading, or when the ping reply has window headers. The
+confirmation evidence for a window is a usage read that accepted the reading
+of that window, stored per window (`cached_5h_read_at`, `cached_7d_read_at`).
+
+When a window is not open after the ping, the keeper records the ping as
+pending (`ping_pending`), not as a failure. The provider accepted the ping, but
+the usage read can show the new window late. The keeper also records the
+reason: `no_header` (no reset header and no usage read), `read_not_landed` (a
+reset header but no usage read) or `read_no_window` (a usage read with no
+window). For two sweeps, and for at least 15 minutes, the keeper does not ping
+the account again. A usage poll or a later sweep that shows each window open
+sets the state to `ok`. If this grace window ends first, the keeper reads the
+usage one more time, then records `ping_ok_no_window` and doubles the retry
+delay, up to one hour. Each change out of the pending state is a
+compare-and-swap on the ping that started it. The change applies only while
+the account still holds that ping (`Database.set_keeper_state_if`).
+
+The keeper stores the count of failures, so a restart does not reset the delay
+or the grace window. The retry delay starts at the end of the grace window. A
 reset value that is not a time (for example, an empty string) is stored as no
-reset. It runs in `full_sweep_loop`
-(`jacked/api/usage_monitor.py`) at the `usage_check_interval`. The wait
-between sweeps uses the wall clock, so a closed laptop does not stretch it.
+reset. A reset travels only with its percent. When a usage percent is null or is
+not a finite number (NaN, an infinity), the cache keeps the last percent and
+the last reset of that window. The keeper ignores a stored time or count that is not a
+finite number, so such a value cannot hold an account. The keeper runs in
+`full_sweep_loop` (`jacked/api/usage_monitor.py`) at the
+`usage_check_interval`. The confirmation of a pending ping is in
+`jacked/api/keeper_confirmation.py`. The wait between sweeps uses the wall
+clock, so a closed laptop does not stretch it.
 
 The keeper pings an account only inside active hours. The pre-wake pass runs
 once on each local date: on the first sweep at or after the pre-wake time and
@@ -381,6 +402,7 @@ certified transaction engine exists.
 | File | Responsibility |
 | --- | --- |
 | `jacked/api/usage_monitor.py` | Decision loop, TOCTOU guard, recommendation-only gate, runtime backoff and broadcasts |
+| `jacked/api/keeper_confirmation.py` | Window keeper: the confirmation of an accepted ping (hold, deadline read, and compare-and-swap transitions out of `ping_pending`) |
 | `jacked/web/auto_swap/selection.py` | Candidate ranking and departure rules |
 | `jacked/web/auto_swap/walls.py` | Wall predicate: walled departure (rules 2a and 2b) and walled-candidate checks |
 | `jacked/service/usage_pacing.py` | Recovery time for the exhaustion banner and `jacked usage` (`account_recovery()`) |

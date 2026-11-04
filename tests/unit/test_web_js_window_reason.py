@@ -156,10 +156,41 @@ class TestWindowReason:
             {"last_status": "rate_limited"},
             {"last_status": "error", "next_attempt_at": _now() + 600},
             {"last_status": "ok"},
+            {"last_status": "ping_pending"},
+            {"last_status": "ping_pending", "skip_reason": "confirming", "next_attempt_at": _now() + 600},
         ]
         for ks in states:
             r = _reason(tmp_path, _fresh(keeper_state=ks))
             assert r is not None and len(r["short"]) <= 14, (ks, r)
+
+    @pytest.mark.parametrize(
+        "ks",
+        [
+            # The ping was accepted and waits for a usage read (#238i).
+            {"last_status": "ping_pending"},
+            # The sweep holds the account until the confirmation deadline.
+            {"last_status": "ping_pending", "skip_reason": "confirming", "next_attempt_at": "+600"},
+            # A confirmation can land between the sweep's read and its
+            # write: the hold still reads as opening, never as lapsed.
+            {"last_status": "ok", "skip_reason": "confirming", "next_attempt_at": "+600"},
+            # A retry status beside the hold never reads as "retry".
+            {"last_status": "ping_ok_no_window", "skip_reason": "confirming", "next_attempt_at": "+600"},
+        ],
+    )
+    def test_a_pending_ping_reads_as_window_opening(self, tmp_path, ks):
+        ks = {k: (_now() + 600 if v == "+600" else v) for k, v in ks.items()}
+        r = _reason(tmp_path, _fresh(keeper_state=ks))
+        assert r == {"text": "window opening", "short": "opening", "tone": "muted", "muted": False}
+
+    @pytest.mark.parametrize("reason_code", ["no_header", "read_not_landed"])
+    def test_a_pending_ping_with_a_stale_reading_still_reads_as_opening(self, tmp_path, reason_code):
+        """A read-back that did not land leaves the last reading old: the
+        pending caption still wins over "last read", and the stale dim stays."""
+        ks = {"last_status": "ping_pending", "pending_reason": reason_code,
+              "pending_windows": ["5h"], "pending_until": _now() + 600}
+        acct = _fresh(keeper_state=ks, usage_cached_at=_now() - 2 * 3600)
+        r = _reason(tmp_path, acct)
+        assert r == {"text": "window opening", "short": "opening", "tone": "muted", "muted": True}
 
     def test_rate_limited_without_a_time(self, tmp_path):
         acct = _fresh(keeper_state={"last_status": "rate_limited"})
@@ -250,6 +281,18 @@ class TestRenderUsageBar:
         html = self._bar(tmp_path, _fresh(), PAST, compact=True)
         assert ">no window</span>" in html
         assert "—" not in html
+
+    def test_a_pending_ping_renders_window_opening_with_its_hover_title(self, tmp_path):
+        acct = _fresh(keeper_state={
+            "last_status": "ping_pending", "skip_reason": "confirming",
+            "next_attempt_at": _now() + 600,
+        })
+        full = self._bar(tmp_path, acct, PAST)
+        assert "window opening" in full
+        assert "retry" not in full and "window lapsed" not in full
+        compact = self._bar(tmp_path, acct, PAST, compact=True)
+        assert ">opening</span>" in compact
+        assert 'title="5h limit · window opening"' in compact
 
 
 class TestElapsedFraction:

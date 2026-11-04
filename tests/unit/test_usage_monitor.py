@@ -4018,3 +4018,100 @@ class TestWallWithNoTargetIsNotAStall:
         assert all(r.startswith("swap warranted (drained:") for r in _decision_reasons(db))
         assert stalled
         assert broadcasts
+
+
+# ---------------------------------------------------------------------------
+# #238i: a usage read that the poll stores confirms a pending keeper ping
+# ---------------------------------------------------------------------------
+
+
+_POLL_READS = [({}, True), ({"_cached": True}, False), ({"_backed_off": True}, False), (None, False)]
+
+
+class TestPollConfirmsPendingKeeperPing:
+    @pytest.mark.parametrize("read, confirms", _POLL_READS)
+    def test_the_active_poll_confirms_after_a_landed_read(self, read, confirms):
+        db = _db_with_rows([_acct(1, usage_5h=10)])
+        app = _make_app(db=db)
+        confirm = AsyncMock(return_value=False)
+
+        async def _run():
+            with (
+                patch(
+                    "jacked.api.usage_monitor.asyncio.sleep",
+                    side_effect=_sleep_canceller(max_sleeps=0),
+                ),
+                patch("jacked.api.usage_monitor._read_active_account_id", return_value=1),
+                patch("jacked.web.auth.fetch_usage", new_callable=AsyncMock, return_value=read),
+                patch("jacked.api.credential_helpers.read_fresh_active_token", return_value="tok"),
+                patch.object(um, "_confirm_pending_from_poll", confirm),
+            ):
+                with pytest.raises(asyncio.CancelledError):
+                    await active_account_poll_loop(app)
+
+        asyncio.run(_run())
+        if confirms:
+            confirm.assert_any_await(db, 1)
+        else:
+            confirm.assert_not_awaited()
+
+    @pytest.mark.parametrize("read, confirms", _POLL_READS)
+    def test_a_candidate_read_confirms_after_a_landed_read(self, read, confirms):
+        old_cache = int(time.time()) - 3600
+        active = _acct(1, usage_5h=30)
+        stale = _acct(2, usage_5h=10, usage_cached_at=old_cache)
+        db = _make_db(accounts=[active, stale])
+        confirm = AsyncMock(return_value=False)
+
+        async def _run():
+            with (
+                patch("jacked.web.auth.fetch_usage", new_callable=AsyncMock, return_value=read),
+                patch("jacked.api.usage_monitor.asyncio.sleep", new_callable=AsyncMock),
+                patch.object(um, "_confirm_pending_from_poll", confirm),
+            ):
+                await um._fetch_candidate_usage([active, stale], 1, db)
+
+        asyncio.run(_run())
+        if confirms:
+            confirm.assert_awaited_once_with(db, 2)
+        else:
+            confirm.assert_not_awaited()
+
+    @pytest.mark.parametrize("read, confirms", _POLL_READS)
+    def test_the_refresh_loop_confirms_after_a_landed_read(self, monkeypatch, read, confirms):
+        import types
+
+        import jacked.web.auth as auth_mod
+
+        accounts = [{"id": 5, "provider": "claude", "access_token": "p-5", "cc_access_token": None}]
+        fake_db = types.SimpleNamespace(list_accounts=lambda **k: accounts)
+        app = types.SimpleNamespace(
+            state=types.SimpleNamespace(db=fake_db, active_poll_account_id=None)
+        )
+        monkeypatch.setattr(auth_mod, "fetch_usage", AsyncMock(return_value=read))
+        confirm = AsyncMock(return_value=False)
+        monkeypatch.setattr(um, "_confirm_pending_from_poll", confirm)
+        tops = {"n": 0}
+
+        async def fake_sleep(seconds):
+            if seconds == um._ALL_ACCOUNTS_REFRESH_INTERVAL:
+                tops["n"] += 1
+                if tops["n"] >= 2:
+                    raise asyncio.CancelledError
+
+        monkeypatch.setattr(um.asyncio, "sleep", fake_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(um.all_accounts_refresh_loop(app))
+        if confirms:
+            confirm.assert_awaited_once_with(fake_db, 5)
+        else:
+            confirm.assert_not_awaited()
+
+    def test_a_failing_confirmation_never_breaks_the_poll(self, caplog):
+        """The confirmation reads the row: a database error is logged and the
+        poll goes on."""
+        db = MagicMock()
+        db.get_account.side_effect = RuntimeError("database is locked")
+        with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
+            assert asyncio.run(um._confirm_pending_from_poll(db, 4)) is False
+        assert any("could not confirm" in r.getMessage() for r in caplog.records)

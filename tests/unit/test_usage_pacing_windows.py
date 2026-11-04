@@ -172,9 +172,17 @@ class TestModelRecovery:
         assert (rec.at.isoformat(), rec.window, rec.label) == (WEEKLY_RESET, "model", "Fable")
 
     def test_an_unknowable_model_reset_gives_none(self):
-        for resets in (None, "not-a-date", 1793780314):
+        for resets in (None, "not-a-date", [1], float("inf")):
             acct = _ultra(cached_usage_raw=_model_raw(99, resets))
             assert pacing.account_recovery(acct, NOW) is None, resets
+
+    def test_an_epoch_model_reset_reads_like_the_usage_cache(self):
+        """The parser stores a model reset the way the usage cache stores a
+        window reset (#231i): epoch seconds become an ISO time."""
+        acct = _ultra(cached_usage_raw=_model_raw(99, 1793780314))
+        rec = pacing.account_recovery(acct, NOW)
+        assert (rec.at.isoformat(), rec.window, rec.label) == (
+            "2026-11-04T08:18:34+00:00", "model", "Fable")
 
     def test_a_model_reading_from_before_its_reset_holds_nothing(self):
         """The Fable limit reset at 17:30 and the reading is from 17:00, so it
@@ -232,3 +240,13 @@ class TestSummary:
         assert summary["best_account_worst_window"] is None
         assert summary["best_account_worst_window_resets_at"] is None
         assert summary["plan_catalog"]["drift"] == []
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("nan"), "Infinity", True])
+def test_a_cached_percent_that_is_not_a_finite_number_is_unknown(value):
+    """#231i: an infinite weekly reading read as a wall, and NaN failed every
+    comparison. Both are no reading, like a missing value."""
+    from jacked.web.auto_swap.walls import _walled_reason
+
+    assert pacing.coerce_pct(value) is None
+    assert _walled_reason({"cached_usage_7d": value}, 98.0, NOW) is None

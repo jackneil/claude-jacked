@@ -179,6 +179,8 @@ class Account(BaseModel):
     cached_5h_resets_at: Optional[str] = None
     cached_7d_resets_at: Optional[str] = None
     usage_cached_at: Optional[int] = None
+    cached_5h_read_at: Optional[float] = None
+    cached_7d_read_at: Optional[float] = None
     cached_usage_raw: Optional[str] = None
     last_error: Optional[str] = None
     last_error_at: Optional[str] = None
@@ -337,6 +339,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     cached_5h_resets_at TEXT,
     cached_7d_resets_at TEXT,
     usage_cached_at INTEGER,
+    cached_5h_read_at REAL,  -- Epoch seconds of the last usage write that accepted the 5h reading
+    cached_7d_read_at REAL,  -- Epoch seconds of the last usage write that accepted the 7d reading
     cached_usage_raw TEXT,
     last_error TEXT,
     last_error_at TIMESTAMP,
@@ -817,6 +821,44 @@ class Database:
             "END"
         )
 
+    # The per-window read stamps: window -> column. See
+    # update_account_usage_cache and _migrate_window_read_stamps.
+    WINDOW_READ_STAMPS = {"5h": "cached_5h_read_at", "7d": "cached_7d_read_at"}
+
+    @staticmethod
+    def _migrate_window_read_stamps(conn: sqlite3.Connection) -> None:
+        """Add the per-window read stamps ``cached_5h_read_at`` and ``cached_7d_read_at``.
+
+        Each column holds the epoch seconds of the last usage write that
+        ACCEPTED the reading of its window (see
+        :meth:`update_account_usage_cache`). The window keeper confirms an
+        accepted ping from these stamps. There is no backfill: the row stamp
+        ``usage_cached_at`` also moves for a rejected reading, so it cannot
+        tell which window an old read accepted. A NULL stamp proves nothing
+        until the next accepted read.
+
+        >>> conn = sqlite3.connect(":memory:")
+        >>> _ = conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, usage_cached_at INTEGER)")
+        >>> _ = conn.execute("INSERT INTO accounts VALUES (1, 50)")
+        >>> Database._migrate_window_read_stamps(conn)
+        >>> Database._migrate_window_read_stamps(conn)  # idempotent
+        >>> conn.execute(
+        ...     "SELECT usage_cached_at, cached_5h_read_at, cached_7d_read_at FROM accounts").fetchone()
+        (50, None, None)
+        """
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+        for col_name in Database.WINDOW_READ_STAMPS.values():
+            if col_name in cols:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE accounts ADD COLUMN {col_name} REAL")
+            except sqlite3.OperationalError:
+                # Another process can add the column after the check above.
+                # Any other failure leaves the column missing: raise it.
+                present = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
+                if col_name not in present:
+                    raise
+
     @staticmethod
     def _bind_legacy_foreign_marks(conn: sqlite3.Connection) -> None:
         """Bind a cross-account verdict recorded before ``foreign_token_fp``.
@@ -1178,6 +1220,10 @@ class Database:
             # copy.
             self._migrate_refresh_failed_token_fp(conn)
             self._bind_legacy_foreign_marks(conn)
+            # Migration (M6 X3): the per-window read stamps. AFTER the
+            # provider rebuild, for the same reason as the fingerprint
+            # columns above: a column added after the rebuild needs no copy.
+            self._migrate_window_read_stamps(conn)
             # Migration: delete the rows of retired settings (RETIRED_SETTING_KEYS).
             conn.executemany("DELETE FROM settings WHERE key = ?", [(k,) for k in self.RETIRED_SETTING_KEYS])
             # Migration: add swap outcome tracking to swap_log.
@@ -1555,6 +1601,8 @@ class Database:
             "cached_5h_resets_at",
             "cached_7d_resets_at",
             "usage_cached_at",
+            "cached_5h_read_at",
+            "cached_7d_read_at",
             "cached_usage_raw",
             "last_error",
             "last_error_at",
@@ -1805,7 +1853,11 @@ class Database:
             return dict(row) if row else None
 
     # Keys set_keeper_state accepts. A typo must fail loudly in tests, not
-    # silently grow the JSON blob the dashboard reads.
+    # silently grow the JSON blob the dashboard reads. The pending_* keys
+    # belong to a ping the provider accepted whose window no usage read
+    # shows yet (last_status "ping_pending"): pending_windows lists "5h" and
+    # "7d", pending_until is the epoch confirmation deadline, and
+    # pending_reason is "no_header", "read_not_landed" or "read_no_window".
     KEEPER_STATE_FIELDS = frozenset(
         {
             "last_ping_at",
@@ -1818,6 +1870,9 @@ class Database:
             "paused_until",
             "token_fp",
             "backoff_fails",
+            "pending_windows",
+            "pending_until",
+            "pending_reason",
         }
     )
 
@@ -1862,24 +1917,89 @@ class Database:
         ('ok', 'backoff')
         >>> Database.parse_keeper_state(db.get_account(acct["id"])["keeper_state"])["skip_reason"]
         'backoff'
+        >>> st = db.set_keeper_state(acct["id"], last_status="ping_pending",
+        ...     pending_windows=["5h"], pending_until=1800000900, pending_reason="read_no_window")
+        >>> st["pending_windows"], st["pending_until"], st["pending_reason"]
+        (['5h'], 1800000900, 'read_no_window')
         """
-        unknown = set(fields) - self.KEEPER_STATE_FIELDS
+        merged = self._merge_keeper_state(account_id, None, fields)
+        return {} if merged is None else merged
+
+    def set_keeper_state_if(self, account_id: int, expected: dict, **fields: Any) -> bool:
+        """Compare-and-swap form of :meth:`set_keeper_state`.
+
+        Merges *fields* only while every ``expected`` key still holds its
+        expected value. A key that the state does not have holds None. The
+        check and the write run in one transaction that holds the database
+        write lock from the read on (:meth:`_merge_keeper_state`), so no other
+        Database object and no other process can write between them. Values
+        compare in their JSON form: NaN never equals itself, so a plain
+        comparison would refuse every write to a state that holds a NaN.
+        Returns True when it wrote, and False when a key changed or the
+        account does not exist.
+
+        >>> db = Database(":memory:")
+        >>> acct = db.create_account("c@test.com", "tok", 9999999999)
+        >>> _ = db.set_keeper_state(acct["id"], last_status="ping_pending", last_ping_at=100)
+        >>> gen = {"last_status": "ping_pending", "last_ping_at": 100}
+        >>> db.set_keeper_state_if(acct["id"], gen, last_status="ok")
+        True
+        >>> db.set_keeper_state_if(acct["id"], gen, last_status="ping_ok_no_window")
+        False
+        >>> Database.parse_keeper_state(db.get_account(acct["id"])["keeper_state"])["last_status"]
+        'ok'
+        >>> _ = db.set_keeper_state(acct["id"], last_ping_at=float("nan"))
+        >>> db.set_keeper_state_if(acct["id"], {"last_ping_at": float("nan")}, skip_reason=None)
+        True
+        >>> db.set_keeper_state_if(999, {}, last_status="ok")
+        False
+        """
+        return self._merge_keeper_state(account_id, expected, fields) is not None
+
+    def _merge_keeper_state(
+        self, account_id: int, expected: Optional[dict], fields: dict
+    ) -> Optional[dict]:
+        """The read-merge-write of the keeper state, in one writer transaction.
+
+        The instance lock in :meth:`_writer` does not reach a second
+        Database object or a second process on the same file. Thus BEGIN
+        IMMEDIATE takes the database write lock BEFORE the read (as in
+        :meth:`update_setting`), and the UPDATE applies only to the
+        keeper_state text that the read returned. A write that finds no
+        such row (rowcount 0) is a lost swap.
+
+        Returns the merged state. Returns None when the account does not
+        exist, when a key of *expected* does not hold its value (see
+        :meth:`set_keeper_state_if`), or when the state changed after the
+        read; nothing is written then.
+        """
+        unknown = (set(fields) | set(expected or ())) - self.KEEPER_STATE_FIELDS
         if unknown:
             raise ValueError(f"Unknown keeper_state fields: {sorted(unknown)}")
         with self._writer() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT keeper_state FROM accounts WHERE id = ? AND is_deleted = 0",
                 (account_id,),
             ).fetchone()
             if row is None:
-                return {}
-            state = self.parse_keeper_state(row[0])
+                return None
+            raw = row[0]
+            state = self.parse_keeper_state(raw)
+            if expected and any(
+                json.dumps(state.get(key), sort_keys=True) != json.dumps(value, sort_keys=True)
+                for key, value in expected.items()
+            ):
+                return None
             state.update(fields)
             state["updated_at"] = int(time.time())
-            conn.execute(
-                "UPDATE accounts SET keeper_state = ? WHERE id = ? AND is_deleted = 0",
-                (json.dumps(state, sort_keys=True), account_id),
+            cursor = conn.execute(
+                "UPDATE accounts SET keeper_state = ? "
+                "WHERE id = ? AND is_deleted = 0 AND keeper_state IS ?",
+                (json.dumps(state, sort_keys=True), account_id, raw),
             )
+            if cursor.rowcount == 0:
+                return None
         return state
 
     def update_account_usage_cache(
@@ -1909,10 +2029,22 @@ class Database:
         reports a window with a reading but no reset time, and the old reset
         time must not survive it.
 
+        ``usage_cached_at`` stamps every write: it is the age of the row.
+        Each window also has its own read stamp (``cached_5h_read_at``,
+        ``cached_7d_read_at``, epoch seconds). A write sets it only when it
+        ACCEPTED the reading of that window: its percent is written, or the
+        window is cleared. A window that the caller keeps (a rejected
+        reading, or a reset with no percent) keeps its stamp. The window
+        keeper reads these stamps as evidence that a window is open
+        (:mod:`jacked.api.keeper_confirmation`).
+
         >>> db = Database(":memory:")
         >>> acct = db.create_account("u@t.com", "tok", 9999999999)
         >>> db.update_account_usage_cache(acct["id"], five_hour=42.5)
         True
+        >>> row = db.get_account(acct["id"])
+        >>> row["cached_5h_read_at"] is not None, row["cached_7d_read_at"]
+        (True, None)
         >>> db.update_account_usage_cache(acct["id"], raw={"test": "data"})
         True
         >>> db.update_account_usage_cache(acct["id"], clear_five_hour=True)
@@ -1938,7 +2070,8 @@ class Database:
         >>> db.get_account(acct["id"])["cached_usage_raw"] is None
         True
         """
-        updates: dict[str, Any] = {"usage_cached_at": int(time.time())}
+        now = time.time()
+        updates: dict[str, Any] = {"usage_cached_at": int(now)}
         if clear_five_hour:
             updates["cached_usage_5h"] = None
             updates["cached_5h_resets_at"] = None
@@ -1957,6 +2090,12 @@ class Database:
             updates["cached_5h_resets_at"] = None
         if clear_seven_day_reset and not clear_seven_day:
             updates["cached_7d_resets_at"] = None
+        for window, accepted in (
+            ("5h", clear_five_hour or five_hour is not None),
+            ("7d", clear_seven_day or seven_day is not None),
+        ):
+            if accepted:
+                updates[self.WINDOW_READ_STAMPS[window]] = now
         if raw is not None:
             raw_str = json.dumps(raw)
             if len(raw_str) <= _RAW_USAGE_MAX_CHARS:

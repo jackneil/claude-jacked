@@ -334,6 +334,14 @@ function windowReason(acct, windowKey, nowMs) {
     // pings a Codex account, so a lapsed Codex window has only its last read.
     const cachedAt = Number(acct.usage_cached_at) || 0;
     const stale = cachedAt > 0 && (now / 1000 - cachedAt) > USAGE_STALE_SECS;
+    // The provider accepted the ping and a usage read has not shown the new
+    // window yet (#238i): the window is opening. It is not a retry and not
+    // a lapsed window, and it holds when the last reading is stale too (a
+    // read-back that did not land leaves the reading old): the caption says
+    // what the keeper knows, the stale dim stays.
+    if (ks && (ks.last_status === 'ping_pending' || ks.skip_reason === 'confirming')) {
+        return reason('window opening', 'muted', stale, 'opening');
+    }
     if (cachedAt > 0 && (acct.provider === 'codex' || stale)) {
         const when = _keeperReadDate(cachedAt);
         return reason('last read ' + when, 'muted', stale, 'read ' + when);

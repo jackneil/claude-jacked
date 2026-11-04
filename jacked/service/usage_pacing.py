@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from jacked.service.menubar_summary import _eligible, binding_model, parse_per_model
+from jacked.service.pill_text import percent_reading
 
 
 def parse_reset_ts(ts: object) -> Optional[datetime]:
@@ -63,17 +64,17 @@ def coerce_pct(value: object) -> Optional[float]:
 
     SQLite's dynamic typing means a cached percent CAN be TEXT (an older or
     buggy writer); one hostile row must degrade to "unknown", never crash
-    the pacing signal an unattended loop depends on.
+    the pacing signal an unattended loop depends on. A value that is not a
+    finite number is unknown too: an infinity would read as a wall, and NaN
+    fails every comparison. The rule is the one reader of every usage
+    percent (:func:`jacked.service.pill_text.percent_reading`).
 
     >>> coerce_pct(91), coerce_pct("91"), coerce_pct("91%"), coerce_pct(None)
     (91.0, 91.0, None, None)
+    >>> coerce_pct(float("inf")), coerce_pct("nan"), coerce_pct(True)
+    (None, None, None)
     """
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    return percent_reading(value)
 
 
 def cache_age_seconds(acct: dict, now: datetime) -> Optional[int]:

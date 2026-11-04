@@ -9,6 +9,9 @@ asyncio.run() (project convention, no pytest-asyncio).
 import asyncio
 import json
 import logging
+import math
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -16,7 +19,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import jacked.api.keeper_confirmation as kc
 import jacked.api.usage_monitor as um
+import jacked.web.auth as auth_mod
 from jacked.web.auth import CCRefreshOutcome, CCRefreshResult
 from jacked.web.database import Database
 from jacked.web.window_keeper import PingResult
@@ -105,7 +110,8 @@ class _Pings:
         return answer
 
 
-def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True, prewake=False):
+def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True, prewake=False,
+              interval=300):
     """One keeper pass with the network edges mocked.
 
     Both schedule inputs are pinned. ``prewake_due`` reads the real clock
@@ -134,7 +140,7 @@ def _run_pass(db, pings, *, active_id=999, refresh=None, fetch=None, active=True
         # store is UNREADABLE, which blocks every cc rotation.)
         patch("jacked.api.credential_helpers.read_live_credentials", return_value=OTHER_SESSION_LIVE),
     ):
-        return asyncio.run(um._run_window_keeper(db, 300))
+        return asyncio.run(um._run_window_keeper(db, interval))
 
 
 # ---------------------------------------------------------------------------
@@ -259,10 +265,15 @@ class TestPrewake:
         self._pass_at(db, day.replace(hour=5, minute=30), pings)
         assert pings.calls == ["cc-tok"]
 
-        # Next local date fires again. (Drop the no-window backoff the first
-        # ping armed: only the pre-wake marker is under test here.)
+        # Next local date fires again. (Drop the confirmation hold that the
+        # first ping set, a 200 with no window headers: only the pre-wake
+        # marker is under test here.)
+        assert _state(db, aid)["last_status"] == "ping_pending"
         um._ping_backoff.clear()
-        db.set_keeper_state(aid, next_attempt_at=None)
+        db.set_keeper_state(
+            aid, last_status=None, next_attempt_at=None, pending_windows=None,
+            pending_until=None, pending_reason=None,
+        )
         self._pass_at(db, day.replace(day=28, hour=4, minute=6), pings)
         assert pings.calls == ["cc-tok", "cc-tok"]
 
@@ -555,7 +566,10 @@ class TestRecoveryLadder:
         row = db.get_account(aid)
         assert row["cached_5h_resets_at"] == "2020-01-01T00:00:00Z"
         assert row["usage_cached_at"] == before
-        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+        # Nothing confirms the window (and the fresh row has no week either):
+        # the ping waits for a usage read to confirm both.
+        st = _state(db, aid)
+        assert (st["last_status"], st["pending_windows"]) == ("ping_pending", ["5h", "7d"])
 
     def test_far_future_headers_are_bounded(self, db):
         """A Retry-After or reset far in the future never parks an account."""
@@ -924,20 +938,26 @@ class TestWindowPersistedFromPing:
         _run_pass(db, pings)
         assert pings.calls == ["cc-tok"]
 
-    def test_ping_ok_without_any_window_is_recorded_and_backed_off(self, db, caplog):
+    def test_ping_ok_without_any_window_waits_for_confirmation(self, db, caplog):
         aid = _mk(db)
         pings = _Pings({"cc-tok": _ok(reset=None)})
-        with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
+        with caplog.at_level(logging.INFO, logger="jacked.api.usage_monitor"):
             _run_pass(db, pings)
         st = _state(db, aid)
-        assert st["last_status"] == "ping_ok_no_window"
-        assert st["next_attempt_at"] > time.time()
-        # The warning names every window that made the keeper ping and is
-        # still not open (a fresh row lacks both).
+        assert st["last_status"] == "ping_pending"
+        assert st["pending_reason"] == "no_header"
+        assert st["pending_until"] > time.time()
+        # The INFO names every window that made the keeper ping and is not
+        # visible yet (a fresh row lacks both). Nothing is a WARNING yet.
         assert any(
-            "cannot confirm the 5h and 7d windows open" in r.getMessage()
+            "5h and 7d windows not visible yet (no reset header and no usage "
+            "read-back)" in r.getMessage()
             for r in caplog.records
         )
+        assert not [
+            r for r in caplog.records
+            if r.name == "jacked.api.usage_monitor" and r.levelno >= logging.WARNING
+        ]
         _run_pass(db, pings)
         assert pings.calls == ["cc-tok"]
 
@@ -1237,45 +1257,55 @@ class TestNoSessionWindow:
     def test_a_read_back_that_never_lands_escalates_the_backoff(self, db, caplog):
         """The live log showed "backing off 600s (1 consecutive failures)" on
         every ping: the success path dropped the backoff before it armed it
-        again, so the delay never grew. It must double per sweep up to 1 h."""
+        again, so the delay never grew. It must double per failed cycle up to
+        1 h. A cycle fails only when the grace window ends unconfirmed."""
         aid = _mk_ultra(db, **_weekly_lapsed())
         pings = _Pings({"cc-tok": NO_HEADERS})
         delays = []
         with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
-            for sweep in range(5):
-                if sweep:
+            for cycle in range(5):
+                if cycle:
                     um._ping_backoff[aid]["skip_until"] = 0.0  # the retry is due
-                _run_pass(db, pings)
-                st = _state(db, aid)
-                assert st["last_status"] == "ping_ok_no_window"
-                delays.append(st["next_attempt_at"] - st["last_ping_at"])
+                delays.append(_ping_then_expire(db, aid, pings))
         assert pings.calls == ["cc-tok"] * 5
-        assert delays == pytest.approx([600, 1200, 2400, 3600, 3600], abs=1.01)
+        assert delays == pytest.approx([600, 1200, 2400, 3600, 3600], abs=2)
         assert um._ping_backoff[aid]["fails"] == 5
         assert any(
-            "cannot confirm the 7d window open" in r.getMessage() for r in caplog.records
+            f"the 7d window of account {aid} is still not visible" in r.getMessage()
+            for r in caplog.records
         )
 
     def test_a_no_window_backoff_survives_a_restart(self, db):
         aid = _mk_ultra(db, **_weekly_lapsed())
         pings = _Pings({"cc-tok": NO_HEADERS})
-        _run_pass(db, pings)
+        _ping_then_expire(db, aid, pings)
         assert _state(db, aid)["next_attempt_at"] > time.time()
         um._ping_backoff.clear()  # a restart: the in-memory backoff is gone
         _run_pass(db, pings)
         assert pings.calls == ["cc-tok"]
         assert _state(db, aid)["skip_reason"] == "backoff"
 
-    def test_success_needs_every_window_that_caused_the_ping(self, db):
+    def test_success_needs_every_window_that_caused_the_ping(self, db, caplog):
         """A 5h-capable row with both windows lapsed and a reply that opens
-        neither: the warning names both, and the escalation starts."""
+        neither: the pending state and the warning name both windows, and
+        the escalation starts after the grace window."""
         aid = _mk(db)
         db.update_account(aid, **_weekly_lapsed())
         db.update_account(aid, cached_5h_resets_at=_iso_in(-60))
-        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)
+        assert _state(db, aid)["pending_windows"] == ["5h", "7d"]
+        assert um._ping_backoff[aid]["fails"] == 0
+        _expire_pending(db, aid)
+        with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
+            _run_pass(db, pings)
         st = _state(db, aid)
         assert st["last_status"] == "ping_ok_no_window"
         assert um._ping_backoff[aid]["fails"] == 1
+        assert any(
+            f"the 5h and 7d windows of account {aid} are still not visible" in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_a_200_that_opens_the_5h_window_also_starts_an_unreported_week(self, db):
         """No 7d reset is recorded before or after the ping. The 200 started
@@ -1309,12 +1339,14 @@ class TestNoSessionWindow:
 
     def test_a_week_without_a_reset_and_no_read_back_is_not_ok(self, db):
         """A 200 with no headers and a read-back that never lands leaves a
-        days-old reading: nothing confirmed the weekly window, so the verdict
-        is ping_ok_no_window and the retry backs off (never a silent ok)."""
+        days-old reading: nothing confirmed the weekly window. The ping is
+        pending, and when the grace window ends with no read after the ping
+        the verdict is ping_ok_no_window and the retry backs off (never a
+        silent ok)."""
         aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 3 * 86400)
-        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))  # fetch mock writes nothing
+        pings = _Pings({"cc-tok": NO_HEADERS})  # fetch mock writes nothing
+        _ping_then_expire(db, aid, pings)
         st = _state(db, aid)
-        assert st["last_status"] == "ping_ok_no_window"
         assert st["next_attempt_at"] > time.time()
         assert um._ping_backoff[aid]["fails"] == 1
 
@@ -1329,29 +1361,27 @@ class TestNoSessionWindow:
             return {}
 
         _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_same_reset))
-        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+        st = _state(db, aid)
+        assert (st["last_status"], st["pending_reason"]) == ("ping_pending", "read_no_window")
 
     def test_the_escalation_count_survives_a_restart(self, db):
         """After the cap, a restart must resume the escalation (3600 s), not
         fall back to the first step (600 s)."""
         aid = _mk_ultra(db, **_weekly_lapsed())
         pings = _Pings({"cc-tok": NO_HEADERS})
-        for sweep in range(4):
-            if sweep:
+        for cycle in range(4):
+            if cycle:
                 um._ping_backoff[aid]["skip_until"] = 0.0
-            _run_pass(db, pings)
+            _ping_then_expire(db, aid, pings)
         assert _state(db, aid)["backoff_fails"] == 4
         um._ping_backoff.clear()  # a restart: the in-memory count is gone
         db.set_keeper_state(aid, next_attempt_at=time.time() - 1)  # the retry is due
-        _run_pass(db, pings)
-        st = _state(db, aid)
-        assert st["last_status"] == "ping_ok_no_window"
-        assert st["next_attempt_at"] - st["last_ping_at"] == pytest.approx(3600, abs=1.01)
-        assert st["backoff_fails"] == 5
+        assert _ping_then_expire(db, aid, pings) == pytest.approx(3600, abs=2)
+        assert _state(db, aid)["backoff_fails"] == 5
 
     def test_success_clears_the_persisted_count(self, db):
         aid = _mk_ultra(db, **_weekly_lapsed())
-        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))
+        _ping_then_expire(db, aid, _Pings({"cc-tok": NO_HEADERS}))
         assert _state(db, aid)["backoff_fails"] == 1
         um._ping_backoff[aid]["skip_until"] = 0.0
         reset_7d = int(time.time()) + 7 * 86400 - 60
@@ -1445,6 +1475,11 @@ class TestConfirmationEvidenceAndBackoffBounds:
             _run_pass(db, pings, fetch=AsyncMock(side_effect=_blank))
         assert pings.calls == ["cc-tok"]
         st = _state(db, aid)
+        assert (st["last_status"], st["skip_reason"]) == ("ping_pending", "confirming")
+        _expire_pending(db, aid)
+        _run_pass(db, pings, fetch=AsyncMock(side_effect=_blank))
+        assert pings.calls == ["cc-tok"]
+        st = _state(db, aid)
         assert st["last_status"] == "ping_ok_no_window"
         assert st["backoff_fails"] == 1
 
@@ -1459,26 +1494,26 @@ class TestConfirmationEvidenceAndBackoffBounds:
             return answer
 
         _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_stamp_only))
-        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+        st = _state(db, aid)
+        assert (st["last_status"], st["pending_reason"]) == ("ping_pending", "no_header")
 
     def test_a_transport_error_before_a_restart_keeps_the_escalation(self, db):
         """L1: a transport failure persists the count under the status
         "transport"; the restart must resume it, not fall back to 600 s."""
         aid = _mk_ultra(db, **_weekly_lapsed())
         pings = _Pings({"cc-tok": [NO_HEADERS] * 4 + [TRANSPORT, NO_HEADERS]})
-        for sweep in range(5):
-            if sweep:
+        for cycle in range(4):
+            if cycle:
                 um._ping_backoff[aid]["skip_until"] = 0.0  # the retry is due
-            _run_pass(db, pings)
+            _ping_then_expire(db, aid, pings)
+        um._ping_backoff[aid]["skip_until"] = 0.0
+        _run_pass(db, pings)  # the transport error
         st = _state(db, aid)
         assert (st["last_status"], st["backoff_fails"]) == ("transport", 4)
         um._ping_backoff.clear()  # a restart: the in-memory count is gone
         db.set_keeper_state(aid, next_attempt_at=time.time() - 1)
-        _run_pass(db, pings)
-        st = _state(db, aid)
-        assert st["last_status"] == "ping_ok_no_window"
-        assert st["next_attempt_at"] - st["last_ping_at"] == pytest.approx(3600, abs=1.01)
-        assert st["backoff_fails"] == 5
+        assert _ping_then_expire(db, aid, pings) == pytest.approx(3600, abs=2)
+        assert _state(db, aid)["backoff_fails"] == 5
 
     def test_the_backoff_exponent_is_bounded(self):
         """L2: with a float interval, 2 ** 1025 overflowed the conversion and
@@ -1490,11 +1525,949 @@ class TestConfirmationEvidenceAndBackoffBounds:
     def test_a_huge_persisted_count_is_clamped_on_restart(self, db):
         aid = _mk_ultra(db, **_weekly_lapsed())
         pings = _Pings({"cc-tok": NO_HEADERS})
-        _run_pass(db, pings)
+        _ping_then_expire(db, aid, pings)
         um._ping_backoff.clear()  # a restart
         db.set_keeper_state(aid, backoff_fails=10**6, next_attempt_at=time.time() - 1)
-        _run_pass(db, pings)
+        assert _ping_then_expire(db, aid, pings) == pytest.approx(3600, abs=2)
+        assert _state(db, aid)["backoff_fails"] == um._PING_BACKOFF_MAX_FAILS
+
+
+# ---------------------------------------------------------------------------
+# #238i: an accepted ping whose window the usage read does not show yet is
+# pending, and a later usage read confirms it. Provider lag is not a failure.
+# ---------------------------------------------------------------------------
+
+
+def _mk_5h_lapsed(db) -> int:
+    """A Max row whose 5-hour window lapsed an hour ago; its week is open."""
+    aid = _mk(db)
+    db.update_account(
+        aid,
+        cached_usage_5h=100.0,
+        cached_5h_resets_at=_iso_in(-3600),
+        cached_usage_7d=30.0,
+        cached_7d_resets_at=_iso_in(3 * 86400),
+        usage_cached_at=int(time.time()) - 7200,
+    )
+    return aid
+
+
+def _lagging_read(reset_iso: str):
+    """A read-back that lands but still reports the lapsed 5h window: the
+    provider's usage endpoint shows the new window later than the ping
+    (#238i, live 2026-11-02)."""
+
+    async def _read(account_id, db_, **_kw):
+        db_.update_account_usage_cache(account_id, five_hour=0.0, five_hour_resets_at=reset_iso)
+        return {}
+
+    return _read
+
+
+def _keeper_logs(caplog, level):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "jacked.api.usage_monitor" and r.levelno == level
+    ]
+
+
+def _expire_pending(db, aid):
+    """The grace window ends: the persisted confirmation deadline is past."""
+    db.set_keeper_state(aid, pending_until=time.time() - 1)
+
+
+def _ping_then_expire(db, aid, pings, **kw) -> float:
+    """One keeper cycle that never confirms: the ping (pending), then the
+    first sweep after the grace window (the confirmation read shows no
+    window). Returns the retry delay that the failure armed."""
+    _run_pass(db, pings, **kw)
+    assert _state(db, aid)["last_status"] == "ping_pending"
+    _expire_pending(db, aid)
+    started = time.time()
+    _run_pass(db, pings, **kw)
+    st = _state(db, aid)
+    assert st["last_status"] == "ping_ok_no_window"
+    return st["next_attempt_at"] - started
+
+
+class TestPendingConfirmation:
+    def test_a_landed_read_back_without_the_window_is_pending_not_failed(self, db, caplog):
+        """Live #238i: the read-back landed two seconds after the ping and
+        still showed the lapsed window. That is provider lag, not a failure:
+        no WARNING, no "ping failed" line, no escalation."""
+        aid = _mk_5h_lapsed(db)
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        fetch = AsyncMock(side_effect=_lagging_read(lapsed))
+        with caplog.at_level(logging.INFO, logger="jacked.api.usage_monitor"):
+            assert _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=fetch) == 1
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_pending"
+        assert st["pending_windows"] == ["5h"]
+        assert st["pending_reason"] == "read_no_window"
+        assert st["backoff_fails"] == 0
+        assert st["next_attempt_at"] is None
+        assert st["skip_reason"] is None
+        assert st["pending_until"] == pytest.approx(st["last_ping_at"] + 900, abs=1.01)
+        assert um._ping_backoff[aid]["fails"] == 0
+        assert um._ping_backoff[aid]["skip_until"] == st["pending_until"]
+        assert _keeper_logs(caplog, logging.WARNING) == []
+        infos = _keeper_logs(caplog, logging.INFO)
+        assert not any("ping failed" in m for m in infos)
+        assert any(
+            f"ping for account {aid} accepted; 5h window not visible yet "
+            "(read-back landed with no window); confirming by " in m
+            for m in infos
+        )
+
+
+    @pytest.mark.parametrize("interval, deadline", [(600, 1200), (900, 1800), (300, 900)])
+    def test_the_confirmation_deadline_follows_the_sweep_interval(self, db, interval, deadline):
+        """Two sweeps, and never less than 15 minutes: a 600 s interval waits
+        1200 s, a 900 s interval 1800 s, the 300 s default the 900 s floor."""
+        aid = _mk_5h_lapsed(db)
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        fetch = AsyncMock(side_effect=_lagging_read(lapsed))
+        assert _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=fetch, interval=interval) == 1
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_pending"
+        assert st["pending_until"] == pytest.approx(st["last_ping_at"] + deadline, abs=1.01)
+
+    def test_the_grace_window_holds_the_next_sweep(self, db):
+        aid = _mk_5h_lapsed(db)
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        fetch = AsyncMock(side_effect=_lagging_read(lapsed))
+        _run_pass(db, pings, fetch=fetch)
+        deadline = _state(db, aid)["pending_until"]
+        assert _run_pass(db, pings, fetch=fetch) == 0
+        assert pings.calls == ["cc-tok"]
+        assert fetch.await_count == 1  # the hold sends no usage read either
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_pending"
+        assert st["skip_reason"] == "confirming"
+        assert st["next_attempt_at"] == deadline
+        assert st["backoff_fails"] == 0
+
+    def test_a_later_usage_read_confirms_the_window(self, db, caplog):
+        """The regular poll stores the open window: the next sweep records
+        ok, clears the pending fields and drops the escalation count."""
+        aid = _mk_5h_lapsed(db)
+        um._ping_backoff[aid] = {"fails": 2, "skip_until": 0.0, "token_fp": _fp(db, aid)}
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        fetch = AsyncMock(side_effect=_lagging_read(lapsed))
+        _run_pass(db, pings, fetch=fetch)
+        assert _state(db, aid)["backoff_fails"] == 2  # the count is kept, not escalated
+        db.update_account_usage_cache(aid, five_hour=3.0, five_hour_resets_at=_iso_in(4 * 3600))
+        with caplog.at_level(logging.INFO, logger="jacked.api.usage_monitor"):
+            assert _run_pass(db, pings, fetch=fetch) == 0  # a confirmation is not a ping
+        assert pings.calls == ["cc-tok"]
+        st = _state(db, aid)
+        assert st["last_status"] == "ok"
+        assert st["backoff_fails"] == 0
+        assert (st["pending_windows"], st["pending_until"], st["pending_reason"]) == (None, None, None)
+        assert (st["next_attempt_at"], st["skip_reason"]) == (None, None)
+        assert aid not in um._ping_backoff
+        assert any(
+            f"the 5h window of account {aid} is confirmed open by the usage poll" in m
+            for m in _keeper_logs(caplog, logging.INFO)
+        )
+
+    @pytest.mark.parametrize(
+        "lagging, reason, other",
+        [
+            (True, "the usage read landed with no window", "did not land"),
+            (False, "the usage read did not land", "landed with no window"),
+        ],
+    )
+    def test_past_the_grace_window_an_unconfirmed_ping_fails_once(
+        self, db, caplog, lagging, reason, other
+    ):
+        aid = _mk_5h_lapsed(db)
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        fetch = (
+            AsyncMock(side_effect=_lagging_read(lapsed))
+            if lagging else AsyncMock(return_value={"_cached": True})
+        )
+        _run_pass(db, pings, fetch=fetch)
+        _expire_pending(db, aid)
+        with caplog.at_level(logging.INFO, logger="jacked.api.usage_monitor"):
+            _run_pass(db, pings, fetch=fetch)
+        assert pings.calls == ["cc-tok"]  # the deadline reads usage, it does not ping
+        assert fetch.await_count == 2
+        confirm_read = fetch.await_args_list[1]
+        assert confirm_read.args[0] == aid
+        assert confirm_read.kwargs["access_token"] == "cc-tok"
+        assert not confirm_read.kwargs.get("post_ping", False)
         st = _state(db, aid)
         assert st["last_status"] == "ping_ok_no_window"
-        assert st["next_attempt_at"] - st["last_ping_at"] == pytest.approx(3600, abs=1.01)
-        assert st["backoff_fails"] == um._PING_BACKOFF_MAX_FAILS
+        assert st["next_attempt_at"] > time.time()
+        assert (st["pending_windows"], st["pending_until"], st["pending_reason"]) == (None, None, None)
+        assert um._ping_backoff[aid]["fails"] == 1
+        assert st["backoff_fails"] == 1
+        warnings = _keeper_logs(caplog, logging.WARNING)
+        assert len(warnings) == 1, warnings
+        assert f"the 5h window of account {aid} is still not visible" in warnings[0]
+        assert reason in warnings[0]
+        assert other not in warnings[0]
+
+    def test_the_deadline_read_can_still_confirm(self, db):
+        aid = _mk_5h_lapsed(db)
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))  # the read-back does not land
+        _expire_pending(db, aid)
+
+        async def _open_now(account_id, db_, **_kw):
+            db_.update_account_usage_cache(account_id, five_hour=2.0, five_hour_resets_at=_iso_in(4 * 3600))
+            return {}
+
+        assert _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_open_now)) == 0
+        st = _state(db, aid)
+        assert st["last_status"] == "ok"
+        assert st["pending_windows"] is None
+        assert aid not in um._ping_backoff
+
+    def test_a_paced_deadline_read_still_names_the_read_that_landed(self, db, caplog):
+        """The read-back landed with no window; at the deadline the usage
+        pacing answers from cache. A read after the ping did land, so the
+        WARNING says so instead of "did not land"."""
+        aid = _mk_5h_lapsed(db)
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_lagging_read(lapsed)))
+        st = _state(db, aid)
+        # The ping went out a minute before its read-back was stored.
+        db.set_keeper_state(aid, last_ping_at=st["last_ping_at"] - 60, pending_until=time.time() - 1)
+        with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
+            _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(return_value={"_cached": True}))
+        warnings = _keeper_logs(caplog, logging.WARNING)
+        assert len(warnings) == 1
+        assert "the usage read landed with no window" in warnings[0]
+
+    def test_a_grace_window_slept_through_still_lets_the_lapsed_window_be_pinged(self, db):
+        """The last sweep before the lid closed pinged the account; the
+        machine slept past the grace window and past the window itself. The
+        pre-wake pass settles the old ping (the read shows no window), and the
+        backoff counts from the grace deadline, hours ago: the same pass pings
+        the lapsed window instead of skipping the pre-wake for this date."""
+        aid = _mk_5h_lapsed(db)
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)  # the read-back does not land: pending
+        st = _state(db, aid)
+        hours_ago = time.time() - 6 * 3600
+        db.set_keeper_state(aid, last_ping_at=int(hours_ago) - 900, pending_until=hours_ago)
+        um._ping_backoff[aid]["skip_until"] = hours_ago
+        assert st["last_status"] == "ping_pending"
+        _run_pass(db, pings, active=False, prewake=True)
+        assert pings.calls == ["cc-tok", "cc-tok"]
+        st = _state(db, aid)
+        assert st["last_status"] == "ping_pending"  # the new ping waits for its own read
+        assert st["backoff_fails"] == 1  # the old ping's failure is kept
+
+    def test_an_unreadable_deadline_never_holds_the_account(self, db):
+        """A pending state without a readable deadline goes to the
+        confirmation read at once instead of holding the account forever."""
+        aid = _mk_5h_lapsed(db)
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))
+        db.set_keeper_state(aid, pending_until="soon")
+        fetch = AsyncMock(return_value={"_cached": True})
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=fetch)
+        fetch.assert_awaited_once()
+        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+
+    def test_a_restart_mid_pending_keeps_the_hold_and_the_count(self, db):
+        aid = _mk_5h_lapsed(db)
+        um._ping_backoff[aid] = {"fails": 2, "skip_until": 0.0, "token_fp": _fp(db, aid)}
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        fetch = AsyncMock(side_effect=_lagging_read(lapsed))
+        _run_pass(db, pings, fetch=fetch)
+        um._ping_backoff.clear()  # a restart: the in-memory entry is gone
+        _run_pass(db, pings, fetch=fetch)
+        assert pings.calls == ["cc-tok"]
+        st = _state(db, aid)
+        assert (st["last_status"], st["skip_reason"], st["backoff_fails"]) == (
+            "ping_pending", "confirming", 2,
+        )
+        assert um._ping_backoff[aid]["fails"] == 2
+        # The escalation resumes from the persisted count after the wait.
+        _expire_pending(db, aid)
+        started = time.time()
+        _run_pass(db, pings, fetch=fetch)
+        st = _state(db, aid)
+        assert (st["last_status"], st["backoff_fails"]) == ("ping_ok_no_window", 3)
+        assert st["next_attempt_at"] - started == pytest.approx(2400, abs=2)
+
+    @pytest.mark.parametrize(
+        "reply, read, code, text",
+        [
+            (NO_HEADERS, None, "no_header", "no reset header and no usage read-back"),
+            (_ok(utilization=None), None, "read_not_landed", "usage read-back did not land"),
+            (NO_HEADERS, "lagging", "read_no_window", "read-back landed with no window"),
+            # A slow read-back is a read that did not land, not a WARNING.
+            (_ok(utilization=None), "timeout", "read_not_landed", "usage read-back did not land"),
+        ],
+    )
+    def test_the_info_names_the_reason_that_applied(self, db, caplog, reply, read, code, text):
+        aid = _mk_5h_lapsed(db)
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        fetch = {
+            "lagging": AsyncMock(side_effect=_lagging_read(lapsed)),
+            "timeout": AsyncMock(side_effect=asyncio.TimeoutError),
+        }.get(read, AsyncMock(return_value={"_cached": True}))
+        with caplog.at_level(logging.INFO, logger="jacked.api.usage_monitor"):
+            _run_pass(db, _Pings({"cc-tok": reply}), fetch=fetch)
+        assert _state(db, aid)["pending_reason"] == code
+        infos = [m for m in _keeper_logs(caplog, logging.INFO) if "not visible yet" in m]
+        assert len(infos) == 1
+        assert f"5h window not visible yet ({text}); confirming by " in infos[0]
+        assert _keeper_logs(caplog, logging.WARNING) == []
+
+    def test_a_reset_header_for_one_window_only_reports_the_missing_header(self, db):
+        """Both windows lapsed, the reply carries a 5h reset without its
+        utilization and no 7d header, and the read-back does not land: the
+        weakest evidence names the reason (the 7d window had no header)."""
+        aid = _mk(db)
+        db.update_account(aid, **_weekly_lapsed())
+        db.update_account(aid, cached_5h_resets_at=_iso_in(-60))
+        _run_pass(db, _Pings({"cc-tok": _ok(utilization=None)}))
+        st = _state(db, aid)
+        assert st["pending_windows"] == ["5h", "7d"]
+        assert st["pending_reason"] == "no_header"
+
+    def test_the_usage_poll_confirms_a_pending_ping(self, db):
+        aid = _mk_5h_lapsed(db)
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_lagging_read(lapsed)))
+        # A poll read that still shows the lapsed window confirms nothing.
+        assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is False
+        assert _state(db, aid)["last_status"] == "ping_pending"
+        db.update_account_usage_cache(aid, five_hour=4.0, five_hour_resets_at=_iso_in(4 * 3600))
+        assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is True
+        st = _state(db, aid)
+        assert st["last_status"] == "ok"
+        assert (st["pending_windows"], st["pending_until"], st["pending_reason"]) == (None, None, None)
+        assert st["backoff_fails"] == 0
+        assert aid not in um._ping_backoff
+
+    def test_the_usage_poll_leaves_a_state_that_is_not_pending_alone(self, db):
+        aid = _mk_5h_lapsed(db)
+        db.set_keeper_state(
+            aid, last_status="ping_ok_no_window", next_attempt_at=time.time() + 600, backoff_fails=3,
+        )
+        db.update_account_usage_cache(aid, five_hour=4.0, five_hour_resets_at=_iso_in(4 * 3600))
+        before = _state(db, aid)
+        assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is False
+        assert _state(db, aid) == before
+        assert asyncio.run(um._confirm_pending_from_poll(db, 99_999)) is False  # no such row
+
+    def test_a_weekly_only_ping_is_pending_on_the_7d_window(self, db):
+        """A plan without a 5-hour window: the pending state names the 7d
+        window only, and a later read that shows the week open confirms it."""
+        aid = _mk_ultra(db, **_weekly_lapsed())
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)  # the read-back does not land
+        st = _state(db, aid)
+        assert (st["last_status"], st["pending_windows"], st["pending_reason"]) == (
+            "ping_pending", ["7d"], "no_header",
+        )
+        _run_pass(db, pings)
+        assert pings.calls == ["cc-tok"]
+        db.update_account_usage_cache(aid, seven_day=1.0, seven_day_resets_at=_iso_in(7 * 86400 - 60))
+        _run_pass(db, pings)
+        assert pings.calls == ["cc-tok"]
+        assert _state(db, aid)["last_status"] == "ok"
+
+    def test_a_weekly_window_without_a_reset_needs_a_read_after_the_ping(self, db):
+        """The API omits the weekly reset for days at a time: a pending 7d
+        window with no reset is confirmed by a read stored after the ping
+        that accepted the weekly reading, never by the read the row held
+        before it, and never by the row stamp alone (X3)."""
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 3 * 86400)
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))
+        st = _state(db, aid)
+        assert st["pending_windows"] == ["7d"]
+        assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is False
+        db.update_account(aid, usage_cached_at=int(st["last_ping_at"]) + 30)  # a row write only
+        assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is False
+        db.update_account(aid, cached_7d_read_at=st["last_ping_at"] + 30)  # an accepted weekly read
+        assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is True
+        assert _state(db, aid)["last_status"] == "ok"
+
+    def test_a_sweep_that_confirms_a_reset_less_week_does_not_ping_again(self, db):
+        """The sweep confirms the week from a read stored after the ping and
+        then reads the state it wrote: the recent ok holds the account, so
+        the same pass does not ping the week again."""
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 3 * 86400)
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)
+        st = _state(db, aid)
+        # The poll read: it accepted the weekly reading after the ping.
+        db.update_account(
+            aid,
+            usage_cached_at=int(st["last_ping_at"]) + 30,
+            cached_7d_read_at=st["last_ping_at"] + 30,
+        )
+        assert _run_pass(db, pings) == 0
+        assert pings.calls == ["cc-tok"]
+        assert _state(db, aid)["last_status"] == "ok"
+
+    def test_the_refresh_loop_confirms_a_pending_ping(self, db, monkeypatch):
+        aid = _mk_5h_lapsed(db)
+        lapsed = db.get_account(aid)["cached_5h_resets_at"]
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_lagging_read(lapsed)))
+
+        async def _poll_read(account_id, db_, access_token=None):
+            db_.update_account_usage_cache(account_id, five_hour=5.0, five_hour_resets_at=_iso_in(4 * 3600))
+            return {"five_hour": {"utilization": 5.0}}
+
+        import types
+
+        import jacked.web.auth as auth_mod
+
+        monkeypatch.setattr(auth_mod, "fetch_usage", _poll_read)
+        tops = {"n": 0}
+
+        async def _sleep(seconds):
+            if seconds == um._ALL_ACCOUNTS_REFRESH_INTERVAL:
+                tops["n"] += 1
+                if tops["n"] >= 2:
+                    raise asyncio.CancelledError
+
+        monkeypatch.setattr(um.asyncio, "sleep", _sleep)
+        app = types.SimpleNamespace(state=types.SimpleNamespace(db=db, active_poll_account_id=None))
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(um.all_accounts_refresh_loop(app))
+        assert _state(db, aid)["last_status"] == "ok"
+
+    def test_restore_does_not_arm_a_retry_for_a_pending_state(self):
+        """A pending state is not a retry schedule: a restart restores the
+        escalation count, never a retry deadline (the pending branch reads
+        its own deadline)."""
+        state = {
+            "token_fp": "a", "last_status": "ping_pending", "next_attempt_at": 50.0,
+            "pending_until": 50.0, "backoff_fails": 3,
+        }
+        assert um._restore_ping_backoff(1, state, "a") is None
+        assert um._ping_backoff.pop(1)["fails"] == 3
+
+
+# ---------------------------------------------------------------------------
+# M6 review wave 1: a persisted number that is not finite never holds or
+# breaks an account (K1), every pending transition is a compare-and-swap on
+# the ping that opened it (K2), and the confirmation subsystem lives in its
+# own module (K3).
+# ---------------------------------------------------------------------------
+
+_INF_OR_HUGE = pytest.mark.parametrize(
+    "raw", [float("inf"), 10**400], ids=["infinity", "int-too-big-for-a-float"]
+)
+
+
+class TestPersistedNumbersThatAreNotFinite:
+    @pytest.mark.parametrize(
+        "raw",
+        [float("inf"), float("nan"), 10**400],
+        ids=["infinity", "nan", "int-too-big-for-a-float"],
+    )
+    def test_a_pending_deadline_that_is_not_finite_settles_at_once(self, db, raw):
+        """K1: Infinity held the account in "confirming" forever, NaN gave a
+        NaN retry deadline (the same pass pinged again), and an int too large
+        for a float raised on every sweep."""
+        aid = _mk_5h_lapsed(db)
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)  # the read-back does not land: pending
+        db.set_keeper_state(aid, pending_until=raw)
+        fetch = AsyncMock(return_value={"_cached": True})
+        _run_pass(db, pings, fetch=fetch)
+        fetch.assert_awaited_once()  # the sweep reached the deadline read
+        st = _state(db, aid)
+        assert (st["last_status"], st["pending_until"], st["backoff_fails"]) == (
+            "ping_ok_no_window", None, 1,
+        )
+        assert math.isfinite(st["next_attempt_at"])
+        assert st["next_attempt_at"] > time.time()
+        assert pings.calls == ["cc-tok"]  # the retry deadline holds the account
+
+    @_INF_OR_HUGE
+    def test_a_restored_retry_deadline_that_is_not_finite_never_holds_the_account(self, db, raw):
+        """A restart restores the persisted retry deadline. Infinity held the
+        account until its token changed; an int too large for a float raised
+        on every sweep."""
+        aid = _mk_5h_lapsed(db)
+        db.set_keeper_state(
+            aid, last_status="error", next_attempt_at=raw, backoff_fails=2, token_fp=_fp(db, aid),
+        )
+        pings = _Pings({"cc-tok": _ok()})
+        assert _run_pass(db, pings) == 1
+        assert _state(db, aid)["last_status"] == "ok"
+
+    @_INF_OR_HUGE
+    def test_a_ping_time_that_is_not_finite_never_suppresses_the_weekly_ping(self, db, raw):
+        aid = _mk(db)
+        db.update_account(aid, cached_5h_resets_at=_iso_in(3600))
+        acct = db.get_account(aid)  # no 7d reset recorded
+        state = {"last_status": "ok", "last_ping_at": raw}
+        assert um._keeper_window_needed(acct, state) == (False, True)
+
+    @pytest.mark.parametrize(
+        "raw", [float("inf"), float("nan"), "x"], ids=["infinity", "nan", "text"]
+    )
+    def test_an_auth_failure_count_that_is_not_a_number_still_records_the_verdict(self, db, raw):
+        """int() raised on the persisted count, so no verdict was ever
+        written and the keeper pinged the rejected tokens every sweep."""
+        aid = _mk(db)
+        db.set_keeper_state(aid, consecutive_auth_failures=raw)
+        pings = _Pings({"cc-tok": _err(401, "authentication_error"), "pri-tok": _err(401)})
+        _run_pass(db, pings)
+        st = _state(db, aid)
+        assert (st["last_status"], st["consecutive_auth_failures"]) == ("needs_reauth", 1)
+
+
+class TestKeeperStateCompareAndSwap:
+    GEN = {"last_status": "ping_pending", "last_ping_at": 100}
+
+    def test_the_write_applies_while_every_expected_key_holds(self, db):
+        aid = _mk(db)
+        db.set_keeper_state(aid, last_status="ping_pending", last_ping_at=100, pending_until=900)
+        assert db.set_keeper_state_if(aid, self.GEN, last_status="ok", pending_until=None) is True
+        st = _state(db, aid)
+        assert (st["last_status"], st["pending_until"], st["last_ping_at"]) == ("ok", None, 100)
+
+    def test_a_changed_key_writes_nothing(self, db):
+        aid = _mk(db)
+        db.set_keeper_state(aid, last_status="ping_pending", last_ping_at=160)  # a newer ping
+        before = db.get_account(aid)["keeper_state"]
+        assert db.set_keeper_state_if(aid, self.GEN, last_status="ok") is False
+        assert db.get_account(aid)["keeper_state"] == before  # updated_at included
+
+    def test_a_missing_key_holds_none_and_a_missing_account_is_false(self, db):
+        aid = _mk(db)
+        assert db.set_keeper_state_if(aid, {"pending_until": None}, skip_reason="x") is True
+        assert _state(db, aid)["skip_reason"] == "x"
+        assert db.set_keeper_state_if(99_999, {}, skip_reason="x") is False
+
+    def test_a_stored_nan_matches_the_nan_read_from_it(self, db):
+        """NaN never equals itself: a plain == would refuse every transition
+        of a state whose ping time is NaN, and hold the account forever."""
+        aid = _mk(db)
+        db.set_keeper_state(aid, last_status="ping_pending", last_ping_at=float("nan"))
+        read = _state(db, aid)
+        gen = {"last_status": "ping_pending", "last_ping_at": read["last_ping_at"]}
+        assert db.set_keeper_state_if(aid, gen, last_status="ok") is True
+
+    def test_unknown_keys_fail_loudly(self, db):
+        aid = _mk(db)
+        with pytest.raises(ValueError):
+            db.set_keeper_state_if(aid, {"nonsense": 1}, last_status="ok")
+        with pytest.raises(ValueError):
+            db.set_keeper_state_if(aid, {}, nonsense=1)
+
+    def test_two_databases_on_one_file_never_both_win_one_generation(self, tmp_path, monkeypatch):
+        """X2: the instance write lock does not reach a second Database object
+        (or a second process) on the same file. The poll's swap reads the
+        pending ping first; the sweep's swap on the same generation runs
+        while the poll is between its read and its write. The swap that read
+        first holds the database write lock from its read to its commit, so
+        the sweep waits, then reads the confirmation and writes nothing."""
+        path = str(tmp_path / "shared.db")
+        poll_db, sweep_db = Database(path), Database(path)
+        aid = _mk(poll_db)
+        poll_db.set_keeper_state(aid, last_status="ping_pending", last_ping_at=100, pending_until=900)
+        gens = [
+            {
+                "last_status": "ping_pending",
+                "last_ping_at": _state(each, aid)["last_ping_at"],
+            }
+            for each in (poll_db, sweep_db)
+        ]
+        assert gens == [self.GEN, self.GEN]  # both writers read the same generation
+        poll_read, sweep_done = threading.Event(), threading.Event()
+        real_parse = Database.parse_keeper_state
+
+        def _parse_then_wait(raw):
+            state = real_parse(raw)
+            if threading.current_thread().name == "poll" and not poll_read.is_set():
+                poll_read.set()
+                # Without the write lock the sweep commits here. With it the
+                # sweep cannot commit before this swap does: the wait ends.
+                sweep_done.wait(timeout=0.5)
+            return state
+
+        monkeypatch.setattr(Database, "parse_keeper_state", staticmethod(_parse_then_wait))
+        results: dict = {}
+
+        def _poll():
+            results["poll"] = poll_db.set_keeper_state_if(
+                aid, gens[0], last_status="ok", pending_until=None
+            )
+
+        def _sweep():
+            assert poll_read.wait(timeout=10)
+            results["sweep"] = sweep_db.set_keeper_state_if(
+                aid, gens[1], last_status="ping_ok_no_window", pending_until=None
+            )
+            sweep_done.set()
+
+        threads = [threading.Thread(target=_poll, name="poll"), threading.Thread(target=_sweep, name="sweep")]
+        for each in threads:
+            each.start()
+        for each in threads:
+            each.join(timeout=60)
+        monkeypatch.undo()
+        assert results == {"poll": True, "sweep": False}
+        st = _state(Database(path), aid)
+        assert (st["last_status"], st["pending_until"]) == ("ok", None)
+
+    def test_the_write_applies_only_to_the_state_text_that_it_read(self, db, monkeypatch):
+        """The UPDATE is conditional on the keeper_state text that the SELECT
+        read, beside the write lock: a state that changed under the read is
+        never overwritten, and the swap reports the loss (rowcount 0)."""
+        aid = _mk(db)
+        db.set_keeper_state(aid, last_status="ping_pending", last_ping_at=100)
+        newer = json.dumps({"last_status": "ok", "last_ping_at": 100}, sort_keys=True)
+        real_parse = Database.parse_keeper_state
+
+        def _parse_then_change(raw):
+            if raw != newer:
+                # The same connection, so the write lock does not stop it.
+                db._get_connection().execute(
+                    "UPDATE accounts SET keeper_state = ? WHERE id = ?", (newer, aid)
+                )
+            return real_parse(raw)
+
+        monkeypatch.setattr(Database, "parse_keeper_state", staticmethod(_parse_then_change))
+        assert db.set_keeper_state_if(aid, self.GEN, last_status="ping_ok_no_window") is False
+        monkeypatch.undo()
+        assert db.get_account(aid)["keeper_state"] == newer
+
+
+def _poll_confirms(db, aid) -> bool:
+    """A usage poll stores the open 5h window and confirms the pending ping.
+
+    It runs on its own thread and event loop, so a test can land it while
+    the sweep waits on a write.
+    """
+    db.update_account_usage_cache(aid, five_hour=3.0, five_hour_resets_at=_iso_in(4 * 3600))
+    out: list[bool] = []
+    poll = threading.Thread(
+        target=lambda: out.append(asyncio.run(um._confirm_pending_from_poll(db, aid)))
+    )
+    poll.start()
+    poll.join()
+    return out[0]
+
+
+class TestPendingTransitionsAreSwaps:
+    """K2: the sweep and a usage poll can settle the same pending ping at the
+    same time. A pending transition applies only while the account still
+    holds the ping that the writer read (ping_pending and its last_ping_at)."""
+
+    def test_a_poll_confirmation_before_the_deadline_failure_write_wins(self, db, caplog):
+        aid = _mk_5h_lapsed(db)
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)  # pending: the read-back did not land
+        _expire_pending(db, aid)
+        real = um._write_keeper_state
+        polls: list[bool] = []
+
+        def _write(db_, account_id, **kw):
+            # The sweep read the row at the deadline and found no window. The
+            # poll stores the open window before the sweep's failure write.
+            if kw.get("last_status") == "ping_ok_no_window" and not polls:
+                polls.append(_poll_confirms(db_, account_id))
+            return real(db_, account_id, **kw)
+
+        with (
+            patch.object(um, "_write_keeper_state", _write),
+            caplog.at_level(logging.DEBUG, logger="jacked.api.usage_monitor"),
+        ):
+            assert _run_pass(db, pings) == 0
+        assert polls == [True]
+        st = _state(db, aid)
+        assert (st["last_status"], st["next_attempt_at"], st["backoff_fails"]) == ("ok", None, 0)
+        assert (st["pending_windows"], st["pending_until"], st["skip_reason"]) == (None, None, None)
+        assert aid not in um._ping_backoff
+        assert pings.calls == ["cc-tok"]
+        assert _keeper_logs(caplog, logging.WARNING) == []
+        lost = [m for m in _keeper_logs(caplog, logging.DEBUG) if "nothing written" in m]
+        assert len(lost) == 1, lost
+
+    def test_a_stale_confirming_note_after_a_confirmation_changes_nothing(self, db):
+        aid = _mk_5h_lapsed(db)
+        um._ping_backoff[aid] = {"fails": 2, "skip_until": 0.0, "token_fp": _fp(db, aid)}
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)  # pending until the deadline, count 2
+        stale = db.get_account(aid)  # the next pass read the account here
+        assert _poll_confirms(db, aid) is True
+        confirmed = db.get_account(aid)["keeper_state"]
+        with patch.object(db, "list_accounts", return_value=[stale]):
+            assert _run_pass(db, pings) == 0
+        assert db.get_account(aid)["keeper_state"] == confirmed
+        # The count that the old read restored does not outlive the lost swap.
+        assert aid not in um._ping_backoff
+        assert pings.calls == ["cc-tok"]
+
+    def test_a_stale_read_that_already_holds_the_confirming_note_still_runs_the_swap(self, db):
+        """X1: the pass read the account after an earlier hold wrote its
+        "confirming" note, and a poll then confirmed the ping and cleared the
+        backoff. The note in the old read equals the note the hold would
+        write, but the hold must still run its swap: the lost swap is the only
+        signal that drops the count that the old read restored. Otherwise the
+        next failed ping escalates from that obsolete count."""
+        aid = _mk_5h_lapsed(db)
+        um._ping_backoff[aid] = {"fails": 2, "skip_until": 0.0, "token_fp": _fp(db, aid)}
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)  # pending until the deadline, count 2
+        _run_pass(db, pings)  # the hold writes the confirming note
+        stale = db.get_account(aid)  # the next pass read the account here
+        st = Database.parse_keeper_state(stale["keeper_state"])
+        assert (st["skip_reason"], st["next_attempt_at"]) == ("confirming", st["pending_until"])
+        assert _poll_confirms(db, aid) is True
+        assert aid not in um._ping_backoff  # the poll cleared the backoff
+        confirmed = db.get_account(aid)["keeper_state"]
+        with patch.object(db, "list_accounts", return_value=[stale]):
+            assert _run_pass(db, pings) == 0
+        assert db.get_account(aid)["keeper_state"] == confirmed
+        assert aid not in um._ping_backoff
+        # The next failed ping escalates from the first step, not from 2.
+        db.update_account(aid, cached_5h_resets_at=_iso_in(-60))
+        failing = _Pings({"cc-tok": _err(400, "invalid_request_error")})
+        started = time.time()
+        _run_pass(db, failing)
+        assert failing.calls == ["cc-tok"]
+        st = _state(db, aid)
+        assert (st["last_status"], st["backoff_fails"]) == ("error", 1)
+        assert um._ping_backoff[aid]["fails"] == 1
+        assert st["next_attempt_at"] - started == pytest.approx(600, abs=2)
+
+    def test_an_unconditional_note_that_changes_nothing_writes_nothing(self, db):
+        """The "only on change" rule stays for the writers without a swap:
+        the same reason again does not rewrite the state (updated_at
+        included)."""
+        aid = _mk(db)
+        acct = db.get_account(aid)
+        state = {}
+        assert um._note_keeper_skip(db, acct, state, "keeper_disabled") is True
+        before = db.get_account(aid)["keeper_state"]
+        with patch.object(db, "set_keeper_state", side_effect=AssertionError("no write")):
+            assert um._note_keeper_skip(db, acct, state, "keeper_disabled") is True
+        assert db.get_account(aid)["keeper_state"] == before
+
+    def test_a_deadline_confirmation_after_a_poll_confirmation_changes_nothing(self, db):
+        """The deadline twin of the stale note: the pass read the account
+        before a poll confirmed it, and the deadline read shows the open
+        window. The sweep's own finish loses its swap."""
+        aid = _mk_5h_lapsed(db)
+        um._ping_backoff[aid] = {"fails": 2, "skip_until": 0.0, "token_fp": _fp(db, aid)}
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)  # pending, count 2
+        _expire_pending(db, aid)
+        stale = db.get_account(aid)  # the next pass read the account here
+        assert _poll_confirms(db, aid) is True
+        confirmed = db.get_account(aid)["keeper_state"]
+        with patch.object(db, "list_accounts", return_value=[stale]):
+            assert _run_pass(db, pings, fetch=AsyncMock(return_value={})) == 0
+        assert db.get_account(aid)["keeper_state"] == confirmed
+        assert aid not in um._ping_backoff
+        assert pings.calls == ["cc-tok"]
+
+    def test_a_late_poll_finish_after_a_newer_ping_changes_nothing(self, db):
+        aid = _mk_5h_lapsed(db)
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)  # ping A: pending (the read-back did not land)
+        hours_ago = time.time() - 6 * 3600
+        db.set_keeper_state(aid, last_ping_at=int(hours_ago) - 900, pending_until=hours_ago)
+        um._ping_backoff[aid]["skip_until"] = hours_ago
+        # A poll read the row while ping A was pending and its window showed open.
+        poll_row = {**db.get_account(aid), "cached_5h_resets_at": _iso_in(4 * 3600)}
+        _run_pass(db, pings)  # the sweep settles ping A, then sends ping B
+        assert pings.calls == ["cc-tok", "cc-tok"]
+        newer = db.get_account(aid)["keeper_state"]
+        assert Database.parse_keeper_state(newer)["last_status"] == "ping_pending"
+        hold = dict(um._ping_backoff[aid])
+        with patch.object(db, "get_account", return_value=poll_row):
+            assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is False
+        assert db.get_account(aid)["keeper_state"] == newer
+        assert um._ping_backoff[aid] == hold
+
+    @pytest.mark.parametrize("path", ["confirming", "deadline", "sweep_finish", "poll_finish"])
+    def test_every_pending_transition_is_a_swap_on_the_ping_that_opened_it(self, db, path):
+        """Regression pins: each normal transition still lands, and it goes
+        through the conditional writer with the generation it read."""
+        aid = _mk_5h_lapsed(db)
+        pings = _Pings({"cc-tok": NO_HEADERS})
+        _run_pass(db, pings)  # pending
+        gen = {"last_status": "ping_pending", "last_ping_at": _state(db, aid)["last_ping_at"]}
+        if path == "deadline":
+            _expire_pending(db, aid)
+        if path in ("sweep_finish", "poll_finish"):
+            db.update_account_usage_cache(aid, five_hour=3.0, five_hour_resets_at=_iso_in(4 * 3600))
+        swaps = []
+        real = db.set_keeper_state_if
+
+        def _spy(account_id, expected, **fields):
+            wrote = real(account_id, expected, **fields)
+            swaps.append((dict(expected), fields, wrote))
+            return wrote
+
+        with patch.object(db, "set_keeper_state_if", side_effect=_spy):
+            if path == "poll_finish":
+                assert asyncio.run(um._confirm_pending_from_poll(db, aid)) is True
+            else:
+                _run_pass(db, pings)
+        assert [(e, w) for e, _f, w in swaps] == [(gen, True)]
+        st = _state(db, aid)
+        expected_status = {
+            "confirming": ("ping_pending", "confirming"),
+            "deadline": ("ping_ok_no_window", "backoff"),
+            "sweep_finish": ("ok", None),
+            "poll_finish": ("ok", None),
+        }[path]
+        assert (st["last_status"], st["skip_reason"]) == expected_status
+
+
+# ---------------------------------------------------------------------------
+# M6 review wave 2 (X3): the evidence for a weekly window without a reset is
+# a usage read that ACCEPTED the weekly reading, stored after the ping. Each
+# window has its own read stamp (cached_5h_read_at, cached_7d_read_at): a
+# rejected reading moves the row stamp (usage_cached_at), never the window's.
+# ---------------------------------------------------------------------------
+
+
+def _real_poll(db, aid, payload) -> bool:
+    """A real usage poll: fetch_usage gets a 200 that carries *payload* (only
+    the HTTP client is mocked) and stores it with the real cache writer, then
+    the poll's confirmation runs. Returns what the confirmation did."""
+    db.update_account(aid, usage_cached_at=int(time.time()) - 3600)  # past the pacing ceiling
+    auth_mod._account_usage_state.pop(aid, None)
+    reply = MagicMock(status_code=200, headers={})
+    reply.json.return_value = payload
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.get = AsyncMock(return_value=reply)
+    with (
+        patch.object(auth_mod.httpx, "AsyncClient", return_value=client),
+        patch.object(auth_mod, "fetch_profile", new=AsyncMock()),
+    ):
+        assert asyncio.run(auth_mod.fetch_usage(aid, db)) is payload
+    client.get.assert_awaited_once()
+    return asyncio.run(um._confirm_pending_from_poll(db, aid))
+
+
+def _pending_reset_less_week(db, *, both: bool) -> tuple[int, dict]:
+    """A ping the provider accepted for a weekly window without a reset (and
+    for a lapsed 5h window too when *both*), whose read-back did not land:
+    pending. The ping time moves one minute back, so that a read in the test
+    is from a later whole second; the last read that accepted the weekly
+    reading is one hour before the ping."""
+    if both:
+        aid = _mk(db)
+        db.update_account(
+            aid,
+            cached_5h_resets_at=_iso_in(-60),
+            cached_7d_resets_at=None,
+            usage_cached_at=int(time.time()) - 3 * 86400,
+        )
+    else:
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 3 * 86400)
+    _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))  # the read-back does not land
+    ping = _state(db, aid)["last_ping_at"] - 60
+    db.set_keeper_state(aid, last_ping_at=ping)
+    db.update_account(aid, cached_7d_read_at=ping - 3600)
+    return aid, _state(db, aid)
+
+
+NAN_WEEK = {"utilization": float("nan"), "resets_at": None}
+
+
+class TestWindowReadEvidence:
+    @pytest.mark.parametrize("both", [False, True], ids=["weekly-only", "5h-and-7d"])
+    def test_a_rejected_weekly_reading_never_confirms_a_reset_less_week(self, db, both):
+        """X3 (a), the reviewer's trigger: a later 200 whose weekly
+        utilization is NaN (beside a valid 5h reading) moved usage_cached_at
+        past the ping, and that stamp confirmed a weekly window that the
+        provider never showed open."""
+        aid, st = _pending_reset_less_week(db, both=both)
+        windows = ["5h", "7d"] if both else ["7d"]
+        assert st["pending_windows"] == windows
+        payload = {"seven_day": dict(NAN_WEEK)}
+        if both:
+            payload["five_hour"] = {"utilization": 12.0, "resets_at": _iso_in(4 * 3600)}
+        assert _real_poll(db, aid, payload) is False
+        row = db.get_account(aid)
+        assert row["usage_cached_at"] > st["last_ping_at"]  # the row stamp moved
+        assert row["cached_7d_read_at"] == st["last_ping_at"] - 3600  # the weekly one did not
+        after = _state(db, aid)
+        assert (after["last_status"], after["pending_windows"]) == ("ping_pending", windows)
+        assert kc._pending_confirmed(row, after, ["7d"]) is False
+        if both:
+            # The 5h reading was accepted: that window shows open.
+            assert row["cached_5h_read_at"] > st["last_ping_at"]
+            assert kc._pending_confirmed(row, after, ["5h"]) is True
+
+    def test_an_accepted_weekly_reading_after_the_ping_confirms_a_reset_less_week(self, db):
+        """X3 (b): a 200 whose weekly reading has a percent and no reset (the
+        API omits the weekly reset for days at a time) is accepted, and it
+        confirms the week."""
+        aid, st = _pending_reset_less_week(db, both=False)
+        payload = {**_ultra_payload(), "seven_day": {"utilization": 41.0, "resets_at": None}}
+        assert _real_poll(db, aid, payload) is True
+        row = db.get_account(aid)
+        assert row["cached_7d_read_at"] > st["last_ping_at"]
+        assert (row["cached_usage_7d"], row["cached_7d_resets_at"]) == (41.0, None)
+        assert _state(db, aid)["last_status"] == "ok"
+
+    def test_a_read_back_that_rejected_the_weekly_reading_is_no_evidence(self, db):
+        """X3 at the keeper's own read-back: the read landed, but it rejected
+        the weekly reading, and the ping carried no window headers. The week
+        is pending, not ok."""
+        aid = _mk_ultra(db, cached_7d_resets_at=None, usage_cached_at=int(time.time()) - 7200)
+        payload = {**_ultra_payload(), "seven_day": dict(NAN_WEEK)}
+
+        async def _read_back(account_id, db_, **_kw):
+            db_.update_account_usage_cache(
+                account_id, raw=payload, **auth_mod.usage_cache_updates(payload)
+            )
+            return payload
+
+        _run_pass(db, _Pings({"cc-tok": NO_HEADERS}), fetch=AsyncMock(side_effect=_read_back))
+        st = _state(db, aid)
+        assert (st["last_status"], st["pending_windows"], st["pending_reason"]) == (
+            "ping_pending", ["7d"], "read_no_window",
+        )
+
+    def test_the_deadline_warning_names_only_the_window_still_not_visible(self, db, caplog):
+        """Per-window evidence can confirm one window of two: the 5h reading
+        shows open, the weekly reading was rejected. The WARNING at the
+        deadline names the weekly window only."""
+        aid, _st = _pending_reset_less_week(db, both=True)
+        payload = {
+            "five_hour": {"utilization": 12.0, "resets_at": _iso_in(4 * 3600)},
+            "seven_day": dict(NAN_WEEK),
+        }
+        assert _real_poll(db, aid, payload) is False
+        _expire_pending(db, aid)
+        with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
+            _run_pass(db, _Pings({"cc-tok": NO_HEADERS}))
+        assert _state(db, aid)["last_status"] == "ping_ok_no_window"
+        warnings = _keeper_logs(caplog, logging.WARNING)
+        assert len(warnings) == 1, warnings
+        assert f"the 7d window of account {aid} is still not visible" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "first", ["jacked.api.keeper_confirmation", "jacked.api.usage_monitor"]
+)
+def test_the_confirmation_module_imports_in_either_order(first):
+    """K3: usage_monitor imports keeper_confirmation at load time, so
+    keeper_confirmation must import usage_monitor only inside its functions."""
+    code = (
+        f"import importlib; importlib.import_module({first!r}); "
+        "import jacked.api.keeper_confirmation as kc, jacked.api.usage_monitor as um; "
+        "assert um._confirm_pending_from_poll is kc._confirm_pending_from_poll; "
+        "assert um._confirm_pending is kc._confirm_pending"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr

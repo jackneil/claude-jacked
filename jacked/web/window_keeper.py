@@ -264,6 +264,12 @@ def cache_reset_value(value) -> str | None:
     ('2026-11-02T19:59:59+00:00', '2026-03-31T05:00:00+00:00')
     >>> [cache_reset_value(v) for v in ("", "  ", "soon", True, {}, None)]
     [None, None, None, None, None, None]
+
+    A value that is not a finite number is no reset. The overflow path of
+    :func:`parse_reset_value` gives None for it, so no surface gets NaN:
+
+    >>> [cache_reset_value(v) for v in (float("inf"), float("nan"), 1e999, "1e999", "-inf")]
+    [None, None, None, None, None]
     """
     if value is None or isinstance(value, bool) or not isinstance(value, (str, int, float)):
         return None
