@@ -85,7 +85,7 @@ def test_skill_dir_hash_matches_manifest_entry(tmp_path):
 def test_is_jacked_skill_dir_true_only_on_hash_match(tmp_path):
     d = _skill(_skills_base(tmp_path), "dcr", "jacked body")
     h = m.skill_dir_hash(d)
-    assert m.is_jacked_skill_dir(d, "dcr", _manifest({"dcr": h})) is True
+    assert m.is_jacked_skill_dir(d, "dcr", _manifest({"dcr": h}), d) is True  # every path in the source
     assert m.is_jacked_skill_dir(d, "dcr", _manifest({"dcr": "sha256:OTHER"})) is False
     assert m.is_jacked_skill_dir(d, "dcr", _manifest({})) is False   # no entry
     assert m.is_jacked_skill_dir(d, "dcr", None) is False            # no manifest
@@ -96,7 +96,7 @@ def test_format_2_missing_dir_entry_is_not_owned(tmp_path):
     - unlike format 1, where the absence just means the feature didn't exist."""
     d = _skill(_skills_base(tmp_path), "dcr", "jacked body")
     md = {"dcr": m.skill_dir_hash(d)}
-    assert m.is_jacked_skill_dir(d, "dcr", _manifest(md)) is True          # format 1
+    assert m.is_jacked_skill_dir(d, "dcr", _manifest(md), d) is True       # format 1, paths in the source
     assert m.is_jacked_skill_dir(d, "dcr", _manifest(md, {})) is False     # format 2
     assert m.is_jacked_skill_dir(d, "dcr", _manifest(md, {"other": "sha256:x"})) is False
 
@@ -256,8 +256,8 @@ def test_sidecar_edit_under_old_manifest_behaves_as_before(tmp_path):
     d = _with_sidecar(_skills_base(tmp_path), "qa", "body", "// jacked")
     old = _manifest({"qa": m.skill_dir_hash(d)})          # format 1
     (d / "measure.js").write_text("// I tuned this", encoding="utf-8")
-    assert m.is_jacked_skill_dir(d, "qa", old) is True
     src = _with_sidecar(tmp_path / "src", "qa", "body", "// jacked v2")
+    assert m.is_jacked_skill_dir(d, "qa", old, src) is True  # the edited file is a path jacked ships
     assert m.preserve_user_skill_dir(d, "qa", src, old) is None
 
 
@@ -323,9 +323,23 @@ def _removed_diff(name: str) -> m.ManifestDiff:
 
 def test_prune_removed_deletes_hash_matching_skill(tmp_path):
     d = _skill(_skills_base(tmp_path), "gone", "jacked body")
-    prior = _manifest({"gone": m.skill_dir_hash(d)})
+    prior = _owning_manifest(d, "gone")  # format 2: the whole dir is proven jacked's
     assert m.prune_removed(_removed_diff("gone"), tmp_path, prior) == (["skills/gone"], [])
     assert not d.exists()
+
+
+def test_prune_removed_moves_a_format_1_skill_aside(tmp_path):
+    """Format 1 proves only SKILL.md, and the skill is no longer shipped, so no
+    source can prove the other files: the dir leaves the live skills tree into
+    jacked-backups (no stale skill loads, no user file is lost)."""
+    base = _skills_base(tmp_path)
+    d = _skill(base, "gone", "jacked body")
+    (d / "notes.md").write_text("mine", encoding="utf-8")
+    prior = _manifest({"gone": m.skill_dir_hash(d)})  # format 1
+    assert m.prune_removed(_removed_diff("gone"), tmp_path, prior) == ([], ["skills/gone"])
+    assert not d.exists()
+    (backup,) = _backups_of(base, "gone")
+    assert (backup / "notes.md").read_text(encoding="utf-8") == "mine"
 
 
 def test_prune_removed_keeps_modified_skill(tmp_path):
@@ -1749,3 +1763,29 @@ def test_json_record_keeps_a_skipped_upgrade_out_of_changes(tmp_path, monkeypatc
     after = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert after["artifacts"]["skills"]["dcr"] == prior_md_hash
     assert after["artifacts"][m.SKILLS_DIRS_KEY]["dcr"] == prior_dir_hash
+
+
+def test_format_1_owns_a_dir_only_when_every_path_is_in_the_source(tmp_path):
+    """Install replaces the whole dir, so under a format-1 manifest (SKILL.md
+    hash only) a file the user ADDED makes the dir the user's: it is backed up,
+    never deleted. Paths the source carries may differ in content (an older
+    jacked copy), and the dir stays jacked's."""
+    d = _with_sidecar(_skills_base(tmp_path), "qa", "body", "// jacked v1")
+    old = _manifest({"qa": m.skill_dir_hash(d)})  # format 1
+    src = _with_sidecar(tmp_path / "src", "qa", "body", "// jacked v2")
+    assert m.is_jacked_skill_dir(d, "qa", old, src) is True
+    (d / "references").mkdir()
+    (d / "references" / "my-notes.md").write_text("mine", encoding="utf-8")
+    assert m.is_jacked_skill_dir(d, "qa", old, src) is False
+    backup = m.preserve_user_skill_dir(d, "qa", src, old)
+    assert backup is not None and not d.exists()
+    assert (backup / "references" / "my-notes.md").read_text(encoding="utf-8") == "mine"
+
+
+def test_format_1_without_a_source_keeps_the_dir(tmp_path):
+    """The prune path has no source for a skill jacked no longer ships, so the
+    SKILL.md match alone cannot rule out user files: the dir is kept."""
+    d = _skill(_skills_base(tmp_path), "gone", "jacked body")
+    old = _manifest({"gone": m.skill_dir_hash(d)})  # format 1
+    assert m.is_jacked_skill_dir(d, "gone", old) is False
+    assert m.skill_removal_decision(d, "gone", old, None)[0] is False
