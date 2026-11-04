@@ -22,10 +22,11 @@ Staleness model (the subtle part, both directions matter):
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
-from jacked.service.menubar_summary import _eligible
+from jacked.service.menubar_summary import _eligible, binding_model, parse_per_model
 
 
 def parse_reset_ts(ts: object) -> Optional[datetime]:
@@ -218,51 +219,113 @@ def worst_window(
     return max(ordered, key=lambda w: w[1])
 
 
+def model_window(
+    acct: dict, now: datetime
+) -> Optional[tuple[Optional[float], Optional[datetime], str]]:
+    """The account's binding model limit as ``(effective percent, reset, label)``.
+
+    The binding model limit is the one the provider flags ``is_active``,
+    else the highest (:func:`jacked.service.menubar_summary.binding_model`).
+    It is the limit that the auto-swap model wall (rule 2b) and the pill
+    read. The percent carries the staleness rule of :func:`_effective_pct`.
+    None when the payload reports no model limit.
+
+    >>> now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    >>> raw = ('{"limits": [{"kind": "weekly_scoped", "percent": 99, "is_active": true,'
+    ...        ' "resets_at": "2026-01-04T00:00:00Z",'
+    ...        ' "scope": {"model": {"display_name": "Fable"}}}]}')
+    >>> pct, reset, label = model_window({"cached_usage_raw": raw}, now)
+    >>> pct, reset.isoformat(), label
+    (99.0, '2026-01-04T00:00:00+00:00', 'Fable')
+    >>> model_window({}, now) is None
+    True
+    """
+    from jacked.usage_plans import raw_usage
+
+    model = binding_model(parse_per_model(raw_usage(acct)))
+    if model is None:
+        return None
+    resets_at = model.get("resets_at")
+    pct = _effective_pct(model.get("utilization"), resets_at, acct.get("usage_cached_at"), now)
+    return pct, parse_reset_ts(resets_at), model["label"]
+
+
+@dataclass(frozen=True, order=True)
+class Recovery:
+    """When an account becomes workable again, and the limit that decides it.
+
+    ``window`` is "5h", "7d" or "model". ``label`` names the model of a
+    "model" window (for example "Fable"), and is None for "5h" and "7d".
+    Recoveries order by time, then by window kind ("5h" < "7d" < "model"):
+    on a tie, ``max`` names the model limit before the weekly window, and
+    the weekly window before the 5-hour window. ``label`` takes no part in
+    the order.
+    """
+
+    at: datetime
+    window: str
+    label: Optional[str] = field(default=None, compare=False)
+
+
 def account_recovery(
     acct: dict, now: datetime, constrained_threshold: float = 90.0
-) -> Optional[tuple[datetime, str]]:
-    """When the account becomes workable again, and the window that decides it.
+) -> Optional[Recovery]:
+    """When the account becomes workable again, and the limit that decides it.
 
-    Returns ``(reset, kind)``: the LATEST future reset among its constrained
-    windows (effective percent at or above ``constrained_threshold``), and
-    that window's kind ("5h" or "7d"). One window resetting while another is
-    still constrained does not make the account usable. None when no window
-    is constrained, or when a constrained window has no knowable future reset
-    (a partial answer would name a time at which the account is still
-    walled).
+    Returns the LATEST future reset among the account's constrained windows,
+    as a :class:`Recovery`. A 5h or 7d window is constrained when its
+    effective percent is at or above ``constrained_threshold``. The binding
+    model limit (:func:`model_window`) is constrained at or above the plan's
+    ``weekly_critical_pct``: at that level auto-swap leaves the account
+    (rule 2b), because it cannot serve that model. Its window kind is
+    "model", and its label names the model. One window resetting while
+    another is still constrained does not make the account usable. None when
+    no window is constrained, or when a constrained window has no knowable
+    future reset (a partial answer would name a time at which the account is
+    still walled).
 
     >>> now = datetime(2026, 1, 2, tzinfo=timezone.utc)
     >>> cached = int(now.timestamp()) - 60
     >>> acct = {"cached_usage_5h": 95.0, "cached_5h_resets_at": "2026-01-02T03:00:00Z",
     ...         "cached_usage_7d": 97.0, "cached_7d_resets_at": "2026-01-05T00:00:00Z",
     ...         "usage_cached_at": cached}
-    >>> reset, kind = account_recovery(acct, now)
-    >>> reset.isoformat(), kind
-    ('2026-01-05T00:00:00+00:00', '7d')
+    >>> rec = account_recovery(acct, now)
+    >>> rec.at.isoformat(), rec.window, rec.label
+    ('2026-01-05T00:00:00+00:00', '7d', None)
     >>> account_recovery({"cached_usage_7d": 10.0}, now) is None
     True
     """
-    constrained: list[tuple[datetime, str]] = []
-    for kind, pct, reset in account_windows(acct, now):
-        if pct is None or pct < constrained_threshold:
+    from jacked.usage_plans import resolve_plan
+
+    sources = [
+        (kind, pct, reset, constrained_threshold, None)
+        for kind, pct, reset in account_windows(acct, now)
+    ]
+    model = model_window(acct, now)
+    if model is not None:
+        pct, reset, label = model
+        sources.append(("model", pct, reset, float(resolve_plan(acct).weekly_critical_pct), label))
+    constrained: list[Recovery] = []
+    for kind, pct, reset, threshold, label in sources:
+        if pct is None or pct < threshold:
             continue
         if reset is None or reset <= now:
             return None
-        constrained.append((reset, kind))
+        constrained.append(Recovery(reset, kind, label))
     return max(constrained) if constrained else None
 
 
 def account_recovery_at(
     acct: dict, now: datetime, constrained_threshold: float = 90.0
 ) -> Optional[datetime]:
-    """:func:`account_recovery` without the window kind.
+    """The time of :func:`account_recovery`, without the window that decides it.
 
     >>> now = datetime(2026, 1, 2, tzinfo=timezone.utc)
     >>> account_recovery_at({"cached_usage_7d": 10.0}, now) is None
     True
     """
     found = account_recovery(acct, now, constrained_threshold)
-    return found[0] if found else None
+    return found.at if found else None
 
 
 def compute_best_account_summary(
@@ -286,7 +349,10 @@ def compute_best_account_summary(
     time at which the account is still walled. ``pause_until`` CAN therefore
     be null while the best percent is constrained; consumers must treat that
     as "pause time unknown" and fall back to error-driven pacing, never "no
-    pause needed".
+    pause needed". A binding model limit at or above the plan's
+    ``weekly_critical_pct`` is a constrained window too
+    (:func:`account_recovery`): an account walled on the model it binds on
+    is not workable before that limit resets.
 
     Windows are plan-aware (:func:`account_windows`): an account whose plan
     has no 5-hour window is judged on its weekly window alone.

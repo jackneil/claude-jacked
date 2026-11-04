@@ -63,10 +63,69 @@ The remaining candidates sort by:
 3. largest deficit from that tier's target.
 
 `should_swap_now()` defaults to staying on the current account. Its departure
-families include higher-tier emergence, guarded intra-T0 preemption, a drained
-T0/T1 account, 5-hour critical usage, and a burn-rate projection. Reset
+families are higher-tier emergence, guarded intra-T0 preemption, a drained
+T0/T1 account, and a walled account (weekly critical or model weekly critical).
+Two more families, 5-hour critical usage and a burn-rate projection, operate
+only when the `auto_swap_5h_rules_enabled` setting is `"true"`. Reset
 suppression, hysteresis, emergence persistence, minimum residency, committed
 swap cooldown, and failure backoff constrain churn.
+
+The walled-only departure (#224i) moves the user off an account only when that
+account cannot serve. Rule 2a gives a departure reason when the weekly usage is
+at or above the `weekly_critical_pct` of the plan. Rule 2b gives a departure
+reason when the binding model limit is at or above the same value. The binding
+model limit is the model limit that the provider marks as active. If no model
+limit has that mark, it is the highest model limit (for example, the weekly
+Fable limit). Each provider default in the plan catalog sets
+`weekly_critical_pct` to 98, and all plans inherit that value. The dashboard
+has no control for this critical level, because it is a field of the plan
+catalog only.
+
+A walled rule gives no reason when its limit resets within
+`RESET_SUPPRESS_MINUTES` (30 minutes) or when the reset time has passed (the
+reading is then from before the reset). The two rules operate with or without a
+target. Thus a walled account without a target gives the `no_target` decision,
+the exhaustion warning, and the `all_accounts_exhausted` banner. A walled
+departure is a forced departure, so the minimum residency does not apply to
+it. `pick_best_target()` skips a walled candidate, and the poll clamp ignores it.
+
+A candidate is walled when its limit for the binding model of the active
+account is at its own `weekly_critical_pct` and that limit has not reset yet.
+A candidate is also walled when rule 2a or 2b would move the user off it at the
+next tick. Thus an account at or above its critical level is not a target
+while its wall holds. The T0 exception to the burn floor (drain to 100%) does not
+override this rule. Each candidate uses the value of its own plan, which is
+the value that rules 2a and 2b use for it after a swap. Thus a swap cannot
+cancel itself at the next tick. No caller can give a different threshold.
+
+One module, `jacked/web/auto_swap/walls.py`, holds the wall predicate.
+`should_swap_now()`, `pick_best_target()`, the poll clamp, and the decision
+loop all use it, so they agree on which accounts are walled.
+
+Rules 1 and 1b keep their priority over rules 2a and 2b. Thus a walled account
+can leave with a `higher_tier_emerged` reason. For this reason, the decision
+loop gets the wall of the active account separately (`walled_reason()`). The
+wall controls the gates, whichever reason wins:
+
+- Emergence persistence does not hold a walled account.
+- The minimum residency does not hold a walled account.
+- A walled account without a target is exhaustion, not a stall. The stall
+  watchdog does not count it while the usage reading is fresh. A stale reading
+  shows nothing about the wall, so the watchdog counts it.
+
+The decision log records the wall of the active account (`wall`). Each
+candidate row records the wall of that candidate (`wall`) and if it can serve
+the binding model of the active account (`serves_model`).
+
+The `all_accounts_exhausted` banner names the limit that frees an account.
+`next_recovery_window` is `5h`, `7d`, or `model`. For a model limit,
+`next_recovery_label` gives the model name (for example, Fable). A binding
+model limit at or above `weekly_critical_pct` is a constrained limit, with its
+own reset time (`account_recovery()` in `jacked/service/usage_pacing.py`).
+The `pause_until` value of `jacked usage --json` uses the same recovery time.
+
+The 5-hour rules are off by default. Each swap makes the new account process
+the full session context again, and a 5-hour limit resets within hours.
 
 Some plans have no 5-hour window. A verified Ultra account (the plan that was
 Max 20x) has only weekly limits, and ChatGPT Pro has no 5-hour limit in
@@ -218,7 +277,7 @@ Credential-related WebSocket events have distinct meanings:
 | `auto_swap_triggered` | A certified transaction returned `committed` or `committed_degraded` |
 | `auto_swap_failed` | An installed transaction engine ran but did not commit |
 | `all_accounts_exhausted` | A departure was needed but no eligible target existed |
-| `auto_swap_stall` | The decision loop met its stale-data/no-candidate watchdog condition |
+| `auto_swap_stall` | The decision loop met its stale-data/no-candidate watchdog condition (a walled account with fresh usage is exhaustion, not a stall) |
 | `decision_log_entry` | Per-tick decision and candidate evidence |
 
 `swap_log.status` must be interpreted, not merely counted. In particular,
@@ -323,6 +382,8 @@ certified transaction engine exists.
 | --- | --- |
 | `jacked/api/usage_monitor.py` | Decision loop, TOCTOU guard, recommendation-only gate, runtime backoff and broadcasts |
 | `jacked/web/auto_swap/selection.py` | Candidate ranking and departure rules |
+| `jacked/web/auto_swap/walls.py` | Wall predicate: walled departure (rules 2a and 2b) and walled-candidate checks |
+| `jacked/service/usage_pacing.py` | Recovery time for the exhaustion banner and `jacked usage` (`account_recovery()`) |
 | `jacked/web/auto_swap/tiers.py` | Urgency tiers, target usage, deficit calculations |
 | `jacked/web/auto_swap/burn.py` | Burn projection and reset suppression helpers |
 | `jacked/web/auto_swap/diagnostics.py` | Decision evidence and advisory calculations |

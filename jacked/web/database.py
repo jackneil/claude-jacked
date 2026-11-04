@@ -90,6 +90,66 @@ DEAD_SESSION_HOURS = 4
 
 
 # ---------------------------------------------------------------------------
+# The account jacked selected for new Claude sessions
+# ---------------------------------------------------------------------------
+
+# The settings keys that hold the selection, in the order a reader trusts
+# them. A switch writes the desired id on every successful outcome, and the
+# macOS outcome (observed_target_unfenced) writes ONLY the desired id, so the
+# active id can name the account the user left. Writers that move both
+# pointers write these same keys.
+SELECTED_ACCOUNT_KEYS = ("desired_account_id", "active_account_id")
+
+
+def selected_account_id(settings: Any, *, existing_only: bool = False) -> Optional[int]:
+    """The Claude account jacked selected for new sessions, or None.
+
+    The keys of ``SELECTED_ACCOUNT_KEYS`` are read in order through
+    ``settings.get_setting``. A value that is missing, empty, not an integer,
+    or not positive is skipped, and the next key is read. With
+    ``existing_only``, an id whose row ``settings.get_account`` does not
+    return (or returns as deleted) is skipped too. ``settings`` can be a
+    ``Database`` or any object with the same two methods; ``get_account`` is
+    called only for ``existing_only``.
+
+    >>> class Store:
+    ...     def __init__(self, rows=(), **values):
+    ...         self.rows, self.values = set(rows), values
+    ...     def get_setting(self, key):
+    ...         return self.values.get(key)
+    ...     def get_account(self, account_id):
+    ...         return {"id": account_id} if account_id in self.rows else None
+    >>> selected_account_id(Store(desired_account_id="5", active_account_id="3"))
+    5
+    >>> selected_account_id(Store(desired_account_id="abc", active_account_id="3"))
+    3
+    >>> [selected_account_id(Store(desired_account_id=value, active_account_id="3"))
+    ...  for value in ("0", "", None)]
+    [3, 3, 3]
+    >>> store = Store(rows={3}, desired_account_id="5", active_account_id="3")
+    >>> selected_account_id(store), selected_account_id(store, existing_only=True)
+    (5, 3)
+    >>> selected_account_id(Store()) is None
+    True
+    """
+    for key in SELECTED_ACCOUNT_KEYS:
+        raw = settings.get_setting(key)
+        try:
+            # None and "" raise here too, so they are skipped like "abc".
+            account_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if account_id <= 0:
+            continue
+        if existing_only:
+            row = settings.get_account(account_id)
+            if row is None or row.get("is_deleted"):
+                continue
+        return account_id
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Pydantic v2 Models
 # ---------------------------------------------------------------------------
 
@@ -817,6 +877,13 @@ class Database:
         except sqlite3.OperationalError:
             pass  # no settings table: the next open binds again, which is harmless there
 
+    # Settings that no code reads now. Each open deletes their rows, so the
+    # settings list never shows a stored value that does nothing. Add a key
+    # here when its last reader goes.
+    # - auto_swap_7d_threshold: the "7-Day Threshold" slider. The weekly wall
+    #   is the plan catalog field weekly_critical_pct.
+    RETIRED_SETTING_KEYS = ("auto_swap_7d_threshold",)
+
     def _init_schema(self) -> None:
         with self._writer() as conn:
             # Pre-schema crash recovery: if accounts_new exists but accounts doesn't,
@@ -1111,6 +1178,8 @@ class Database:
             # copy.
             self._migrate_refresh_failed_token_fp(conn)
             self._bind_legacy_foreign_marks(conn)
+            # Migration: delete the rows of retired settings (RETIRED_SETTING_KEYS).
+            conn.executemany("DELETE FROM settings WHERE key = ?", [(k,) for k in self.RETIRED_SETTING_KEYS])
             # Migration: add swap outcome tracking to swap_log.
             # status distinguishes committed swaps from pending/failed attempts;
             # residency_seconds is how long the outgoing account was active.
@@ -2427,13 +2496,17 @@ class Database:
         except (TypeError, ValueError):
             return None
 
-    def get_selected_account_id(self, provider: str = "claude") -> Optional[int]:
+    def get_selected_account_id(
+        self, provider: str = "claude", *, existing_only: bool = False
+    ) -> Optional[int]:
         """The account jacked last selected for new sessions of ``provider``.
 
-        Claude: ``desired_account_id``, else ``active_account_id`` (the same
-        order every credential surface uses). A switch writes the desired id
-        on every successful outcome, including ``observed_target_unfenced``,
-        which leaves the active id behind. Codex: its active account id.
+        Claude: the module rule ``selected_account_id`` (the desired id, else
+        the active id). A switch writes the desired id on every successful
+        outcome, including ``observed_target_unfenced``, which leaves the
+        active id behind. Codex: its active account id. With
+        ``existing_only``, an id with no account row gives None for Codex, and
+        the next key for Claude.
 
         >>> db = Database(":memory:")
         >>> db.set_setting("active_account_id", "3")
@@ -2442,20 +2515,17 @@ class Database:
         >>> db.set_setting("desired_account_id", "5")
         >>> db.get_selected_account_id()
         5
+        >>> db.get_selected_account_id(existing_only=True) is None
+        True
         >>> db.get_selected_account_id("codex") is None
         True
         """
         if provider == "claude":
-            for key in ("desired_account_id", "active_account_id"):
-                raw = self.get_setting(key)
-                try:
-                    account_id = int(raw) if raw else 0
-                except (TypeError, ValueError):
-                    continue
-                if account_id > 0:
-                    return account_id
+            return selected_account_id(self, existing_only=existing_only)
+        account_id = self.get_active_account_id(provider)
+        if existing_only and account_id is not None and self.get_account(account_id) is None:
             return None
-        return self.get_active_account_id(provider)
+        return account_id
 
     def find_open_sessions(self, pids) -> dict:
         """The newest open tracked session of each Claude Code process id in

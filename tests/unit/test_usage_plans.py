@@ -178,6 +178,20 @@ class TestBundledCatalog:
                         if text:
                             assert EM_DASH not in text and EN_DASH not in text, text
 
+    def test_weekly_critical_pct_is_98_for_every_bundled_plan(self):
+        """#224i: an account leaves on a weekly or model wall at 98% of the
+        limit. The value sits on each provider's default in the JSON file,
+        and every plan inherits it."""
+        raw = json.loads((up.DATA_ROOT / up.CATALOG_FILE).read_text(encoding="utf-8"))
+        assert raw["providers"]["claude"]["default"]["weekly_critical_pct"] == 98
+        assert raw["providers"]["codex"]["default"]["weekly_critical_pct"] == 98
+        cat = up.load_catalog(up.DATA_ROOT)
+        for pcat in cat.providers.values():
+            assert pcat.default.weekly_critical_pct == 98.0
+            for sub in pcat.subscriptions.values():
+                for entry in (sub.plan, *sub.tiers.values()):
+                    assert entry.weekly_critical_pct == 98.0, entry.id
+
     def test_window_lengths(self):
         assert up.window_seconds("claude", "session") == 5 * 3600
         assert up.window_seconds("claude", "weekly") == 7 * 86400
@@ -310,12 +324,79 @@ class TestLoader:
         assert nine.verified_at == "2026-11-01"
         assert nine.sources == ("https://example.com/a",)
 
+    def test_weekly_critical_pct_parses_and_inherits(self, tmp_path):
+        """The field parses like session_critical_pct: the provider default,
+        then the subscription, then its tier, each inheriting from the one
+        above. A catalog that never names it reads the built-in 98."""
+        root = _write(tmp_path, {
+            "version": 1,
+            "providers": {
+                "claude": {
+                    "default": {"session": "reported", "weekly_critical_pct": 96},
+                    "subscriptions": {
+                        "max": {
+                            "label": "Max", "session": "always",
+                            "weekly_critical_pct": 93,
+                            "tiers": {
+                                "t9": {"id": "nine", "label": "Nine"},
+                                "t10": {"id": "ten", "label": "Ten",
+                                        "weekly_critical_pct": 99.5},
+                            },
+                        },
+                        "pro": {"label": "Pro", "session": "always"},
+                    },
+                },
+                "codex": {"subscriptions": {"plus": {"label": "Plus", "session": "always"}}},
+            },
+        })
+        cat = up.load_catalog(root)
+        claude = cat.providers["claude"]
+        assert claude.default.weekly_critical_pct == 96.0
+        assert claude.subscriptions["pro"].plan.weekly_critical_pct == 96.0
+        assert claude.subscriptions["max"].plan.weekly_critical_pct == 93.0
+        assert claude.subscriptions["max"].tiers["t9"].weekly_critical_pct == 93.0
+        assert claude.subscriptions["max"].tiers["t10"].weekly_critical_pct == 99.5
+        assert isinstance(claude.subscriptions["max"].plan.weekly_critical_pct, float)
+        codex = cat.providers["codex"]
+        assert codex.default.weekly_critical_pct == 98.0
+        assert codex.subscriptions["plus"].plan.weekly_critical_pct == 98.0
+
+    @pytest.mark.parametrize("bad", [0, 101, "x", True, -5, float("nan")])
+    def test_invalid_weekly_critical_pct_skips_the_entry(self, tmp_path, caplog, bad):
+        root = _write(tmp_path, {
+            "version": 1,
+            "providers": {"claude": {"subscriptions": {
+                "pro": {"label": "Pro", "session": "always", "weekly_critical_pct": bad},
+                "team": {"label": "Team", "session": "always"},
+            }}},
+        })
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        subs = cat.providers["claude"].subscriptions
+        assert "pro" not in subs
+        assert "team" in subs
+        assert any(
+            "'pro'" in r.getMessage() and "invalid weekly_critical_pct" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_invalid_default_weekly_critical_pct_uses_the_built_ins(self, tmp_path, caplog):
+        root = _write(tmp_path, {
+            "version": 1,
+            "providers": {"claude": {"default": {"weekly_critical_pct": 150}}},
+        })
+        with caplog.at_level(logging.WARNING, logger="jacked.usage_plans"):
+            cat = up.load_catalog(root)
+        assert cat.providers["claude"].default.weekly_critical_pct == 98.0
+        assert any("invalid weekly_critical_pct" in r.getMessage() for r in caplog.records)
+
     def test_resolution_uses_builtin_defaults_without_a_catalog(self, tmp_path, monkeypatch):
         monkeypatch.setattr(up, "_catalog_cache", up.load_catalog(tmp_path))
         plan = up.resolve_plan(_ultra())
         assert plan.id is None
         assert plan.session == "reported"
         assert plan.session_critical_pct == 80
+        assert plan.weekly_critical_pct == 98.0
         assert plan.label == "Max"
         # Silence from an authoritative payload still reads as "no window".
         assert up.session_window(_ultra(), ULTRA_RAW).state == "absent"
@@ -416,6 +497,23 @@ class TestResolvePlan:
         assert up.resolve_plan({"rate_limit_tier": "default_claude_max_20x"}).id == "ultra"
         assert up.resolve_plan({"rate_limit_tier": "default_claude_max_5x"}).id == "max"
         assert up.resolve_plan({"rate_limit_tier": "mystery"}).session_critical_pct == 80
+
+    def test_plan_match_carries_the_weekly_critical_pct(self, tmp_path, monkeypatch):
+        assert up.resolve_plan(_ultra()).weekly_critical_pct == 98.0
+        assert up.resolve_plan({"provider": "codex", "subscription_type": "pro"}
+                               ).weekly_critical_pct == 98.0
+        assert up.resolve_plan({}).weekly_critical_pct == 98.0
+        root = _write(tmp_path, {
+            "version": 1,
+            "providers": {"claude": {"subscriptions": {"max": {
+                "label": "Max", "session": "always",
+                "tiers": {"default_claude_max_20x": {"id": "ultra", "label": "Ultra",
+                                                     "weekly_critical_pct": 90}},
+            }}}},
+        })
+        monkeypatch.setattr(up, "_catalog_cache", up.load_catalog(root))
+        assert up.resolve_plan(_ultra()).weekly_critical_pct == 90.0
+        assert up.resolve_plan(_max5()).weekly_critical_pct == 98.0
 
     def test_codex_plans(self):
         pro = up.resolve_plan({"provider": "codex", "subscription_type": "pro"})

@@ -505,20 +505,6 @@ def _profile_identity(profile: dict) -> tuple[str | None, Any]:
     return (email if isinstance(email, str) and email else None), org
 
 
-def _desired_account_id(db) -> int | None:
-    for key in ("desired_account_id", "active_account_id"):
-        raw = db.get_setting(key)
-        if raw is None or raw == "":
-            continue
-        try:
-            account_id = int(raw)
-        except (TypeError, ValueError):
-            continue
-        if account_id > 0:
-            return account_id
-    return None
-
-
 def _repair_committed(outcome: Any) -> bool:
     """True when a repair outcome leaves the authority holding its target.
 
@@ -933,7 +919,9 @@ def _heal(
             reason="the tokens are not proven to belong to the matched account",
         )
 
-    desired_id = _desired_account_id(db)
+    from jacked.web.database import selected_account_id
+
+    desired_id = selected_account_id(db)
     if desired_id is None:
         _mark_handled(digest, foreign_account_id, settled=True)
         return HealResult(

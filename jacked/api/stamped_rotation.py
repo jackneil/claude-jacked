@@ -50,7 +50,6 @@ from jacked.api.stamped_evidence import (
 
 logger = logging.getLogger(__name__)
 
-_POINTER_KEYS = ("desired_account_id", "active_account_id")
 _PHASE_NEW = "new"
 _PHASE_OWED = "owed"
 _PHASE_DONE = "done"
@@ -346,7 +345,9 @@ def _followable(owner: dict) -> bool:
 
 def _stale_target(db, stamp: int) -> tuple[dict | None, str]:
     """Return the row to reassert after a stale-session rotation, or why none."""
-    desired_id = guard._desired_account_id(db)
+    from jacked.web.database import selected_account_id
+
+    desired_id = selected_account_id(db)
     if desired_id != stamp:
         return None, "the desired account is not the stamped account"
     row = db.get_account(desired_id)
@@ -402,11 +403,13 @@ def _restore_stamped(
 
 def _point_at(db, account_id: int) -> None:
     """Make ``account_id`` the desired and the active account in one write."""
+    from jacked.web.database import SELECTED_ACCOUNT_KEYS
+
     wanted = str(account_id)
-    if all(db.get_setting(key) == wanted for key in _POINTER_KEYS):
+    if all(db.get_setting(key) == wanted for key in SELECTED_ACCOUNT_KEYS):
         return
     try:
-        db.set_settings({key: wanted for key in _POINTER_KEYS})
+        db.set_settings({key: wanted for key in SELECTED_ACCOUNT_KEYS})
     except Exception as exc:
         # The guard never raises past the observer; say why the user's
         # choice is not the active account yet, then let the pass end.

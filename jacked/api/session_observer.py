@@ -154,16 +154,17 @@ def _account_identity(
 def _desired_identity(
     db: SessionObservationDatabase | None,
 ) -> CredentialIdentity | None:
+    """The identity of the account jacked selected for new sessions, or None.
+
+    The selection rule is ``jacked.web.database.selected_account_id``. A
+    selected row that is missing or deleted gives None: the observer then
+    reports no desired identity, and does not use the active id instead.
+    """
     if db is None:
         return None
-    raw_id = db.get_setting("desired_account_id") or db.get_setting("active_account_id")
-    try:
-        account_id = int(raw_id) if raw_id is not None else None
-    except (TypeError, ValueError):
-        return None
-    if account_id is None or account_id <= 0:
-        return None
-    return _account_identity(db, account_id)
+    from jacked.web.database import selected_account_id
+
+    return _account_identity(db, selected_account_id(db))
 
 
 def _qualify_observation(

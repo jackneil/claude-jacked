@@ -11,15 +11,17 @@ prove neither the real tray nor a real execv is invoked.
 """
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 import jacked.api.routes.settings_remote as sr
 from jacked.api.main import app
+from jacked.api.routes.settings_swap import SWAP_SETTING_KEYS
 from jacked.service.bind import BindPlan, set_active_plan
 from jacked.service.restart import set_restart_handler
-from jacked.web.database import Database
+from jacked.web.database import SELECTED_ACCOUNT_KEYS, Database
 
 
 @pytest.fixture(autouse=True)
@@ -153,26 +155,98 @@ def test_put_missing_field_is_422(client):
 # ---------------------------------------------------------------------------
 
 
-def test_generic_put_on_protected_key_is_422(client):
-    resp = client.put(
-        "/api/settings/remote_access_enabled", json={"value": "true"}
-    )
+# Every key that a dedicated endpoint owns: the remote-access pair (a security
+# decision with its own restart flow), every auto-swap / window keeper
+# setting (PUT /api/settings/swap-settings validates them as one set), and
+# the credential-selection pointers. The authority guard, the identity watcher
+# and the OAuth flow act on the pointers, so only the switch path (its
+# mutation gate, switch audit and rate limit) may move them. The 5-hour rules
+# toggle and each pointer are named on their own too, so the test still fails
+# if one drops out of its source tuple.
+_DEDICATED_KEYS = list(dict.fromkeys([
+    "remote_access_enabled",
+    "remote_access_scope",
+    "auto_swap_5h_rules_enabled",
+    *SWAP_SETTING_KEYS,
+    "desired_account_id",
+    "active_account_id",
+    "active_account_id_codex",
+    *SELECTED_ACCOUNT_KEYS,
+    Database.active_account_setting_key("codex"),
+]))
+
+
+@pytest.mark.parametrize("key", _DEDICATED_KEYS)
+def test_generic_put_on_protected_key_is_422(client, db, key):
+    resp = client.put(f"/api/settings/{key}", json={"value": "true"})
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "PROTECTED_KEY"
+    assert db.get_setting(key) is None
 
 
-def test_generic_put_on_protected_scope_is_422(client):
-    resp = client.put(
-        "/api/settings/remote_access_scope", json={"value": "all"}
-    )
+@pytest.mark.parametrize("key", _DEDICATED_KEYS)
+def test_generic_delete_on_protected_key_is_422(client, db, key):
+    db.set_setting(key, "kept")
+    resp = client.delete(f"/api/settings/{key}")
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "PROTECTED_KEY"
+    assert db.get_setting(key) == "kept"
 
 
-def test_generic_delete_on_protected_key_is_422(client):
-    resp = client.delete("/api/settings/remote_access_enabled")
+def test_generic_delete_removes_a_stale_retired_7d_row(client, db):
+    """No endpoint owns the retired ``auto_swap_7d_threshold`` now, so the
+    generic DELETE must not answer "Use the dedicated endpoint". It deletes
+    a row that an old jacked wrote after the database opened."""
+    key = "auto_swap_7d_threshold"
+    assert key not in _DEDICATED_KEYS
+    db.set_setting(key, "85")
+    resp = client.delete(f"/api/settings/{key}")
+    assert resp.status_code == 200
+    assert resp.json() == {"key": key, "deleted": True}
+    assert db.get_setting(key) is None
+
+
+@pytest.mark.parametrize("method", ["put", "delete"])
+@pytest.mark.parametrize(
+    "key",
+    [Database.active_account_setting_key("nextprovider"), "desired_account_id_nextprovider"],
+    ids=["active", "desired"],
+)
+def test_the_pointer_of_a_new_provider_is_protected_too(client, db, method, key):
+    """Each provider has its own pointers (``Database.active_account_setting_key``
+    for the active one; a desired pointer would follow the same shape). The
+    guard follows the shape of both stems, so the pointers of a provider added
+    later are protected the day the provider is added."""
+    db.set_setting(key, "7")
+    if method == "put":
+        resp = client.put(f"/api/settings/{key}", json={"value": "9"})
+    else:
+        resp = client.delete(f"/api/settings/{key}")
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "PROTECTED_KEY"
+    assert db.get_setting(key) == "7"
+
+
+def test_a_key_that_only_looks_like_a_pointer_is_not_protected(client, db):
+    """The guard matches the pointer keys, not every key that starts with
+    the same letters."""
+    resp = client.put("/api/settings/active_account_ids_note", json={"value": "x"})
+    assert resp.status_code == 200
+    assert db.get_setting("active_account_ids_note") == '"x"'
+
+
+@pytest.mark.parametrize("key", Database.RETIRED_SETTING_KEYS)
+def test_generic_put_on_a_retired_key_is_422(client, db, key):
+    """A retired key is deleted when the database opens. The generic PUT must
+    not write it again in between: no code reads it, so a write there only
+    looks like a setting that works."""
+    resp = client.put(f"/api/settings/{key}", json={"value": 70})
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "RETIRED_KEY"
+    assert body["error"]["message"] == f"jacked no longer uses the setting '{key}'."
+    assert "—" not in body["error"]["message"]
+    assert db.get_setting(key) is None
 
 
 # ---------------------------------------------------------------------------
@@ -530,3 +604,171 @@ def test_get_reports_editable_false_for_a_remote_client(db, host):
     # policy that applies to it, it just may not change it.
     assert body["enabled"] is False
     assert body["scope"] == "tailscale"
+
+
+# ---------------------------------------------------------------------------
+# The mutation gate on the generic settings endpoint and on the swap routes
+#
+# The generic PUT/DELETE /api/settings/{key} writes every key that no
+# dedicated endpoint owns (the color theme, the OAuth browser mode, the raw
+# table on the Settings page). PUT /api/settings/swap-settings,
+# POST /swap-pause and POST /swap-resume turn auto-swap on and off and set or
+# clear the hold after a manual switch. All five run the gate of an account
+# switch: loopback always may; a remote client may only while remote access
+# is on and its address is inside the scope.
+# ---------------------------------------------------------------------------
+
+_OUTSIDE_SCOPE_MESSAGE = (
+    "This browser's address is outside the remote access scope. Widen the "
+    "scope under Settings > Advanced on the host machine."
+)
+_SETTINGS_DENIED = {
+    "remote_access_off": (
+        "Changing settings from this browser is off. Turn on remote access "
+        "under Settings > Advanced on the host machine."
+    ),
+    "outside_scope": _OUTSIDE_SCOPE_MESSAGE,
+}
+_SWAP_DENIED = {
+    "remote_access_off": (
+        "Changing auto-swap from this browser is off. Turn on remote access "
+        "under Settings > Advanced on the host machine."
+    ),
+    "outside_scope": _OUTSIDE_SCOPE_MESSAGE,
+}
+_STORED_PAUSE = "2999-01-01T00:00:00+00:00"
+_SWAP_ROUTES = ("swap-settings", "swap-pause", "swap-resume")
+
+
+@pytest.fixture
+def sweep_wakes(monkeypatch):
+    """The swap-settings PUT wakes the sweep loop: record the wake instead of
+    setting the module's asyncio.Event."""
+    import jacked.api.usage_monitor as usage_monitor
+
+    calls = []
+    monkeypatch.setattr(usage_monitor, "_sweep_wake", SimpleNamespace(set=lambda: calls.append(1)))
+    return calls
+
+
+def _turn_on_remote_access(db, scope="tailscale"):
+    db.set_setting("remote_access_enabled", "true")
+    db.set_setting("remote_access_scope", scope)
+
+
+def _generic_write(http, method):
+    if method == "put":
+        return http.put("/api/settings/color_theme", json={"value": "light"})
+    return http.delete("/api/settings/color_theme")
+
+
+def _generic_written(db, method):
+    return db.get_setting("color_theme") == ('"light"' if method == "put" else None)
+
+
+def _swap_write(http, route):
+    if route == "swap-settings":
+        return http.put("/api/settings/swap-settings", json={"auto_swap_enabled": True})
+    if route == "swap-pause":
+        return http.post("/api/settings/swap-pause?minutes=30")
+    return http.post("/api/settings/swap-resume")
+
+
+def _swap_written(db, route):
+    if route == "swap-settings":
+        return db.get_setting("auto_swap_enabled") == "true"
+    if route == "swap-pause":
+        return db.get_setting("auto_swap_paused_until") not in (None, "", _STORED_PAUSE)
+    return db.get_setting("auto_swap_paused_until") == ""
+
+
+def _assert_denied(resp, code, message):
+    assert resp.status_code == 403
+    assert resp.json() == {"error": {"message": message, "code": code}}
+    assert resp.headers["cache-control"] == "no-store"
+    assert "—" not in message
+
+
+@pytest.mark.parametrize("method", ["put", "delete"])
+@pytest.mark.parametrize("host", [TAILNET_IP, LAN_IP])
+def test_generic_settings_write_is_refused_while_remote_access_is_off(db, method, host):
+    db.set_setting("color_theme", '"dark"')
+    resp = _generic_write(TestClient(app, client=(host, 1)), method)
+    _assert_denied(resp, "REMOTE_ACCESS_OFF", _SETTINGS_DENIED["remote_access_off"])
+    assert db.get_setting("color_theme") == '"dark"'
+
+
+@pytest.mark.parametrize("method", ["put", "delete"])
+def test_generic_settings_write_is_refused_outside_the_scope(db, method):
+    _turn_on_remote_access(db)
+    db.set_setting("color_theme", '"dark"')
+    resp = _generic_write(TestClient(app, client=(LAN_IP, 1)), method)
+    _assert_denied(resp, "OUTSIDE_SCOPE", _SETTINGS_DENIED["outside_scope"])
+    assert db.get_setting("color_theme") == '"dark"'
+
+
+@pytest.mark.parametrize("method", ["put", "delete"])
+def test_generic_settings_write_works_inside_the_scope(db, method):
+    _turn_on_remote_access(db)
+    db.set_setting("color_theme", '"dark"')
+    resp = _generic_write(TestClient(app, client=(TAILNET_IP, 1)), method)
+    assert resp.status_code == 200
+    assert _generic_written(db, method)
+
+
+@pytest.mark.parametrize("method", ["put", "delete"])
+def test_generic_settings_write_from_loopback_is_unchanged(client, db, method):
+    db.set_setting("color_theme", '"dark"')
+    resp = _generic_write(client, method)
+    assert resp.status_code == 200
+    assert _generic_written(db, method)
+
+
+@pytest.mark.parametrize("method", ["put", "delete"])
+def test_the_gate_runs_before_the_protected_key_check(db, method):
+    """A refused client gets the 403 for a protected key too, so it learns
+    nothing about the key, and the pointer stays as it was."""
+    db.set_setting("desired_account_id", "5")
+    remote = TestClient(app, client=(TAILNET_IP, 1))
+    if method == "put":
+        resp = remote.put("/api/settings/desired_account_id", json={"value": "9"})
+    else:
+        resp = remote.delete("/api/settings/desired_account_id")
+    _assert_denied(resp, "REMOTE_ACCESS_OFF", _SETTINGS_DENIED["remote_access_off"])
+    assert db.get_setting("desired_account_id") == "5"
+
+
+@pytest.mark.parametrize("route", _SWAP_ROUTES)
+@pytest.mark.parametrize("host", [TAILNET_IP, LAN_IP])
+def test_swap_writes_are_refused_while_remote_access_is_off(db, sweep_wakes, route, host):
+    db.set_setting("auto_swap_paused_until", _STORED_PAUSE)
+    resp = _swap_write(TestClient(app, client=(host, 1)), route)
+    _assert_denied(resp, "REMOTE_ACCESS_OFF", _SWAP_DENIED["remote_access_off"])
+    # Nothing changed: auto-swap stays off, the hold stays, the loop sleeps on.
+    assert db.get_setting("auto_swap_enabled") is None
+    assert db.get_setting("auto_swap_paused_until") == _STORED_PAUSE
+    assert sweep_wakes == []
+
+
+@pytest.mark.parametrize("route", _SWAP_ROUTES)
+def test_swap_writes_are_refused_outside_the_scope(db, sweep_wakes, route):
+    _turn_on_remote_access(db)
+    db.set_setting("auto_swap_paused_until", _STORED_PAUSE)
+    resp = _swap_write(TestClient(app, client=(LAN_IP, 1)), route)
+    _assert_denied(resp, "OUTSIDE_SCOPE", _SWAP_DENIED["outside_scope"])
+    assert db.get_setting("auto_swap_enabled") is None
+    assert db.get_setting("auto_swap_paused_until") == _STORED_PAUSE
+
+
+@pytest.mark.parametrize("route", _SWAP_ROUTES)
+@pytest.mark.parametrize("who", ["loopback", "tailnet_in_scope"])
+def test_swap_writes_work_from_loopback_and_inside_the_scope(db, sweep_wakes, route, who):
+    if who == "loopback":
+        http = TestClient(app)
+    else:
+        _turn_on_remote_access(db)
+        http = TestClient(app, client=(TAILNET_IP, 1))
+    db.set_setting("auto_swap_paused_until", _STORED_PAUSE)
+    resp = _swap_write(http, route)
+    assert resp.status_code == 200
+    assert _swap_written(db, route)

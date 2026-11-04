@@ -1,13 +1,14 @@
 """Tests for the auto-swap dashboard JS (drain advisor, swap history
-status/residency, pause indicator, 24h swap counter) and the
-account-actions auto-refresh guards (hard floor, fire-rate guard,
-cross-tab storage sync, overdue-fire circuit breaker).
+status/residency, pause indicator, 24h swap counter, the 5-hour rules
+toggle) and the account-actions auto-refresh guards (hard floor, fire-rate
+guard, cross-tab storage sync, overdue-fire circuit breaker).
 
 The web UI is plain browser JS with no bundler or JS test harness, so
 these tests drive ``node`` from pytest: each case evals the component
 source inside a minimal DOM stub and asserts on rendered output and
 handler behavior. Skipped when node is not on PATH."""
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -49,12 +50,18 @@ function makeEl(tag) {
         parentNode: null,
         style: {},
         _classes: new Set(),
+        _listeners: {},
     };
     el.classList = {
         add: (...cs) => cs.forEach(c => el._classes.add(c)),
         remove: (...cs) => cs.forEach(c => el._classes.delete(c)),
         contains: (c) => el._classes.has(c),
-        toggle: (c) => el._classes.has(c) ? el._classes.delete(c) : el._classes.add(c),
+        // Same contract as DOMTokenList.toggle, including the force argument.
+        toggle: (c, force) => {
+            const on = force === undefined ? !el._classes.has(c) : Boolean(force);
+            if (on) el._classes.add(c); else el._classes.delete(c);
+            return on;
+        },
     };
     el.setAttribute = (k, v) => { el.attributes[k] = v; };
     el.appendChild = (c) => { c.parentNode = el; el.children.push(c); return c; };
@@ -66,7 +73,11 @@ function makeEl(tag) {
         }
         el.parentNode = null;
     };
-    el.addEventListener = () => {};
+    // Listeners are recorded, never fired on their own: a test fires one
+    // with __fire(el, type).
+    el.addEventListener = (type, cb) => {
+        (el._listeners[type] = el._listeners[type] || []).push(cb);
+    };
     el.querySelector = () => null;
     el.insertAdjacentHTML = () => {};
     return el;
@@ -121,6 +132,7 @@ global.showToast = (message, type, duration) => _toasts.push({ message, type, du
 global.__getToasts = () => _toasts;
 global.__makeEl = makeEl;
 global.__body = body;
+global.__fire = (el, type) => (el._listeners[type] || []).forEach(cb => cb({ type, target: el }));
 const out = (o) => process.stdout.write('\n' + JSON.stringify(o) + '\n');
 
 const SRC = fs.readFileSync(TARGET, 'utf8');
@@ -361,22 +373,464 @@ out({
         assert result["counterId"] is True
 
 
+# The toggle controls only the 5-hour rules. The weekly and model walls and
+# the tier departures (a better 7-day position) run whatever it says, so the
+# help text never says that jacked leaves an account "only" at a wall.
+FIVE_H_RULES_HELP = (
+    "Off: jacked does not leave an account for its 5-hour window. It still "
+    "leaves an account whose weekly limit or model limit reaches the critical "
+    "level of the plan (98% by default). It still moves to an account with a "
+    "better 7-day position. Each swap makes the new account read the whole "
+    "session again, and a 5-hour limit resets within hours. On: the two "
+    "5-hour thresholds below also start a swap."
+)
+DIM = "opacity-60"
+FIVE_H_ROWS = (("rng-warn-5h", "row-warn-5h"), ("rng-crit-5h", "row-crit-5h"))
+
+
+def _tag(html, el_id, tag="input"):
+    """The match of the opening tag of the element with this id."""
+    m = re.search(rf'<{tag}\b[^>]*\bid="{re.escape(el_id)}"[^>]*>', html)
+    assert m, f"no <{tag} id={el_id!r}> in the panel"
+    return m
+
+
+def _has_attr(tag_html, attr):
+    """A real attribute, not a word in the class list: Tailwind variants
+    such as ``disabled:cursor-not-allowed`` are classes."""
+    bare = re.sub(r'\sclass="[^"]*"', "", tag_html)
+    return re.search(rf"\s{attr}(?=[\s>=/])", bare) is not None
+
+
+def _classes(tag_html):
+    m = re.search(r'\sclass="([^"]*)"', tag_html)
+    return set(m.group(1).split()) if m else set()
+
+
+class TestFiveHourRulesToggle:
+    """#224i: the 5-hour rules (5h critical, burn rate) are off by default,
+    behind the "Swap on the 5-hour window" toggle. The toggle sits directly
+    above the two 5-hour sliders. While it is off, those two sliders are
+    disabled and their rows are dimmed. The usage check interval below the
+    group is not a 5-hour rule: a divider separates it from the group, and
+    the toggle never changes it."""
+
+    def _panel(self, tmp_path, settings):
+        return _run_js(tmp_path, """
+window.jackedState.swapSettings = __SETTINGS__;
+out({ html: renderAutoSwapPanel() });
+""".replace("__SETTINGS__", json.dumps(settings)))["html"]
+
+    def test_renders_off_by_default_with_the_label_and_the_help(self, tmp_path):
+        html = self._panel(tmp_path, {})
+        chk = _tag(html, "chk-swap-5h-rules").group(0)
+        assert 'type="checkbox"' in chk
+        assert not _has_attr(chk, "checked")
+        assert '<label for="chk-swap-5h-rules" class="text-slate-400 text-sm">Swap on the 5-hour window</label>' in html
+        assert f'id="help-swap-5h-rules" class="text-xs text-slate-400 mt-1 text-pretty">{FIVE_H_RULES_HELP}</p>' in html
+        assert 'aria-describedby="help-swap-5h-rules"' in chk
+        assert "—" not in html and "–" not in html
+
+    def test_off_disables_the_two_5h_sliders_and_never_the_check_interval(self, tmp_path):
+        html = self._panel(tmp_path, {"auto_swap_5h_rules_enabled": False})
+        for slider, row in FIVE_H_ROWS:
+            assert _has_attr(_tag(html, slider).group(0), "disabled"), slider
+            assert DIM in _classes(_tag(html, row, "div").group(0)), row
+        assert not _has_attr(_tag(html, "sel-check-interval", "select").group(0), "disabled")
+        assert DIM not in _classes(_tag(html, "row-check-interval", "div").group(0))
+
+    def test_on_renders_checked_with_the_5h_sliders_enabled(self, tmp_path):
+        html = self._panel(tmp_path, {"auto_swap_5h_rules_enabled": True})
+        assert _has_attr(_tag(html, "chk-swap-5h-rules").group(0), "checked")
+        for slider, row in FIVE_H_ROWS:
+            assert not _has_attr(_tag(html, slider).group(0), "disabled"), slider
+            assert DIM not in _classes(_tag(html, row, "div").group(0)), row
+
+    def test_the_toggle_sits_directly_above_the_5h_sliders_and_a_divider_closes_the_group(self, tmp_path):
+        html = self._panel(tmp_path, {})
+        chk = _tag(html, "chk-swap-5h-rules")
+        warn = _tag(html, "rng-warn-5h")
+        crit = _tag(html, "rng-crit-5h")
+        interval_row = _tag(html, "row-check-interval", "div")
+        assert chk.end() < warn.start() < crit.start() < interval_row.start()
+        between = html[chk.end():warn.start()]
+        assert "<input" not in between and "<select" not in between
+        # The next control after the 5-hour group is the check interval.
+        after = html[crit.end():interval_row.start()]
+        assert "<input" not in after and "<select" not in after
+        # A divider separates the 5-hour group from the check interval.
+        assert "border-t" in _classes(interval_row.group(0))
+
+    def test_flipping_the_toggle_enables_and_disables_the_5h_sliders_live(self, tmp_path):
+        result = _run_js(tmp_path, """
+const mk = (id, props) => {
+    const el = Object.assign(__makeEl('div'), props || {});
+    el.id = id;
+    __body.appendChild(el);
+    return el;
+};
+const chk = mk('chk-swap-5h-rules', { checked: true });
+const sliders = {
+    warn: mk('rng-warn-5h', { value: '80', disabled: false }),
+    crit: mk('rng-crit-5h', { value: '90', disabled: false }),
+    interval: mk('sel-check-interval', { value: '300', disabled: false }),
+};
+const rows = { warn: mk('row-warn-5h'), crit: mk('row-crit-5h'), interval: mk('row-check-interval') };
+window.jackedState.swapSettings = {};
+bindAutoSwapEvents();
+const snap = () => Object.fromEntries(Object.keys(sliders).map(k => [k, {
+    disabled: sliders[k].disabled, dim: rows[k].classList.contains('opacity-60'),
+}]));
+chk.checked = false; __fire(chk, 'change');
+const off = snap();
+chk.checked = true; __fire(chk, 'change');
+const on = snap();
+out({ off, on });
+process.exit(0);
+""")
+        off, on = result["off"], result["on"]
+        assert off["warn"] == {"disabled": True, "dim": True}
+        assert off["crit"] == {"disabled": True, "dim": True}
+        assert off["interval"] == {"disabled": False, "dim": False}
+        for k in ("warn", "crit", "interval"):
+            assert on[k] == {"disabled": False, "dim": False}, k
+
+    def test_flipping_the_toggle_autosaves_it(self, tmp_path):
+        result = _run_js(tmp_path, """
+(async () => {
+    const puts = [];
+    global.api.put = async (path, body) => { puts.push({ path, body }); return body; };
+    const chk = Object.assign(__makeEl('input'), { checked: false });
+    chk.id = 'chk-swap-5h-rules';
+    __body.appendChild(chk);
+    window.jackedState.swapSettings = {};
+    bindAutoSwapEvents();
+    chk.checked = true;
+    __fire(chk, 'change');
+    await new Promise(r => setTimeout(r, 600));  // the save is debounced 400 ms
+    out({ puts });
+    process.exit(0);
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert [p["path"] for p in result["puts"]] == ["/api/settings/swap-settings"]
+        assert result["puts"][0]["body"]["auto_swap_5h_rules_enabled"] is True
+
+    def test_save_sends_the_field_and_keeps_the_pause_in_state(self, tmp_path):
+        result = _run_js(tmp_path, """
+(async () => {
+    const puts = [];
+    global.api.put = async (path, body) => { puts.push(body); return body; };
+    window.jackedState.swapSettings = { auto_swap_paused_until: '2999-01-01T00:00:00+00:00' };
+    await _saveSwapSettings();                    // no toggle in the DOM
+    const chk = Object.assign(__makeEl('input'), { checked: true });
+    chk.id = 'chk-swap-5h-rules';
+    __body.appendChild(chk);
+    await _saveSwapSettings();
+    chk.checked = false;
+    await _saveSwapSettings();
+    out({ puts, state: window.jackedState.swapSettings });
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert [p["auto_swap_5h_rules_enabled"] for p in result["puts"]] == [False, True, False]
+        # The pause has its own endpoints. The form never sends it, so a save
+        # never clears it on the server, and the panel keeps showing it.
+        assert all("auto_swap_paused_until" not in p for p in result["puts"])
+        assert result["state"]["auto_swap_paused_until"] == "2999-01-01T00:00:00+00:00"
+        assert result["state"]["auto_swap_5h_rules_enabled"] is False
+
+
+# The block of the panel that shows the pause: the notice, the badge, and the
+# pause menu or the Resume button. When the pause changes, the page renders
+# this block again in place, so an open panel stays open.
+PAUSE_SLOT = "swap-pause-state"
+PAUSE_NOTICE = "Auto-swap paused until"
+MANUAL_SUFFIX = "(manual switch)"
+
+_PAUSE_SETUP = r"""
+const slot = __makeEl('div');
+slot.id = 'swap-pause-state';
+__body.appendChild(slot);
+const PAUSE = new Date(Date.now() + 30 * 60000).toISOString();
+const settle = () => new Promise(r => setTimeout(r, 0));
+// The pause control of the page: the pause menu, or the Resume button.
+const pauseControl = (action) => {
+    const el = __makeEl(action === 'pause' ? 'select' : 'button');
+    el.id = action === 'pause' ? 'sel-swap-pause' : 'btn-swap-resume';
+    el.value = '30';
+    __body.appendChild(el);
+    return el;
+};
+const useControl = (action, el) => __fire(el, action === 'pause' ? 'change' : 'click');
+global.api.post = async (path) => (
+    path.includes('swap-pause') ? { paused_until: PAUSE, minutes: 30 } : { resumed: true }
+);
+"""
+
+
+def _inner_div(html, el_id):
+    """The inner HTML of the ``<div>`` with this id (nested divs counted)."""
+    start = _tag(html, el_id, "div").end()
+    depth = 1
+    for m in re.finditer(r"<div\b|</div>", html[start:]):
+        depth += 1 if m.group(0) == "<div" else -1
+        if depth == 0:
+            return html[start:start + m.start()]
+    raise AssertionError(f"no closing tag for <div id={el_id!r}>")
+
+
+class TestThePauseStateFollowsTheServer:
+    """U2: the PUT response is the stored state. The server keeps a pause
+    that a save does not send and reads it back, so the panel merges the
+    response into ``window.jackedState.swapSettings`` and renders its pause
+    block again. A pause that another client set (a manual switch, the menu
+    bar) then shows after a save. A pause or a resume made on this page
+    while a save is in flight wins over the response of that save: the
+    server read that response before the change."""
+
+    def test_the_panel_renders_the_pause_inside_its_slot(self, tmp_path):
+        html = _run_js(tmp_path, """
+window.jackedState.swapSettings = {
+    auto_swap_paused_until: new Date(Date.now() + 30 * 60000).toISOString(),
+};
+out({ html: renderAutoSwapPanel() });
+""")["html"]
+        inner = _inner_div(html, PAUSE_SLOT)
+        assert PAUSE_NOTICE in inner
+        assert 'id="btn-swap-resume"' in inner
+        assert 'id="chk-auto-swap"' not in inner
+        assert 'id="chk-swap-5h-rules"' not in inner
+
+    def test_save_shows_a_pause_that_the_server_kept(self, tmp_path):
+        result = _run_js(tmp_path, _PAUSE_SETUP + """
+(async () => {
+    global.api.put = async (path, body) => ({ ...body, auto_swap_paused_until: PAUSE });
+    window.jackedState.swapSettings = {};
+    await _saveSwapSettings();
+    out({ pause: window.jackedState.swapSettings.auto_swap_paused_until ?? null, expected: PAUSE, html: slot.innerHTML || '' });
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["pause"] == result["expected"]
+        # This page did not make the pause, so it reads as the manual-switch hold.
+        assert PAUSE_NOTICE in result["html"] and MANUAL_SUFFIX in result["html"]
+        assert 'id="btn-swap-resume"' in result["html"]
+
+    def test_save_clears_a_pause_that_the_server_no_longer_has(self, tmp_path):
+        result = _run_js(tmp_path, _PAUSE_SETUP + """
+(async () => {
+    global.api.put = async (path, body) => ({ ...body, auto_swap_paused_until: null });
+    window.jackedState.swapSettings = { auto_swap_paused_until: PAUSE };
+    await _saveSwapSettings();
+    out({ pause: window.jackedState.swapSettings.auto_swap_paused_until ?? null, html: slot.innerHTML || '' });
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["pause"] is None
+        assert PAUSE_NOTICE not in result["html"]
+        assert 'id="sel-swap-pause"' in result["html"]
+
+    @pytest.mark.parametrize("action", ["pause", "resume"])
+    def test_a_pause_change_during_a_save_wins_over_its_response(self, tmp_path, action):
+        result = _run_js(tmp_path, _PAUSE_SETUP + """
+(async () => {
+    const ACTION = __ACTION__;
+    const control = pauseControl(ACTION);
+    window.jackedState.swapSettings = { auto_swap_paused_until: ACTION === 'pause' ? null : PAUSE };
+    // The server reads the pause for this save before the change below.
+    const readBefore = window.jackedState.swapSettings.auto_swap_paused_until;
+    let answer;
+    global.api.put = (path, body) => new Promise(r => {
+        answer = () => r({ ...body, auto_swap_paused_until: readBefore });
+    });
+    bindAutoSwapEvents();
+    const saving = _saveSwapSettings();
+    useControl(ACTION, control);
+    await settle();
+    answer();
+    await saving;
+    out({
+        pause: window.jackedState.swapSettings.auto_swap_paused_until ?? null,
+        expected: ACTION === 'pause' ? PAUSE : null,
+        html: slot.innerHTML || '',
+    });
+})().catch(e => { console.error(e); process.exit(1); });
+""".replace("__ACTION__", json.dumps(action)))
+        assert result["pause"] == result["expected"]
+        assert (PAUSE_NOTICE in result["html"]) is (action == "pause")
+
+    @pytest.mark.parametrize("action", ["pause", "resume"])
+    def test_pause_and_resume_render_the_pause_block_again(self, tmp_path, action):
+        html = _run_js(tmp_path, _PAUSE_SETUP + """
+(async () => {
+    const ACTION = __ACTION__;
+    const control = pauseControl(ACTION);
+    window.jackedState.swapSettings = { auto_swap_paused_until: ACTION === 'pause' ? null : PAUSE };
+    bindAutoSwapEvents();
+    useControl(ACTION, control);
+    await settle();
+    out({ html: slot.innerHTML || '' });
+})().catch(e => { console.error(e); process.exit(1); });
+""".replace("__ACTION__", json.dumps(action)))["html"]
+        if action == "pause":
+            # This page made the pause, so it is not the manual-switch hold.
+            assert PAUSE_NOTICE in html and MANUAL_SUFFIX not in html
+            assert 'id="btn-swap-resume"' in html
+        else:
+            assert PAUSE_NOTICE not in html
+            assert 'id="sel-swap-pause"' in html
+
+
+class TestRetiredSevenDayThreshold:
+    """The "7-Day Threshold" slider (``auto_swap_7d_threshold``) changed
+    nothing: no decision code read it. The weekly wall is the plan catalog
+    field ``weekly_critical_pct``, and the dashboard has no control for it.
+    So the panel shows no 7-day slider, and a save never sends the field."""
+
+    RETIRED_IDS = ("row-thresh-7d", "rng-thresh-7d", "lbl-thresh-7d")
+
+    def test_the_panel_has_no_7_day_threshold_control(self, tmp_path):
+        # An older server still returns the field. The panel ignores it.
+        html = _run_js(tmp_path, """
+window.jackedState.swapSettings = { auto_swap_7d_threshold: 70 };
+out({ html: renderAutoSwapPanel() });
+""")["html"]
+        for retired_id in self.RETIRED_IDS:
+            assert f'id="{retired_id}"' not in html, retired_id
+        assert "7-Day Threshold" not in html
+
+    def test_a_stale_7_day_slider_is_neither_bound_nor_saved(self, tmp_path):
+        """A stale page can still hold the old slider. bindAutoSwapEvents
+        attaches no handler to it, and a save does not send its value."""
+        result = _run_js(tmp_path, """
+(async () => {
+    const puts = [];
+    global.api.put = async (path, body) => { puts.push(body); return body; };
+    const slider = Object.assign(__makeEl('input'), { value: '70' });
+    slider.id = 'rng-thresh-7d';
+    __body.appendChild(slider);
+    const label = __makeEl('span');
+    label.id = 'lbl-thresh-7d';
+    __body.appendChild(label);
+    window.jackedState.swapSettings = {};
+    bindAutoSwapEvents();
+    await _saveSwapSettings();
+    out({ listeners: Object.keys(slider._listeners), puts });
+})().catch(e => { console.error(e); process.exit(1); });
+""")
+        assert result["listeners"] == []
+        assert len(result["puts"]) == 1
+        assert "auto_swap_7d_threshold" not in result["puts"][0]
+
+
+class TestDecisionLogWallColumn:
+    """The candidate table of a decision-log row ends with a "Wall" column
+    (#224i). It shows why the wall filter rejects a candidate: the first word
+    of its walled departure reason (``wall``: "weekly critical: ..." gives
+    "weekly", "model weekly critical: ..." gives "model"), "model" when it
+    cannot serve the model of the active account (``serves_model`` false),
+    else a plain "-". A row logged before these fields shows "-"."""
+
+    WEEKLY = "weekly critical: 7d usage 99.0% >= 98%"
+    MODEL = "model weekly critical: Fable 100.0% >= 98%"
+
+    def _table(self, tmp_path, candidates):
+        html = _run_js(tmp_path, """
+out({ html: buildDecisionDetailHtml(
+    { candidates: __CANDIDATES__, should_swap: false, cooldown_active: false }, 'decision-1') });
+""".replace("__CANDIDATES__", json.dumps(candidates)))["html"]
+        table = html[html.index("<table"):html.index("</table>")]
+        head, body = table.split("<tbody>")
+        heads = re.findall(r"<th\b[^>]*>([^<]*)</th>", head)
+        rows = re.findall(r"<tr\b[^>]*>(.*?)</tr>", body)
+        return heads, [re.findall(r"<td\b[^>]*>(.*?)</td>", row)[-1] for row in rows]
+
+    def test_wall_is_the_last_column(self, tmp_path):
+        heads, _ = self._table(tmp_path, [{"label": "a"}])
+        assert heads[-2:] == ["Best", "Wall"]
+
+    def test_the_three_states_and_an_old_row(self, tmp_path):
+        heads, cells = self._table(tmp_path, [
+            {"label": "weekly", "wall": self.WEEKLY, "serves_model": True},
+            {"label": "model wall", "wall": self.MODEL, "serves_model": False},
+            {"label": "other model", "wall": None, "serves_model": False},
+            {"label": "free", "wall": None, "serves_model": True},
+            {"label": "logged before the fields"},
+        ])
+        texts = [re.sub(r"<[^>]+>", "", cell) for cell in cells]
+        assert texts == ["weekly", "model", "model", "-", "-"]
+        assert all("—" not in cell and "–" not in cell for cell in cells)
+
+    def test_the_full_reason_is_an_escaped_title(self, tmp_path):
+        _, cells = self._table(tmp_path, [
+            {"label": "a", "wall": self.WEEKLY, "serves_model": True},
+            {"label": "b", "wall": '<img src=x onerror="alert(1)">: x', "serves_model": True},
+        ])
+        assert 'title="weekly critical: 7d usage 99.0% &gt;= 98%"' in cells[0]
+        assert "<img" not in cells[1]
+        assert "&lt;img" in cells[1]
+
+
 class TestExhaustionBanner:
     """The all-accounts-exhausted banner names the window whose reset frees
     an account (next_recovery_window), and never promises usage in general:
     a model limit (Fable) can still be full after that reset. Without a
-    window kind (an older server) it keeps the generic text."""
+    window kind (an older server) it keeps the generic text. When a model
+    limit walls the account (window "model"), the banner names that limit
+    (next_recovery_label) and gives its reset time in the format of the
+    account cards (formatResetTime, utils.js)."""
 
-    def _banner(self, tmp_path, minutes, window=None):
+    def _banner(self, tmp_path, minutes, window=None, label=None):
+        # utils.js loads before auto-swap.js on the page. Only its reset
+        # formatter is taken here: its escapeHtml needs a real DOM. The eval
+        # runs first-party repo source only, as the harness eval does.
         return _run_js(tmp_path, """
+global.formatResetTime = (function () {
+    eval(fs.readFileSync(__UTILS__, 'utf8'));
+    return formatResetTime;
+})();
 const el = __makeEl('div');
 el.id = 'swap-exhaustion-banner';
 __body.appendChild(el);
 const at = __MINUTES__ === null ? null : new Date(Date.now() + __MINUTES__ * 60000).toISOString();
-window.jackedState._exhaustionData = { next_recovery_at: at, next_recovery_window: __WINDOW__ };
+window.jackedState._exhaustionData = {
+    next_recovery_at: at, next_recovery_window: __WINDOW__, next_recovery_label: __LABEL__,
+};
 renderExhaustionBanner();
-out({ html: el.innerHTML, hidden: el.classList.contains('hidden') });
-""".replace("__MINUTES__", json.dumps(minutes)).replace("__WINDOW__", json.dumps(window)))
+out({
+    html: el.innerHTML,
+    hidden: el.classList.contains('hidden'),
+    reset: at === null ? null : formatResetTime(at),
+});
+""".replace("__UTILS__", json.dumps(str(UTILS_JS)))
+           .replace("__MINUTES__", json.dumps(minutes))
+           .replace("__WINDOW__", json.dumps(window))
+           .replace("__LABEL__", json.dumps(label)))
+
+    @pytest.mark.parametrize(
+        "minutes, label, name",
+        [
+            (3 * 1440 + 125, "Fable", "The Fable limit"),
+            (11.5, "Fable", "The Fable limit"),
+            (199.5, None, "The model limit"),
+            (199.5, "", "The model limit"),
+        ],
+    )
+    def test_model_window_names_the_limit_and_its_reset_time(self, tmp_path, minutes, label, name):
+        result = self._banner(tmp_path, minutes, "model", label)
+        assert result["hidden"] is False
+        assert result["reset"].startswith("resets ")
+        assert f">{name} {result['reset']}</div>" in result["html"]
+        assert "available again" not in result["html"]
+        assert "—" not in result["html"] and "–" not in result["html"]
+
+    def test_model_window_with_a_passed_reset_says_soon(self, tmp_path):
+        result = self._banner(tmp_path, -1, "model", "Fable")
+        assert ">The Fable limit should reset soon</div>" in result["html"]
+
+    def test_model_label_is_escaped(self, tmp_path):
+        """The label comes from the provider's usage payload: it is text,
+        never markup, in the banner's innerHTML."""
+        result = self._banner(tmp_path, 30, "model", '<img src=x onerror="alert(1)">')
+        assert "<img" not in result["html"]
+        assert "The &lt;img src=x onerror=&quot;alert(1)&quot;&gt; limit resets" in result["html"]
 
     @pytest.mark.parametrize(
         "minutes, window, text",

@@ -301,6 +301,7 @@ class TestAutoSwapTriggers:
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
+                "auto_swap_5h_rules_enabled": "true",
                 "usage_check_interval": "300",
             },
             accounts=accounts,
@@ -369,6 +370,7 @@ class TestNoTarget:
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
+                "auto_swap_5h_rules_enabled": "true",
             },
             accounts=accounts,
         )
@@ -797,6 +799,7 @@ class TestTOCTOU:
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
+                "auto_swap_5h_rules_enabled": "true",
                 "usage_check_interval": "300",
             },
             accounts=accounts,
@@ -943,6 +946,7 @@ class TestBurnRateReseedAfterSwap:
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
+                "auto_swap_5h_rules_enabled": "true",
                 "usage_check_interval": "300",
             },
             accounts=accounts,
@@ -1003,6 +1007,7 @@ class TestSwapCooldown:
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
+                "auto_swap_5h_rules_enabled": "true",
                 "usage_check_interval": "300",
             },
             accounts=accounts,
@@ -1056,6 +1061,7 @@ class TestSwapCooldown:
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
+                "auto_swap_5h_rules_enabled": "true",
                 "usage_check_interval": "300",
             },
             accounts=accounts,
@@ -1116,6 +1122,7 @@ class TestPauseMechanism:
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
+                "auto_swap_5h_rules_enabled": "true",
                 "auto_swap_paused_until": future_iso,
             },
             accounts=accounts,
@@ -1169,6 +1176,7 @@ class TestPauseMechanism:
         db = _make_db(
             settings={
                 "auto_swap_enabled": "true",
+                "auto_swap_5h_rules_enabled": "true",
                 "auto_swap_paused_until": past_iso,
                 "usage_check_interval": "300",
             },
@@ -1481,6 +1489,7 @@ class TestSilentStallWatchdog:
             usage_cached_at_age_seconds=2000,
             has_other_accounts=True,
             reason=None,
+            wall=None,
             staleness_threshold=1800,
         )
         assert bumped is True
@@ -1494,6 +1503,7 @@ class TestSilentStallWatchdog:
             usage_cached_at_age_seconds=10,
             has_other_accounts=False,
             reason="drained: 7d at 100%",
+            wall=None,
             staleness_threshold=1800,
         )
         assert bumped is True
@@ -1507,6 +1517,7 @@ class TestSilentStallWatchdog:
             usage_cached_at_age_seconds=10,
             has_other_accounts=True,
             reason="drained: 7d at 100%",
+            wall=None,
             staleness_threshold=1800,
         )
         assert bumped is True
@@ -1520,6 +1531,7 @@ class TestSilentStallWatchdog:
             usage_cached_at_age_seconds=10,
             has_other_accounts=True,
             reason="anything",
+            wall=None,
             staleness_threshold=1800,
         )
         assert bumped is False
@@ -1533,6 +1545,7 @@ class TestSilentStallWatchdog:
             usage_cached_at_age_seconds=10,
             has_other_accounts=True,
             reason=None,
+            wall=None,
             staleness_threshold=1800,
         )
         assert bumped is False
@@ -1549,9 +1562,47 @@ class TestSilentStallWatchdog:
             usage_cached_at_age_seconds=10,  # fresh, not stale
             has_other_accounts=True,
             reason=None,  # same-tier-never-overrides → no reason
+            wall=None,
             staleness_threshold=1800,
         )
         assert bumped is False
+
+    WEEKLY_WALL = "weekly critical: 7d usage 100.0% >= 98%"
+
+    @pytest.mark.parametrize("reason", [
+        WEEKLY_WALL,
+        "model weekly critical: Fable 100.0% >= 98%",
+        # A T0 account at 100%: rule 2 (drained) wins the reason, and the
+        # account is walled all the same.
+        "drained: 7d usage 100.0% >= tier target 100.0%",
+    ])
+    @pytest.mark.parametrize("has_other_accounts", [True, False])  # patterns (c), (b)
+    def test_a_fresh_wall_with_no_target_is_exhaustion_not_a_stall(
+        self, reason, has_other_accounts,
+    ):
+        """The no_target decision, the exhaustion WARNING and the
+        all_accounts_exhausted banner report a walled account with no target,
+        and a weekly wall can hold for days: an ERROR every 30 minutes on top
+        is noise."""
+        from jacked.api.usage_monitor import _evaluate_stall
+
+        assert _evaluate_stall(
+            decision_action="stay", best=None, usage_cached_at_age_seconds=10,
+            has_other_accounts=has_other_accounts, reason=reason,
+            wall=self.WEEKLY_WALL, staleness_threshold=1800,
+        ) is False
+
+    @pytest.mark.parametrize("has_other_accounts", [True, False])  # patterns (a), (b)
+    def test_a_wall_read_from_stale_usage_still_stalls(self, has_other_accounts):
+        """A stale reading proves nothing about the wall: the watchdog keeps
+        every pattern."""
+        from jacked.api.usage_monitor import _evaluate_stall
+
+        assert _evaluate_stall(
+            decision_action="stay", best=None, usage_cached_at_age_seconds=2000,
+            has_other_accounts=has_other_accounts, reason=self.WEEKLY_WALL,
+            wall=self.WEEKLY_WALL, staleness_threshold=1800,
+        ) is True
 
 
 class TestSameTierDeficitAdvisory:
@@ -1970,6 +2021,18 @@ class TestTriggerTaxonomy:
         )
         assert _trigger_for_reason("some other reason") == "tier_aware"
 
+    def test_walled_departure_triggers(self):
+        from jacked.api.usage_monitor import _trigger_for_reason
+
+        assert (
+            _trigger_for_reason("weekly critical: 7d usage 100.0% >= 98%")
+            == "weekly_critical"
+        )
+        assert (
+            _trigger_for_reason("model weekly critical: Fable 100.0% >= 98%")
+            == "model_weekly_critical"
+        )
+
 
 class TestActiveHoursGuardPreserved:
     """The active-hours guard survives the rewrite — verify settings keys."""
@@ -2253,6 +2316,12 @@ def _swap_settings():
     }
 
 
+def _five_hour_swap_settings():
+    """_swap_settings with the 5h rules (critical, burn rate) turned on: they
+    are off by default (#224i), and the tests that drive them opt in."""
+    return {**_swap_settings(), "auto_swap_5h_rules_enabled": "true"}
+
+
 # ---------------------------------------------------------------------------
 # Min-residency gate (item 6)
 # ---------------------------------------------------------------------------
@@ -2293,7 +2362,7 @@ class TestResidencyGate:
             _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
             _acct(2, usage_5h=20, usage_7d=10),  # good target
         ]
-        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        db = _make_db(settings=_five_hour_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
         activations = _run_one_tick(app)
@@ -2359,7 +2428,7 @@ class TestFailureBackoff:
             _acct(1, usage_5h=95, usage_7d=50),  # active, over critical
             _acct(2, usage_5h=20, usage_7d=10),  # good target
         ]
-        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        db = _make_db(settings=_five_hour_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
         activations = _run_one_tick(app)
@@ -2378,7 +2447,7 @@ class TestFailureBackoff:
             _acct(1, usage_5h=95, usage_7d=50),
             _acct(2, usage_5h=20, usage_7d=10),
         ]
-        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        db = _make_db(settings=_five_hour_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
         activations = _run_one_tick(app)
@@ -2409,7 +2478,7 @@ class TestTriggerTaxonomyBranches:
             _acct(1, usage_5h=95, usage_7d=50),
             _acct(2, usage_5h=20, usage_7d=10),
         ]
-        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        db = _make_db(settings=_five_hour_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
         activations = _run_one_tick(app)
@@ -2418,7 +2487,7 @@ class TestTriggerTaxonomyBranches:
 
     def test_no_target_trigger(self):
         accounts = [_acct(1, usage_5h=95, usage_7d=50)]
-        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        db = _make_db(settings=_five_hour_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
         _run_one_tick(app)
@@ -2457,7 +2526,7 @@ class TestTriggerTaxonomyBranches:
             _acct(1, usage_5h=95, usage_7d=50),
             _acct(2, usage_5h=20, usage_7d=10),
         ]
-        db = _make_db(settings=_swap_settings(), accounts=accounts)
+        db = _make_db(settings=_five_hour_swap_settings(), accounts=accounts)
         app = _make_app(db=db)
 
         activations = _run_one_tick(app)
@@ -2817,6 +2886,37 @@ class TestPollIntervalClamp:
             {},
         )
         assert out == 90.0
+
+    def test_a_walled_t0_candidate_does_not_clamp(self):
+        """A T0 account at its weekly wall still shows a deficit (98.5% vs a
+        target of 100), but pick_best_target never offers it (#224i), so a
+        faster poll buys nothing. The same goes for one walled on the model
+        the active account binds on."""
+        from jacked.api.usage_monitor import _clamp_poll_interval
+
+        now = datetime.now(timezone.utc)
+        resets = _t0_resets_at()
+        active = _ultra(1, usage_5h=None, usage_7d=50.0, model_pct=40, model_active=True)
+        weekly_walled = _acct(2, usage_5h=10, usage_7d=98.5, cached_7d_resets_at=resets)
+        # Binds on Sonnet (10%), so only the active's Fable makes it walled.
+        fable_walled = _ultra(3, usage_5h=None, usage_7d=50.0, cached_7d_resets_at=resets)
+        fable_walled["cached_usage_raw"] = json.dumps({"five_hour": None, "limits": [
+            {"kind": "weekly_all", "percent": 50.0, "is_active": False, "resets_at": resets},
+            {"kind": "weekly_scoped", "percent": 10, "is_active": True, "resets_at": resets,
+             "scope": {"model": {"display_name": "Sonnet"}}},
+            {"kind": "weekly_scoped", "percent": 99, "is_active": False, "resets_at": resets,
+             "scope": {"model": {"display_name": "Fable"}}},
+        ]})
+        healthy = _acct(4, usage_5h=10, usage_7d=50, cached_7d_resets_at=resets)
+
+        def clamp(*candidates):
+            return _clamp_poll_interval(
+                300.0, [active, *candidates], 1, now, "06:00", "23:00", {},
+            )
+
+        assert clamp(weekly_walled) == 300.0
+        assert clamp(fable_walled) == 300.0
+        assert clamp(weekly_walled, fable_walled, healthy) == 90.0
 
     def test_clamps_to_60_when_saturated_t0_reset_imminent(self):
         from jacked.api.usage_monitor import _clamp_poll_interval
@@ -3320,7 +3420,7 @@ class TestNoSessionProjection:
             _ultra(1, usage_5h=100.0, resets_5h=self._future(hours=2)),
             _acct(2, usage_5h=10, usage_7d=10),
         ]
-        db = _db_with_rows(accounts)
+        db = _db_with_rows(accounts, settings=_five_hour_swap_settings())
         app = _make_app(db=db)
 
         activations = _run_one_tick(app)
@@ -3341,7 +3441,7 @@ class TestNoSessionProjection:
             subscription_type="max", rate_limit_tier="default_claude_max_5x",
         )
         ultra = _ultra(2, usage_5h=100.0, resets_5h=self._future(hours=2), usage_7d=10.0)
-        db = _db_with_rows([active, ultra])
+        db = _db_with_rows([active, ultra], settings=_five_hour_swap_settings())
 
         activations = _run_one_tick(_make_app(db=db))
 
@@ -3401,8 +3501,29 @@ class TestNoSessionProjection:
         )
         assert exhausted[0]["usage_5h"] is None
         assert exhausted[0]["next_recovery_window"] == "7d"
+        assert exhausted[0]["next_recovery_label"] is None  # only a model window has a name
         warnings = [r.getMessage() for r in caplog.records if "no eligible target" in r.getMessage()]
         assert warnings and "5h=n/a" in warnings[0] and "7d=100.0%" in warnings[0]
+
+    def test_a_model_wall_names_the_model_and_its_reset(self):
+        """The active's Fable limit is at 99% and its weekly limit at 40%, with
+        no other account (F4). The banner names the Fable limit and when it
+        resets; the 5h and 7d windows alone gave no recovery time at all."""
+        resets = self._future(hours=72)
+        active = _ultra(1, usage_5h=None, usage_7d=40.0, model_pct=99, model_active=True,
+                        cached_7d_resets_at=resets)
+        ws = AsyncMock()
+        db = _db_with_rows([active])
+
+        _run_one_tick(_make_app(db=db, ws_registry=ws))
+
+        assert _decision_triggers(db) == ["no_target"]
+        (payload,) = _broadcasts(ws, "all_accounts_exhausted")
+        assert datetime.fromisoformat(payload["next_recovery_at"]) == (
+            datetime.fromisoformat(resets.replace("Z", "+00:00"))
+        )
+        assert payload["next_recovery_window"] == "model"
+        assert payload["next_recovery_label"] == "Fable"
 
     def test_recovery_is_the_earliest_account_recovery_and_skips_unconstrained(self):
         """next_recovery_at is the minimum over accounts of the time each
@@ -3612,3 +3733,288 @@ class TestPollUrgencyInputs:
         db = _db_with_rows([])
         _interval, tier = um._compute_poll_interval(1, um._poll_interval_inputs(1, db), {})
         assert tier == "idle"
+
+
+# ---------------------------------------------------------------------------
+# #224i: walled-only departure, and the 5h rules behind a setting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("_fresh_auth_usage_state")
+class TestFiveHourRulesSetting:
+    """auto_swap_5h_rules_enabled ("true"/"false", absent means false) turns
+    the 5h critical and burn-rate departures on. Off by default: each swap
+    makes the new account re-process the whole session context, and a
+    5-hour wall resets within hours."""
+
+    def _accounts(self):
+        return [
+            _acct(1, usage_5h=95, usage_7d=50),  # 5h critical, weekly healthy
+            _acct(2, usage_5h=20, usage_7d=10),
+        ]
+
+    @pytest.mark.parametrize("value", [None, "false"])
+    def test_the_5h_rules_stay_off_unless_the_setting_is_true(self, value):
+        settings = _swap_settings()
+        if value is not None:
+            settings["auto_swap_5h_rules_enabled"] = value
+        db = _make_db(settings=settings, accounts=self._accounts())
+
+        activations = _run_one_tick(_make_app(db=db))
+
+        assert activations == []
+        assert "forced_critical" not in _decision_triggers(db)
+        assert _decision_actions(db) == ["stay"]
+
+    def test_the_setting_true_turns_the_5h_rules_on(self):
+        db = _make_db(settings=_five_hour_swap_settings(), accounts=self._accounts())
+
+        activations = _run_one_tick(_make_app(db=db))
+
+        assert activations == [2]
+        assert "forced_critical" in _decision_triggers(db)
+
+    def test_the_setting_is_read_in_the_tick_snapshot(self):
+        db = _make_db(settings=_swap_settings(), accounts=self._accounts())
+
+        _run_one_tick(_make_app(db=db))
+
+        snapshots = [list(c.args[0]) for c in db.get_settings.call_args_list]
+        assert any(
+            "auto_swap_5h_rules_enabled" in keys and "auto_swap_enabled" in keys
+            for keys in snapshots
+        ), snapshots
+
+
+@pytest.mark.usefixtures("_fresh_auth_usage_state")
+class TestWalledDepartureTick:
+    """End to end through one tick: a walled account leaves with its own
+    trigger, skips the minimum residency (it cannot serve), and with no
+    target raises the exhaustion banner."""
+
+    def _resets(self):
+        return _iso(datetime.now(timezone.utc) + timedelta(hours=72))  # T2
+
+    def _weekly_walled(self):
+        return _ultra(1, usage_5h=None, usage_7d=100.0, cached_7d_resets_at=self._resets())
+
+    def _model_walled(self):
+        return _ultra(1, usage_5h=None, usage_7d=60.0, model_pct=100, model_active=True,
+                      cached_7d_resets_at=self._resets())
+
+    def _healthy(self):
+        return _ultra(2, usage_5h=None, usage_7d=30.0, cached_7d_resets_at=self._resets())
+
+    @pytest.mark.parametrize("walled, trigger, reason", [
+        ("_weekly_walled", "weekly_critical", "weekly critical: 7d usage 100.0% >= 98%"),
+        ("_model_walled", "model_weekly_critical", "model weekly critical: Fable 100.0% >= 98%"),
+    ])
+    def test_a_walled_account_swaps_with_its_trigger(self, walled, trigger, reason):
+        db = _db_with_rows([getattr(self, walled)(), self._healthy()])
+
+        activations = _run_one_tick(_make_app(db=db))
+
+        assert activations == [2]
+        assert _decision_triggers(db) == [trigger]
+        assert _decision_actions(db) == ["swap"]
+        assert _decision_reasons(db) == [reason]
+
+    @pytest.mark.parametrize("walled", ["_weekly_walled", "_model_walled"])
+    def test_a_wall_is_a_forced_departure_that_skips_residency(self, walled):
+        """A walled account cannot serve, so the minimum residency (which
+        lets a proactive swap settle) never holds it."""
+        um._last_committed_swap_time = time.time() - 100
+        db = _db_with_rows([getattr(self, walled)(), self._healthy()])
+
+        activations = _run_one_tick(_make_app(db=db))
+
+        assert activations == [2]
+        assert "residency_blocked" not in _decision_triggers(db)
+
+    def test_a_walled_account_with_no_target_raises_the_banner(self, caplog):
+        ws = AsyncMock()
+        db = _db_with_rows([self._weekly_walled()])
+
+        with caplog.at_level(logging.WARNING, logger="jacked.api.usage_monitor"):
+            _run_one_tick(_make_app(db=db, ws_registry=ws))
+
+        assert _decision_triggers(db) == ["no_target"]
+        assert _broadcasts(ws, "all_accounts_exhausted")
+        assert any("no eligible target" in r.getMessage() for r in caplog.records)
+
+    def test_each_candidate_is_judged_by_its_own_plan_threshold(self, tmp_path, monkeypatch):
+        """The tick passes the active plan's threshold to should_swap_now
+        only. A candidate is judged by its own plan's field, the threshold
+        rule 2b applies to it once it is active; the active's 98 would admit
+        a Max candidate at 96% that its own 95 ejects on the next tick."""
+        from jacked import usage_plans
+
+        (tmp_path / usage_plans.CATALOG_FILE).write_text(json.dumps({
+            "version": 1, "verified_at": "2026-11-01",
+            "providers": {"claude": {"subscriptions": {"max": {"label": "Max", "tiers": {
+                "default_claude_max_20x": {"id": "ultra", "label": "Ultra"},
+                "default_claude_max_5x": {"id": "max", "label": "Max",
+                                          "weekly_critical_pct": 95},
+            }}}}},
+        }), encoding="utf-8")
+        monkeypatch.setattr(usage_plans, "_catalog_cache", usage_plans.load_catalog(tmp_path))
+        max5 = _acct(2, usage_5h=None, usage_7d=30.0, cached_7d_resets_at=self._resets(),
+                     subscription_type="max", rate_limit_tier="default_claude_max_5x")
+        max5["cached_usage_raw"] = _ultra_raw(30.0, 96, max5["cached_7d_resets_at"], True)
+        db = _db_with_rows([self._weekly_walled(), max5])
+
+        activations = _run_one_tick(_make_app(db=db))
+
+        assert activations == []
+        assert _decision_triggers(db) == ["no_target"]
+
+
+def _resets_in(hours):
+    return _iso(datetime.now(timezone.utc) + timedelta(hours=hours))
+
+
+def _sonnet_bound_raw(fable_pct, resets):
+    """A payload whose binding limit is Sonnet (flagged is_active, 20%) with a
+    Fable limit at *fable_pct* that is not the binding one."""
+    def scoped(label, pct, active):
+        return {"kind": "weekly_scoped", "percent": pct, "is_active": active,
+                "resets_at": resets, "scope": {"model": {"display_name": label}}}
+
+    return json.dumps({"five_hour": None, "limits": [
+        {"kind": "weekly_all", "percent": 30.0, "is_active": False, "resets_at": resets},
+        scoped("Sonnet", 20, True),
+        scoped("Fable", fable_pct, False),
+    ]})
+
+
+@pytest.mark.usefixtures("_fresh_auth_usage_state")
+class TestWallCarriedApartFromTheReason:
+    """Rule 1 (a higher-tier candidate) keeps its priority over rules 2a/2b,
+    so a walled active can leave with a higher_tier_emerged reason. The tick
+    carries the wall apart from that reason, and the wall makes the
+    departure forced: neither emergence persistence nor the minimum
+    residency may hold an account that cannot serve (F2)."""
+
+    WALLS = [
+        ("_weekly_walled", "weekly critical: 7d usage 100.0% >= 98%"),
+        ("_model_walled", "model weekly critical: Fable 100.0% >= 98%"),
+    ]
+
+    def _weekly_walled(self):  # a T2 active at its weekly wall
+        return _ultra(1, usage_5h=None, usage_7d=100.0, cached_7d_resets_at=_resets_in(72))
+
+    def _model_walled(self):  # a T2 active at its Fable wall
+        return _ultra(1, usage_5h=None, usage_7d=60.0, model_pct=100, model_active=True,
+                      cached_7d_resets_at=_resets_in(72))
+
+    def _unwalled(self):
+        return _ultra(1, usage_5h=None, usage_7d=60.0, cached_7d_resets_at=_resets_in(72))
+
+    def _tick(self, active):
+        t1_candidate = _ultra(2, usage_5h=None, usage_7d=30.0, cached_7d_resets_at=_resets_in(36))
+        db = _db_with_rows([active, t1_candidate])
+        return db, _run_one_tick(_make_app(db=db))
+
+    @pytest.mark.parametrize("walled, wall", WALLS)
+    def test_a_walled_active_leaves_inside_the_residency_with_no_streak(self, walled, wall):
+        um._last_committed_swap_time = time.time() - 600  # the residency still holds
+        db, activations = self._tick(getattr(self, walled)())
+        assert activations == [2]
+        assert _decision_actions(db) == ["swap"]
+        assert _decision_triggers(db) == ["higher_tier_emerged"]  # the reason keeps its priority
+
+    @pytest.mark.parametrize("walled, wall", WALLS)
+    def test_emergence_persistence_never_holds_a_walled_active(self, walled, wall):
+        db, activations = self._tick(getattr(self, walled)())  # residency long over
+        assert activations == [2]
+        assert "emergence_pending" not in _decision_triggers(db)
+
+    @pytest.mark.parametrize("walled, wall", WALLS)
+    def test_the_residency_never_holds_a_walled_active(self, walled, wall):
+        um._emerged_tier_streak.update(tier=1, count=1)  # persistence is met this tick
+        um._last_committed_swap_time = time.time() - 600
+        db, activations = self._tick(getattr(self, walled)())
+        assert activations == [2]
+        assert "residency_blocked" not in _decision_triggers(db)
+
+    def test_an_unwalled_active_still_waits_for_both_gates(self):
+        um._last_committed_swap_time = time.time() - 600
+        db, activations = self._tick(self._unwalled())
+        assert activations == []
+        assert _decision_triggers(db) == ["emergence_pending"]
+        um._emerged_tier_streak.update(tier=1, count=1)
+        db, activations = self._tick(self._unwalled())
+        assert activations == []
+        assert _decision_triggers(db) == ["residency_blocked"]
+
+    @pytest.mark.parametrize("walled, wall", WALLS + [("_unwalled", None)])
+    def test_the_decision_detail_records_the_wall(self, walled, wall):
+        db, _ = self._tick(getattr(self, walled)())
+        assert db.record_decision.call_args.kwargs["detail"]["wall"] == wall
+
+    def test_each_candidate_row_names_its_wall(self):
+        """F3: the decision log explains a candidate that the wall filter
+        rejected, by account id (the rows keep their email field as before)."""
+        resets = _resets_in(72)
+        active = _ultra(1, usage_5h=None, usage_7d=60.0, model_pct=40, model_active=True,
+                        cached_7d_resets_at=resets)
+        fable_walled = _ultra(2, usage_5h=None, usage_7d=30.0, model_pct=100,
+                              model_active=True, cached_7d_resets_at=resets)
+        sonnet_bound = _ultra(3, usage_5h=None, usage_7d=30.0, cached_7d_resets_at=resets)
+        sonnet_bound["cached_usage_raw"] = _sonnet_bound_raw(99, resets)
+        healthy = _ultra(4, usage_5h=None, usage_7d=30.0, cached_7d_resets_at=resets)
+        db = _db_with_rows([active, fable_walled, sonnet_bound, healthy])
+
+        _run_one_tick(_make_app(db=db))
+
+        rows = {r["id"]: r for r in db.record_decision.call_args.kwargs["detail"]["candidates"]}
+        assert (rows[2]["wall"], rows[2]["serves_model"]) == (
+            "model weekly critical: Fable 100.0% >= 98%", False)
+        assert (rows[3]["wall"], rows[3]["serves_model"]) == (None, False)
+        assert (rows[4]["wall"], rows[4]["serves_model"]) == (None, True)
+
+
+@pytest.mark.usefixtures("_fresh_auth_usage_state")
+class TestWallWithNoTargetIsNotAStall:
+    """F6: a walled account with no target and a fresh reading is
+    exhaustion. The no_target decision, the exhaustion WARNING and the
+    all_accounts_exhausted banner report it; the stall watchdog does not
+    add an ERROR and an auto_swap_stall broadcast every 30 minutes."""
+
+    def _walled(self, id, **kw):
+        return _ultra(id, usage_5h=None, usage_7d=100.0, cached_7d_resets_at=_resets_in(72), **kw)
+
+    def _twelve_ticks(self, accounts, caplog):
+        ws = AsyncMock()
+        db = _db_with_rows(accounts)
+        with caplog.at_level(logging.ERROR, logger="jacked.api.usage_monitor"):
+            _run_one_tick(_make_app(db=db, ws_registry=ws), max_sleeps=11)
+        assert len(_decision_actions(db)) == 12  # 12 ticks, past _STALL_TICK_THRESHOLD
+        stalled = [r for r in caplog.records if r.getMessage().startswith("Auto-swap stalled")]
+        return db, stalled, _broadcasts(ws, "auto_swap_stall")
+
+    def test_twelve_walled_no_target_ticks_with_fresh_usage_never_stall(self, caplog):
+        db, stalled, broadcasts = self._twelve_ticks([self._walled(1), self._walled(2)], caplog)
+        assert set(_decision_triggers(db)) == {"no_target"}
+        assert stalled == []
+        assert broadcasts == []
+
+    def test_the_same_ticks_with_stale_usage_still_stall(self, caplog):
+        stale = int(time.time()) - um._STALL_USAGE_STALENESS_SECONDS - 200
+        _db, stalled, broadcasts = self._twelve_ticks(
+            [self._walled(1, usage_cached_at=stale), self._walled(2)], caplog,
+        )
+        assert stalled
+        assert broadcasts
+
+    def test_a_drained_unwalled_account_with_no_target_still_stalls(self, caplog, monkeypatch):
+        """Pattern (c) keeps its pre-existing policy: a T1 account drained to
+        its target (90 here) but under its wall (98) is a stall."""
+        from jacked.web.auto_swap import tiers
+
+        monkeypatch.setattr(tiers, "_t1_deadline_target", lambda *a, **k: 90.0)
+        drained = _ultra(1, usage_5h=None, usage_7d=95.0, cached_7d_resets_at=_resets_in(36))
+        db, stalled, broadcasts = self._twelve_ticks([drained, self._walled(2)], caplog)
+        assert all(r.startswith("swap warranted (drained:") for r in _decision_reasons(db))
+        assert stalled
+        assert broadcasts

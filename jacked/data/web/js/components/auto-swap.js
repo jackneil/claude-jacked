@@ -56,14 +56,17 @@ async function loadDecisionLog(showAll) {
 // Render
 // ---------------------------------------------------------------------------
 
-function renderAutoSwapPanel() {
-    const s = window.jackedState.swapSettings || {};
+// The "Swap on the 5-hour window" toggle controls these two sliders
+// ([slider id, row id]) and no other control.
+const SWAP_5H_RULE_ROWS = [['rng-warn-5h', 'row-warn-5h'], ['rng-crit-5h', 'row-crit-5h']];
+// The dim of a row whose control is disabled (as on a locked remote-access row).
+const SWAP_5H_DIM_CLASS = 'opacity-60';
 
-    const autoSwapEnabled = s.auto_swap_enabled || false;
-    const warn5h = s.auto_swap_5h_warning ?? 80;
-    const crit5h = s.auto_swap_5h_critical ?? 90;
-    const thresh7d = s.auto_swap_7d_threshold ?? 85;
-    const checkInterval = s.usage_check_interval ?? 300;
+// The pause block of the panel: the notice, the badge, and the pause menu or
+// the Resume button. It renders inside #swap-pause-state, so a pause change
+// renders this block again in place (_refreshSwapPauseState) and an open
+// panel stays open.
+function renderSwapPauseState(s) {
     const pausedUntil = s.auto_swap_paused_until || null;
 
     // Compute pause status
@@ -90,6 +93,40 @@ function renderAutoSwapPanel() {
     const pausedNotice = isPaused
         ? `<div class="text-xs text-amber-400">Auto-swap paused until ${escapeHtml(pausedUntilTime)}${isManualSwitchPause ? ' (manual switch)' : ''}</div>`
         : '';
+
+    return `
+        ${pausedNotice}
+        <!-- Pause / Snooze -->
+        <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2">
+                <span class="text-slate-400 text-sm">Pause Auto-Swap</span>
+                ${isPaused ? `<span class="text-xs px-2 py-0.5 bg-amber-600/20 text-amber-400 border border-amber-600/30 rounded">Paused: ${escapeHtml(pauseLabel)} left</span>` : ''}
+            </div>
+            <div class="flex items-center gap-1.5">
+                ${isPaused
+                    ? '<button id="btn-swap-resume" class="text-xs px-2.5 py-1 bg-teal-600/20 text-teal-400 border border-teal-600/30 rounded hover:bg-teal-600/30 transition active:scale-[0.96]">Resume</button>'
+                    : `<select id="sel-swap-pause" class="bg-slate-700 border border-slate-600 text-slate-300 text-xs rounded px-2 py-1 cursor-pointer hover:border-slate-500 transition-colors">
+                            <option value="">Not paused</option>
+                            <option value="30">30 min</option>
+                            <option value="60">1 hour</option>
+                            <option value="120">2 hours</option>
+                        </select>`}
+            </div>
+        </div>
+    `;
+}
+
+function renderAutoSwapPanel() {
+    const s = window.jackedState.swapSettings || {};
+
+    const autoSwapEnabled = s.auto_swap_enabled || false;
+    const fiveHourRules = s.auto_swap_5h_rules_enabled || false;
+    // While the 5-hour rules are off, the two 5-hour sliders change nothing.
+    const fiveHourSliderOff = fiveHourRules ? '' : ' disabled';
+    const fiveHourRowClass = fiveHourRules ? '' : ` class="${SWAP_5H_DIM_CLASS}"`;
+    const warn5h = s.auto_swap_5h_warning ?? 80;
+    const crit5h = s.auto_swap_5h_critical ?? 90;
+    const checkInterval = s.usage_check_interval ?? 300;
 
     const swapsLast24h = window.jackedState.swapsLast24h;
     const counterText = swapsLast24h == null ? '' : `${swapsLast24h} swaps / 24h`;
@@ -133,55 +170,44 @@ function renderAutoSwapPanel() {
                                         <span class="toggle-slider"></span>
                                     </label>
                                 </div>
-                                ${pausedNotice}
 
-                                <!-- Pause / Snooze -->
-                                <div class="flex items-center justify-between">
-                                    <div class="flex items-center gap-2">
-                                        <span class="text-slate-400 text-sm">Pause Auto-Swap</span>
-                                        ${isPaused ? `<span class="text-xs px-2 py-0.5 bg-amber-600/20 text-amber-400 border border-amber-600/30 rounded">Paused: ${escapeHtml(pauseLabel)} left</span>` : ''}
+                                <!-- Pause notice and Pause / Snooze row (rendered again in place on a pause change) -->
+                                <div id="swap-pause-state" class="space-y-4">${renderSwapPauseState(s)}</div>
+
+                                <!-- 5-hour rules: the toggle and the two 5-hour sliders it controls -->
+                                <div class="border-t border-slate-700/50 pt-4 space-y-4">
+                                    <div class="flex items-start justify-between gap-3">
+                                        <div class="min-w-0 flex-1">
+                                            <label for="chk-swap-5h-rules" class="text-slate-400 text-sm">Swap on the 5-hour window</label>
+                                            <p id="help-swap-5h-rules" class="text-xs text-slate-400 mt-1 text-pretty">Off: jacked does not leave an account for its 5-hour window. It still leaves an account whose weekly limit or model limit reaches the critical level of the plan (98% by default). It still moves to an account with a better 7-day position. Each swap makes the new account read the whole session again, and a 5-hour limit resets within hours. On: the two 5-hour thresholds below also start a swap.</p>
+                                        </div>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="chk-swap-5h-rules" aria-describedby="help-swap-5h-rules" ${fiveHourRules ? 'checked' : ''}>
+                                            <span class="toggle-slider"></span>
+                                        </label>
                                     </div>
-                                    <div class="flex items-center gap-1.5">
-                                        ${isPaused
-                                            ? '<button id="btn-swap-resume" class="text-xs px-2.5 py-1 bg-teal-600/20 text-teal-400 border border-teal-600/30 rounded hover:bg-teal-600/30 transition active:scale-[0.96]">Resume</button>'
-                                            : `<select id="sel-swap-pause" class="bg-slate-700 border border-slate-600 text-slate-300 text-xs rounded px-2 py-1 cursor-pointer hover:border-slate-500 transition-colors">
-                                                    <option value="">Not paused</option>
-                                                    <option value="30">30 min</option>
-                                                    <option value="60">1 hour</option>
-                                                    <option value="120">2 hours</option>
-                                                </select>`}
+
+                                    <!-- 5h Warning Threshold -->
+                                    <div id="row-warn-5h"${fiveHourRowClass}>
+                                        <div class="flex items-center justify-between mb-1">
+                                            <label for="rng-warn-5h" class="text-slate-400 text-sm">5h Warning Threshold</label>
+                                            <span class="text-slate-300 text-sm font-mono tabular-nums" id="lbl-warn-5h">${warn5h}%</span>
+                                        </div>
+                                        <input type="range" id="rng-warn-5h" min="50" max="100" value="${warn5h}" class="w-full accent-teal-500 h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer disabled:cursor-not-allowed"${fiveHourSliderOff}>
+                                    </div>
+
+                                    <!-- 5h Critical Threshold -->
+                                    <div id="row-crit-5h"${fiveHourRowClass}>
+                                        <div class="flex items-center justify-between mb-1">
+                                            <label for="rng-crit-5h" class="text-slate-400 text-sm">5h Critical Threshold</label>
+                                            <span class="text-slate-300 text-sm font-mono tabular-nums" id="lbl-crit-5h">${crit5h}%</span>
+                                        </div>
+                                        <input type="range" id="rng-crit-5h" min="50" max="100" value="${crit5h}" class="w-full accent-teal-500 h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer disabled:cursor-not-allowed"${fiveHourSliderOff}>
                                     </div>
                                 </div>
 
-                                <!-- 5h Warning Threshold -->
-                                <div>
-                                    <div class="flex items-center justify-between mb-1">
-                                        <span class="text-slate-400 text-sm">5h Warning Threshold</span>
-                                        <span class="text-slate-300 text-sm font-mono tabular-nums" id="lbl-warn-5h">${warn5h}%</span>
-                                    </div>
-                                    <input type="range" id="rng-warn-5h" min="50" max="100" value="${warn5h}" class="w-full accent-teal-500 h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer">
-                                </div>
-
-                                <!-- 5h Critical Threshold -->
-                                <div>
-                                    <div class="flex items-center justify-between mb-1">
-                                        <span class="text-slate-400 text-sm">5h Critical Threshold</span>
-                                        <span class="text-slate-300 text-sm font-mono tabular-nums" id="lbl-crit-5h">${crit5h}%</span>
-                                    </div>
-                                    <input type="range" id="rng-crit-5h" min="50" max="100" value="${crit5h}" class="w-full accent-teal-500 h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer">
-                                </div>
-
-                                <!-- 7-Day Threshold -->
-                                <div>
-                                    <div class="flex items-center justify-between mb-1">
-                                        <span class="text-slate-400 text-sm">7-Day Threshold</span>
-                                        <span class="text-slate-300 text-sm font-mono tabular-nums" id="lbl-thresh-7d">${thresh7d}%</span>
-                                    </div>
-                                    <input type="range" id="rng-thresh-7d" min="50" max="100" value="${thresh7d}" class="w-full accent-teal-500 h-1.5 bg-slate-700 rounded-full appearance-none cursor-pointer">
-                                </div>
-
-                                <!-- Usage Check Interval -->
-                                <div class="flex items-center justify-between">
+                                <!-- Usage Check Interval: not a 5-hour rule, so a divider closes the group above -->
+                                <div id="row-check-interval" class="flex items-center justify-between border-t border-slate-700/50 pt-4">
                                     <span class="text-slate-400 text-sm">Usage Check Interval</span>
                                     <select id="sel-check-interval" class="bg-slate-700 border border-slate-600 text-slate-300 text-sm rounded px-3 py-1.5 cursor-pointer hover:border-slate-500 transition-colors">
                                         <option value="60" ${checkInterval === 60 ? 'selected' : ''}>1 min</option>
@@ -415,6 +441,23 @@ const TIER_TOOLTIPS = {
     4: 'No 7d data, or the window already expired. Excluded from selection.',
 };
 
+// The Wall column of the candidate table (#224i): why the wall filter
+// rejects a candidate. A walled departure reason (wall) shows its first
+// word: "weekly critical: ..." gives "weekly", "model weekly critical: ..."
+// gives "model", and the full reason is the tooltip. A candidate that cannot
+// serve the model of the active account (serves_model false) shows "model".
+// Else a plain "-": a row logged before these fields has neither.
+const WALL_NO_MODEL_TITLE = 'This account cannot serve the model of the active account.';
+
+function candidateWall(c) {
+    if (c.wall) {
+        const reason = String(c.wall);
+        return { label: reason.trim().split(/[\s:]/)[0], title: reason };
+    }
+    if (c.serves_model === false) return { label: 'model', title: WALL_NO_MODEL_TITLE };
+    return { label: '-', title: '' };
+}
+
 function buildDecisionDetailHtml(d, detailId) {
     const parts = [];
 
@@ -442,6 +485,7 @@ function buildDecisionDetailHtml(d, detailId) {
             '<th class="pr-2 text-right">Target</th>' +
             '<th class="pr-2 text-right">Deficit</th>' +
             '<th class="pr-2 text-center">Best</th>' +
+            '<th class="pr-2">Wall</th>' +
             '</tr></thead><tbody>';
 
         d.candidates.forEach(function(c) {
@@ -457,6 +501,10 @@ function buildDecisionDetailHtml(d, detailId) {
                 deficitStr = (deficit >= 0 ? '+' : '') + deficit.toFixed(1) + '%';
             }
             const bestStr = isBest ? '\u2713' : '';
+            const wall = candidateWall(c);
+            const wallCell = wall.title
+                ? '<span title="' + escapeHtml(wall.title) + '" class="cursor-help">' + escapeHtml(wall.label) + '</span>'
+                : escapeHtml(wall.label);
             table += '<tr class="' + rowCls + '">' +
                 '<td class="pr-2">' + escapeHtml(c.label || c.email || '?') + '</td>' +
                 '<td class="pr-2 text-right">' + escapeHtml(fivehStr) + '</td>' +
@@ -467,6 +515,7 @@ function buildDecisionDetailHtml(d, detailId) {
                 '<td class="pr-2 text-right">' + escapeHtml(targetStr) + '</td>' +
                 '<td class="pr-2 text-right">' + escapeHtml(deficitStr) + '</td>' +
                 '<td class="pr-2 text-center text-teal-300">' + bestStr + '</td>' +
+                '<td class="pr-2">' + wallCell + '</td>' +
                 '</tr>';
         });
         table += '</tbody></table>';
@@ -534,16 +583,24 @@ function renderExhaustionBanner() {
         const now = Date.now();
         const diffMin = Math.max(0, Math.ceil((recoverAt.getTime() - now) / 60000));
         // The recovery time is the earliest moment an account has usage
-        // again: the reset of the window that walls it (next_recovery_window,
-        // "5h" or "7d"). Name that window: a model limit (Fable, for
-        // example) can still be full after it resets. No em-dashes: this is
-        // user-facing copy.
-        const windowName = { '5h': 'The 5-hour limit', '7d': 'The weekly limit' }[data.next_recovery_window];
-        if (diffMin > 0) {
+        // again: the reset of the window that walls it (next_recovery_window:
+        // "5h", "7d", or "model" for a model limit such as the weekly Fable
+        // limit, whose name is next_recovery_label). Name that window: a
+        // model limit can still be full after a 5h or 7d reset. A model
+        // limit can reset days away, so its text gives the reset time in the
+        // format of the account cards (formatResetTime). No em-dashes: this
+        // is user-facing copy.
+        const isModel = data.next_recovery_window === 'model';
+        const windowName = isModel
+            ? `The ${String(data.next_recovery_label || '').trim() || 'model'} limit`
+            : { '5h': 'The 5-hour limit', '7d': 'The weekly limit' }[data.next_recovery_window];
+        if (diffMin <= 0) {
+            recoveryText = windowName ? `${windowName} should reset soon` : 'Usage should be available again soon';
+        } else if (isModel) {
+            recoveryText = `${windowName} ${formatResetTime(data.next_recovery_at)}`;
+        } else {
             const span = diffMin > 60 ? `${Math.floor(diffMin/60)}h ${diffMin%60}m` : `${diffMin}m`;
             recoveryText = windowName ? `${windowName} resets in ${span}` : `Usage is available again in ${span}`;
-        } else {
-            recoveryText = windowName ? `${windowName} should reset soon` : 'Usage should be available again soon';
         }
     }
     el.classList.remove('hidden');
@@ -552,7 +609,7 @@ function renderExhaustionBanner() {
             <svg class="w-5 h-5 shrink-0 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
             <div>
                 <div class="font-medium">All accounts at capacity</div>
-                <div class="text-xs text-red-300 mt-0.5">${recoveryText}</div>
+                <div class="text-xs text-red-300 mt-0.5">${escapeHtml(recoveryText)}</div>
             </div>
         </div>
     `;
@@ -703,6 +760,55 @@ function showSameTierAdvisory(data) {
 // Event binding
 // ---------------------------------------------------------------------------
 
+// Goes up by one at each pause change that this page makes (a pause, a
+// resume). A save whose response the server read before such a change must
+// not undo it (_saveSwapSettings).
+let _swapPauseEpoch = 0;
+
+// Render the pause block again from window.jackedState.swapSettings, in
+// place, and bind its new pause menu or Resume button.
+function _refreshSwapPauseState() {
+    const slot = document.getElementById('swap-pause-state');
+    if (!slot) return;
+    slot.innerHTML = renderSwapPauseState(window.jackedState.swapSettings || {});
+    _bindSwapPauseEvents();
+}
+
+function _bindSwapPauseEvents() {
+    const pauseSel = document.getElementById('sel-swap-pause');
+    if (pauseSel) {
+        pauseSel.addEventListener('change', async () => {
+            const minutes = parseInt(pauseSel.value);
+            if (!minutes) return;
+            try {
+                const res = await api.post(`/api/settings/swap-pause?minutes=${minutes}`);
+                window.jackedState.swapSettings.auto_swap_paused_until = res.paused_until;
+                window.jackedState._uiPauseUntil = res.paused_until;
+                _swapPauseEpoch++;
+                showToast(`Auto-swap paused for ${minutes} min`, 'success', 3000);
+                _refreshSwapPauseState();
+            } catch (e) {
+                showToast(e.message || 'Failed to pause', 'error');
+            }
+        });
+    }
+    const resumeBtn = document.getElementById('btn-swap-resume');
+    if (resumeBtn) {
+        resumeBtn.addEventListener('click', async () => {
+            try {
+                await api.post('/api/settings/swap-resume');
+                window.jackedState.swapSettings.auto_swap_paused_until = null;
+                window.jackedState._uiPauseUntil = null;
+                _swapPauseEpoch++;
+                showToast('Auto-swap resumed', 'success', 2000);
+                _refreshSwapPauseState();
+            } catch (e) {
+                showToast(e.message || 'Failed to resume', 'error');
+            }
+        });
+    }
+}
+
 function bindAutoSwapEvents() {
     // Collapsible panel toggle
     const toggleBtn = document.getElementById('btn-toggle-swap-panel');
@@ -719,45 +825,22 @@ function bindAutoSwapEvents() {
     }
 
     // Pause / Resume
-    const pauseSel = document.getElementById('sel-swap-pause');
-    if (pauseSel) {
-        pauseSel.addEventListener('change', async () => {
-            const minutes = parseInt(pauseSel.value);
-            if (!minutes) return;
-            try {
-                const res = await api.post(`/api/settings/swap-pause?minutes=${minutes}`);
-                window.jackedState.swapSettings.auto_swap_paused_until = res.paused_until;
-                window.jackedState._uiPauseUntil = res.paused_until;
-                showToast(`Auto-swap paused for ${minutes} min`, 'success', 3000);
-                if (typeof renderPage === 'function') renderPage();
-            } catch (e) {
-                showToast(e.message || 'Failed to pause', 'error');
-            }
-        });
-    }
-    const resumeBtn = document.getElementById('btn-swap-resume');
-    if (resumeBtn) {
-        resumeBtn.addEventListener('click', async () => {
-            try {
-                await api.post('/api/settings/swap-resume');
-                window.jackedState.swapSettings.auto_swap_paused_until = null;
-                window.jackedState._uiPauseUntil = null;
-                showToast('Auto-swap resumed', 'success', 2000);
-                if (typeof renderPage === 'function') renderPage();
-            } catch (e) {
-                showToast(e.message || 'Failed to resume', 'error');
-            }
-        });
-    }
+    _bindSwapPauseEvents();
 
     // Slider live labels
     _bindSliderLabel('rng-warn-5h', 'lbl-warn-5h');
     _bindSliderLabel('rng-crit-5h', 'lbl-crit-5h');
-    _bindSliderLabel('rng-thresh-7d', 'lbl-thresh-7d');
+
+    // The 5-hour rules toggle enables or disables its two sliders at once,
+    // without a reload. The save below runs on the same change.
+    const fiveHourRules = document.getElementById('chk-swap-5h-rules');
+    if (fiveHourRules) {
+        fiveHourRules.addEventListener('change', () => _apply5hRulesState(fiveHourRules.checked));
+    }
 
     // Save on any change (debounced)
     const inputIds = [
-        'chk-auto-swap', 'rng-warn-5h', 'rng-crit-5h', 'rng-thresh-7d',
+        'chk-auto-swap', 'chk-swap-5h-rules', 'rng-warn-5h', 'rng-crit-5h',
         'sel-check-interval', 'chk-window-keeper',
         'inp-active-start', 'inp-active-end', 'inp-pre-wake',
     ];
@@ -772,6 +855,15 @@ function bindAutoSwapEvents() {
     }
 }
 
+function _apply5hRulesState(enabled) {
+    for (const [sliderId, rowId] of SWAP_5H_RULE_ROWS) {
+        const slider = document.getElementById(sliderId);
+        if (slider) slider.disabled = !enabled;
+        const row = document.getElementById(rowId);
+        if (row) row.classList.toggle(SWAP_5H_DIM_CLASS, !enabled);
+    }
+}
+
 function _bindSliderLabel(sliderId, labelId) {
     const slider = document.getElementById(sliderId);
     const label = document.getElementById(labelId);
@@ -783,21 +875,32 @@ function _bindSliderLabel(sliderId, labelId) {
 }
 
 async function _saveSwapSettings() {
+    // The pause (auto_swap_paused_until) is not sent: it has its own
+    // endpoints, and the server keeps it when a save does not send it.
     const settings = {
         auto_swap_enabled: document.getElementById('chk-auto-swap')?.checked || false,
+        auto_swap_5h_rules_enabled: document.getElementById('chk-swap-5h-rules')?.checked || false,
         auto_swap_5h_warning: parseInt(document.getElementById('rng-warn-5h')?.value) || 80,
         auto_swap_5h_critical: parseInt(document.getElementById('rng-crit-5h')?.value) || 90,
-        auto_swap_7d_threshold: parseInt(document.getElementById('rng-thresh-7d')?.value) || 85,
         usage_check_interval: parseInt(document.getElementById('sel-check-interval')?.value) || 300,
         window_keeper_enabled: document.getElementById('chk-window-keeper')?.checked || false,
         window_keeper_active_start: document.getElementById('inp-active-start')?.value || '06:00',
         window_keeper_active_end: document.getElementById('inp-active-end')?.value || '23:00',
         window_keeper_prewake: document.getElementById('inp-pre-wake')?.value || '04:00',
     };
+    const pauseEpoch = _swapPauseEpoch;
 
     try {
-        await api.put('/api/settings/swap-settings', settings);
-        window.jackedState.swapSettings = settings;
+        const stored = await api.put('/api/settings/swap-settings', settings);
+        // The response is the stored state: the server keeps the pause that
+        // this save did not send, and reads it back. So the panel shows a
+        // pause that another client set (a manual switch, the menu bar). A
+        // pause or a resume made on this page while the save was in flight
+        // is newer than the pause in the response, so it stays.
+        const fromServer = stored && typeof stored === 'object' ? { ...stored } : {};
+        if (pauseEpoch !== _swapPauseEpoch) delete fromServer.auto_swap_paused_until;
+        window.jackedState.swapSettings = { ...window.jackedState.swapSettings, ...settings, ...fromServer };
+        _refreshSwapPauseState();
         showToast('Settings saved', 'success', 2000);
     } catch (e) {
         console.error('Failed to save swap settings:', e);

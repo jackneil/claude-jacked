@@ -1,4 +1,9 @@
-"""Selection rule and departure decision (tier-aware unified flow)."""
+"""Selection rule and departure decision (tier-aware unified flow).
+
+The wall policy (rules 2a/2b and the walled-candidate skip) lives in
+:mod:`jacked.web.auto_swap.walls`; this module re-exports its two reason
+prefixes.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +27,14 @@ from jacked.web.auto_swap.tiers import (
     target_for_tier,
     tier_for,
 )
+from jacked.web.auto_swap.walls import (
+    REASON_PREFIX_MODEL_WEEKLY as REASON_PREFIX_MODEL_WEEKLY,
+    REASON_PREFIX_WEEKLY_CRITICAL as REASON_PREFIX_WEEKLY_CRITICAL,
+    _cannot_serve,
+    _epoch_or_inf,
+    _protected_model_key,
+    walled_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +45,12 @@ def _resets_within_at(
     """``now``-aware variant of ``_resets_within`` for testable code paths.
 
     Returns True if the window resets within ``minutes`` of the supplied
-    ``now`` (must be tz-aware UTC). False for None, past timestamps, or
-    parse errors. Mirrors ``burn._resets_within`` but accepts an injected
-    clock so tests using a frozen ``now`` are deterministic.
+    ``now`` (must be tz-aware UTC). False for None, a value that is not a
+    string (a provider payload can carry any JSON type), past timestamps,
+    or parse errors. Mirrors ``burn._resets_within`` but accepts an
+    injected clock so tests using a frozen ``now`` are deterministic.
     """
-    if resets_at is None:
+    if not isinstance(resets_at, str):
         return False
     try:
         reset_dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
@@ -114,23 +128,6 @@ class _SortKey:
     neg_deficit: float        # negated deficit so larger raw deficit -> smaller key
 
 
-def _epoch_or_inf(resets_at: str | None) -> float:
-    """Parse an ISO reset timestamp to UTC epoch seconds for chronological
-    sorting. Lexicographic string sort diverges from chronological for mixed
-    formats (Z suffix vs explicit offsets), so the key must be numeric.
-    float('inf') on missing/unparseable values (sorts last).
-    """
-    if not resets_at:
-        return float("inf")
-    try:
-        dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except (ValueError, TypeError):
-        return float("inf")
-
-
 def pick_best_target(
     accounts: list[dict],
     current_id: int,
@@ -149,7 +146,16 @@ def pick_best_target(
        invalid, no token, auto_swap_enabled=0, no 5h headroom,
        no viable 7d headroom (bypassed for T0 with deficit >= 1.0 —
        drain-to-100 must not strand the final slice below the
-       burn-per-window floor), deficit<=0, tier=excluded.
+       burn-per-window floor), deficit<=0, tier=excluded, and two
+       walled cases (#224i, ``walls._cannot_serve``): a candidate whose
+       limit for the active account's binding model is at its weekly
+       threshold (it cannot serve the model the user works on), and a
+       candidate that the walled departure rules 2a/2b of
+       ``should_swap_now`` would eject on the next tick (the swap would
+       undo itself: a ping-pong). The threshold is each candidate's own
+       plan field (``weekly_critical_threshold``): the same threshold
+       rules 2a/2b apply to that account once it is active. The T0
+       burn-floor bypass does not override this skip.
     2. Pick the candidate that minimizes (tier_index, resets_at_epoch,
        -deficit). See ``_SortKey`` for the sign convention.
     3. ``active_start``/``active_end`` feed ``has_viable_headroom`` (the
@@ -168,14 +174,18 @@ def pick_best_target(
     ``cached_usage_5h``, ``cached_usage_7d``, and the plan fields
     ``provider``, ``subscription_type``, ``rate_limit_tier`` and
     ``cached_usage_raw``. The plan fields decide, through the plan catalog,
-    whether the account has a 5h window at all (``_has_5h_headroom``) and
-    how long its weekly window is (``white_bar`` in the T2/T3 targets). The
-    plan resolver also reads ``profile_json``, but only for the plan name,
-    and no decision here uses the name. Nothing else is consulted —
-    do NOT add fields here without updating callers and tests.
+    whether the account has a 5h window at all (``_has_5h_headroom``), how
+    long its weekly window is (``white_bar`` in the T2/T3 targets) and its
+    weekly threshold (``weekly_critical_pct``). ``cached_usage_raw`` also
+    gives the per-model weekly limits of each candidate and of the current
+    account (its binding model). The plan resolver also reads
+    ``profile_json``, but only for the plan name, and no decision here uses
+    the name. Nothing else is consulted: do NOT add fields here without
+    updating callers and tests.
     """
     now = _resolve_now(now)
     prev_tiers = prev_tiers or {}
+    protected_key = _protected_model_key(accounts, current_id)
 
     candidates: list[tuple[_SortKey, dict]] = []
     for a in accounts:
@@ -208,11 +218,15 @@ def pick_best_target(
         if deficit <= 0:
             continue
         # T0 drains to 100: the burn-per-window floor (~4.2%) would
-        # permanently strand the final slice of every account.
+        # permanently strand the final slice of every account. This bypass
+        # never overrides the walled skip below: an account at its weekly
+        # threshold (98) is no target, T0 or not (#224i).
         if not (tier == TIER_T0 and deficit >= 1.0):
             if not has_viable_headroom(a, active_start, active_end):
                 continue
         if not _has_5h_headroom(a, now=now):
+            continue
+        if _cannot_serve(a, protected_key, now):
             continue
 
         key = _SortKey(
@@ -253,7 +267,9 @@ _TIER_NAMES = {
 
 
 # Reason-string prefixes — DO NOT change these without updating
-# usage_monitor's `_trigger_for_reason` mapping.
+# usage_monitor's `_trigger_for_reason` mapping. The two wall prefixes
+# (REASON_PREFIX_WEEKLY_CRITICAL, REASON_PREFIX_MODEL_WEEKLY) live in
+# walls.py and are imported above.
 REASON_PREFIX_HIGHER_TIER = "higher tier emerged"
 REASON_PREFIX_INTRA_TIER = "intra-tier preemption:"
 REASON_PREFIX_DRAINED = "drained:"
@@ -291,14 +307,27 @@ def should_swap_now(
     prev_tiers: dict[int, int] | None = None,
     active_start: str = "06:00",
     active_end: str = "23:00",
+    five_hour_rules: bool = False,
 ) -> str | None:
     """Return a reason string if the algorithm should swap off ``active``,
     or None to stay.
 
-    Departure rules — DO NOT REORDER. Rules 1/1b are the ONLY rules that
-    override 5h-reset suppression, and rule 1 is the ONLY rule gated by
-    emergence persistence in the caller. Reordering breaks both
-    invariants. See spec
+    Departure rules: DO NOT REORDER. The order is the priority, and the
+    caller's gates depend on it. Reset suppression is per rule:
+
+    - Rules 1, 1b and 2 are independent of all suppression: they fire
+      when the 5h window, the weekly window or a model limit resets soon.
+    - Rules 2a and 2b each suppress on the reset of their own limit (the
+      weekly window, the binding model limit) within
+      RESET_SUPPRESS_MINUTES.
+    - Rules 3 and 4 suppress on the 5h reset.
+
+    Emergence persistence in the caller gates rules 1 and 1b only, and the
+    minimum residency holds rules 1, 1b and 4 only. The caller lifts both
+    gates when the active account is walled (rule 2a or 2b holds), whichever
+    reason wins here. Rules 2a/2b must stay ahead of rules 3/4: a walled
+    account cannot serve, and it must leave even when the 5h rules are off.
+    See spec
     docs/superpowers/specs/2026-05-04-auto-swap-utilization-redesign-design.md.
 
     1. Higher-tier candidate emerged: ``best`` exists with strictly
@@ -316,13 +345,36 @@ def should_swap_now(
     2. Active drained (T0/T1 only): usage_7d >= the active tier's
        target. T2/T3 targets are FLOORS (white_bar baseline), not
        drain-to goals — being above the floor is the desired state.
+    2a. Weekly critical (#224i, any tier): usage_7d >= the threshold AND
+       the 7d reset NOT within RESET_SUPPRESS_MINUTES. The account is
+       walled on its weekly limit and cannot serve.
+    2b. Model weekly critical (#224i, any tier): the binding model limit
+       (the one the provider flags ``is_active``, else the highest; for
+       example the weekly Fable limit) >= the threshold AND its reset NOT
+       within RESET_SUPPRESS_MINUTES.
+       The threshold is the active account's plan field
+       (``weekly_critical_threshold``, 98 today), read by
+       :func:`jacked.web.auto_swap.walls.walled_reason`. Rules 2a/2b fire
+       with or without ``best``: the caller turns a reason with no
+       candidate into the ``no_target`` decision, the exhaustion WARNING
+       and the ``all_accounts_exhausted`` banner, which a user walled on
+       the week needs to see.
     3. Active 5h critical: usage_5h >= critical_5h, AND 5h reset NOT
        imminent (within RESET_SUPPRESS_MINUTES). Also evaluated when
-       the active has no 7d data (TIER_EXCLUDED) — exhaustion alerting
-       must not depend on 7d cache presence.
+       the active has no 7d data (TIER_EXCLUDED): exhaustion alerting
+       must not depend on 7d cache presence. With ``five_hour_rules``
+       off (the default), rules 3 and 4 do not run, so this alerting is
+       off too. For an active account with no 7d data, the walls (rules
+       2a and 2b) are then the only exhaustion signal, and rule 2a needs
+       a 7d reading.
     4. Burn-rate projection: usage_5h >= warning_5h AND projected to
        cross critical within 2 * check_interval_min, AND 5h reset
        not imminent.
+       Rules 3 and 4 run only when ``five_hour_rules`` is True (the
+       ``auto_swap_5h_rules_enabled`` setting, off by default). Every swap
+       makes the new account re-process the whole session context, and a
+       5-hour wall resets within hours, so leaving a 5h-critical account
+       usually costs more than it saves.
 
     ``active_start``/``active_end`` feed the deadline-aware T1 target in
     rule 2 (defaults preserve prior call sites).
@@ -407,6 +459,15 @@ def should_swap_now(
                 f"{REASON_PREFIX_DRAINED} 7d usage {usage_7d:.1f}% >= "
                 f"tier target {target:.1f}%"
             )
+
+    # 2a/2b. Walled on the weekly limit or the binding model limit (each
+    # suppressed when that limit resets soon). No ``best`` required.
+    walled = walled_reason(active, now)
+    if walled is not None:
+        return walled
+
+    if not five_hour_rules:
+        return None
 
     # 3. 5h critical (suppressed if reset imminent)
     if usage_5h >= critical_5h and not suppress_5h:
