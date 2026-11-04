@@ -609,7 +609,8 @@ def run_update(
     from jacked.mixed_generation import preload_upgrade_modules
     from jacked.service.update_refusal import refuser
 
-    _refuse = refuser(parent_pid, log, _write_recovery, wait_for_exit, close=log_fh.close)
+    _refuse = refuser(parent_pid, log, _write_recovery, wait_for_exit, close=log_fh.close, start_fallback=lambda: _spawn_detached(
+        [find_bin("jacked") or "jacked", "service", "start"], log_fh=log_fh))
 
     try:
         preload_upgrade_modules(log=log)
@@ -654,11 +655,10 @@ def run_update(
         # Same posture as the CLI: a machine that cannot take the lock must
         # not start a package install.
         logger.exception("Could not take the update lock")
-        _refuse(  # no lock, so the shared status record stays as it is
+        _refuse(
             f"could not take the update lock ({type(exc).__name__})",
             "Jacked auto-update refused: the update lock could not be taken "
             f"({type(exc).__name__}). Check ~/.claude is writable, then retry.\n",
-            mark_status=False,
         )
         return
     else:

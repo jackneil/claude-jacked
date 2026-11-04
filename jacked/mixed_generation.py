@@ -178,17 +178,30 @@ def lazy_imports(module: str, entry: str | None = None) -> set[str]:
     else:
         top = _top_functions(tree)
         bodies = [top[name] for name in sorted(reachable_functions(tree, entry))]
+    package = module if Path(_origin(module) or "").name == "__init__.py" else module.rpartition(".")[0]
     found: set[str] = set()
     for function in bodies:
         for node in ast.walk(function):
             if isinstance(node, ast.Import):
                 found.update(a.name for a in node.names if _is_jacked(a.name))
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and _is_jacked(node.module):
-                found.add(node.module)
-                found.update(
-                    f"{node.module}.{a.name}" for a in node.names if _is_submodule(f"{node.module}.{a.name}")
-                )
+            elif isinstance(node, ast.ImportFrom):
+                base = _absolute(node, package)
+                if not _is_jacked(base):
+                    continue
+                if node.module:
+                    found.add(base)
+                found.update(f"{base}.{a.name}" for a in node.names if _is_submodule(f"{base}.{a.name}"))
     return found
+
+
+def _absolute(node: ast.ImportFrom, package: str) -> str | None:
+    """The absolute module name of ``from ... import``, relative ones too."""
+    if node.level == 0:
+        return node.module
+    try:
+        return importlib.util.resolve_name("." * node.level + (node.module or ""), package)
+    except (ImportError, ValueError):
+        return None
 
 
 def reachable_functions(tree: ast.Module, entry: str) -> set[str]:
@@ -217,13 +230,18 @@ def _top_functions(tree: ast.Module) -> dict:
     return {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
 
-def _source_tree(module: str) -> ast.Module | None:
+def _origin(module: str) -> str | None:
     try:
         spec = importlib.util.find_spec(module)
-    except (ImportError, ValueError):
+    except Exception:  # find_spec imports the parent package
         return None
     origin = getattr(spec, "origin", None) if spec else None
-    if not origin or not origin.endswith(".py"):
+    return origin if origin and origin.endswith(".py") else None
+
+
+def _source_tree(module: str) -> ast.Module | None:
+    origin = _origin(module)
+    if origin is None:
         return None
     try:
         return ast.parse(Path(origin).read_text(encoding="utf-8"))
@@ -236,9 +254,10 @@ def _is_jacked(name: str | None) -> bool:
 
 
 def _is_submodule(name: str) -> bool:
+    # find_spec imports the parent package, which can raise anything.
     try:
         return importlib.util.find_spec(name) is not None
-    except (ImportError, ValueError):
+    except Exception:
         return False
 
 

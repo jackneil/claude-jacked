@@ -247,6 +247,7 @@ print(sorted(missing))
         monkeypatch.setattr(install_method, "can_auto_upgrade", lambda: gate_calls.append(1) or (False, "never reached"))
         monkeypatch.setattr(updater, "wait_for_exit", lambda pid, timeout=30.0: True)
         monkeypatch.setattr(update_status, "mark_failed", lambda path, error, recovery=None: marked.append(error))
+        monkeypatch.setattr(update_status, "acquire_update_lock", lambda path: _Lock())
         monkeypatch.setattr(platform, "native_restart", lambda: restarts.append(1) or (True, "kickstarted"))
         updater.run_update(parent_pid=1, extras="tray")
         assert gate_calls == []
@@ -260,12 +261,28 @@ print(sorted(missing))
         assert "uv tool install" in recovery
 
 
+class _Lock:
+    def __init__(self):
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
 class TestRefuseAndRestore:
-    def _run(self, *, alive=False, restart=(True, "ok"), mark_status=True, monkeypatch):
+    def _run(self, monkeypatch, *, lock="free", alive=False, restart=(True, "ok"), fallback="ok"):
         from jacked.service import platform, update_status
         from jacked.service.update_refusal import refuser
 
-        lines, recovery, marked, closed = [], [], [], []
+        lines, recovery, marked, closed, started = [], [], [], [], []
+        handle = _Lock()
+
+        def _acquire(path):
+            if lock == "raises":
+                raise OSError("read-only")
+            return None if lock == "busy" else handle
+
+        monkeypatch.setattr(update_status, "acquire_update_lock", _acquire)
         monkeypatch.setattr(update_status, "mark_failed", lambda path, error, recovery=None: marked.append(error))
 
         def _restart():
@@ -273,34 +290,81 @@ class TestRefuseAndRestore:
                 raise restart
             return restart
 
+        def _fallback():
+            if fallback == "raises":
+                raise OSError("no jacked")
+            started.append(1)
+
         monkeypatch.setattr(platform, "native_restart", _restart)
-        refuse = refuser(4242, lines.append, recovery.append, lambda pid, timeout: not alive, close=lambda: closed.append(1))
-        result = refuse("a reason", "recovery text", mark_status=mark_status)
-        return result, lines, recovery, marked, closed
+        refuse = refuser(
+            4242, lines.append, recovery.append, lambda pid, timeout: not alive,
+            close=lambda: closed.append(1), start_fallback=_fallback,
+        )
+        result = refuse("a reason", "recovery text")
+        return {"result": result, "lines": lines, "recovery": recovery, "marked": marked,
+                "closed": closed, "started": started, "lock": handle}
 
-    def test_a_refusal_closes_the_record_and_restarts_the_service(self, monkeypatch):
-        result, lines, recovery, marked, closed = self._run(monkeypatch=monkeypatch)
-        assert result is True
-        assert lines == ["REFUSED: a reason", "Refusal: service restart OK (ok)"]
-        assert recovery == ["recovery text"]
-        assert marked == ["update refused: a reason"]
-        assert closed == [1]
+    def test_with_the_lock_it_closes_the_record_restarts_and_releases(self, monkeypatch):
+        r = self._run(monkeypatch)
+        assert r["result"] is True
+        assert r["lines"] == ["REFUSED: a reason", "Refusal: service restart OK (ok)"]
+        assert r["recovery"] == ["recovery text"]
+        assert r["marked"] == ["update refused: a reason"]
+        assert r["started"] == []
+        assert r["lock"].closed == 1
+        assert r["closed"] == [1]
 
-    def test_a_live_old_service_is_left_alone(self, monkeypatch):
-        result, lines, _, _, closed = self._run(alive=True, monkeypatch=monkeypatch)
-        assert result is False
-        assert lines[-1] == "Refusal: the old service did not exit; nothing restarted"
-        assert closed == [1]
+    @pytest.mark.parametrize("lock", ["busy", "raises"])
+    def test_without_the_lock_neither_the_record_nor_the_service_changes(self, monkeypatch, lock):
+        r = self._run(monkeypatch, lock=lock)
+        assert r["result"] is False
+        assert r["marked"] == [] and r["started"] == []
+        assert r["recovery"] == ["recovery text"]
+        assert "left" in r["lines"][-1]
+        assert r["closed"] == [1]
 
-    def test_without_the_lock_the_status_record_is_not_changed(self, monkeypatch):
-        _, _, _, marked, _ = self._run(mark_status=False, monkeypatch=monkeypatch)
-        assert marked == []
+    def test_a_live_old_service_is_left_alone_and_the_lock_released(self, monkeypatch):
+        r = self._run(monkeypatch, alive=True)
+        assert r["result"] is False
+        assert r["lines"][-1] == "Refusal: the old service did not exit; nothing restarted"
+        assert r["started"] == []
+        assert r["lock"].closed == 1
 
-    def test_a_restart_that_raises_is_logged_and_the_log_still_closes(self, monkeypatch):
-        result, lines, _, _, closed = self._run(restart=RuntimeError("no"), monkeypatch=monkeypatch)
-        assert result is False
-        assert lines[-1] == "Refusal: service restart raised RuntimeError"
-        assert closed == [1]
+    @pytest.mark.parametrize("restart", [(False, "no supervisor artifact"), RuntimeError("no")])
+    def test_a_failed_supervisor_restart_falls_back_to_a_detached_start(self, monkeypatch, restart):
+        r = self._run(monkeypatch, restart=restart)
+        assert r["result"] is False
+        assert r["started"] == [1]
+        assert r["lines"][-2].startswith("Refusal: service restart FAILED (")
+        assert r["lines"][-1] == "Refusal: fallback start spawned"
+        assert r["lock"].closed == 1
+
+    def test_a_fallback_that_raises_is_logged(self, monkeypatch):
+        r = self._run(monkeypatch, restart=(False, "x"), fallback="raises")
+        assert r["lines"][-1] == "Refusal: fallback start raised OSError"
+        assert r["closed"] == [1]
+
+
+class TestWalkEdges:
+    def test_a_relative_lazy_import_is_resolved(self):
+        assert "jacked.codex.credentials" in mixed_generation.lazy_imports("jacked.codex.usage")
+
+    def test_a_find_spec_that_raises_skips_the_name(self, monkeypatch):
+        real = importlib.util.find_spec
+
+        def _find(name, *args):
+            if name.startswith("jacked.service.supervisors.launchd"):
+                raise RuntimeError("broken parent")
+            return real(name, *args)
+
+        monkeypatch.setattr(importlib.util, "find_spec", _find)
+        # The submodule probes under launchd raise; the walk goes on, and a
+        # module named in `from X import` still counts without a probe.
+        found = mixed_generation.lazy_imports("jacked.service.supervisors")
+        assert {"jacked.service.supervisors.launchd", "jacked.service.supervisors.systemd"} <= found
+        # Its own source lookup raises: no source, no lazy imports.
+        assert mixed_generation.lazy_imports("jacked.service.supervisors.launchd") == set()
+        assert mixed_generation._is_submodule("jacked.service.supervisors.launchd.anything") is False
 
 
 class TestNamesFromMissingOnDisk:
