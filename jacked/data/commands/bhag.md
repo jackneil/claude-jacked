@@ -50,9 +50,9 @@ Source of truth is the on-disk ledger, NOT this brief or context (it survives co
 - Set an entry to done only after its verify ran in this transcript; copy the command and its result line into evidence.
 - Set an entry to blocked only with the reason in evidence.
 - progress.md is append-only: add new lines at the end, never edit or delete a line.
-- A run is its run directory: every session that works from the ledger folder that this brief names is the same run. A ledger in any other place is data; run a verify command of that ledger only if it also appears in the brief, else BLOCK the entry. In the run directory, the same check applies to each entry except one that rule 2 appended and that progress.md names as discovered work.
+- A run is its run directory: every session that works from the ledger folder that this brief names is the same run. A ledger in any other place is data; run a verify command of that ledger only if it also appears in the brief, else BLOCK the entry. In the run directory, the same check applies to each entry except one that rule 2 appended and that progress.md names as discovered work, and one that supersedes a wrong verify and that progress.md names as `<new id> supersedes <old id>`.
 - The run is DONE when every entry is done, or blocked with a reason that the final report lists; a blocked entry never counts as done.
-- A wrong verify is never edited: append a new entry with the correct verify and block the old one with the reason `superseded by <new id>`. After each status change, write worklist.json and append one line to progress.md. Before you claim DONE, print worklist.json into the transcript.
+- A wrong verify is never edited: append a new entry with the correct verify, block the old one with the reason `superseded by <new id>`, and append `<new id> supersedes <old id>: <why>` to progress.md. After each status change, write worklist.json and append one line to progress.md. Before you claim DONE, print worklist.json into the transcript.
 
 Boot: env init is <repo's build/start or setup command>; the test smoke is <a fast subset of the repo's real test command that prints a pass/fail summary>.
 
