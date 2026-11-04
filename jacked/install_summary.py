@@ -1,14 +1,32 @@
 """Build + render the install/upgrade change-summary, and persist the record
-the dashboard reads (~/.claude/jacked-last-install.json)."""
+the dashboard reads (.claude/jacked-last-install.json under jacked's home)."""
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from jacked.atomic_io import atomic_write_text
 from jacked.install_manifest import ManifestDiff
 
-DEFAULT_LAST_INSTALL_PATH = Path.home() / ".claude" / "jacked-last-install.json"
+logger = logging.getLogger(__name__)
+
+# The most bytes a last-install record may have before it is read: the same
+# bound the service manifest reader applies (64 KiB). A real record is a few
+# KiB; a larger file is not ours.
+MAX_RECORD_BYTES = 65_536
+
+
+def last_install_path() -> Path:
+    """Return the path of the last-install record, resolved at call time.
+
+    The record lives under jacked's home, which honors ``$JACKED_HOME`` the
+    same way ``jacked install`` resolves it when it writes the record.
+    """
+    from jacked.memory.vault import jacked_home
+
+    return jacked_home() / ".claude" / "jacked-last-install.json"
+
 
 _LABELS = [
     ("skills", "Skills"), ("commands", "Commands"), ("agents", "Agents"),
@@ -66,10 +84,53 @@ def render_terminal(record: dict) -> str:
     return "\n".join(lines)
 
 
-def write_last_install(record: dict, path=DEFAULT_LAST_INSTALL_PATH) -> None:
+def write_last_install(record: dict, path: Path | str | None = None) -> None:
     """Persist the record through the shared atomic writer.
 
+    ``path`` defaults to ``last_install_path()``, resolved at call time.
     A fixed temp name would let `jacked install` and a dashboard upgrade in
     another process replace the record with each other's half-written file.
     """
-    atomic_write_text(Path(path), json.dumps(record, indent=2))
+    target = Path(last_install_path() if path is None else path)
+    atomic_write_text(target, json.dumps(record, indent=2))
+
+
+def read_last_install(path: Path | str | None = None) -> dict | None:
+    """Return the last-install record, or None when no usable record exists.
+
+    ``path`` defaults to ``last_install_path()``, resolved at call time. A
+    missing file is the normal state before the first install. A file that
+    cannot be read or parsed, or that does not hold a JSON object, also
+    gives None. The log line for that case names only the exception class:
+    the path names the user's home and the content is not ours to print.
+
+    >>> import tempfile
+    >>> with tempfile.TemporaryDirectory() as d:
+    ...     p = Path(d) / "last.json"
+    ...     before = read_last_install(p)
+    ...     write_last_install({"to_version": "0.110.2"}, p)
+    ...     before, read_last_install(p)
+    (None, {'to_version': '0.110.2'})
+    """
+    target = Path(last_install_path() if path is None else path)
+    try:
+        size = target.stat().st_size
+        if size > MAX_RECORD_BYTES:
+            logger.debug(
+                "The last-install record is too large (%d bytes); it is not read", size
+            )
+            return None
+        record = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, RecursionError) as exc:
+        # ValueError: bad UTF-8 or bad JSON. RecursionError: JSON nested
+        # deeper than the interpreter allows.
+        logger.debug("Could not read the last-install record: %s", type(exc).__name__)
+        return None
+    if not isinstance(record, dict):
+        logger.debug(
+            "The last-install record is not a JSON object: %s", type(record).__name__
+        )
+        return None
+    return record

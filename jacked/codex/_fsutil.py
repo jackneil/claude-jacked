@@ -137,24 +137,22 @@ def _sha_solo_skill(content: str) -> str:
 
 
 def _copy_tree(src: Path, dst: Path) -> None:
-    """Replace dst with an exact copy of src (no stale sidecars left behind)."""
-    if dst.exists() or dst.is_symlink():
-        if dst.is_dir() and not dst.is_symlink():
-            shutil.rmtree(dst)
-        else:
-            dst.unlink()
+    """Copy src, sidecars included, into the NEW dir dst.
+
+    This is the copy step of the shared skill transaction
+    (`jacked.cli._install_skill_dir_transactional`), which gives it a new
+    private staging dir. It never deletes anything: the publish rename of the
+    transaction replaces the old skill dir as a whole, so no stale sidecar is
+    left. A dst that exists raises FileExistsError and stays as it is."""
     shutil.copytree(src, dst)
 
 
 def _write_solo_skill(skill_dir: Path, content: str) -> None:
-    """Replace skill_dir with a single-file skill (only SKILL.md).
+    """Write a single-file skill (only SKILL.md) into the NEW dir skill_dir.
 
-    Mirrors _copy_tree's replace semantics so a prior pointer-wrapper copy (and
-    any of its sidecars) is wiped, leaving nothing stale behind."""
-    if skill_dir.exists() or skill_dir.is_symlink():
-        if skill_dir.is_dir() and not skill_dir.is_symlink():
-            shutil.rmtree(skill_dir)
-        else:
-            skill_dir.unlink()
+    Like `_copy_tree`, this is a copy step of the shared skill transaction:
+    the publish rename replaces a prior pointer-wrapper dir as a whole, so
+    none of its sidecars is left. A skill_dir that exists raises
+    FileExistsError and stays as it is."""
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")

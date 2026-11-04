@@ -63,6 +63,70 @@ class BindIdentity:
             raise ValueError("port must be between 1 and 65535")
 
 
+# The manifest fields that must hold a non-empty string, and the ones that
+# must hold an integer. The dataclass itself checks no types, and the
+# signature key is the manifest's own nonce, so a writer with the same user
+# can sign a manifest that carries a number where a string belongs. A reader
+# then fails on that field (a slice of the generation, for example) instead
+# of reporting an unreadable manifest.
+_TEXT_FIELDS = (
+    "instance_id",
+    "machine_id",
+    "user_id",
+    "service_id",
+    "build_version",
+    "generation",
+    "supervisor",
+    "control_address",
+    "control_nonce",
+    "signature",
+)
+_INT_FIELDS = ("schema_version", "protocol_version")
+# The largest pid a manifest may name: the same bound process_liveness
+# applies (jacked.service.process._PID_MAX), kept here without an import so
+# this module stays free of the process module (a test pins the equality).
+_PID_MAX = 2**31 - 1
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_field_types(payload: dict[str, Any]) -> None:
+    """Raise ValueError when a manifest field has the wrong type or shape.
+
+    Every caller of ``InstanceManifest.from_dict`` maps ValueError to an
+    unreadable manifest, which is the right verdict for a manifest that
+    jacked did not write.
+    """
+    for name in _TEXT_FIELDS:
+        if not isinstance(payload[name], str) or not payload[name]:
+            raise ValueError(f"manifest field {name} must be a non-empty string")
+    for name in _INT_FIELDS:
+        if not _is_int(payload[name]):
+            raise ValueError(f"manifest field {name} must be an integer")
+    process = payload["process"]
+    if (
+        not isinstance(process, dict)
+        or not _is_int(process.get("pid"))
+        or not 1 <= process["pid"] <= _PID_MAX
+        or not isinstance(process.get("creation_id"), str)
+        or not isinstance(process.get("executable"), str)
+    ):
+        raise ValueError("manifest process identity has the wrong shape")
+    bind = payload["bind"]
+    if (
+        not isinstance(bind, dict)
+        or not isinstance(bind.get("host"), str)
+        or not _is_int(bind.get("port"))
+        or not isinstance(bind.get("quarantine", False), bool)
+    ):
+        raise ValueError("manifest bind identity has the wrong shape")
+    sessions = payload["login_sessions"]
+    if not isinstance(sessions, list) or not all(isinstance(s, str) for s in sessions):
+        raise ValueError("manifest login_sessions must be a list of strings")
+
+
 @dataclass(frozen=True)
 class InstanceManifest:
     schema_version: int
@@ -157,6 +221,7 @@ class InstanceManifest:
         }
         if set(payload) != required:
             raise ValueError("manifest has missing or unknown fields")
+        _check_field_types(payload)
         try:
             manifest = cls(
                 **{

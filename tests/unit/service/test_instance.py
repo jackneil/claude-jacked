@@ -129,6 +129,58 @@ def test_manifest_tamper_is_rejected(tmp_path):
         read_manifest(paths.manifest)
 
 
+@pytest.mark.parametrize(
+    "field, value, match",
+    [
+        ("generation", 7, "generation"),
+        ("supervisor", "", "supervisor"),
+        ("control_address", None, "control_address"),
+        ("schema_version", "1", "schema_version"),
+    ],
+)
+def test_a_signed_manifest_with_a_mistyped_field_is_unreadable(field, value, match):
+    """The signature key is the manifest's own nonce, so a same-user writer can
+    sign a manifest whose generation is a number. The reader must report an
+    unreadable manifest, not fail later on a slice of that field."""
+    from dataclasses import replace
+
+    manifest = _manifest(_spec())
+    tampered = replace(manifest, **{field: value}, signature="")
+    signed = replace(tampered, signature=tampered._calculate_signature())
+    with pytest.raises(ValueError, match=match):
+        InstanceManifest.from_dict(signed.to_dict())
+
+
+@pytest.mark.parametrize("pid", [0, -1, 2**31])
+def test_a_signed_manifest_with_an_out_of_range_pid_is_unreadable(pid):
+    """The pid bound is the one process_liveness applies, so a manifest can
+    never name a pid that the liveness probe would refuse."""
+    from dataclasses import replace
+
+    manifest = _manifest(_spec())
+    tampered = replace(manifest, process=replace(manifest.process, pid=pid), signature="")
+    signed = replace(tampered, signature=tampered._calculate_signature())
+    with pytest.raises(ValueError, match="process identity"):
+        InstanceManifest.from_dict(signed.to_dict())
+
+
+def test_the_manifest_pid_bound_is_the_liveness_bound():
+    from jacked.service import instance_models, process
+
+    assert instance_models._PID_MAX == process._PID_MAX
+
+
+def test_a_signed_manifest_with_a_mistyped_pid_is_unreadable():
+    from dataclasses import replace
+
+    manifest = _manifest(_spec())
+    broken = replace(manifest.process, pid="12")
+    tampered = replace(manifest, process=broken, signature="")
+    signed = replace(tampered, signature=tampered._calculate_signature())
+    with pytest.raises(ValueError, match="process identity"):
+        InstanceManifest.from_dict(signed.to_dict())
+
+
 def test_inspection_reports_exact_owned_and_quarantined_states(tmp_path, monkeypatch):
     paths = ServicePaths.in_directory(tmp_path)
     spec = _spec()

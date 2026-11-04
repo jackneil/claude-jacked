@@ -600,3 +600,25 @@ def test_lifecycle_launchctl_calls_get_the_handoff_sized_timeout(tmp_path):
     assert seen["kickstart"] == launchd_module.LIFECYCLE_CALL_TIMEOUT_SECONDS
     assert seen["print"] == 15 and seen["enable"] == 15
 
+
+
+def test_install_refuses_a_truncated_launchd_plist_without_raising(tmp_path):
+    """The legacy check parsed the unreadable plist again and let expat's
+    ExpatError out of `jacked install`. A plist that is not ours is refused
+    and left in place, and launchd is not touched."""
+    spec, environment, rendered, path = _installed_artifact(
+        tmp_path, SupervisorKind.LAUNCHD
+    )
+    truncated = rendered.content[: len(rendered.content) // 2]
+    path.write_bytes(truncated)
+    runner = Mock(side_effect=AssertionError("a refused install runs no launchctl"))
+
+    result = install_owned_supervisor(
+        spec, path, environment=environment, run=runner, uid=501
+    )
+
+    assert result.ok is False
+    assert result.action == "refused"
+    assert result.reason == "artifact has no valid jacked ownership marker"
+    runner.assert_not_called()
+    assert path.read_bytes() == truncated

@@ -297,6 +297,20 @@ jacked service recover     # reconcile owned drift without PID- or port-based co
 
 If status says **quarantined**, use the dashboard URL it prints. Another process owns 8321, and jacked deliberately leaves that process alone. If status says **ownership indeterminate**, run `jacked service recover`. Recovery hands off a manually started service before it installs the native definition. It also backs up and replaces a known legacy definition that jacked wrote in an earlier version. Recovery refuses a foreign supervisor artifact and prints its exact path. For a foreign artifact, stop that service from its own tray menu, inspect and move the artifact to a backup path, then run recovery again. Do not kill a PID copied from the legacy diagnostic file at `~/.claude/jacked-service.pid`.
 
+An enabled autostart definition can still fail to supervise the running service. For example, launchd does not have the job loaded, or a manual start replaced the supervised service. Then nothing restarts the service after a crash. The `Autostart:` line of `jacked service status` shows `enabled` and the reason in parentheses. When a service runs, the line reads:
+
+```text
+Autostart: enabled (not supervising the running service: launchd job not loaded; run `jacked service restart`)
+```
+
+When no service runs, launchd loads the job again at the next login. Until then, nothing starts the service, and the line reads:
+
+```text
+Autostart: enabled (will not start the service until the next login: launchd job not loaded; run `jacked service restart`)
+```
+
+Run `jacked service restart` to repair it. `jacked doctor` reports the same reason on its `Autostart:` line.
+
 Common issues:
 
 - **Tray icon never appears after install** - the tray ships by default now, so the usual causes are: (a) you passed `jacked install --no-tray`, (b) you're on a **headless** box (no `DISPLAY`/Wayland) where the icon is skipped on purpose, or (c) the service is not running. Run `jacked service status`; use the reported dashboard URL if the service is quarantined, or run `jacked service start` if it is stopped.

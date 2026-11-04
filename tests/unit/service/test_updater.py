@@ -128,6 +128,31 @@ def _script_port_mock(mock, results, run_mock) -> None:
         mock.side_effect = list(results)
 
 
+@pytest.fixture(autouse=True)
+def _stub_native_restart():
+    """Keep the real native lifecycle adapter out of every test in this file.
+
+    The final guard of run_update calls native_restart when a run ends
+    early. Without this stub, that ran the real adapter
+    (provision_service_contract, then restart_native_owned) against the
+    temporary HOME. Only the missing supervisor artifact and the conftest
+    launchctl tripwire stopped it. A test that asserts on native_restart
+    patches its own mock, and that patch replaces this stub for the test.
+    """
+    with patch(
+        "jacked.service.platform.native_restart",
+        return_value=(True, "stubbed native_restart"),
+    ) as stub:
+        yield stub
+
+
+def test_no_test_in_this_file_runs_the_real_native_restart():
+    """The autouse stub is in force for every test in this file."""
+    from jacked.service import platform
+
+    assert platform.native_restart() == (True, "stubbed native_restart")
+
+
 class TestWaitForExit:
     def test_returns_true_when_process_exits(self):
         from jacked.service.updater import wait_for_exit
@@ -320,10 +345,14 @@ class TestRunUpdate:
 
         # Neither the success-path restart nor the Popen fallback ran: the run
         # bailed first. The finally-guard SHOULD have called native_restart.
-        assert mock_restart.called, \
-            "Finally-guard must call native_restart when upgrade bails early"
-        # Log should record the guard firing.
-        assert "Final guard" in (tmp_path / "update.log").read_text()
+        mock_restart.assert_called_once_with()
+        mock_popen.assert_not_called()
+        # The log records the guard firing, and its result (#140i keeps this
+        # early-exit kickstart exactly as it was).
+        log = (tmp_path / "update.log").read_text()
+        assert "Final guard: no restart attempted by upgrade flow. Kickstart." in log
+        assert "Final guard: native_restart OK (test-kickstart)" in log
+        assert "Final guard: skipped" not in log
 
     # Removed in 0.41.19: pip installs are refused by the gate, not auto-upgraded.
 
@@ -587,13 +616,17 @@ class TestUpdaterRollback:
     def _run_update(
         monkeypatch, tmp_path, run_results, listen_results,
         version_answer=None, health_answer=JACKED_HEALTH, clock_step=5.0,
+        lifecycle=(False, "unavailable", "test: manual spawn"),
+        parent_exits=True,
     ):
         """Drive run_update with scripted subprocess, port and probe outcomes.
 
         `listen_results` scripts `is_port_listening` (True = something answers
         on the port) and accepts a bool, a finite list, or a run-count oracle.
         `version_answer` scripts /api/version and `health_answer` /api/health,
-        the two ways a listener can identify itself.
+        the two ways a listener can identify itself. `lifecycle` is the answer
+        of ensure_native_lifecycle; the default forces the manual spawn.
+        `parent_exits` False keeps the old service alive past its wait.
         """
         from jacked.service import updater, update_status as us_mod
 
@@ -603,7 +636,7 @@ class TestUpdaterRollback:
 
         with (
             patch("jacked.service.platform.ensure_native_lifecycle",
-                  return_value=(False, "unavailable", "test: manual spawn")),
+                  return_value=lifecycle),
             patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")),
             patch("jacked.install_method.detect_install_method", return_value="uv"),
             patch("jacked.service.updater.time.sleep", lambda _s: None),
@@ -617,7 +650,7 @@ class TestUpdaterRollback:
             patch("subprocess.run") as run,
             patch("subprocess.Popen") as popen,
             patch("jacked.__version__", "0.95.0"),
-            patch.object(updater, "wait_for_exit", return_value=True),
+            patch.object(updater, "wait_for_exit", return_value=parent_exits),
         ):
             find.side_effect = lambda name: {
                 "uv": "/fake/uv", "jacked": "/fake/jacked",
@@ -756,6 +789,74 @@ class TestUpdaterRollback:
         argvs = [call[0][0] for call in run.call_args_list]
         assert not [a for a in argvs if a[1:] == self.RB_ARGV_TAIL]
         popen.assert_called_once()
+
+    @pytest.mark.parametrize("earlier_failure", [True, False])
+    def test_a_healthy_update_removes_the_recovery_file_of_an_earlier_failure(
+        self, earlier_failure, tmp_path, monkeypatch
+    ):
+        """A good update removes the recovery file an earlier failure left.
+        With no such file there is nothing to remove, and nothing to warn
+        about either."""
+        if earlier_failure:
+            (tmp_path / "recovery.txt").write_text(
+                "Jacked auto-update failed: an earlier run\n", encoding="utf-8"
+            )
+
+        _run, _popen, status, recovery = self._run_update(
+            monkeypatch, tmp_path,
+            run_results=_successful_runs(),
+            listen_results=_comes_up_after(1),
+            version_answer="0.100.0",
+        )
+
+        assert status["overall"] == "succeeded"
+        assert not recovery.exists()
+        log = (tmp_path / "update.log").read_text(encoding="utf-8")
+        assert "Could not remove the update recovery file" not in log
+
+    def test_a_recovery_file_that_cannot_be_removed_is_logged_not_fatal(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """An earlier failure left the recovery file, and this good update
+        cannot remove it (a locked file, a read-only dir). The update stays a
+        success. The refusal is logged at WARNING with the exception class
+        only, never its text, and the update log carries the same line: the
+        detached updater's stderr goes to DEVNULL, so the update log is the
+        record an operator reads."""
+        import logging
+        import pathlib
+
+        stale = tmp_path / "recovery.txt"
+        stale.write_text("Jacked auto-update failed: an earlier run\n", encoding="utf-8")
+        real_unlink = pathlib.Path.unlink
+
+        def refuse(self, *args, **kwargs):
+            if self == stale:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "unlink", refuse)
+        with caplog.at_level(logging.WARNING, logger="jacked.service.updater"):
+            _run, _popen, status, recovery = self._run_update(
+                monkeypatch, tmp_path,
+                run_results=_successful_runs(),
+                listen_results=_comes_up_after(1),
+                version_answer="0.100.0",
+            )
+
+        assert status["overall"] == "succeeded"
+        assert recovery.exists()
+        warned = [
+            r.getMessage() for r in caplog.records
+            if r.name == "jacked.service.updater" and r.levelno == logging.WARNING
+        ]
+        assert warned.count(
+            "Could not remove the update recovery file (PermissionError)"
+        ) == 1, warned
+        assert not any("Permission denied" in w for w in warned), warned
+        log = (tmp_path / "update.log").read_text(encoding="utf-8")
+        assert "WARNING: Could not remove the update recovery file (PermissionError)" in log
+        assert "Permission denied" not in log
 
 
 class TestUpdaterPartialRollback:
@@ -2251,3 +2352,531 @@ class TestSkillPacksRefreshAfterTheService:
         assert status["overall"] == "succeeded"
         packs = [p for p in status["phases"] if p["name"] == "refreshing_packs"]
         assert packs and packs[-1]["status"] == "warning"
+
+
+class TestFinalGuardFollowsTheOutcome:
+    """#140i: the final guard acts on how the run ended.
+
+    The guard used to ask only "did the flow attempt a restart". The
+    port_busy exit never gets to the restart, so the guard then ran
+    native_restart (launchctl kickstart -k on macOS) right after the
+    recovery file said that no port owner was killed. A deliberate
+    hands-off exit now stays hands-off. An early exit or a crash still gets
+    its kickstart, and a run that restarted the service gets no second one.
+    """
+
+    _run_update = staticmethod(TestUpdaterRollback._run_update)
+
+    SKIP_PREFIX = "Final guard: skipped"
+    PORT_BUSY_SKIPPED = (
+        "Final guard: skipped (port held by an unverified listener; "
+        "nothing restarted)"
+    )
+    PARENT_ALIVE_SKIPPED = (
+        "Final guard: skipped (the old service did not exit; nothing restarted)"
+    )
+    KICKSTART = "Final guard: no restart attempted by upgrade flow. Kickstart."
+    PORT_BUSY_RECOVERY = (
+        "Jacked auto-update stopped safely because port 8321 is occupied by an "
+        "unverified listener. No port owner was killed. Run `jacked service "
+        "status` for ownership and quarantine guidance.\n"
+    )
+    PARENT_ALIVE_RECOVERY = (
+        "Jacked auto-update stopped safely because the old service did not "
+        "exit.\nNo process was killed from PID-only evidence. Stop jacked "
+        "normally, then retry.\n"
+    )
+
+    def _drive(self, monkeypatch, tmp_path, kick_result=(True, "test-kickstart"), **kwargs):
+        """Run one update with native_restart mocked, and read its log."""
+        with patch(
+            "jacked.service.platform.native_restart",
+            return_value=kick_result,
+        ) as kick:
+            _run, popen, status, recovery = self._run_update(
+                monkeypatch, tmp_path, **kwargs
+            )
+        log = (tmp_path / "update.log").read_text(encoding="utf-8")
+        return kick, popen, status, recovery, log
+
+    def test_a_port_held_by_an_unverified_listener_is_left_alone(
+        self, tmp_path, monkeypatch
+    ):
+        kick, popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs(),
+            listen_results=True,
+            health_answer=None,   # the holder never answers /api/health
+            clock_step=0.1,
+        )
+
+        popen.assert_not_called()
+        kick.assert_not_called()
+        assert self.PORT_BUSY_SKIPPED in log
+        assert self.KICKSTART not in log
+        # The hands-off exit is the intended behavior, so its recovery text
+        # stays exactly as it was: nothing was killed, and it says so.
+        assert recovery.read_text(encoding="utf-8") == self.PORT_BUSY_RECOVERY
+        # The status record ends failed, names the held port, and gives the
+        # command to run.
+        assert status["overall"] == "failed"
+        assert status["error"] == "port 8321 is held by an unverified listener"
+        assert status["recovery"] == "jacked service status"
+
+    def test_a_rollback_tail_that_finds_the_port_held_is_left_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """The same exit on the restored build's tail is hands-off too."""
+        kick, popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            run_results=[
+                _ok(),                                        # uv install
+                _fail(1, stderr="[FAIL] ValueError: nope"),   # preflight refuses
+                _ok(),                                        # rollback install
+                _ok(),                                        # jacked install --force
+            ],
+            listen_results=True,
+            health_answer=None,
+            clock_step=0.1,
+        )
+
+        popen.assert_not_called()
+        kick.assert_not_called()
+        assert self.PORT_BUSY_SKIPPED in log
+        assert self.KICKSTART not in log
+        assert status["overall"] == "failed"
+        assert "stopped at the service restart step" in recovery.read_text(
+            encoding="utf-8"
+        )
+
+    def test_an_old_service_that_did_not_exit_is_left_alone(
+        self, tmp_path, monkeypatch
+    ):
+        """The parent refusal is hands-off too.
+
+        On macOS the guard's kickstart is `launchctl kickstart -k`, which
+        kills the job, and that job can be the old service that is still
+        alive. The recovery text says that no process was killed.
+        """
+        kick, popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            run_results=[],   # no step may run: the update stops first
+            listen_results=False,
+            parent_exits=False,
+        )
+
+        popen.assert_not_called()
+        kick.assert_not_called()
+        assert self.PARENT_ALIVE_SKIPPED in log
+        assert self.KICKSTART not in log
+        # The recovery text stays as it was. It is true now that the guard
+        # does not kick the job.
+        assert recovery.read_text(encoding="utf-8") == self.PARENT_ALIVE_RECOVERY
+        # The waiting_for_parent phase already closed the record as failed.
+        assert status["overall"] == "failed"
+        assert status["error"] == (
+            "parent process did not exit; ownership cannot be revalidated"
+        )
+        assert status["recovery"] == (
+            "stop the owned service normally, then retry the update"
+        )
+
+    def test_a_restart_that_ran_is_never_logged_as_nothing_restarted(
+        self, tmp_path, monkeypatch
+    ):
+        """A later hands-off exit does not hide an earlier restart."""
+        kick, popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs() + [_ok(), _ok()],  # + the rollback pair
+            # The new build never comes up. Once the rollback has run (four
+            # subprocess calls), an unverified listener holds the port for
+            # the restored build's tail.
+            listen_results=lambda run: run.call_count >= 4,
+            health_answer=None,
+            clock_step=0.1,
+        )
+
+        popen.assert_called_once()   # the new build's start ran
+        kick.assert_not_called()
+        assert self.SKIP_PREFIX not in log
+        assert self.KICKSTART not in log
+        assert status["overall"] == "failed"
+        assert "stopped at the service restart step" in recovery.read_text(
+            encoding="utf-8"
+        )
+
+    def test_a_crash_before_any_restart_still_gets_its_kickstart(
+        self, tmp_path, monkeypatch
+    ):
+        """An unplanned exit leaves the guard pending, so it kicks as before."""
+        with (
+            patch(
+                "jacked.service.platform.native_restart",
+                return_value=(True, "test-kickstart"),
+            ) as kick,
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            self._run_update(
+                monkeypatch, tmp_path,
+                run_results=[RuntimeError("boom")],  # the package step crashes
+                listen_results=False,
+            )
+
+        kick.assert_called_once_with()
+        log = (tmp_path / "update.log").read_text(encoding="utf-8")
+        assert self.KICKSTART in log
+        assert self.SKIP_PREFIX not in log
+
+    @pytest.mark.parametrize(
+        ("lifecycle", "spawn_kicks"),
+        [
+            ((False, "unavailable", "test: manual spawn"), 0),
+            ((True, "just_installed", "test: RunAtLoad started it"), 0),
+            ((True, "already_installed", "test: kickstart"), 1),
+        ],
+        ids=["manual-spawn", "just-installed", "native-restart"],
+    )
+    def test_a_run_that_restarted_the_service_gets_no_guard_kick(
+        self, lifecycle, spawn_kicks, tmp_path, monkeypatch
+    ):
+        """Each restart path records itself, so the guard adds no second kick."""
+        kick, _popen, status, _recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            run_results=_successful_runs(),
+            listen_results=_comes_up_after(1),
+            version_answer="0.100.0",
+            lifecycle=lifecycle,
+        )
+
+        assert status["overall"] == "succeeded"
+        # Only the start step's own kickstart may run, never one from the guard.
+        assert kick.call_count == spawn_kicks
+        assert "Final guard" not in log
+
+    # A wedged listener that IS this installation's own service (pre-mortem
+    # 5): the instance manifest names a live process bound to this port. The
+    # old guard restarted it, and the hands-off exit must not strand it. A
+    # manifest that proves nothing keeps the hands-off exit exactly as built.
+
+    OWN_HELD = (
+        "Port 8321 is held by this installation's own service (pid live) "
+        "that does not answer health; the final guard restarts it"
+    )
+    OWN_HELD_AFTER_A_RESTART = (
+        "Port 8321 is held by this installation's own service (pid live) "
+        "that does not answer health; this run restarted the service once "
+        "already, so the final guard restarts it again"
+    )
+    SECOND_KICK = (
+        "Final guard: this installation's own service still holds the port "
+        "without answering health after this run's restart. Second kickstart."
+    )
+    OWN_ERROR_RESTARTED = (
+        "port 8321 is held by this installation's own service that did not "
+        "answer health; the final guard restarted it"
+    )
+    OWN_ERROR_NOT_RESTARTED = (
+        "port 8321 is held by this installation's own service that did not "
+        "answer health; the final guard could not restart it"
+    )
+    OWN_RESTARTED_RECOVERY = (
+        "Jacked auto-update stopped safely because port 8321 is occupied by an "
+        "unverified listener. That listener was this installation's own "
+        "service, which did not answer health, and the final guard restarted "
+        "it. Run `jacked service status` for ownership and quarantine "
+        "guidance.\n"
+    )
+
+    @staticmethod
+    def _publish_own_service(monkeypatch, *, port=8321, alive=True):
+        """Publish a signed instance manifest where the updater reads it.
+
+        The service conftest points CLAUDE_DIR at this test's tmp dir, so
+        `default_service_paths()` names a tmp manifest. The process probe is
+        faked: ``alive`` False makes the recorded process read as dead.
+        """
+        from jacked.service import instance_storage
+        from jacked.service.instance import (
+            BindIdentity,
+            InstanceManifest,
+            ProcessIdentity,
+            current_user_identity,
+            publish_manifest,
+        )
+        from jacked.service.lifecycle import default_service_paths
+        from jacked.service.spec import SupervisorKind
+        from tests.unit.service.supervisor_test_support import make_spec
+
+        process = ProcessIdentity(
+            pid=4242, creation_id="test-creation", executable="/opt/jacked/python"
+        )
+        paths = default_service_paths()
+        manifest = InstanceManifest.create(
+            spec=make_spec(SupervisorKind.MANUAL),
+            process=process,
+            user_id=current_user_identity(),
+            machine_id="machine-test",
+            bind=BindIdentity(host="127.0.0.1", port=port),
+            control_address=str(paths.control),
+        )
+        publish_manifest(paths.manifest, manifest)
+
+        def identity(pid):
+            if not alive:
+                raise ProcessLookupError(pid)
+            return process
+
+        monkeypatch.setattr(instance_storage, "process_identity", identity)
+
+    def test_this_installations_wedged_service_gets_the_guard_restart(
+        self, tmp_path, monkeypatch
+    ):
+        """The holder never answers health, but the manifest proves it is
+        this installation's own live service on this port. The guard stays
+        pending and kickstarts it once, and the recovery text says so instead
+        of "No port owner was killed"."""
+        self._publish_own_service(monkeypatch)
+
+        kick, popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs(),
+            listen_results=True,
+            health_answer=None,   # the holder never answers /api/health
+            clock_step=0.1,
+        )
+
+        popen.assert_not_called()
+        kick.assert_called_once_with()
+        assert self.OWN_HELD in log
+        assert self.KICKSTART in log
+        assert "Final guard: native_restart OK (test-kickstart)" in log
+        assert self.SKIP_PREFIX not in log
+        assert recovery.read_text(encoding="utf-8") == self.OWN_RESTARTED_RECOVERY
+        # The status record says the same thing as the recovery file.
+        assert status["overall"] == "failed"
+        assert status["error"] == self.OWN_ERROR_RESTARTED
+        assert status["recovery"] == "jacked service status"
+
+    def test_a_guard_restart_that_fails_is_not_reported_as_done(
+        self, tmp_path, monkeypatch
+    ):
+        """The kickstart is refused. The recovery text must not say that the
+        guard restarted the service: it says the restart failed and points
+        at the update log."""
+        self._publish_own_service(monkeypatch)
+
+        kick, _popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            kick_result=(False, "test-refused"),
+            run_results=_healthy_runs(),
+            listen_results=True,
+            health_answer=None,
+            clock_step=0.1,
+        )
+
+        kick.assert_called_once_with()
+        assert "Final guard: native_restart FAILED (test-refused)" in log
+        assert status["overall"] == "failed"
+        assert status["error"] == self.OWN_ERROR_NOT_RESTARTED
+        assert status["recovery"] == "jacked service status"
+        body = recovery.read_text(encoding="utf-8")
+        assert body.startswith(
+            "Jacked auto-update stopped safely because port 8321 is occupied by "
+            "an unverified listener. That listener is this installation's own "
+            "service, which did not answer health, and the final guard could "
+            "not restart it. "
+        )
+        assert "restarted it" not in body
+        assert f"See {tmp_path / 'update.log'} for the reason." in body
+        assert "Run `jacked service status`" in body
+
+    @pytest.mark.parametrize("manifest", ["stale", "other_port", "unreadable"])
+    def test_a_manifest_that_proves_nothing_keeps_the_hands_off_exit(
+        self, manifest, tmp_path, monkeypatch
+    ):
+        """A dead recorded process, a manifest for another port, or a
+        manifest that cannot be read is not evidence that the holder is
+        ours, so nothing is restarted and the text stays as it was."""
+        if manifest == "stale":
+            self._publish_own_service(monkeypatch, alive=False)
+        elif manifest == "other_port":
+            self._publish_own_service(monkeypatch, port=8400)
+        else:
+            from jacked.service.lifecycle import default_service_paths
+
+            path = default_service_paths().manifest
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{not json", encoding="utf-8")
+            if os.name == "posix":
+                path.chmod(0o600)
+
+        kick, popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs(),
+            listen_results=True,
+            health_answer=None,
+            clock_step=0.1,
+        )
+
+        popen.assert_not_called()
+        kick.assert_not_called()
+        assert self.PORT_BUSY_SKIPPED in log
+        assert "this installation's own service" not in log
+        assert recovery.read_text(encoding="utf-8") == self.PORT_BUSY_RECOVERY
+        assert status["error"] == "port 8321 is held by an unverified listener"
+
+    @pytest.mark.parametrize(
+        ("lifecycle", "spawn_popens", "kicks"),
+        [
+            ((False, "unavailable", "test: manual spawn"), 1, 1),
+            ((True, "already_installed", "test: kickstart"), 0, 2),
+        ],
+        ids=["manual-spawn", "native-restart"],
+    )
+    def test_an_own_service_after_a_restart_gets_a_second_kick(
+        self, lifecycle, spawn_popens, kicks, tmp_path, monkeypatch
+    ):
+        """This run already started the new build, which never became ready.
+        On the rollback tail the wedged holder is this installation's own
+        service. The last tail decides: the guard kicks once more, so the
+        restored build gets started, and the log says it is the second kick."""
+        self._publish_own_service(monkeypatch)
+
+        kick, popen, _status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            run_results=_healthy_runs() + [_ok(), _ok()],  # + the rollback pair
+            listen_results=lambda run: run.call_count >= 4,
+            health_answer=None,
+            clock_step=0.1,
+            lifecycle=lifecycle,
+        )
+
+        assert popen.call_count == spawn_popens   # the new build's start
+        assert kick.call_count == kicks           # the start's kick + the guard's
+        assert self.OWN_HELD_AFTER_A_RESTART in log
+        assert self.SECOND_KICK in log
+        assert "Final guard: native_restart OK (test-kickstart)" in log
+        assert self.OWN_HELD not in log
+        assert self.KICKSTART not in log
+        assert self.SKIP_PREFIX not in log
+        assert "stopped at the service restart step" in recovery.read_text(
+            encoding="utf-8"
+        )
+
+    # Wave 2 W4: only the update tail's port_busy exit recorded what the
+    # guard's restart did. A rollback tail that found this installation's
+    # own wedged service left the record saying the rollback stopped at the
+    # restart step, and the guard's kick after it was never recorded.
+
+    NEVER_READY_ROLLBACK = (
+        "v0.100.0 never became ready on :8321; the rollback to v0.95.0 "
+        "stopped at the service restart step"
+    )
+    REFUSED_ROLLBACK = (
+        "v0.100.0 refused to start: [FAIL] ValueError: nope; the rollback to "
+        "v0.95.0 stopped at the service restart step"
+    )
+    ROLLBACK_RECOVERY = (
+        'uv tool install "claude-jacked[tray]==0.95.0" --force --refresh '
+        "&& jacked install --force && jacked service start"
+    )
+    GUARD_RESTARTED_NOTE = (
+        "This installation's own service held port 8321 and did not answer "
+        "health. The final guard then restarted it. Nothing checked the "
+        "service after that restart: run `jacked service status`."
+    )
+    GUARD_NOT_RESTARTED_NOTE = (
+        "This installation's own service held port 8321 and did not answer "
+        "health. The final guard could not restart it."
+    )
+    GUARD_RESTARTED_CLAUSE = (
+        "the final guard then restarted this installation's own service on "
+        "port 8321 (not verified)"
+    )
+    GUARD_NOT_RESTARTED_CLAUSE = (
+        "the final guard could not restart this installation's own service "
+        "on port 8321"
+    )
+
+    def _rollback_record(self, tmp_path, failure, note):
+        """The recovery file of a rollback failure, with the guard's note
+        after the failure."""
+        return (
+            f"Jacked auto-update failed: {failure}\n\n"
+            f"{note}\n\n"
+            f"See {tmp_path / 'update.log'} for details.\n\n"
+            "Recovery:\n"
+            f"  {self.ROLLBACK_RECOVERY}\n"
+        )
+
+    @pytest.mark.parametrize(
+        ("kick_result", "note", "clause"),
+        [
+            ((True, "test-kickstart"), GUARD_RESTARTED_NOTE, GUARD_RESTARTED_CLAUSE),
+            ((False, "test-refused"), GUARD_NOT_RESTARTED_NOTE, GUARD_NOT_RESTARTED_CLAUSE),
+        ],
+        ids=["restarted", "could-not-restart"],
+    )
+    def test_a_rollback_tail_records_what_the_second_kick_did(
+        self, kick_result, note, clause, tmp_path, monkeypatch
+    ):
+        """The new build never became ready, the rollback ran, and its tail
+        found this installation's own service wedged on the port. The guard
+        kicks a second time, and the record keeps the update failure first,
+        then says what that kick did. A kick that worked is never called a
+        verified restore."""
+        self._publish_own_service(monkeypatch)
+
+        kick, _popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            kick_result=kick_result,
+            run_results=_healthy_runs() + [_ok(), _ok()],  # + the rollback pair
+            listen_results=lambda run: run.call_count >= 4,
+            health_answer=None,
+            clock_step=0.1,
+        )
+
+        kick.assert_called_once_with()     # the manual spawn ran, then the guard
+        assert self.OWN_HELD_AFTER_A_RESTART in log
+        assert self.SECOND_KICK in log
+        body = recovery.read_text(encoding="utf-8")
+        assert body == self._rollback_record(tmp_path, self.NEVER_READY_ROLLBACK, note)
+        assert "rolled back to" not in body
+        assert status["overall"] == "failed"
+        assert status["error"] == f"{self.NEVER_READY_ROLLBACK}; {clause}"
+        assert status["recovery"] == self.ROLLBACK_RECOVERY
+
+    def test_a_refused_preflight_tail_records_the_guard_restart(
+        self, tmp_path, monkeypatch
+    ):
+        """The same record when the guard is still pending: the preflight
+        refused, nothing was started, and the rollback tail found this
+        installation's own wedged service. The guard's first kick is the
+        restart that the record names."""
+        self._publish_own_service(monkeypatch)
+
+        kick, popen, status, recovery, log = self._drive(
+            monkeypatch, tmp_path,
+            run_results=[
+                _ok(),                                        # uv install
+                _fail(1, stderr="[FAIL] ValueError: nope"),   # preflight refuses
+                _ok(),                                        # rollback install
+                _ok(),                                        # jacked install --force
+            ],
+            listen_results=True,
+            health_answer=None,
+            clock_step=0.1,
+        )
+
+        popen.assert_not_called()
+        kick.assert_called_once_with()
+        assert self.OWN_HELD in log
+        assert self.KICKSTART in log
+        body = recovery.read_text(encoding="utf-8")
+        assert body == self._rollback_record(
+            tmp_path, self.REFUSED_ROLLBACK, self.GUARD_RESTARTED_NOTE
+        )
+        assert status["error"] == (
+            f"{self.REFUSED_ROLLBACK}; {self.GUARD_RESTARTED_CLAUSE}"
+        )
+        assert status["recovery"] == self.ROLLBACK_RECOVERY

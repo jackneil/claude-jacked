@@ -2394,20 +2394,29 @@ def _update_status_init_shim(from_version, to_version, method, log_path):
     written, no phases opened yet — the tray creates it moments before
     spawning us). Exit 2 only when a REAL updater is in flight (has a phase
     open). The Windows batch checks errorlevel and aborts on 2.
+
+    The claim is a read-check-write, so it runs under the update lock
+    (``update_status.with_update_lock``), like every other batch step.
     """
     from jacked.service import update_status as us_mod
-    try:
+
+    path = us_mod.UPDATE_STATUS_FILE
+
+    def claim():
         # This shim exits immediately while the batch that called it keeps
         # running, so its own pid would read as "updater dead" within seconds.
         # Record no pid: the batch's liveness then follows the mtime rule.
-        outcome = us_mod.init_or_adopt_status(
-            us_mod.UPDATE_STATUS_FILE,
+        return us_mod.init_or_adopt_status(
+            path,
             from_version=from_version,
             to_version=to_version,
             method=method,
             log_path=log_path,
             updater_pid=us_mod.NO_UPDATER_PID,
         )
+
+    try:
+        outcome = us_mod.with_update_lock(path, claim)
     except us_mod.LockBusy as exc:
         click.echo(f"[update-status] lock busy: {exc}", err=True)
         sys.exit(2)
@@ -2427,14 +2436,21 @@ def _update_status_init_shim(from_version, to_version, method, log_path):
 @click.option("--error", default=None)
 @click.option("--recovery", default=None)
 def _update_status_shim(phase, status, error, recovery):
-    """Internal: write one status transition. `status` is in_progress|ok|warning|failed."""
+    """Internal: write one status transition. `status` is in_progress|ok|warning|failed.
+
+    The write runs under the update lock (``update_status.with_update_lock``).
+    """
     from jacked.service import update_status as us_mod
     path = us_mod.UPDATE_STATUS_FILE
-    try:
+
+    def write():
         if status == "in_progress":
             us_mod.begin_phase(path, phase)
         else:
             us_mod.end_phase(path, phase, status=status, error=error, recovery=recovery)
+
+    try:
+        us_mod.with_update_lock(path, write)
     except ValueError as exc:
         # Exit non-zero so the Windows batch's `if errorlevel 1` check fires
         # on phase-name drift between the batch and update_phases.PHASES.
@@ -2468,21 +2484,26 @@ def _update_status_succeed_shim(target, previous):
 
     With ``--target``, a build older than the target (the package index did
     not serve it yet, #166i) closes the record as failed with the lag message
-    and exits 4, instead of succeeded.
+    and exits 4, instead of succeeded. The close runs under the update lock
+    (``update_status.with_update_lock``).
     """
     from jacked.service import update_status as us_mod
 
+    path = us_mod.UPDATE_STATUS_FILE
     installed = _installed_package_version()
     if _index_lag(installed, target):
         message = _index_lag_message(installed, target, changed=installed != previous)
-        us_mod.mark_failed(
-            us_mod.UPDATE_STATUS_FILE,
-            error=f"the package index does not serve v{target} yet",
-            recovery="jacked upgrade (in a few minutes)",
+        us_mod.with_update_lock(
+            path,
+            lambda: us_mod.mark_failed(
+                path,
+                error=f"the package index does not serve v{target} yet",
+                recovery="jacked upgrade (in a few minutes)",
+            ),
         )
         click.echo(message)
         sys.exit(EXIT_INDEX_LAG)
-    us_mod.mark_succeeded(us_mod.UPDATE_STATUS_FILE)
+    us_mod.with_update_lock(path, lambda: us_mod.mark_succeeded(path))
 
 
 @main.command(name="_update_status_fail", hidden=True)
@@ -2493,12 +2514,16 @@ def _update_status_fail_shim(error, recovery):
 
     The Windows `jacked upgrade` batch runs this command at each failure
     exit. It opens no phase, so it uses mark_failed, not end_phase. When the
-    status file does not exist, the command does nothing.
+    status file does not exist, the command does nothing. The write runs
+    under the update lock (``update_status.with_update_lock``).
     """
     from jacked.service import update_status as us_mod
 
+    path = us_mod.UPDATE_STATUS_FILE
     try:
-        us_mod.mark_failed(us_mod.UPDATE_STATUS_FILE, error=error, recovery=recovery)
+        us_mod.with_update_lock(
+            path, lambda: us_mod.mark_failed(path, error=error, recovery=recovery)
+        )
     except Exception as exc:  # noqa: BLE001 - the batch exits 1 next anyway
         click.echo(
             f"[update-status] cannot mark the update failed: {type(exc).__name__}",
@@ -2685,12 +2710,16 @@ def _get_data_root() -> Path:
 def _is_editable_install() -> bool:
     """Check if package is installed in editable (dev) mode.
 
+    The package is editable when it sits in a source checkout. A normal clone
+    has a ``.git`` dir. A git worktree or a submodule checkout has a ``.git``
+    file (a ``gitdir:`` pointer) instead, so any ``.git`` entry counts.
+
     >>> # In a git repo with editable install, returns True
     >>> isinstance(_is_editable_install(), bool)
     True
     """
     repo_root = _get_data_root().parent.parent
-    return (repo_root / ".git").is_dir()
+    return (repo_root / ".git").exists()
 
 
 def _jacked_home() -> Path:
@@ -2872,7 +2901,11 @@ def _copy_skill_tree(src_skill_root: Path, skill_dir: Path) -> int:
     into it would go THROUGH the link: `_link_or_copy` unlinks each dst before
     linking, so it would delete the source files the link points at. Callers run
     `preserve_user_skill_dir` before this, so a link jacked does not own has
-    already been moved aside by then.
+    already been moved aside by then. The shared transaction
+    (`_install_skill_dir_transactional`) gives this a new staging dir, so
+    the link case matters only to a direct call. Editable-mode links point at
+    the absolute source path, so they still resolve after the publish
+    renames the staging dir into place.
 
     >>> callable(_copy_skill_tree)
     True
@@ -2920,6 +2953,296 @@ def _remove_skill_dir(skill_dir: Path) -> None:
         skill_dir.unlink()
     else:
         shutil.rmtree(skill_dir)
+
+
+@dataclass
+class SkillInstallOutcome:
+    """The result of one `_install_skill_dir_transactional` call.
+
+    ``backup`` is where the user's own same-named dir is now, or None. It is
+    None after a restore, because the dir is back at its own path. ``error``
+    is the OSError that stopped the install, or None when the install worked.
+    ``restored`` is True when a failed install put the user's dir back.
+    ``copied`` is the file count that the copy step returned, or 0 when the
+    copy step returns no count. ``rollback_error`` is the OSError that stopped
+    the rollback, or None.
+
+    >>> SkillInstallOutcome().restore_note()
+    ''
+    >>> SkillInstallOutcome(restored=True).restore_note()
+    '; your own skill was restored'
+    >>> SkillInstallOutcome(backup=Path("kept")).restore_note()
+    '; your own skill is at kept'
+    """
+
+    backup: Path | None = None
+    error: OSError | None = None
+    restored: bool = False
+    copied: int = 0
+    rollback_error: OSError | None = None
+
+    def restore_note(self) -> str:
+        """After a failed install, the clause that tells the user where their
+        own skill is: back at its path, in a backup dir, or "" when there was
+        no user dir."""
+        if self.restored:
+            return "; your own skill was restored"
+        if self.backup is not None:
+            return f"; your own skill is at {self.backup}"
+        return ""
+
+
+# The private dirs of one skill transaction are named ``.<name>.<tag>-<pid>``
+# beside the skill dir. The leading dot keeps the skill loader from taking
+# one for a skill. The pid of the process that made the dir lets a later run
+# tell the leftover of a dead process from an install that is still running.
+_SKILL_STAGING_TAG = "jacked-staging"
+_SKILL_PREVIOUS_TAG = "jacked-previous"
+
+
+def _skill_side_dir(skill_dir: Path, name: str, tag: str, pid: int | None = None) -> Path:
+    """The private dir ``.<name>.<tag>-<pid>`` beside `skill_dir`. The pid is
+    the pid of this process when none is given.
+
+    >>> _skill_side_dir(Path("skills") / "qa", "qa", _SKILL_STAGING_TAG, 7).as_posix()
+    'skills/.qa.jacked-staging-7'
+    """
+    return skill_dir.parent / f".{name}.{tag}-{os.getpid() if pid is None else pid}"
+
+
+def _clear_skill_leftovers(skill_dir: Path, name: str) -> None:
+    """Remove the private dirs that an earlier install of skill `name` left.
+
+    A crash during the copy leaves a staging dir. A crash between the two
+    publish renames leaves a previous dir, which holds jacked's own old copy.
+    A leftover is removed when its pid is this process or a process that is
+    proven dead (`process_liveness` is False). The leftover of a live process
+    belongs to an install that is still running, and an unknown answer proves
+    nothing, so both stay. A removal that fails is logged at WARNING, and the
+    install continues: it checks for its own staging dir again before the
+    copy. Raises OSError when the skills dir cannot be listed.
+
+    >>> callable(_clear_skill_leftovers)
+    True
+    """
+    from jacked.service.process import process_liveness
+
+    try:
+        entries = list(skill_dir.parent.iterdir())
+    except FileNotFoundError:
+        return
+    me = os.getpid()
+    prefixes = tuple(
+        f".{name}.{tag}-" for tag in (_SKILL_STAGING_TAG, _SKILL_PREVIOUS_TAG)
+    )
+    for entry in entries:
+        prefix = next((p for p in prefixes if entry.name.startswith(p)), None)
+        if prefix is None:
+            continue
+        pid_text = entry.name[len(prefix):]
+        if not (pid_text.isascii() and pid_text.isdigit()):
+            continue
+        pid = int(pid_text)
+        if pid != me and process_liveness(pid) is not False:
+            continue
+        try:
+            _remove_skill_dir(entry)
+        except OSError as e:
+            logger.warning("Could not remove the leftover %s of skill %s: %s", entry, name, e)
+
+
+def _install_skill_dir_transactional(
+    src, skill_dir: Path, name: str, prior_manifest, *, preserve, copy,
+) -> SkillInstallOutcome:
+    """Install one skill dir as one move-aside, stage and publish transaction.
+
+    `jacked install`, the dashboard skill toggle and the Codex installer all
+    call this, so the rollback lives in one place. ``preserve(skill_dir, name,
+    src, prior_manifest)`` moves a dir that jacked does not own out of the
+    way and returns the backup path, or None. ``copy(src, staging)`` writes
+    jacked's copy into a NEW private staging dir beside the skill,
+    ``.<name>.jacked-staging-<pid>``, and can return a file count. The copy
+    never writes into the live skill dir.
+
+    The publish renames the staging dir to the skill path with
+    `replace_with_retry`. When the path was free when the copy started, that
+    is the only rename. When jacked's own copy (or a link that jacked owns)
+    was there, that copy is renamed to ``.<name>.jacked-previous-<pid>``
+    first, the staging dir takes its place, and the previous dir is removed.
+    A reader sees the old copy or the new one, never a mix of the two
+    (#260i). A crash between the two renames leaves the previous dir beside
+    the skill. The next install of the same skill removes it first, because
+    it is jacked's own old copy. It removes a staging dir that a crash left
+    in the same way.
+
+    Only jacked's own copy, as it was when the transaction saw it, is set
+    aside and removed. Its fingerprint (the full-dir hash of the install
+    manifest, `install_manifest.skill_content_hash`) is taken when the
+    transaction decides that the path holds jacked's copy, and compared
+    again right before the move-aside. A file that another writer added
+    during the copy, an edit, or a dir that replaced jacked's copy changes
+    the fingerprint, and the install raises FileExistsError ("The skill path
+    changed during the install") BEFORE any rename, so the rollback removes
+    only the staging dir. The previous dir is compared once more after the
+    move-aside: a change that landed between the check and the rename is
+    there, and the rollback renames that dir back.
+
+    When the copy or the publish raises OSError, the rollback removes ONLY
+    the staging dir, which this transaction made. Then it renames a previous
+    dir back and moves the user's backup back, each only when the skill path
+    is free: a dir that another writer put there is never removed, replaced
+    or written into. A rollback step that fails goes in ``rollback_error``
+    and is logged at WARNING with the paths. An OSError from ``preserve``
+    stops the install before the copy starts. A skill path that is the
+    packaged source (a skills dir symlinked into the package) is left alone,
+    because a publish there would rename the source aside and delete it. The
+    helper never raises OSError: every failure is in the outcome, so one
+    skill can never stop a whole install.
+
+    >>> callable(_install_skill_dir_transactional)
+    True
+    """
+    import errno
+
+    from jacked import install_manifest as _m
+    from jacked.atomic_io import replace_with_retry
+
+    if _is_packaged_source(skill_dir, src):
+        logger.info(
+            "skill %s: %s is the packaged source, reached through a symlinked "
+            "skills dir; nothing to install", name, skill_dir,
+        )
+        return SkillInstallOutcome()
+    try:
+        backup = preserve(skill_dir, name, src, prior_manifest)
+    except OSError as e:
+        return SkillInstallOutcome(error=e)
+    staging = _skill_side_dir(skill_dir, name, _SKILL_STAGING_TAG)
+    staged = False
+    previous = None
+
+    def refuse_if_changed(path: Path) -> None:
+        # `path` is the occupant, at the skill path or just set aside.
+        if _m.skill_content_hash(path) != seen:
+            raise FileExistsError(
+                errno.EEXIST, "The skill path changed during the install", str(skill_dir),
+            )
+
+    try:
+        # Only jacked's own copy, seen at this point, is ever set aside by the
+        # publish. A dir that appears at a free path during the copy is
+        # another writer's: the rename onto it fails, and it stays as it is.
+        occupied = backup is None and (skill_dir.exists() or skill_dir.is_symlink())
+        # The fingerprint of jacked's copy as it is now. A change during the
+        # copy (a file added, an edit, a dir that replaced it) is not
+        # jacked's, so the publish must not set it aside and delete it.
+        seen = _m.skill_content_hash(skill_dir) if occupied else None
+        _clear_skill_leftovers(skill_dir, name)
+        if staging.exists() or staging.is_symlink():
+            raise FileExistsError(
+                errno.EEXIST, "A leftover staging dir could not be removed", str(staging),
+            )
+        staged = True
+        written = copy(src, staging)
+        if occupied and (skill_dir.exists() or skill_dir.is_symlink()):
+            refuse_if_changed(skill_dir)  # before any rename
+            aside = _skill_side_dir(skill_dir, name, _SKILL_PREVIOUS_TAG)
+            replace_with_retry(skill_dir, aside)
+            previous = aside
+            # A change that landed between that check and the rename is in
+            # the previous dir now. The rollback renames the dir back.
+            refuse_if_changed(aside)
+        if skill_dir.exists() or skill_dir.is_symlink():
+            # Another writer made the path during the copy. A rename onto a
+            # file, a link or a non-empty dir fails on its own, but rename(2)
+            # does replace an EMPTY dir on POSIX: refuse before the rename,
+            # so nothing another writer created is ever replaced.
+            raise FileExistsError(errno.EEXIST, "The skill path is in use", str(skill_dir))
+        replace_with_retry(staging, skill_dir)
+        staged = False  # the staging dir is the live skill dir now
+    except OSError as e:
+        outcome = SkillInstallOutcome(backup=backup, error=e)
+        _roll_back_skill_dir(
+            skill_dir, name, outcome,
+            staging=staging if staged else None, previous=previous,
+        )
+        return outcome
+    if previous is not None:
+        try:
+            _remove_skill_dir(previous)
+        except OSError as e:
+            # The new copy is live, so the install worked. The next install
+            # of this skill removes the leftover.
+            logger.warning(
+                "Could not remove the previous copy of skill %s at %s: %s", name, previous, e,
+            )
+    return SkillInstallOutcome(
+        backup=backup, copied=written if isinstance(written, int) else 0,
+    )
+
+
+def _roll_back_skill_dir(
+    skill_dir: Path, name: str, outcome: SkillInstallOutcome, *,
+    staging: Path | None = None, previous: Path | None = None,
+) -> None:
+    """Undo one failed copy or publish of `_install_skill_dir_transactional`.
+
+    Removes ONLY ``staging``, the dir that this transaction made (None when
+    it made none). Renames ``previous`` (jacked's own copy, set aside by the
+    publish) back, and moves the user's backup back, each only when the skill
+    path is free. A dir at the skill path is not this transaction's, so it is
+    never removed and nothing is moved into it (shutil.move would put the
+    backup INSIDE it). Updates `outcome` in place: ``restored``, ``backup``
+    and ``rollback_error``. The first rollback failure is the one that
+    ``rollback_error`` keeps, and each one is logged at WARNING with its
+    paths. The copy failure, and a restore of the user's dir that worked, are
+    logged at INFO: `jacked install --json` keeps its console quiet, so the
+    log is the only operator record of them there.
+    """
+    import errno
+
+    from jacked.atomic_io import replace_with_retry
+
+    def failed(e: OSError, message: str, *args) -> None:
+        if outcome.rollback_error is None:
+            outcome.rollback_error = e
+        logger.warning(message, *args, e)
+
+    def require_free() -> None:
+        if skill_dir.exists() or skill_dir.is_symlink():
+            raise FileExistsError(errno.EEXIST, "The skill path is in use", str(skill_dir))
+
+    if staging is not None:
+        try:
+            if staging.exists() or staging.is_symlink():
+                _remove_skill_dir(staging)
+        except OSError as e:
+            failed(e, "Could not remove the staging copy of skill %s at %s: %s", name, staging)
+    if previous is not None:
+        try:
+            require_free()
+            replace_with_retry(previous, skill_dir)
+        except OSError as e:
+            failed(
+                e, "Could not put the previous copy of skill %s back from %s to %s: %s",
+                name, previous, skill_dir,
+            )
+    backup = outcome.backup
+    if backup is None:
+        logger.info("skill %s: copy failed (%s)", name, outcome.error)
+        return
+    try:
+        require_free()
+        shutil.move(str(backup), str(skill_dir))
+    except OSError as e:
+        failed(e, "Could not restore skill %s from %s to %s: %s", name, backup, skill_dir)
+        return
+    outcome.backup = None
+    outcome.restored = True
+    logger.info(
+        "skill %s: copy failed (%s); restored the user's dir from %s",
+        name, outcome.error, backup,
+    )
 
 
 def _stage_for_removal(skill_dir: Path, name: str) -> Path:
@@ -4468,6 +4791,8 @@ def install(
     _prev_quiet = console.quiet
     if as_json:
         console.quiet = True
+    # The skills that the install skipped, each with its error class.
+    _skipped_skills: list = []
     try:
         _installed_skill_names = _run_install(
             home=home,
@@ -4478,6 +4803,7 @@ def install(
             no_statusline=no_statusline,
             force=force,
             as_json=as_json,
+            skipped_skills=_skipped_skills,
         )
     finally:
         console.quiet = _prev_quiet
@@ -4500,7 +4826,21 @@ def install(
             if n in _installed_skill_names
         },
     )
+    # A skipped skill was not written, so its SOURCE hash describes nothing on
+    # disk. It keeps the record of the prior manifest instead. Dropping it
+    # would make the diff call it "removed", and the prune would then delete
+    # jacked's untouched old copy. With the prior record it shows up nowhere
+    # in `changes`, and the record's `skipped` list names it.
+    _skipped_names = {s["name"] for s in _skipped_skills}
+    _mani.keep_prior_skill_records(_current_hashes, _prior_manifest, _skipped_names)
     _d = _mani.diff(_prior_manifest, _current_hashes)
+    # Not installed is not "unchanged" either: the unchanged count leaves the
+    # skipped skills out.
+    _skill_diff = _d.by_category.get("skills")
+    if _skill_diff is not None:
+        _skill_diff.unchanged = [
+            n for n in _skill_diff.unchanged if n not in _skipped_names
+        ]
     # Pass the prior manifest so a skill dir the user modified/recreated is never
     # deleted by the prune (upgrade runs this automatically — high exposure).
     _pruned, _preserved = _mani.prune_removed(_d, home, _prior_manifest)
@@ -4521,6 +4861,7 @@ def install(
     _record["pruned"] = _pruned
     _record["preserved"] = _preserved
     _record["stale_commands"] = _stale_cmds
+    _record["skipped"] = _skipped_skills
     # Strip every intended removal that did not actually happen (preserved to
     # backups, kept-in-place modified skill dir, or a locked file the prune
     # could not touch) so neither the render nor the dashboard claims it's gone.
@@ -4676,6 +5017,7 @@ def _run_install(
     as_json: bool,
     no_tray: bool = False,
     no_statusline: bool = False,
+    skipped_skills: list | None = None,
 ) -> set:
     """Run the artifact/hook/rules installation (no manifest, no summary).
 
@@ -4686,6 +5028,9 @@ def _run_install(
     hit the per-skill OSError skip is absent — the caller must not record a
     dir hash for it, because the dir at that path is the USER's (recording it
     would mark their dir jacked-owned and a later uninstall would delete it).
+    When ``skipped_skills`` is a list, each skipped skill is appended to it as
+    ``{"name": <skill>, "error": <exception class name>}``, so the JSON record
+    can say which skills were not installed and why.
     """
     import json
     import shutil
@@ -4763,28 +5108,41 @@ def _run_install(
         from jacked import install_manifest as _skill_mani
 
         _prior_skills = _skill_mani.load(home / ".claude" / "jacked-manifest.json")
+
+        def _preserve_and_report(skill_dir, name, src_dir, manifest):
+            # The move is REPORTED immediately: a Ctrl-C later in the loop
+            # must not leave the user's dir relocated without them ever seeing
+            # where it went.
+            backup = _skill_mani.preserve_user_skill_dir(skill_dir, name, src_dir, manifest)
+            if backup:
+                console.print(
+                    f"[yellow][!][/yellow] Preserved your existing skill "
+                    f"{name} (not installed by jacked) at {_rich_escape(str(backup))}"
+                )
+            return backup
+
         for skill_md in skills_src_dir.glob("*/SKILL.md"):
             skill_name = skill_md.parent.name
             skill_dir = home / ".claude" / "skills" / skill_name
             # Never destroy a dir that isn't ours: a user's own same-named skill
-            # (or one they edited) is moved aside first, and the move is REPORTED
-            # immediately — a Ctrl-C later in the loop must not leave the user's
-            # dir relocated without them ever seeing where it went. One
-            # unwritable skill is skipped, not fatal to the whole install.
-            try:
-                _backup = _skill_mani.preserve_user_skill_dir(
-                    skill_dir, skill_name, skill_md.parent, _prior_skills,
-                )
-                if _backup:
-                    console.print(
-                        f"[yellow][!][/yellow] Preserved your existing skill "
-                        f"{skill_name} (not installed by jacked) at {_backup}"
-                    )
-                _copy_skill_tree(skill_md.parent, skill_dir)
-            except OSError as _skill_err:
+            # (or one they edited) is moved aside first. One unwritable skill is
+            # skipped, not fatal to the whole install, and a copy that fails
+            # part-way puts the user's own dir back (#145i). The copy goes into
+            # a private staging dir that a rename publishes, so the live dir is
+            # never a mix of two copies (#260i).
+            _outcome = _install_skill_dir_transactional(
+                skill_md.parent, skill_dir, skill_name, _prior_skills,
+                preserve=_preserve_and_report, copy=_copy_skill_tree,
+            )
+            if _outcome.error is not None:
                 console.print(
-                    f"[yellow][!][/yellow] Skipped skill {skill_name}: {_skill_err}"
+                    f"[yellow][!][/yellow] Skipped skill {skill_name}: "
+                    f"{_rich_escape(str(_outcome.error) + _outcome.restore_note())}"
                 )
+                if skipped_skills is not None:
+                    skipped_skills.append(
+                        {"name": skill_name, "error": type(_outcome.error).__name__}
+                    )
                 continue
             skill_count += 1
             installed_skill_names.add(skill_name)
@@ -5222,7 +5580,13 @@ def _live_manifest(paths):
         manifest = read_manifest(paths.manifest)
     except (OSError, ValueError):
         return None
-    if _manifest_is_proven_stale(paths.manifest):
+    try:
+        stale = _manifest_is_proven_stale(paths.manifest)
+    except (OSError, ValueError):
+        # The staleness rule reads the manifest again. An owner that exits
+        # between the two reads removes it: that is no live owner either.
+        return None
+    if stale:
         return None
     return manifest
 
@@ -5261,6 +5625,19 @@ def _release_manual_owner(paths, *, timeout: float = 10.0) -> tuple[bool, str]:
 
     try:
         response = send_native_control(paths.manifest, ControlAction.SHUTDOWN)
+    except (FileNotFoundError, ConnectionRefusedError) as exc:
+        refused = f"manual service refused handoff ({type(exc).__name__})"
+        # No control endpoint answers. That is a refusal only while the
+        # owner still runs: a crashed or killed owner leaves its manifest
+        # behind with no pipe or socket (#161i). Re-check with the shared
+        # staleness rule.
+        try:
+            gone = _manifest_is_proven_stale(paths.manifest)
+        except FileNotFoundError:
+            gone = True  # the owner removed its manifest when it exited
+        except (OSError, ValueError):
+            return False, refused  # liveness unreadable: this proves nothing
+        return (True, "previous service is gone") if gone else (False, refused)
     except (OSError, ValueError) as exc:
         return False, f"manual service refused handoff ({type(exc).__name__})"
     if not response.get("ok"):
@@ -5294,14 +5671,12 @@ def _ensure_autostart_and_running(
     """
     from jacked.service.lifecycle import (
         default_service_paths,
-        discover_service,
         inspect_native_artifact,
         install_native_owned,
         native_artifact_path,
         provision_service_contract,
         spawn_exact_service,
     )
-    from jacked.service.instance import read_manifest
     from jacked.service.spec import SupervisorKind
     from jacked.service.supervisors import (
         ArtifactDisposition,
@@ -5311,34 +5686,35 @@ def _ensure_autostart_and_running(
     paths = default_service_paths()
     try:
         spec, environment = provision_service_contract(paths=paths)
-        endpoint = discover_service(paths)
-        if endpoint.source == "manifest":
-            existing = read_manifest(paths.manifest)
-            if existing.supervisor == SupervisorKind.MANUAL.value:
-                artifact_path = native_artifact_path(spec, paths=paths)
-                inspected = inspect_native_artifact(
-                    spec,
-                    artifact_path,
-                    environment=environment,
+        # The shared liveness rule, as `service restart` and `service recover`
+        # apply it. A manifest whose owner died is not a live owner: the
+        # ownership claim of the new service retires it (#161i).
+        existing = _live_manifest(paths)
+        if existing is not None and existing.supervisor == SupervisorKind.MANUAL.value:
+            artifact_path = native_artifact_path(spec, paths=paths)
+            inspected = inspect_native_artifact(
+                spec,
+                artifact_path,
+                environment=environment,
+            )
+            # A pre-v2 definition jacked itself wrote is NOT foreign: the
+            # supervisor install backs it up and replaces it. Only refuse
+            # an artifact nobody here recognises.
+            if (
+                inspected.artifact.disposition is ArtifactDisposition.FOREIGN
+                and not is_known_legacy_artifact(
+                    artifact_path, spec.service_id, spec.supervisor
                 )
-                # A pre-v2 definition jacked itself wrote is NOT foreign: the
-                # supervisor install backs it up and replaces it. Only refuse
-                # an artifact nobody here recognises.
-                if (
-                    inspected.artifact.disposition is ArtifactDisposition.FOREIGN
-                    and not is_known_legacy_artifact(
-                        artifact_path, spec.service_id, spec.supervisor
-                    )
-                ):
-                    console.print(
-                        "[red]Error:[/red] supervisor artifact is foreign; "
-                        "run `jacked service recover`"
-                    )
-                    return False
-                released, detail = _release_manual_owner(paths)
-                if not released:
-                    console.print(f"[red]Error:[/red] {detail}")
-                    return False
+            ):
+                console.print(
+                    "[red]Error:[/red] supervisor artifact is foreign; "
+                    "run `jacked service recover`"
+                )
+                return False
+            released, detail = _release_manual_owner(paths)
+            if not released:
+                console.print(f"[red]Error:[/red] {detail}")
+                return False
         result = (
             spawn_exact_service(spec, environment=environment)
             if spec.supervisor is SupervisorKind.MANUAL
@@ -5618,7 +5994,12 @@ def doctor():
     from jacked import __version__
     from jacked.install_method import detect_install_method
     from jacked.service import DEFAULT_HOST, DEFAULT_PORT, PID_FILE
-    from jacked.service.platform import launchd_job_never_ran
+    from jacked.service.platform import (
+        drift_consequence,
+        launchd_job_never_ran,
+        launchd_job_probe,
+        supervision_drift,
+    )
     from jacked.service.process import (
         is_port_available, is_process_alive, read_pid,
     )
@@ -5659,13 +6040,22 @@ def doctor():
         pid_info is not None
         and is_process_alive(pid_info.get("pid", 0))
     )
+    # An owned definition is not proof that it supervises the running
+    # service (#128i). The same probe as `jacked service status`, and one
+    # `launchctl print` serves both launchd checks.
+    probe = launchd_job_probe() if sys.platform == "darwin" else None
+    drift = supervision_drift(probe=probe)
+    # The evidence that the verdicts below are built from: a held port and a
+    # live PID file name a running jacked service (HEALTHY, or alive but not
+    # answering). Every other verdict found no live service.
+    service_live = not port_free and pid_alive
 
     if port_free:
         console.print(
             f"[bold]Service:[/bold] [yellow]NOT RUNNING[/yellow] "
             f"(port {DEFAULT_PORT} free)"
         )
-        if launchd_job_never_ran():
+        if drift is None and launchd_job_never_ran(probe=probe):
             console.print(
                 "  [yellow]The launchd job is loaded but never ran.[/yellow]"
             )
@@ -5742,6 +6132,13 @@ def doctor():
                     "to see the owner."
                 )
             console.print("  Recovery: [cyan]jacked service restart[/cyan]")
+
+    if drift is not None:
+        consequence = drift_consequence(drift, service_live=service_live)
+        console.print(
+            f"[bold]Autostart:[/bold] [yellow]{consequence}: {drift}[/yellow]"
+        )
+        console.print("  Recovery: [cyan]jacked service restart[/cyan]")
 
     # Install-method-specific recovery
     if method == "editable":
@@ -7752,7 +8149,14 @@ def _service_start_command() -> str:
 
 @service.command(name="status")
 def service_status():
-    """Show evidence-qualified service state and discovered endpoint."""
+    """Show evidence-qualified service state and discovered endpoint.
+
+    An enabled autostart definition can still fail to supervise the running
+    service. For example, launchd does not have the job loaded, or a manual
+    start replaced the supervised service. The Autostart line then shows
+    "enabled" and the reason in parentheses. Run `jacked service restart`
+    to repair it.
+    """
     from jacked.service.lifecycle import default_service_paths, discover_service
     from jacked.service.autostart import AutostartState
     from jacked.service.platform import inspect_autostart
@@ -7762,22 +8166,50 @@ def service_status():
     autostart = inspect_autostart()
     stopped = False
     if autostart.state is AutostartState.OWNED_ENABLED:
-        autostart_label = "[green]enabled[/green]"
+        autostart_base = "[green]enabled[/green]"
     elif autostart.state in {AutostartState.ABSENT, AutostartState.OWNED_DISABLED}:
-        autostart_label = "[dim]disabled[/dim]"
+        autostart_base = "[dim]disabled[/dim]"
     else:
         detail = f" ({autostart.reason})" if autostart.reason else ""
-        autostart_label = f"[yellow]{autostart.state.value}{detail}[/yellow]"
+        autostart_base = f"[yellow]{autostart.state.value}{detail}[/yellow]"
+    drift = None
+    never_ran = False
     if autostart.state is AutostartState.OWNED_ENABLED:
-        from jacked.service.platform import launchd_job_never_ran
+        from jacked.service.platform import (
+            launchd_job_never_ran,
+            launchd_job_probe,
+            supervision_drift,
+        )
 
-        if launchd_job_never_ran():
-            # Loaded with RunAtLoad but never spawned (#178i): "enabled" alone
-            # read as fine while nothing was going to start the service.
-            autostart_label += (
+        # An owned definition is not proof that it supervises the running
+        # service (#128i): launchd can have the job unloaded while a manual
+        # service from another generation runs in its place. One
+        # `launchctl print` serves both checks, so a launchctl that cannot
+        # run gives one WARNING, not two.
+        probe = launchd_job_probe() if sys.platform == "darwin" else None
+        drift = supervision_drift(paths=paths, inspection=autostart, probe=probe)
+        # Loaded with RunAtLoad but never spawned (#178i): "enabled" alone
+        # read as fine while nothing was going to start the service.
+        never_ran = drift is None and launchd_job_never_ran(probe=probe)
+
+    def autostart_label(service_live: bool) -> str:
+        """The Autostart value. ``service_live`` is the verdict printed above
+        it: True only when status found a live service."""
+        if drift is not None:
+            from jacked.service.platform import drift_consequence
+
+            consequence = drift_consequence(drift, service_live=service_live)
+            return autostart_base + (
+                f" [yellow]({consequence}: {drift}; "
+                "run `jacked service restart`)[/yellow]"
+            )
+        if never_ran:
+            return autostart_base + (
                 " [yellow](the launchd job is loaded but never ran; "
                 "run `jacked service restart`)[/yellow]"
             )
+        return autostart_base
+
     if endpoint.source == "manifest":
         from jacked.service.ipc import ControlAction, send_native_control
 
@@ -7790,7 +8222,9 @@ def service_status():
             console.print(
                 f"  Evidence:  manifest + failed control ({type(exc).__name__})"
             )
-            console.print(f"  Autostart: {autostart_label}")
+            # A manifest of a dead process also fails its control call, so
+            # this verdict does not prove a live service.
+            console.print(f"  Autostart: {autostart_label(False)}")
             _print_start_failure_breaker(paths)
             return
         if response.get("ok"):
@@ -7807,7 +8241,7 @@ def service_status():
             console.print(f"  Protocol:  {state.get('protocol_version')}")
             console.print(f"  Generation:{state.get('generation')}")
             console.print(f"  Port:      {state.get('port')}")
-            console.print(f"  Autostart: {autostart_label}")
+            console.print(f"  Autostart: {autostart_label(True)}")
             if reported == "degraded":
                 console.print(f"  Failure:   {state.get('failure') or 'unknown'}")
                 console.print(
@@ -7832,7 +8266,7 @@ def service_status():
     else:
         console.print("[bold yellow]Jacked Service: stopped[/bold yellow]")
         stopped = True
-    console.print(f"  Autostart: {autostart_label}")
+    console.print(f"  Autostart: {autostart_label(endpoint.source == 'legacy')}")
     # A legacy autostart entry cannot start the owned service, so a stopped
     # service stays stopped until the operator re-installs ownership.
     if stopped and autostart.state is AutostartState.LEGACY:

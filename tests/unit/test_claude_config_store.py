@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
+from pathlib import Path
 import time
 
 import pytest
@@ -233,6 +235,38 @@ def test_a_change_during_a_windows_retry_pause_aborts_the_write(tmp_path, monkey
     assert len(tries) == 1
     assert _read(tmp_path) == {"projects": {"a": 1, "b": 2}, "oauthAccount": {"emailAddress": "z@q.io"}}
     assert list(tmp_path.glob(store.TMP_PREFIX + "*")) == []
+
+
+def test_a_transient_zero_inode_on_windows_does_not_abort_the_write(tmp_path, monkeypatch):
+    """CPython's os.stat on Windows reports st_ino 0 when it cannot open the
+    file for its attributes (a scanner holds a freshly written file for a
+    few milliseconds). One such stat made the two signatures differ and the
+    store aborted a write that nothing had changed. The stat is retried."""
+    _write(tmp_path, {"projects": {"a": 1}, "oauthAccount": {"emailAddress": "z@q.io"}})
+    config = tmp_path / ".claude.json"
+    real_stat = os.stat
+    zeroed = []
+
+    def stat_with_one_zero_inode(path, *args, **kwargs):
+        # Only the signature's own stat is faked (other callers stat the
+        # file too), and only its first call: the shape CPython produces when
+        # it falls back to the directory listing is a result with st_ino 0.
+        st = real_stat(path, *args, **kwargs)
+        caller = sys._getframe(1).f_code.co_name
+        if caller == "_stat_signature" and Path(path) == config and not zeroed:
+            zeroed.append(True)
+            return os.stat_result((*st[:1], 0, *st[2:]))  # st_ino is index 1
+        return st
+
+    monkeypatch.setattr(store.sys, "platform", "win32")
+    monkeypatch.setattr(store.os, "stat", stat_with_one_zero_inode)
+    monkeypatch.setattr(store.time, "sleep", lambda _seconds: None)
+
+    result = store._write_locked(config, _set_email, None, 4, time.monotonic())
+
+    assert result.status == "written"
+    assert zeroed == [True]
+    assert _read(tmp_path) == {"projects": {"a": 1}, "oauthAccount": {"emailAddress": "a@b.c"}}
 
 
 def test_an_unchanged_config_is_written_on_the_windows_retry(tmp_path, monkeypatch):

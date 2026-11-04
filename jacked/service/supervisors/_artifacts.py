@@ -11,6 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
+from xml.parsers.expat import ExpatError
 
 from jacked.service.spec import SupervisorKind
 from jacked.service.supervisors._helpers import atomic_write, privately_controlled
@@ -152,10 +153,42 @@ def restore_artifact(
     return restored == previous
 
 
+# plistlib raises more than InvalidFileException (a ValueError) for bytes
+# that are not a valid plist: expat's ExpatError for malformed XML, such as
+# a truncated file, and AttributeError for a malformed <date> value.
+_PLIST_PARSE_ERRORS = (ValueError, ExpatError, AttributeError)
+
+
+def load_plist_dict(content: bytes) -> dict[str, Any] | None:
+    """Return the root dictionary of a plist, or None when there is none.
+
+    None when the bytes are not a valid plist, or when the root is not a
+    dictionary. Every caller reads keys from the root, so a list root is
+    as useless as a parse failure. Only the plistlib call is guarded, so
+    an error in the code of the caller is never hidden.
+
+    >>> load_plist_dict(b"<plist><dict><key>Label</key><string>x</string></dict></plist>")
+    {'Label': 'x'}
+    >>> load_plist_dict(b'<?xml version="1.0"?><plist><dict><key>Label</key>') is None
+    True
+    >>> load_plist_dict(b"<plist><date>bad</date></plist>") is None
+    True
+    >>> load_plist_dict(b"<plist><array/></plist>") is None
+    True
+    """
+    try:
+        payload = plistlib.loads(content)
+    except _PLIST_PARSE_ERRORS:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def extract_marker(content: bytes, kind: SupervisorKind) -> dict[str, Any] | None:
     try:
         if kind is SupervisorKind.LAUNCHD:
-            payload = plistlib.loads(content)
+            payload = load_plist_dict(content)
+            if payload is None:
+                return None
             return {
                 "owner": payload["JackedOwner"],
                 "service_id": payload["JackedServiceID"],
@@ -206,4 +239,8 @@ def _extract_task_marker(content: bytes) -> dict[str, Any] | None:
         "",
     )
     prefix = "JACKED-MARKER:"
-    return json.loads(description[len(prefix) :]) if description.startswith(prefix) else None
+    if not description.startswith(prefix):
+        return None
+    marker = json.loads(description[len(prefix) :])
+    # The owner checks read the marker with .get: a list is no marker.
+    return marker if isinstance(marker, dict) else None

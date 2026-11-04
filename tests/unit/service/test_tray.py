@@ -1,5 +1,6 @@
 """Tests for jacked.service.tray module."""
 
+import signal
 import socket
 import time
 from types import SimpleNamespace
@@ -1784,6 +1785,62 @@ class TestAbandonedUpdateRecovery:
         record = json.loads(us.UPDATE_STATUS_FILE.read_text(encoding="utf-8"))
         assert record["overall"] == "failed"
 
+    def test_a_held_update_lock_writes_no_recovery_file(self, monkeypatch):
+        """A held lock means that an updater runs now: the record stays open,
+        and no recovery file tells the user about a failure."""
+        import json
+
+        from jacked.service import update_status as us
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        self._write_status(
+            us.UPDATE_STATUS_FILE, "migrating_settings", us.STALE_IN_PROGRESS_SECONDS + 60
+        )
+        monkeypatch.setattr(us, "acquire_update_lock", lambda _path: None)
+
+        ServiceRunner(host="127.0.0.1", port=8321)._record_abandoned_update()
+
+        assert not updater.RECOVERY_FILE.exists()
+        record = json.loads(us.UPDATE_STATUS_FILE.read_text(encoding="utf-8"))
+        assert record["overall"] == "in_progress"
+
+    def test_a_record_replaced_during_the_check_writes_no_recovery_file(
+        self, monkeypatch
+    ):
+        """Updater B started a new attempt between the boot check's read and
+        its close. B's live attempt is not marked failed, and no recovery
+        file names a phase that B never had."""
+        import json
+
+        from jacked.service import update_status as us
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        self._write_status(
+            us.UPDATE_STATUS_FILE, "migrating_settings", us.STALE_IN_PROGRESS_SECONDS + 60
+        )
+        attempt_b = {
+            "overall": "in_progress",
+            "current_phase": "installing_package",
+            "started_at": "2026-11-03T08:00:00+00:00",
+        }
+
+        class _Lock:
+            def close(self):
+                pass
+
+        def b_started_then_granted(_path):
+            us.UPDATE_STATUS_FILE.write_text(json.dumps(attempt_b), encoding="utf-8")
+            return _Lock()
+
+        monkeypatch.setattr(us, "acquire_update_lock", b_started_then_granted)
+
+        ServiceRunner(host="127.0.0.1", port=8321)._record_abandoned_update()
+
+        assert not updater.RECOVERY_FILE.exists()
+        assert json.loads(us.UPDATE_STATUS_FILE.read_text(encoding="utf-8")) == attempt_b
+
     def test_run_checks_for_an_abandoned_update_before_provisioning(self):
         from jacked.service.tray import ServiceRunner
 
@@ -1794,6 +1851,9 @@ class TestAbandonedUpdateRecovery:
             patch.object(
                 runner, "_record_abandoned_update", side_effect=lambda: order.append("abandoned")
             ),
+            patch.object(
+                runner, "clear_stale_recovery", side_effect=lambda: order.append("stale")
+            ),
             patch(
                 "jacked.service.lifecycle.provision_service_contract",
                 side_effect=lambda *a, **k: (order.append("provision"), (_ for _ in ()).throw(ValueError("stop here")))[1],
@@ -1802,7 +1862,30 @@ class TestAbandonedUpdateRecovery:
         ):
             with pytest.raises(SystemExit):
                 runner.run()
-        assert order[:2] == ["abandoned", "provision"]
+        # The stale-file check follows the interrupted-update check, which
+        # can close a record as succeeded that the stale check then reads.
+        assert order[:3] == ["abandoned", "stale", "provision"]
+
+    def test_a_stale_check_that_raises_does_not_stop_the_boot(self, caplog):
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        order = []
+        with (
+            caplog.at_level("ERROR", logger="jacked.service.tray"),
+            patch.object(runner, "_install_tray_file_logger"),
+            patch.object(runner, "_record_abandoned_update"),
+            patch.object(runner, "clear_stale_recovery", side_effect=OSError("disk")),
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                side_effect=lambda *a, **k: (order.append("provision"), (_ for _ in ()).throw(ValueError("stop here")))[1],
+            ),
+            patch.object(runner, "_abort_refused_contract", side_effect=SystemExit(0)),
+        ):
+            with pytest.raises(SystemExit):
+                runner.run()
+        assert order == ["provision"]
+        assert "Could not check for a stale update recovery file" in caplog.text
 
 
 
@@ -1900,3 +1983,721 @@ def test_the_hidden_spawn_command_calls_the_updater():
                                            "--port", "8321", "--target", "0.42.0"])
     assert result.exit_code == 0, result.output
     spawn.assert_called_once_with(parent_pid=42, extras="tray", target_version="0.42.0", port=8321)
+
+
+# ---------------------------------------------------------------------------
+# #138i: the stop-signal handlers belong to one run, not to the process
+# ---------------------------------------------------------------------------
+
+
+def _watched_signals():
+    """SIGINT and SIGTERM, plus every stop signal this platform routes."""
+    from jacked.service import tray
+
+    return {signal.SIGINT, signal.SIGTERM, *tray._stop_signal_numbers()}
+
+
+def _handlers(signums):
+    return {signum: signal.getsignal(signum) for signum in signums}
+
+
+class TestStopSignalsAreScoped:
+    """run() routes the stop signals to its runner only while it runs (#138i).
+
+    run() and the macOS agent replaced the process-wide SIGINT and SIGTERM
+    handlers (SIGINT and SIGBREAK on Windows) with lambdas bound to the
+    runner and never put the previous handlers back. After run() returned,
+    in a test or an in-process restart, Ctrl+C called _request_stop on a dead
+    runner instead of raising KeyboardInterrupt.
+    """
+
+    @staticmethod
+    def _run_with(runner, fake_run):
+        """Drive the real run() with its side effects stubbed. ``_run`` is
+        replaced by ``fake_run``, so only run() itself can set a handler."""
+        from jacked.service.tray import ServiceRunner
+
+        with (
+            patch.object(runner, "_install_tray_file_logger"),
+            patch.object(runner, "_record_abandoned_update"),
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(MagicMock(), {}),
+            ),
+            patch(
+                "jacked.service.lifecycle.claim_service_ownership",
+                return_value=MagicMock(),
+            ),
+            patch.object(runner, "_guard_legacy_pid_or_exit"),
+            patch.object(ServiceRunner, "_run", side_effect=fake_run),
+        ):
+            return runner.run()
+
+    def test_run_restores_the_previous_handlers_when_it_returns(self):
+        from jacked.service import tray
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        watched = _watched_signals()
+        before = _handlers(watched)
+        during = {}
+
+        def fake_run():
+            during.update(_handlers(tray._stop_signal_numbers()))
+            # The routed handler is the runner's stop: Ctrl+C asks it to stop.
+            signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+
+        self._run_with(runner, fake_run)
+
+        assert during and all(
+            handler == runner._on_stop_signal for handler in during.values()
+        ), "run() did not route the stop signals to its runner"
+        assert runner._stop_event.is_set()
+        after = _handlers(watched)
+        for signum, handler in before.items():
+            assert after[signum] is handler, (
+                f"{signal.Signals(signum).name} still points at the finished runner"
+            )
+
+    def test_run_restores_the_previous_handlers_when_it_raises(self):
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        watched = _watched_signals()
+        before = _handlers(watched)
+        during = []
+
+        def fake_run():
+            during.append(signal.getsignal(signal.SIGINT))
+            raise RuntimeError("the backend failed")
+
+        with pytest.raises(RuntimeError, match="the backend failed"):
+            self._run_with(runner, fake_run)
+
+        assert during == [runner._on_stop_signal]
+        after = _handlers(watched)
+        for signum, handler in before.items():
+            assert after[signum] is handler, (
+                f"{signal.Signals(signum).name} still points at the finished runner"
+            )
+
+    @pytest.mark.skipif(
+        not hasattr(signal, "SIGBREAK"),
+        reason="SIGBREAK exists only on Windows; the Windows CI leg runs this test",
+    )
+    def test_run_routes_and_restores_sigbreak_on_windows(self):
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        before = signal.getsignal(signal.SIGBREAK)
+        during = []
+
+        def fake_run():
+            during.append(signal.getsignal(signal.SIGBREAK))
+
+        self._run_with(runner, fake_run)
+
+        assert during == [runner._on_stop_signal]
+        assert signal.getsignal(signal.SIGBREAK) is before
+
+    def test_mac_menubar_restores_the_previous_handlers_when_its_body_returns(self):
+        from jacked.service import tray
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        runner._ownership = MagicMock()  # an owned start skips the port probe
+        watched = _watched_signals()
+        before = _handlers(watched)
+        during = {}
+
+        class _Agent:
+            """Stands in for the AppKit agent; its run loop returns at once."""
+
+            def __init__(self, owner):
+                assert owner is runner
+
+            def run(self):
+                during.update(_handlers(tray._stop_signal_numbers()))
+
+        with (
+            patch("jacked.service.menubar_mac.MacMenuBarApp", _Agent),
+            patch.object(tray, "_UVICORN_AVAILABLE", True),
+            patch("jacked.service.platform.detect_autostart", return_value=False),
+            patch.object(runner, "_start_uvicorn", return_value=MagicMock()),
+            patch.object(runner, "_wait_for_ready", return_value=True),
+            patch.object(runner, "_note_ready"),
+        ):
+            runner._run_mac_menubar()
+
+        assert during and all(
+            handler == runner._on_stop_signal for handler in during.values()
+        ), "the macOS agent did not route the stop signals to its runner"
+        after = _handlers(watched)
+        for signum, handler in before.items():
+            assert after[signum] is handler, (
+                f"{signal.Signals(signum).name} still points at the finished runner"
+            )
+
+    @pytest.mark.parametrize("platform", ["darwin", "linux"])
+    def test_posix_routes_sigterm_and_sigint(self, platform):
+        from jacked.service import tray
+
+        with patch.object(tray.sys, "platform", platform):
+            assert tray._stop_signal_numbers() == (signal.SIGTERM, signal.SIGINT)
+
+    def test_windows_routes_sigint_and_sigbreak_when_the_platform_has_it(self):
+        from jacked.service import tray
+
+        with patch.object(tray.sys, "platform", "win32"):
+            numbers = tray._stop_signal_numbers()
+        expected = (signal.SIGINT,)
+        if hasattr(signal, "SIGBREAK"):
+            expected += (signal.SIGBREAK,)
+        assert numbers == expected
+
+    def test_off_the_main_thread_the_handlers_stay_unchanged(self, caplog):
+        """Python lets only the main thread set a handler, so another thread
+        is a quiet no-op: no attempt, and no warning per signal."""
+        import threading
+
+        from jacked.service import tray
+
+        watched = _watched_signals()
+        before = _handlers(watched)
+        seen = {}
+
+        def worker():
+            try:
+                with tray._stop_signals(lambda *_: None):
+                    seen["inside"] = _handlers(watched)
+            except BaseException as exc:  # reported on the main thread below
+                seen["error"] = exc
+
+        with caplog.at_level("DEBUG", logger="jacked.service.tray"):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert "error" not in seen, seen.get("error")
+        assert seen["inside"] == before
+        assert not [r for r in caplog.records if r.name == "jacked.service.tray"]
+
+    def test_a_signal_that_cannot_be_routed_is_logged_and_the_rest_still_are(
+        self, caplog
+    ):
+        from jacked.service import tray
+
+        numbers = tray._stop_signal_numbers()
+        refused = numbers[0]
+        real_signal = signal.signal
+        before = _handlers(_watched_signals())
+
+        def handler(*_):
+            return None
+
+        def flaky_signal(signum, action):
+            if signum == refused and action is handler:
+                raise OSError("refused")
+            return real_signal(signum, action)
+
+        with (
+            caplog.at_level("WARNING", logger="jacked.service.tray"),
+            patch.object(tray.signal, "signal", flaky_signal),
+        ):
+            with tray._stop_signals(handler):
+                inside = _handlers(numbers)
+
+        assert inside[refused] is before[refused]
+        assert all(inside[s] is handler for s in numbers if s != refused)
+        after = _handlers(before)
+        assert all(after[s] is before[s] for s in before)
+        assert any(
+            signal.Signals(refused).name in record.getMessage()
+            for record in caplog.records
+            if record.levelname == "WARNING"
+        )
+
+    def test_a_handler_that_cannot_be_put_back_is_logged_and_the_rest_are(
+        self, caplog
+    ):
+        from jacked.service import tray
+
+        numbers = tray._stop_signal_numbers()
+        stuck = numbers[0]
+        real_signal = signal.signal
+        before = _handlers(numbers)
+
+        def handler(*_):
+            return None
+
+        def flaky_signal(signum, action):
+            if signum == stuck and action is before[stuck]:
+                raise OSError("refused")
+            return real_signal(signum, action)
+
+        try:
+            with (
+                caplog.at_level("WARNING", logger="jacked.service.tray"),
+                patch.object(tray.signal, "signal", flaky_signal),
+            ):
+                with tray._stop_signals(handler):
+                    pass
+            after = _handlers(numbers)
+            assert after[stuck] is handler
+            assert all(after[s] is before[s] for s in numbers if s != stuck)
+            assert any(
+                signal.Signals(stuck).name in record.getMessage()
+                for record in caplog.records
+                if record.levelname == "WARNING"
+            )
+        finally:
+            real_signal(stuck, before[stuck])
+
+
+# ---------------------------------------------------------------------------
+# #151i: a completed install closes its update; a stale recovery file goes
+# ---------------------------------------------------------------------------
+
+
+def _iso(when):
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(when, tz=timezone.utc).isoformat()
+
+
+class TestCompletedInstallIsNotAFailedUpdate:
+    """#151i: the tray judged an update "abandoned" or "failed" from the
+    status record's age alone. It ignored the independent proof that the
+    install completed: the last-install record and the running version. So
+    an update whose batch died after a good install wrote a recovery file,
+    and an old recovery file toasted "Previous update failed" on every start.
+    """
+
+    RUNNING = "0.110.2"
+    TOAST = (
+        "Previous update failed. See "
+        "~/.claude/jacked-update-failed.txt for recovery steps."
+    )
+
+    @pytest.fixture(autouse=True)
+    def _running_version(self, monkeypatch):
+        import jacked
+
+        monkeypatch.setattr(jacked, "__version__", self.RUNNING)
+
+    @staticmethod
+    def _write_status(record, age_seconds):
+        import json
+        import os
+
+        from jacked.service import update_status as us
+
+        path = us.UPDATE_STATUS_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+
+    @staticmethod
+    def _write_last_install(at, to_version):
+        """Write the record where `jacked install` does: the default path
+        under this test's home, which is where the tray reads it."""
+        from jacked import install_summary as isum
+
+        isum.write_last_install(
+            {
+                "at": at,
+                "from_version": "0.110.1",
+                "to_version": to_version,
+                "changes": {},
+                "unchanged_count": 0,
+            }
+        )
+
+    @staticmethod
+    def _write_recovery_file():
+        from jacked.service import updater
+
+        updater.RECOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        updater.RECOVERY_FILE.write_text(
+            "Jacked update interrupted: An update was interrupted.\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _boot(backend):
+        """Drive the real ``run()`` on one status-bar backend.
+
+        No server, GUI or thread starts. The boot checks run for real. On
+        the pystray backend a fake icon runs the real ``_setup`` callback,
+        so its toast is visible: the icon is returned. The macOS menu-bar
+        agent shows no toast, so that backend returns None.
+        """
+        from types import SimpleNamespace
+
+        from jacked.service import tray
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=8321)
+        icon = MagicMock()
+        started = []
+
+        class _NoThread:
+            def __init__(self, target=None, name=None, daemon=None):
+                pass
+
+            def start(self):
+                pass
+
+        class _Icon:
+            """pystray.Icon: its run loop calls the setup callback once."""
+
+            def __init__(self, **_kwargs):
+                pass
+
+            def run(self, setup):
+                started.append("pystray")
+                with patch.object(tray.threading, "Thread", _NoThread):
+                    setup(icon)
+
+        with (
+            patch.object(runner, "_install_tray_file_logger"),
+            patch(
+                "jacked.service.lifecycle.provision_service_contract",
+                return_value=(MagicMock(), {}),
+            ),
+            patch(
+                "jacked.service.lifecycle.claim_service_ownership",
+                return_value=MagicMock(),
+            ),
+            patch.object(runner, "_guard_legacy_pid_or_exit"),
+            patch.object(tray, "select_menubar_backend", return_value=backend),
+            patch.object(
+                runner, "_run_mac_menubar", side_effect=lambda: started.append("mac")
+            ),
+            patch.object(tray, "check_tray_deps"),
+            patch.object(tray, "_UVICORN_AVAILABLE", True),
+            patch.object(runner, "_install_windows_console_handler"),
+            patch("jacked.service.platform.detect_autostart", return_value=False),
+            patch.object(runner, "_start_uvicorn", return_value=MagicMock()),
+            patch.object(runner, "_wait_for_ready", return_value=True),
+            patch.object(runner, "_note_ready"),
+            patch.object(runner, "_apply_icon"),
+            patch.object(tray, "build_menu", return_value=MagicMock()),
+            patch.object(tray, "create_icon_image", return_value=MagicMock()),
+            patch.object(tray, "pystray", SimpleNamespace(Icon=_Icon), create=True),
+        ):
+            runner.run()
+        assert started == [backend], "run() did not reach the backend under test"
+        return icon if backend == "pystray" else None
+
+    def _assert_toast(self, icon, shown):
+        """The pystray toast for a recovery file (the macOS agent has none)."""
+        if icon is None:
+            return
+        if shown:
+            icon.notify.assert_called_once_with(self.TOAST, "Jacked Update Failed Earlier")
+        else:
+            icon.notify.assert_not_called()
+
+    def _stale_in_progress(self):
+        """An in_progress record whose updater stopped writing long ago."""
+        from jacked.service import update_status as us
+
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        self._write_status(
+            {
+                "overall": "in_progress",
+                "current_phase": "restarting_service",
+                "started_at": _iso(started),
+                "from_version": "0.110.1",
+                "to_version": self.RUNNING,
+                "phases": [],
+            },
+            us.STALE_IN_PROGRESS_SECONDS + 60,
+        )
+        return started
+
+    def _failed(self, from_version, started, failed_at=None):
+        record = {
+            "overall": "failed",
+            "current_phase": None,
+            "started_at": _iso(started),
+            "from_version": from_version,
+            "to_version": "0.104.0",
+            "phases": [],
+            "error": "An update was interrupted at phase migrating_settings.",
+            "recovery": "jacked upgrade",
+        }
+        if failed_at is not None:
+            record["failed_at"] = _iso(failed_at)
+        self._write_status(record, time.time() - started)
+
+    # (1) a completed install is not an abandoned update
+
+    def test_a_stale_update_whose_install_completed_is_closed_not_reported(self):
+        import json
+
+        from jacked.service import update_status as us
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        started = self._stale_in_progress()
+        self._write_last_install(_iso(started + 25), self.RUNNING)
+
+        ServiceRunner(host="127.0.0.1", port=8321)._record_abandoned_update()
+
+        assert not updater.RECOVERY_FILE.exists(), (
+            "the tray wrote a recovery file for an install that completed"
+        )
+        record = json.loads(us.UPDATE_STATUS_FILE.read_text(encoding="utf-8"))
+        assert record["overall"] == "succeeded"
+
+    # (2) without a later install, the update is still reported
+
+    @pytest.mark.parametrize("install_offset", [None, -60])
+    def test_a_stale_update_without_a_later_install_is_still_reported(
+        self, install_offset
+    ):
+        import json
+
+        from jacked.service import update_status as us
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        started = self._stale_in_progress()
+        if install_offset is not None:
+            self._write_last_install(_iso(started + install_offset), self.RUNNING)
+
+        ServiceRunner(host="127.0.0.1", port=8321)._record_abandoned_update()
+
+        assert "interrupted at phase restarting_service" in (
+            updater.RECOVERY_FILE.read_text(encoding="utf-8")
+        )
+        record = json.loads(us.UPDATE_STATUS_FILE.read_text(encoding="utf-8"))
+        assert record["overall"] == "failed"
+
+    # (3) a later install makes an old failure stale. The check runs in
+    # run(), the path both backends share: it ran only in the pystray setup
+    # before, so the macOS menu-bar agent never removed a stale file.
+
+    @pytest.mark.parametrize("backend", ["mac", "pystray"])
+    def test_boot_clears_a_recovery_file_a_later_install_made_stale(
+        self, caplog, backend
+    ):
+        from jacked.service import updater
+
+        started = time.time() - 3 * 86400
+        self._failed("0.103.0", started)
+        self._write_last_install(_iso(time.time() - 3600), self.RUNNING)
+        self._write_recovery_file()
+
+        with caplog.at_level("INFO", logger="jacked.service.tray"):
+            icon = self._boot(backend)
+
+        assert not updater.RECOVERY_FILE.exists()
+        assert (
+            "cleared stale update recovery file (from 0.103.0, running 0.110.2)"
+            in caplog.text
+        )
+        self._assert_toast(icon, shown=False)
+
+    # (4) a genuine failure keeps its file and its toast
+
+    @pytest.mark.parametrize("backend", ["mac", "pystray"])
+    def test_boot_keeps_a_recovery_file_no_later_install_followed(self, backend):
+        from jacked.service import updater
+
+        started = time.time() - 3600
+        self._failed("0.103.0", started)
+        self._write_last_install(_iso(started - 86400), self.RUNNING)
+        self._write_recovery_file()
+
+        icon = self._boot(backend)
+
+        assert updater.RECOVERY_FILE.exists()
+        self._assert_toast(icon, shown=True)
+
+    @pytest.mark.parametrize("backend", ["mac", "pystray"])
+    def test_boot_keeps_the_recovery_file_while_the_failed_build_still_runs(
+        self, backend
+    ):
+        """The update started from the build that still runs, so its failure
+        still describes this process, whatever a later install wrote."""
+        from jacked.service import updater
+
+        started = time.time() - 3600
+        self._failed(self.RUNNING, started)
+        self._write_last_install(_iso(started + 60), "0.110.3")
+        self._write_recovery_file()
+
+        icon = self._boot(backend)
+
+        assert updater.RECOVERY_FILE.exists()
+        self._assert_toast(icon, shown=True)
+
+    @pytest.mark.parametrize("backend", ["mac", "pystray"])
+    def test_boot_keeps_a_recovery_file_without_a_record(self, backend):
+        """A recovery file that no status record explains (the tray's own
+        refusal, a CLI upgrade) is never cleared on a guess."""
+        from jacked.service import updater
+
+        self._write_last_install(_iso(time.time() - 60), self.RUNNING)
+        self._write_recovery_file()
+
+        icon = self._boot(backend)
+
+        assert updater.RECOVERY_FILE.exists()
+        self._assert_toast(icon, shown=True)
+
+    @pytest.mark.parametrize("backend", ["mac", "pystray"])
+    def test_boot_keeps_the_file_of_a_failure_that_followed_its_own_install(
+        self, backend
+    ):
+        """Reviewer B / pre-mortem 3: an update installed 0.110.2 (its own
+        last-install record), then failed and could not roll back, so
+        0.110.2 runs. Nothing repaired the failure after it closed."""
+        from jacked.service import updater
+
+        started = time.time() - 3600
+        self._failed("0.110.1", started, failed_at=started + 300)
+        self._write_last_install(_iso(started + 60), self.RUNNING)
+        self._write_recovery_file()
+
+        icon = self._boot(backend)
+
+        assert updater.RECOVERY_FILE.exists()
+        self._assert_toast(icon, shown=True)
+
+    # (5) a completed update retires the file of an EARLIER failure
+
+    def _reconciled_update(self, recovery_written):
+        """An earlier failure's recovery file, then a later update whose
+        install completed while its record stayed in_progress."""
+        import os
+
+        from jacked.service import updater
+
+        self._write_recovery_file()
+        started = self._stale_in_progress()
+        os.utime(updater.RECOVERY_FILE, (started + recovery_written,) * 2)
+        self._write_last_install(_iso(started + 25), self.RUNNING)
+
+    @pytest.mark.parametrize("backend", ["mac", "pystray"])
+    def test_boot_clears_an_earlier_failures_file_after_a_completed_update(
+        self, caplog, backend
+    ):
+        """Reviewer D: abandoned_status closed the later update as succeeded,
+        but only a failed record could clear the file, so the old file
+        stayed and toasted on every start."""
+        import json
+
+        from jacked.service import update_status as us
+        from jacked.service import updater
+
+        self._reconciled_update(recovery_written=-600)
+
+        with caplog.at_level("INFO", logger="jacked.service.tray"):
+            icon = self._boot(backend)
+
+        record = json.loads(us.UPDATE_STATUS_FILE.read_text(encoding="utf-8"))
+        assert record["overall"] == "succeeded"
+        assert not updater.RECOVERY_FILE.exists()
+        assert (
+            "cleared stale update recovery file (from 0.110.1, running 0.110.2)"
+            in caplog.text
+        )
+        self._assert_toast(icon, shown=False)
+
+    def test_boot_clears_the_file_after_an_old_completed_update(self, caplog):
+        """read_status hides a succeeded record after STALE_SUCCEEDED_SECONDS,
+        but the record is still evidence: a boot an hour later still finds
+        that the file predates the completed update."""
+        import os
+
+        from jacked.service import update_status as us
+        from jacked.service import updater
+
+        started = time.time() - 3600
+        self._write_recovery_file()
+        os.utime(updater.RECOVERY_FILE, (started - 3600,) * 2)
+        self._write_status(
+            {
+                "overall": "succeeded",
+                "current_phase": None,
+                "started_at": _iso(started),
+                "from_version": "0.110.1",
+                "to_version": self.RUNNING,
+                "phases": [],
+            },
+            us.STALE_SUCCEEDED_SECONDS + 60,
+        )
+        assert us.read_status(us.UPDATE_STATUS_FILE) is None
+
+        with caplog.at_level("INFO", logger="jacked.service.tray"):
+            self._boot("mac")
+
+        assert not updater.RECOVERY_FILE.exists()
+        assert "cleared stale update recovery file" in caplog.text
+
+    @pytest.mark.parametrize("backend", ["mac", "pystray"])
+    def test_boot_keeps_a_file_written_after_the_completed_update_started(
+        self, backend
+    ):
+        from jacked.service import updater
+
+        self._reconciled_update(recovery_written=+30)
+
+        icon = self._boot(backend)
+
+        assert updater.RECOVERY_FILE.exists()
+        self._assert_toast(icon, shown=True)
+
+    def test_clear_stale_recovery_without_a_recovery_file_does_nothing(self):
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        started = time.time() - 3 * 86400
+        self._failed("0.103.0", started)
+        self._write_last_install(_iso(time.time() - 3600), self.RUNNING)
+
+        assert ServiceRunner(host="127.0.0.1", port=8321).clear_stale_recovery() is False
+        assert not updater.RECOVERY_FILE.exists()
+
+
+@pytest.mark.parametrize("payload", ["[]", '"in_progress"'], ids=["list", "string"])
+def test_a_status_file_that_is_not_an_object_reads_as_missing(payload, caplog):
+    """A status file that holds valid JSON but no object (a ``[]`` or a
+    string) made every status reader raise AttributeError on ``data.get``:
+    /api/update/status failed, and the tray's boot check logged an
+    exception on every start. It now reads as missing, and the boot check
+    stays quiet."""
+    import logging
+
+    from jacked.service import update_status as us
+    from jacked.service.tray import ServiceRunner
+
+    us.UPDATE_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    us.UPDATE_STATUS_FILE.write_text(payload, encoding="utf-8")
+    assert us.read_status(us.UPDATE_STATUS_FILE) is None
+
+    runner = ServiceRunner(host="127.0.0.1", port=8321)
+    with (
+        caplog.at_level(logging.DEBUG, logger="jacked"),
+        patch.object(runner, "_install_tray_file_logger"),
+        patch(
+            "jacked.service.lifecycle.provision_service_contract",
+            return_value=(MagicMock(), {}),
+        ),
+        patch(
+            "jacked.service.lifecycle.claim_service_ownership",
+            return_value=MagicMock(),
+        ),
+        patch.object(runner, "_guard_legacy_pid_or_exit"),
+        patch.object(ServiceRunner, "_run"),
+    ):
+        runner.run()  # the real boot check: _record_abandoned_update
+
+    loud = [r for r in caplog.records if r.levelno > logging.DEBUG]
+    assert not loud, [r.getMessage() for r in loud]
+    assert us.UPDATE_STATUS_FILE.read_text(encoding="utf-8") == payload

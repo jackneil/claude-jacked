@@ -20,6 +20,20 @@ import os
 import pytest
 
 
+def isolate_windows_profile(monkeypatch, root):
+    """Point APPDATA into ``root`` for the rest of the test.
+
+    The legacy Startup script and the staged Windows task paths derive from
+    APPDATA (``platform._get_windows_startup_path``,
+    ``autostart._windows_vbs_path``, the Task Scheduler supervisor). On a
+    real Windows host APPDATA names the user's roaming folder, where a
+    legacy ``jacked.vbs`` can exist, and the inspector would then read it.
+    The redirect applies on every platform, so no test result can depend on
+    the APPDATA that the process inherited.
+    """
+    monkeypatch.setenv("APPDATA", str(root / "AppData" / "Roaming"))
+
+
 @pytest.fixture(autouse=True)
 def _isolate_claude_dir(tmp_path, monkeypatch):
     """Point every service-module ~/.claude path constant at a tmp dir.
@@ -48,6 +62,7 @@ def _isolate_claude_dir(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: cls(tmp_path)))
+    isolate_windows_profile(monkeypatch, tmp_path)
     if os.name == "nt":
         secure_windows_path(fake)
 

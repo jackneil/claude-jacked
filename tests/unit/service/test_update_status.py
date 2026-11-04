@@ -695,6 +695,274 @@ class TestExclusiveUpdateLock:
         handle.close()
 
 
+def _update_status_warnings(caplog) -> list:
+    """The WARNING messages that the update_status module logged."""
+    import logging
+
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == "jacked.service.update_status" and r.levelno >= logging.WARNING
+    ]
+
+
+def _waited_too_long(message: str) -> bool:
+    """True for the one WARNING of a lock that stayed held past the wait."""
+    import re
+
+    return re.fullmatch(
+        r"the update lock stayed held for \d+\.\d s; writing the status without it",
+        message,
+    ) is not None
+
+
+class TestBatchStepsTakeTheUpdateLock:
+    """Wave 2 W1: the abandoned-update close takes the update lock, reads
+    the record again, checks it and writes. The Windows batch steps
+    (``jacked _update_status*``) held no lock, so a step that wrote between
+    that check and the write was overwritten by the close. Each step is its
+    own short process, so it takes the same lock for its own read-modify-
+    write (``with_update_lock``). The batch cannot hold the lock across its
+    steps, and a step never fails because of the lock."""
+
+    @staticmethod
+    def _hold_then_release(path, after):
+        """Hold the real update lock and release it ``after`` seconds later.
+
+        Returns the thread and a dict. Its ``released`` entry is the
+        monotonic time just before the release."""
+        import threading
+
+        from jacked.service.update_status import acquire_update_lock
+
+        handle = acquire_update_lock(path)
+        assert handle is not None
+        mark = {}
+
+        def release():
+            time.sleep(after)
+            mark["released"] = time.monotonic()
+            handle.close()
+
+        thread = threading.Thread(target=release)
+        thread.start()
+        return thread, mark
+
+    def test_the_action_runs_under_the_lock_and_the_lock_is_released(
+        self, tmp_path, monkeypatch
+    ):
+        """The release is an explicit ``close()``. Garbage collection would
+        release a dropped handle in CPython too, so the spy counts the
+        close itself."""
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        real_try = us._try_update_lock
+        closes = []
+
+        class _CountedHandle:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def close(self):
+                closes.append(1)
+                self._handle.close()
+
+        def counted(target):
+            handle, refusal = real_try(target)
+            return (None if handle is None else _CountedHandle(handle)), refusal
+
+        monkeypatch.setattr(us, "_try_update_lock", counted)
+        seen = []
+
+        def action():
+            seen.append(us.acquire_update_lock(path))
+            return "written"
+
+        assert us.with_update_lock(path, action) == "written"
+        assert seen == [None]                 # the helper held the lock
+        assert closes == [1]                  # and released it once
+        again = us.acquire_update_lock(path)
+        assert again is not None
+        again.close()
+
+    def test_a_held_lock_is_waited_for(self, tmp_path, caplog):
+        import logging
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        thread, mark = self._hold_then_release(path, 0.5)
+        ran = []
+        try:
+            with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+                us.with_update_lock(path, lambda: ran.append(time.monotonic()))
+        finally:
+            thread.join()
+
+        assert len(ran) == 1
+        assert ran[0] >= mark["released"]
+        assert _update_status_warnings(caplog) == []
+
+    def test_a_lock_held_past_the_wait_still_runs_the_action(self, tmp_path, caplog):
+        """The status record is observability, not the update itself: a
+        holder that never lets go must not stop the batch step."""
+        import logging
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        handle = us.acquire_update_lock(path)
+        try:
+            with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+                start = time.monotonic()
+                result = us.with_update_lock(path, lambda: "written", wait_seconds=0.3)
+                waited = time.monotonic() - start
+        finally:
+            handle.close()
+
+        assert result == "written"
+        assert waited >= 0.3
+        warnings = _update_status_warnings(caplog)
+        assert len(warnings) == 1 and _waited_too_long(warnings[0]), warnings
+
+    def test_an_unusable_lock_file_runs_the_action_at_once(self, tmp_path, caplog):
+        """A lock file that cannot be opened is never held by anyone, so a
+        wait cannot help: the step writes at once, with one WARNING that
+        says the lock file cannot be used (not that it stayed held)."""
+        import logging
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        (tmp_path / "status.json.lock").mkdir()   # a dir is not a lock file
+        with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+            start = time.monotonic()
+            result = us.with_update_lock(path, lambda: "written", wait_seconds=5.0)
+            elapsed = time.monotonic() - start
+
+        assert result == "written"
+        assert elapsed < 1.0
+        assert _update_status_warnings(caplog) == [
+            "the update lock file cannot be used; writing the status without it"
+        ]
+
+    def test_the_lock_is_released_when_the_action_raises(self, tmp_path):
+        """The shim handles the exception while its traceback is alive, and
+        the traceback keeps the helper's frame alive. So the lock must be
+        released by the helper itself, not by garbage collection."""
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+
+        def drift():
+            raise ValueError("no in_progress entry")
+
+        with pytest.raises(ValueError, match="no in_progress entry") as raised:
+            us.with_update_lock(path, drift)
+        again = us.acquire_update_lock(path)
+        assert raised.tb is not None          # the frame is still referenced
+        assert again is not None
+        again.close()
+
+    @staticmethod
+    def _step(name, path):
+        """Write the record that batch step ``name`` expects. Returns its
+        argv and a check of the record that the step leaves."""
+        from jacked.service import update_status as us
+
+        if name != "init":
+            us.init_status(path, from_version="a", to_version="b", method="uv")
+        if name == "end":
+            us.begin_phase(path, "installing_package")
+        steps = {
+            "init": (
+                ["_update_status_init", "a", "b", "uv"],
+                lambda d: d["from_version"] == "a" and d["overall"] == "in_progress",
+            ),
+            "begin": (
+                ["_update_status", "installing_package", "in_progress"],
+                lambda d: d["current_phase"] == "installing_package",
+            ),
+            "end": (
+                ["_update_status", "installing_package", "ok"],
+                lambda d: d["phases"][0]["status"] == "ok",
+            ),
+            "succeed": (
+                ["_update_status_succeed"],
+                lambda d: d["overall"] == "succeeded",
+            ),
+            "fail": (
+                ["_update_status_fail", "--error", "the install is in use"],
+                lambda d: d["overall"] == "failed" and d["error"] == "the install is in use",
+            ),
+        }
+        return steps[name]
+
+    @pytest.mark.parametrize("name", ["init", "begin", "end", "succeed", "fail"])
+    def test_every_batch_step_writes_after_a_held_lock_is_released(
+        self, tmp_path, monkeypatch, name
+    ):
+        """The test holds the update lock for 0.5 s, as the abandoned-update
+        close holds it for its check and write. The step waits, and its
+        write lands only after the release."""
+        from click.testing import CliRunner
+
+        from jacked.cli import main
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        argv, check = self._step(name, path)
+        monkeypatch.setattr(us, "UPDATE_STATUS_FILE", path)
+        real_write = us._atomic_write
+        writes = []
+
+        def timed_write(target, data):
+            writes.append(time.monotonic())
+            real_write(target, data)
+
+        monkeypatch.setattr(us, "_atomic_write", timed_write)
+        thread, mark = self._hold_then_release(path, 0.5)
+        try:
+            result = CliRunner().invoke(main, argv)
+        finally:
+            thread.join()
+
+        assert result.exit_code == 0, result.output
+        assert writes, "the step wrote nothing"
+        assert min(writes) >= mark["released"]
+        assert check(us.read_record(path))
+
+    def test_a_batch_step_writes_without_the_lock_after_the_wait(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Through the shim: a lock that stays held past the wait still
+        gets the write, and the step exits 0 with one WARNING."""
+        import logging
+
+        from click.testing import CliRunner
+
+        from jacked.cli import main
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        us.init_status(path, from_version="a", to_version="b", method="uv")
+        monkeypatch.setattr(us, "UPDATE_STATUS_FILE", path)
+        monkeypatch.setattr(us, "BATCH_STEP_LOCK_WAIT_SECONDS", 0.3)
+        handle = us.acquire_update_lock(path)
+        try:
+            with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+                result = CliRunner().invoke(
+                    main, ["_update_status", "installing_package", "in_progress"]
+                )
+        finally:
+            handle.close()
+
+        assert result.exit_code == 0, result.output
+        assert us.read_record(path)["current_phase"] == "installing_package"
+        warnings = _update_status_warnings(caplog)
+        assert len(warnings) == 1 and _waited_too_long(warnings[0]), warnings
+
+
 @pytest.mark.parametrize("pid", [2**31, 2**40, 2**70, True])
 def test_an_oversized_or_bogus_updater_pid_never_raises(tmp_path, pid):
     """os.kill raises OverflowError (not OSError) above pid_t; a probe must not."""
@@ -846,3 +1114,874 @@ def test_a_reused_pid_does_not_keep_an_update_alive(tmp_path, monkeypatch):
     assert us.updater_liveness(data) is None  # cannot tell: the mtime rule applies
     legacy = {k: v for k, v in data.items() if k != "updater_creation_id"}
     assert us.updater_liveness(legacy) is True  # a record from before the field
+
+
+# ---------------------------------------------------------------------------
+# #151i: a completed install is proof the update finished
+# ---------------------------------------------------------------------------
+
+
+def _iso(when):
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(when, tz=timezone.utc).isoformat()
+
+
+_STARTED = "2026-11-02T10:00:00.000000+00:00"
+_LATER = "2026-11-02T10:00:25.000000+00:00"
+
+
+def _record(**overrides):
+    record = {
+        "overall": "in_progress",
+        "started_at": _STARTED,
+        "from_version": "0.110.1",
+        "to_version": "0.110.2",
+    }
+    record.update(overrides)
+    return record
+
+
+def _last(at=_LATER, to_version="0.110.2"):
+    return {"at": at, "from_version": "0.110.1", "to_version": to_version}
+
+
+class TestInstallCompletedAfter:
+    """The last-install record and the running version are independent proof
+    that an update's install finished, whatever its status record says."""
+
+    def test_an_install_after_the_start_at_the_running_version_completed(self):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(_record(), _last(), "0.110.2") is True
+
+    def test_an_install_newer_than_the_running_build_also_counts(self):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(
+            _record(), _last(to_version="0.110.3"), "0.110.2"
+        ) is True
+
+    @pytest.mark.parametrize(
+        "at", ["2026-11-02T09:59:59.000000+00:00", _STARTED],
+        ids=["before-the-start", "at-the-start"],
+    )
+    def test_an_install_that_is_not_later_than_the_start_proves_nothing(self, at):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(_record(), _last(at=at), "0.110.2") is False
+
+    def test_no_last_install_proves_nothing(self):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(_record(), None, "0.110.2") is False
+
+    def test_an_install_older_than_the_running_build_proves_nothing(self):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(
+            _record(from_version="0.110.0"), _last(to_version="0.110.1"), "0.110.2"
+        ) is False
+
+    def test_an_install_that_is_not_newer_than_the_from_version_proves_nothing(self):
+        from jacked.service import update_status as us
+
+        assert us.install_completed_after(
+            _record(from_version="0.110.2"), _last(to_version="0.110.2"), "0.110.2"
+        ) is False
+
+    def test_the_build_the_update_started_from_still_running_proves_nothing(self):
+        """Reviewer D: an update from 0.110.2 to 0.110.3 and a later install
+        of 0.110.3, while 0.110.2 still runs. The install did not reach this
+        process, so this process cannot call the update complete."""
+        from jacked.service import update_status as us
+
+        record = _record(from_version="0.110.2", to_version="0.110.3")
+        assert us.install_completed_after(
+            record, _last(to_version="0.110.3"), "0.110.2"
+        ) is False
+        # An older build than the update started from is not newer either.
+        assert us.install_completed_after(
+            record, _last(to_version="0.110.3"), "0.110.1"
+        ) is False
+
+    def test_versions_compare_by_pep_440_not_as_text(self):
+        from jacked.service import update_status as us
+
+        # 0.99.0 sorts after 0.110.2 as text, before it by PEP 440.
+        assert us.install_completed_after(
+            _record(from_version="0.99.0"), _last(), "0.110.2"
+        ) is True
+        # A dev build sorts before its release.
+        assert us.install_completed_after(
+            _record(), _last(to_version="0.110.2.dev3"), "0.110.2"
+        ) is False
+        # A release candidate sorts before its release.
+        assert us.install_completed_after(
+            _record(from_version="0.110.2rc1"), _last(), "0.110.2"
+        ) is True
+
+    def test_timestamps_compare_as_instants_across_offsets(self):
+        from jacked.service import update_status as us
+
+        # 06:00:25-04:00 is 10:00:25 UTC: 25 s after the start.
+        assert us.install_completed_after(
+            _record(), _last(at="2026-11-02T06:00:25-04:00"), "0.110.2"
+        ) is True
+
+    @pytest.mark.parametrize(
+        "record,last,running",
+        [
+            (_record(from_version="not a version"), _last(), "0.110.2"),
+            (_record(from_version=None), _last(), "0.110.2"),
+            (_record(), _last(to_version=None), "0.110.2"),
+            (_record(), _last(to_version="0.110"), "garbage!"),
+            (_record(started_at="yesterday"), _last(), "0.110.2"),
+            (_record(started_at=None), _last(), "0.110.2"),
+            (_record(), _last(at=12345), "0.110.2"),
+            (_record(), _last(at="2026-11-02T10:00:25"), "0.110.2"),
+            (_record(), {"to_version": "0.110.2"}, "0.110.2"),
+            (_record(), ["not", "a", "record"], "0.110.2"),
+            (["not", "a", "record"], _last(), "0.110.2"),
+            (_record(), _last(), None),
+        ],
+        ids=[
+            "bad-from-version",
+            "no-from-version",
+            "no-to-version",
+            "bad-running-version",
+            "bad-started-at",
+            "no-started-at",
+            "numeric-at",
+            "naive-at",
+            "no-at",
+            "last-install-not-an-object",
+            "record-not-an-object",
+            "no-running-version",
+        ],
+    )
+    def test_malformed_input_proves_nothing_with_one_debug_line(
+        self, caplog, record, last, running
+    ):
+        import logging
+
+        from jacked.service import update_status as us
+
+        with caplog.at_level(logging.DEBUG, logger="jacked.service.update_status"):
+            assert us.install_completed_after(record, last, running) is False
+        lines = [
+            r for r in caplog.records
+            if r.name == "jacked.service.update_status" and r.levelno == logging.DEBUG
+        ]
+        assert len(lines) == 1, [r.getMessage() for r in lines]
+
+
+class TestAbandonedStatusSeesACompletedInstall:
+    """A stale in_progress record whose install completed is closed as
+    succeeded: the batch or the updater died after the install, not during it.
+    """
+
+    @staticmethod
+    def _write(path, started, age_seconds):
+        import json
+
+        path.write_text(
+            json.dumps(_record(started_at=_iso(started), current_phase="restarting_service",
+                               phases=[])),
+            encoding="utf-8",
+        )
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+
+    def test_a_completed_install_closes_the_record_as_succeeded(self, tmp_path):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        self._write(path, started, us.STALE_IN_PROGRESS_SECONDS + 60)
+        last = _last(at=_iso(started + 25))
+
+        assert us.abandoned_status(
+            path, last_install=last, running_version="0.110.2"
+        ) is None
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "succeeded"
+
+    @pytest.mark.parametrize("offset", [None, -60], ids=["no-install", "older-install"])
+    def test_without_a_later_install_the_record_is_still_abandoned(self, tmp_path, offset):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        self._write(path, started, us.STALE_IN_PROGRESS_SECONDS + 60)
+        last = None if offset is None else _last(at=_iso(started + offset))
+
+        record = us.abandoned_status(path, last_install=last, running_version="0.110.2")
+
+        assert record is not None
+        assert record["current_phase"] == "restarting_service"
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+    def test_a_fresh_record_stays_open_even_after_a_completed_install(self, tmp_path):
+        """The updater may still run its last phases; it closes its own record."""
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - 30
+        self._write(path, started, 5)
+
+        assert us.abandoned_status(
+            path, last_install=_last(at=_iso(started + 25)), running_version="0.110.2"
+        ) is None
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+    def test_a_record_that_cannot_be_closed_is_still_not_abandoned(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The verdict holds without the write: no recovery file is due, and
+        the next start reads the same evidence and tries the close again."""
+        import json
+        import logging
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        self._write(path, started, us.STALE_IN_PROGRESS_SECONDS + 60)
+
+        def refuse(*_args, **_kwargs):
+            raise PermissionError("read-only")
+
+        monkeypatch.setattr(us, "_atomic_write", refuse)
+        with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+            assert us.abandoned_status(
+                path, last_install=_last(at=_iso(started + 25)), running_version="0.110.2"
+            ) is None
+        assert "PermissionError" in caplog.text
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+    def test_without_a_running_version_the_age_rule_alone_decides(self, tmp_path):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        self._write(path, started, us.STALE_IN_PROGRESS_SECONDS + 60)
+
+        assert us.abandoned_status(
+            path, last_install=_last(at=_iso(started + 25))
+        ) is not None
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+    def test_an_install_that_this_build_did_not_get_is_still_abandoned(self, tmp_path):
+        """Reviewer D: the stale record says 0.110.2 to 0.110.3, an install of
+        0.110.3 completed later, and 0.110.2 still runs. Marking it succeeded
+        hid an update that never reached this process."""
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        path.write_text(
+            json.dumps(_record(
+                started_at=_iso(started), from_version="0.110.2", to_version="0.110.3",
+                current_phase="restarting_service", phases=[],
+            )),
+            encoding="utf-8",
+        )
+        stamp = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+        os.utime(path, (stamp, stamp))
+
+        record = us.abandoned_status(
+            path,
+            last_install=_last(at=_iso(started + 25), to_version="0.110.3"),
+            running_version="0.110.2",
+        )
+
+        assert record is not None
+        assert record["current_phase"] == "restarting_service"
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+
+class _FakeLock:
+    """Stands in for the update lock handle: records that it was released."""
+
+    def __init__(self):
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+class TestAbandonedStatusHoldsTheUpdateLock:
+    """Reviewer B / pre-mortem 4: ``abandoned_status`` marked the record
+    succeeded with no update lock and no attempt identity. Updater B could
+    start a new attempt between the read and the write, and the write then
+    marked B's live attempt succeeded."""
+
+    @staticmethod
+    def _stale_completed(path):
+        """A stale in_progress record whose install completed after it began."""
+        import json
+
+        from jacked.service import update_status as us
+
+        started = time.time() - us.STALE_IN_PROGRESS_SECONDS - 120
+        path.write_text(
+            json.dumps(_record(
+                started_at=_iso(started), current_phase="restarting_service", phases=[],
+            )),
+            encoding="utf-8",
+        )
+        stamp = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+        os.utime(path, (stamp, stamp))
+        return _last(at=_iso(started + 25))
+
+    def test_a_held_lock_leaves_the_record_open(self, tmp_path, monkeypatch):
+        """A held lock means a live updater, and a live updater is never
+        abandoned: no write, and no recovery file is due."""
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        last = self._stale_completed(path)
+        asked = []
+
+        def held(lock_target):
+            asked.append(lock_target)
+            return None
+
+        monkeypatch.setattr(us, "acquire_update_lock", held)
+
+        assert us.abandoned_status(
+            path, last_install=last, running_version="0.110.2"
+        ) is None
+        assert asked == [path]
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+    def test_the_lock_is_taken_and_released_around_the_close(self, tmp_path, monkeypatch):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        last = self._stale_completed(path)
+        lock = _FakeLock()
+        monkeypatch.setattr(us, "acquire_update_lock", lambda _path: lock)
+
+        assert us.abandoned_status(
+            path, last_install=last, running_version="0.110.2"
+        ) is None
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "succeeded"
+        assert lock.closed == 1
+
+    @pytest.mark.parametrize(
+        ("change", "fresh"),
+        [
+            ({"started_at": "2026-11-03T08:00:00+00:00"}, False),
+            ({"from_version": "0.110.2"}, False),
+            ({"overall": "failed"}, False),
+            # The same attempt wrote again (a fresh mtime): it still runs. A
+            # Windows batch step that wrote between the first read and the
+            # lock is protected by this second mtime check.
+            ({}, True),
+        ],
+        ids=[
+            "a-new-attempt-started", "a-new-from-version", "closed-meanwhile",
+            "the-attempt-wrote-again",
+        ],
+    )
+    def test_a_record_that_changed_before_the_lock_is_left_alone(
+        self, tmp_path, monkeypatch, change, fresh
+    ):
+        """Between the first read and the lock, another updater replaced or
+        closed the record. Only the attempt that was read may be closed.
+
+        A changed identity keeps a STALE mtime, so the identity check alone
+        must refuse it: a fresh mtime would hide a missing identity check
+        behind the staleness check. The unchanged record is the one case
+        with a fresh mtime, and only the staleness check refuses it."""
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        last = self._stale_completed(path)
+        lock = _FakeLock()
+
+        def replaced_then_granted(_path):
+            current = json.loads(path.read_text(encoding="utf-8"))
+            current.update(change)
+            path.write_text(json.dumps(current), encoding="utf-8")
+            if not fresh:
+                stamp = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+                os.utime(path, (stamp, stamp))
+            return lock
+
+        monkeypatch.setattr(us, "acquire_update_lock", replaced_then_granted)
+
+        assert us.abandoned_status(
+            path, last_install=last, running_version="0.110.2"
+        ) is None
+        after = json.loads(path.read_text(encoding="utf-8"))
+        for key, value in change.items():
+            assert after[key] == value
+        assert after["overall"] == change.get("overall", "in_progress")
+        assert lock.closed == 1
+
+    def test_a_lock_that_cannot_be_taken_leaves_the_record_open(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The verdict holds without the write: no recovery file is due, and
+        the next start reads the same evidence and tries again."""
+        import json
+        import logging
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        last = self._stale_completed(path)
+
+        def broken(_path):
+            raise PermissionError("read-only")
+
+        monkeypatch.setattr(us, "acquire_update_lock", broken)
+
+        with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+            assert us.abandoned_status(
+                path, last_install=last, running_version="0.110.2"
+            ) is None
+        assert "PermissionError" in caplog.text
+        assert "read-only" not in caplog.text
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+
+class TestCloseAbandonedUpdate:
+    """The failed close of an abandoned update takes the same update lock and
+    makes the same second read as the completed close. Before this the tray
+    called mark_failed with neither, so an updater that started between the
+    read and the write had its live attempt marked failed, and the tray wrote
+    a recovery file for a failure that did not happen."""
+
+    @staticmethod
+    def _stale(path):
+        """Write a stale in_progress record; return it as the first read saw it."""
+        import json
+
+        from jacked.service import update_status as us
+
+        record = _record(
+            started_at=_iso(time.time() - us.STALE_IN_PROGRESS_SECONDS - 120),
+            current_phase="migrating_settings",
+            phases=[],
+        )
+        path.write_text(json.dumps(record), encoding="utf-8")
+        stamp = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+        os.utime(path, (stamp, stamp))
+        return record
+
+    def test_a_stale_attempt_closes_as_failed_and_returns_the_record(self, tmp_path):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        seen = self._stale(path)
+
+        closed = us.close_abandoned_update(
+            path, seen, error="interrupted", recovery="jacked upgrade"
+        )
+
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert closed == stored
+        assert stored["overall"] == "failed"
+        assert stored["error"] == "interrupted"
+        assert stored["recovery"] == "jacked upgrade"
+        assert stored["started_at"] == seen["started_at"]
+        assert "failed_at" in stored
+
+    def test_a_held_lock_writes_nothing(self, tmp_path, monkeypatch):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        seen = self._stale(path)
+        monkeypatch.setattr(us, "acquire_update_lock", lambda _path: None)
+
+        assert us.close_abandoned_update(path, seen, error="interrupted") is None
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+    @pytest.mark.parametrize(
+        ("change", "fresh"),
+        [
+            ({"started_at": "2026-11-03T08:00:00+00:00"}, False),
+            ({"from_version": "0.110.2"}, False),
+            ({"overall": "succeeded"}, False),
+            ({}, True),
+        ],
+        ids=[
+            "a-new-attempt-started", "a-new-from-version", "closed-meanwhile",
+            "the-attempt-wrote-again",
+        ],
+    )
+    def test_a_record_that_changed_before_the_lock_is_left_alone(
+        self, tmp_path, monkeypatch, change, fresh
+    ):
+        """A changed identity keeps a STALE mtime, so only the identity check
+        can refuse it. The unchanged record has a fresh mtime, so only the
+        staleness check can refuse it."""
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        seen = self._stale(path)
+        lock = _FakeLock()
+
+        def replaced_then_granted(_path):
+            current = json.loads(path.read_text(encoding="utf-8"))
+            current.update(change)
+            path.write_text(json.dumps(current), encoding="utf-8")
+            if not fresh:
+                stamp = time.time() - us.STALE_IN_PROGRESS_SECONDS - 60
+                os.utime(path, (stamp, stamp))
+            return lock
+
+        monkeypatch.setattr(us, "acquire_update_lock", replaced_then_granted)
+
+        assert us.close_abandoned_update(path, seen, error="interrupted") is None
+        after = json.loads(path.read_text(encoding="utf-8"))
+        assert after["overall"] == change.get("overall", "in_progress")
+        assert "failed_at" not in after
+        assert lock.closed == 1
+
+    def test_a_lock_that_cannot_be_taken_writes_nothing(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import json
+        import logging
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        seen = self._stale(path)
+
+        def broken(_path):
+            raise PermissionError("read-only")
+
+        monkeypatch.setattr(us, "acquire_update_lock", broken)
+
+        with caplog.at_level(logging.WARNING, logger="jacked.service.update_status"):
+            assert us.close_abandoned_update(path, seen, error="interrupted") is None
+        assert "Could not close the abandoned update record: PermissionError" in (
+            caplog.text
+        )
+        assert json.loads(path.read_text(encoding="utf-8"))["overall"] == "in_progress"
+
+
+class TestFailedUpdateSuperseded:
+    """A failed record no longer applies once a later install replaced the
+    build it started from."""
+
+    def test_a_later_install_past_the_failed_build_supersedes_it(self):
+        from jacked.service import update_status as us
+
+        failed = _record(overall="failed", from_version="0.103.0")
+        assert us.failed_update_superseded(failed, _last(), "0.110.2") is True
+
+    def test_a_record_that_did_not_fail_is_never_superseded(self):
+        from jacked.service import update_status as us
+
+        for overall in ("in_progress", "succeeded", None):
+            record = _record(overall=overall, from_version="0.103.0")
+            assert us.failed_update_superseded(record, _last(), "0.110.2") is False
+
+    def test_the_failed_build_still_running_is_not_superseded(self):
+        from jacked.service import update_status as us
+
+        failed = _record(overall="failed", from_version="0.110.2")
+        assert us.failed_update_superseded(
+            failed, _last(to_version="0.110.3"), "0.110.2"
+        ) is False
+
+    def test_no_install_after_the_failure_is_not_superseded(self):
+        from jacked.service import update_status as us
+
+        failed = _record(overall="failed", from_version="0.103.0")
+        early = _last(at="2026-11-01T10:00:00.000000+00:00")
+        assert us.failed_update_superseded(failed, early, "0.110.2") is False
+        assert us.failed_update_superseded(failed, None, "0.110.2") is False
+
+    @pytest.mark.parametrize(
+        "record,running",
+        [
+            (_record(overall="failed", from_version="garbage!"), "0.110.2"),
+            (_record(overall="failed", from_version="0.103.0"), "garbage!"),
+            (["not", "a", "record"], "0.110.2"),
+        ],
+        ids=["bad-from-version", "bad-running-version", "record-not-an-object"],
+    )
+    def test_malformed_input_is_not_superseded_and_never_raises(self, record, running):
+        from jacked.service import update_status as us
+
+        assert us.failed_update_superseded(record, _last(), running) is False
+
+    # Reviewer B / pre-mortem 3: the failed attempt's OWN install record
+    # counted as the later repair.
+
+    _FAILED_AT = "2026-11-02T10:02:00.000000+00:00"
+
+    def _own_install_failure(self, **overrides):
+        """An update that installed 0.110.2 (its migrate step wrote the
+        last-install record at _LATER), then failed verification and could
+        not roll the package back, so 0.110.2 runs."""
+        phases = [
+            {"name": "migrating_settings", "status": "ok",
+             "started_at": "2026-11-02T10:00:20.000000+00:00",
+             "finished_at": "2026-11-02T10:00:30.000000+00:00"},
+            {"name": "verifying_service", "status": "failed",
+             "started_at": "2026-11-02T10:00:31.000000+00:00",
+             "finished_at": "2026-11-02T10:01:31.000000+00:00"},
+        ]
+        return _record(
+            overall="failed", phases=phases, failed_at=self._FAILED_AT, **overrides
+        )
+
+    def test_the_failed_attempts_own_install_does_not_supersede_it(self):
+        from jacked.service import update_status as us
+
+        assert us.failed_update_superseded(
+            self._own_install_failure(), _last(), "0.110.2"
+        ) is False
+
+    def test_a_repair_after_the_failure_supersedes_it(self):
+        from jacked.service import update_status as us
+
+        repair = _last(at="2026-11-02T10:05:00.000000+00:00")
+        assert us.failed_update_superseded(
+            self._own_install_failure(), repair, "0.110.2"
+        ) is True
+        # An install between the last phase and the close is still the
+        # failed attempt's own work (a rollback step), not a repair.
+        during = _last(at="2026-11-02T10:01:45.000000+00:00")
+        assert us.failed_update_superseded(
+            self._own_install_failure(), during, "0.110.2"
+        ) is False
+
+    def test_a_record_without_failed_at_uses_its_latest_phase_finish(self):
+        """A record from a build before ``failed_at``: the latest phase that
+        closed is the last instant the record proves the attempt ran."""
+        from jacked.service import update_status as us
+
+        old_shape = self._own_install_failure()
+        del old_shape["failed_at"]
+        old_shape["phases"].append(
+            {"name": "rolling_back", "status": "in_progress",
+             "started_at": "2026-11-02T10:01:32.000000+00:00", "finished_at": None}
+        )
+
+        assert us.failed_update_superseded(old_shape, _last(), "0.110.2") is False
+        after_the_last_phase = _last(at="2026-11-02T10:01:40.000000+00:00")
+        assert us.failed_update_superseded(
+            old_shape, after_the_last_phase, "0.110.2"
+        ) is True
+
+    def test_a_record_with_no_finish_instant_falls_back_to_its_start(self):
+        """The #151i acceptance: a 0.103.0 failure with no phases and no
+        failed_at, then a later install of 0.110.2, is superseded."""
+        from jacked.service import update_status as us
+
+        failed = _record(overall="failed", from_version="0.103.0", phases=[])
+        assert us.failed_update_superseded(failed, _last(), "0.110.2") is True
+
+    @pytest.mark.parametrize("value", ["yesterday", "2026-11-02T10:02:00", 7])
+    def test_an_unusable_failed_at_proves_nothing(self, caplog, value):
+        import logging
+
+        from jacked.service import update_status as us
+
+        record = self._own_install_failure()
+        record["failed_at"] = value
+        repair = _last(at="2026-11-02T10:05:00.000000+00:00")
+
+        with caplog.at_level(logging.DEBUG, logger="jacked.service.update_status"):
+            assert us.failed_update_superseded(record, repair, "0.110.2") is False
+        assert "failed_at" in caplog.text
+
+    def test_the_real_writers_close_the_record_after_its_own_install(
+        self, tmp_path, monkeypatch
+    ):
+        """The updater's own sequence, through the real writers: the migrate
+        step's install, a failed verification, then mark_failed."""
+        import json
+        from datetime import datetime, timedelta, timezone
+
+        from jacked.service import update_status as us
+
+        clock = [datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc)]
+
+        def tick():
+            clock[0] += timedelta(seconds=1)
+            return clock[0].isoformat()
+
+        monkeypatch.setattr(us, "_now_iso", tick)
+        path = tmp_path / "status.json"
+        us.init_status(path, "0.110.1", "0.110.2", "uv")
+        us.begin_phase(path, "migrating_settings")
+        own_install = {"at": tick(), "from_version": "0.110.1", "to_version": "0.110.2"}
+        us.end_phase(path, "migrating_settings", status="ok")
+        us.begin_phase(path, "verifying_service")
+        us.end_phase(path, "verifying_service", status="failed", error="no bind")
+        us.mark_failed(path, error="never became ready", recovery="jacked upgrade")
+        record = json.loads(path.read_text(encoding="utf-8"))
+
+        assert us.failed_update_superseded(record, own_install, "0.110.2") is False
+        repair = {"at": tick(), "from_version": "0.110.2", "to_version": "0.110.2"}
+        assert us.failed_update_superseded(record, repair, "0.110.2") is True
+
+
+class TestFailedAtStamp:
+    """The record carries the instant it closed as failed (``failed_at``),
+    so a later install can be compared with the failure, not the start."""
+
+    @staticmethod
+    def _instant(value):
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(value)
+        assert parsed.utcoffset() is not None
+        return parsed
+
+    def test_mark_failed_stamps_failed_at(self, tmp_path):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        us.init_status(path, "0.110.1", "0.110.2", "uv")
+        before = self._instant(us._now_iso())
+        us.mark_failed(path, error="boom")
+        record = json.loads(path.read_text(encoding="utf-8"))
+
+        assert self._instant(record["failed_at"]) >= before
+
+    def test_a_failed_phase_stamps_failed_at_and_an_ok_phase_does_not(self, tmp_path):
+        import json
+
+        from jacked.service import update_status as us
+
+        path = tmp_path / "status.json"
+        us.init_status(path, "0.110.1", "0.110.2", "uv")
+        us.begin_phase(path, "preflight")
+        us.end_phase(path, "preflight", status="ok")
+        assert "failed_at" not in json.loads(path.read_text(encoding="utf-8"))
+
+        us.begin_phase(path, "migrating_settings")
+        us.end_phase(path, "migrating_settings", status="failed", error="boom")
+        record = json.loads(path.read_text(encoding="utf-8"))
+
+        assert record["failed_at"] == record["phases"][-1]["finished_at"]
+
+    def test_a_later_close_moves_failed_at_forward(self, tmp_path, monkeypatch):
+        """mark_failed after a failed phase (the rollback, then the close):
+        everything before the last close is the failed attempt's own work."""
+        import json
+        from datetime import datetime, timedelta, timezone
+
+        from jacked.service import update_status as us
+
+        clock = [datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc)]
+
+        def tick():
+            clock[0] += timedelta(seconds=1)
+            return clock[0].isoformat()
+
+        monkeypatch.setattr(us, "_now_iso", tick)
+        path = tmp_path / "status.json"
+        us.init_status(path, "0.110.1", "0.110.2", "uv")
+        us.begin_phase(path, "verifying_service")
+        us.end_phase(path, "verifying_service", status="failed", error="no bind")
+        first = json.loads(path.read_text(encoding="utf-8"))["failed_at"]
+        us.mark_failed(path, error="never became ready")
+        last = json.loads(path.read_text(encoding="utf-8"))["failed_at"]
+
+        assert self._instant(last) > self._instant(first)
+
+
+class TestRecoveryPredatesCompletedUpdate:
+    """Reviewer D: a recovery file left by an EARLIER failure survived a
+    later update that closed as succeeded, and toasted on every start."""
+
+    _DONE = {
+        "overall": "succeeded",
+        "started_at": _STARTED,
+        "from_version": "0.110.1",
+        "to_version": "0.110.2",
+    }
+
+    @staticmethod
+    def _epoch(value):
+        from datetime import datetime
+
+        return datetime.fromisoformat(value).timestamp()
+
+    def test_a_file_older_than_the_completed_update_is_stale(self):
+        from jacked.service import update_status as us
+
+        earlier = self._epoch("2026-11-01T10:00:00+00:00")
+        assert us.recovery_predates_completed_update(
+            self._DONE, "0.110.2", earlier
+        ) is True
+
+    @pytest.mark.parametrize(
+        "written", [_STARTED, "2026-11-02T10:00:05+00:00"], ids=["at-the-start", "later"]
+    )
+    def test_a_file_written_during_or_after_the_update_stays(self, written):
+        from jacked.service import update_status as us
+
+        assert us.recovery_predates_completed_update(
+            self._DONE, "0.110.2", self._epoch(written)
+        ) is False
+
+    def test_the_build_the_update_started_from_still_running_keeps_the_file(self):
+        from jacked.service import update_status as us
+
+        earlier = self._epoch("2026-11-01T10:00:00+00:00")
+        assert us.recovery_predates_completed_update(
+            self._DONE, "0.110.1", earlier
+        ) is False
+
+    @pytest.mark.parametrize("overall", ["failed", "in_progress", None])
+    def test_a_record_that_did_not_succeed_keeps_the_file(self, overall):
+        from jacked.service import update_status as us
+
+        earlier = self._epoch("2026-11-01T10:00:00+00:00")
+        assert us.recovery_predates_completed_update(
+            {**self._DONE, "overall": overall}, "0.110.2", earlier
+        ) is False
+
+    @pytest.mark.parametrize(
+        "record,running",
+        [
+            ({**_DONE, "from_version": "garbage!"}, "0.110.2"),
+            (_DONE, "garbage!"),
+            ({**_DONE, "started_at": "yesterday"}, "0.110.2"),
+            ({**_DONE, "started_at": "2026-11-02T10:00:00"}, "0.110.2"),
+            (["not", "a", "record"], "0.110.2"),
+        ],
+        ids=["bad-from-version", "bad-running", "bad-start", "naive-start", "not-an-object"],
+    )
+    def test_malformed_input_keeps_the_file_and_never_raises(self, record, running):
+        from jacked.service import update_status as us
+
+        earlier = self._epoch("2026-11-01T10:00:00+00:00")
+        assert us.recovery_predates_completed_update(record, running, earlier) is False

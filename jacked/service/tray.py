@@ -1,5 +1,6 @@
 """System tray icon and menu for jacked service mode."""
 
+import contextlib
 import logging
 import os
 import signal
@@ -99,6 +100,69 @@ _ICON_COLORS = {
 # If Win32 refuses to unregister a console callback, Windows still owns its
 # raw address. Root it for the rest of the process so GC can never free it.
 _FAILED_WIN_CTRL_HANDLERS: list[object] = []
+
+
+def _stop_signal_numbers() -> tuple[signal.Signals, ...]:
+    """Return the signals that stop the service on this platform.
+
+    Windows: SIGINT (Ctrl+C) and SIGBREAK (Ctrl+Break). pystray runs a
+    native message pump there that blocks Python bytecode, but a Ctrl+C in
+    the console still reaches SIGINT, and SIGBREAK covers Ctrl+Break. POSIX:
+    SIGTERM (the supervisor's stop) and SIGINT.
+    """
+    if sys.platform == "win32":
+        numbers: tuple[signal.Signals, ...] = (signal.SIGINT,)
+        if hasattr(signal, "SIGBREAK"):
+            numbers += (signal.SIGBREAK,)
+        return numbers
+    return (signal.SIGTERM, signal.SIGINT)
+
+
+@contextlib.contextmanager
+def _stop_signals(handler):
+    """Route the stop signals to ``handler`` while the block runs.
+
+    Signal handlers belong to the whole process, but a runner lives for one
+    ``run()`` call. So this saves each previous handler first and puts it
+    back when the block exits, also on an exception, the way
+    ``proctree._terminate_as_exception`` does for SIGTERM. Without the
+    restore, a handler left after ``run()`` returns binds Ctrl+C to a dead
+    runner, and Ctrl+C no longer raises KeyboardInterrupt (#138i).
+
+    Python lets only the main thread set a handler. On any other thread the
+    block runs with the handlers unchanged. A signal that cannot be routed
+    or put back is logged at WARNING, and the other signals still are.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    saved: list[tuple[signal.Signals, object]] = []
+    try:
+        for signum in _stop_signal_numbers():
+            try:
+                previous = signal.getsignal(signum)
+                signal.signal(signum, handler)
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "Could not route %s to the service stop: %s",
+                    signal.Signals(signum).name,
+                    type(exc).__name__,
+                )
+                continue
+            saved.append((signum, previous))
+        yield
+    finally:
+        for signum, previous in reversed(saved):
+            try:
+                signal.signal(signum, previous)
+            except (OSError, ValueError, TypeError) as exc:
+                # TypeError: a handler set outside Python reads back as None,
+                # and Python cannot set None again.
+                logger.warning(
+                    "Could not restore the previous %s handler: %s",
+                    signal.Signals(signum).name,
+                    type(exc).__name__,
+                )
 
 
 def check_tray_deps() -> None:
@@ -939,6 +1003,15 @@ class ServiceRunner:
             self._uvicorn_server.should_exit = True
         self._stop_event.set()
 
+    def _on_stop_signal(self, _signum, _frame) -> None:
+        """Signal handler for the stop signals: request a stop (signal-safe).
+
+        ``_stop_signals`` installs it for one run. The stop-monitor thread
+        (pystray) or the agent's stop timer (macOS) bridges the request to
+        the full cleanup.
+        """
+        self._request_stop()
+
     def _install_windows_console_handler(self) -> None:
         """Register a Win32 SetConsoleCtrlHandler so Ctrl+C kills the service.
 
@@ -1392,11 +1465,13 @@ class ServiceRunner:
         """pystray setup callback — runs after icon appears."""
         icon.visible = True
 
-        # Surface a prior failed update if recovery file exists.
+        # Surface a prior failed update if recovery file exists. run() made
+        # the boot checks on the path that both backends share: it wrote the
+        # file for an interrupted update and removed a stale one, so the
+        # toast below shows only for a real failure.
         try:
             from jacked.service.updater import RECOVERY_FILE
 
-            self._record_abandoned_update()
             if RECOVERY_FILE.exists():
                 icon.notify(
                     "Previous update failed. See "
@@ -1437,13 +1512,30 @@ class ServiceRunner:
         A machine that lost power (or the tray process) mid-update boots with
         an `in_progress` status file nobody will ever close. The status reader
         hides it so no zombie banner appears, which also hid it from the user.
-        Write the recovery file instead, and close the status as failed.
+        Close the status as failed instead, then write the recovery file.
+
+        The close comes first and takes the update lock
+        (``update_status.close_abandoned_update``). Another updater can start,
+        or the attempt can write again, between the first read and the close.
+        Then nothing is closed and no recovery file is written, because the
+        file would describe a failure that did not happen.
+
+        An old record is not proof of a failure: the batch or the updater can
+        stop after the install completed. The last-install record and this
+        build's version are the evidence; with them, ``abandoned_status``
+        closes a completed update as succeeded and no recovery file is
+        written (#151i).
         """
         from jacked import __version__
+        from jacked.install_summary import read_last_install
         from jacked.service import update_status as _us
         from jacked.service.updater import RECOVERY_FILE
 
-        record = _us.abandoned_status(_us.UPDATE_STATUS_FILE)
+        record = _us.abandoned_status(
+            _us.UPDATE_STATUS_FILE,
+            last_install=read_last_install(),
+            running_version=__version__,
+        )
         if record is None:
             return
         phase = record.get("current_phase") or "an unknown phase"
@@ -1452,6 +1544,11 @@ class ServiceRunner:
             f"This tray is v{__version__}."
         )
         recovery = "jacked upgrade"
+        closed = _us.close_abandoned_update(
+            _us.UPDATE_STATUS_FILE, record, error=error, recovery=recovery
+        )
+        if closed is None:
+            return
         try:
             RECOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
             RECOVERY_FILE.write_text(
@@ -1462,10 +1559,58 @@ class ServiceRunner:
             )
         except OSError:
             logger.exception("Could not write the update recovery file")
+
+    def clear_stale_recovery(self) -> bool:
+        """Remove the update recovery file when a later install made it stale.
+
+        The tray toasts "Previous update failed" on every start while the
+        recovery file exists. After a later install replaced the build that
+        failed to update (a manual ``jacked upgrade``, a second update), that
+        toast repeated forever. The file is stale in two cases:
+
+        * The status record closed as failed, the running build is newer
+          than the version that update started from, and an install
+          completed after the update failed
+          (``update_status.failed_update_superseded``).
+        * The status record closed as succeeded, the running build is newer
+          than the version that update started from, and the file was
+          written before that update started
+          (``update_status.recovery_predates_completed_update``). The
+          updater removes the file when its own update succeeds, but an
+          update that ``abandoned_status`` closed as succeeded did not.
+
+        The record is read with no staleness rule (``read_record``): an old
+        record is still evidence. A genuine failure keeps its file and its
+        toast. A recovery file that no record explains is never removed.
+        Returns True when this call removed the file.
+        """
+        from jacked import __version__
+        from jacked.install_summary import read_last_install
+        from jacked.service import update_status as _us
+        from jacked.service.updater import RECOVERY_FILE
+
         try:
-            _us.mark_failed(_us.UPDATE_STATUS_FILE, error=error, recovery=recovery)
-        except Exception:
-            logger.exception("Could not mark the abandoned update failed")
+            written = RECOVERY_FILE.stat().st_mtime
+        except FileNotFoundError:
+            return False
+        record = _us.read_record(_us.UPDATE_STATUS_FILE)
+        if record is None:
+            return False
+        stale = _us.failed_update_superseded(
+            record, read_last_install(), __version__
+        ) or _us.recovery_predates_completed_update(record, __version__, written)
+        if not stale:
+            return False
+        try:
+            RECOVERY_FILE.unlink()
+        except FileNotFoundError:
+            return False  # another process removed it first; nothing is left
+        logger.info(
+            "cleared stale update recovery file (from %s, running %s)",
+            record.get("from_version"),
+            __version__,
+        )
+        return True
 
     def _install_tray_file_logger(self) -> None:
         """Route `jacked` logger output to ~/.claude/jacked-tray.log.
@@ -1521,34 +1666,36 @@ class ServiceRunner:
                 "Use --port to run on a different port."
             )
 
-        # Signal-safe: just set the stop event; the agent's stop-watch timer
-        # bridges that to a clean uvicorn shutdown + quit on the main thread.
-        signal.signal(signal.SIGTERM, lambda *_: self._request_stop())
-        signal.signal(signal.SIGINT, lambda *_: self._request_stop())
+        # Signal-safe: the handler only sets the stop event; the agent's
+        # stop-watch timer bridges that to a clean uvicorn shutdown + quit on
+        # the main thread. The previous handlers come back when this body
+        # returns or raises. A normal quit ends in NSApp.terminate_, which
+        # exits without unwinding Python, so the restore never runs on that
+        # path. That is acceptable: the process ends there.
+        with _stop_signals(self._on_stop_signal):
+            from jacked.service.platform import detect_autostart
 
-        from jacked.service.platform import detect_autostart
+            self._autostart_enabled = detect_autostart()
 
-        self._autostart_enabled = detect_autostart()
+            # Start the one uvicorn (daemon thread) and health-check it before
+            # the status item appears, so the first pill reflects real data.
+            self._uvicorn_thread = self._start_uvicorn(cold_start=True)
+            if self._wait_for_ready():
+                self._server_ready = True
+                self._service_state = "running"
+                self._lifecycle_failure = None
+                self._started_at = time.time()
+                self._note_ready(self._ready_elapsed or 0.0)
+                logger.info(
+                    "Service ready: macOS menu-bar agent (pid=%d, port=%d, ready_in=%.1fs)",
+                    os.getpid(),
+                    self.port,
+                    self._ready_elapsed or 0.0,
+                )
+            else:
+                self._abort_unready_start()
 
-        # Start the one uvicorn (daemon thread) and health-check it before the
-        # status item appears, so the first pill reflects real data.
-        self._uvicorn_thread = self._start_uvicorn(cold_start=True)
-        if self._wait_for_ready():
-            self._server_ready = True
-            self._service_state = "running"
-            self._lifecycle_failure = None
-            self._started_at = time.time()
-            self._note_ready(self._ready_elapsed or 0.0)
-            logger.info(
-                "Service ready — macOS menu-bar agent (pid=%d, port=%d, ready_in=%.1fs)",
-                os.getpid(),
-                self.port,
-                self._ready_elapsed or 0.0,
-            )
-        else:
-            self._abort_unready_start()
-
-        MacMenuBarApp(self).run()
+            MacMenuBarApp(self).run()
 
     def run(self) -> None:
         """Start the service: tray icon on main thread, uvicorn in background."""
@@ -1560,6 +1707,13 @@ class ServiceRunner:
             self._record_abandoned_update()
         except Exception:
             logger.exception("Could not check for an interrupted update")
+        # A later install can leave an old failure's recovery file behind.
+        # The check runs here, on the path that both backends share, so the
+        # macOS menu-bar agent removes a stale file too.
+        try:
+            self.clear_stale_recovery()
+        except Exception:
+            logger.exception("Could not check for a stale update recovery file")
 
         from jacked.service.lifecycle import (
             claim_service_ownership,
@@ -1597,29 +1751,37 @@ class ServiceRunner:
                 "Jacked ownership is invalid. Run `jacked service recover`, then retry."
             ) from exc
 
-        try:
-            # The v2 lease is acquired first so v2-v2 contention never consults
-            # a mutable compatibility file. Legacy admission follows while the
-            # lease is held, preventing any new v2 tray from racing us to UI.
-            self._guard_legacy_pid_or_exit()
-
-            # Register the in-process restart handler for the WHOLE run lifetime,
-            # so the settings API's POST /remote-access/restart can apply a bind
-            # change (same PID, tray survives) instead of execv. Registered as
-            # _on_settings_restart, NOT _on_restart: a settings apply must clear
-            # any launch-time --host pin (stale launchd in-memory argv) so the DB
-            # actually wins — see _on_settings_restart's docstring.
-            # Shared across both backends below; the finally unregisters on exit.
-            from jacked.service.restart import set_restart_handler
-
-            set_restart_handler(self._on_settings_restart)
+        # The stop signals reach this runner only while it owns the service
+        # (#138i). The previous handlers come back after the cleanup in the
+        # finally below, so a second Ctrl+C or SIGTERM during
+        # release_ownership() only sets the stop flags and cannot cut the
+        # release short.
+        with _stop_signals(self._on_stop_signal):
             try:
-                return self._run()
+                # The v2 lease is acquired first so v2-v2 contention never
+                # consults a mutable compatibility file. Legacy admission
+                # follows while the lease is held, preventing any new v2 tray
+                # from racing us to UI.
+                self._guard_legacy_pid_or_exit()
+
+                # Register the in-process restart handler for the WHOLE run
+                # lifetime, so the settings API's POST /remote-access/restart
+                # can apply a bind change (same PID, tray survives) instead of
+                # execv. Registered as _on_settings_restart, NOT _on_restart: a
+                # settings apply must clear any launch-time --host pin (stale
+                # launchd in-memory argv) so the DB actually wins (see
+                # _on_settings_restart's docstring). Shared across both
+                # backends below; the finally unregisters on exit.
+                from jacked.service.restart import set_restart_handler
+
+                set_restart_handler(self._on_settings_restart)
+                try:
+                    return self._run()
+                finally:
+                    set_restart_handler(None)
             finally:
-                set_restart_handler(None)
-        finally:
-            self._uninstall_windows_console_handler()
-            self.release_ownership()
+                self._uninstall_windows_console_handler()
+                self.release_ownership()
 
     def release_ownership(self) -> None:
         """Close the control channel and retire this instance's manifest.
@@ -1697,30 +1859,15 @@ class ServiceRunner:
                 "Use --port to run on a different port."
             )
 
-        # Signal handlers are signal-safe — they just set the stop event.
-        # The stop-monitor thread bridges that to the full _on_stop() cleanup.
+        # run() routes the stop signals to this runner for its lifetime
+        # (_stop_signals). The handlers only set the stop event; the
+        # stop-monitor thread bridges that to the full _on_stop() cleanup.
         if sys.platform == "win32":
             # Windows: pystray runs a native GUI message pump that blocks
-            # Python bytecode. Installing SIGINT still lets Ctrl+C in the
-            # console deliver a KeyboardInterrupt, and SIGBREAK covers
-            # Ctrl+Break explicitly. Without these, `jacked service start`
-            # in a console ignored Ctrl+C entirely.
-            try:
-                signal.signal(signal.SIGINT, lambda *_: self._request_stop())
-            except (ValueError, OSError):
-                pass  # not a main thread (shouldn't happen here, but harmless)
-            if hasattr(signal, "SIGBREAK"):
-                try:
-                    signal.signal(signal.SIGBREAK, lambda *_: self._request_stop())
-                except (ValueError, OSError):
-                    pass
-            # Console Ctrl-events are delivered by the OS to a separate
-            # handler chain; wire that too so the user's Ctrl+C isn't
-            # swallowed by the GUI message pump before Python sees it.
+            # Python bytecode. Console Ctrl-events are delivered by the OS to
+            # a separate handler chain; wire that too so the user's Ctrl+C
+            # isn't swallowed by the GUI message pump before Python sees it.
             self._install_windows_console_handler()
-        else:
-            signal.signal(signal.SIGTERM, lambda *_: self._request_stop())
-            signal.signal(signal.SIGINT, lambda *_: self._request_stop())
 
         from jacked.service.platform import detect_autostart
 

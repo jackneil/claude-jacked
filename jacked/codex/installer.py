@@ -50,7 +50,7 @@ import shutil
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 from jacked.install_manifest import skill_content_hash as _skill_content_hash
 
@@ -108,6 +108,11 @@ from ._managed import (
     _write_mcp_verified as _write_mcp_verified,
     ensure_chrome_devtools_mcp as ensure_chrome_devtools_mcp,
 )
+
+if TYPE_CHECKING:
+    # Imported lazily at run time: jacked.cli is the CLI module that drives
+    # this installer.
+    from jacked.cli import SkillInstallOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +190,41 @@ class CodexInstallSummary:
     changed: bool = False
 
 
+def _install_codex_skill_dir(
+    src, target: Path, name: str, prior: Mapping, preserved: list, *,
+    expected: str, copy, this_run: Optional[Mapping] = None,
+) -> SkillInstallOutcome:
+    """Write one ~/.agents/skills dir through the shared move-aside, stage
+    and publish transaction, `jacked.cli._install_skill_dir_transactional`.
+
+    The Codex `_preserve_user_skill_dir` is wrapped to the shared shape
+    ``(target, name, src, prior) -> backup``. ``src`` is also its ``src_dir``
+    (None for a skill that is generated from a command). ``copy(src,
+    staging)`` writes into a new private staging dir beside `target`, and
+    the transaction renames that dir into place, so the copy step never
+    deletes the old dir itself. A dir that preserve moved aside goes into
+    `preserved` only while the dir is still in jacked-backups: a failed write
+    that put the dir back leaves nothing to report. A preserve, copy or
+    publish OSError is returned in the outcome, never raised.
+    """
+    from jacked.cli import _install_skill_dir_transactional
+
+    moved: list = []
+
+    def preserve(skill_dir, skill_name, src_dir, prior_manifest):
+        return _preserve_user_skill_dir(
+            skill_dir, expected, skill_name, prior_manifest, moved,
+            this_run=this_run, src_dir=src_dir,
+        )
+
+    outcome = _install_skill_dir_transactional(
+        src, target, name, prior, preserve=preserve, copy=copy,
+    )
+    if outcome.backup is not None:
+        preserved.extend(moved)
+    return outcome
+
+
 def install_codex(
     data_root,
     *,
@@ -211,7 +251,10 @@ def install_codex(
     #    have a same-name command (precedence rule: command content wins).
     #    Before overwriting a target, `_preserve_user_skill_dir` moves aside any
     #    NON-jacked dir that collides with a skill name (shared ~/.agents/skills),
-    #    so a user's own dir is never silently destroyed.
+    #    so a user's own dir is never silently destroyed. Both writes run in the
+    #    shared transaction (`_install_codex_skill_dir`): the copy goes into a
+    #    private staging dir that a rename publishes, so a write that fails
+    #    part-way never touches the live dir, and the user's dir moves back.
     #    A skill whose SKILL.md carries the `<!-- ENGINE -->` marker absorbed a
     #    former command body, so it ALSO ships as a ~/.codex/prompts/<name>.md
     #    (frontmatter + engine, dropping the Claude-side repo-dispatch preamble)
@@ -220,20 +263,24 @@ def install_codex(
     #    data/skills actually ships.
     skills: dict = {}
     prompts: dict = {}
+    # The skill dirs step 1 really WROTE. `skills` also holds prior hashes that
+    # a failed write carried forward, and those dirs are not this run's output:
+    # one can be the user's own dir, just moved back.
+    written_this_run: dict = {}
     for skill_md in sorted((data_root / "skills").glob("*/SKILL.md")):
         name = skill_md.parent.name
         if name in _CLAUDE_ONLY_SKILLS:
             continue
         expected = _sha_dir(skill_md.parent)
         # One unwritable path must not abort the whole Codex pass.
-        try:
-            _preserve_user_skill_dir(
-                skills_base / name, expected, name, prior, preserved,
-                src_dir=skill_md.parent,
+        outcome = _install_codex_skill_dir(
+            skill_md.parent, skills_base / name, name, prior, preserved,
+            expected=expected, copy=_copy_tree,
+        )
+        if outcome.error is not None:
+            logger.warning(
+                "skipping Codex skill %s: %s%s", name, outcome.error, outcome.restore_note(),
             )
-            _copy_tree(skill_md.parent, skills_base / name)
-        except OSError as e:
-            logger.warning("skipping Codex skill %s: %s", name, e)
             # Carry prior hashes forward: a transient write failure must not let
             # the prune below delete the existing good dir or prompt.
             _prev_skill = ((prior or {}).get("skills") or {}).get(name)
@@ -244,6 +291,7 @@ def install_codex(
                 prompts[f"{name}.md"] = _prev_prompt
             continue
         skills[name] = expected
+        written_this_run[name] = expected
         engine = _skill_engine_prompt(skill_md)
         if engine is None:
             continue
@@ -297,18 +345,35 @@ def install_codex(
                 continue
             try:
                 prompts[cmd.name] = _sha_file(cmd)
-                # this_run=skills: a wrapper dir step 1 wrote this run is jacked's
-                # own, not user content, so overwriting it must not spawn a backup.
-                # No src_dir: this skill's content is GENERATED from the command,
-                # so the expected-hash identity check is the only source test.
-                _preserve_user_skill_dir(
-                    skill_dir, _sha_solo_skill(content), cmd.stem, prior, preserved,
-                    this_run=skills,
-                )
-                _write_solo_skill(skill_dir, content)
             except OSError as e:
+                logger.warning("skipping Codex command-derived skill %s: %s", cmd.stem, e)
+                # The prompt copy above landed, but the command could not be
+                # read for its hash. Carry BOTH prior hashes forward, as the
+                # copy-failure path does: the prune below must not unlink the
+                # prompt that this run just wrote, or the command-derived skill.
+                _prev = ((prior or {}).get("prompts") or {}).get(cmd.name)
+                if _prev:
+                    prompts[cmd.name] = _prev
+                _prev_skill = ((prior or {}).get("skills") or {}).get(cmd.stem)
+                if _prev_skill:
+                    skills[cmd.stem] = _prev_skill
+                continue
+            # this_run: a wrapper dir step 1 WROTE this run is jacked's own, not
+            # user content, so overwriting it must not spawn a backup. A name
+            # step 1 only carried forward is not in it: that dir can be the
+            # user's own, moved back after a failed write.
+            # src None: this skill's content is GENERATED from the command, so
+            # the expected-hash identity check is the only source test.
+            outcome = _install_codex_skill_dir(
+                None, skill_dir, cmd.stem, prior, preserved,
+                expected=_sha_solo_skill(content),
+                copy=lambda _src, dst, body=content: _write_solo_skill(dst, body),
+                this_run=written_this_run,
+            )
+            if outcome.error is not None:
                 logger.warning(
-                    "skipping Codex command-derived skill %s: %s", cmd.stem, e
+                    "skipping Codex command-derived skill %s: %s%s",
+                    cmd.stem, outcome.error, outcome.restore_note(),
                 )
                 _prev_skill = ((prior or {}).get("skills") or {}).get(cmd.stem)
                 if _prev_skill:

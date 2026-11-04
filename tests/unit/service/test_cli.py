@@ -1,5 +1,6 @@
 """Tests for jacked service CLI commands."""
 
+import sys
 from unittest.mock import MagicMock, patch
 from click.testing import CliRunner
 import pytest
@@ -2179,6 +2180,7 @@ class TestStartupExposureWarning:
 def test_status_flags_a_launchd_job_that_never_ran(tmp_path, monkeypatch):
     """#178i: "Autostart: enabled" while launchd had the job loaded with
     runs = 0 read as fine; nothing was going to start the service."""
+    import subprocess
     from types import SimpleNamespace
 
     from jacked.cli import main
@@ -2188,9 +2190,666 @@ def test_status_flags_a_launchd_job_that_never_ran(tmp_path, monkeypatch):
         "jacked.service.platform.inspect_autostart",
         lambda: SimpleNamespace(state=AutostartState.OWNED_ENABLED, reason=""),
     )
-    monkeypatch.setattr("jacked.service.platform.launchd_job_never_ran", lambda: True)
+    # The drift probe asks launchd before it reads the manifest: the job is
+    # loaded, so it has nothing to report and the never-ran hint shows.
+    monkeypatch.setattr(subprocess, "run", _Launchctl(loaded=True))  # macOS only
+    monkeypatch.setattr(
+        "jacked.service.platform.launchd_job_never_ran", lambda **_kwargs: True
+    )
     with patch("jacked.service.PID_FILE", tmp_path / "nope.pid"):
         result = CliRunner().invoke(main, ["service", "status"])
     text = " ".join(result.output.split())  # Rich wraps at the console width
     assert "loaded but never ran" in text
     assert "jacked service restart" in text
+
+
+# ---------------------------------------------------------------------------
+# #128i: "Autostart: enabled" must mean the definition supervises the
+# running service, not only that an owned definition exists.
+# ---------------------------------------------------------------------------
+
+_LIVE_PROCESS = {
+    "pid": 4242,
+    "creation_id": "test-creation",
+    "executable": "/opt/jacked/python",
+}
+
+
+def _publish_live_manifest(monkeypatch, spec, *, alive=True, paths=None):
+    """Publish a signed manifest for ``spec`` and fake its process liveness."""
+    from jacked.service import instance_storage
+    from jacked.service.instance import (
+        BindIdentity,
+        InstanceManifest,
+        ProcessIdentity,
+        current_user_identity,
+        publish_manifest,
+    )
+    from jacked.service.lifecycle import default_service_paths
+
+    paths = paths or default_service_paths()
+    process = ProcessIdentity(**_LIVE_PROCESS)
+    manifest = InstanceManifest.create(
+        spec=spec,
+        process=process,
+        user_id=current_user_identity(),
+        machine_id="machine-test",
+        bind=BindIdentity(host="127.0.0.1", port=8321),
+        control_address=str(paths.root / "control.sock"),
+    )
+    publish_manifest(paths.manifest, manifest)
+
+    def identity(pid):
+        if not alive:
+            raise ProcessLookupError(pid)
+        return process
+
+    monkeypatch.setattr(instance_storage, "process_identity", identity)
+    return manifest
+
+
+def _running_status(manifest):
+    return {
+        "ok": True,
+        "result": {
+            "state": "running",
+            "quarantine": False,
+            "build_version": manifest.build_version,
+            "protocol_version": manifest.protocol_version,
+            "generation": manifest.generation,
+            "port": 8321,
+        },
+    }
+
+
+class _Launchctl:
+    """Stand in for launchctl; refuse every other command."""
+
+    def __init__(self, *, loaded):
+        self.loaded = loaded
+        self.calls = []
+
+    def __call__(self, argv, **_kwargs):
+        from types import SimpleNamespace
+
+        argv = list(argv)
+        self.calls.append(argv)
+        if argv[:2] == ["launchctl", "print-disabled"]:
+            return SimpleNamespace(
+                returncode=0, stdout="disabled services = {\n}\n", stderr=""
+            )
+        if argv[:2] == ["launchctl", "print"]:
+            if self.loaded:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="gui/501/ai.hank.jacked = {\n\tstate = running\n\truns = 1\n}\n",
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=113, stdout="", stderr="Could not find service"
+            )
+        raise AssertionError(f"unexpected command: {argv}")
+
+
+def _owned_enabled(generation):
+    from jacked.service.autostart import AutostartInspection, AutostartState
+
+    return AutostartInspection(AutostartState.OWNED_ENABLED, generation=generation)
+
+
+def _flat(output):
+    return " ".join(output.split())  # Rich wraps at the console width
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="launchd is macOS only")
+def test_status_says_an_unloaded_launchd_job_does_not_supervise_the_service(
+    tmp_path, monkeypatch
+):
+    """#128i: an owned plist, `launchctl print` exits 113, and a manual
+    service runs. "Autostart: enabled" alone hid that nothing restarts it."""
+    import subprocess
+    from pathlib import Path
+
+    from jacked.cli import main
+    from jacked.service.spec import SupervisorKind
+    from tests.unit.service.supervisor_test_support import installed_artifact, make_spec
+
+    render = tmp_path / "render"
+    render.mkdir()
+    _spec, _environment, rendered, _path = installed_artifact(
+        render, SupervisorKind.LAUNCHD
+    )
+    plist = Path.home() / "Library" / "LaunchAgents" / "ai.hank.jacked.plist"
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_bytes(rendered.content)
+    manifest = _publish_live_manifest(monkeypatch, make_spec(SupervisorKind.MANUAL))
+    launchctl = _Launchctl(loaded=False)
+    monkeypatch.setattr(subprocess, "run", launchctl)
+
+    with patch(
+        "jacked.service.ipc.send_native_control",
+        return_value=_running_status(manifest),
+    ):
+        result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Autostart: enabled (not supervising the running service: launchd job "
+        "not loaded; run `jacked service restart`)"
+    ) in _flat(result.output)
+    # The probe reuses the inspection that status already made: on Windows a
+    # second native manager query is a second PowerShell COM call.
+    assert [call[:2] for call in launchctl.calls].count(
+        ["launchctl", "print-disabled"]
+    ) == 1
+
+
+def test_status_names_a_manual_supervisor_beside_a_loaded_definition(monkeypatch):
+    import subprocess
+
+    from jacked.cli import main
+    from jacked.service.spec import SupervisorKind
+    from tests.unit.service.supervisor_test_support import make_spec
+
+    manifest = _publish_live_manifest(monkeypatch, make_spec(SupervisorKind.MANUAL))
+    monkeypatch.setattr(
+        "jacked.service.platform.inspect_autostart",
+        lambda run=None: _owned_enabled(manifest.generation),
+    )
+    monkeypatch.setattr(subprocess, "run", _Launchctl(loaded=True))  # macOS only
+
+    with patch(
+        "jacked.service.ipc.send_native_control",
+        return_value=_running_status(manifest),
+    ):
+        result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "Autostart: enabled (not supervising the running service: the running "
+        "service is under a manual supervisor; run `jacked service restart`)"
+    ) in _flat(result.output)
+
+
+def test_status_names_a_generation_the_definition_does_not_run(monkeypatch):
+    import subprocess
+
+    from jacked.cli import main
+    from jacked.service.lifecycle import supervisor_for_platform
+    from tests.unit.service.supervisor_test_support import make_spec
+
+    manifest = _publish_live_manifest(
+        monkeypatch, make_spec(supervisor_for_platform(), launcher_hash="d" * 64)
+    )
+    on_disk = "e" * 64
+    monkeypatch.setattr(
+        "jacked.service.platform.inspect_autostart",
+        lambda run=None: _owned_enabled(on_disk),
+    )
+    monkeypatch.setattr(subprocess, "run", _Launchctl(loaded=True))  # macOS only
+
+    with patch(
+        "jacked.service.ipc.send_native_control",
+        return_value=_running_status(manifest),
+    ):
+        result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        "(not supervising the running service: generation "
+        f"{on_disk[:12]} on disk, {manifest.generation[:12]} running; "
+        "run `jacked service restart`)"
+    ) in _flat(result.output)
+
+
+def test_status_stays_plain_enabled_when_the_definition_runs_the_service(
+    monkeypatch,
+):
+    import subprocess
+
+    from jacked.cli import main
+    from jacked.service.lifecycle import supervisor_for_platform
+    from tests.unit.service.supervisor_test_support import make_spec
+
+    manifest = _publish_live_manifest(monkeypatch, make_spec(supervisor_for_platform()))
+    monkeypatch.setattr(
+        "jacked.service.platform.inspect_autostart",
+        lambda run=None: _owned_enabled(manifest.generation),
+    )
+    monkeypatch.setattr(subprocess, "run", _Launchctl(loaded=True))  # macOS only
+
+    with patch(
+        "jacked.service.ipc.send_native_control",
+        return_value=_running_status(manifest),
+    ):
+        result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Autostart: enabled" in [line.strip() for line in result.output.splitlines()]
+    assert "not supervising" not in result.output
+    assert "never ran" not in result.output
+
+
+_LIVE_UNLOADED_LABEL = (
+    "Autostart: enabled (not supervising the running service: launchd job "
+    "not loaded; run `jacked service restart`)"
+)
+_STOPPED_UNLOADED_LABEL = (
+    "Autostart: enabled (will not start the service until the next login: "
+    "launchd job not loaded; run `jacked service restart`)"
+)
+
+
+def test_status_shows_the_drift_reason_instead_of_the_never_ran_hint(monkeypatch):
+    """The never-ran hint is kept only for the state the probe cannot see."""
+    from jacked.cli import main
+
+    monkeypatch.setattr(
+        "jacked.service.platform.inspect_autostart",
+        lambda run=None: _owned_enabled(None),
+    )
+    monkeypatch.setattr("jacked.service.platform.launchd_job_probe", lambda: None)
+    monkeypatch.setattr(
+        "jacked.service.platform.supervision_drift",
+        lambda **_kwargs: "launchd job not loaded",
+    )
+    monkeypatch.setattr(
+        "jacked.service.platform.launchd_job_never_ran", lambda **_kwargs: True
+    )
+
+    result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    text = _flat(result.output)
+    assert "Jacked Service: stopped" in text
+    assert _STOPPED_UNLOADED_LABEL in text
+    assert "never ran" not in text
+
+
+@pytest.mark.parametrize("verdict", ["stopped", "indeterminate", "running"])
+def test_status_words_an_unloaded_job_by_the_printed_verdict(monkeypatch, verdict):
+    """Only a live service is "the running service". A stopped service, and
+    a manifest whose control call fails (a dead process leaves one too), get
+    the words that are true either way: launchd loads the plist again at the
+    next login, and until then nothing starts the service."""
+    from jacked.cli import main
+    from jacked.service.platform import LAUNCHD_JOB_NOT_LOADED
+    from jacked.service.spec import SupervisorKind
+    from tests.unit.service.supervisor_test_support import make_spec
+
+    monkeypatch.setattr(
+        "jacked.service.platform.inspect_autostart",
+        lambda run=None: _owned_enabled(None),
+    )
+    monkeypatch.setattr("jacked.service.platform.launchd_job_probe", lambda: None)
+    monkeypatch.setattr(
+        "jacked.service.platform.supervision_drift",
+        lambda **_kwargs: LAUNCHD_JOB_NOT_LOADED,
+    )
+    control = {}
+    if verdict != "stopped":
+        manifest = _publish_live_manifest(monkeypatch, make_spec(SupervisorKind.MANUAL))
+        if verdict == "running":
+            control["return_value"] = _running_status(manifest)
+        else:
+            control["side_effect"] = ConnectionRefusedError("no listener")
+
+    with patch("jacked.service.ipc.send_native_control", **control):
+        result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    text = _flat(result.output)
+    heading = {
+        "stopped": "Jacked Service: stopped",
+        "indeterminate": "Jacked Service: ownership indeterminate",
+        "running": "Jacked Service: running",
+    }[verdict]
+    assert heading in text
+    expected = _LIVE_UNLOADED_LABEL if verdict == "running" else _STOPPED_UNLOADED_LABEL
+    assert expected in text
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="launchd is macOS only")
+@pytest.mark.parametrize("answer", ["loaded, never ran", "timed out"])
+def test_status_asks_launchctl_once_for_both_launchd_checks(
+    monkeypatch, caplog, answer
+):
+    """The drift check and the never-ran check asked launchctl the same
+    question, so a launchctl that could not answer logged two WARNINGs. One
+    shared probe now serves both."""
+    import logging
+    import subprocess
+    from types import SimpleNamespace
+
+    from jacked.cli import main
+
+    monkeypatch.setattr(
+        "jacked.service.platform.inspect_autostart",
+        lambda run=None: _owned_enabled(None),
+    )
+    calls = []
+
+    def launchctl(argv, **_kwargs):
+        argv = list(argv)
+        calls.append(argv)
+        if argv[:2] != ["launchctl", "print"]:
+            raise AssertionError(f"unexpected command: {argv}")
+        if answer == "timed out":
+            raise subprocess.TimeoutExpired(argv, 10)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="gui/501/ai.hank.jacked = {\n\tstate = not running\n\truns = 0\n}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", launchctl)
+    with caplog.at_level(logging.WARNING, logger="jacked.service.platform"):
+        result = CliRunner().invoke(main, ["service", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1, calls
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "jacked.service.platform" and record.levelno == logging.WARNING
+    ]
+    text = _flat(result.output)
+    if answer == "timed out":
+        assert warnings == [
+            "launchctl could not be asked about the jacked job (TimeoutExpired); "
+            "autostart supervision was not checked"
+        ]
+        assert "Autostart: enabled" in text
+    else:
+        assert warnings == []
+        assert "(the launchd job is loaded but never ran; run `jacked service restart`)" in text
+
+
+# ---------------------------------------------------------------------------
+# #161i: `jacked install` applies the shared liveness rule to the manifest of
+# a manual owner. The presence of a manifest is not proof of a live owner.
+# ---------------------------------------------------------------------------
+
+
+def _raise(error):
+    def fail(*_args, **_kwargs):
+        raise error
+
+    return fail
+
+
+class _InstallFlow:
+    """Record the install steps that matter here; fake the native manager."""
+
+    def __init__(self, monkeypatch, tmp_path, *, control_error=None):
+        import jacked.cli as cli
+        from jacked.service.spec import SupervisorKind
+        from jacked.service.supervisors import ArtifactDisposition, ArtifactInspection
+
+        self.order = []
+        spec = MagicMock(
+            supervisor=SupervisorKind.LAUNCHD,
+            service_id="ai.hank.jacked",
+            generation="b" * 64,
+        )
+        monkeypatch.setattr(
+            "jacked.service.lifecycle.provision_service_contract",
+            lambda **_k: (spec, {}),
+        )
+        monkeypatch.setattr(
+            "jacked.service.lifecycle.native_artifact_path",
+            lambda *_a, **_k: tmp_path / "ai.hank.jacked.plist",
+        )
+        monkeypatch.setattr(
+            "jacked.service.lifecycle.inspect_native_artifact",
+            lambda *_a, **_k: MagicMock(
+                artifact=ArtifactInspection(ArtifactDisposition.MATCHING)
+            ),
+        )
+
+        def control(manifest_path, _action, **_kwargs):
+            self.order.append("shutdown")
+            if control_error is not None:
+                raise control_error
+            manifest_path.unlink()  # the owner exits and removes its manifest
+            return {"ok": True}
+
+        monkeypatch.setattr("jacked.service.ipc.send_native_control", control)
+        monkeypatch.setattr(
+            "jacked.service.lifecycle.install_native_owned",
+            lambda *_a, **_k: (
+                self.order.append("activate") or MagicMock(ok=True, reason="ok")
+            ),
+        )
+        monkeypatch.setattr(
+            cli,
+            "_wait_owned_service_ready",
+            lambda *_a, **_k: {"state": "running", "port": 8321},
+        )
+
+
+def _manual_spec():
+    from jacked.service.spec import SupervisorKind
+    from tests.unit.service.supervisor_test_support import make_spec
+
+    return make_spec(SupervisorKind.MANUAL)
+
+
+def test_install_starts_over_a_dead_manual_owner_without_a_handoff(
+    tmp_path, monkeypatch, capsys
+):
+    """#161i: the manual service died without removing its manifest, so its
+    control pipe is gone. Install used to send SHUTDOWN to it anyway."""
+    import jacked.cli as cli
+
+    _publish_live_manifest(monkeypatch, _manual_spec(), alive=False)
+    flow = _InstallFlow(
+        monkeypatch, tmp_path, control_error=FileNotFoundError(2, "No such file")
+    )
+
+    assert cli._ensure_autostart_and_running(8321) is True
+
+    assert flow.order == ["activate"]  # no SHUTDOWN to a dead owner
+    output = capsys.readouterr().out
+    assert "refused handoff" not in output
+    assert "Autostart registered from exact ServiceSpec" in output
+
+
+def test_service_install_command_starts_over_a_dead_manual_owner(
+    tmp_path, monkeypatch
+):
+    from jacked.cli import main
+
+    _publish_live_manifest(monkeypatch, _manual_spec(), alive=False)
+    flow = _InstallFlow(
+        monkeypatch, tmp_path, control_error=FileNotFoundError(2, "No such file")
+    )
+
+    result = CliRunner().invoke(main, ["service", "install"])
+
+    assert result.exit_code == 0, result.output
+    assert flow.order == ["activate"]
+    assert "refused handoff" not in result.output
+    assert "Autostart registered from exact ServiceSpec" in result.output
+
+
+def test_install_still_reports_a_live_manual_owner_it_cannot_reach(
+    tmp_path, monkeypatch, capsys
+):
+    import jacked.cli as cli
+
+    _publish_live_manifest(monkeypatch, _manual_spec(), alive=True)
+    flow = _InstallFlow(
+        monkeypatch, tmp_path, control_error=FileNotFoundError(2, "No such file")
+    )
+
+    assert cli._ensure_autostart_and_running(8321) is False
+
+    assert flow.order == ["shutdown"]  # nothing activated beside a live owner
+    assert "manual service refused handoff (FileNotFoundError)" in _flat(
+        capsys.readouterr().out
+    )
+
+
+def test_install_hands_off_from_a_live_manual_owner_that_accepts(
+    tmp_path, monkeypatch
+):
+    import jacked.cli as cli
+
+    _publish_live_manifest(monkeypatch, _manual_spec(), alive=True)
+    flow = _InstallFlow(monkeypatch, tmp_path)
+
+    assert cli._ensure_autostart_and_running(8321) is True
+
+    assert flow.order == ["shutdown", "activate"]
+
+
+def test_install_leaves_a_live_supervised_owner_to_the_native_manager(
+    tmp_path, monkeypatch
+):
+    """Only a manual owner gets SHUTDOWN; the supervisor install replaces a
+    supervised one through the native manager."""
+    import jacked.cli as cli
+    from jacked.service.lifecycle import supervisor_for_platform
+    from tests.unit.service.supervisor_test_support import make_spec
+
+    _publish_live_manifest(monkeypatch, make_spec(supervisor_for_platform()))
+    flow = _InstallFlow(monkeypatch, tmp_path)
+
+    assert cli._ensure_autostart_and_running(8321) is True
+
+    assert flow.order == ["activate"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [FileNotFoundError(2, "No such file"), ConnectionRefusedError(61, "refused")],
+    ids=["FileNotFoundError", "ConnectionRefusedError"],
+)
+def test_release_reports_a_dead_owner_without_a_control_endpoint_as_gone(
+    monkeypatch, error
+):
+    from jacked.cli import _release_manual_owner
+    from jacked.service.lifecycle import default_service_paths
+
+    _publish_live_manifest(monkeypatch, _manual_spec(), alive=False)
+    monkeypatch.setattr("jacked.service.ipc.send_native_control", _raise(error))
+
+    assert _release_manual_owner(default_service_paths()) == (
+        True,
+        "previous service is gone",
+    )
+
+
+def test_release_treats_a_removed_manifest_as_a_gone_owner(monkeypatch):
+    """The owner exited cleanly after the liveness read: it took its manifest
+    and its control endpoint with it."""
+    from jacked.cli import _release_manual_owner
+    from jacked.service.lifecycle import default_service_paths
+
+    paths = default_service_paths()
+    assert not paths.manifest.exists()
+    monkeypatch.setattr(
+        "jacked.service.ipc.send_native_control",
+        _raise(FileNotFoundError(2, "No such file")),
+    )
+
+    assert _release_manual_owner(paths) == (True, "previous service is gone")
+
+
+def test_release_keeps_the_refusal_for_a_live_owner(monkeypatch):
+    from jacked.cli import _release_manual_owner
+    from jacked.service.lifecycle import default_service_paths
+
+    _publish_live_manifest(monkeypatch, _manual_spec(), alive=True)
+    monkeypatch.setattr(
+        "jacked.service.ipc.send_native_control",
+        _raise(FileNotFoundError(2, "No such file")),
+    )
+
+    assert _release_manual_owner(default_service_paths()) == (
+        False,
+        "manual service refused handoff (FileNotFoundError)",
+    )
+
+
+def test_release_keeps_the_refusal_when_the_manifest_cannot_be_read(monkeypatch):
+    from jacked.cli import _release_manual_owner
+    from jacked.service.lifecycle import default_service_paths
+
+    paths = default_service_paths()
+    paths.root.mkdir(parents=True, exist_ok=True)
+    paths.manifest.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(
+        "jacked.service.ipc.send_native_control",
+        _raise(ConnectionRefusedError(61, "refused")),
+    )
+
+    assert _release_manual_owner(paths) == (
+        False,
+        "manual service refused handoff (ConnectionRefusedError)",
+    )
+
+
+def test_release_rechecks_liveness_only_when_the_endpoint_is_gone(monkeypatch):
+    """A control error that is not "no endpoint" stays a refusal."""
+    from jacked.cli import _release_manual_owner
+    from jacked.service.lifecycle import default_service_paths
+
+    _publish_live_manifest(monkeypatch, _manual_spec(), alive=False)
+    monkeypatch.setattr(
+        "jacked.service.ipc.send_native_control",
+        _raise(PermissionError(13, "Permission denied")),
+    )
+
+    assert _release_manual_owner(default_service_paths()) == (
+        False,
+        "manual service refused handoff (PermissionError)",
+    )
+
+
+def test_live_manifest_is_none_when_the_owner_exits_between_the_reads(monkeypatch):
+    """The liveness rule reads the manifest a second time. An owner that
+    exits in between takes the manifest with it: that is no live owner, not
+    an exception for `jacked install` or `jacked service recover`."""
+    from jacked.cli import _live_manifest
+    from jacked.service.lifecycle import default_service_paths
+
+    _publish_live_manifest(monkeypatch, _manual_spec(), alive=True)
+    monkeypatch.setattr(
+        "jacked.service.instance.manifest_is_proven_stale",
+        _raise(FileNotFoundError(2, "No such file")),
+    )
+
+    assert _live_manifest(default_service_paths()) is None
+
+
+def test_status_reports_a_truncated_launchd_plist_as_unowned(tmp_path, monkeypatch):
+    """An interrupted write leaves a truncated plist. plistlib raises expat's
+    ExpatError for it, which is not a ValueError, so inspect_autostart()
+    raised and `jacked service status` crashed with a traceback."""
+    from pathlib import Path
+
+    from jacked.cli import main
+    from jacked.service.autostart import AutostartState
+    from jacked.service.platform import inspect_autostart
+    from jacked.service.spec import SupervisorKind
+    from tests.unit.service.supervisor_test_support import installed_artifact
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    render = tmp_path / "render"
+    render.mkdir()
+    _spec, _environment, rendered, _path = installed_artifact(
+        render, SupervisorKind.LAUNCHD
+    )
+    plist = Path.home() / "Library" / "LaunchAgents" / "ai.hank.jacked.plist"
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_bytes(rendered.content[: len(rendered.content) // 2])
+
+    inspection = inspect_autostart()
+
+    assert inspection.state is AutostartState.FOREIGN
+    assert inspection.reason == "unowned launchd definition"
+    result = CliRunner().invoke(main, ["service", "status"])
+    assert result.exit_code == 0, result.output
+    assert "Autostart: foreign (unowned launchd definition)" in _flat(result.output)

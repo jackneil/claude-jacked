@@ -4,10 +4,8 @@ from jacked.api.main import app
 
 
 def test_install_summary_absent(tmp_path, monkeypatch):
-    monkeypatch.setattr("jacked.install_summary.DEFAULT_LAST_INSTALL_PATH", tmp_path / "missing.json")
-    # Re-point the route's module-level reference if it imported the constant directly:
-    import jacked.api.routes.system as sysroutes
-    monkeypatch.setattr(sysroutes, "_LAST_INSTALL_PATH", tmp_path / "missing.json", raising=False)
+    # An empty jacked home holds no last-install record.
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
     client = TestClient(app)
     r = client.get("/api/install/summary")
     assert r.status_code == 200
@@ -15,11 +13,13 @@ def test_install_summary_absent(tmp_path, monkeypatch):
 
 
 def test_install_summary_present(tmp_path, monkeypatch):
-    p = tmp_path / "last.json"
+    """The route reads where `jacked install` writes the record: .claude under
+    the $JACKED_HOME-aware jacked home, resolved on each request."""
+    p = tmp_path / ".claude" / "jacked-last-install.json"
+    p.parent.mkdir()
     p.write_text(json.dumps({"to_version": "0.51.0", "from_version": "0.50.0",
                              "changes": {}, "unchanged_count": 3, "at": "x"}), encoding="utf-8")
-    import jacked.api.routes.system as sysroutes
-    monkeypatch.setattr(sysroutes, "_LAST_INSTALL_PATH", p, raising=False)
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
     client = TestClient(app)
     r = client.get("/api/install/summary")
     assert r.status_code == 200

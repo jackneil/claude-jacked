@@ -134,13 +134,13 @@ class TestEnsureAutostartAndRunning:
             "jacked.service.lifecycle.provision_service_contract",
             lambda **k: (spec, {}),
         )
-        monkeypatch.setattr(
-            "jacked.service.lifecycle.discover_service",
-            lambda _p: mock.MagicMock(source="manifest"),
-        )
+        # A live owner: install applies the shared liveness rule (#161i).
         monkeypatch.setattr(
             "jacked.service.instance.read_manifest",
             lambda _p: mock.MagicMock(supervisor="manual"),
+        )
+        monkeypatch.setattr(
+            "jacked.service.instance.manifest_is_proven_stale", lambda _p: False
         )
         monkeypatch.setattr(
             "jacked.service.lifecycle.inspect_native_artifact",
@@ -292,13 +292,13 @@ def _patch_manual_owner(monkeypatch, tmp_path, artifact_path):
     monkeypatch.setattr(
         "jacked.service.lifecycle.provision_service_contract", lambda **k: (spec, {})
     )
-    monkeypatch.setattr(
-        "jacked.service.lifecycle.discover_service",
-        lambda _p: mock.MagicMock(source="manifest"),
-    )
+    # A live owner: install applies the shared liveness rule (#161i).
     monkeypatch.setattr(
         "jacked.service.instance.read_manifest",
         lambda _p: mock.MagicMock(supervisor="manual"),
+    )
+    monkeypatch.setattr(
+        "jacked.service.instance.manifest_is_proven_stale", lambda _p: False
     )
     monkeypatch.setattr(
         "jacked.service.lifecycle.inspect_native_artifact",

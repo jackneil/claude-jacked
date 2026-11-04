@@ -1,7 +1,6 @@
 """Feature detection and toggle routes — agents, commands, hooks, knowledge."""
 
 import asyncio
-import contextlib
 import json
 import logging
 import shutil
@@ -747,38 +746,24 @@ def _install_skill_sync(skill_name: str, src_dir: Path, skill_dir: Path, manifes
     None), the OSError that stopped the install (or None), and whether that
     user dir was put back after a failure.
 
-    Same steps as the CLI install loop: move a dir jacked does not own aside,
-    then copy the WHOLE tree (SKILL.md and every sidecar; symlinks in editable
-    mode). When the copy fails into a dir that did not exist before, the partial
-    copy is removed and a user dir that was moved aside is moved back, so a
-    failed toggle leaves the skill as it was. Last, the manifest records the
-    dir, so a later upgrade or uninstall knows that jacked owns it.
+    It runs the CLI's own transaction, `_install_skill_dir_transactional`:
+    move a dir jacked does not own aside, copy the WHOLE tree (SKILL.md and
+    every sidecar; symlinks in editable mode) into a private staging dir
+    beside the skill, then rename that dir into place. When the copy or the
+    rename fails, only the staging dir is removed and a user dir that was
+    moved aside is moved back, so a failed toggle leaves the skill as it was.
+    Last, the manifest records the dir, so a later upgrade or uninstall knows
+    that jacked owns it.
     """
     from jacked import cli as jacked_cli
     from jacked import install_manifest as mani
 
-    backup = None
-    fresh = False
-    try:
-        backup = mani.preserve_user_skill_dir(
-            skill_dir, skill_name, src_dir, mani.load(manifest_path),
-        )
-        fresh = not (skill_dir.exists() or skill_dir.is_symlink())
-        jacked_cli._copy_skill_tree(src_dir, skill_dir)
-    except OSError as e:
-        restored = False
-        if fresh:
-            with contextlib.suppress(OSError):
-                jacked_cli._remove_skill_dir(skill_dir)
-            if backup is not None and not (skill_dir.exists() or skill_dir.is_symlink()):
-                try:
-                    shutil.move(str(backup), str(skill_dir))
-                    backup, restored = None, True
-                except OSError as move_err:
-                    logger.warning(
-                        "Could not restore skill %s from %s: %s", skill_name, backup, move_err,
-                    )
-        return backup, e, restored
+    outcome = jacked_cli._install_skill_dir_transactional(
+        src_dir, skill_dir, skill_name, mani.load(manifest_path),
+        preserve=mani.preserve_user_skill_dir, copy=jacked_cli._copy_skill_tree,
+    )
+    if outcome.error is not None:
+        return outcome.backup, outcome.error, outcome.restored
     try:
         recorded = mani.record_installed_skill(manifest_path, skill_name, skill_dir)
     except OSError as e:
@@ -791,7 +776,7 @@ def _install_skill_sync(skill_name: str, src_dir: Path, skill_dir: Path, manifes
             "Install manifest at %s not updated for skill %s (missing or unreadable)",
             manifest_path, skill_name,
         )
-    return backup, None, False
+    return outcome.backup, None, False
 
 
 def _remove_skill_sync(skill_name: str, src_dir: Path, skill_dir: Path, manifest_path: Path) -> str:

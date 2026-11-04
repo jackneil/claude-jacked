@@ -298,7 +298,7 @@ def _preserve_user_skill_dir(
     prior_manifest: Mapping, preserved: list,
     this_run: Optional[Mapping] = None,
     src_dir: Optional[Path] = None,
-) -> None:
+) -> Optional[Path]:
     """Never destroy a user's OWN ~/.agents/skills/<name> on a name collision.
 
     ~/.agents/skills is a shared surface; a user may own a dir whose name collides
@@ -311,17 +311,18 @@ def _preserve_user_skill_dir(
     survives. The backup lives OUTSIDE ~/.agents/skills on purpose: a copy left
     beside the live skills is a discoverable duplicate skill, and those pile up
     forever. Records ``skills/<name>`` in `preserved`. The caller then writes
-    jacked's copy into the now-vacant path."""
+    jacked's copy into the now-vacant path. Returns the backup path when it
+    moved the dir, else None, so a failed write can move the dir back."""
     from jacked.install_manifest import backup_dir_for, skill_content_hash
 
     if not (target.exists() or target.is_symlink()):
-        return
+        return None
     if _is_jacked_owned(name, prior_manifest, this_run, target, src_dir):
-        return
+        return None
     if (target.is_dir() and not target.is_symlink()
             and (_sha_dir(target) == expected_hash
                  or skill_content_hash(target) == expected_hash)):
-        return  # already what we'd install (droppings aside) -> no clobber, no backup
+        return None  # already what we'd install (droppings aside) -> no clobber, no backup
     # Never clobber a backup that already exists (it may be the user's own, or a
     # prior preservation): backup_dir_for picks the first free timestamped path
     # so no earlier preserved copy is silently destroyed.
@@ -330,3 +331,4 @@ def _preserve_user_skill_dir(
     shutil.move(str(target), str(backup))
     logger.warning("preserved your existing ~/.agents/skills/%s as %s", name, backup)
     preserved.append(f"skills/{name}")
+    return backup

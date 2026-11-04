@@ -88,6 +88,102 @@ def test_write_last_install_does_not_use_a_fixed_temp_name(tmp_path):
     assert sorted(x.name for x in tmp_path.iterdir()) == ["last.json", "last.json.tmp"]
 
 
+def test_read_last_install_returns_the_written_record(tmp_path):
+    rec = {"at": "2026-11-02T10:00:25+00:00", "from_version": "0.110.1",
+           "to_version": "0.110.2", "changes": {}, "unchanged_count": 0}
+    p = tmp_path / "last.json"
+    s.write_last_install(rec, p)
+    assert s.read_last_install(p) == rec
+
+
+def test_read_last_install_defaults_to_the_path_at_call_time(tmp_path, monkeypatch):
+    """The default resolves at call time under jacked's home, so a
+    $JACKED_HOME set after import is honored: the reader looks where
+    `jacked install` writes the record."""
+    record = tmp_path / ".claude" / "jacked-last-install.json"
+    s.write_last_install({"to_version": "0.110.2"}, record)
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    assert s.last_install_path() == record
+    assert s.read_last_install() == {"to_version": "0.110.2"}
+
+
+def test_write_last_install_defaults_to_the_path_at_call_time(tmp_path, monkeypatch):
+    """The writer resolves the same default at call time, so a record written
+    with no path lands under the $JACKED_HOME set after import."""
+    monkeypatch.setenv("JACKED_HOME", str(tmp_path))
+    s.write_last_install({"to_version": "0.110.2"})
+    record = tmp_path / ".claude" / "jacked-last-install.json"
+    assert json.loads(record.read_text(encoding="utf-8")) == {"to_version": "0.110.2"}
+
+
+def test_read_last_install_without_a_record_is_none_and_quiet(tmp_path, caplog):
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="jacked.install_summary"):
+        assert s.read_last_install(tmp_path / "missing.json") is None
+    assert not [r for r in caplog.records if r.name == "jacked.install_summary"]
+
+
+def test_read_last_install_corrupt_is_none_and_logs_the_class_only(tmp_path, caplog):
+    import logging
+
+    p = tmp_path / "last.json"
+    p.write_text('{"to_version": "0.110.2", "secret-ish": "TOKEN-VALUE"', encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="jacked.install_summary"):
+        assert s.read_last_install(p) is None
+    lines = [r.getMessage() for r in caplog.records if r.name == "jacked.install_summary"]
+    assert len(lines) == 1
+    assert "JSONDecodeError" in lines[0]
+    assert "TOKEN-VALUE" not in lines[0] and str(tmp_path) not in lines[0]
+
+
+def test_read_last_install_unreadable_file_is_none_and_logged(tmp_path, caplog):
+    import logging
+
+    p = tmp_path / "last.json"
+    p.mkdir()  # a directory where the file belongs: reading it raises OSError
+    with caplog.at_level(logging.DEBUG, logger="jacked.install_summary"):
+        assert s.read_last_install(p) is None
+    lines = [r for r in caplog.records if r.name == "jacked.install_summary"]
+    assert len(lines) == 1 and lines[0].levelno == logging.DEBUG
+    assert str(tmp_path) not in lines[0].getMessage()
+
+
+def test_read_last_install_refuses_an_oversized_record_and_logs_it(tmp_path, caplog):
+    p = tmp_path / "last.json"
+    p.write_text('{"pad": "' + "x" * (s.MAX_RECORD_BYTES + 1) + '"}', encoding="utf-8")
+    with caplog.at_level("DEBUG", logger="jacked.install_summary"):
+        assert s.read_last_install(p) is None
+    assert "too large" in caplog.text
+
+
+def test_read_last_install_survives_json_nested_too_deep(tmp_path, caplog, monkeypatch):
+    """The depth at which the JSON decoder gives up differs by interpreter
+    (the C decoder on this one parses thousands of levels), so the decoder's
+    RecursionError is raised directly: the reader must turn it into None."""
+    p = tmp_path / "last.json"
+    p.write_text("[[]]", encoding="utf-8")
+
+    def nested_too_deep(_text):
+        raise RecursionError("maximum recursion depth exceeded while decoding")
+
+    monkeypatch.setattr(s.json, "loads", nested_too_deep)
+    with caplog.at_level("DEBUG", logger="jacked.install_summary"):
+        assert s.read_last_install(p) is None
+    assert "RecursionError" in caplog.text
+
+
+def test_read_last_install_that_is_not_an_object_is_none(tmp_path, caplog):
+    import logging
+
+    p = tmp_path / "last.json"
+    p.write_text(json.dumps(["0.110.2"]), encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="jacked.install_summary"):
+        assert s.read_last_install(p) is None
+    lines = [r.getMessage() for r in caplog.records if r.name == "jacked.install_summary"]
+    assert len(lines) == 1 and "list" in lines[0]
+
+
 # --- CLI integration: install wires the manifest + summary (Task A3) ---
 from click.testing import CliRunner  # noqa: E402
 from jacked.cli import main  # noqa: E402
