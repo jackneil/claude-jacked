@@ -35,6 +35,7 @@ from jacked.web.refresh_verdict import primary_refresh_revoked as _primary_refre
 from jacked.web.refresh_verdict import primary_tokens_foreign as _primary_tokens_foreign
 from jacked.web.refresh_verdict import standing_verdict_or as _standing_verdict_or
 from jacked.web.refresh_verdict import token_fingerprint as _token_fingerprint
+from jacked.web.validation_records import _record_auth_rejection, _record_validation_http
 from jacked.web.window_keeper import cache_reset_value
 from jacked.web.oauth import (
     CC_LINEAGE_WRITE_LOCK,
@@ -1821,6 +1822,7 @@ async def fetch_usage(
     manual: bool = False,
     _retry_depth: int = 0,
     post_ping: bool = False,
+    allow_refresh: bool = True,
 ) -> Optional[dict]:
     """Fetch usage data from the Anthropic Usage API (design doc section 4f).
 
@@ -1838,7 +1840,10 @@ async def fetch_usage(
     backoff still applies, and pacing state is stamped exactly as for any
     other attempt.
 
-    Updates the account's cached usage fields in the database.
+    Updates the account's cached usage fields in the database. With
+    ``allow_refresh=False`` (a caller that may not change credentials) no
+    token is renewed or imported, a 401 is not recorded, and a Codex account
+    gives its cached usage (the app-server can renew the root's token).
 
     Returns the raw usage response dict, or None on failure.
     """
@@ -1920,7 +1925,7 @@ async def fetch_usage(
         # the live account's numbers under the wrong id (and risk rotating its
         # tokens), so only poll the account currently in the root; the others
         # keep their last-known cached usage until switched to.
-        if await asyncio.to_thread(live_codex_account_id, db) != account_id:
+        if not allow_refresh or await asyncio.to_thread(live_codex_account_id, db) != account_id:
             return {"_cached": True}
         return await fetch_codex_usage(account_id, db, state=state)
 
@@ -1974,7 +1979,7 @@ async def fetch_usage(
                 if now - _profile_refreshed_at.get(account_id, 0) > _PROFILE_REFRESH_INTERVAL:
                     _profile_refreshed_at[account_id] = now  # stamp first — a failing profile API must not retry every poll
                     try:
-                        await fetch_profile(account_id, db, access_token=token)
+                        await fetch_profile(account_id, db, access_token=token, allow_refresh=allow_refresh)
                     except Exception:
                         logger.debug(
                             "piggybacked profile refresh failed for account %d",
@@ -1984,6 +1989,9 @@ async def fetch_usage(
                 return data
 
             if resp.status_code in (401, 403):
+                if not allow_refresh:  # no renewal, so no verdict either
+                    logger.info("Usage HTTP %d for account %d; not renewed for this caller", resp.status_code, account_id)
+                    return None
                 # Try refreshing the primary token before giving up. The
                 # retry rides _retry_depth through the pacing check; we
                 # re-stamp last_fetched_at afterwards (success or not) so
@@ -2101,7 +2109,7 @@ async def fetch_usage(
                 if (
                     _retry_depth == 0
                     and n >= _USAGE_429_ROTATION_MIN_CONSECUTIVE
-                    and rotation_due
+                    and rotation_due and allow_refresh
                 ):
                     # Stamp at attempt time (success or not): a failed
                     # rotation still hit the token endpoint.
@@ -2519,69 +2527,7 @@ async def _profile_after_refresh(
     return fresh, await _get_profile(client, fresh)
 
 
-def _record_auth_rejection(
-    account_id: int, db: Database, status: int, token: Optional[str],
-) -> dict:
-    """Mark the row invalid after a 401/403 that no refresh fixed (worker thread).
-
-    ``token`` is the access token that the refused request sent. The write
-    is a compare-and-swap on it: a re-auth that stored a new token after
-    the 401 keeps its own status. A standing terminal verdict keeps its
-    text (``standing_verdict_or``): the sign-in text for a revoked refresh
-    token (#152i), the foreign-token text (#154i). Any other failure names
-    the HTTP status, as before.
-    """
-    row = db.get_account(account_id) or {}
-    stored = _standing_verdict_or(row, f"Token invalid (HTTP {status}), refresh failed")
-    shown = _standing_verdict_or(row, f"Token invalid (HTTP {status})")
-    if not db.update_account_if_unchanged(
-        account_id,
-        {"access_token": token},
-        validation_status="invalid",
-        last_validated_at=int(time.time()),
-        last_error=stored,
-        last_error_at=datetime.now(timezone.utc).isoformat(),
-    ):
-        logger.info(
-            "Account %d: validation verdict not recorded; the access token "
-            "changed during the check",
-            account_id,
-        )
-    return {"valid": False, "error": shown}
-
-
-def _record_validation_http(
-    account_id: int, db: Database, account: dict, status: int, token: Optional[str],
-) -> dict:
-    """Record a profile answer that is not 200, 401 or 403 (worker thread).
-
-    Like ``_record_auth_rejection``, the write is a compare-and-swap on
-    ``token``, the access token that the request sent (a re-auth that
-    landed meanwhile keeps its own status), and a standing terminal verdict
-    keeps its text (``standing_verdict_or``).
-    """
-    now = datetime.now(timezone.utc).isoformat()
-    if status == 429:
-        # Rate limited: keep the earlier status, only note the error.
-        db.update_account_if_unchanged(
-            account_id,
-            {"access_token": token},
-            validation_status=account.get("validation_status", "unknown"),
-            last_error=_standing_verdict_or(account, "Rate limited during validation"),
-            last_error_at=now,
-        )
-        return {"valid": False, "error": "Rate limited. Try again later."}
-    db.update_account_if_unchanged(
-        account_id,
-        {"access_token": token},
-        validation_status="unknown",
-        last_error=_standing_verdict_or(account, f"Validation HTTP {status}"),
-        last_error_at=now,
-    )
-    return {"valid": False, "error": f"Unexpected HTTP {status}"}
-
-
-async def validate_account(account_id: int, db: Database) -> dict:
+async def validate_account(account_id: int, db: Database, allow_refresh: bool = True) -> dict:
     """Validate an account with a profile request.
 
     A profile 200 marks the row valid when the profile names this account,
@@ -2590,7 +2536,8 @@ async def validate_account(account_id: int, db: Database) -> dict:
     refresh token) and asks again; when that does not give a 200, the row
     is invalid. Every write after a request is a compare-and-swap on the
     access token that the request sent: a re-auth that landed meanwhile
-    keeps its own status.
+    keeps its own status. With ``allow_refresh=False`` a 401/403 renews
+    nothing and is recorded as an unknown status, not as invalid.
 
     Returns dict with 'valid' (bool) and 'error' (str or None). A result
     with 'recheck' asks for a new check: the row changed during this one.
@@ -2603,7 +2550,7 @@ async def validate_account(account_id: int, db: Database) -> dict:
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await _get_profile(client, token)
-            if resp.status_code in (401, 403):
+            if resp.status_code in (401, 403) and allow_refresh:
                 retry = await _profile_after_refresh(account_id, db, account, client)
                 if retry is None or retry[1].status_code != 200:
                     refused = token if retry is None else retry[0]

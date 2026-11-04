@@ -19,9 +19,10 @@ from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from jacked.api.mutation_gate import denied_response, mutation_decision
 from jacked.api import provider_accounts
 from jacked.providers import is_claude, provider_of
+from jacked.api.mutation_gate import mutation_decision
+from jacked.api.write_gate import mutation_refusal
 from jacked.api.remote_access import (
     LOOPBACK_HOSTS,
     REASON_OUTSIDE_SCOPE,
@@ -441,35 +442,13 @@ def _credential_mutation_decision(
     """Resolve ``(allowed, reason, client_host)`` for this request.
 
     The policy and the audit line live in ``jacked.api.mutation_gate`` (one
-    gate for switches, status and the service upgrade); this name stays for
-    the routes and tests in this module.
+    gate for every write route); this name stays for this module's callers.
     """
     return mutation_decision(request, audit=audit)
 
 
-# Add, re-auth, delete, edit, reorder and token refresh: the same gate as a
-# switch. The Claude OAuth add and re-auth only store the login that the
-# user finished; they pass the gate result as their activation right instead.
-_ACCOUNT_DENIED_MESSAGES = {
-    REASON_REMOTE_ACCESS_OFF: (
-        "Account changes from this browser are off. Turn on remote access "
-        "under Settings > Advanced on the host machine."
-    ),
-    REASON_OUTSIDE_SCOPE: _SWITCH_DENIED_MESSAGES[REASON_OUTSIDE_SCOPE],
-}
-
-
-def _account_change_refusal(request: Request, audit: str) -> Optional[JSONResponse]:
-    """The 403 for a client that may not change accounts here, else None."""
-    allowed, reason, _host = _credential_mutation_decision(request, audit=audit)
-    if allowed:
-        return None
-    return denied_response(reason, _ACCOUNT_DENIED_MESSAGES, code="CREDENTIAL_MUTATION_LOCAL_ONLY")
-
-
 def _credential_mutation_allowed(request: Request) -> bool:
-    """Boolean half of :func:`_credential_mutation_decision`, for the OAuth
-    flow sites that only need to know whether to offer activation."""
+    """Boolean half of :func:`_credential_mutation_decision`: OAuth activation, token renewal."""
     return _credential_mutation_decision(request)[0]
 
 
@@ -949,7 +928,7 @@ async def start_add_account(
         return _db_unavailable()
 
     if provider in ("codex", "grok"):
-        refused = await asyncio.to_thread(_account_change_refusal, request, f"add-{provider}")
+        refused = await asyncio.to_thread(mutation_refusal, request, f"add-{provider}")
         if refused is not None:
             return refused
         if provider == "codex":
@@ -1004,7 +983,7 @@ async def start_reauth(account_id: int, request: Request, remote: bool = False):
         )
 
     if provider_of(account) == "grok":
-        refused = await asyncio.to_thread(_account_change_refusal, request, "reauth-grok")
+        refused = await asyncio.to_thread(mutation_refusal, request, "reauth-grok")
         if refused is not None:
             return refused
         notify = provider_accounts.ws_notifier(request.app)
@@ -1114,9 +1093,6 @@ async def list_accounts(request: Request, include_inactive: bool = False):
 @router.patch("/accounts/{account_id}")
 def update_account(account_id: int, body: AccountPatchRequest, request: Request):
     """Update display_name and/or is_active for an account."""
-    refused = _account_change_refusal(request, "edit-account")
-    if refused is not None:
-        return refused
     db = _get_db(request)
     if db is None:
         return _db_unavailable()
@@ -1163,9 +1139,6 @@ def update_account(account_id: int, body: AccountPatchRequest, request: Request)
 @router.delete("/accounts/{account_id}")
 def delete_account(account_id: int, request: Request):
     """Soft-delete an account. Cannot delete primary while others exist."""
-    refused = _account_change_refusal(request, "delete-account")
-    if refused is not None:
-        return refused
     db = _get_db(request)
     if db is None:
         return _db_unavailable()
@@ -1198,9 +1171,6 @@ def delete_account(account_id: int, request: Request):
 @router.post("/accounts/reorder")
 def reorder_accounts(body: ReorderRequest, request: Request):
     """Reorder account priorities. Index position becomes priority value."""
-    refused = _account_change_refusal(request, "reorder-accounts")
-    if refused is not None:
-        return refused
     db = _get_db(request)
     if db is None:
         return _db_unavailable()
@@ -1226,9 +1196,6 @@ def reorder_accounts(body: ReorderRequest, request: Request):
 @router.post("/accounts/{account_id}/refresh", response_model=RefreshResponse)
 async def refresh_token(account_id: int, request: Request):
     """Force token refresh for an account."""
-    refused = await asyncio.to_thread(_account_change_refusal, request, "refresh-token")
-    if refused is not None:
-        return refused
     db = _get_db(request)
     if db is None:
         return _db_unavailable()
@@ -1286,6 +1253,7 @@ async def refresh_usage(account_id: int, request: Request):
 
     from jacked.api.credential_helpers import read_fresh_active_token
 
+    allow_refresh = await asyncio.to_thread(_credential_mutation_allowed, request)
     fresh_token = read_fresh_active_token(account_id)
     # Only pass fresh_token when it differs from DB token — passing a non-None
     # access_token to fetch_usage() bypasses its cache freshness guard (auth.py:339).
@@ -1293,7 +1261,7 @@ async def refresh_usage(account_id: int, request: Request):
     effective_token = fresh_token if (fresh_token and fresh_token != db_token) else None
     try:
         usage_data = await asyncio.wait_for(
-            fetch_usage(account_id, db, access_token=effective_token, manual=True),
+            fetch_usage(account_id, db, access_token=effective_token, manual=True, allow_refresh=allow_refresh),
             timeout=_SINGLE_USAGE_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -1464,9 +1432,8 @@ async def refresh_all_usage(
         my_task = asyncio.current_task()
         _bulk_refresh_task = my_task
         try:
-            accounts = await asyncio.to_thread(
-                db.list_accounts, include_inactive=False
-            )
+            accounts = await asyncio.to_thread(db.list_accounts, include_inactive=False)
+            allow_refresh = await asyncio.to_thread(_credential_mutation_allowed, request)
             ws_registry = getattr(request.app.state, "ws_registry", None)
             total = len(accounts)
 
@@ -1528,7 +1495,7 @@ async def refresh_all_usage(
                                 acct["id"],
                                 db,
                                 access_token=effective_token,
-                                manual=user_initiated,
+                                manual=user_initiated, allow_refresh=allow_refresh,
                             ),
                             timeout=_BULK_PER_ACCOUNT_TIMEOUT,
                         )
@@ -1695,10 +1662,9 @@ async def validate_token(account_id: int, request: Request):
         return _not_found(f"No account with id={account_id}")
 
     try:
+        allow_refresh = await asyncio.to_thread(_credential_mutation_allowed, request)
         result = await asyncio.wait_for(
-            validate_account(account_id, db),
-            timeout=_VALIDATE_TIMEOUT,
-        )
+            validate_account(account_id, db, allow_refresh=allow_refresh), timeout=_VALIDATE_TIMEOUT)
     except asyncio.TimeoutError:
         logger.warning(
             "validate_token: account %d validate_account exceeded %.0fs — returning 504",

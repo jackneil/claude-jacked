@@ -88,7 +88,7 @@ def _storing_fetch(payload, **cache_updates):
     """A fetch_usage stand-in that stores like the real one, then returns
     the provider payload."""
 
-    async def _fetch(account_id, db_arg, access_token=None, manual=False):
+    async def _fetch(account_id, db_arg, access_token=None, manual=False, allow_refresh=True):
         updates = cache_updates or usage_cache_updates(payload)
 
         def _store():

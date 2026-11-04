@@ -1178,12 +1178,24 @@ its refresh token in memory and spends it when its access token expires.
 After the window, a tracked session stays a holder while its recorded process
 still runs it (`tracked_holder_sessions()` in `jacked/session_ancestry.py`).
 For example, a laptop that slept all night keeps its sessions. The process
-must be alive and must have started before the tracker row was written, so a
-reused process id does not count. When jacked cannot read the liveness or
-the start time, the session stays a holder. A session with no process id
-keeps the time rule only. The check probes each process id once and reads
-the start times of the live ones in one pass: `/proc` on Linux, the kernel
-on Windows, and one `ps` command on macOS. The dashboard process sweeper
+must be alive and must still be the process that wrote the tracker row, so a
+reused process id does not count. The session hook stores a process token
+with each row (`pid_token`, the `creation_id()` of the session process in
+`jacked/process_identity.py`). The token is the start that the kernel keeps
+for the process, so a wall-clock step (a resumed virtual machine, an NTP
+correction) does not change it. The same token is the same process. A
+different token is a reused process id. A row with no token uses the start
+time, and the start time can only confirm the row: a start that is later
+than the row time is unknown, because a clock step looks the same as a
+reused id. When jacked cannot read the liveness, the token or the start
+time, the session stays a holder. A session with no process id keeps the
+time rule only. The check probes each process id once, then reads the tokens
+of the live ones in one pass (in-process on every platform) and, for rows
+with no token, their start times in one more pass: `/proc` on Linux, the
+kernel on Windows, and one `ps` command on macOS. When `claude --resume`
+runs a session again in a new process, the hook ends the open row and
+writes a new row with the new process id and token
+(`write_span()` in `jacked/session_tracking_store.py`). The dashboard process sweeper
 uses the same verdict (`session_processes_running()`). It sends a heartbeat
 for a running session, closes a session whose process ended or was reused,
 and does not change a session with an unknown answer. When

@@ -182,3 +182,19 @@ def test_a_failed_update_says_so_in_the_heading(tmp_path):
     assert out[0]["heading"] == "Jacked update failed"
     assert "Error: uv exited 2" in out[0]["banner"]
     assert out[0]["polling"] is False
+
+
+def test_a_no_op_update_shows_its_note_and_not_a_completed_update(tmp_path):
+    """UG-1: the updater refused an install that would go back to an older
+    version. Its record closes as done at the installed version, with the
+    refusal as its note. The page says that nothing changed."""
+    note = ("Nothing to upgrade. The package index serves v0.109.0. "
+            "The installed version is v0.109.1.")
+    noop = {"from_version": "0.109.1", "to_version": "0.109.1", "method": "uv",
+            "overall": "succeeded", "current_phase": None, "phases": [], "note": note}
+    out = _run(tmp_path, [{"status": noop, "version": "0.109.1"}])
+    assert out[0]["heading"] == "Jacked is up to date"
+    assert note in out[0]["banner"]
+    assert "Update complete" not in out[0]["banner"]
+    assert "—" not in out[0]["banner"]
+    assert out[0]["polling"] is False

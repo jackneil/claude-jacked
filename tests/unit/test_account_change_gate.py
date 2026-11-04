@@ -7,60 +7,24 @@ its address is inside the scope. ``/use`` ran it before this change. Add
 not, so a remote page could start a sign-in on the host, import a login, or
 delete stored credentials while remote access was off.
 
-The route table test makes the class closed: a new write route in the auth
-router fails here until it is listed as gated or as exempt with a reason.
+The app-wide write gate (``jacked.api.write_gate``) now refuses every
+unsafe route; ``tests/unit/api/test_write_gate.py`` keeps that set closed.
+This file proves the account routes through the same wiring as the app.
 """
 
 import json
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from jacked.api.routes.auth import router
+from jacked.api.write_gate import MutationRefused, mutation_refused_handler, require_mutation_access
 from jacked.web.database import Database
 
 TAILNET_IP = "100.116.47.72"
 LAN_IP = "192.168.42.5"
-
-# Write routes that run the gate and answer 403.
-GATED = {
-    ("POST", "/accounts/add"),
-    ("POST", "/accounts/{account_id}/reauth"),
-    ("PATCH", "/accounts/{account_id}"),
-    ("DELETE", "/accounts/{account_id}"),
-    ("POST", "/accounts/reorder"),
-    ("POST", "/accounts/{account_id}/refresh"),
-    ("POST", "/accounts/{account_id}/use"),
-}
-# Write routes that do not answer 403, and why.
-EXEMPT = {
-    # Claude OAuth only stores a login that the user finished in the browser.
-    # The gate result decides whether the flow may activate it
-    # (tests/unit/api/test_oauth_remote_routes.py). Codex and Grok add, and
-    # Grok re-auth, are gated (the cases below).
-    ("POST", "/accounts/{account_id}/authorize-cc"): "Claude OAuth, activation-gated",
-    ("POST", "/flow/{flow_id}/code"): "completes a flow that the gated start made",
-    ("POST", "/flow/{flow_id}/open"): "reopens the browser of an existing flow",
-    ("POST", "/accounts/{account_id}/refresh-usage"): "reads usage, writes no credential",
-    ("POST", "/accounts/refresh-all-usage"): "reads usage, writes no credential",
-    ("POST", "/accounts/{account_id}/validate"): "reads the profile API",
-}
-
-
-def _write_routes():
-    found = set()
-    for route in router.routes:
-        for method in set(route.methods) - {"GET", "HEAD"}:
-            found.add((method, route.path))
-    return found
-
-
-def test_every_write_route_is_gated_or_exempt_with_a_reason():
-    assert _write_routes() == GATED | set(EXEMPT)
-    assert not GATED & set(EXEMPT)
-
 
 @pytest.fixture
 def db(tmp_path):
@@ -97,7 +61,9 @@ def side_effects(monkeypatch):
 
 
 def _app(db):
-    app = FastAPI()
+    # The same wiring as jacked.api.main: the gate runs before every write.
+    app = FastAPI(dependencies=[Depends(require_mutation_access)])
+    app.add_exception_handler(MutationRefused, mutation_refused_handler)
     app.include_router(router, prefix="/api/auth")
     app.state.db = db
     return app
@@ -153,7 +119,8 @@ def test_a_refused_remote_client_changes_nothing(
 
     assert resp.status_code == 403, resp.text
     error = resp.json()["error"]
-    assert error["code"] == "CREDENTIAL_MUTATION_LOCAL_ONLY"
+    # /use keeps its own code; every other route answers with the reason.
+    assert error["code"] in {"CREDENTIAL_MUTATION_LOCAL_ONLY", "REMOTE_ACCESS_OFF", "OUTSIDE_SCOPE"}
     assert "—" not in error["message"]
     assert resp.headers["cache-control"] == "no-store"
     assert side_effects == []

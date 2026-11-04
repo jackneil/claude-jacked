@@ -640,9 +640,9 @@ def run_update(
         _refuse(_reason, f"Jacked auto-update refused:\n{_reason}\n")
         return
 
-    # #295i: never an older version. The refusal restarts the stopped service.
+    # #295i: never an older version. A no-op, not a failure; restarts the service.
     if _downgrade := upgrade_guard.current_refusal():
-        _refuse(_downgrade, f"Jacked auto-update did nothing. {_downgrade}\n")
+        _refuse(_downgrade, None, noop_version=upgrade_guard.installed_version() or _current_version)
         return
 
     # --- Status file lifecycle

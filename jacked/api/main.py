@@ -9,7 +9,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,15 +36,14 @@ from jacked.api.security import (
     origin_allowed,
 )
 from jacked.api.websocket import WebSocketRegistry
+from jacked.api.write_gate import MutationRefused, mutation_refused_handler, require_mutation_access
 from jacked.credentials.startup_recovery import recover_pending_switches
 from jacked.service.issue_queue_refresh import issue_queue_refresh_loop
 
 logger = logging.getLogger(__name__)
 
-# Monotonic counter of completed lifespan startups in this process.
-# Bumped on each lifespan entry so on-call can distinguish "first
-# startup" from "N-th tray restart" in logs that share the same PID
-# (the tray restarts uvicorn in a new thread without forking).
+# Completed lifespan startups in this process: tells "first startup" from the
+# "N-th tray restart" in logs that share one PID (the tray restarts uvicorn in a thread).
 _lifespan_startup_count: int = 0
 
 # Static web files shipped with the package
@@ -540,11 +539,12 @@ app = FastAPI(
     description="Local web dashboard for Claude Code account management and analytics.",
     version=__version__,
     lifespan=lifespan,
-    # FastAPI's /docs and /redoc pages load Swagger UI and ReDoc from a CDN,
-    # which would run third-party code on the dashboard origin (and the
-    # document CSP refuses it). Nothing uses them; /openapi.json stays.
+    # /docs and /redoc load Swagger UI and ReDoc from a CDN (third-party code
+    # on the dashboard origin; the CSP refuses it). /openapi.json stays.
     docs_url=None,
     redoc_url=None,
+    # Every write route runs the remote-access gate (jacked/api/write_gate.py).
+    dependencies=[Depends(require_mutation_access)],
 )
 
 _cors_origins = build_allowed_origins(
@@ -565,6 +565,7 @@ app.add_middleware(HostValidationMiddleware)
 # Fixed client text for exceptions no route handled (#289i); see error_handlers.
 app.add_exception_handler(ValueError, value_error_handler)
 app.add_exception_handler(FileNotFoundError, not_found_handler)
+app.add_exception_handler(MutationRefused, mutation_refused_handler)
 
 
 @app.exception_handler(Exception)
@@ -699,8 +700,7 @@ if WEB_DIR.exists():
     _js_dir = WEB_DIR / "js"
     _assets_dir = WEB_DIR / "assets"
 
-    # Middleware: prevent browser caching of static assets so code changes
-    # take effect without hard refresh after jacked install + server restart.
+    # No browser cache for static assets: a reinstall then needs no hard refresh.
     @app.middleware("http")
     async def no_cache_static(request, call_next):
         response = await call_next(request)

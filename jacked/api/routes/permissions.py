@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from jacked.api.routes.features import (
 from jacked.memory.settings_io import SettingsUnreadableError
 from jacked.memory.vault import atomic_write_text
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _project_settings_lock = asyncio.Lock()
@@ -117,6 +119,26 @@ def _validate_repo_path(repo_path: str | None, db) -> Path:
 
 
 # --- Endpoints ---
+
+
+@router.get("/claude-settings/projects")
+def list_recorded_projects(request: Request):
+    """List every project that jacked recorded, for the project-permissions list.
+
+    The installations overview gives only the 20 most recent projects. This
+    list has no limit. It reads only the database, never a project folder.
+    No database, or a read that fails, gives an empty list.
+    """
+    from jacked.web.project_activity import list_recorded_projects as _recorded
+
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return {"projects": []}
+    try:
+        return {"projects": _recorded(db)}
+    except Exception:
+        logger.exception("Could not read the recorded projects")
+        return {"projects": []}
 
 
 @router.get("/claude-settings/project-permissions")

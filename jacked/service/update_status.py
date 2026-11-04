@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,7 +30,9 @@ from typing import Optional
 from packaging.version import InvalidVersion, Version
 
 from jacked.atomic_io import atomic_write_text
+from jacked.process_identity import creation_id as _creation_id
 from jacked.service import CLAUDE_DIR
+from jacked.service.update_noop import is_unclaimed_preinit
 
 logger = logging.getLogger(__name__)
 
@@ -692,54 +693,6 @@ def _resolve_updater_pid(updater_pid: Optional[int]) -> Optional[int]:
     return updater_pid
 
 
-def _creation_id(pid: Optional[int]) -> Optional[str]:
-    """A marker of when ``pid`` started, or None when it cannot be read.
-
-    Read in-process on every platform, never through a subprocess: this runs
-    on every status write and every status poll. Linux and Windows use
-    ``process_identity`` (/proc, the Windows API); macOS reads the start time
-    with ``proc_pidinfo`` instead of the ``ps`` that ``process_identity``
-    runs there.
-    """
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return None
-    try:
-        if sys.platform == "darwin":
-            return _darwin_start_marker(pid)
-        from jacked.service.instance_storage import process_identity
-
-        return process_identity(pid).creation_id
-    except Exception:  # noqa: BLE001 - an unreadable identity is simply unknown
-        return None
-
-
-def _darwin_start_marker(pid: int) -> Optional[str]:
-    """``proc_pidinfo(PROC_PIDTBSDINFO)``: the struct proc_bsdinfo start time
-    (sys/proc_info.h), in-process."""
-    import ctypes
-    import ctypes.util
-
-    class _BsdInfo(ctypes.Structure):
-        _fields_ = [
-            *[(name, ctypes.c_uint32) for name in (
-                "flags", "status", "xstatus", "pid", "ppid", "uid", "gid",
-                "ruid", "rgid", "svuid", "svgid", "rfu_1")],
-            ("comm", ctypes.c_char * 16),
-            ("name", ctypes.c_char * 32),
-            *[(name, ctypes.c_uint32) for name in ("nfiles", "pgid", "pjobc", "tdev", "tpgid")],
-            ("nice", ctypes.c_int32),
-            ("start_tvsec", ctypes.c_uint64),
-            ("start_tvusec", ctypes.c_uint64),
-        ]
-
-    libproc = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib")
-    info = _BsdInfo()
-    size = libproc.proc_pidinfo(pid, 3, ctypes.c_uint64(0), ctypes.byref(info), ctypes.sizeof(info))
-    if size != ctypes.sizeof(info) or info.pid != pid:
-        return None
-    return f"darwin-start:{info.start_tvsec}.{info.start_tvusec:06d}"
-
-
 def updater_liveness(data: dict) -> Optional[bool]:
     """True when the recording process runs, False when it is gone, None when
     the record names no usable pid or the probe is indeterminate.
@@ -894,11 +847,7 @@ def init_or_adopt_status(
         return "initialized"
     except LockBusy:
         prior = _read_raw(path) or {}
-        if (
-            prior.get("preinit") is True
-            and not (prior.get("phases") or [])
-            and prior.get("current_phase") is None
-        ):
+        if is_unclaimed_preinit(prior):
             # Claim the record for THIS process. The tray that pre-created it
             # is about to exit, and a record naming a dead pid would read as
             # abandoned the moment this update runs longer than the mtime rule.

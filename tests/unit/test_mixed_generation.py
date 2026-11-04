@@ -270,11 +270,12 @@ class _Lock:
 
 
 class TestRefuseAndRestore:
-    def _run(self, monkeypatch, *, lock="free", alive=False, restart=(True, "ok"), fallback="ok"):
+    def _run(self, monkeypatch, *, lock="free", alive=False, restart=(True, "ok"), fallback="ok",
+             noop_version=None):
         from jacked.service import platform, update_status
         from jacked.service.update_refusal import refuser
 
-        lines, recovery, marked, closed, started = [], [], [], [], []
+        lines, recovery, marked, closed, started, noops = [], [], [], [], [], []
         handle = _Lock()
 
         def _acquire(path):
@@ -284,6 +285,10 @@ class TestRefuseAndRestore:
 
         monkeypatch.setattr(update_status, "acquire_update_lock", _acquire)
         monkeypatch.setattr(update_status, "mark_failed", lambda path, error, recovery=None: marked.append(error))
+        monkeypatch.setattr(
+            "jacked.service.update_noop.close_preinit_as_noop",
+            lambda path, installed, note: noops.append((installed, note)) or True,
+        )
 
         def _restart():
             if isinstance(restart, Exception):
@@ -300,9 +305,12 @@ class TestRefuseAndRestore:
             4242, lines.append, recovery.append, lambda pid, timeout: not alive,
             close=lambda: closed.append(1), start_fallback=_fallback,
         )
-        result = refuse("a reason", "recovery text")
+        if noop_version is None:
+            result = refuse("a reason", "recovery text")
+        else:
+            result = refuse("a reason", None, noop_version=noop_version)
         return {"result": result, "lines": lines, "recovery": recovery, "marked": marked,
-                "closed": closed, "started": started, "lock": handle}
+                "closed": closed, "started": started, "lock": handle, "noops": noops}
 
     def test_with_the_lock_it_closes_the_record_restarts_and_releases(self, monkeypatch):
         r = self._run(monkeypatch)
@@ -313,6 +321,22 @@ class TestRefuseAndRestore:
         assert r["started"] == []
         assert r["lock"].closed == 1
         assert r["closed"] == [1]
+
+    def test_a_no_op_writes_no_recovery_and_marks_nothing_failed(self, monkeypatch):
+        """UG-1: an install that would go back is a no-op, not a failure. The
+        tray's record closes as done at the installed version, and the
+        service still restarts."""
+        r = self._run(monkeypatch, noop_version="0.111.2")
+        assert r["result"] is True
+        assert r["recovery"] == [] and r["marked"] == []
+        assert r["noops"] == [("0.111.2", "a reason")]
+        assert r["lines"] == ["REFUSED: a reason", "Refusal: service restart OK (ok)"]
+        assert r["lock"].closed == 1 and r["closed"] == [1]
+
+    @pytest.mark.parametrize("lock", ["busy", "raises"])
+    def test_without_the_lock_a_no_op_still_writes_no_recovery(self, monkeypatch, lock):
+        r = self._run(monkeypatch, lock=lock, noop_version="0.111.2")
+        assert r["recovery"] == [] and r["noops"] == [] and r["marked"] == []
 
     @pytest.mark.parametrize("lock", ["busy", "raises"])
     def test_without_the_lock_neither_the_record_nor_the_service_changes(self, monkeypatch, lock):

@@ -83,17 +83,10 @@ def test_a_removed_route_is_reported():
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 def test_the_permission_project_list_comes_from_the_recorded_projects(tmp_path):
-    overview = {
-        "projects": [
-            {"repo_path": "/work/b"},
-            {"repo_path": "/work/a"},
-            {"repo_path": "/work/b"},
-            {"repo_path": "/Work/A"},
-            {"repo_path": ""},
-            {},
-            None,
-        ]
-    }
+    """The list reads GET /api/claude-settings/projects, which has no limit
+    (G3-UI-1: the installations overview stops at 20 projects)."""
+    many = [f"/work/p{n:02d}" for n in range(25)]
+    answer = {"projects": ["/work/b", "/work/a", "/work/b", "/Work/A", "", None, 7] + many}
     # eval() runs only this repo's own settings.js in a throwaway node
     # process, the same pattern as the other test_web_js_* suites.
     program = f"""
@@ -103,7 +96,7 @@ global.document = {{ getElementById: () => null, querySelectorAll: () => [], que
 global.localStorage = {{ getItem: () => null, setItem: () => {{}} }};
 eval(fs.readFileSync({json.dumps(str(SETTINGS_JS))}, 'utf8'));
 process.stdout.write(JSON.stringify([
-    permProjectRepoList({json.dumps(overview)}),
+    permProjectRepoList({json.dumps(answer)}),
     permProjectRepoList(null),
     permProjectRepoList({{}}),
 ]));
@@ -112,4 +105,14 @@ process.stdout.write(JSON.stringify([
     script.write_text(program, encoding="utf-8")
     proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
-    assert json.loads(proc.stdout) == [["/Work/A", "/work/a", "/work/b"], [], []]
+    listed, empty_null, empty_obj = json.loads(proc.stdout)
+    assert listed == sorted({"/Work/A", "/work/a", "/work/b", *many})
+    assert len(listed) == 28
+    assert empty_null == [] and empty_obj == []
+
+
+def test_the_permission_project_list_reads_the_uncapped_route():
+    source = SETTINGS_JS.read_text(encoding="utf-8")
+    assert "api.get('/api/claude-settings/projects')" in source
+    start = source.index("_permScope === 'project' && _permProjectRepos.length === 0")
+    assert "/api/installations/overview" not in source[start:start + 600]

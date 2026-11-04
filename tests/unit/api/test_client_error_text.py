@@ -418,15 +418,59 @@ def test_upgrade_failure_hides_an_unexpected_exception(monkeypatch):
     assert "upgrade step" in payload["error"]
 
 
-def test_upgrade_failure_shows_the_installer_report(monkeypatch):
+def test_upgrade_failure_shows_the_step_error_text(monkeypatch):
     from jacked.api.routes import system
 
     async def installer_fails(cmd):
-        raise system.UpgradeStepError("error: no matching version of claude-jacked")
+        raise system.UpgradeStepError("uv not found on PATH. Cannot upgrade.")
 
     event, payload = _upgrade(monkeypatch, run_cmd=installer_fails)
     assert event == "upgrade_failed"
-    assert payload["error"] == "error: no matching version of claude-jacked"
+    assert payload["error"] == "uv not found on PATH. Cannot upgrade."
+
+
+# The installer is a real child that prints a marker path and exits 3.
+_INSTALLER = f"import sys; print({MARKER!r}); sys.exit(3)"
+
+
+def test_a_failed_installer_step_gives_fixed_text(caplog):
+    """The upgrade_failed event reaches every WebSocket client, remote ones
+    too, so the installer's output stays in the host's log file."""
+    import sys
+    from pathlib import Path
+
+    from jacked.api.log_capture import _format_entry
+    from jacked.api.upgrade_steps import UpgradeStepError, _upgrade_run_cmd
+
+    with caplog.at_level(logging.WARNING, logger="jacked.api.upgrade_steps"), \
+            pytest.raises(UpgradeStepError) as raised:
+        asyncio.run(_upgrade_run_cmd([sys.executable, "-c", _INSTALLER]))
+
+    name = Path(sys.executable).name
+    assert raised.value.public_message == (
+        f"The {name} step failed with exit code 3. See ~/.claude/jacked-server.log."
+    )
+    assert MARKER not in str(raised.value)
+    records = [r for r in caplog.records if r.name == "jacked.api.upgrade_steps"]
+    assert len(records) == 1
+    assert MARKER in records[0].getMessage()  # the host's log file keeps it
+    assert MARKER not in _format_entry(records[0])["msg"]  # the log viewer does not
+
+
+def test_the_upgrade_failed_event_has_no_installer_output(monkeypatch):
+    import sys
+
+    from jacked.api.upgrade_steps import _upgrade_run_cmd
+
+    async def installer(cmd):
+        await _upgrade_run_cmd([sys.executable, "-c", _INSTALLER])
+
+    event, payload = _upgrade(monkeypatch, run_cmd=installer)
+    assert event == "upgrade_failed"
+    assert MARKER not in payload["error"]
+    assert "exit code 3" in payload["error"]
+    assert "jacked-server.log" in payload["error"]
+    assert "\u2014" not in payload["error"]
 
 
 # ---------------------------------------------------------------------------

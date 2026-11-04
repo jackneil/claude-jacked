@@ -1965,12 +1965,13 @@ let _permProjectRepos = [];
 
 /**
  * The project paths for the project-permissions list, from the
- * /api/installations/overview answer. One entry for each recorded path, in
- * path order. The server accepts each path exactly as it gives it.
+ * /api/claude-settings/projects answer. That route gives every recorded
+ * project, with no limit. One entry for each path, in path order. The server
+ * accepts each path exactly as it gives it.
  */
-function permProjectRepoList(overview) {
-    const projects = (overview && Array.isArray(overview.projects)) ? overview.projects : [];
-    const paths = projects.map(p => p && p.repo_path).filter(p => typeof p === 'string' && p);
+function permProjectRepoList(answer) {
+    const projects = (answer && Array.isArray(answer.projects)) ? answer.projects : [];
+    const paths = projects.filter(p => typeof p === 'string' && p);
     return [...new Set(paths)].sort();
 }
 let _permProjectData = null;  // cached project permissions
@@ -2167,10 +2168,10 @@ function _bindClaudeCodeEvents(container) {
             _permProjectData = null;
             if (_permScope === 'project' && _permProjectRepos.length === 0) {
                 try {
-                    // The projects that jacked recorded: the server opens
+                    // Every project that jacked recorded: the server opens
                     // project settings only for a recorded project.
-                    const overview = await api.get('/api/installations/overview');
-                    _permProjectRepos = permProjectRepoList(overview);
+                    const recorded = await api.get('/api/claude-settings/projects');
+                    _permProjectRepos = permProjectRepoList(recorded);
                 } catch (e) { _permProjectRepos = []; }
             }
             await renderClaudeCodeTab(container);
