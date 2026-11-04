@@ -14,7 +14,6 @@ shells out to ``jacked``), so there is no language detection here.
 from __future__ import annotations
 
 import logging
-import stat
 from pathlib import Path
 
 from jacked import guardrails
@@ -116,11 +115,9 @@ def install_post_merge(repo_path: str | Path, force: bool = False) -> dict:
                 ),
             }
 
-    target.write_text(new_content, encoding="utf-8")
-    try:
-        target.chmod(target.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    except OSError:
-        pass
+    # The lint hook's writer: a link at the target is replaced, not written
+    # through, and the result is executable.
+    guardrails.write_hook(target, new_content.encode("utf-8"))
 
     return {"installed": True, "path": str(target)}
 
