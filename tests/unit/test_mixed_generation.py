@@ -84,6 +84,17 @@ class TestNamesFrom:
         assert callable(program) and winproc.system_program is program
 
 
+def _forget(monkeypatch, module: str) -> None:
+    """Drop ``module`` and its submodules from ``sys.modules`` AND from the
+    parent package attributes, so a re-import leaves no orphan bound on the
+    package after monkeypatch restores ``sys.modules``."""
+    for name in [n for n in sys.modules if n == module or n.startswith(module + ".")]:
+        parent, _, leaf = name.rpartition(".")
+        if parent in sys.modules:
+            monkeypatch.delattr(sys.modules[parent], leaf, raising=False)
+        monkeypatch.delitem(sys.modules, name)
+
+
 @pytest.mark.parametrize("module", ["jacked.service.supervisors", "jacked.proctree", "jacked.service.process"])
 class TestNewModulesImportInAStaleInterpreter:
     """The three modules an older upgrade process first-imports after the install."""
@@ -92,8 +103,7 @@ class TestNewModulesImportInAStaleInterpreter:
         import jacked.winproc as winproc
 
         monkeypatch.delattr(winproc, "system_program")
-        for name in [n for n in sys.modules if n == module or n.startswith(module + ".")]:
-            monkeypatch.delitem(sys.modules, name)
+        _forget(monkeypatch, module)
         loaded = importlib.import_module(module)
         assert loaded.system_program is winproc.system_program
         assert callable(winproc.system_program)
@@ -101,8 +111,7 @@ class TestNewModulesImportInAStaleInterpreter:
     def test_a_current_interpreter_never_reloads(self, monkeypatch, module):
         calls = []
         monkeypatch.setattr(importlib, "reload", lambda m: calls.append(m.__name__))
-        for name in [n for n in sys.modules if n == module or n.startswith(module + ".")]:
-            monkeypatch.delitem(sys.modules, name)
+        _forget(monkeypatch, module)
         importlib.import_module(module)
         assert calls == []
 
@@ -298,3 +307,22 @@ class TestNamesFromMissingOnDisk:
     def test_a_name_missing_from_the_disk_too_raises_import_error(self):
         with pytest.raises(ImportError, match="cannot import name 'no_such_name' from 'jacked.winproc'"):
             mixed_generation.names_from("jacked.winproc", "no_such_name")
+
+
+class TestMixedGenerationKeepsItsImportedNames:
+    def test_other_modules_import_only_the_stable_names(self):
+        """From 0.111.1 on, every upgrade process holds this module, and
+        ``names_from`` cannot guard a name added to its own module. So the
+        names other modules import from it are a fixed set: a new one must be
+        added here on purpose, with a getattr fallback at its call site."""
+        import ast
+
+        imported = set()
+        for path in Path(jacked.__file__).resolve().parent.rglob("*.py"):
+            if path.name == "mixed_generation.py":
+                continue
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.ImportFrom) and node.module == "jacked.mixed_generation":
+                    imported.update(a.name for a in node.names)
+        assert imported <= mixed_generation.STABLE_NAMES, sorted(imported - mixed_generation.STABLE_NAMES)
+        assert all(hasattr(mixed_generation, name) for name in mixed_generation.STABLE_NAMES)

@@ -24,6 +24,12 @@ names too.
 
 Only modules without import-time side effects and without state are safe
 to reload this way.
+
+From 0.111.1 on, every upgrade process holds this module (``jacked.service.
+process`` imports it), and :func:`names_from` cannot guard a name added to
+its own module. Other modules therefore import only :data:`STABLE_NAMES`
+from it. Do not remove or rename one of them; a new name needs a ``getattr``
+fallback at each call site, and a unit test holds the set.
 """
 
 from __future__ import annotations
@@ -34,6 +40,9 @@ import importlib.util
 import re
 import sys
 from pathlib import Path
+
+# The names other jacked modules import from this module (see the docstring).
+STABLE_NAMES = frozenset({"names_from", "preload_upgrade_modules"})
 
 _VERSION_LINE = re.compile(r'^__version__ = "([^"]+)"', re.MULTILINE)
 
