@@ -220,9 +220,11 @@ async def process_alive_sweeper_loop(app, interval: int = 60):
 
     For sessions with a PID: one batched check (``session_processes_running``,
     the verdict the credential holder set uses too). A session whose process
-    is alive and started before its row was written gets a heartbeat. A
-    session whose process ended, or whose PID a newer process reuses, is
-    closed. An unknown answer leaves the row alone (never a false close).
+    is alive and is still the process that wrote its row gets a heartbeat. A
+    session whose process ended, or whose PID a newer process reuses (its
+    process token differs), is closed. An unknown answer (for example a row
+    with no token whose process reads as started after the row, which a
+    wall-clock step can cause) leaves the row alone (never a false close).
     For sessions without a usable PID (none, 0 or 1): fall back to the old
     "any claude running?" heuristic.
 

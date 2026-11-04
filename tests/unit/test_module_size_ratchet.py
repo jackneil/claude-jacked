@@ -67,14 +67,14 @@ BASELINE: dict[str, int] = {
     "jacked/service/menubar_mac.py": 846,
     "jacked/service/spec.py": 585,
     "jacked/service/tray.py": 2083,
-    "jacked/service/update_status.py": 1034,
+    "jacked/service/update_status.py": 986,
     "jacked/service/updater.py": 2208,
     "jacked/skill_listing.py": 1744,
     "jacked/transcript.py": 794,
     "jacked/web/analytics_db.py": 625,
     "jacked/web/auth.py": 3169,
     "jacked/web/browser_launch.py": 585,
-    "jacked/web/database.py": 4078,
+    "jacked/web/database.py": 4020,
     "jacked/web/oauth.py": 1238,
 }
 

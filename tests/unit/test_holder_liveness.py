@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import jacked.process_identity as pi
 import jacked.session_ancestry as anc
 from jacked.api import credential_helpers as ch
 from jacked.web.database import Database
@@ -43,9 +44,10 @@ def db(tmp_path):
     database.close()
 
 
-def _session(db, session_id, account_id, *, pid=None, idle_hours=9.0):
+def _session(db, session_id, account_id, *, pid=None, idle_hours=9.0, token=None):
     db.record_session_account(
         session_id, account_id=account_id, detection_method="session_start", pid=pid,
+        pid_token=token,
     )
     seen = (datetime.now(timezone.utc) - timedelta(hours=idle_hours)).isoformat()
     with db._writer() as conn:
@@ -59,13 +61,15 @@ def _session(db, session_id, account_id, *, pid=None, idle_hours=9.0):
 class _Processes:
     """A fake process table: liveness and start time per pid, with call logs."""
 
-    def __init__(self, monkeypatch, alive=None, starts=None):
+    def __init__(self, monkeypatch, alive=None, starts=None, tokens=None):
         self.alive = dict(alive or {})
         self.starts = dict(starts or {})
+        self.tokens = dict(tokens or {})
         self.probed: list[int] = []
         self.start_reads: list[list[int]] = []
         monkeypatch.setattr("jacked.service.process.process_liveness", self._liveness)
         monkeypatch.setattr(anc, "process_starts", self._process_starts)
+        monkeypatch.setattr(anc, "process_tokens", self._process_tokens)
 
     def _liveness(self, pid):
         self.probed.append(pid)
@@ -74,6 +78,9 @@ class _Processes:
     def _process_starts(self, pids):
         self.start_reads.append(sorted(pids))
         return {p: self.starts[p] for p in pids if p in self.starts}
+
+    def _process_tokens(self, pids):
+        return {p: self.tokens[p] for p in pids if p in self.tokens}
 
 
 # ---------------------------------------------------------------------------
@@ -94,10 +101,17 @@ def test_a_dead_pid_with_old_activity_is_not_a_holder(db, monkeypatch):
 
 
 def test_a_pid_reused_by_a_newer_process_is_not_a_holder(db, monkeypatch):
-    """The process now at 4100 started after the row was written."""
-    _session(db, "crashed", 4, pid=4100, idle_hours=9)
-    _Processes(monkeypatch, alive={4100: True}, starts={4100: time.time() - 60})
+    """The process now at 4100 has a different token than the row's process."""
+    _session(db, "crashed", 4, pid=4100, idle_hours=9, token="tok-old")
+    _Processes(monkeypatch, alive={4100: True}, tokens={4100: "tok-new"})
     assert ch.live_holder_account_ids(db, _NO_TOKENS) == set()
+
+
+def test_a_tokenless_row_with_a_later_start_fails_closed(db, monkeypatch):
+    """With no token, a later start can be a clock step: still a holder."""
+    _session(db, "legacy", 4, pid=4100, idle_hours=9)
+    _Processes(monkeypatch, alive={4100: True}, starts={4100: time.time() - 60})
+    assert ch.live_holder_account_ids(db, _NO_TOKENS) == {4}
 
 
 def test_a_row_with_no_pid_keeps_the_time_rule(db, monkeypatch):
@@ -216,11 +230,11 @@ def test_the_sweeper_uses_the_same_verdict(db, monkeypatch):
     from jacked.api import watchers
 
     _session(db, "alive", 4, pid=4100, idle_hours=2)
-    _session(db, "reused", 5, pid=4200, idle_hours=2)
+    _session(db, "reused", 5, pid=4200, idle_hours=2, token="tok-old")
     _session(db, "unknown", 6, pid=4300, idle_hours=2)
     _Processes(
         monkeypatch, alive={4100: True, 4200: True, 4300: None},
-        starts={4100: EARLY, 4200: time.time() - 60},
+        starts={4100: EARLY}, tokens={4200: "tok-new"},
     )
     sleeps = []
 
@@ -276,8 +290,8 @@ def test_the_sweeper_sends_an_unusable_pid_to_the_no_pid_heuristic(db, monkeypat
 
 def test_ps_reads_every_start_in_one_run(monkeypatch):
     """macOS has no /proc: one ps run answers every pid."""
-    monkeypatch.setattr(anc, "_on_windows", lambda: False)
-    monkeypatch.setattr(anc, "_proc_stat", lambda pid: None)
+    monkeypatch.setattr(pi, "_on_windows", lambda: False)
+    monkeypatch.setattr(pi, "_proc_stat", lambda pid: None)
     calls = []
 
     def _run(cmd, **_k):
@@ -296,17 +310,17 @@ def test_ps_reads_every_start_in_one_run(monkeypatch):
 
 def test_proc_answers_linux_with_no_subprocess(monkeypatch):
     fields = ["S", "4100"] + ["0"] * 17 + ["250"]  # field 22 (starttime) = 250 ticks
-    monkeypatch.setattr(anc, "_on_windows", lambda: False)
-    monkeypatch.setattr(anc, "_proc_stat", lambda pid: fields)
-    monkeypatch.setattr(anc, "_linux_boot_time", lambda: 1_000.0)
-    monkeypatch.setattr(anc.os, "sysconf", lambda name: 100, raising=False)
+    monkeypatch.setattr(pi, "_on_windows", lambda: False)
+    monkeypatch.setattr(pi, "_proc_stat", lambda pid: fields)
+    monkeypatch.setattr(pi, "_linux_boot_time", lambda: 1_000.0)
+    monkeypatch.setattr(pi.os, "sysconf", lambda name: 100, raising=False)
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("no ps on Linux"))
     assert anc.process_starts([5000, 5001]) == {5000: 1_002.5, 5001: 1_002.5}
 
 
 def test_windows_asks_the_kernel_for_each_pid(monkeypatch):
-    monkeypatch.setattr(anc, "_on_windows", lambda: True)
-    monkeypatch.setattr(anc, "_windows_process_start", {5000: 42.0}.get)
+    monkeypatch.setattr(pi, "_on_windows", lambda: True)
+    monkeypatch.setattr(pi, "_windows_process_start", {5000: 42.0}.get)
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("no ps on Windows"))
     assert anc.process_starts([5000, 5001]) == {5000: 42.0}
 
@@ -315,8 +329,8 @@ def test_a_windows_probe_error_is_an_unknown_start(monkeypatch):
     def _boom(pid):
         raise OSError("access denied")
 
-    monkeypatch.setattr(anc, "_on_windows", lambda: True)
-    monkeypatch.setattr(anc, "_windows_process_start", _boom)
+    monkeypatch.setattr(pi, "_on_windows", lambda: True)
+    monkeypatch.setattr(pi, "_windows_process_start", _boom)
     assert anc.process_starts([5000]) == {}
 
 
@@ -351,15 +365,15 @@ def _fake_kernel32(monkeypatch, *, handle=77, created=None, times_ok=True):
 def test_windows_creation_time_is_converted_to_epoch_seconds(monkeypatch):
     epoch = 1_700_000_000
     closed = _fake_kernel32(
-        monkeypatch, created=(epoch + anc._FILETIME_EPOCH_OFFSET) * 10_000_000
+        monkeypatch, created=(epoch + pi._FILETIME_EPOCH_OFFSET) * 10_000_000
     )
-    assert anc._windows_process_start(5000) == pytest.approx(epoch)
+    assert pi._windows_process_start(5000) == pytest.approx(epoch)
     assert closed == [77]
 
 
 def test_windows_unopenable_or_unreadable_process_has_no_start(monkeypatch):
     _fake_kernel32(monkeypatch, handle=0)
-    assert anc._windows_process_start(5000) is None
+    assert pi._windows_process_start(5000) is None
     closed = _fake_kernel32(monkeypatch, times_ok=False)
-    assert anc._windows_process_start(5000) is None
+    assert pi._windows_process_start(5000) is None
     assert closed == [77]
