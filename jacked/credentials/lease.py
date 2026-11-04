@@ -17,15 +17,25 @@ class SwitchLease(Protocol):
     def acquire(self) -> ContextManager[bool]: ...
 
 
+# Why the last ``acquire`` yielded False. ``REFUSAL_HELD`` is another holder;
+# ``REFUSAL_UNUSABLE`` is a lock file that could not be opened at all, which
+# cannot prove that nobody is switching and so refuses fail-closed. A caller
+# that reports the refusal to a person reads ``refusal`` right after a False.
+REFUSAL_HELD = "held"
+REFUSAL_UNUSABLE = "unusable"
+
+
 class ProcessSwitchLease:
     """Nonblocking in-process lease; service adapters may supply an OS lease."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self.refusal: str | None = None
 
     @contextmanager
     def acquire(self) -> Iterator[bool]:
         acquired = self._lock.acquire(blocking=False)
+        self.refusal = None if acquired else REFUSAL_HELD
         try:
             yield acquired
         finally:
@@ -46,6 +56,7 @@ class FileSwitchLease:
 
     def __init__(self, path: Path | str) -> None:
         self._path = Path(path)
+        self.refusal: str | None = None
 
     @property
     def path(self) -> Path:
@@ -57,11 +68,13 @@ class FileSwitchLease:
         if handle is None:
             # Fail closed: an unusable lock file cannot prove that no other
             # process is switching, and a refused switch is always recoverable.
+            self.refusal = REFUSAL_UNUSABLE
             yield False
             return
         acquired = False
         try:
             acquired = _lock(handle)
+            self.refusal = None if acquired else REFUSAL_HELD
             yield acquired
         finally:
             if acquired:
@@ -135,12 +148,17 @@ class CompositeSwitchLease:
 
     def __init__(self, *leases: SwitchLease) -> None:
         self._leases = leases
+        self.refusal: str | None = None
 
     @contextmanager
     def acquire(self) -> Iterator[bool]:
+        self.refusal = None
         with ExitStack() as stack:
             for lease in self._leases:
                 if not stack.enter_context(lease.acquire()):
+                    # The first lease that refused says why; a lease that
+                    # does not report a reason was simply held.
+                    self.refusal = getattr(lease, "refusal", None) or REFUSAL_HELD
                     yield False
                     return
             yield True

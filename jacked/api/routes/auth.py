@@ -21,14 +21,13 @@ from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from jacked.api.mutation_gate import mutation_decision
 from jacked.api.remote_access import (
     LOOPBACK_HOSTS,
     REASON_OUTSIDE_SCOPE,
     REASON_REMOTE_ACCESS_OFF,
     SwitchRateLimiter,
-    credential_mutation_decision,
     credential_policy_editable,
-    read_enabled_scope,
 )
 from jacked.web.auth import (
     fetch_usage,
@@ -440,45 +439,11 @@ def _credential_mutation_decision(
 ) -> tuple[bool, str | None, str | None]:
     """Resolve ``(allowed, reason, client_host)`` for this request.
 
-    Loopback always may. A remote client may only when the persisted
-    remote-access setting is on AND its address is inside the enabled scope,
-    so the Settings toggle is the one visible switch that hands out credential
-    control. No DB, or a settings DB that will not read, means loopback only.
-
-    Pass ``audit`` (a short action name) from the routes that mutate or expose
-    a mutation: every non-loopback decision then leaves one INFO line naming
-    the client and the reason, so a remote switch is attributable after the
-    fact. Loopback is deliberately silent, since the local dashboard switches
-    accounts all day. Only addresses and setting values are logged, never
-    tokens or account secrets.
-
-    The policy itself lives in ``jacked/api/remote_access.py``; this wrapper
-    only resolves the inputs off the Request and records the outcome.
+    The policy and the audit line live in ``jacked.api.mutation_gate`` (one
+    gate for switches, status and the service upgrade); this name stays for
+    the routes and tests in this module.
     """
-    client = request.client
-    host = client.host if client and client.host else None
-    enabled, scope = read_enabled_scope(_get_db(request))
-    allowed, reason = credential_mutation_decision(host, enabled, scope)
-    if audit and not credential_policy_editable(host):
-        if allowed:
-            logger.info(
-                "Remote credential mutation ALLOWED (%s) for client %s "
-                "(remote access on, scope=%s)",
-                audit,
-                host,
-                scope,
-            )
-        else:
-            logger.info(
-                "Remote credential mutation DENIED (%s) for client %s: %s "
-                "(enabled=%s, scope=%s)",
-                audit,
-                host,
-                reason,
-                enabled,
-                scope,
-            )
-    return allowed, reason, host
+    return mutation_decision(request, audit=audit)
 
 
 def _credential_mutation_allowed(request: Request) -> bool:

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
@@ -11,6 +12,8 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from jacked.api.mutation_gate import denied_response, mutation_decision
+from jacked.api.remote_access import REASON_OUTSIDE_SCOPE, REASON_REMOTE_ACCESS_OFF
 from jacked.findbin import find_bin
 from jacked.install_summary import DEFAULT_LAST_INSTALL_PATH as _LAST_INSTALL_PATH
 from jacked.memory.vault import atomic_write_text
@@ -778,12 +781,36 @@ def installations_overview(request: Request):
 # --- Self-upgrade ---
 
 _upgrade_lock = asyncio.Lock()
+# The scheduled upgrade tasks. asyncio keeps only weak references to tasks,
+# so the module holds the strong ones until each finishes (a set: two
+# requests can be scheduled on one loop tick, and the second drops itself).
+_upgrade_tasks: set[asyncio.Task] = set()
 
 
 def reset_locks() -> None:
     """Rebind to the current event loop — see routes.auth.reset_locks."""
     global _upgrade_lock
     _upgrade_lock = asyncio.Lock()
+    _upgrade_tasks.clear()
+
+
+async def cancel_running_upgrade() -> None:
+    """Cancel and await any scheduled upgrade task (service shutdown).
+
+    Called first in the lifespan shutdown, while the log handlers are still
+    attached, so the installer child is terminated and its outcome logged
+    before the database closes and the loop is torn down.
+    """
+    for task in list(_upgrade_tasks):
+        if task.done():
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - shutdown must continue
+            logger.warning("Upgrade task ended with %s during shutdown", type(exc).__name__)
 
 
 async def _upgrade_broadcast(ws_registry, event: str, payload: dict) -> None:
@@ -795,7 +822,12 @@ async def _upgrade_broadcast(ws_registry, event: str, payload: dict) -> None:
 
 
 async def _upgrade_run_cmd(cmd: list[str]) -> None:
-    """Run a subprocess command list, raising RuntimeError on failure or timeout."""
+    """Run a subprocess command list, raising RuntimeError on failure or timeout.
+
+    On cancellation (the service shutting down mid-upgrade) the child is
+    terminated and awaited BEFORE the cancellation propagates, so the switch
+    lease the caller holds is never released while an installer still runs.
+    """
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -806,53 +838,204 @@ async def _upgrade_run_cmd(cmd: list[str]) -> None:
     except asyncio.TimeoutError:
         proc.kill()
         raise RuntimeError(f"{cmd[0]} timed out after 120s")
+    except asyncio.CancelledError:
+        await _stop_child(proc)
+        raise
     if proc.returncode != 0:
         raise RuntimeError((stdout or b"").decode()[-500:] or "Unknown error")
 
 
-async def _do_upgrade(ws_registry) -> None:
-    async with _upgrade_lock:
+async def _stop_child(proc) -> None:
+    """Terminate a child and wait for it, escalating to kill after 5 s.
+
+    The cancelled ``communicate()`` no longer drains the child's stdout, and
+    asyncio reports a child as finished only once its pipes close. A noisy
+    child that ignores SIGTERM would fill the pipe and never be seen to
+    exit, so a drain task reads the pipe to EOF while the child is stopped.
+    """
+    if proc.returncode is not None:
+        return
+    drain = asyncio.create_task(_drain(proc.stdout)) if proc.stdout is not None else None
+    try:
         try:
-            await _upgrade_broadcast(ws_registry, "upgrade_started", {})
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+    finally:
+        if drain is not None:
+            try:
+                await asyncio.wait_for(drain, timeout=5)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - best effort
+                drain.cancel()
 
-            uv_bin = find_bin("uv")
-            if not uv_bin:
-                raise RuntimeError("uv not found on PATH. Cannot upgrade.")
-            await _upgrade_broadcast(ws_registry, "upgrade_progress",
-                                     {"step": "upgrade", "message": "Upgrading claude-jacked\u2026"})
-            await _upgrade_run_cmd([uv_bin, "tool", "upgrade", "claude-jacked"])
 
-            jacked_bin = find_bin("jacked")
-            if not jacked_bin:
-                raise RuntimeError("jacked not found on PATH. Cannot reinstall.")
-            await _upgrade_broadcast(ws_registry, "upgrade_progress",
-                                     {"step": "reinstall", "message": "Reinstalling files\u2026"})
-            await _upgrade_run_cmd([jacked_bin, "install", "--force"])
+async def _drain(stream) -> None:
+    """Read a pipe to EOF, discarding the data."""
+    while await stream.read(65536):
+        pass
 
-            await _upgrade_broadcast(ws_registry, "upgrade_complete",
-                                     {"message": "Restarting server\u2026"})
-            await asyncio.sleep(1.5)  # let WS message flush
-            # Replace the running process with a fresh start (picks up the new
-            # venv). Use the shared exec-target resolver, not a raw
-            # os.execv(sys.argv[0], ...): under `python -m jacked` / `pythonw
-            # -m jacked` argv[0] is __main__.py (no exec bit) and a raw execv
-            # raises OSError, stranding the dashboard on the old code.
-            from jacked.service.restart import _exec_target
 
-            prog, argv = _exec_target()
-            os.execv(prog, argv)
+# Reason-keyed denial copy for a refused remote upgrade. The two denials
+# have different fixes, so they get different sentences. No em-dashes
+# (user-facing). The codes are the policy reasons themselves.
+_UPGRADE_DENIED_MESSAGES = {
+    REASON_REMOTE_ACCESS_OFF: (
+        "Upgrades from this browser are off. Turn on remote access under "
+        "Settings > Advanced on the host machine."
+    ),
+    REASON_OUTSIDE_SCOPE: (
+        "This browser's address is outside the remote access scope. Widen the "
+        "scope under Settings > Advanced on the host machine."
+    ),
+}
+_SWITCH_IN_PROGRESS = "Account switch in progress. Try again when it finishes."
+_LEASE_UNAVAILABLE = (
+    "The credential switch lease is not available. Check the service log on "
+    "the host machine."
+)
 
-        except Exception as exc:
-            await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": str(exc)})
+
+def _switch_lease():
+    """The credential switch lease, on the same home every activation uses."""
+    from jacked.credentials.runtime import switch_lease_for
+
+    return switch_lease_for(Path.home())
+
+
+def _switch_lease_refusal() -> str | None:
+    """Why the switch lease cannot be taken right now, or None when it can.
+
+    A non-blocking probe: acquire and release at once. The upgrade itself
+    takes the lease again for its whole run, so this only turns a certain
+    refusal into a clean answer before anything is scheduled. ``"held"``
+    means a switch is in progress; ``"unusable"`` means the lock file could
+    not be opened, which refuses fail-closed and needs the service log.
+    """
+    lease = _switch_lease()
+    with lease.acquire() as held:
+        return None if held else (lease.refusal or "held")
+
+
+def _refusal_message(refusal: str) -> str:
+    return _LEASE_UNAVAILABLE if refusal == "unusable" else _SWITCH_IN_PROGRESS
+
+
+async def _do_upgrade(ws_registry, client_host: str | None = None) -> None:
+    if _upgrade_lock.locked():
+        # The route checked the lock before scheduling, but two requests can
+        # both pass that check on one loop tick; the second must not queue
+        # behind the first and run an upgrade nobody asked for.
+        logger.info("Upgrade already in progress; a second request was dropped")
+        return
+    async with _upgrade_lock:
+        # Hold the credential switch lease across the install and the exec:
+        # a switch that starts mid-restart would leave its journal row
+        # pending and its stores half-written. Python opens the lock file
+        # close-on-exec, so the new process starts with the lease released.
+        lease = _switch_lease()
+        with lease.acquire() as held:
+            if not held:
+                refusal = lease.refusal or "held"
+                logger.warning(
+                    "Upgrade refused for client %s: the credential switch lease is %s",
+                    client_host,
+                    refusal,
+                )
+                await _upgrade_broadcast(
+                    ws_registry, "upgrade_failed", {"error": _refusal_message(refusal)}
+                )
+                return
+            logger.info("Upgrade started (requested by client %s)", client_host)
+            await _run_upgrade_steps(ws_registry)
+
+
+async def _run_upgrade_steps(ws_registry) -> None:
+    """Upgrade, reinstall, then replace this process. Caller holds both leases."""
+    stage = "upgrade"
+    try:
+        await _upgrade_broadcast(ws_registry, "upgrade_started", {})
+
+        uv_bin = find_bin("uv")
+        if not uv_bin:
+            raise RuntimeError("uv not found on PATH. Cannot upgrade.")
+        await _upgrade_broadcast(ws_registry, "upgrade_progress",
+                                 {"step": "upgrade", "message": "Upgrading claude-jacked\u2026"})
+        await _upgrade_run_cmd([uv_bin, "tool", "upgrade", "claude-jacked"])
+
+        stage = "reinstall"
+        jacked_bin = find_bin("jacked")
+        if not jacked_bin:
+            raise RuntimeError("jacked not found on PATH. Cannot reinstall.")
+        await _upgrade_broadcast(ws_registry, "upgrade_progress",
+                                 {"step": "reinstall", "message": "Reinstalling files\u2026"})
+        await _upgrade_run_cmd([jacked_bin, "install", "--force"])
+
+        stage = "restart"
+        await _upgrade_broadcast(ws_registry, "upgrade_complete",
+                                 {"message": "Restarting server\u2026"})
+        await asyncio.sleep(1.5)  # let WS message flush
+        # Replace the running process with a fresh start (picks up the new
+        # venv). Use the shared exec-target resolver, not a raw
+        # os.execv(sys.argv[0], ...): under `python -m jacked` / `pythonw
+        # -m jacked` argv[0] is __main__.py (no exec bit) and a raw execv
+        # raises OSError, stranding the dashboard on the old code.
+        from jacked.service.restart import _exec_target
+
+        prog, argv = _exec_target()
+        os.execv(prog, argv)
+
+    except Exception as exc:
+        # Durable, values-free: the stage and the exception type. The raw
+        # text goes to the dashboard modal only.
+        logger.warning("Upgrade failed at stage %s: %s", stage, type(exc).__name__)
+        await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": str(exc)})
 
 
 @router.post("/upgrade")
 async def system_upgrade(request: Request):
-    """Upgrade claude-jacked, reinstall files, and restart the server."""
+    """Upgrade claude-jacked, reinstall files, and restart the server.
+
+    The same remote-access policy that gates credential switches gates this
+    install-and-restart of the host: loopback always may; a remote client may
+    only while remote access is on and its address is inside the scope. The
+    gate runs before any lock check, so a refused remote call can never
+    wedge a later local upgrade behind a 409. Then the running-upgrade lock,
+    then the credential switch lease, then the task.
+    """
+    allowed, reason, host = await asyncio.to_thread(
+        mutation_decision, request, audit="upgrade"
+    )
+    if not allowed:
+        return denied_response(reason, _UPGRADE_DENIED_MESSAGES, code=reason.upper())
+    # The running upgrade holds the switch lease itself, so this check comes
+    # before the lease probe: a second request during an upgrade is told
+    # about the upgrade, not about an account switch.
     if _upgrade_lock.locked():
-        return JSONResponse(status_code=409, content={"detail": "Upgrade already in progress"})
+        return JSONResponse(status_code=409, content={"detail": "Upgrade already in progress"}, headers={"Cache-Control": "no-store"})
+    refusal = await asyncio.to_thread(_switch_lease_refusal)
+    if refusal == "unusable":
+        # Fail closed, and say so where an operator can act on it: the lease
+        # module already logged why the lock file could not be opened.
+        logger.warning(
+            "Upgrade refused for client %s: the credential switch lease is unusable",
+            host,
+        )
+        return JSONResponse(status_code=503, content={"detail": _LEASE_UNAVAILABLE}, headers={"Cache-Control": "no-store"})
+    if refusal is not None:
+        # Attributable without secrets: the client address and the reason.
+        logger.info(
+            "Upgrade refused for client %s: an account switch holds the lease", host
+        )
+        return JSONResponse(status_code=409, content={"detail": _SWITCH_IN_PROGRESS}, headers={"Cache-Control": "no-store"})
     ws_registry = getattr(request.app.state, "ws_registry", None)
-    asyncio.create_task(_do_upgrade(ws_registry))
+    task = asyncio.create_task(_do_upgrade(ws_registry, host))
+    _upgrade_tasks.add(task)
+    task.add_done_callback(_upgrade_tasks.discard)
     return {"status": "started"}
 
 

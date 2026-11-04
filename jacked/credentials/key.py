@@ -30,7 +30,10 @@ class FileInstallKeyProvider:
             raise OSError("recovery key is not a private regular file")
         if os.name != "nt" and path_stat.st_mode & 0o077:
             raise OSError("recovery key permissions are not private")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        # O_BINARY: without it Windows opens the file in text mode, where byte
+        # 0x1a ends the read and \r\n collapses, so a random key that happens
+        # to contain either can never be read back.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         descriptor = os.open(self.path, flags)
         try:
             value = os.read(descriptor, 33)
@@ -44,7 +47,7 @@ class FileInstallKeyProvider:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         value = secrets.token_bytes(32)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         descriptor = os.open(self.path, flags, 0o600)
         try:
             written = os.write(descriptor, value)

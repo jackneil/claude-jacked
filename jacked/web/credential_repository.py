@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 
 from jacked.credentials.models import (
@@ -13,6 +14,8 @@ from jacked.credentials.models import (
     SwitchContext,
     SwitchOutcome,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _wake_usage_watchers() -> None:
@@ -266,3 +269,27 @@ class DatabaseCredentialSwitchRepository:
             self._pending_from_row(row)
             for row in self.db.list_pending_credential_switches()
         )
+
+    def list_interrupted(self) -> tuple[PendingSwitchRecord, ...]:
+        """Rows an interrupted switch left in phase ``pending``, and only those.
+
+        ``list_pending`` also returns ``indeterminate`` rows, which recovery
+        already observed once and could not classify (a shipped build has no
+        verifier key, so such a row can never change). The startup sweep uses
+        this narrower list, so one crash does not add a decision-log row on
+        every later service start.
+        """
+        records = []
+        for row in self.db.list_pending_credential_switches():
+            if row.get("phase") != "pending":
+                continue
+            try:
+                records.append(self._pending_from_row(row))
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                # One corrupt row must not hide every other interrupted switch.
+                logger.warning(
+                    "Skipping malformed credential switch row %r: %s",
+                    row.get("operation_id"),
+                    type(exc).__name__,
+                )
+        return tuple(records)
