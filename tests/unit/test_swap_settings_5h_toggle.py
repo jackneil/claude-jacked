@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+import jacked.api.keeper.state as keeper_state
 import jacked.api.usage_monitor as usage_monitor
 from jacked.api.main import app
 from jacked.api.routes.settings_swap import MAX_PAUSE_MINUTES
@@ -53,7 +54,7 @@ def db(tmp_path):
 @pytest.fixture
 def woken(monkeypatch):
     calls = []
-    monkeypatch.setattr(usage_monitor, "_sweep_wake", SimpleNamespace(set=lambda: calls.append(1)))
+    monkeypatch.setattr(keeper_state, "_sweep_wake", SimpleNamespace(set=lambda: calls.append(1)))
     return calls
 
 

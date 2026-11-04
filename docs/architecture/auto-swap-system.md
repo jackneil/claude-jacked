@@ -329,7 +329,7 @@ reset. A reset travels only with its percent. When a usage percent is null or is
 not a finite number (NaN, an infinity), the cache keeps the last percent and
 the last reset of that window. The keeper ignores a stored time or count that is not a
 finite number, so such a value cannot hold an account. The keeper runs in
-`full_sweep_loop` (`jacked/api/usage_monitor.py`) at the
+`full_sweep_loop` (`jacked/api/keeper/sweep.py`) at the
 `usage_check_interval`. The confirmation of a pending ping is in
 `jacked/api/keeper_confirmation.py`. The wait between sweeps uses the wall
 clock, so a closed laptop does not stretch it.
@@ -402,6 +402,7 @@ certified transaction engine exists.
 | File | Responsibility |
 | --- | --- |
 | `jacked/api/usage_monitor.py` | Decision loop, TOCTOU guard, recommendation-only gate, runtime backoff and broadcasts |
+| `jacked/api/keeper/` | Window keeper: the full-sweep loop (`sweep.py`), the work for one account in a pass (`process.py`), the success path (`confirm.py`), the candidate tokens and the 401/403 recovery (`auth_ladder.py`), and the ping backoff and the sweep wake Event (`state.py`) |
 | `jacked/api/keeper_confirmation.py` | Window keeper: the confirmation of an accepted ping (hold, deadline read, and compare-and-swap transitions out of `ping_pending`) |
 | `jacked/web/auto_swap/selection.py` | Candidate ranking and departure rules |
 | `jacked/web/auto_swap/walls.py` | Wall predicate: walled departure (rules 2a and 2b) and walled-candidate checks |

@@ -3,7 +3,7 @@
 A ping can open its window before the usage endpoint shows it: the usage
 read two seconds after the ping can still show the lapsed window. The
 keeper then records the ping as pending (``last_status`` ``ping_pending``,
-written by ``_keeper_record_success`` in :mod:`jacked.api.usage_monitor`)
+written by ``_keeper_record_success`` in :mod:`jacked.api.keeper.confirm`)
 and confirms it later from a usage read. This module holds that
 confirmation: the pending fields, the hold until the deadline, the usage
 read at the deadline, and the transitions out of the pending state.
@@ -14,10 +14,10 @@ settle the same ping at the same time, and a write that is based on an old
 read must never overwrite a newer state. A lost swap writes nothing and
 logs one DEBUG line; the next sweep reads the new state.
 
-The rest of the keeper lives in :mod:`jacked.api.usage_monitor`, which
-imports this module when it loads. The functions here import usage_monitor
-when they run, never at load time: a load-time import back would be a
-cycle. They log under the usage monitor's logger name, so the keeper's log
+The rest of the keeper lives in the :mod:`jacked.api.keeper` package, and
+:mod:`jacked.api.usage_monitor` re-exports its names. Both import this module
+when they load. The functions here import usage_monitor when they run, never
+at load time: a load-time import back would be a cycle. They log under the usage monitor's logger name, so the keeper's log
 lines keep the name that log filters already use.
 """
 

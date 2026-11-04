@@ -354,8 +354,8 @@ async def update_swap_settings(request: Request, body: SwapSettings):
         return _pause_refused(refused)
 
     # Wake the sweep loop immediately so changes take effect now
-    from jacked.api.usage_monitor import _sweep_wake
-    _sweep_wake.set()
+    from jacked.api.keeper.state import sweep_wake
+    sweep_wake().set()
 
     return body.model_copy(update=kept)
 
