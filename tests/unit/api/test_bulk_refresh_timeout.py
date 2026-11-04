@@ -46,7 +46,7 @@ def test_hanging_account_times_out_and_others_complete(monkeypatch):
 
     never_fires = asyncio.Event()
 
-    async def fake_fetch(acct_id, db_arg, access_token=None, manual=False):
+    async def fake_fetch(acct_id, db_arg, access_token=None, manual=False, allow_refresh=True):
         if acct_id == 2:
             await never_fires.wait()
             return None

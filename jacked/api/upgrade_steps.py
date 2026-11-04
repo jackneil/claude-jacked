@@ -7,18 +7,53 @@ live here so that the route module stays inside its line budget.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import re
 
 from jacked.public_errors import PublicError
 
+logger = logging.getLogger(__name__)
+
+SERVER_LOG_HINT = "See ~/.claude/jacked-server.log."
+
+# A subcommand word that may name a step ("tool", "upgrade", "install").
+_STEP_WORD = re.compile(r"[a-z][a-z-]{0,31}")
+
 
 class UpgradeStepError(PublicError, RuntimeError):
-    """An upgrade step failed with a report that is written for the user.
+    """An upgrade step failed. The message is fixed text written for the user.
 
-    The message is the installer's own output (its last 500 characters) or a
-    fixed sentence. The dashboard upgrade dialog shows it as it is, so the
-    user can see why ``uv`` or ``jacked install`` failed.
+    The ``upgrade_failed`` event sends the message to every dashboard client,
+    remote ones too. So the message names the step and the exit code only.
+    The installer's output goes to the host's log file (see
+    :func:`_upgrade_run_cmd`), never into the message.
     """
+
+
+class InstallerOutput(Exception):
+    """The output of a failed installer, as an argument of a log record.
+
+    The host's log file formats it in full. The dashboard log viewer names
+    an exception argument by its type only (``jacked.api.log_capture``), so
+    the output does not get to a client through the viewer either.
+    """
+
+
+def step_label(cmd: list[str]) -> str:
+    """Name a step by its program and its first subcommand words.
+
+    An argument that is not a plain word (an option, a path, code) is left out.
+
+    >>> step_label(["/opt/bin/uv", "tool", "upgrade", "claude-jacked"])
+    'uv tool upgrade'
+    >>> step_label(["/opt/bin/jacked", "install", "--force"])
+    'jacked install'
+    >>> step_label(["/usr/bin/python3", "-c", "print('/Users/x')"])
+    'python3'
+    """
+    words = [arg for arg in cmd[1:3] if _STEP_WORD.fullmatch(arg)]
+    return " ".join([os.path.basename(cmd[0]), *words])
 
 
 async def _upgrade_run_cmd(cmd: list[str]) -> None:
@@ -37,12 +72,20 @@ async def _upgrade_run_cmd(cmd: list[str]) -> None:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
     except asyncio.TimeoutError:
         proc.kill()
-        raise UpgradeStepError(f"{os.path.basename(cmd[0])} timed out after 120s")
+        raise UpgradeStepError(f"The {step_label(cmd)} step timed out after 120 s. {SERVER_LOG_HINT}")
     except asyncio.CancelledError:
         await _stop_child(proc)
         raise
     if proc.returncode != 0:
-        raise UpgradeStepError((stdout or b"").decode(errors="replace")[-500:] or "Unknown error")
+        label = step_label(cmd)
+        output = (stdout or b"").decode(errors="replace")
+        logger.warning(
+            "Upgrade step %s exited with code %s. Installer output:\n%s",
+            label, proc.returncode, InstallerOutput(output or "(no output)"),
+        )
+        raise UpgradeStepError(
+            f"The {label} step failed with exit code {proc.returncode}. {SERVER_LOG_HINT}"
+        )
 
 
 async def _stop_child(proc) -> None:
