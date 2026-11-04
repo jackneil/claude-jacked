@@ -1163,18 +1163,40 @@ class TestRefreshRepo:
 
 
 class FakeDb:
-    def __init__(self, paths):
+    """The real query always fills ``last_activity``; the fake marks every
+    project active now unless ``idle`` names it."""
+
+    def __init__(self, paths, idle=()):
         self.paths = paths
+        self.idle = set(idle)
         self.limits: list = []
         self.threads: list = []
 
     def get_project_activity_summary(self, limit=20):
         self.limits.append(limit)
         self.threads.append(threading.current_thread())
-        return [{"repo_path": p} for p in self.paths]
+        now = datetime.now(timezone.utc)
+        return [
+            {"repo_path": p,
+             "last_activity": (now - (timedelta(days=30) if p in self.idle else timedelta(0))).isoformat()}
+            for p in self.paths
+        ]
 
 
 class TestRefreshPass:
+    def test_a_project_idle_past_the_cache_lifetime_gets_no_github_call(self, home, tmp_path, fakes):
+        """The hook drops a cache 24 h old, so a project idle longer than that
+        is not refreshed: its GraphQL call would spend the user's API budget on
+        a file no session reads (the final-head review of #275pr)."""
+        active = _repo(tmp_path, "active")
+        idle = _repo(tmp_path, "idle")
+        db = FakeDb([str(idle), str(active)], idle={str(idle)})
+
+        written = asyncio.run(refresh.refresh_pass(SimpleNamespace(state=SimpleNamespace(db=db))))
+
+        assert written == 1
+        assert len(fakes.run.gh_calls()) == 1
+
     def test_every_known_repo_is_refreshed_once_per_slug(self, home, tmp_path, fakes):
         a = _repo(tmp_path, "a")
         b = _repo(tmp_path, "b")
