@@ -322,18 +322,22 @@ def test_merge_mode_routes_a_done_milestone_the_end_gate_cannot_save():
     assert "appends the new head SHA to the evidence of each entry whose branch moved" in goal
 
 
-def _newest_version_row(readme: str) -> str:
-    """The first row of the Version History table: `Unreleased` while the
-    change waits, the release number once it ships. A release renames the
-    row, it does not move the text."""
+def _version_rows(readme: str) -> list[str]:
+    """The rows of the Version History table, newest first. The first row
+    is `Unreleased` while a change waits and the release number once it
+    ships. A release renames the row, it does not move the text."""
     lines = readme.splitlines()
     start = lines.index("## Version History")
-    return next(line for line in lines[start:] if line.startswith("| **"))
+    return [line for line in lines[start:] if line.startswith("| **")]
 
 
-def test_readme_newest_version_row_names_the_cadence_change():
+def _version_row_that_mentions(readme: str, needle: str) -> str:
+    """The newest Version History row whose text contains ``needle``."""
+    return next(row for row in _version_rows(readme) if needle in row)
+
+
+def test_readme_version_history_names_the_cadence_change():
     readme = (DATA.parents[1] / "README.md").read_text(encoding="utf-8")
-    row = _newest_version_row(readme)
+    row = _version_row_that_mentions(readme, "run once per goal")
     assert row.startswith("| **Unreleased**") or row.startswith("| **0.")
-    assert "run once per goal" in row
     assert "`full gate green at <sha>`" in row
