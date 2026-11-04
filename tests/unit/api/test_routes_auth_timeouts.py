@@ -77,6 +77,8 @@ def test_refresh_token_timeout_returns_504(monkeypatch):
     db = MagicMock()
     db.get_account.return_value = {"id": 1, "refresh_token": "rt_db"}
     request = MagicMock()
+    # A token refresh runs the account-change gate: a local client passes it.
+    request.client.host = "127.0.0.1"
     monkeypatch.setattr(routes_auth, "_get_db", lambda r: db)
     monkeypatch.setattr(routes_auth, "_TOKEN_REFRESH_TIMEOUT", 0.2)
 

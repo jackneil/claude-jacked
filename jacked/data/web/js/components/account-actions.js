@@ -94,23 +94,25 @@ function _formatCountdown(seconds) {
 // ---------------------------------------------------------------------------
 // SweetAlert confirmation helpers for auth flows
 // ---------------------------------------------------------------------------
+// Resolves to 'claude', 'codex', 'grok', or null when the user cancels.
 async function _confirmAddAccount() {
-    return Swal.fire({
+    const result = await Swal.fire({
         title: 'Add account',
         html: `Which provider?<br><br>
                <b>Claude</b>: opens browser tabs to authorize (usage + Claude Code tokens).<br><br>
                <b>Codex</b>: imports your signed-in OpenAI Codex account
-               (run <code>codex login</code> in a terminal first if you're not signed in).`,
-        showDenyButton: true,
+               (run <code>codex login</code> in a terminal first if you're not signed in).<br><br>
+               <b>Grok</b>: imports your signed-in Grok account. If you are signed out,
+               jacked opens the Grok sign-in in a browser profile.`,
+        input: 'radio',
+        inputOptions: { claude: 'Claude', codex: 'Codex', grok: 'Grok' },
+        inputValue: 'claude',
+        inputValidator: (value) => (value ? undefined : 'Select a provider.'),
         showCancelButton: true,
-        confirmButtonText: 'Claude',
-        denyButtonText: 'Codex',
+        confirmButtonText: 'Continue',
         cancelButtonText: 'Cancel',
-        // SweetAlert's deny button is RED by default — that reads as danger for a
-        // benign choice. Color both buttons with their provider hue instead.
-        confirmButtonColor: '#a78bfa',  // Claude violet
-        denyButtonColor: '#60a5fa',     // Codex blue
     });
+    return result.isConfirmed ? (result.value || null) : null;
 }
 
 async function _confirmReauth(email) {
@@ -403,6 +405,8 @@ const CC_REAUTH_REQUIRED_NOTICE = 'Try the switch again in a moment. If jacked r
 function showCredentialActivationResult(result, email) {
     if (result && result.code === 'CC_REAUTH_REQUIRED') {
         showToast(CC_REAUTH_REQUIRED_NOTICE, 'warning', 10000);
+    } else if (result && result.provider === 'grok' && result.success) {
+        showToast(result.message || 'Switched the active Grok account.', 'success', 7000);
     } else if (result && result.restart_required) {
         showToast(
             result.message || 'Switched the active Codex account. Restart Codex to pick it up.',
@@ -609,16 +613,18 @@ function bindAccountEvents() {
                 return;
             }
             try {
-                const result = await _confirmAddAccount();
-                if (!result.isConfirmed && !result.isDenied) return;  // cancelled
+                const provider = await _confirmAddAccount();
+                if (!provider) return;  // cancelled
                 if (window.jackedState._accountActionInFlight) {
                     showToast('Another action started. Try again.', 'warning', 2000);
                     return;
                 }
-                if (result.isDenied) {
-                    startAddCodexFlow();   // Codex
+                if (provider === 'codex') {
+                    startAddCodexFlow();
+                } else if (provider === 'grok') {
+                    startAddGrokFlow();
                 } else {
-                    startAddAccountFlow(); // Claude
+                    startAddAccountFlow();
                 }
             } catch (err) {
                 console.error('Add account confirmation error:', err);
@@ -635,6 +641,17 @@ function bindAccountEvents() {
     // account instead of re-authing the one that was clicked.
     document.querySelectorAll('.btn-reauth').forEach(btn => {
         btn.addEventListener('click', () => startTargetedAuthFlow('reauth', btn.dataset.id, btn.dataset.email || ''));
+    });
+
+    // Grok Re-auth rows: the Grok sign-in, not the Claude authorize flow.
+    document.querySelectorAll('.btn-reauth-grok').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (window.jackedState._accountActionInFlight) {
+                showToast('Another action is in progress', 'warning', 2000);
+                return;
+            }
+            startGrokReauthFlow(btn.dataset.id, btn.dataset.email || '');
+        });
     });
 
     // Authorize Claude Code Token rows (kebab menu). The same flow the CC

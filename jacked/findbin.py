@@ -386,6 +386,13 @@ def require_bin(name: str) -> str:
     return found
 
 
+# A CLI whose own installer puts its launcher under a vendor directory in the
+# home directory, not in ~/.local/bin. Only that CLI is looked up there.
+_VENDOR_HOME_BINS: dict[str, tuple[str, ...]] = {
+    "grok": (".grok", "bin"),  # the xAI Grok installer
+}
+
+
 def find_bin(name: str, *, home: str | None = None) -> str | None:
     """Find a binary by name, searching PATH then known install locations.
 
@@ -424,6 +431,9 @@ def find_bin(name: str, *, home: str | None = None) -> str | None:
         candidates.append(os.path.join(home, ".local", "bin", target))
         # All platforms: cargo bin (uv can be installed via cargo)
         candidates.append(os.path.join(home, ".cargo", "bin", target))
+        vendor_bin = _VENDOR_HOME_BINS.get(name.lower().removesuffix(".exe"))
+        if vendor_bin:
+            candidates.append(os.path.join(home, *vendor_bin, target))
 
     if is_win:
         local_app = _clean_dir(os.environ.get("LOCALAPPDATA"), "LOCALAPPDATA")

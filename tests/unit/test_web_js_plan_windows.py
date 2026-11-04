@@ -519,6 +519,15 @@ const a = {json.dumps(acct)};
 out({{ text: getSubDisplay(a), html: renderPlanLabel(a) }});
 """)
 
+    def test_a_provider_without_plans_shows_no_plan_label(self, tmp_path):
+        """Grok has no plan jacked can read: "Unknown subscription" says nothing."""
+        r = self._label(tmp_path, {"id": 2, "provider": "grok", "email": "g@x.com"})
+        assert r["html"] == ""
+
+    def test_a_claude_account_without_a_plan_still_says_unknown(self, tmp_path):
+        r = self._label(tmp_path, {"id": 1, "provider": "claude", "email": "c@x.com"})
+        assert ">Unknown subscription</span>" in r["html"]
+
     def test_ultra_reads_ultra_with_the_former_name_in_the_hover(self, tmp_path):
         r = self._label(tmp_path, _ultra())
         assert r["text"] == "Ultra subscription"

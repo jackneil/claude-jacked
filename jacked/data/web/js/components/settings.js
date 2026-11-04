@@ -2630,7 +2630,7 @@ function renderOAuthBrowserCard(card) {
         'h3', 'text-sm font-medium text-slate-300 mb-3 text-balance', 'Re-auth browser'));
     card.appendChild(_oauthBrowserText(
         'p', 'text-xs text-slate-400 mb-3 text-pretty',
-        'Where jacked opens the Claude login when you add or re-authenticate an account.'));
+        'Where jacked opens sign-in when you add or re-authenticate an account.'));
 
     const select = document.createElement('select');
     select.id = 'oauth-browser-mode';
@@ -2647,9 +2647,10 @@ function renderOAuthBrowserCard(card) {
 
     card.appendChild(_oauthBrowserText(
         'p', 'text-xs text-slate-500 mt-2 text-pretty',
-        'A dedicated profile keeps each account signed in to claude.ai on its own '
-        + 'cookies, so re-auth is one click. Profiles live in '
-        + '~/.claude/jacked-browser-profiles.'));
+        'A dedicated profile keeps each login on its own cookies, so the next '
+        + 're-auth is one confirmation. Claude profiles stay under '
+        + '~/.claude/jacked-browser-profiles. A Grok sign-in gets its own '
+        + 'profile there, so one login does not replace another.'));
 
     select.addEventListener('change', async () => {
         const value = select.value;

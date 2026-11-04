@@ -21,6 +21,7 @@ from jacked.api.keeper.state import (
     _write_keeper_state,
 )
 from jacked.api.keeper_confirmation import _confirm_pending
+from jacked.providers import is_claude, provider_of
 from jacked.service.pill_text import finite_number
 
 logger = logging.getLogger("jacked.api.usage_monitor")
@@ -205,8 +206,10 @@ async def _keeper_process_account(db, acct: dict, check_interval: float) -> str:
     account_id = acct["id"]
     state = _keeper_state_of(acct)
 
-    if (acct.get("provider") or "claude") == "codex":
-        await asyncio.to_thread(_note_keeper_skip, db, acct, state, "codex_no_keeper")
+    if not is_claude(acct):
+        # The keeper pings Anthropic. A Codex or Grok row has no token to ping.
+        reason = f"{provider_of(acct)}_no_keeper"
+        await asyncio.to_thread(_note_keeper_skip, db, acct, state, reason)
         return "skipped"
 
     pending = await _confirm_pending(db, acct, state, time.time(), check_interval)

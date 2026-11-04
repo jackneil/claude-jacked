@@ -68,10 +68,12 @@
     color: #f59e0b !important;
 }
 
-/* Checkbox input (Swal `input: 'checkbox'`, e.g. the mandatory "I understand"
-   acknowledgement). Swal's default renders it on a white strip with inherited
-   near-white text — illegible on the dark popup. */
-.swal2-checkbox {
+/* Checkbox and radio inputs (Swal `input: 'checkbox'` / `input: 'radio'`, e.g.
+   the "I understand" acknowledgement and the Add Account provider choice).
+   Swal's default renders them on a white strip with inherited near-white
+   text — illegible on the dark popup. */
+.swal2-checkbox,
+.swal2-radio {
     background: transparent !important;
     color: #cbd5e1 !important;
     font-size: 0.85rem !important;
@@ -80,6 +82,15 @@
 .swal2-checkbox input {
     accent-color: #dc2626 !important;
     margin-inline-end: 0.5rem !important;
+}
+
+.swal2-radio input {
+    accent-color: #3b82f6 !important;
+    margin-inline-end: 0.35rem !important;
+}
+
+.swal2-radio label {
+    margin: 0 0.75rem !important;
 }
 
 .swal2-validation-message {

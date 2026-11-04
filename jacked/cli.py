@@ -28,6 +28,7 @@ from jacked.dcr_settings import EFFORT_CHOICES as _DCR_EFFORT_CHOICES
 from jacked.dcr_settings import ENGINE_CHOICES as _DCR_ENGINE_CHOICES
 from jacked.integrity_cli import integrity_group, print_doctor_lines
 from jacked.issues_cli import issues_group
+from jacked.provider_cli import grok_group, provider_db as _codex_db
 from jacked.memory.settings_io import SettingsUnreadableError as _SettingsUnreadable
 from jacked.memory.settings_io import read_settings as _read_settings_strict
 from jacked.service import REPLACEMENT_READY_TIMEOUT
@@ -7013,6 +7014,7 @@ def dcr_engine_clear():
 
 main.add_command(issues_group)
 main.add_command(integrity_group)
+main.add_command(grok_group)
 
 
 @main.group(name="memory")
@@ -9031,7 +9033,7 @@ def _render_usage_table(rows: list[dict], summary: dict) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
 @click.option(
     "--provider", "provider",
-    type=click.Choice(["claude", "codex"], case_sensitive=False), default=None,
+    type=click.Choice(["claude", "codex", "grok"], case_sensitive=False), default=None,
     help="Show only the accounts of this provider. The summary uses only these accounts.",
 )
 @click.option(
@@ -9050,7 +9052,7 @@ def usage_cmd(as_json, provider, include_inactive):
     This command does not call a provider API. The data is as fresh as the
     last refresh of the dashboard or the menu bar (see cache_age_seconds).
 
-    --provider claude or --provider codex shows only the accounts of that
+    --provider claude, codex or grok shows only the accounts of that
     provider, and the summary uses only those accounts. In each JSON row,
     "selected" is true for the account jacked last selected for new sessions
     of that provider, and "in_use" is true for the account of the Claude
@@ -9063,7 +9065,7 @@ def usage_cmd(as_json, provider, include_inactive):
     accounts. A past resets_at makes the cached percent stale headroom.
     tests/unit/test_usage_cmd.py pins the JSON contract.
 
-    >>> # CLI command: jacked usage [--json] [--provider claude|codex] [--include-inactive]
+    >>> # CLI command: jacked usage [--json] [--provider claude|codex|grok] [--include-inactive]
     """
     import json as _json
     from datetime import datetime, timezone
@@ -9168,12 +9170,6 @@ def codex_add_cmd(make_active, no_login):
             f"Its usage will show in the dashboard. Make it active with "
             f"[bold]jacked codex use {acct['id']}[/bold]."
         )
-
-
-def _codex_db():
-    from jacked.web.database import Database
-
-    return Database(str(Path.home() / ".claude" / "jacked.db"))
 
 
 @codex_group.command(name="list")

@@ -720,3 +720,27 @@ def test_require_bin_returns_the_path_or_raises_file_not_found(monkeypatch):
     assert fb.require_bin("git") == "/usr/bin/git"
     with pytest.raises(FileNotFoundError):
         fb.require_bin("nope")
+
+
+def test_falls_back_to_the_grok_installer_bin(tmp_path):
+    """The Grok installer puts its launcher in ~/.grok/bin, which the service
+    PATH does not name. find_bin must still find it there."""
+    target_name = "grok.exe" if sys.platform == "win32" else "grok"
+    grok_bin = tmp_path / ".grok" / "bin"
+    grok_bin.mkdir(parents=True)
+    exe = grok_bin / target_name
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
+    with patch("jacked.findbin.shutil.which", return_value=None):
+        assert find_bin("grok", home=str(tmp_path)) == str(exe)
+
+
+def test_a_vendor_bin_is_only_searched_for_its_own_cli(tmp_path):
+    """~/.grok/bin is Grok's directory. Another name is not looked up there."""
+    grok_bin = tmp_path / ".grok" / "bin"
+    grok_bin.mkdir(parents=True)
+    exe = grok_bin / ("codex.exe" if sys.platform == "win32" else "codex")
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
+    with patch("jacked.findbin.shutil.which", return_value=None):
+        assert find_bin("codex", home=str(tmp_path)) is None

@@ -78,6 +78,11 @@ const PLAN_DRIFT_HINT = 'The plan catalog in this jacked release does not match 
  */
 function renderPlanLabel(acct) {
     const plan = (acct && acct.plan) || {};
+    // A provider with no plan that jacked can read (Grok) gets no label:
+    // "Unknown subscription" would say nothing. Claude keeps "Unknown", because
+    // its plan comes from the profile and can still arrive.
+    const known = (typeof plan.label === 'string' && plan.label.trim()) || (acct && acct.subscription_type);
+    if (!known && String((acct && acct.provider) || 'claude').toLowerCase() !== 'claude') return '';
     const parts = [];
     if (plan.formerly) parts.push('Formerly ' + plan.formerly);
     const drift = Array.isArray(plan.drift) && plan.drift.length > 0;
@@ -312,12 +317,15 @@ function renderAccountMenu(acct) {
                 ${orgLine}
             </div>`;
 
-    let items = renderAccountMenuItem(
+    // Grok has no jacked launcher, so it gets no launch command to copy.
+    const launchCmd = provider === 'codex' ? `jacked codex launch ${acct.id}`
+        : (provider === 'grok' ? '' : `jacked claude ${acct.id}`);
+    let items = launchCmd ? renderAccountMenuItem(
         'btn-copy-cmd',
-        `data-id="${acct.id}" data-cmd="jacked claude ${acct.id}"`,
+        `data-id="${acct.id}" data-cmd="${launchCmd}"`,
         'copy',
         'Copy launch command',
-    );
+    ) : '';
 
     items += renderAccountMenuItem(
         'btn-edit-label',
@@ -329,7 +337,17 @@ function renderAccountMenu(acct) {
     // Codex re-auth is `codex login` in a terminal (the Codex pill's
     // "re-login" tooltip guides that); the backend rejects browser OAuth for
     // it, so the row is omitted entirely rather than rendered and failing.
-    if (provider !== 'codex') {
+    // Grok re-auth opens the Grok sign-in in the account's browser profile.
+    // It is a different control: it has no usage or Claude Code token.
+    if (provider === 'grok') {
+        items += renderAccountMenuItem(
+            'btn-reauth-grok',
+            `data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}" title="Sign in to this Grok account again, in its browser profile."`,
+            'reauth',
+            'Re-auth',
+        );
+    }
+    if (provider === 'claude') {
         const emailAttr = `data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}"`;
         items += renderAccountMenuItem(
             'btn-reauth',
@@ -468,10 +486,14 @@ function renderAccountCard(acct, idx, total) {
 
     // Usage bars: the window key reads the plan's window state and length
     // (acct.windows), so a plan with no 5-hour window reads "none".
-    const usage5h = renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, windowElapsed(acct, 'five_hour'), '5h limit', usageBarOpts(acct, 'five_hour'));
-    const usage7d = renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, windowElapsed(acct, 'seven_day'), '7d limit', usageBarOpts(acct, 'seven_day'));
+    // A provider with no usage reader (Grok) gets one line in place of the
+    // bars, and no usage age or refresh control.
+    const hasUsage = typeof providerHasUsage !== 'function' || providerHasUsage(acct);
+    const planLabelHtml = renderPlanLabel(acct);
+    const usage5h = hasUsage ? renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, windowElapsed(acct, 'five_hour'), '5h limit', usageBarOpts(acct, 'five_hour')) : renderNoUsageNote(acct);
+    const usage7d = hasUsage ? renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, windowElapsed(acct, 'seven_day'), '7d limit', usageBarOpts(acct, 'seven_day')) : '';
     const usageBlockBadge = renderUsageBlockBadge(acct);
-    const cacheAgeHtml = renderCacheAge(acct.usage_cached_at, acct.id);
+    const cacheAgeHtml = hasUsage ? renderCacheAge(acct.usage_cached_at, acct.id) : '';
 
     // Priority reorder buttons
     const upDisabled = idx === 0 ? 'disabled' : '';
@@ -522,13 +544,12 @@ function renderAccountCard(acct, idx, total) {
                     </div>
                     <div class="flex items-center gap-3 mb-2 ml-5">
                         <span class="text-xs text-slate-400">${escapeHtml(email)}${orgLabel ? ` (${escapeHtml(orgLabel)})` : ''}</span>
-                        <span class="text-slate-600">|</span>
-                        ${renderPlanLabel(acct)}
-                        <span class="text-slate-600">|</span>
+                        ${planLabelHtml ? `<span class="text-slate-600">|</span>${planLabelHtml}` : ''}
+                        ${hasUsage ? `<span class="text-slate-600">|</span>
                         ${cacheAgeHtml}
                         <button class="btn-refresh-single text-slate-500 hover:text-slate-300 transition-colors p-1.5 -m-1 rounded relative" data-id="${acct.id}" title="Refresh usage" aria-label="Refresh usage">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
-                        </button>
+                        </button>` : ''}
                     </div>
                     <!-- data-usage-container: queried by _usageUpdateCardDOM (websocket.js) for surgical bar updates -->
                     <div class="ml-5" data-usage-container>
@@ -657,7 +678,7 @@ function renderEmptyState() {
                 <svg class="w-8 h-8 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
             </div>
             <h3 class="text-lg font-semibold text-white mb-1">No accounts connected</h3>
-            <p class="text-sm text-slate-400 mb-6">Connect a Claude or Codex account to get started</p>
+            <p class="text-sm text-slate-400 mb-6">Connect a Claude, Codex, or Grok account to get started</p>
             <button id="btn-add-account" class="flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition active:scale-[0.96]">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
                 Add Account

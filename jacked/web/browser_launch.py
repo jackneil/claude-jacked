@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import Optional
 
 from jacked.findbin import trusted_path_refusal
+from jacked.providers import CLAUDE, provider_of
+from jacked.web.browser_candidates import _mac_candidates, _win_candidates
 from jacked.web.window_focus import bring_to_front_windows as _bring_to_front_windows
 
 logger = logging.getLogger("jacked.oauth.browser")
@@ -146,17 +148,28 @@ def profile_slug(account: Optional[dict]) -> Optional[str]:
 def profile_dir_for(account: Optional[dict]) -> Optional[Path]:
     """Profile directory for this account, or None when the identity is unknown.
 
+    A Claude profile stays at ``PROFILE_ROOT/<email>``, so existing cookie
+    jars keep working. Every other provider gets its own directory under that
+    root: claude.ai, auth.openai.com and auth.x.ai are different logins, and
+    a shared jar would sign the wrong product in.
+
     >>> profile_dir_for(None) is None
     True
     >>> profile_dir_for({"email": "j@x.com"}).name
     'j@x.com'
     >>> profile_dir_for({"email": "j@x.com"}).parent == PROFILE_ROOT
     True
+    >>> profile_dir_for({"email": "j@x.com", "provider": "grok"}).parts[-2:]
+    ('grok', 'j@x.com')
     """
     slug = profile_slug(account)
     if slug is None:
         return None
-    return PROFILE_ROOT / slug
+    provider = provider_of(account)
+    if provider == CLAUDE:
+        return PROFILE_ROOT / slug
+    safe = "".join(c if c in _SLUG_SAFE else "_" for c in provider).strip(".")
+    return PROFILE_ROOT / (safe or "provider") / slug
 
 
 @dataclass(frozen=True)
@@ -169,28 +182,6 @@ class BrowserSpec:
     # Set for a Flatpak export launcher: the app id, so a launch can grant the
     # sandbox the profile directory (see launch_argv).
     flatpak_app: Optional[str] = None
-
-
-def _win_candidates() -> list[tuple[str, str, str]]:
-    """(name, relative path, family) triples under the Windows program roots."""
-    return [
-        ("Chrome", r"Google\Chrome\Application\chrome.exe", "chromium"),
-        ("Edge", r"Microsoft\Edge\Application\msedge.exe", "chromium"),
-        ("Brave", r"BraveSoftware\Brave-Browser\Application\brave.exe", "chromium"),
-        ("Chromium", r"Chromium\Application\chrome.exe", "chromium"),
-        ("Firefox", r"Mozilla Firefox\firefox.exe", "firefox"),
-    ]
-
-
-def _mac_candidates() -> list[tuple[str, str, str]]:
-    """(name, app-relative path, family) triples for macOS app bundles."""
-    return [
-        ("Chrome", "Google Chrome.app/Contents/MacOS/Google Chrome", "chromium"),
-        ("Edge", "Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "chromium"),
-        ("Brave", "Brave Browser.app/Contents/MacOS/Brave Browser", "chromium"),
-        ("Chromium", "Chromium.app/Contents/MacOS/Chromium", "chromium"),
-        ("Firefox", "Firefox.app/Contents/MacOS/firefox", "firefox"),
-    ]
 
 
 def _linux_candidates() -> list[tuple[str, str, str]]:
