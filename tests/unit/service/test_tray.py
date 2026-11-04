@@ -1,5 +1,6 @@
 """Tests for jacked.service.tray module."""
 
+import logging
 import signal
 import socket
 import time
@@ -9,47 +10,43 @@ import pytest
 from unittest.mock import call, patch, MagicMock
 
 
-def _skip_if_no_tray():
-    """Skip test if pystray/Pillow can't load (not installed, or headless:
-    pystray resolves its GUI backend at import and raises non-ImportError
-    errors like Xlib.error.DisplayNameError when there is no display)."""
-    try:
-        import pystray  # noqa: F401
-        import PIL  # noqa: F401
-    except Exception:
-        pytest.skip("pystray/Pillow unavailable (missing or headless)")
+@pytest.fixture(autouse=True)
+def _tray(tray_module):
+    """Run every test in this module on the real pystray, or on the fake.
+
+    pystray cannot load on a Linux runner with no display. Then the
+    ``tray_module`` fixture (conftest.py) binds ``tray.pystray`` to the fake,
+    so these tests run there too instead of skipping. Pillow is a core
+    dependency, so the icon tests always have it.
+    """
+    return tray_module
 
 
 class TestCreateIcon:
     """Tests for create_icon_image()."""
 
     def test_running_icon_is_64x64(self):
-        _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
         img = create_icon_image("running")
         assert img.size == (64, 64)
 
     def test_stopped_icon_is_64x64(self):
-        _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
         img = create_icon_image("stopped")
         assert img.size == (64, 64)
 
     def test_starting_icon_is_64x64(self):
-        _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
         img = create_icon_image("starting")
         assert img.size == (64, 64)
 
     def test_different_states_produce_different_images(self):
-        _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
         running = create_icon_image("running")
         stopped = create_icon_image("stopped")
         assert running.tobytes() != stopped.tobytes()
 
     def test_unknown_state_defaults_to_stopped(self):
-        _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
         unknown = create_icon_image("bogus")
         stopped = create_icon_image("stopped")
@@ -58,13 +55,11 @@ class TestCreateIcon:
     def test_update_available_draws_blue_badge_dot(self):
         """update_available=True paints the blue badge dot (parity with the
         macOS menu-bar icon). (51, 13) is the badge dot center."""
-        _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
         badged = create_icon_image("running", update_available=True)
         assert badged.getpixel((51, 13)) == (59, 130, 246, 255)
 
     def test_no_badge_when_update_unavailable(self):
-        _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
         plain = create_icon_image("running")
         assert plain.getpixel((51, 13)) != (59, 130, 246, 255)
@@ -90,7 +85,6 @@ class TestMarkVisibility:
         return solid / (size * size)
 
     def test_running_icon_is_bold_at_full_size(self):
-        _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
         cov = self._coverage(create_icon_image("running"), 64)
         assert cov > 0.15, f"mark covers only {cov:.0%} of the 64px canvas"
@@ -99,7 +93,6 @@ class TestMarkVisibility:
         """The Windows tray renders at 16px — the actual bug surface. The
         old 10px-bitmap 'J' covered ~2% of a 16px cell; the shipped arm
         silhouette measures ~42%."""
-        _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
         # Calibration: shipped mark ~42% of a 16px cell, the old font-bug
         # speck ~2%. 15% floor separates them with margin for redesigns.
@@ -109,7 +102,6 @@ class TestMarkVisibility:
     def test_all_three_states_render_distinct_tints(self):
         """running/starting/stopped must each get their own fill — pins the
         amber 'starting' tint, not just running-vs-stopped."""
-        _skip_if_no_tray()
         from jacked.service.tray import create_icon_image
         imgs = {s: create_icon_image(s).tobytes() for s in ("running", "starting", "stopped")}
         assert len(set(imgs.values())) == 3, "two service states share a tint"
@@ -118,7 +110,6 @@ class TestMarkVisibility:
         """The mark renderer must not touch font machinery at all — font
         resolution was the Windows failure class. jacked.service.tray no
         longer defines _load_glyph_font."""
-        _skip_if_no_tray()
         from jacked.service import tray
         assert not hasattr(tray, "_load_glyph_font")
 
@@ -127,7 +118,6 @@ class TestBuildMenu:
     """Tests for build_menu()."""
 
     def test_menu_has_expected_items(self):
-        _skip_if_no_tray()
         from jacked.service.tray import build_menu
         def noop():
             return None
@@ -148,19 +138,336 @@ class TestBuildMenu:
         assert any("Login" in t for t in texts)
         assert any("0.39.0" in t for t in texts)
 
+    def test_open_dashboard_is_the_one_default_action(self, tray_module):
+        """#232i: Open Dashboard is the default item. On a left click, the
+        backends with a click action (Windows, GTK, the Xorg fallback) run
+        ``menu(icon)``, and that call runs the default item. No other item
+        is a default, so the click cannot do anything else. The test uses
+        the real pystray when it loads, else the fake (``tray_module``)."""
+
+        def noop():
+            return None
+
+        opened = []
+        menu = tray_module.build_menu(
+            port=8321,
+            version="0.39.0",
+            autostart_check=lambda: True,
+            on_open_dashboard=lambda: opened.append("dashboard"),
+            on_restart=noop,
+            on_stop=noop,
+            on_toggle_autostart=noop,
+            version_text_fn=lambda: "v0.39.0",
+            version_click_fn=noop,
+            version_enabled_fn=lambda: False,
+            on_check_for_updates=noop,
+            last_check_text_fn=lambda: "Last checked: never",
+            check_in_progress_fn=lambda: False,
+            started_at_text_fn=lambda: "Started: -",
+            usage_text_fn=lambda: "Claude · 7d 74%",
+        )
+        for item in menu.items:
+            assert item.default is (item.text == "Open Dashboard"), item.text
+        menu(MagicMock())  # pystray's Icon.__call__ runs this on a left click
+        assert opened == ["dashboard"]
+
+
+class _SetupIcon:
+    """The parts of a pystray icon that ``ServiceRunner._setup`` uses.
+
+    It declares no capability attribute (``HAS_MENU``,
+    ``HAS_NOTIFICATION``), like a backend that does not declare them.
+    """
+
+    def __init__(self):
+        self.visible = False
+        self.notices = []
+        self.menu_updates = 0
+
+    def notify(self, message, title=None):
+        self.notices.append((message, title))
+
+    def update_menu(self):
+        self.menu_updates += 1
+
+
+class _XorgIcon(_SetupIcon):
+    """pystray's Xorg backend: no menu (only the left click works) and no
+    notifications. Its notify raises, as the real backend's does."""
+
+    HAS_MENU = False
+    HAS_NOTIFICATION = False
+
+    def notify(self, message, title=None):
+        raise NotImplementedError()  # pystray _base.Icon._notify on Xorg
+
+
+class _MenuIcon(_SetupIcon):
+    HAS_MENU = True  # pystray on Windows, GTK and AppIndicator
+    HAS_NOTIFICATION = True
+
+
+class _RefusingIcon(_MenuIcon):
+    """Declares notifications and then refuses one, as GTK can when no
+    notification service runs on the session bus."""
+
+    def notify(self, message, title=None):
+        raise RuntimeError("no notification service")
+
+
+_NO_MENU_WARNING = (
+    "Tray: this desktop has no tray menu (pystray Xorg backend). Left-click "
+    "the icon to open the dashboard. Use `jacked service restart` / `jacked "
+    "service stop` for the other actions. The full menu needs PyGObject in "
+    "the jacked tool environment; see the README Linux tray notes."
+)
+
+
+def _run_setup(icon, *, started=True):
+    """Run ``ServiceRunner._setup`` on *icon* with no threads and no render.
+
+    *started* False models a first start that did not become ready.
+    """
+    from jacked.service import tray
+
+    runner = tray.ServiceRunner(host="127.0.0.1", port=9999)
+    runner._started_at = time.time() if started else None
+
+    class _Thread:
+        def __init__(self, target=None, name=None, daemon=None):
+            self.target, self.name = target, name
+
+        def start(self):
+            return None
+
+    with patch.object(tray.threading, "Thread", _Thread), patch.object(
+        runner, "_apply_icon"
+    ):
+        runner._setup(icon)
+    return runner
+
+
+class TestTrayMenuCapability:
+    """#232i: on a pystray backend with no menu (Xorg), only the left click
+    works. The tray probes the backend once at setup, logs one WARNING, and
+    the native STATUS payload reports the result."""
+
+    @pytest.mark.parametrize(
+        "icon_cls, available",
+        [(_XorgIcon, False), (_MenuIcon, True), (_SetupIcon, True)],
+        ids=["xorg-no-menu", "menu", "no-capability-attribute"],
+    )
+    def test_setup_probes_the_menu_and_status_reports_it(
+        self, icon_cls, available, caplog
+    ):
+        from jacked.service.ipc import ControlAction
+
+        with caplog.at_level(logging.WARNING):
+            runner = _run_setup(icon_cls())
+
+        warnings = [
+            (record.name, record.getMessage())
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        ]
+        # The "jacked" logger writes to ~/.claude/jacked-tray.log.
+        expected = [] if available else [("jacked.service.tray", _NO_MENU_WARNING)]
+        assert warnings == expected
+        status = runner._handle_control_action(ControlAction.STATUS)
+        assert status["tray_menu_available"] is available
+
+    def test_a_runner_without_the_pystray_setup_reports_a_menu(self):
+        """The macOS menu-bar agent never runs ``_setup``, and STATUS can
+        arrive before it runs. Neither case reports a missing menu."""
+        from jacked.service.ipc import ControlAction
+        from jacked.service.tray import ServiceRunner
+
+        runner = ServiceRunner(host="127.0.0.1", port=9999)
+        status = runner._handle_control_action(ControlAction.STATUS)
+        assert status["tray_menu_available"] is True
+
+    def test_the_shared_probe_reads_the_declared_capability(self):
+        from jacked.service.usage_tooltip import tray_backend_has_menu
+
+        assert tray_backend_has_menu(_XorgIcon()) is False
+        assert tray_backend_has_menu(_MenuIcon()) is True
+        assert tray_backend_has_menu(_SetupIcon()) is True
+        # A real bool, because the STATUS payload is sent as JSON.
+        assert tray_backend_has_menu(MagicMock()) is True
+
+
+class TestTrayNotifications:
+    """#232i, the same class for notifications: pystray's Xorg backend
+    cannot show one (HAS_NOTIFICATION is False and its notify raises).
+    ``ServiceRunner._notify`` shows a notification where the backend can
+    and logs it at WARNING where it cannot, so no message is lost."""
+
+    FAILED_START = ("Jacked Service", "Jacked failed to start")
+    RECOVERY = (
+        "Jacked Update Failed Earlier",
+        "Previous update failed. See ~/.claude/jacked-update-failed.txt for "
+        "recovery steps.",
+    )
+
+    @staticmethod
+    def _write_recovery_file():
+        from jacked.service import updater
+
+        # The service conftest points RECOVERY_FILE into the test's tmp dir.
+        updater.RECOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        updater.RECOVERY_FILE.write_text("update failed\n", encoding="utf-8")
+
+    def test_the_shared_probe_reads_the_notification_capability(self):
+        from jacked.service.usage_tooltip import tray_backend_can_notify
+
+        assert tray_backend_can_notify(_XorgIcon()) is False
+        assert tray_backend_can_notify(_MenuIcon()) is True
+        assert tray_backend_can_notify(_SetupIcon()) is True  # not declared
+        assert tray_backend_can_notify(MagicMock()) is True  # a real bool
+
+    @pytest.mark.parametrize(
+        "recovery", [False, True], ids=["failed-start", "and-recovery-file"]
+    )
+    def test_an_xorg_tray_logs_each_notification_and_setup_does_not_raise(
+        self, caplog, recovery
+    ):
+        if recovery:
+            self._write_recovery_file()
+        with caplog.at_level(logging.WARNING):
+            _run_setup(_XorgIcon(), started=False)  # must not raise
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        expected = [self.RECOVERY, self.FAILED_START] if recovery else [self.FAILED_START]
+        for title, message in expected:
+            assert any(
+                "cannot show notifications" in w and title in w and message in w
+                for w in warnings
+            ), (title, warnings)
+        # The capability probe routed each one, so the backend refused none,
+        # and a notification that the backend cannot show is not an error.
+        assert not any("refused" in w for w in warnings), warnings
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+    def test_a_notifying_tray_shows_the_failed_start_once(self, caplog):
+        icon = _MenuIcon()
+        with caplog.at_level(logging.WARNING):
+            _run_setup(icon, started=False)
+
+        title, message = self.FAILED_START
+        assert icon.notices == [(message, title)]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_a_refused_recovery_notification_names_the_notification(self, caplog):
+        """A backend that declares notifications can still refuse one. The
+        existing handler logs it, and the text names the notification."""
+        self._write_recovery_file()
+        with caplog.at_level(logging.ERROR):
+            _run_setup(_RefusingIcon())  # must not raise
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors == [
+            "Could not check the update recovery file or show its notification"
+        ]
+
+    def test_a_refused_failed_start_notification_is_logged_by_class(self, caplog):
+        """The failed-start notice is the last step of the setup thread. A
+        refusal is logged at WARNING with the error class and the message,
+        and the thread does not end on it (no traceback on stderr)."""
+        with caplog.at_level(logging.WARNING):
+            _run_setup(_RefusingIcon(), started=False)  # must not raise
+
+        title, message = self.FAILED_START
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            "RuntimeError" in w and title in w and message in w for w in warnings
+        ), warnings
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+class TestOpenDashboardGuard:
+    """#232i: Windows sends down, up, double-click, up for one double-click,
+    and pystray runs the default item (Open Dashboard) on each button-up.
+    The tray ignores a second activation within 0.5 s of an open, so a
+    double-click opens one browser tab."""
+
+    URL = "http://127.0.0.1:9999"
+
+    @staticmethod
+    def _runner(monkeypatch, open_seconds=0.0):
+        """A runner with a fake clock and a fake browser launch.
+
+        The clock starts at 0.0, so the first activation must open at any
+        clock value. A browser launch moves the clock by *open_seconds*.
+        """
+        from jacked.service import tray
+
+        runner = tray.ServiceRunner(host="127.0.0.1", port=9999)
+        clock = [0.0]
+        opened = []
+
+        def _open(url):
+            opened.append(url)
+            clock[0] += open_seconds
+
+        monkeypatch.setattr(tray, "webbrowser", SimpleNamespace(open=_open))
+        monkeypatch.setattr(tray, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        return runner, opened, clock
+
+    @pytest.mark.parametrize(
+        "gap, tabs", [(0.010, 1), (1.0, 2)], ids=["10-ms-apart", "1-s-apart"]
+    )
+    def test_a_second_activation_within_half_a_second_opens_no_tab(
+        self, monkeypatch, caplog, gap, tabs
+    ):
+        runner, opened, clock = self._runner(monkeypatch)
+        with caplog.at_level(logging.DEBUG, logger="jacked.service.tray"):
+            runner._on_open_dashboard()
+            clock[0] += gap
+            runner._on_open_dashboard()
+
+        assert opened == [self.URL] * tabs
+        # An ignored activation is logged at DEBUG, never dropped in silence.
+        ignored = [
+            r
+            for r in caplog.records
+            if "ignored a second" in r.getMessage() and r.levelno == logging.DEBUG
+        ]
+        assert len(ignored) == 2 - tabs
+
+    def test_the_interval_counts_from_the_last_open(self, monkeypatch):
+        """An ignored activation does not make the interval longer."""
+        runner, opened, clock = self._runner(monkeypatch)
+        for at in (0.0, 0.3, 0.6):  # open, ignored, open
+            clock[0] = at
+            runner._on_open_dashboard()
+        assert opened == [self.URL] * 2
+
+    def test_a_slow_browser_start_does_not_let_the_second_click_through(
+        self, monkeypatch
+    ):
+        """The second button-up waits in the message queue until the first
+        launch returns. The interval starts when the launch returns, so a
+        browser that takes 0.7 s to start still opens one tab."""
+        runner, opened, _clock = self._runner(monkeypatch, open_seconds=0.7)
+        runner._on_open_dashboard()
+        runner._on_open_dashboard()  # queued during the launch, runs at once
+        assert opened == [self.URL]
+
 
 class TestServiceRunner:
     """Tests for ServiceRunner lifecycle."""
 
     def test_init_stores_config(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=9999)
         assert runner.host == "127.0.0.1"
         assert runner.port == 9999
 
     def test_uvicorn_server_initialized_in_init(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=8321)
         assert hasattr(runner, "_uvicorn_server")
@@ -457,14 +764,13 @@ class TestServiceRunner:
         runner._icon.notify.assert_called_once()
         assert "recover" in runner._icon.notify.call_args.args[0]
 
-    # create=True: headless boxes never bind tray.pystray (backend resolution
-    # fails without a display), and @patch resolves the target BEFORE the
-    # in-body _skip_if_no_tray() can skip.
+    # create=True: a headless box binds no real tray.pystray (backend
+    # resolution fails without a display). The autouse _tray fixture binds
+    # the fake there, and create=True keeps the patch valid without it.
     @patch("jacked.service.bind.create_sockets", return_value=[])
     @patch("jacked.service.tray.pystray", create=True)
     @patch("jacked.service.tray.uvicorn")
     def test_start_uvicorn_thread_is_daemon(self, mock_uvicorn, mock_pystray, mock_socks):
-        _skip_if_no_tray()
         from jacked.service.bind import BindPlan
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=8321)
@@ -488,7 +794,6 @@ class TestServiceRunner:
         primary_host, not self.cli_host."""
         import os
 
-        _skip_if_no_tray()
         from jacked.service.bind import BindPlan
         from jacked.service.tray import ServiceRunner
 
@@ -537,7 +842,6 @@ class TestServiceRunner:
         """At COLD START a create_sockets OSError surfaces as SystemExit with the
         friendly message, so the boot exits cleanly rather than dying silently in
         the daemon thread."""
-        _skip_if_no_tray()
         from jacked.service.bind import BindPlan
         from jacked.service.tray import ServiceRunner
 
@@ -565,7 +869,6 @@ class TestServiceRunner:
         _on_restart's `except Exception` retry loop can catch it and fall back to
         the "stopped" state instead of the exception escaping and stranding a
         dead dashboard."""
-        _skip_if_no_tray()
         from jacked.service.bind import BindPlan
         from jacked.service.tray import ServiceRunner
 
@@ -587,7 +890,6 @@ class TestServiceRunner:
             assert not isinstance(exc_info.value, SystemExit)
 
     def test_on_restart_handles_exception(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=8321)
         runner._icon = MagicMock()
@@ -605,7 +907,6 @@ class TestServiceRunner:
     def test_on_restart_aborts_when_port_does_not_free(self):
         """If the old uvicorn won't release the port, abort cleanly
         rather than hanging or repeatedly failing to bind."""
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=8321)
         runner._icon = MagicMock()
@@ -623,7 +924,6 @@ class TestServiceRunner:
     def test_on_restart_retries_on_transient_failure(self):
         """A first-attempt OSError should not give up — try again up to
         3 times before declaring failure."""
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=8321)
         runner._icon = MagicMock()
@@ -643,7 +943,6 @@ class TestServiceRunner:
         """When `should_exit` doesn't release the thread within the
         graceful window, set `force_exit` to drop active connections.
         This is the core fix for "WebSockets keep restart hanging"."""
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=8321)
         # Mock server + thread that simulates graceful shutdown hanging
@@ -668,7 +967,6 @@ class TestApplyIcon:
     """_apply_icon must render the badge whenever an update is available."""
 
     def test_passes_update_available_true_when_outdated(self):
-        _skip_if_no_tray()
         import jacked.service.tray as tray_mod
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -680,7 +978,6 @@ class TestApplyIcon:
         assert runner._icon_state == "running"
 
     def test_passes_update_available_false_when_current(self):
-        _skip_if_no_tray()
         import jacked.service.tray as tray_mod
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -695,14 +992,12 @@ class TestStartedTimestamp:
     """Verify the menu shows when the service actually became ready."""
 
     def test_started_text_default_em_dash(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         assert runner._started_at is None
         assert runner._started_text() == "Started: -"
 
     def test_started_text_seconds_resolution(self):
-        _skip_if_no_tray()
         import time
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -712,7 +1007,6 @@ class TestStartedTimestamp:
         assert "5s ago" in text
 
     def test_started_text_minutes_and_seconds(self):
-        _skip_if_no_tray()
         import time
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -723,7 +1017,6 @@ class TestStartedTimestamp:
     def test_restart_updates_started_at(self):
         """Headline behavior: clicking Restart shifts the timestamp so
         the user can verify the click took effect."""
-        _skip_if_no_tray()
         import time
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner(host="127.0.0.1", port=8321)
@@ -756,10 +1049,174 @@ class TestCheckDeps:
             tray.check_tray_deps()  # should not raise
 
 
+class TestPystrayLoadFailure:
+    """pystray 0.19.5 selects its backend at import, and its selector
+    catches only ImportError. On Linux, when PyGObject loads but neither
+    AppIndicator typelib is installed, the AppIndicator backend raises
+    ValueError. Then ``import pystray`` fails and the service does not start.
+    The import guard keeps the error, and ``check_tray_deps`` logs it at
+    WARNING before the start stops, so the tray log tells the reason. The
+    abort text names the error too, because a reinstall of the empty
+    ``[tray]`` extra cannot fix a missing typelib or a missing display."""
+
+    TYPELIB_ERROR = "Namespace AyatanaAppIndicator3 not available"
+    WARNING = (
+        "Tray: pystray could not load (ValueError: Namespace "
+        "AyatanaAppIndicator3 not available), so the service does not start. "
+        "See the README Linux tray notes."
+    )
+    BACKEND_ABORT = (
+        "The jacked service cannot start: pystray could not load (ValueError: "
+        "Namespace AyatanaAppIndicator3 not available).\n"
+        'See "Linux tray notes" in the jacked README: '
+        "https://github.com/jackneil/claude-jacked#linux-tray-notes"
+    )
+    INSTALL_ABORT = (
+        "Service mode requires the [tray] extra.\n"
+        'Install it with: uv tool install "claude-jacked[tray]" --force'
+    )
+
+    @classmethod
+    def _fake_site(cls, root):
+        """A directory with a pystray package whose import raises ValueError,
+        as the real one does when the AppIndicator typelibs are missing."""
+        package = root / "fake_site" / "pystray"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(
+            f"raise ValueError({cls.TYPELIB_ERROR!r})\n", encoding="utf-8"
+        )
+        return package.parent
+
+    def test_a_backend_error_is_kept_with_its_class_and_message(
+        self, tmp_path, monkeypatch
+    ):
+        import sys
+
+        from jacked.service import tray
+
+        monkeypatch.syspath_prepend(str(self._fake_site(tmp_path)))
+        monkeypatch.delitem(sys.modules, "pystray", raising=False)
+
+        assert tray._import_pystray() == (None, f"ValueError: {self.TYPELIB_ERROR}")
+
+    def test_a_missing_package_gives_no_failure_text(self, monkeypatch):
+        import sys
+
+        from jacked.service import tray
+
+        monkeypatch.setitem(sys.modules, "pystray", None)  # import raises ImportError
+        assert tray._import_pystray() == (None, None)
+
+    def test_a_loaded_pystray_is_returned(self, monkeypatch):
+        import sys
+        import types
+
+        from jacked.service import tray
+
+        module = types.ModuleType("pystray")
+        monkeypatch.setitem(sys.modules, "pystray", module)
+        assert tray._import_pystray() == (module, None)
+
+    def test_a_backend_error_is_logged_and_named_in_the_abort(
+        self, monkeypatch, caplog
+    ):
+        from jacked.service import tray
+
+        monkeypatch.setattr(tray, "_TRAY_AVAILABLE", False)
+        monkeypatch.setattr(
+            tray, "_PYSTRAY_LOAD_FAILURE", f"ValueError: {self.TYPELIB_ERROR}"
+        )
+        with caplog.at_level(logging.WARNING), pytest.raises(SystemExit) as stopped:
+            tray.check_tray_deps()
+
+        assert stopped.value.code == self.BACKEND_ABORT
+        warnings = [
+            (record.name, record.getMessage())
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        ]
+        assert warnings == [("jacked.service.tray", self.WARNING)]
+
+    def test_a_missing_package_keeps_the_install_abort_with_no_warning(
+        self, monkeypatch, caplog
+    ):
+        from jacked.service import tray
+
+        monkeypatch.setattr(tray, "_TRAY_AVAILABLE", False)
+        monkeypatch.setattr(tray, "_PYSTRAY_LOAD_FAILURE", None)
+        with caplog.at_level(logging.WARNING), pytest.raises(SystemExit) as stopped:
+            tray.check_tray_deps()
+
+        assert stopped.value.code == self.INSTALL_ABORT
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_the_tray_log_names_the_error_when_the_start_stops(self, tmp_path):
+        """The real artifact, in a fresh interpreter: the tray module imports
+        a pystray that raises ValueError, the tray log is installed as
+        ``ServiceRunner.run`` installs it first, and the check stops the
+        start. A line logged at import time cannot reach the tray log,
+        because the module is imported before ``run`` installs the log."""
+        import os
+        import subprocess
+        import sys
+
+        home = tmp_path / "home"
+        home.mkdir()
+        script = tmp_path / "stops_on_import_error.py"
+        script.write_text(
+            "from jacked.service import tray\n"
+            "assert tray._TRAY_AVAILABLE is False\n"
+            "tray.ServiceRunner(host='127.0.0.1', port=9999)._install_tray_file_logger()\n"
+            "tray.check_tray_deps()\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env.update(HOME=str(home), USERPROFILE=str(home), PYTHONDONTWRITEBYTECODE="1")
+        env["PYTHONPATH"] = os.pathsep.join(
+            path for path in (str(self._fake_site(tmp_path)), env.get("PYTHONPATH")) if path
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            env=env, capture_output=True, text=True, timeout=120,
+        )
+
+        assert result.returncode == 1, result.stderr
+        assert self.BACKEND_ABORT in result.stderr, result.stderr
+        assert "[tray] extra" not in result.stderr, result.stderr
+        log = (home / ".claude" / "jacked-tray.log").read_text(encoding="utf-8")
+        assert f"jacked.service.tray WARNING {self.WARNING}" in log, log
+
+
+class TestSetupFunctionLength:
+    """JACKED_GUARDRAILS: 50 lines max per function. ``_setup`` grew to 75
+    lines, so its capability report and its failed-start notice are named
+    steps. The measure is the one ``test_updater.TestUpdaterFunctionLength``
+    uses."""
+
+    FUNCTIONS = {"_setup", "_report_tray_capabilities", "_notify_failed_start"}
+
+    def test_setup_and_its_steps_are_at_most_50_lines(self):
+        import ast
+        import inspect
+
+        from jacked.service import tray
+
+        tree = ast.parse(inspect.getsource(tray.ServiceRunner))
+        lengths = {
+            node.name: node.end_lineno - node.lineno + 1
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in self.FUNCTIONS
+        }
+        assert set(lengths) == self.FUNCTIONS, f"missing: {self.FUNCTIONS - set(lengths)}"
+        too_long = {name: n for name, n in lengths.items() if n > 50}
+        assert too_long == {}, f"functions over 50 lines: {too_long}"
+
+
 class TestVersionMenu:
     def test_version_text_when_current(self):
         """Not outdated: show the running __version__ (not cached latest)."""
-        _skip_if_no_tray()
         from jacked import __version__
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -769,7 +1226,6 @@ class TestVersionMenu:
     def test_manual_check_sets_failed_flag_when_unreachable(self, monkeypatch):
         """The mac menubar reads _last_check_failed to show 'couldn't reach PyPI'
         (its rumps path has no pystray notification)."""
-        _skip_if_no_tray()
         import time
 
         import jacked.service.tray as tray_mod
@@ -786,7 +1242,6 @@ class TestVersionMenu:
         assert runner._last_check_at is not None
 
     def test_manual_check_clears_failed_flag_on_success(self, monkeypatch):
-        _skip_if_no_tray()
         import time
 
         import jacked.service.tray as tray_mod
@@ -805,7 +1260,6 @@ class TestVersionMenu:
         assert runner._version_info == {"latest": "9.9.9", "outdated": True}
 
     def test_version_text_when_outdated(self):
-        _skip_if_no_tray()
         from jacked import __version__
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -818,7 +1272,6 @@ class TestVersionMenu:
 
     def test_version_text_when_ahead_of_pypi(self):
         """Running ahead of PyPI cache: show OUR version, not stale cached latest."""
-        _skip_if_no_tray()
         from jacked import __version__
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -829,7 +1282,6 @@ class TestVersionMenu:
         assert "0.41.3" not in text  # must NOT show cached latest
 
     def test_version_text_when_check_not_yet_run(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         from jacked import __version__
         runner = ServiceRunner()
@@ -837,7 +1289,6 @@ class TestVersionMenu:
         assert __version__ in runner._version_menu_text()
 
     def test_update_enabled_only_when_outdated(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         runner._version_info = {"latest": "0.42.0", "outdated": True}
@@ -850,7 +1301,6 @@ class TestVersionMenu:
 
 class TestOnUpdateClick:
     def test_spawns_updater_then_stops(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         runner._version_info = {"latest": "0.42.0", "outdated": True}
@@ -863,7 +1313,6 @@ class TestOnUpdateClick:
         mock_stop.assert_called_once()
 
     def test_no_op_when_not_outdated(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         runner._version_info = {"latest": "0.41.0", "outdated": False}
@@ -872,7 +1321,6 @@ class TestOnUpdateClick:
         mock_spawn.assert_not_called()
 
     def test_click_releases_lock_on_spawn_failure(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         runner._version_info = {"latest": "0.42.0", "outdated": True}
@@ -886,7 +1334,6 @@ class TestOnUpdateClick:
 
     def test_double_click_only_spawns_once(self):
         """Rapid double-click spawns only one updater."""
-        _skip_if_no_tray()
         import threading as _threading
         import time as _time
         from jacked.service.tray import ServiceRunner
@@ -913,7 +1360,6 @@ class TestOnUpdateClick:
 
     def test_spawns_before_stops(self):
         """Updater is spawned BEFORE _on_stop is called (ordering assertion)."""
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         runner._version_info = {"latest": "0.42.0", "outdated": True}
@@ -936,7 +1382,6 @@ class TestOnUpdateClick:
 
 class TestCheckForUpdatesMenu:
     def test_menu_has_check_for_updates_item(self):
-        _skip_if_no_tray()
         from jacked.service.tray import build_menu
         def noop():
             return None
@@ -959,7 +1404,6 @@ class TestCheckForUpdatesMenu:
         assert any("Check for updates" in t for t in texts)
 
     def test_menu_omits_check_for_updates_when_not_provided(self):
-        _skip_if_no_tray()
         from jacked.service.tray import build_menu
         def noop():
             return None
@@ -980,7 +1424,6 @@ class TestCheckForUpdatesMenu:
 class TestOnCheckForUpdates:
     @patch("jacked.service.tray.check_version_cached")
     def test_forces_fresh_pypi_check(self, mock_check):
-        _skip_if_no_tray()
         import time as _time
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -1003,14 +1446,12 @@ class TestOnCheckForUpdates:
 
 class TestLastCheckedMenu:
     def test_never_checked(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         runner._last_check_at = None
         assert runner._last_check_menu_text() == "Last checked: never"
 
     def test_just_now(self):
-        _skip_if_no_tray()
         import time as _time
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -1018,7 +1459,6 @@ class TestLastCheckedMenu:
         assert "just now" in runner._last_check_menu_text()
 
     def test_minutes_ago(self):
-        _skip_if_no_tray()
         import time as _time
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -1026,7 +1466,6 @@ class TestLastCheckedMenu:
         assert runner._last_check_menu_text() == "Last checked: 2m ago"
 
     def test_hours_ago(self):
-        _skip_if_no_tray()
         import time as _time
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -1034,7 +1473,6 @@ class TestLastCheckedMenu:
         assert runner._last_check_menu_text() == "Last checked: 2h ago"
 
     def test_days_ago(self):
-        _skip_if_no_tray()
         import time as _time
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -1042,7 +1480,6 @@ class TestLastCheckedMenu:
         assert runner._last_check_menu_text() == "Last checked: 3d ago"
 
     def test_checking_now_overrides_timestamp(self):
-        _skip_if_no_tray()
         import time as _time
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -1052,7 +1489,6 @@ class TestLastCheckedMenu:
         assert "Checking" in text
 
     def test_menu_includes_last_checked_when_fn_provided(self):
-        _skip_if_no_tray()
         from jacked.service.tray import build_menu
         def noop():
             return None
@@ -1070,7 +1506,6 @@ class TestLastCheckedMenu:
         assert any("Last checked" in t for t in texts)
 
     def test_check_for_updates_disabled_while_in_progress(self):
-        _skip_if_no_tray()
         from jacked.service.tray import build_menu
         def noop():
             return None
@@ -1103,7 +1538,6 @@ class TestWindowsConsoleHandler:
 
     def test_handler_no_op_on_posix(self):
         """On POSIX the method short-circuits and must not raise."""
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         # No patching needed — on macOS/Linux it should just return.
@@ -1111,7 +1545,6 @@ class TestWindowsConsoleHandler:
 
     def test_handler_installs_on_windows(self):
         """When sys.platform is win32, it installs a SetConsoleCtrlHandler."""
-        _skip_if_no_tray()
         import sys as _sys
         from jacked.service.tray import ServiceRunner
         # Skip if ctypes.windll isn't available (non-Windows systems don't have it
@@ -1136,7 +1569,6 @@ class TestWindowsConsoleHandler:
     def test_failed_uninstall_roots_callback_for_process_lifetime(
         self, monkeypatch, failure
     ):
-        _skip_if_no_tray()
         import ctypes
         import gc
         import sys as _sys
@@ -1174,7 +1606,6 @@ class TestWindowsConsoleHandler:
 
 class TestVersionCheckThread:
     def test_exits_on_stop_event(self):
-        _skip_if_no_tray()
         import threading as _threading
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
@@ -1197,7 +1628,6 @@ class TestOnUpdateClickRefusal:
     def test_refuses_editable_clears_status_no_spawn_no_stop(
         self, mock_spawn, mock_gate, mock_clear,
     ):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         runner = ServiceRunner()
         runner._version_info = {"latest": "0.42.0", "outdated": True}
@@ -1217,7 +1647,6 @@ class TestOnUpdateClickBreadcrumbs:
     def test_init_status_called_before_spawn(
         self, mock_init, mock_spawn, mock_gate, monkeypatch, tmp_path,
     ):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         monkeypatch.setattr("jacked.service.CLAUDE_DIR", tmp_path)
         runner = ServiceRunner()
@@ -1241,7 +1670,6 @@ class TestOnUpdateClickBreadcrumbs:
     def test_breadcrumb_appended_to_update_log(
         self, mock_spawn, mock_gate, tmp_path, monkeypatch,
     ):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         from jacked.service import updater as updater_mod
         runner = ServiceRunner()
@@ -1261,7 +1689,6 @@ class TestOnUpdateClickBreadcrumbs:
     def test_bootstrap_targets_loopback_regardless_of_host(self, monkeypatch, tmp_path):
         """host may be 0.0.0.0 (bind-all), unroutable by clients on Linux. The
         bootstrap the tray writes must always point the browser at 127.0.0.1."""
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         monkeypatch.setattr("jacked.service.CLAUDE_DIR", tmp_path)
         runner = ServiceRunner(host="0.0.0.0", port=8321)
@@ -1283,7 +1710,6 @@ class TestOnUpdateClickBreadcrumbs:
     def test_writes_bootstrap_and_opens_file_uri(self, monkeypatch, tmp_path):
         """Happy path: the substituted bootstrap lands in ~/.claude and the
         browser is pointed at it via file:// — never the racing port."""
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         monkeypatch.setattr("jacked.service.CLAUDE_DIR", tmp_path)
         runner = ServiceRunner(port=8321)
@@ -1308,7 +1734,6 @@ class TestOnUpdateClickBreadcrumbs:
     def test_falls_back_to_http_url_when_template_unreadable(self, monkeypatch, tmp_path):
         """Template missing/unreadable -> open the port directly (old behavior,
         minus the pre-warm) rather than leaving the user with nothing."""
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
         empty_web = tmp_path / "web"
         empty_web.mkdir()
@@ -1336,7 +1761,6 @@ class TestRestartHandlerRegistration:
     any launch-time --host pin before restarting so the DB actually wins."""
 
     def test_run_registers_during_and_unregisters_after(self, monkeypatch):
-        _skip_if_no_tray()
         from jacked.service import restart as restart_mod
         from jacked.service.tray import ServiceRunner
 
@@ -1392,6 +1816,9 @@ class TestRestartHandlerRegistration:
         fake_pystray = MagicMock()
         fake_pystray.Icon.return_value = icon_instance
         monkeypatch.setattr(tray_mod, "pystray", fake_pystray, raising=False)
+        # run() reaches check_tray_deps, which reads _TRAY_AVAILABLE. A
+        # headless runner has no real pystray, so the test sets it.
+        monkeypatch.setattr(tray_mod, "_TRAY_AVAILABLE", True)
 
         runner.run()
 
@@ -1413,7 +1840,6 @@ class TestOnSettingsRestart:
     resolve_bind on every in-process restart, making the GUI toggle inert."""
 
     def test_clears_cli_host_before_restarting(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
 
         runner = ServiceRunner(host="0.0.0.0", port=8321)
@@ -1432,7 +1858,6 @@ class TestOnSettingsRestart:
     def test_menu_restart_keeps_the_launch_pin(self, monkeypatch):
         """The tray MENU's Restart calls _on_restart directly and must NOT
         clear the operator's one-shot --host pin."""
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
 
         runner = ServiceRunner(host="192.168.1.5", port=8321)
@@ -1900,7 +2325,6 @@ class TestTrayProxyHeaderTrustIsPinned:
     def test_start_uvicorn_pins_proxy_headers(
         self, mock_uvicorn, mock_pystray, mock_socks, monkeypatch
     ):
-        _skip_if_no_tray()
         from jacked.service.bind import BindPlan
         from jacked.service.tray import ServiceRunner
 
@@ -1926,7 +2350,6 @@ class TestUpdateClickSurvivesCodeSkew:
     interpreter when the in-process import fails."""
 
     def _runner(self):
-        _skip_if_no_tray()
         from jacked.service.tray import ServiceRunner
 
         runner = ServiceRunner()

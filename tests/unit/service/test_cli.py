@@ -210,6 +210,52 @@ class TestServiceStatus:
         assert "starting" in result.output.lower()
         assert "Dashboard:" not in result.output
 
+    @pytest.mark.parametrize(
+        "extra, shown",
+        [
+            ({"tray_menu_available": False}, True),
+            ({"tray_menu_available": True}, False),
+            ({"tray_menu_available": None}, False),
+            ({}, False),  # a service from before the field existed
+        ],
+        ids=["no-menu", "menu", "unknown", "older-service"],
+    )
+    def test_status_names_a_tray_without_a_menu(self, absent_autostart, extra, shown):
+        """#232i: on the pystray Xorg backend the tray has no menu. Status
+        says so and names the left click. Only an explicit False prints it."""
+        from types import SimpleNamespace
+
+        from jacked.cli import main
+
+        state = {
+            "state": "running",
+            "quarantine": False,
+            "build_version": "test",
+            "protocol_version": 2,
+            "generation": "abc",
+            "port": 8321,
+            **extra,
+        }
+        with (
+            patch(
+                "jacked.service.lifecycle.discover_service",
+                return_value=SimpleNamespace(source="manifest", reason=""),
+            ),
+            patch(
+                "jacked.service.ipc.send_native_control",
+                return_value={"ok": True, "result": state},
+            ),
+        ):
+            result = CliRunner().invoke(main, ["service", "status"])
+
+        assert result.exit_code == 0, result.output
+        line = (
+            "Tray menu: unavailable (pystray Xorg backend); left-click the "
+            "icon opens the dashboard"
+        )
+        assert (line in _flat(result.output)) is shown
+        assert ("Tray menu" in result.output) is shown
+
     def test_status_preserves_unknown_autostart_truth(self):
         from types import SimpleNamespace
 
@@ -346,6 +392,19 @@ class TestServiceStop:
         assert "signalled" in result.output.lower()
 
 
+@pytest.fixture
+def tray_service_can_start(monkeypatch):
+    """Pin the check of `jacked service install` to "the tray service can start".
+
+    tests/unit/service/test_tray_install.py tests the check itself. These tests
+    are about what the install does after it. Without the pin they fail where
+    the check refuses: a runner with no display (the Linux CI leg) or no
+    pystray.
+    """
+    monkeypatch.setattr("jacked.cli._tray_service_can_start_here", lambda: True)
+
+
+@pytest.mark.usefixtures("tray_service_can_start")
 class TestServiceInstall:
     @pytest.fixture(autouse=True)
     def _service_becomes_ready(self, monkeypatch):
@@ -402,6 +461,7 @@ class TestServiceUninstall:
         assert "pid or port" in result.output.lower()
 
 
+@pytest.mark.usefixtures("tray_service_can_start")
 class TestServiceInstallError:
     @pytest.fixture(autouse=True)
     def _service_becomes_ready(self, monkeypatch):
@@ -412,11 +472,13 @@ class TestServiceInstallError:
         side_effect=ValueError("bad"),
     )
     def test_install_shows_error_when_binary_not_found(self, mock_install):
+        """The service is the only job of `service install`: a failed install
+        prints its error and exits 1, never 0."""
         from jacked.cli import main
 
         runner = CliRunner()
         result = runner.invoke(main, ["service", "install"])
-        assert result.exit_code == 0
+        assert result.exit_code == 1, result.output
         assert "Error" in result.output
         assert "safe service install failed" in result.output
 
@@ -430,6 +492,7 @@ class TestServiceInstallError:
         mock_install.return_value = MagicMock(ok=True, reason="installed")
         runner = CliRunner()
         result = runner.invoke(main, ["service", "install"])
+        assert result.exit_code == 0, result.output
         assert "OK" in result.output
 
 
@@ -1191,6 +1254,7 @@ class TestServiceStartBootMigration:
         assert mock_runner_cls.call_args.kwargs["host"] == "192.168.1.5"
 
 
+@pytest.mark.usefixtures("tray_service_can_start")
 class TestServiceInstallRemoteAccessParity:
     """`service install --host X` maps X onto the dashboard Remote access
     setting (OVERWRITING existing keys — the command expresses intent), then
@@ -2655,6 +2719,7 @@ def test_install_starts_over_a_dead_manual_owner_without_a_handoff(
     assert "Autostart registered from exact ServiceSpec" in output
 
 
+@pytest.mark.usefixtures("tray_service_can_start")
 def test_service_install_command_starts_over_a_dead_manual_owner(
     tmp_path, monkeypatch
 ):

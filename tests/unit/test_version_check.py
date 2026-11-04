@@ -148,6 +148,78 @@ class TestIsNewer:
         assert vc.is_newer("0.5.0", "0.3.11-beta1") is True
 
 
+class TestInstallableVersion:
+    """installable_version(): what uv installs now (the update badge).
+
+    uv resolves through the simple index, so the simple index's answer is
+    the installable version. The JSON API never supplies the answer. Compare
+    TestNewestListedVersion: the upgrade target answers another question.
+    """
+
+    def test_a_lagging_json_api_gives_the_simple_index_answer(self):
+        """G3, 2026-11-02: JSON API 0.110.1, simple index 0.110.2, uv got 0.110.2."""
+        assert vc.installable_version("0.110.1", "0.110.2") == "0.110.2"
+
+    def test_a_json_api_ahead_gives_the_simple_index_answer(self):
+        """The phantom-badge case: the index does not serve the new release yet."""
+        assert vc.installable_version("0.111.0", "0.110.2") == "0.110.2"
+
+    def test_agreeing_probes_give_that_version(self):
+        assert vc.installable_version("0.110.2", "0.110.2") == "0.110.2"
+
+    def test_only_the_simple_index_answers(self):
+        assert vc.installable_version(None, "0.110.2") == "0.110.2"
+        assert vc.installable_version("garbage", "0.110.2") == "0.110.2"
+
+    def test_no_simple_index_answer_is_none(self):
+        """A JSON-only answer is not what uv installs."""
+        assert vc.installable_version("0.110.2", None) is None
+        assert vc.installable_version("0.110.2", "") is None
+        assert vc.installable_version("0.110.2", "garbage") is None
+        assert vc.installable_version(None, None) is None
+
+
+class TestNewestListedVersion:
+    """newest_listed_version(): what `jacked upgrade` aims for.
+
+    The newest release that either probe names. When the simple index lags,
+    the target stays ahead of what uv installs, so the upgrade can report the
+    lag (#166i, commit 26227f8).
+    """
+
+    def test_a_lagging_json_api_gives_the_simple_index_answer(self):
+        """G3, 2026-11-02: JSON API 0.110.1, simple index 0.110.2."""
+        assert vc.newest_listed_version("0.110.1", "0.110.2") == "0.110.2"
+
+    def test_a_lagging_simple_index_gives_the_json_api_answer(self):
+        """#166i: the target stays the newer release, so the upgrade can say
+        that the package index does not serve it yet."""
+        assert vc.newest_listed_version("0.111.0", "0.110.2") == "0.111.0"
+
+    def test_one_answer_is_enough(self):
+        assert vc.newest_listed_version(None, "0.110.2") == "0.110.2"
+        assert vc.newest_listed_version("0.110.2", None) == "0.110.2"
+        assert vc.newest_listed_version(None, None) is None
+
+    def test_versions_compare_in_pep440_order(self):
+        """Not as text, and not as a tuple of the leading numbers."""
+        assert vc.newest_listed_version("0.9.0", "0.10.0") == "0.10.0"
+        assert vc.newest_listed_version("0.111.0.post1", "0.111.0") == "0.111.0.post1"
+
+    def test_an_answer_that_is_not_a_version_counts_as_no_answer(self):
+        assert vc.newest_listed_version("garbage", "0.110.2") == "0.110.2"
+        assert vc.newest_listed_version("0.110.2", "garbage") == "0.110.2"
+        assert vc.newest_listed_version("", "garbage") is None
+        # The JSON API answer is whatever the response holds.
+        assert vc.newest_listed_version(0.2, "0.110.2") == "0.110.2"
+        assert vc.newest_listed_version(["0.111.0"], None) is None
+
+    def test_the_result_is_the_normalized_version(self):
+        """The result reaches a batch line: never the raw answer's spelling."""
+        assert vc.newest_listed_version(" 0.110.3 ", None) == "0.110.3"
+        assert vc.newest_listed_version("v0.110.3", None) == "0.110.3"
+
+
 class TestGetLatestPypiVersion:
     """Tests for get_latest_pypi_version() with mocked network."""
 
@@ -325,6 +397,54 @@ class TestGetLatestFromSimpleIndex:
             return_value=self._mock_urlopen_response(payload),
         ):
             assert vc.get_latest_from_simple_index("claude-jacked") == "0.45.2"
+
+    def _latest_of(self, *filenames):
+        payload = {
+            "name": "claude-jacked",
+            "files": [{"filename": name} for name in filenames],
+        }
+        with patch(
+            "urllib.request.urlopen",
+            return_value=self._mock_urlopen_response(payload),
+        ):
+            return vc.get_latest_from_simple_index("claude-jacked")
+
+    def test_get_latest_from_simple_skips_pre_releases_when_a_final_exists(self):
+        """uv does not install a pre-release while a final release exists, so
+        the probe must not report one (0.111.0rc1 once outranked 0.110.2)."""
+        assert self._latest_of(
+            "claude_jacked-0.110.2-py3-none-any.whl",
+            "claude_jacked-0.111.0rc1-py3-none-any.whl",
+            "claude_jacked-0.111.0b2-py3-none-any.whl",
+            "claude_jacked-0.111.0a1.tar.gz",
+            "claude_jacked-0.111.0.dev1.tar.gz",
+        ) == "0.110.2"
+
+    def test_get_latest_from_simple_ranks_a_post_release_above_its_final(self):
+        """PEP 440 order, not a tuple of the leading numbers: the result does
+        not depend on the order the index lists the files in."""
+        files = (
+            "claude_jacked-0.111.0-py3-none-any.whl",
+            "claude_jacked-0.111.0.post1-py3-none-any.whl",
+        )
+        assert self._latest_of(*files) == "0.111.0.post1"
+        assert self._latest_of(*reversed(files)) == "0.111.0.post1"
+
+    def test_get_latest_from_simple_ranks_a_final_above_its_dev_build(self):
+        files = (
+            "claude_jacked-0.111.0.dev1-py3-none-any.whl",
+            "claude_jacked-0.111.0-py3-none-any.whl",
+        )
+        assert self._latest_of(*files) == "0.111.0"
+        assert self._latest_of(*reversed(files)) == "0.111.0"
+
+    def test_get_latest_from_simple_offers_a_pre_release_when_no_final_exists(self):
+        """uv's default: pre-releases are allowed when every version is one."""
+        assert self._latest_of(
+            "claude_jacked-0.1.0.dev3-py3-none-any.whl",
+            "claude_jacked-0.1.0rc2-py3-none-any.whl",
+            "claude_jacked-0.1.0rc1-py3-none-any.whl",
+        ) == "0.1.0rc2"
 
 
 class TestCheckVersionCached:
@@ -784,3 +904,57 @@ class TestCheckVersionCachedDualEndpoint:
         # Must have re-probed both endpoints despite fresh cache
         assert p_pypi.called and p_simple.called
         assert result["installable_latest"] == "0.45.3"
+
+    def test_both_answers_go_through_the_shared_helper(self, tmp_path, monkeypatch):
+        """One implementation: the badge and `jacked upgrade` read the
+        installable version through installable_version()."""
+        self._isolate_cache(tmp_path, monkeypatch)
+        with patch(
+            "jacked.version_check.get_latest_pypi_version", return_value="0.45.3"
+        ), patch(
+            "jacked.version_check.get_latest_from_simple_index", return_value="0.45.2"
+        ), patch(
+            "jacked.version_check.installable_version", wraps=vc.installable_version
+        ) as helper:
+            result = vc.check_version_cached("0.45.1", force=True)
+        helper.assert_called_once_with("0.45.3", "0.45.2")
+        assert result["installable_latest"] == "0.45.2"
+
+    def test_a_failed_or_garbled_probe_keeps_the_current_version(
+        self, tmp_path, monkeypatch
+    ):
+        """The badge's own conservative rule: when either probe fails or
+        answers garbage, installable is the running version, also when the
+        other probe names a newer release."""
+        self._isolate_cache(tmp_path, monkeypatch)
+        for json_api, simple in (
+            (None, "0.45.3"), ("garbage", "0.45.3"),
+            ("0.45.3", None), ("0.45.3", "garbage"),
+        ):
+            with patch(
+                "jacked.version_check.get_latest_pypi_version", return_value=json_api
+            ), patch(
+                "jacked.version_check.get_latest_from_simple_index", return_value=simple
+            ):
+                result = vc.check_version_cached("0.45.2", force=True)
+            assert (result["installable_latest"], result["outdated"]) == ("0.45.2", False), (
+                json_api, simple,
+            )
+
+    def test_a_lagging_json_api_names_the_version_uv_installs(
+        self, tmp_path, monkeypatch
+    ):
+        """JSON API 0.110.1, simple index 0.110.2: the update offered is the
+        one the click installs, and a build upgraded to 0.110.2 is not
+        reported as ahead of the index."""
+        self._isolate_cache(tmp_path, monkeypatch)
+        with patch(
+            "jacked.version_check.get_latest_pypi_version", return_value="0.110.1"
+        ), patch(
+            "jacked.version_check.get_latest_from_simple_index", return_value="0.110.2"
+        ):
+            older = vc.check_version_cached("0.110.0", force=True)
+            upgraded = vc.check_version_cached("0.110.2", force=True)
+        assert (older["installable_latest"], older["outdated"]) == ("0.110.2", True)
+        assert (upgraded["installable_latest"], upgraded["ahead"]) == ("0.110.2", False)
+        assert upgraded["next_check_at"] - upgraded["checked_at"] == vc.CACHE_TTL

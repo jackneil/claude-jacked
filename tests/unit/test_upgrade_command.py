@@ -65,6 +65,8 @@ class TestUpgradeRefusal:
         result = CliRunner().invoke(main, ["upgrade"])
         assert result.exit_code == 2
         assert "pip" in result.output.lower()
+        # The reason is printed as it is: Rich must not drop "[tray]".
+        assert 'uv tool install "claude-jacked[tray]"' in " ".join(result.output.split())
         mock_run.assert_not_called()
         mock_popen.assert_not_called()
 
@@ -422,6 +424,22 @@ class TestUpgradeIsATransaction:
         assert "rolling back" in result.output.lower()
         assert "0.95.0" in result.output
         popen.assert_not_called()
+
+    def test_the_printed_commands_keep_the_tray_extra(self, tmp_path):
+        """Rich reads "[tray]" as a style tag. Unescaped, the echoed install
+        and rollback commands lost it, and the printed command was not the
+        command that ran."""
+        result, _run, _popen = self._invoke(
+            [_ok(), _fail(1, stderr="[FAIL] ValueError: nope"), _ok(), _ok(), _ok()],
+            tmp_path=tmp_path,
+        )
+
+        output = " ".join(result.output.split())
+        assert '$ uv tool install "claude-jacked[tray]" --force --refresh' in output
+        assert (
+            '$ uv tool install "claude-jacked[tray]==0.95.0" --force --refresh'
+            in output
+        )
 
     def test_refused_preflight_writes_the_recovery_file(self, tmp_path):
         recovery = tmp_path / "jacked-update-failed.txt"
@@ -1260,6 +1278,36 @@ class TestIndexLag:
         assert data["overall"] == "failed"
         assert "does not serve v0.107.1" in data["error"]
 
+    @staticmethod
+    def _real_target(json_api, simple_index):
+        """The REAL target lookup, with only the two index probes replaced."""
+        from jacked import cli
+
+        with patch("jacked.version_check.get_latest_pypi_version", return_value=json_api), \
+                patch("jacked.version_check.get_latest_from_simple_index",
+                      return_value=simple_index):
+            return cli._upgrade_target_version_impl()
+
+    def test_pin_166i_a_lagging_simple_index_stays_detectable(self):
+        """#166i (commit 26227f8) must not come back: with the JSON API ahead
+        of the simple index, the target is the newer release, so the install
+        of the older build reads as index lag, not as "Upgrade complete"."""
+        from jacked import cli
+
+        target = self._real_target("0.111.0", "0.110.2")
+        assert target == "0.111.0"
+        assert cli._index_lag(installed="0.110.2", target=target) is True
+
+    def test_pin_g3_a_lagging_json_api_is_not_index_lag(self):
+        """G3 (2026-11-02): the JSON API still said 0.110.1 and uv installed
+        0.110.2 from the simple index. The target names 0.110.2, and the
+        install is complete, not lagging."""
+        from jacked import cli
+
+        target = self._real_target("0.110.1", "0.110.2")
+        assert target == "0.110.2"
+        assert cli._index_lag(installed="0.110.2", target=target) is False
+
 
 def test_status_succeed_shim_reports_index_lag(tmp_path):
     import json
@@ -1295,28 +1343,183 @@ def test_a_reinstall_of_the_running_version_keeps_next_as_the_status_target(tmp_
 
 
 class TestTargetLookup:
-    """The real _upgrade_target_version (the autouse stub is bypassed here)."""
+    """The real _upgrade_target_version (the autouse stub is bypassed here).
 
-    def test_lookup_returns_the_pypi_version(self, monkeypatch):
+    The target is the newest release that the JSON API or the simple index
+    names. Every test replaces BOTH probes: no test reaches PyPI.
+    """
+
+    @staticmethod
+    def _probe(name, answer):
+        """Replace one index probe. An exception answer is raised by it."""
+        target = f"jacked.version_check.{name}"
+        if isinstance(answer, BaseException):
+            return patch(target, side_effect=answer)
+        return patch(target, return_value=answer)
+
+    def _lookup(self, json_api, simple_index):
+        """The real lookup with the JSON API and simple index answers given."""
         from jacked import cli
 
-        with patch("jacked.version_check.get_latest_pypi_version", return_value="0.109.0"):
-            assert cli._upgrade_target_version_impl() == "0.109.0"
+        with self._probe("get_latest_pypi_version", json_api), \
+                self._probe("get_latest_from_simple_index", simple_index):
+            return cli._upgrade_target_version_impl()
 
-    def test_lookup_failure_is_none(self):
+    def test_a_lagging_json_api_does_not_hide_the_version_uv_installs(self):
+        """2026-11-02: the JSON API still said 0.110.1, the simple index
+        served 0.110.2, and uv installed 0.110.2."""
+        assert self._lookup("0.110.1", "0.110.2") == "0.110.2"
+
+    def test_a_lagging_simple_index_keeps_the_newer_json_api_target(self):
+        """#166i: the simple index can lag a release. The target stays the
+        JSON API's newer answer, so the upgrade can report that the index
+        does not serve it yet instead of "Upgrade complete"."""
+        assert self._lookup("0.111.0", "0.110.2") == "0.111.0"
+
+    @staticmethod
+    def _probe_failures(caplog):
+        """The DEBUG lines that the probe guard wrote, then clear the capture.
+
+        A line names the probe and the error class only. The message of an
+        error can hold the index URL, so the line and the record carry no
+        message and no traceback.
+        """
+        import logging
+
+        lines = []
+        for record in caplog.records:
+            if record.name == "jacked.cli" and record.levelno == logging.DEBUG:
+                assert record.exc_info is None, record.getMessage()
+                lines.append(record.getMessage())
+        caplog.clear()
+        return sorted(lines)
+
+    def test_a_failed_simple_index_does_not_hide_the_json_api_answer(self, caplog):
+        caplog.set_level("DEBUG", logger="jacked.cli")
+        assert self._lookup("0.110.2", None) == "0.110.2"
+        assert self._probe_failures(caplog) == []  # no answer is not a failure
+        assert self._lookup("0.110.2", OSError("offline")) == "0.110.2"
+        assert self._probe_failures(caplog) == [
+            "Upgrade target probe get_latest_from_simple_index failed: OSError"
+        ]
+
+    def test_a_failed_json_api_does_not_hide_the_simple_index_answer(self, caplog):
+        caplog.set_level("DEBUG", logger="jacked.cli")
+        assert self._lookup(OSError("offline"), "0.110.2") == "0.110.2"
+        assert self._probe_failures(caplog) == [
+            "Upgrade target probe get_latest_pypi_version failed: OSError"
+        ]
+        assert self._lookup(None, "0.110.2") == "0.110.2"
+        assert self._probe_failures(caplog) == []
+
+    def test_both_probes_failing_is_none(self, caplog):
+        caplog.set_level("DEBUG", logger="jacked.cli")
+        assert self._lookup(None, None) is None
+        assert self._probe_failures(caplog) == []
+        assert self._lookup(OSError("offline"), OSError("offline")) is None
+        assert self._probe_failures(caplog) == [
+            "Upgrade target probe get_latest_from_simple_index failed: OSError",
+            "Upgrade target probe get_latest_pypi_version failed: OSError",
+        ]
+
+    def test_an_answer_that_is_not_a_version_counts_as_no_answer(self):
+        assert self._lookup("0.110.2", "garbage-version-string") == "0.110.2"
+        assert self._lookup("garbage-version-string", "0.110.2") == "0.110.2"
+        assert self._lookup("garbage-version-string", "garbage") is None
+        # The JSON API answer is whatever the response holds.
+        assert self._lookup(0.2, "0.110.2") == "0.110.2"
+        assert self._lookup({"v": 1}, None) is None
+
+    def test_both_probes_use_the_upgrade_timeout(self):
         from jacked import cli
 
-        with patch("jacked.version_check.get_latest_pypi_version", side_effect=OSError("offline")):
-            assert cli._upgrade_target_version_impl() is None
-        with patch("jacked.version_check.get_latest_pypi_version", return_value=None):
-            assert cli._upgrade_target_version_impl() is None
+        with self._probe("get_latest_pypi_version", "0.110.2") as json_api, \
+                self._probe("get_latest_from_simple_index", "0.110.2") as simple:
+            assert cli._upgrade_target_version_impl() == "0.110.2"
+        json_api.assert_called_once_with(timeout=5.0)
+        simple.assert_called_once_with(timeout=5.0)
 
     def test_an_unsafe_version_string_never_reaches_a_batch(self):
+        unsafe = '1.0" & del C:\\x & "'
+        assert self._lookup(unsafe, unsafe) is None
+        assert self._lookup("0.110.2", unsafe) == "0.110.2"
+        assert self._lookup(unsafe, "0.110.2") == "0.110.2"
+        # A valid PEP 440 spelling can still hold a character that the batch
+        # guard refuses: the result is the normalized version, never the raw
+        # answer.
+        assert self._lookup(" 0.110.3 ", None) == "0.110.3"
+        # A valid version that is longer than the batch guard allows (64
+        # characters) is refused by the guard itself.
+        too_long = "1." + ".".join(["0"] * 40)
+        assert self._lookup(too_long, None) is None
+
+    def test_the_probes_run_at_the_same_time(self):
+        """An unreachable index costs one timeout, not two: each probe waits
+        for the other at a barrier, which only opens when both run at once."""
+        import threading
+
         from jacked import cli
 
+        barrier = threading.Barrier(2, timeout=5)
+
+        def meets_the_other_probe(answer):
+            def probe(timeout):
+                barrier.wait()
+                return answer
+            return probe
+
         with patch("jacked.version_check.get_latest_pypi_version",
-                   return_value='1.0" & del C:\\x & "'):
-            assert cli._upgrade_target_version_impl() is None
+                   side_effect=meets_the_other_probe("0.110.1")), \
+                patch("jacked.version_check.get_latest_from_simple_index",
+                      side_effect=meets_the_other_probe("0.110.2")):
+            assert cli._upgrade_target_version_impl() == "0.110.2"
+
+
+class TestTargetLookupDrivesTheLagReport:
+    """`jacked upgrade` end to end with the REAL target lookup: only the two
+    index probes and the subprocess calls are replaced."""
+
+    def _invoke(self, json_api, simple_index, installed, version, run_results):
+        from jacked import cli
+        from jacked.cli import main
+
+        stack = TestUpgradeIsATransaction._patches()
+        with (
+            stack[0], stack[1], stack[2], stack[3],
+            patch("subprocess.Popen"),
+            patch("subprocess.run") as run,
+            patch("jacked.__version__", version),
+            patch("jacked.cli._installed_package_version", return_value=installed),
+            patch("jacked.cli._upgrade_target_version", cli._upgrade_target_version_impl),
+            patch("jacked.version_check.get_latest_pypi_version", return_value=json_api),
+            patch("jacked.version_check.get_latest_from_simple_index",
+                  return_value=simple_index),
+        ):
+            run.side_effect = list(run_results)
+            result = CliRunner().invoke(main, ["upgrade"])
+        return result, run
+
+    def test_a_lagging_simple_index_is_reported_not_called_complete(self):
+        """#166i (0.107.0 -> 0.107.1): the simple index still served 0.107.0,
+        so uv reinstalled it. The service is not touched."""
+        result, run = self._invoke("0.107.1", "0.107.0", installed="0.107.0",
+                                   version="0.107.0", run_results=[_ok()])
+        assert result.exit_code == 4, result.output
+        assert "Target version: v0.107.1 (PyPI)" in result.output
+        assert ("Already on v0.107.0. The package index does not serve v0.107.1 yet."
+                in result.output)
+        assert "Upgrade complete" not in result.output
+        assert run.call_count == 1
+
+    def test_a_lagging_json_api_names_the_build_uv_installs(self):
+        """G3 (2026-11-02): the JSON API still said 0.110.1, the simple index
+        served 0.110.2, and uv installed 0.110.2."""
+        result, _run = self._invoke("0.110.1", "0.110.2", installed="0.110.2",
+                                    version="0.110.1", run_results=[_ok()] * 5)
+        assert result.exit_code == 0, result.output
+        assert "Target version: v0.110.2 (PyPI)" in result.output
+        assert "Target version: v0.110.1" not in result.output
+        assert "Upgrade complete." in result.output
 
 
 # ---------------------------------------------------------------------------

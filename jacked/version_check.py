@@ -6,6 +6,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from packaging.version import InvalidVersion, Version
+
 from jacked.atomic_io import atomic_write_text
 
 VERSION_CACHE =Path.home() / ".claude" / "jacked-version-cache.json"
@@ -47,9 +49,12 @@ def get_latest_pypi_version(package: str = "claude-jacked", timeout: float = 3.0
 
 
 def get_latest_from_simple_index(package: str = "claude-jacked", timeout: float = 3.0) -> str | None:
-    """Query the PEP 691 JSON variant of /simple/<package>/. Returns max non-yanked version or None.
+    """Query the PEP 691 JSON variant of /simple/<package>/. Returns the version uv installs, or None.
 
-    This is THE SAME index uv reads. A version's presence here guarantees
+    This is THE SAME index uv reads, and the pick follows uv's default
+    resolution: yanked files do not count, a pre-release (a, b, rc or dev)
+    counts only when the index has no final release, and versions compare in
+    PEP 440 order. A version's presence here guarantees
     `uv tool install --refresh` can resolve to it.
     """
     try:
@@ -71,10 +76,16 @@ def get_latest_from_simple_index(package: str = "claude-jacked", timeout: float 
             fn = entry.get("filename", "")
             m = _VERSION_FROM_FILENAME.match(fn)
             if m:
-                versions.add(m.group(1))
-        if not versions:
+                # The pattern captures only valid PEP 440 versions.
+                versions.add(Version(m.group(1)))
+        # uv does not install a pre-release while a final release exists. A
+        # leading-numbers tuple would rank 0.111.0rc1 above 0.110.2, and tie
+        # 0.111.0 with 0.111.0.post1 (then the set order picks one).
+        finals = {v for v in versions if not v.is_prerelease}
+        candidates = finals or versions
+        if not candidates:
             return None
-        return max(versions, key=_parse_version_tuple)
+        return str(max(candidates))
     except Exception:
         return None
 
@@ -130,6 +141,76 @@ def is_newer(latest: str, current: str) -> bool:
         return False
 
 
+def installable_version(pypi_latest: str | None, simple_latest: str | None) -> str | None:
+    """What uv installs now: the update badge offers this version.
+
+    uv resolves through the simple index (PEP 691), so the simple index's
+    answer is the installable version. The JSON API answer is never the
+    result, because uv does not read the JSON API. For minutes after a
+    release, the JSON API can name an older version (it lags) or a version
+    that the simple index does not serve yet (it leads). When the simple
+    index gives no parseable answer, the installable version is unknown and
+    the result is None. The caller passes both probe answers.
+
+    This answer differs from newest_listed_version() on purpose. The badge
+    must offer only a version that uv can install now. Thus a JSON API that
+    leads the simple index cannot show a phantom update. In G3 (the
+    2026-11-02 lag), the JSON API still named 0.110.1 while the simple index
+    served 0.110.2: the badge offers 0.110.2, the version that the update
+    installs.
+
+    >>> installable_version("0.110.1", "0.110.2")  # the JSON API lags (G3)
+    '0.110.2'
+    >>> installable_version("0.111.0", "0.110.2")  # the simple index lags
+    '0.110.2'
+    >>> installable_version(None, "0.110.2")  # only the simple index answers
+    '0.110.2'
+    >>> installable_version("0.110.2", None) is None  # a JSON-only answer
+    True
+    """
+    if not simple_latest or not _parse_version_tuple(simple_latest):
+        return None
+    return simple_latest
+
+
+def newest_listed_version(pypi_latest: str | None, simple_latest: str | None) -> str | None:
+    """What ``jacked upgrade`` aims for: the newest release that a probe names.
+
+    Versions compare in PEP 440 order. An answer that is not a valid version
+    string counts as no answer. The result is None only when neither probe
+    gives a valid answer. The result is the normalized version string.
+
+    This answer differs from installable_version() on purpose. When the
+    simple index lags the JSON API, uv installs the older build. The target
+    must stay the newer JSON API answer. Then the upgrade reports "the
+    package index does not serve vX yet" instead of "Upgrade complete"
+    (#166i, commit 26227f8). When the JSON API lags the simple index, the
+    simple index's newer answer is the target, and uv installs it. In G3
+    (the 2026-11-02 lag), the target line said v0.110.1 while uv installed
+    0.110.2.
+
+    >>> newest_listed_version("0.110.1", "0.110.2")  # the JSON API lags (G3)
+    '0.110.2'
+    >>> newest_listed_version("0.111.0", "0.110.2")  # the simple index lags (#166i)
+    '0.111.0'
+    >>> newest_listed_version(None, "0.110.2"), newest_listed_version("0.110.2", None)
+    ('0.110.2', '0.110.2')
+    >>> newest_listed_version("garbage", None) is None
+    True
+    """
+    answers = []
+    for answer in (simple_latest, pypi_latest):
+        # The JSON API answer is whatever the response holds: it can be any
+        # JSON type, not only a string.
+        if not isinstance(answer, str):
+            continue
+        try:
+            answers.append(Version(answer))
+        except InvalidVersion:
+            continue
+    return str(max(answers)) if answers else None
+
+
 def _cache_ttl(pypi_latest, simple_latest, installable, current_version) -> int:
     """How long one check of the index stays fresh, in seconds.
 
@@ -154,14 +235,16 @@ def _cache_ttl(pypi_latest, simple_latest, installable, current_version) -> int:
 
 
 def check_version_cached(current_version: str, force: bool = False) -> dict | None:
-    """Check PyPI with 24h cache. Returns dict with keys:
+    """Check PyPI with a 12 h cache (see CACHE_TTL). Returns dict with keys:
        latest (alias for installable_latest, kept for back-compat),
        installable_latest, pypi_latest, simple_latest, outdated, checked_at, next_check_at.
 
-    Both /pypi/json and /simple/ are probed; outdated is true only when the LESSER
-    of the two (== what uv would actually install) is newer than current_version.
-    This eliminates phantom 'Update available' badges when PyPI's /simple/ index
-    is still propagating a newly-published release.
+    Both /pypi/json and /simple/ are probed. outdated is true only when both
+    answer and the simple index's version (what uv installs, see
+    installable_version) is newer than current_version. This prevents a
+    phantom 'Update available' badge while /simple/ still propagates a new
+    release, and the badge names the version that the update installs while
+    the JSON API lags.
     """
     try:
         now = time.time()
@@ -205,19 +288,14 @@ def check_version_cached(current_version: str, force: bool = False) -> dict | No
         pypi_latest = get_latest_pypi_version()
         simple_latest = get_latest_from_simple_index()
 
-        # Conservative: if either probe failed OR returned an unparseable
-        # version (defensive — PyPI shouldn't ever do this, but a corrupted
-        # cache/proxy could), do not surface an update.
-        if not pypi_latest or not simple_latest:
-            installable = current_version
-        else:
-            p_pypi = _parse_version_tuple(pypi_latest)
-            p_simple = _parse_version_tuple(simple_latest)
-            if not p_pypi or not p_simple:
-                installable = current_version
-            else:
-                # The LESSER of the two — what uv would actually resolve to.
-                installable = pypi_latest if p_pypi <= p_simple else simple_latest
+        # The badge's own conservative rule: when either probe failed or gave
+        # an unparseable version (a corrupted cache or proxy could), installable
+        # stays the running version and no update shows. When both answer, the
+        # version is the simple index's answer (installable_version), which is
+        # what uv installs, also when the JSON API leads or lags that index.
+        installable = current_version
+        if pypi_latest and _parse_version_tuple(pypi_latest):
+            installable = installable_version(pypi_latest, simple_latest) or current_version
 
         outdated = is_newer(installable, current_version)
 

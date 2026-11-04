@@ -2,10 +2,12 @@
 
 The pystray tray icon color shows the state of the service, so the usage goes
 in two other places: the icon tooltip (Windows shows it on hover) and a line
-at the top of the tray menu (every backend shows it; the Linux backends have
-no hover tooltip). :class:`UsageTooltip` reads ``/api/menubar-summary`` from
-its own service and sets both. The macOS menu bar does not use this module:
-it shows the usage as the pill text.
+at the top of the tray menu (every backend with a menu shows it; the pystray
+Xorg backend has no menu, and the Linux backends have no hover tooltip).
+:class:`UsageTooltip` reads ``/api/menubar-summary`` from its own service and
+sets both. The macOS menu bar does not use this module: it shows the usage as
+the pill text. The module also holds the probes for the capabilities that a
+pystray backend declares (a menu, notifications). The tray uses them too.
 """
 
 from __future__ import annotations
@@ -32,6 +34,42 @@ logger = logging.getLogger(__name__)
 # 1-second watch and 30-second heartbeat.
 TICK_S = 1.0
 HEARTBEAT_S = 30.0
+
+
+def tray_backend_has_menu(icon: object) -> bool:
+    """True when the pystray backend of *icon* can show a menu.
+
+    pystray declares this capability as the class attribute ``HAS_MENU``.
+    Only the Xorg backend sets it to False. An icon that does not declare
+    the attribute counts as a backend with a menu. The tray setup and the
+    usage line both use this probe.
+
+    >>> class XorgIcon:
+    ...     HAS_MENU = False
+    >>> tray_backend_has_menu(XorgIcon())
+    False
+    >>> tray_backend_has_menu(object())
+    True
+    """
+    return bool(getattr(icon, "HAS_MENU", True))
+
+
+def tray_backend_can_notify(icon: object) -> bool:
+    """True when the pystray backend of *icon* can show a notification.
+
+    pystray declares this capability as the class attribute
+    ``HAS_NOTIFICATION``. Only the Xorg backend sets it to False, and its
+    ``notify`` raises NotImplementedError. An icon that does not declare
+    the attribute counts as a backend with notifications.
+
+    >>> class XorgIcon:
+    ...     HAS_NOTIFICATION = False
+    >>> tray_backend_can_notify(XorgIcon())
+    False
+    >>> tray_backend_can_notify(object())
+    True
+    """
+    return bool(getattr(icon, "HAS_NOTIFICATION", True))
 
 
 class UsageTooltip:
@@ -109,7 +147,7 @@ class UsageTooltip:
     def _has_menu(self, icon) -> bool:
         """False on a backend with no menu (pystray Xorg). Say so once: the
         usage then shows only where the tray displays the icon title."""
-        if getattr(icon, "HAS_MENU", True):
+        if tray_backend_has_menu(icon):
             return True
         if not self._no_menu_noted:
             self._no_menu_noted = True
