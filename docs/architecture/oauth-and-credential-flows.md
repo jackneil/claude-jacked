@@ -180,6 +180,43 @@ representation used by stores, the resolver, and the transaction engine. It:
 The canonical digest compares complete payloads. It is not written into the
 secret-free resolver snapshot.
 
+### Pass-through fields
+
+Claude Code writes four fields into `claudeAiOauth` that jacked's columns do
+not model: `refreshTokenExpiresAt`, `clientId`, `subscriptionTypeSource` and
+`subscriptionTypeVerifiedAt`. jacked keeps them per account in
+`accounts.cc_oauth_extra` (`jacked/credentials/oauth_extra.py`) and writes
+them back on the next switch. Two rules bind the stored values:
+
+- The record names the refresh lineage it was captured with (`_lineage`).
+  jacked reads it back only while the row still holds that refresh token.
+- The record names the tier that `subscriptionTypeVerifiedAt` verified
+  (`_tier`). jacked writes the timestamp back only while the row's
+  `subscription_type` still equals that tier. A changed tier publishes
+  `subscriptionTypeSource` with no timestamp. Claude Code applies the same
+  rule in its own refresh merge, and it re-checks the profile for that shape.
+
+jacked never invents a value. Before a switch, the transaction engine compares
+the keys in the authority with the keys in the target payload. It logs a
+WARNING for a key outside this allowlist, because the switch drops that key.
+It logs an allowlisted key that the target payload does not carry at DEBUG,
+because Claude Code re-derives that key. The DEBUG line names the account id
+and the key names. Neither line contains a value.
+
+jacked's own refresh of the Claude Code chain applies the same rules:
+
+- The refresh binds the stored fields to the new refresh token.
+- The refresh takes `refreshTokenExpiresAt` from the token response when the
+  response sends it. Otherwise, it keeps the previous value.
+- The refresh does not change the tier. It keeps `subscriptionTypeVerifiedAt`
+  only while the row's `subscription_type` equals the captured tier.
+  Otherwise, it removes the timestamp and keeps `subscriptionTypeSource`.
+
+After an invalid_grant, jacked can keep a live access token that it proves
+belongs to the account. This recovery stores the pass-through fields of the
+live object with no refresh token. It does not keep `refreshTokenExpiresAt`.
+It binds `subscriptionTypeVerifiedAt` to the tier in the live object.
+
 ## 4. Capability resolution fails closed
 
 Before the new activation path can mutate credentials, it resolves the actual
@@ -569,13 +606,108 @@ with evidence for the scoped-file input and global-authority observation. The
 system must not claim that the child actually consumed only the scoped
 credential file.
 
+### Token sync from the per-account file
+
+While a launched Claude Code runs, `jacked/launch.py` `_sync_tokens_from_file()`
+copies a rotated token pair from the per-account `.credentials.json` into the
+account row. The sync runs when the mtime of the file changes. The thread reads
+the mtime every 30 seconds. The sync also runs one time when Claude Code stops.
+
+The per-account `.claude.json` does not prove who owns the tokens, because
+jacked and Claude Code both write it from the token that a process holds. The
+sync does not read that file. The sync uses the import rules of reconcile
+(`jacked/api/credential_helpers.py`):
+
+- An expiry that is not a real time stops the sync. jacked logs
+  `Token sync BLOCKED for account N: unreadable expiry`.
+- A row that has no Claude Code token gets no tokens. Only the OAuth flow or a
+  jacked refresh fills those columns.
+- jacked does not import its own primary-token fallback into the cc_* columns,
+  because that merges the two chains.
+- A pair that expires before the pair in the row does not replace that pair.
+  The exception is a row token that is known to be dead (#179i).
+- The shared ownership rule (`live_payload_ownership`) must prove the owner.
+  The per-account file has no `_jackedAccountId` stamp, so the rule does not
+  require one. A token that the row holds proves the owner with no request.
+  Any other token gets one cached profile request, and the shared owner rule
+  compares the profile with the row. A profile answer of 401 or 403 is about
+  the token, so it settles the verdict as refused. The verdict cache keeps
+  that refusal for 15 minutes, and then the next sync asks again, because an
+  edge or a policy can refuse a token for a short time. A profile that names
+  another owner is final for the life of the token.
+
+The sync runs the local rules first. Only a token that they cannot place costs
+a profile request. The sync gives one of four results:
+
+- `imported`: the tokens belong to the row, and the row holds them now.
+- `refused`: the profile names another owner, or the file holds an expired
+  access token and no new refresh token. jacked writes nothing and logs
+  `Token sync BLOCKED for account N: ownership not proven`. The line gives the
+  row id only. A refusal holds only for the row it was decided against: when
+  the row identity (email, organization uuid, account uuid) changed during
+  the profile request, the sync defers instead, and the next pass decides
+  against the new row. The verdict cache is keyed by that identity, so the
+  new row gets a fresh profile request. A refusal the profile settled by
+  naming another account is also remembered beside the per-account file,
+  as digests of the pair and of the row identity, never a token
+  (`.jacked-foreign-pair.json`). The next launch replaces that pair without
+  a request, even when its access token expired. The launch removes the
+  marker when it writes the row's pair.
+- `deferred`: the profile request failed, an error stopped the sync (for
+  example, a half-written file), or the file holds a rotation whose access
+  token expired before the sync could ask (a new refresh token beside an
+  expired access token). Nobody can prove that rotation now, and the file
+  keeps it for the next session. jacked writes nothing. The poll loop keeps
+  the old mtime, so the next poll tries again when the file does not change.
+  The verdict cache keeps the result of a failed request for 5 minutes, so the
+  next request goes out after that time. The first deferral of a row in a
+  process is a WARNING, and the retries are INFO lines.
+- `unchanged`: there is nothing to copy, or another writer changed the row
+  first. jacked writes nothing.
+
+The write is a compare-and-swap on the access token that the sync read before
+the profile request. A writer that changes the row during the request wins.
+
+Two steps keep a rotation that the loop could not prove from being lost:
+
+- When Claude Code stops, jacked clears the verdict cache before the exit-time
+  sync, so a deferred token gets one fresh profile request. A refused
+  exit-time sync logs a WARNING with the row id, because the next launch
+  writes the row's tokens over the file.
+- The sync thread syncs the file one time when it starts, before it accepts
+  the file's mtime as processed, so a rotation that landed between the
+  launch's own write and the thread's start is not missed.
+- Before the next launch of the same account, `prepare_account_dir()` runs the
+  sync on the existing per-account file before the pre-launch refresh spends
+  the row's refresh token. A proven rotation goes into the row first, and the
+  launch then re-reads the row. A refused result (another owner) falls
+  through, and the launch writes the row's tokens over the file as before,
+  with a WARNING that gives the row id and the sync result. A deferred result
+  (the profile request failed, or the access token of the rotation expired
+  before the launch) keeps the file's tokens for that launch and logs a
+  WARNING, because the row's spent lineage written over the only live
+  rotation would be the real loss. The launch also skips its pre-launch
+  Claude Code refresh in that case, because the rotation in the file may have
+  spent the refresh token of the row. Claude Code refreshes from the file,
+  and the sync proves the new access token on its next poll. On a platform
+  whose authority is the launch directory's own file, the launch reads back
+  the pair it wrote, so a kept rotation reads back as itself, and the
+  resolver snapshot carries the evidence
+  `launch:scoped-file:unchecked-rotation-kept`.
+- The write of a proven rotation is a compare-and-swap on the access token AND
+  on the identity the proof was made against (email, organization uuid,
+  account uuid). A writer that changed either during the profile request wins,
+  and the sync forgets its cached verdict for that row, so the next attempt
+  proves the token against the new identity.
+
 ## 11. Foreign authority writes
 
 Claude Code holds its OAuth token in memory. When that token expires, the
 session refreshes it and writes the new payload into the same authority store
-jacked writes. The payload has no `_jackedAccountId` stamp, and it carries a
-`refreshTokenExpiresAt` field that jacked logs as schema drift. A session that
-still holds an older account therefore replaces the account the user chose.
+jacked writes. The payload has no `_jackedAccountId` stamp. It carries the pass-through
+fields that jacked stores per account (see section 3); a key outside that
+allowlist is logged as schema drift. A session that still holds an older
+account therefore replaces the account the user chose.
 
 Three effects follow a foreign write:
 
@@ -611,7 +743,19 @@ before the pass observes the authority:
   wrote. Sessions do not change account, the observed identity becomes usable,
   and the status line shows the true account. The guard cannot restore a
   refresh lineage that is already lost; the user re-authenticates the desired
-  account to make it the default again.
+  account to make it the default again. When the holding account has no
+  Claude Code access token either, there is nothing to re-stamp with: the
+  guard settles the payload at once, logs one WARNING, and leaves the
+  authority unstamped.
+- Both repairs, the reassert and the re-stamp, share one retry rule
+  (#157i). The guard records a repair as done only after the engine commits
+  it. A 60-second floor spaces the attempts. The transient answers of the
+  engine (a held switch lease, a busy outgoing row, a torn authority, an
+  unreadable authority) are retried after the floor and do not count; ten
+  of them in a row are reported with one WARNING. Any
+  other failure is attempted three times. The third failure settles the
+  payload with one WARNING that names the row and the outcome, and the guard
+  tries again only when the authority payload changes.
 
 A stamp does not prove who owns the tokens. Claude Code keeps the top-level
 `_jackedAccountId` when it rewrites the item. A `/login` to another account in
@@ -653,8 +797,10 @@ row only when it can prove the owner:
 - Any other live token is identified through the OAuth profile endpoint,
   with the shared owner rule `profile_owner_mismatch()`. The email must match
   the row, and so must the organization uuid and the account uuid when both
-  sides record them. The verdict is cached for each token, and a failed
-  request is retried after 5 minutes.
+  sides record them. The verdict is cached for each token. A failed request
+  is retried after 5 minutes, and a 401 or 403 answer after 15 minutes. A
+  profile that names the owner, or another owner, is final for the life of
+  the token.
 - Nothing else is proof. The stamp survives Claude Code's writes, and jacked
   rewrites the `~/.claude.json` identity on every switch, so neither names the
   owner of the tokens.

@@ -171,135 +171,99 @@ class TestGetAccountByEmailAmbiguity:
 # ---------------------------------------------------------------------------
 
 
+def _profile_says(email, org):
+    """Fake the profile of the rotated token (#158i: the launch sync proves
+    ownership with the token's profile, never with .claude.json)."""
+    from unittest.mock import patch
+
+    from jacked.api.authority_guard import ProfileLookup
+
+    organization = {"uuid": org} if org is not None else {}
+    return patch(
+        "jacked.api.credential_helpers._ownership_lookup",
+        return_value=ProfileLookup(200, {"account": {"email": email},
+                                         "organization": organization}),
+    )
+
+
 class TestSyncTokensOrgCheck:
-    """Test 5: Token sync blocked on org UUID mismatch."""
+    """Test 5: the token sync refuses a token whose profile names another org."""
+
+    @staticmethod
+    def _account_with_cc(db, org):
+        acct = db.create_account(
+            email="jack@x.com",
+            access_token="at1",
+            expires_at=int(time.time()) + 3600,
+            organization_uuid=org,
+        )
+        # Give it a CC token so sync has something to check
+        db.update_account(acct["id"], cc_access_token="old_cc_at")
+        return acct["id"]
+
+    @staticmethod
+    def _rotated_file(tmp_path, acct_id):
+        config_dir = tmp_path / "accounts" / str(acct_id)
+        config_dir.mkdir(parents=True)
+        (config_dir / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "new_cc_at",
+                "refreshToken": "new_cc_rt",
+                "expiresAt": (int(time.time()) + 7200) * 1000,
+            }
+        }))
+        return config_dir
 
     def test_org_mismatch_blocks_sync(self, tmp_path):
-        """Sync blocked when file org doesn't match DB org."""
+        """Sync blocked when the token's profile names another org."""
         from jacked.launch import _sync_tokens_from_file
 
         db = Database(str(tmp_path / "test.db"))
         try:
-            acct = db.create_account(
-                email="jack@x.com",
-                access_token="at1",
-                expires_at=int(time.time()) + 3600,
-                organization_uuid="org-123",
-            )
-            acct_id = acct["id"]
-            # Give it a CC token so sync has something to check
-            db.update_account(acct_id, cc_access_token="old_cc_at")
+            acct_id = self._account_with_cc(db, "org-123")
+            config_dir = self._rotated_file(tmp_path, acct_id)
 
-            config_dir = tmp_path / "accounts" / str(acct_id)
-            config_dir.mkdir(parents=True)
+            with _profile_says("jack@x.com", "wrong-org-456"):
+                result = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
-            # Write credential file with a token
-            cred_path = config_dir / ".credentials.json"
-            cred_path.write_text(json.dumps({
-                "claudeAiOauth": {
-                    "accessToken": "new_cc_at",
-                    "refreshToken": "new_cc_rt",
-                    "expiresAt": (int(time.time()) + 7200) * 1000,
-                }
-            }))
-
-            # Write .claude.json with WRONG org
-            claude_json = config_dir / ".claude.json"
-            claude_json.write_text(json.dumps({
-                "oauthAccount": {
-                    "emailAddress": "jack@x.com",
-                    "organizationUuid": "wrong-org-456",
-                }
-            }))
-
-            _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
-
+            assert result == "refused"
             # Token should NOT have been updated
-            refreshed = db.get_account(acct_id)
-            assert refreshed["cc_access_token"] == "old_cc_at"
+            assert db.get_account(acct_id)["cc_access_token"] == "old_cc_at"
         finally:
             db.close()
 
     def test_missing_org_on_org_account_blocks_sync(self, tmp_path):
-        """Sync blocked when file has no org but DB account is org-scoped."""
+        """Sync blocked when the profile has no org but the account is org-scoped."""
         from jacked.launch import _sync_tokens_from_file
 
         db = Database(str(tmp_path / "test.db"))
         try:
-            acct = db.create_account(
-                email="jack@x.com",
-                access_token="at1",
-                expires_at=int(time.time()) + 3600,
-                organization_uuid="org-123",
-            )
-            acct_id = acct["id"]
-            db.update_account(acct_id, cc_access_token="old_cc_at")
+            acct_id = self._account_with_cc(db, "org-123")
+            config_dir = self._rotated_file(tmp_path, acct_id)
 
-            config_dir = tmp_path / "accounts" / str(acct_id)
-            config_dir.mkdir(parents=True)
+            with _profile_says("jack@x.com", None):
+                result = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
-            cred_path = config_dir / ".credentials.json"
-            cred_path.write_text(json.dumps({
-                "claudeAiOauth": {
-                    "accessToken": "new_cc_at",
-                    "expiresAt": (int(time.time()) + 7200) * 1000,
-                }
-            }))
-
-            # Write .claude.json WITHOUT organizationUuid
-            claude_json = config_dir / ".claude.json"
-            claude_json.write_text(json.dumps({
-                "oauthAccount": {
-                    "emailAddress": "jack@x.com",
-                }
-            }))
-
-            _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
-
-            refreshed = db.get_account(acct_id)
-            assert refreshed["cc_access_token"] == "old_cc_at"
+            assert result == "refused"
+            assert db.get_account(acct_id)["cc_access_token"] == "old_cc_at"
         finally:
             db.close()
 
     def test_personal_account_skips_org_check(self, tmp_path):
-        """Sync proceeds for personal accounts (empty sentinel) without org in file."""
+        """Sync proceeds for a personal account (empty sentinel) when the
+        profile names the account and carries no org."""
         from jacked.launch import _sync_tokens_from_file
 
         db = Database(str(tmp_path / "test.db"))
         try:
-            acct = db.create_account(
-                email="jack@x.com",
-                access_token="at1",
-                expires_at=int(time.time()) + 3600,
-                organization_uuid="",  # personal
-            )
-            acct_id = acct["id"]
-            db.update_account(acct_id, cc_access_token="old_cc_at")
+            acct_id = self._account_with_cc(db, "")  # personal
+            config_dir = self._rotated_file(tmp_path, acct_id)
 
-            config_dir = tmp_path / "accounts" / str(acct_id)
-            config_dir.mkdir(parents=True)
+            with _profile_says("jack@x.com", None):
+                result = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
-            cred_path = config_dir / ".credentials.json"
-            cred_path.write_text(json.dumps({
-                "claudeAiOauth": {
-                    "accessToken": "new_cc_at",
-                    "refreshToken": "new_cc_rt",
-                    "expiresAt": (int(time.time()) + 7200) * 1000,
-                }
-            }))
-
-            claude_json = config_dir / ".claude.json"
-            claude_json.write_text(json.dumps({
-                "oauthAccount": {
-                    "emailAddress": "jack@x.com",
-                    # No organizationUuid — fine for personal accounts
-                }
-            }))
-
-            _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
-
-            refreshed = db.get_account(acct_id)
-            assert refreshed["cc_access_token"] == "new_cc_at"
+            assert result == "imported"
+            assert db.get_account(acct_id)["cc_access_token"] == "new_cc_at"
         finally:
             db.close()
 

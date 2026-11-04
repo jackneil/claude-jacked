@@ -89,7 +89,7 @@ def _db(**settings) -> FakeDatabase:
     )
 
 
-def _foreign_payload(access="live_at_3", refresh="live_rt_3", expires=1_800_000_000_000):
+def _foreign_payload(access="live_at_3", refresh="live_rt_3", expires=9_999_999_999_000):
     return {
         "claudeAiOauth": {
             "accessToken": access,
@@ -153,7 +153,7 @@ def test_foreign_write_adopts_tokens_and_reasserts_desired():
     )
     assert db.accounts[3]["cc_access_token"] == "live_at_3"
     assert db.accounts[3]["cc_refresh_token"] == "live_rt_3"
-    assert db.accounts[3]["cc_expires_at"] == 1_800_000_000
+    assert db.accounts[3]["cc_expires_at"] == 9_999_999_999
     assert db.accounts[11]["cc_access_token"] == "db_at_11", (
         "the desired row must never receive another account's tokens"
     )

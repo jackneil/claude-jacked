@@ -1361,9 +1361,28 @@ class TestLaunchClaude:
 # ---------------------------------------------------------------------------
 
 
+def _profile_says(profile):
+    """Fake the profile endpoint that the launch token sync asks (#158i)."""
+    from jacked.api.authority_guard import ProfileLookup
+
+    return mock.patch(
+        "jacked.api.credential_helpers._ownership_lookup",
+        return_value=ProfileLookup(200, profile),
+    )
+
+
+def _owner(email, org):
+    return {"account": {"email": email}, "organization": {"uuid": org}}
+
+
 class TestTokenSync:
+    """The launch token sync imports a token only when the shared ownership
+    rule proves that it is the row's token: the row holds the access or the
+    refresh token, or the token's profile names the row. The per-account
+    .claude.json decides nothing (#158i)."""
+
     def test_sync_tokens_from_file_updates_db(self, tmp_path):
-        """_sync_tokens_from_file writes changed tokens to cc_* columns."""
+        """_sync_tokens_from_file writes a proven rotation to cc_* columns."""
         db = _make_db(tmp_path)
 
         config_dir = tmp_path / "accounts" / "1"
@@ -1378,8 +1397,10 @@ class TestTokenSync:
 
         from jacked.launch import _sync_tokens_from_file
 
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _profile_says(_owner("alice@test.com", "org-alice")):
+            result = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
+        assert result == "imported"
         account = db.get_account(1)
         # Writes to cc_* columns, not primary
         assert account["cc_access_token"] == "new_cc_access"
@@ -1405,7 +1426,8 @@ class TestTokenSync:
 
         from jacked.launch import _sync_tokens_from_file
 
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        # The row holds this token: proven with no profile request.
+        assert _sync_tokens_from_file(config_dir, str(tmp_path / "test.db")) == "imported"
 
         # Should not have changed anything
         account = db.get_account(1)
@@ -1431,8 +1453,10 @@ class TestTokenSync:
         rows2 = db.get_session_accounts("sess-pid2")
         assert rows2[0]["ended_at"] is None  # different PID, not closed
 
-    def test_sync_rejects_mismatched_email(self, tmp_path):
-        """_sync_tokens_from_file refuses to sync when email doesn't match DB."""
+    def test_sync_rejects_a_token_whose_profile_names_another_account(self, tmp_path):
+        """Claude Code signed in as bob inside alice's dir: the profile of the
+        new token names bob, so alice's row keeps its own tokens. The
+        .claude.json that Claude Code wrote for bob decides nothing."""
         db = _make_db(tmp_path)
         original = db.get_account(1)
         assert original["access_token"] == "alice_access"
@@ -1454,15 +1478,18 @@ class TestTokenSync:
 
         from jacked.launch import _sync_tokens_from_file
 
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _profile_says(_owner("bob@different.com", "org-bob")):
+            result = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
+        assert result == "refused"
         # DB should NOT be contaminated — alice's original tokens preserved
         account = db.get_account(1)
         assert account["access_token"] == "alice_access"
         assert account["cc_access_token"] == "alice_cc_access"
+        assert account["cc_refresh_token"] == "alice_cc_refresh"
 
-    def test_sync_allows_matching_email(self, tmp_path):
-        """_sync_tokens_from_file syncs CC tokens when email matches DB."""
+    def test_sync_imports_a_token_whose_profile_names_the_account(self, tmp_path):
+        """A legitimate refresh: the profile of the new token names the row."""
         db = _make_db(tmp_path)
 
         config_dir = tmp_path / "accounts" / "1"
@@ -1474,25 +1501,20 @@ class TestTokenSync:
                 "expiresAt": 9999999999000,
             }
         }))
-        # Email matches DB — this is a legitimate token refresh
-        (config_dir / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {
-                "emailAddress": "alice@test.com",
-                "organizationUuid": "org-alice",
-            }
-        }))
 
         from jacked.launch import _sync_tokens_from_file
 
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _profile_says(_owner("alice@test.com", "org-alice")):
+            result = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
+        assert result == "imported"
         account = db.get_account(1)
         # Writes to cc_* columns
         assert account["cc_access_token"] == "refreshed_alice_token"
         assert account["cc_refresh_token"] == "new_refresh"
 
-    def test_sync_allows_case_insensitive_email_match(self, tmp_path):
-        """Email guard compares case-insensitively — same email, different case syncs."""
+    def test_sync_matches_the_profile_email_case_insensitively(self, tmp_path):
+        """The owner rule casefolds the email: same email, different case syncs."""
         db = _make_db(tmp_path)
 
         config_dir = tmp_path / "accounts" / "1"
@@ -1504,23 +1526,18 @@ class TestTokenSync:
                 "expiresAt": 9999999999000,
             }
         }))
-        # Same email, different case — should sync normally
-        (config_dir / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {
-                "emailAddress": "Alice@Test.Com",
-                "organizationUuid": "org-alice",
-            }
-        }))
 
         from jacked.launch import _sync_tokens_from_file
 
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _profile_says(_owner("Alice@Test.Com", "org-alice")):
+            result = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
+        assert result == "imported"
         account = db.get_account(1)
         assert account["cc_access_token"] == "refreshed_token"
 
-    def test_sync_blocks_when_email_missing_from_oauth(self, tmp_path):
-        """Blocks sync when oauthAccount exists but emailAddress is absent."""
+    def test_sync_refuses_a_profile_without_an_email(self, tmp_path):
+        """A profile that names no email cannot name the row: no import."""
         db = _make_db(tmp_path)
 
         config_dir = tmp_path / "accounts" / "1"
@@ -1532,21 +1549,21 @@ class TestTokenSync:
                 "expiresAt": 9999999999000,
             }
         }))
-        # oauthAccount exists but no emailAddress — suspicious
-        (config_dir / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"accountUuid": "some-uuid"}
-        }))
 
         from jacked.launch import _sync_tokens_from_file
 
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _profile_says({"account": {"uuid": "some-uuid"},
+                            "organization": {"uuid": "org-alice"}}):
+            result = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
+        assert result == "refused"
         account = db.get_account(1)
         assert account["access_token"] == "alice_access"  # not contaminated
         assert account["cc_access_token"] == "alice_cc_access"  # CC not contaminated
 
-    def test_sync_allows_when_no_claude_json(self, tmp_path):
-        """_sync_tokens_from_file syncs CC tokens when .claude.json missing."""
+    def test_sync_without_claude_json_still_imports_a_proven_rotation(self, tmp_path):
+        """No .claude.json: the profile still decides, and a proven rotation
+        goes in (the foreign case is in test_launch_token_sync.py)."""
         db = _make_db(tmp_path)
 
         config_dir = tmp_path / "accounts" / "1"
@@ -1558,23 +1575,33 @@ class TestTokenSync:
                 "expiresAt": 9999999999000,
             }
         }))
-        # No .claude.json at all — can't validate, allow sync
 
         from jacked.launch import _sync_tokens_from_file
 
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _profile_says(_owner("alice@test.com", "org-alice")):
+            result = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
+        assert result == "imported"
         account = db.get_account(1)
         assert account["cc_access_token"] == "new_cc_access"
         assert account["cc_refresh_token"] == "new_cc_refresh"
 
-    def test_sync_skips_when_claude_json_corrupted(self, tmp_path):
-        """Corrupted .claude.json → fail closed, skip sync without identity check."""
+    @pytest.mark.parametrize(
+        "profile_email, result, kept",
+        [
+            ("alice@test.com", "imported", "new_cc_access"),
+            ("bob@different.com", "refused", "alice_cc_access"),
+        ],
+    )
+    def test_a_corrupt_claude_json_is_not_evidence_either_way(
+        self, tmp_path, profile_email, result, kept
+    ):
+        """A corrupt .claude.json neither blocks a proven rotation nor lets a
+        foreign token in: the sync does not read it."""
         db = _make_db(tmp_path)
 
         config_dir = tmp_path / "accounts" / "1"
         config_dir.mkdir(parents=True)
-        # Write valid credential file with new tokens
         (config_dir / ".credentials.json").write_text(json.dumps({
             "claudeAiOauth": {
                 "accessToken": "new_cc_access",
@@ -1587,15 +1614,14 @@ class TestTokenSync:
 
         from jacked.launch import _sync_tokens_from_file
 
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _profile_says(_owner(profile_email, "org-alice")):
+            got = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
-        account = db.get_account(1)
-        # Sync should NOT have happened — fail closed
-        assert account["cc_access_token"] == "alice_cc_access"  # unchanged
-
+        assert got == result
+        assert db.get_account(1)["cc_access_token"] == kept
 
     def test_blocked_sync_logs_name_the_field_not_the_values(self, tmp_path, caplog):
-        """Identity-guard warnings carry the row id and the field name only."""
+        """A refusal logs the row id and the profile field name only."""
         import logging
 
         db = _make_db(tmp_path)
@@ -1604,22 +1630,23 @@ class TestTokenSync:
         (config_dir / ".credentials.json").write_text(json.dumps({
             "claudeAiOauth": {"accessToken": "bob_token", "expiresAt": 9999999999000}
         }))
-        (config_dir / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": "bob@different.com"}
-        }))
-        caplog.set_level(logging.DEBUG, logger="jacked.launch")
+        caplog.set_level(logging.DEBUG)
 
         from jacked.launch import _sync_tokens_from_file
 
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _profile_says(_owner("bob@different.com", "org-alice")):
+            _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
-        assert "Token sync BLOCKED for account 1" in caplog.text
-        assert "emailAddress" in caplog.text
+        assert "Token sync BLOCKED for account 1: ownership not proven" in caplog.text
+        assert "names another owner (account.email)" in caplog.text
         assert "bob@" not in caplog.text
         assert "alice@" not in caplog.text
+        assert "bob_token" not in caplog.text
         assert db.get_account(1)["cc_access_token"] == "alice_cc_access"
 
-    def test_org_mismatch_log_carries_uuid_prefixes_only(self, tmp_path, caplog):
+    def test_org_mismatch_log_carries_no_uuid_material(self, tmp_path, caplog):
+        """The same email in another org is another owner. The logs name the
+        field; no uuid, and no uuid prefix, appears in them."""
         import logging
 
         db_org = "0d1e2f3a-3333-4c4d-9e5f-000000000003"
@@ -1634,21 +1661,16 @@ class TestTokenSync:
         (config_dir / ".credentials.json").write_text(json.dumps({
             "claudeAiOauth": {"accessToken": "other_org_token", "expiresAt": 9999999999000}
         }))
-        (config_dir / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {
-                "emailAddress": "alice@test.com",
-                "organizationUuid": file_org,
-            }
-        }))
-        caplog.set_level(logging.DEBUG, logger="jacked.launch")
+        caplog.set_level(logging.DEBUG)
 
         from jacked.launch import _sync_tokens_from_file
 
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _profile_says(_owner("alice@test.com", file_org)):
+            result = _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
-        assert "organizationUuid" in caplog.text
-        assert db_org[:8] in caplog.text and file_org[:8] in caplog.text
-        assert db_org not in caplog.text and file_org not in caplog.text
+        assert result == "refused"
+        assert "names another owner (organization.uuid)" in caplog.text
+        assert db_org[:8] not in caplog.text and file_org[:8] not in caplog.text
         assert "alice@" not in caplog.text
         assert db.get_account(1)["cc_access_token"] == "alice_cc_access"
 

@@ -279,6 +279,18 @@ class TestShouldRefreshCC:
 # ---------------------------------------------------------------------------
 
 
+def _alice_owns_the_token():
+    """The profile of a rotated token names alice's row, so the launch sync
+    may import it (#158i: a token the row does not hold needs that proof)."""
+    from jacked.api.authority_guard import ProfileLookup
+
+    return patch(
+        "jacked.api.credential_helpers._ownership_lookup",
+        return_value=ProfileLookup(200, {"account": {"email": "alice@test.com"},
+                                         "organization": {"uuid": None}}),
+    )
+
+
 class TestSyncTokensCAS:
     def test_cas_writes_to_cc_columns(self, tmp_path):
         """_sync_tokens_from_file writes to cc_* columns, not primary."""
@@ -298,7 +310,8 @@ class TestSyncTokensCAS:
         }))
 
         from jacked.launch import _sync_tokens_from_file
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _alice_owns_the_token():
+            _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
         acct = db.get_account(1)
         assert acct["cc_access_token"] == "new_cc_at"
@@ -321,7 +334,8 @@ class TestSyncTokensCAS:
                               "expiresAt": 9999999999000}
         }))
         from jacked.launch import _sync_tokens_from_file
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _alice_owns_the_token():
+            _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
         acct = db.get_account(1)
         assert acct["cc_access_token"] == "new_cc_at"
         assert acct["cc_refresh_failure_type"] == kept
@@ -412,7 +426,8 @@ class TestSyncTokensCAS:
         }))
 
         from jacked.launch import _sync_tokens_from_file
-        _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
+        with _alice_owns_the_token():
+            _sync_tokens_from_file(config_dir, str(tmp_path / "test.db"))
 
         acct = db.get_account(1)
         assert acct["cc_access_token"] == "new_cc_at"

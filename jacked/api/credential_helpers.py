@@ -204,18 +204,101 @@ def _owner_mismatch(account: dict, profile) -> str | None:
     )
 
 
-# Profile verdicts by (account id, sha256 of the access token). A settled
-# verdict (proven, or another owner) is kept for the token's life; a failed
-# request is retried after _OWNERSHIP_RETRY_SECONDS. Without the cache every
-# dashboard poll would send a profile request for a rejected foreign token.
+# Profile verdicts by (account id, sha256 of the access token, the row
+# identity the verdict was made against). A verdict compares the profile
+# with the row's email, organization and account uuid, so a row whose
+# identity changed (a re-auth) misses the cache by construction and proves
+# the token again. A settled verdict (proven, or another owner) is kept for
+# the token's life; a failed request is retried after
+# _OWNERSHIP_RETRY_SECONDS. Without the cache every dashboard poll would send
+# a profile request for a rejected foreign token.
 _OWNERSHIP_RETRY_SECONDS = 300.0
+# A profile endpoint answer that is about the TOKEN, not about the request
+# (401, 403): the verdict is a refusal, but an edge or policy 403 can be
+# transient, so it is re-asked after this window instead of for good. Only a
+# 200 whose profile names another owner is final for the token's life.
+_OWNERSHIP_TERMINAL_STATUSES = frozenset({401, 403})
+_OWNERSHIP_REFUSAL_RETRY_SECONDS = 900.0
 _OWNERSHIP_CACHE_LIMIT = 64
-_ownership_cache: dict[tuple, tuple[bool | None, float]] = {}
+# key -> (verdict, decided_at, final). A final verdict is kept for the token's
+# life; a non-final one is re-asked after its window (None: 300 s, False from
+# a 401/403: 900 s).
+_ownership_cache: dict[tuple, tuple[bool | None, float, bool]] = {}
+
+
+def _identity_key(account: dict) -> tuple[str, str, str]:
+    """The row identity a verdict is made against, as a cache key part.
+
+    >>> _identity_key({"email": "A@x.com", "organization_uuid": None})
+    ('a@x.com', '', '')
+    """
+    return (
+        (account.get("email") or "").lower(),
+        account.get("organization_uuid") or "",
+        account.get("account_uuid") or "",
+    )
+
+
+def _verdict_key(account: dict, live_access: str) -> tuple:
+    """The cache key of a verdict: the row id, the token's digest, and the
+    row identity the verdict was made against."""
+    import hashlib
+
+    return (
+        account.get("id"),
+        hashlib.sha256(live_access.encode("utf-8")).hexdigest(),
+        _identity_key(account),
+    )
+
+
+def ownership_refusal_is_final(account: dict, live_access) -> bool:
+    """True when the cached verdict for this token and row is a refusal the
+    profile endpoint settled by naming another owner.
+
+    A 401 or 403 refusal is not final (it is asked again later), and neither
+    is a proof or an unknown verdict. A caller that must act on "this pair
+    belongs to another account" across processes (the launch sync remembers
+    such a pair beside the per-account file) asks this right after the
+    verdict, in the same process.
+
+    >>> _ownership_cache.clear()
+    >>> row = {"id": 2, "email": "a@x.com"}
+    >>> ownership_refusal_is_final(row, "t")
+    False
+    >>> _ownership_cache[_verdict_key(row, "t")] = (False, 0.0, True)
+    >>> ownership_refusal_is_final(row, "t")
+    True
+    >>> _ownership_cache[_verdict_key(row, "t")] = (False, 0.0, False)
+    >>> ownership_refusal_is_final(row, "t")
+    False
+    >>> _ownership_cache.clear()
+    """
+    if not isinstance(live_access, str) or not live_access:
+        return False
+    cached = _ownership_cache.get(_verdict_key(account, live_access))
+    return cached is not None and cached[0] is False and bool(cached[2])
 
 
 def clear_ownership_cache() -> None:
     """Forget every cached ownership verdict (tests and account changes)."""
     _ownership_cache.clear()
+
+
+def forget_ownership_verdicts(account_id: int) -> None:
+    """Forget the cached verdicts of one row.
+
+    A verdict proves a token against the row's identity (email, org, uuid)
+    as it was at the time. A writer that changed that identity under a
+    pending import (a re-auth) makes the verdict stale, so the importer
+    forgets it and proves the token again against the new row.
+
+    >>> _ownership_cache[(9, "h")] = (True, 0.0, True); _ownership_cache[(8, "h")] = (True, 0.0, True)
+    >>> forget_ownership_verdicts(9); sorted(k[0] for k in _ownership_cache)
+    [8]
+    >>> _ownership_cache.clear()
+    """
+    for key in [k for k in _ownership_cache if k[0] == account_id]:
+        _ownership_cache.pop(key, None)
 
 
 def expiry_seconds(raw) -> int | None:
@@ -254,21 +337,39 @@ def _live_tokens_belong_to(
 ) -> bool:
     """True when the live tokens provably belong to ``account``.
 
+    The boolean half of :func:`_live_tokens_ownership`: an unknown verdict
+    (a failed lookup) counts as not proven.
+
+    >>> row = {"cc_access_token": "a1", "cc_refresh_token": "r1"}
+    >>> _live_tokens_belong_to(row, "a1", "r9", None)
+    True
+    """
+    return _live_tokens_ownership(account, live_access, live_refresh, live_expires) is True
+
+
+def _live_tokens_ownership(
+    account: dict, live_access: str, live_refresh: str | None, live_expires
+) -> bool | None:
+    """True when the live tokens provably belong to ``account``, False when
+    they provably do not (or can never be proven), None when the profile
+    lookup failed and a later attempt may still decide.
+
     A token the row already holds proves ownership with no network call.
     Any other token is identified through the OAuth profile endpoint with the
     shared owner rule. Nothing else counts as proof: the stamp survives Claude
     Code's own writes, and jacked itself rewrites ~/.claude.json on every
     switch, so neither one names the token's owner.
 
-    An expired token, a failed request, or a call on an event-loop thread
-    proves nothing, and the result is False, so the caller imports nothing.
+    An expired token or a call on an event-loop thread proves nothing, and
+    the result is False, so the caller imports nothing. A failed request is
+    None: the caller may defer and retry instead of dropping the tokens.
 
     >>> row = {"cc_access_token": "a1", "cc_refresh_token": "r1"}
-    >>> _live_tokens_belong_to(row, "a1", "r9", None)
+    >>> _live_tokens_ownership(row, "a1", "r9", None)
     True
-    >>> _live_tokens_belong_to(row, "a9", "r1", None)
+    >>> _live_tokens_ownership(row, "a9", "r1", None)
     True
-    >>> _live_tokens_belong_to(row, "a9", "r9", 1)  # expired, cannot prove
+    >>> _live_tokens_ownership(row, "a9", "r9", 1)  # expired, cannot prove
     False
     """
     if live_access == account.get("cc_access_token"):
@@ -293,26 +394,39 @@ def _live_tokens_belong_to(
         )
         return False
 
-    import hashlib
-
-    key = (account.get("id"), hashlib.sha256(live_access.encode("utf-8")).hexdigest())
+    key = _verdict_key(account, live_access)
     now = time.time()
     cached = _ownership_cache.get(key)
     if cached is not None:
-        verdict, at = cached
-        if verdict is not None or now - at < _OWNERSHIP_RETRY_SECONDS:
-            return bool(verdict)
+        verdict, at, final = cached
+        window = (
+            _OWNERSHIP_RETRY_SECONDS if verdict is None else _OWNERSHIP_REFUSAL_RETRY_SECONDS
+        )
+        if final or now - at < window:
+            return verdict
 
     result = _ownership_lookup(live_access)
+    final = False
     if result.status_code == 200 and isinstance(result.profile, dict):
         field = _owner_mismatch(account, result.profile)
         verdict = field is None
+        final = True  # the token's owner is known either way
         if not verdict:
             logger.warning(
                 "Account %s: live token profile names another owner (%s)",
                 account.get("id"),
                 field,
             )
+    elif result.status_code in _OWNERSHIP_TERMINAL_STATUSES:
+        # The endpoint refused the token itself (revoked, expired upstream):
+        # that will not change on a retry, so the verdict settles as "not
+        # proven" instead of deferring a caller forever.
+        verdict = False
+        logger.warning(
+            "Account %s: live token refused by the profile endpoint (HTTP %s)",
+            account.get("id"),
+            result.status_code,
+        )
     else:
         verdict = None
         logger.info(
@@ -320,10 +434,10 @@ def _live_tokens_belong_to(
             account.get("id"),
             result.status_code,
         )
-    _ownership_cache[key] = (verdict, now)
+    _ownership_cache[key] = (verdict, now, final)
     while len(_ownership_cache) > _OWNERSHIP_CACHE_LIMIT:
         _ownership_cache.pop(next(iter(_ownership_cache)))
-    return bool(verdict)
+    return verdict
 
 
 # Claude Code chain failure types that mean "do not use this chain". An
@@ -469,6 +583,40 @@ def live_payload_belongs_to(
             return False
         return True
     return _live_tokens_belong_to(
+        account, live_access, live_refresh, oauth.get("expiresAt")
+    )
+
+
+def live_payload_ownership(
+    account: dict, payload: dict | None, *, require_stamp: bool = True
+) -> bool | None:
+    """:func:`live_payload_belongs_to` with a third answer.
+
+    True: the tokens provably belong to ``account``. False: they provably do
+    not, or can never be proven (no payload, a foreign stamp, an expired
+    token, an event-loop caller). None: the profile lookup failed, so a
+    later attempt may still decide; a caller that would otherwise drop a
+    rotated token (the launch sync) defers instead of refusing.
+
+    >>> row = {"id": 1, "email": "a@x.com", "cc_access_token": "a1"}
+    >>> live_payload_ownership(row, {"claudeAiOauth": {"accessToken": "a1"}},
+    ...                        require_stamp=False)
+    True
+    >>> live_payload_ownership(row, None) is False
+    True
+    """
+    if not isinstance(payload, dict):
+        return False
+    if require_stamp and _stamp_of(payload) != account.get("id"):
+        return False
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    live_access = oauth.get("accessToken")
+    if not isinstance(live_access, str) or not live_access:
+        return False
+    live_refresh = oauth.get("refreshToken")
+    return _live_tokens_ownership(
         account, live_access, live_refresh, oauth.get("expiresAt")
     )
 
@@ -832,11 +980,11 @@ def _reconcile_decision(account_id: int, account: dict, live: dict, cached: bool
     # refresh lineage is dead, because they describe a refresh token jacked
     # does not take.
     if not cc_chain_dead(account):
-        from jacked.credentials.oauth_extra import encode_oauth_extra, oauth_extra_from
+        from jacked.credentials.oauth_extra import capture_oauth_extra
 
         # Bound to the refresh token the row holds after this write.
         row_refresh = updates.get("cc_refresh_token", account.get("cc_refresh_token"))
-        extra = encode_oauth_extra(oauth_extra_from(oauth), row_refresh)
+        extra = capture_oauth_extra(oauth, row_refresh)
         if extra != account.get("cc_oauth_extra"):
             updates["cc_oauth_extra"] = extra
 
@@ -976,8 +1124,12 @@ def build_oauth_data(account: dict) -> dict:
             # the refresh token beside it, so it goes only with one.
             # Read for the row's own refresh token: fields captured with an
             # earlier lineage are not this one's.
+            # subscriptionTypeVerifiedAt only while the row still publishes
+            # the tier it verified (#230i).
             extra = parse_oauth_extra(
-                account.get("cc_oauth_extra"), account.get("cc_refresh_token")
+                account.get("cc_oauth_extra"),
+                account.get("cc_refresh_token"),
+                current_tier=account.get("subscription_type"),
             )
             if not cc_rt:
                 extra.pop("refreshTokenExpiresAt", None)

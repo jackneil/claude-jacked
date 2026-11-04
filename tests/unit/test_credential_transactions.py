@@ -524,6 +524,67 @@ def test_schema_drift_is_logged_by_key_name(caplog):
     assert "refresh-" not in caplog.text  # key names only, never values
 
 
+_DRIFT_LOGGER = "jacked.credentials.transaction"
+_DRIFT_WARNING = (
+    "Credential schema drift: authority carries claudeAiOauth keys jacked "
+    "does not write and will drop: {}"
+)
+
+
+def _drift_log(caplog, before: CredentialPayload, target: CredentialPayload):
+    """Switch from ``before`` to ``target`` (account 2) on the shipped
+    uncooperative build; return this module's (WARNING, DEBUG) messages."""
+    import logging
+
+    engine, _repository, _store = _engine(CapabilityMode.GLOBAL_UNCOOPERATIVE, before)
+    with caplog.at_level(logging.DEBUG, logger=_DRIFT_LOGGER):
+        result = engine.activate(_request(target))
+    assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
+    records = [r for r in caplog.records if r.name == _DRIFT_LOGGER]
+    return (
+        [r.getMessage() for r in records if r.levelno >= logging.WARNING],
+        [r.getMessage() for r in records if r.levelno == logging.DEBUG],
+    )
+
+
+def test_switch_to_a_row_without_recorded_pass_through_fields_is_not_drift(caplog):
+    """#230i cross-account case: the authority holds account 1's object with
+    Claude Code's verified-tier pair; account 2's row has no recorded
+    pass-through fields (cc_oauth_extra NULL). Claude Code re-derives them,
+    so this is expected: no WARNING, one values-free DEBUG line naming 2."""
+    from jacked.api.credential_helpers import build_oauth_data
+
+    before = CredentialPayload.from_mapping({"_jackedAccountId": 1, "claudeAiOauth": {
+        "accessToken": "a1-at", "refreshToken": "a1-rt", "subscriptionType": "max",
+        "subscriptionTypeSource": "profile", "subscriptionTypeVerifiedAt": 1_798_000_000_000}})
+    row_b = {"access_token": "b-pat", "expires_at": 9_999_999_999, "cc_access_token": "b-at",
+             "cc_refresh_token": "b-rt", "cc_expires_at": 9_999_999_999,
+             "subscription_type": "max", "rate_limit_tier": "t1", "cc_oauth_extra": None}
+    target = CredentialPayload.from_mapping(
+        {"_jackedAccountId": 2, "claudeAiOauth": build_oauth_data(row_b)})
+
+    warnings, debug = _drift_log(caplog, before, target)
+
+    assert warnings == []
+    assert debug == [
+        "Account 2 has no value to write for subscriptionTypeSource, subscriptionTypeVerifiedAt; "
+        "Claude Code re-derives them"
+    ]
+
+
+def test_an_unknown_key_still_warns_and_a_carried_key_does_not(caplog):
+    before = CredentialPayload.from_mapping({"_jackedAccountId": 1, "claudeAiOauth": {
+        "accessToken": "a1-at", "refreshToken": "a1-rt", "clientId": "custom-client",
+        "futureKey": "future-value"}})
+
+    warnings, debug = _drift_log(caplog, before, _payload(2, "token"))
+
+    assert warnings == [_DRIFT_WARNING.format("futureKey")]
+    assert debug == ["Account 2 has no value to write for clientId; Claude Code re-derives them"]
+    logged = " ".join(warnings + debug)
+    assert "future-value" not in logged and "custom-client" not in logged  # names only
+
+
 def test_concurrent_write_on_a_missing_authority_reports_the_new_contents_as_preserved():
     """Claude Code logged in between this adapter's read and its write."""
     appeared = _payload(9, "written-by-claude")

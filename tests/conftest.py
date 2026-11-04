@@ -1,20 +1,40 @@
 """Shared fixtures for jacked tests."""
 
+import atexit
 import inspect
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 from unittest.mock import patch
+
+# The developer's real home, captured before anything can move HOME.
+REAL_HOME = Path.home()
+
+# Isolate HOME (and USERPROFILE on Windows) BEFORE the first jacked import.
+# Eleven modules compute a path from ``Path.home()`` at import time
+# (launch.ACCOUNTS_DIR, service.CLAUDE_DIR, cli.DB_PATH, version_check,
+# install_manifest, ...). The per-test ``_isolate_home`` fixture runs AFTER
+# the autouse fixtures that import those modules (pytest sets fixtures up in
+# name order), so without this the constants froze to the real home and
+# tests/unit/test_dual_token.py wrote test tokens into the real
+# ~/.claude/accounts/1/ on every run (found 2026-11-02).
+_IMPORT_HOME = Path(tempfile.mkdtemp(prefix="jacked-tests-home-"))
+(_IMPORT_HOME / ".claude").mkdir()
+os.environ["HOME"] = str(_IMPORT_HOME)
+os.environ["USERPROFILE"] = str(_IMPORT_HOME)
+atexit.register(shutil.rmtree, _IMPORT_HOME, True)
 
 # Any jacked.db query that jacked code makes on an event-loop thread raises
 # in tests (jacked/web/database.py, #162): a blocking query on the service
 # loop freezes every route, whatever form the call takes.
 os.environ.setdefault("JACKED_DB_LOOP_STRICT", "1")
 
-from jacked.credentials.models import (
+from jacked.credentials.models import (  # noqa: E402
     CredentialIdentity,
     IdentityAxis,
     ProviderVerificationState,
@@ -40,9 +60,6 @@ assert (
     is _REAL_SUBPROCESS_RUN
 ), "the Keychain backend default bound to a patched subprocess.run"
 
-
-# The developer's real home, captured before any test can move HOME.
-REAL_HOME = Path.home()
 
 
 # --------------------------------------------------------------------------- #
@@ -132,6 +149,69 @@ def _isolate_home(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_accounts_dir(monkeypatch, _isolate_home):
+    """Point the launch's per-account tree at this test's HOME.
+
+    ``jacked.launch.ACCOUNTS_DIR`` is an import-time constant; the
+    session-wide import HOME above keeps it off the real machine, and this
+    puts it under the per-test home so a test's files are its own.
+    """
+    import jacked.launch
+
+    monkeypatch.setattr(
+        jacked.launch, "ACCOUNTS_DIR", _isolate_home / ".claude" / "accounts"
+    )
+
+
+@pytest.fixture(autouse=True)
+def _tripwire_real_credential_files(monkeypatch):
+    """Tripwire: no test may write a credential file under the real ~/.claude.
+
+    Covers the two writers the launch and the stores use: the shared
+    ``_safe_replace`` (per-account credential and config files) and
+    ``FileCredentialStore.write`` (the global file authority and mirror).
+    """
+    from jacked.api import credential_helpers
+    from jacked.credentials import file_store
+
+    real_replace = credential_helpers._safe_replace
+    real_write = file_store.FileCredentialStore.write
+
+    def guarded_replace(src, dst, **kwargs):
+        if _under_real_claude_dir(dst):
+            raise RuntimeError("test tripwire: credential write under the real ~/.claude")
+        return real_replace(src, dst, **kwargs)
+
+    def guarded_write(self, *args, **kwargs):
+        target = getattr(self, "_path", None) or getattr(self, "path", None)
+        if target is not None and _under_real_claude_dir(target):
+            raise RuntimeError("test tripwire: credential store write under the real ~/.claude")
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(credential_helpers, "_safe_replace", guarded_replace)
+    # Modules that bind the writer by name at import keep their own alias;
+    # guard each one, or a launch-side write would bypass the tripwire.
+    import jacked.launch
+    from jacked.api import claude_config_store
+
+    monkeypatch.setattr(jacked.launch, "_safe_replace", guarded_replace)
+    monkeypatch.setattr(claude_config_store, "_safe_replace", guarded_replace)
+    monkeypatch.setattr(file_store.FileCredentialStore, "write", guarded_write)
+
+
+@pytest.fixture(autouse=True)
+def _reset_live_credential_cache():
+    """The live-credential read cache (30 s TTL, keyed by account id) never
+    expires inside a test run, so one test's cached payload leaked into the
+    next test's reconcile. Every test starts and ends with it empty."""
+    from jacked.api.credential_helpers import invalidate_live_cred_cache
+
+    invalidate_live_cred_cache()
+    yield
+    invalidate_live_cred_cache()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_default_db_path(monkeypatch, tmp_path_factory):
     """Tripwire: no test may open the developer's real ~/.claude/jacked.db.
 
@@ -171,9 +251,18 @@ def _under_real_claude_config(path) -> bool:
         REAL_HOME / ".claude" / ".config.json",
         REAL_HOME / ".claude" / ".config.json.lock",
     }
-    return target in guarded or target.parent == REAL_HOME and target.name.startswith(
-        ".claude_json_tmp_"
-    )
+    if target in guarded:
+        return True
+    if target.parent == REAL_HOME and target.name.startswith(".claude_json_tmp_"):
+        return True
+    return _under_real_claude_dir(target)
+
+
+def _under_real_claude_dir(path) -> bool:
+    """True when ``path`` is inside the real ``~/.claude`` (any depth)."""
+    target = Path(path).absolute()
+    real = (REAL_HOME / ".claude").absolute()
+    return target == real or real in target.parents
 
 
 @pytest.fixture(autouse=True)

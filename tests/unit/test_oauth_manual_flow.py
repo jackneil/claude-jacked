@@ -259,7 +259,11 @@ def test_manual_flow_expiry_task_marks_the_flow_not_found(fake_web, monkeypatch)
     async def _body():
         flow = OAuthFlow(MagicMock(), manual=True)
         await flow.start()
-        await asyncio.sleep(0.05)  # let the expiry task's wait_for lapse
+        # Let the expiry task's wait_for lapse. Under load the loop may take
+        # far longer than 0.05 s to schedule it, so poll with a bound.
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while flow._status == "pending" and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
         return flow
 
     flow = run_async(_body)
