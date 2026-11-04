@@ -42,7 +42,7 @@ BASELINE: dict[str, int] = {
     "jacked/api/authority_guard.py": 1038,
     "jacked/api/claude_config_store.py": 554,
     "jacked/api/claude_identity.py": 601,
-    "jacked/api/credential_helpers.py": 1327,
+    "jacked/api/credential_helpers.py": 1326,
     "jacked/api/identity_watcher.py": 799,
     "jacked/api/main.py": 787,
     "jacked/api/routes/auth.py": 2421,

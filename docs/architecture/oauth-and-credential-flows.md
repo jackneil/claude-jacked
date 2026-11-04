@@ -1146,8 +1146,20 @@ session can hold. `live_holder_account_ids()` names those rows. A row is a
 holder when the live authority holds its tokens. A row is also a holder when a
 tracked session used it in the last 480 minutes (`HOLDER_WINDOW_MINUTES`).
 That window is the life of a Claude Code access token: an idle session keeps
-its refresh token in memory and spends it when its access token expires. When
-an active session has no account id, the holders are unknown. Then the
+its refresh token in memory and spends it when its access token expires.
+After the window, a tracked session stays a holder while its recorded process
+still runs it (`tracked_holder_sessions()` in `jacked/session_ancestry.py`).
+For example, a laptop that slept all night keeps its sessions. The process
+must be alive and must have started before the tracker row was written, so a
+reused process id does not count. When jacked cannot read the liveness or
+the start time, the session stays a holder. A session with no process id
+keeps the time rule only. The check probes each process id once and reads
+the start times of the live ones in one pass: `/proc` on Linux, the kernel
+on Windows, and one `ps` command on macOS. The dashboard process sweeper
+uses the same verdict (`session_processes_running()`). It sends a heartbeat
+for a running session, closes a session whose process ended or was reused,
+and does not change a session with an unknown answer. When
+a holder session has no account id, the holders are unknown. Then the
 function returns None, `cc_rotation_block()` reports `holders_unknown`, and
 jacked refuses every rotation; one INFO line names the cause until the
 holders are known again. A live-chain import never adopts a refresh token
