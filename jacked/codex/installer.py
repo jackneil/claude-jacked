@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Optional
 
+from jacked.atomic_install import atomic_copy_file
 from jacked.install_manifest import skill_content_hash as _skill_content_hash
 
 from .credentials import codex_home
@@ -330,12 +331,11 @@ def install_codex(
             skill_dir = skills_base / cmd.stem
             content = _command_skill_md(cmd)
             try:
-                shutil.copy(cmd, prompts_dst / cmd.name)
+                atomic_copy_file(cmd, prompts_dst / cmd.name)
             except OSError as e:
                 logger.warning("skipping Codex command %s: %s", cmd.name, e)
-                # Same transient-failure guard as the skills pass: keep the
-                # existing good prompt AND command-derived skill dir out of the
-                # prune's reach.
+                # Same transient-failure guard as the skills pass: keep the existing
+                # good prompt AND command-derived skill dir out of the prune's reach.
                 _prev = ((prior or {}).get("prompts") or {}).get(cmd.name)
                 if _prev:
                     prompts[cmd.name] = _prev

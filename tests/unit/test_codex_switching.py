@@ -188,6 +188,8 @@ def test_swap_refuses_incomplete_slot(tmp_path, db):
 def test_swap_different_account_not_treated_as_stale(tmp_path, db):
     base = tmp_path / ".codex"
     # Live A @ T2; target B @ T1 — older, but DIFFERENT account → allowed.
+    db.create_account("b@x.com", "t", 9999999999, provider="codex", organization_uuid="acct-B")
+    db.create_account("a@x.com", "t", 9999999999, provider="codex", organization_uuid="acct-A")
     _write(base / "auth.json", _auth("acct-A", last_refresh="2026-06-28T12:00:00Z"))
     _write(sw.codex_slot_auth_path(1, base),
            _auth("acct-B", last_refresh="2026-06-28T08:00:00Z"))
@@ -239,27 +241,31 @@ def test_swap_captures_empty_org_outgoing_by_email(tmp_path, db):
     assert o_slot["tokens"]["account_id"] == ""  # the empty-org account's live tokens
 
 
-def test_swap_skips_capture_for_unknown_live_account(tmp_path, db):
-    """If the live root belongs to an account jacked doesn't know (out-of-band
-    login), capture is SKIPPED — it must not clobber a tracked account's slot
-    with the stranger's tokens. (Regression for the /dcr Wave-2 finding.)"""
+def test_swap_refuses_to_replace_an_unknown_live_login(tmp_path, db):
+    """A live root that belongs to an account jacked does not track (an
+    out-of-band `codex login`) has no slot to be captured into. Replacing it
+    would lose that login's single-use refresh token, so the switch refuses
+    and writes nothing: the root, the slots and the pointer stay as they were.
+    (The Grok switch has the same rule.)"""
     base = tmp_path / ".codex"
     a = db.create_account("a@x.com", "t", 9999999999, provider="codex",
                           organization_uuid="acct-A")
     t = db.create_account("t@x.com", "t", 9999999999, provider="codex",
                           organization_uuid="acct-T")
     t_good = _auth("acct-T", email="t@x.com")
+    stranger = _auth("acct-STRANGER", email="stranger@x.com")
     _write(sw.codex_slot_auth_path(t["id"], base), t_good)
     _write(sw.codex_slot_auth_path(a["id"], base), _auth("acct-A", email="a@x.com"))
-    # Live root is a stranger not in the DB; the tracked pointer wrongly says T.
-    _write(base / "auth.json", _auth("acct-STRANGER", email="stranger@x.com"))
+    _write(base / "auth.json", stranger)
     db.set_active_account_id(t["id"], provider="codex")
 
-    result = sw.swap_codex_account(db, a["id"], base=base)
-    assert result.captured_outgoing is False
-    assert result.outgoing_id is None
-    # T's slot is intact — NOT clobbered with the stranger's tokens.
+    with pytest.raises(sw.CodexSwapError) as err:
+        sw.swap_codex_account(db, a["id"], base=base)
+
+    assert "Add it" in err.value.public_message
+    assert json.loads((base / "auth.json").read_text()) == stranger
     assert json.loads(sw.codex_slot_auth_path(t["id"], base).read_text()) == t_good
+    assert db.get_active_account_id(provider="codex") == t["id"]
 
 
 @requires_posix_file_modes
@@ -282,6 +288,8 @@ def test_swap_forces_file_storage(tmp_path, db):
     base = tmp_path / ".codex"
     (base).mkdir(parents=True)
     (base / "config.toml").write_text('cli_auth_credentials_store = "auto"\n')
+    db.create_account("a@x.com", "t", 9999999999, provider="codex", organization_uuid="acct-A")
+    db.create_account("b@x.com", "t", 9999999999, provider="codex", organization_uuid="acct-B")
     _write(base / "auth.json", _auth("acct-B"))
     _write(sw.codex_slot_auth_path(1, base), _auth("acct-A"))
     db.set_active_account_id(2, provider="codex")

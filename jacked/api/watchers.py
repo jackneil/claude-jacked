@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from jacked.api.websocket import WebSocketRegistry
+from jacked.session_ancestry import session_processes_running, tracked_pid
 
 logger = logging.getLogger(__name__)
 
@@ -214,39 +215,18 @@ def _any_claude_process_alive() -> bool:
         return False
 
 
-def _is_pid_alive(pid: int) -> bool:
-    """Check if a process with the given PID is alive.
-
-    Delegates to jacked.service.process.is_process_alive which uses the
-    correct cross-platform mechanism — `os.kill(pid, 0)` on POSIX, and
-    `OpenProcess` + `WaitForSingleObject` via ctypes on Windows. The
-    previous implementation called `os.kill(pid, 0)` unconditionally,
-    which on Windows surfaced CPython SystemError ("returned a result
-    with an exception set") for exited PIDs. That error slipped past
-    the `except OSError:` below because SystemError isn't an OSError.
-
-    >>> import os
-    >>> _is_pid_alive(os.getpid())  # this process, on every OS
-    True
-    >>> _is_pid_alive(999999999)
-    False
-    """
-    if pid is None or pid <= 0:
-        return False
-    try:
-        from jacked.service.process import is_process_alive
-        return is_process_alive(pid)
-    except Exception:
-        # Fail-safe: if liveness can't be determined, assume alive so we
-        # never incorrectly close a live user's session.
-        return True
-
-
 async def process_alive_sweeper_loop(app, interval: int = 60):
     """Close sessions whose Claude process has exited.
 
-    For sessions with a PID: check that specific PID.
-    For sessions without a PID: fall back to old "any claude running?" heuristic.
+    For sessions with a PID: one batched check (``session_processes_running``,
+    the verdict the credential holder set uses too). A session whose process
+    is alive and is still the process that wrote its row gets a heartbeat. A
+    session whose process ended, or whose PID a newer process reuses (its
+    process token differs), is closed. An unknown answer (for example a row
+    with no token whose process reads as started after the row, which a
+    wall-clock step can cause) leaves the row alone (never a false close).
+    For sessions without a usable PID (none, 0 or 1): fall back to the old
+    "any claude running?" heuristic.
 
     >>> # Verified via integration test
     """
@@ -265,14 +245,17 @@ async def process_alive_sweeper_loop(app, interval: int = 60):
                 changed = False
 
                 # Split into PID-tracked and non-PID sessions
-                pid_sessions = [s for s in stale if s.get("pid")]
-                no_pid_sessions = [s for s in stale if not s.get("pid")]
+                pid_sessions = [s for s in stale if tracked_pid(s) is not None]
+                no_pid_sessions = [s for s in stale if tracked_pid(s) is None]
 
-                # PID-tracked: check each individually
-                for sess in pid_sessions:
-                    pid = sess["pid"]
-                    alive = await asyncio.to_thread(_is_pid_alive, pid)
-                    if alive:
+                # PID-tracked: one batched liveness + identity check.
+                running = await asyncio.to_thread(
+                    session_processes_running, pid_sessions
+                )
+                for sess, state in zip(pid_sessions, running):
+                    if state is None:
+                        continue
+                    if state:
                         await asyncio.to_thread(
                             db_obj.heartbeat_session, sess["session_id"]
                         )
@@ -283,9 +266,9 @@ async def process_alive_sweeper_loop(app, interval: int = 60):
                         )
                         changed = True
                         logger.info(
-                            "Sweeper: closed session %s (PID %d dead)",
+                            "Sweeper: closed session %s (PID %s ended or reused)",
                             sess["session_id"][-8:],
-                            pid,
+                            sess["pid"],
                         )
 
                 # Non-PID: old heuristic fallback

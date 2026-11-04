@@ -456,6 +456,10 @@ class _SessionsDb:
         self.windows.append(staleness_minutes)
         return [s for s in self.sessions if s["idle_minutes"] < staleness_minutes]
 
+    def get_stale_open_sessions(self, staleness_minutes=60):
+        # No row records a process id, so an idle one keeps the time rule.
+        return [s for s in self.sessions if s["idle_minutes"] >= staleness_minutes]
+
 
 class TestHolders:
     def test_a_session_with_no_account_id_makes_the_holders_unknown(self, tmp_path):

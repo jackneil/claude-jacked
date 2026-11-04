@@ -27,6 +27,9 @@ class _Db:
     def get_active_sessions(self, staleness_minutes=60):
         return self.sessions
 
+    def get_stale_open_sessions(self, staleness_minutes=60):
+        return []
+
 
 def test_the_block_reason_names_unknown_holders():
     with (

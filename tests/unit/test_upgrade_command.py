@@ -6,6 +6,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+from jacked import upgrade_guard
+from jacked.upgrade_guard import IndexVersions
+
 
 @pytest.fixture(autouse=True)
 def _isolated_update_state(tmp_path_factory, monkeypatch):
@@ -100,7 +103,8 @@ class TestUpgradeCommand:
         assert mock_run.call_args_list[4][0][0] == ["/fake/jacked", "packs", "update"]
         uv_args = mock_run.call_args_list[0][0][0]
         assert "/fake/uv" in uv_args
-        assert "claude-jacked[tray]" in uv_args
+        # #295i: the requirement carries the installed version as a floor.
+        assert any(arg.startswith("claude-jacked[tray]>=") for arg in uv_args)
         preflight_args = mock_run.call_args_list[1][0][0]
         assert preflight_args == ["/fake/jacked", "service", "preflight"]
         install_args = mock_run.call_args_list[2][0][0]
@@ -435,7 +439,7 @@ class TestUpgradeIsATransaction:
         )
 
         output = " ".join(result.output.split())
-        assert '$ uv tool install "claude-jacked[tray]" --force --refresh' in output
+        assert '$ uv tool install "claude-jacked[tray]>=0.100.0" --force --refresh' in output
         assert (
             '$ uv tool install "claude-jacked[tray]==0.95.0" --force --refresh'
             in output
@@ -733,7 +737,8 @@ class TestUpgradeWindows:
         # equals the target and upgrade takes the "already current" path.
         with (
             patch("jacked.__version__", "0.108.0"),
-            patch("jacked.cli._upgrade_target_version", return_value="0.109.0"),
+            patch("jacked.upgrade_guard.probe_index_versions",
+                  return_value=IndexVersions(target="0.109.0")),
         ):
             CliRunner().invoke(main, ["upgrade"])
         batch = open(created[0]).read()
@@ -1230,7 +1235,8 @@ class TestIndexLag:
             patch("subprocess.run") as run,
             patch("jacked.__version__", version),
             patch("jacked.cli._installed_package_version", return_value=installed),
-            patch("jacked.cli._upgrade_target_version", return_value=target),
+            patch("jacked.upgrade_guard.probe_index_versions",
+                  return_value=IndexVersions(target=target)),
         ):
             run.side_effect = list(run_results)
             result = CliRunner().invoke(main, ["upgrade"])
@@ -1281,12 +1287,10 @@ class TestIndexLag:
     @staticmethod
     def _real_target(json_api, simple_index):
         """The REAL target lookup, with only the two index probes replaced."""
-        from jacked import cli
-
         with patch("jacked.version_check.get_latest_pypi_version", return_value=json_api), \
                 patch("jacked.version_check.get_latest_from_simple_index",
                       return_value=simple_index):
-            return cli._upgrade_target_version_impl()
+            return upgrade_guard._probe_index_versions_impl().target
 
     def test_pin_166i_a_lagging_simple_index_stays_detectable(self):
         """#166i (commit 26227f8) must not come back: with the JSON API ahead
@@ -1330,6 +1334,28 @@ def test_status_succeed_shim_reports_index_lag(tmp_path):
 
 
 
+def test_status_succeed_shim_never_calls_an_older_build_an_upgrade(tmp_path):
+    """#295i, Windows: the batch's last step closes the record. An install
+    that is older than the build it replaced is a failure, never
+    "Upgraded to" and never "succeeded"."""
+    import json
+
+    from jacked.cli import main
+    from jacked.service import update_status as us
+
+    us.init_or_adopt_status(us.UPDATE_STATUS_FILE, from_version="0.111.2",
+                            to_version="next", method="uv")
+    with patch("jacked.cli._installed_package_version", return_value="0.111.1"):
+        result = CliRunner().invoke(main, ["_update_status_succeed", "--target", "0.111.2",
+                                           "--previous", "0.111.2"])
+    assert result.exit_code == 1, result.output
+    assert "Upgraded to" not in result.output
+    assert "The install is v0.111.1, which is older than v0.111.2." in result.output
+    data = json.loads(us.UPDATE_STATUS_FILE.read_text())
+    assert data["overall"] == "failed"
+    assert "older than v0.111.2" in data["error"]
+
+
 def test_a_reinstall_of_the_running_version_keeps_next_as_the_status_target(tmp_path):
     """The update page treats a running build equal to to_version as done, so
     a target that is not newer than the running build is not recorded."""
@@ -1343,7 +1369,7 @@ def test_a_reinstall_of_the_running_version_keeps_next_as_the_status_target(tmp_
 
 
 class TestTargetLookup:
-    """The real _upgrade_target_version (the autouse stub is bypassed here).
+    """The real index probe (the autouse stub is bypassed here).
 
     The target is the newest release that the JSON API or the simple index
     names. Every test replaces BOTH probes: no test reaches PyPI.
@@ -1356,11 +1382,9 @@ class TestTargetLookup:
 
     def _lookup(self, json_api, simple_index):
         """The real lookup with the JSON API and simple index answers given."""
-        from jacked import cli
-
         with self._probe("get_latest_pypi_version", json_api), \
                 self._probe("get_latest_from_simple_index", simple_index):
-            return cli._upgrade_target_version_impl()
+            return upgrade_guard._probe_index_versions_impl().target
 
     def test_a_lagging_json_api_does_not_hide_the_version_uv_installs(self):
         """2026-11-02: the JSON API still said 0.110.1, the simple index
@@ -1382,8 +1406,6 @@ class TestTargetLookup:
         import json
         from unittest.mock import MagicMock
 
-        from jacked import cli
-
         def urlopen(request, timeout=None):
             is_json_api = request.full_url.endswith("/json")
             answer = json_api if is_json_api else simple_index
@@ -1398,7 +1420,7 @@ class TestTargetLookup:
             return response
 
         with patch("urllib.request.urlopen", side_effect=urlopen):
-            return cli._upgrade_target_version_impl()
+            return upgrade_guard._probe_index_versions_impl().target
 
     @staticmethod
     def _probe_failures(caplog):
@@ -1455,11 +1477,9 @@ class TestTargetLookup:
         assert self._lookup({"v": 1}, None) is None
 
     def test_both_probes_use_the_upgrade_timeout(self):
-        from jacked import cli
-
         with self._probe("get_latest_pypi_version", "0.110.2") as json_api, \
                 self._probe("get_latest_from_simple_index", "0.110.2") as simple:
-            assert cli._upgrade_target_version_impl() == "0.110.2"
+            assert upgrade_guard._probe_index_versions_impl().target == "0.110.2"
         json_api.assert_called_once_with(timeout=5.0)
         simple.assert_called_once_with(timeout=5.0)
 
@@ -1482,8 +1502,6 @@ class TestTargetLookup:
         for the other at a barrier, which only opens when both run at once."""
         import threading
 
-        from jacked import cli
-
         barrier = threading.Barrier(2, timeout=5)
 
         def meets_the_other_probe(answer):
@@ -1496,7 +1514,7 @@ class TestTargetLookup:
                    side_effect=meets_the_other_probe("0.110.1")), \
                 patch("jacked.version_check.get_latest_from_simple_index",
                       side_effect=meets_the_other_probe("0.110.2")):
-            assert cli._upgrade_target_version_impl() == "0.110.2"
+            assert upgrade_guard._probe_index_versions_impl().target == "0.110.2"
 
 
 class TestTargetLookupDrivesTheLagReport:
@@ -1504,7 +1522,6 @@ class TestTargetLookupDrivesTheLagReport:
     index probes and the subprocess calls are replaced."""
 
     def _invoke(self, json_api, simple_index, installed, version, run_results):
-        from jacked import cli
         from jacked.cli import main
 
         stack = TestUpgradeIsATransaction._patches()
@@ -1514,7 +1531,8 @@ class TestTargetLookupDrivesTheLagReport:
             patch("subprocess.run") as run,
             patch("jacked.__version__", version),
             patch("jacked.cli._installed_package_version", return_value=installed),
-            patch("jacked.cli._upgrade_target_version", cli._upgrade_target_version_impl),
+            patch("jacked.upgrade_guard.probe_index_versions",
+                  upgrade_guard._probe_index_versions_impl),
             patch("jacked.version_check.get_latest_pypi_version", return_value=json_api),
             patch("jacked.version_check.get_latest_from_simple_index",
                   return_value=simple_index),
@@ -1544,6 +1562,165 @@ class TestTargetLookupDrivesTheLagReport:
         assert "Target version: v0.110.2 (PyPI)" in result.output
         assert "Target version: v0.110.1" not in result.output
         assert "Upgrade complete." in result.output
+
+
+class TestNoDowngrade:
+    """#295i: `jacked upgrade` never moves to an older version.
+
+    On 2026-11-04 the JSON API named 0.111.2 while the simple index (the one
+    uv reads) still served 0.111.1, and the upgrade replaced 0.111.2 with
+    0.111.1 and called it "upgraded".
+    """
+
+    REFUSAL = (
+        "Nothing to upgrade. The package index serves v0.111.1. "
+        "The installed version is v0.111.2."
+    )
+
+    def _invoke(self, versions, installed="0.111.2", run_results=(), platform="darwin",
+                post_install=None):
+        """Run `jacked upgrade` with the index answers given as IndexVersions.
+
+        ``installed`` is the version on disk before the install. ``post_install``
+        is the version on disk after it (default: unchanged).
+        """
+        from jacked.cli import main
+
+        stack = TestUpgradeIsATransaction._patches()
+        disk = [installed]
+
+        def run(cmd, *args, **kwargs):
+            if post_install is not None and "install" in cmd and cmd[0] == "/fake/uv":
+                disk[0] = post_install
+            return outcomes.pop(0)
+
+        outcomes = list(run_results)
+        with (
+            patch("sys.platform", platform),
+            stack[1], stack[2], stack[3],
+            patch("subprocess.Popen") as popen,
+            patch("subprocess.run", side_effect=run) as run_mock,
+            patch("jacked.__version__", installed),
+            patch("jacked.cli._installed_package_version", side_effect=lambda: disk[0]),
+            patch("jacked.upgrade_guard.probe_index_versions", return_value=versions),
+            patch("jacked.cli._spawn_windows_upgrade_helper") as helper,
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
+        return result, run_mock, popen, helper
+
+    def test_pin_295i_an_older_index_runs_no_install_and_says_so(self):
+        from jacked.service import update_status as us
+
+        result, run, popen, _helper = self._invoke(
+            IndexVersions(target="0.111.2", installable="0.111.1")
+        )
+        assert result.exit_code == 0, result.output
+        assert self.REFUSAL in " ".join(result.output.split())
+        assert "upgraded" not in result.output.lower()
+        run.assert_not_called()
+        popen.assert_not_called()
+        # Nothing started, so no update is recorded and no lock was claimed.
+        assert not us.UPDATE_STATUS_FILE.exists()
+
+    def test_an_older_index_and_a_newer_unserved_target_is_index_lag(self):
+        """The JSON API names a release the simple index does not serve yet,
+        and the simple index serves an older build than the installed one."""
+        from jacked.cli import EXIT_INDEX_LAG
+
+        result, run, _popen, _helper = self._invoke(
+            IndexVersions(target="0.112.0", installable="0.111.1")
+        )
+        assert result.exit_code == EXIT_INDEX_LAG, result.output
+        output = " ".join(result.output.split())
+        assert self.REFUSAL in output
+        assert "The package index does not serve v0.112.0 yet. Try again in a few minutes." in output
+        run.assert_not_called()
+
+    def test_the_windows_helper_is_never_spawned_for_a_downgrade(self):
+        result, run, popen, helper = self._invoke(
+            IndexVersions(target="0.111.2", installable="0.111.1"), platform="win32"
+        )
+        assert result.exit_code == 0, result.output
+        assert self.REFUSAL in " ".join(result.output.split())
+        helper.assert_not_called()
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_same_version_reinstalls_with_the_installed_version_as_a_floor(self):
+        result, run, _popen, _helper = self._invoke(
+            IndexVersions(target="0.111.2", installable="0.111.2"), run_results=[_ok()] * 5,
+        )
+        assert result.exit_code == 0, result.output
+        assert "Upgrade complete." in result.output
+        assert run.call_args_list[0][0][0] == [
+            "/fake/uv", "tool", "install", "claude-jacked[tray]>=0.111.2", "--force", "--refresh",
+        ]
+        assert '$ uv tool install "claude-jacked[tray]>=0.111.2" --force --refresh' in " ".join(
+            result.output.split()
+        )
+
+    def test_the_windows_helper_gets_the_floored_command(self):
+        result, _run, _popen, helper = self._invoke(
+            IndexVersions(target="0.111.2", installable="0.111.2"), platform="win32"
+        )
+        assert result.exit_code == 0, result.output
+        cmd, label = helper.call_args[0][0], helper.call_args[0][1]
+        assert "claude-jacked[tray]>=0.111.2" in cmd
+        assert '"claude-jacked[tray]>=0.111.2"' in label
+
+    def test_an_offline_index_still_installs_with_the_floor(self):
+        result, run, _popen, _helper = self._invoke(IndexVersions(), run_results=[_ok()] * 5)
+        assert result.exit_code == 0, result.output
+        assert "claude-jacked[tray]>=0.111.2" in run.call_args_list[0][0][0]
+
+    def test_a_downgrade_that_slips_past_the_floor_is_rolled_back_not_reported_upgraded(self, tmp_path):
+        """Defense in depth: if an installer ever ignores the floor, the
+        post-install check must not print "Upgraded to" an older build."""
+        with patch("jacked.service.updater.RECOVERY_FILE", tmp_path / "failed.txt"):
+            result, run, _popen, _helper = self._invoke(
+                IndexVersions(target="0.111.2", installable="0.111.2"),
+                post_install="0.111.1",
+                run_results=[_ok()] * 4,  # install, rollback install, migrate, restart
+            )
+        assert result.exit_code == 1, result.output
+        output = " ".join(result.output.split())
+        assert "Upgraded to" not in output
+        assert "Upgrade complete" not in output
+        assert "older than v0.111.2" in output
+        argvs = [call[0][0] for call in run.call_args_list]
+        assert ["/fake/jacked", "service", "preflight"] not in argvs
+        assert argvs[1] == [
+            "/fake/uv", "tool", "install", "claude-jacked[tray]==0.111.2", "--force", "--refresh",
+        ]
+        import json
+
+        from jacked.service import update_status as us
+
+        data = json.loads(us.UPDATE_STATUS_FILE.read_text())
+        assert data["overall"] == "failed"
+        assert "older than v0.111.2" in data["error"]
+
+    def test_the_real_probe_end_to_end(self):
+        """Only the two index probes are replaced: the 2026-11-04 answers."""
+        from jacked.cli import main
+
+        stack = TestUpgradeIsATransaction._patches()
+        with (
+            stack[0], stack[1], stack[2], stack[3],
+            patch("subprocess.Popen") as popen,
+            patch("subprocess.run") as run,
+            patch("jacked.__version__", "0.111.2"),
+            patch("jacked.cli._installed_package_version", return_value="0.111.2"),
+            patch("jacked.upgrade_guard.probe_index_versions",
+                  upgrade_guard._probe_index_versions_impl),
+            patch("jacked.version_check.get_latest_pypi_version", return_value="0.111.2"),
+            patch("jacked.version_check.get_latest_from_simple_index", return_value="0.111.1"),
+        ):
+            result = CliRunner().invoke(main, ["upgrade"])
+        assert result.exit_code == 0, result.output
+        assert self.REFUSAL in " ".join(result.output.split())
+        run.assert_not_called()
+        popen.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

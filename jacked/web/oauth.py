@@ -28,7 +28,9 @@ from urllib.parse import parse_qs, urlencode
 import httpx
 from aiohttp import web
 
+from jacked.public_errors import describe, http_failure
 from jacked.web.database import Database, selected_account_id
+from jacked.web.oauth_errors import OAuthIdentityError, OAuthVerificationError, flow_error_text
 
 logger = logging.getLogger("jacked.oauth")
 
@@ -380,7 +382,7 @@ class OAuthFlow:
         except Exception as e:
             logger.debug(
                 "Could not load re-auth target account %s: %s",
-                self._target_account_id, e,
+                self._target_account_id, describe(e),
             )
             return None
 
@@ -468,7 +470,7 @@ class OAuthFlow:
                     self._browser_mode,
                 )
             except Exception as e:
-                logger.warning(f"Could not open a local browser for OAuth: {e}")
+                logger.warning("Could not open a local browser for OAuth: %s", describe(e))
 
             # Wait for callback in background — don't block the API response
             asyncio.create_task(self._wait_for_callback(runner))
@@ -512,7 +514,7 @@ class OAuthFlow:
                 open_auth_url, self._auth_url, self._target_account, self.db
             )
         except Exception as e:
-            logger.warning("Could not re-open the OAuth browser: %s", e)
+            logger.warning("Could not re-open the OAuth browser: %s", describe(e))
             return {
                 **self.get_status(),
                 "reopen_error": "Could not open a browser on the jacked machine.",
@@ -587,15 +589,14 @@ class OAuthFlow:
                 self._result = result
                 self._status = "completed"
             except Exception as e:
-                # The exception text can name emails (the re-auth identity
-                # check does), so the log gets the type only; the UI gets
-                # the text through self._error.
+                # The log gets the type only (the text can name emails); the UI
+                # gets flow_error_text(e), which is written for the user (#289i).
                 logger.error(
                     "OAuth completion failed for flow %s (purpose=%s): %s",
                     self.flow_id, self.purpose, type(e).__name__,
                 )
                 self._status = "error"
-                self._error = str(e)
+                self._error = flow_error_text(e)
         else:
             self._status = "error"
             self._error = "No authorization code received"
@@ -693,7 +694,7 @@ class OAuthFlow:
                     self.flow_id, self.purpose, type(e).__name__,
                 )
                 self._status = "error"
-                self._error = str(e)
+                self._error = flow_error_text(e)
             self._event.set()
             return self.get_status()
 
@@ -784,7 +785,7 @@ class OAuthFlow:
                     cc_result = await cc_flow.start()
                     self._cc_flow_id = cc_result.get("flow_id")
                 except Exception as e:
-                    logger.warning(f"CC auto-flow failed (non-fatal): {e}")
+                    logger.warning("CC auto-flow failed (non-fatal): %s", describe(e))
                     self._cc_flow_id = None
 
             response = {
@@ -833,9 +834,8 @@ class OAuthFlow:
             },
         )
         if resp.status_code != 200:
-            # Truncate response body to avoid logging sensitive data
-            body_preview = (resp.text or "")[:200]
-            logger.error(f"Token exchange HTTP {resp.status_code}: {body_preview}")
+            # Values-free: the body of a failed exchange can echo the code.
+            logger.error("Token exchange failed: %s", http_failure(resp.status_code, resp.text))
             resp.raise_for_status()
 
         tokens = resp.json()
@@ -895,12 +895,11 @@ class OAuthFlow:
                     logger.info("Created long-lived API key (1 year)")
                     return api_key_data["api_key"], tokens
             else:
-                body_preview = (resp.text or "")[:200]
                 logger.warning(
-                    f"API key creation HTTP {resp.status_code}: {body_preview}"
+                    "API key creation failed: %s", http_failure(resp.status_code, resp.text)
                 )
         except Exception as e:
-            logger.warning(f"API key creation failed: {e} — using short-lived token")
+            logger.warning("API key creation failed: %s; using short-lived token", describe(e))
 
         return access_token, tokens
 
@@ -920,7 +919,7 @@ class OAuthFlow:
                 return resp.json()
             logger.warning(f"Profile fetch HTTP {resp.status_code}")
         except Exception as e:
-            logger.warning(f"Profile fetch failed: {e}")
+            logger.warning("Profile fetch failed: %s", describe(e))
         return {}
 
     async def _fetch_usage(
@@ -939,7 +938,7 @@ class OAuthFlow:
                 return resp.json()
             logger.warning(f"Usage fetch HTTP {resp.status_code}")
         except Exception as e:
-            logger.warning(f"Usage fetch failed: {e}")
+            logger.warning("Usage fetch failed: %s", describe(e))
         return {}
 
     def _store_account(self, tokens: dict, profile: dict, usage: dict) -> dict:
@@ -1005,13 +1004,13 @@ class OAuthFlow:
             # can change between OAuth sessions, creating duplicates.
             target = self.db.get_account(self._target_account_id)
             if not target:
-                raise ValueError(
+                raise OAuthIdentityError(
                     f"Re-auth target account {self._target_account_id} not found"
                 )
 
             # Identity check: ensure the user logged in with the same Claude account
             if email.lower() != target["email"].lower():
-                raise ValueError(
+                raise OAuthIdentityError(
                     f"Re-auth email ({email}) does not match "
                     f"target account ({target['email']})"
                 )
@@ -1144,7 +1143,7 @@ class OAuthFlow:
         account_id = self._target_account_id
         target = self.db.get_account(account_id)
         if not target:
-            raise ValueError(f"Target account {account_id} not found")
+            raise OAuthIdentityError(f"Target account {account_id} not found")
 
         # Identity validation — try token response first, fall back to profile.
         # CC flows skip API key creation, so _fetch_profile may fail with
@@ -1159,11 +1158,11 @@ class OAuthFlow:
             or profile_account.get("email_address")
         )
         if not cc_email:
-            raise RuntimeError(
+            raise OAuthVerificationError(
                 "Cannot verify CC token identity. No email in token response or profile."
             )
         if cc_email.lower() != target["email"].lower():
-            raise ValueError(
+            raise OAuthIdentityError(
                 f"CC auth email ({cc_email}) does not match "
                 f"target account ({target['email']})"
             )
@@ -1173,12 +1172,12 @@ class OAuthFlow:
         cc_org = tokens.get("organization_uuid", "")
         if target_org:  # non-empty sentinel = real org
             if not cc_org:
-                raise ValueError(
+                raise OAuthIdentityError(
                     "CC auth is missing an org, so jacked cannot verify it against an org-scoped account "
                     f"(target org: {target_org})."
                 )
             if cc_org != target_org:
-                raise ValueError(
+                raise OAuthIdentityError(
                     f"CC auth org ({cc_org}) does not match "
                     f"target account org ({target_org})"
                 )
@@ -1188,14 +1187,14 @@ class OAuthFlow:
             # so a token for another org must not land here.
             stored_org = _stored_profile_org(target)
             if stored_org and stored_org != cc_org:
-                raise ValueError(
+                raise OAuthIdentityError(
                     "CC auth org does not match the organization stored for the "
                     "target account"
                 )
         target_uuid = target.get("account_uuid")
         cc_uuid = tokens.get("account_uuid")
         if target_uuid and cc_uuid and cc_uuid != target_uuid:
-            raise ValueError("CC auth account does not match the target account")
+            raise OAuthIdentityError("CC auth account does not match the target account")
 
         expires_at = int(time.time()) + tokens.get("expires_in", DEFAULT_TOKEN_TTL_SECONDS)
 

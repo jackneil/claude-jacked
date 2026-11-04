@@ -299,13 +299,19 @@ def _swap_root(
         live = _read_live_root(root_path)
         # The outgoing account is whoever the LIVE root belongs to, by org OR
         # email (personal/empty-org accounts, an out-of-band `codex login`).
-        # An unknown identity has NO correct slot: skip the capture rather than
-        # clobber a tracked account's slot with a stranger's tokens.
         outgoing_id = find_codex_account_id(db, extract_identity(live)) if live else None
         refuse_stale_replay(target_data, live)
         # The last refusal, right before the first write: the store as it is
         # now, not as it was before the lock wait.
         refuse_unswitchable_store(base, env)
+        # An unknown identity has no slot to capture into, and replacing it
+        # would lose its single-use refresh token. Refuse before any write.
+        if outgoing_id is None and live and (live.get("tokens") or live.get("OPENAI_API_KEY")):
+            raise CodexSwapError(
+                "The live Codex login belongs to an account that jacked does not "
+                "track. Add it first (Add Account, then Codex), then switch.",
+                reason="unknown_live_login",
+            )
 
         ensure_file_storage(base, env)
         # 1. CAPTURE the live root into the outgoing account's slot FIRST, so

@@ -43,3 +43,19 @@ def test_a_failed_upgrade_event_frees_the_button_too():
     assert "_showUpgradeError(d.error || 'Upgrade failed')" in handler
     assert "document.getElementById('version-upgrade-btn')" in handler
     assert "btn.disabled = false" in handler
+
+
+def test_a_no_op_upgrade_shows_a_note_not_an_error():
+    """#295i: an index that serves an older build is "nothing to upgrade".
+    The page says so as a note (no error style) and gives the button back."""
+    source = WEBSOCKET_JS.read_text(encoding="utf-8")
+    start = source.index("jackedWS.on('upgrade_noop'")
+    end = source.index("});", start)
+    handler = source[start:end]
+    assert "_showUpgradeNote(" in handler
+    assert "_showUpgradeError" not in handler
+    assert "btn.disabled = false" in handler
+    header = HEADER_JS.read_text(encoding="utf-8")
+    note = header[header.index("function _showUpgradeNote("):]
+    note = note[: note.index("\n}\n") + 3]
+    assert "_showUpgradeMessage(message, false)" in note

@@ -514,14 +514,14 @@ def test_command_copy_failure_keeps_derived_skill(data_root, homes, monkeypatch)
     prompt = ins.codex_prompts_dir(homes["home"]) / "dcr.md"
     assert skill_dir.exists() and prompt.exists()
 
-    real_copy = shutil.copy
+    real_copy = ins.atomic_copy_file
 
     def _flaky(src, dst):
         if Path(src).name == "dcr.md":
             raise OSError("locked")
         return real_copy(src, dst)
 
-    monkeypatch.setattr(ins.shutil, "copy", _flaky)
+    monkeypatch.setattr(ins, "atomic_copy_file", _flaky)
     summ = _install(data_root, homes)
     assert skill_dir.exists()
     assert prompt.exists()
@@ -542,7 +542,7 @@ def test_command_hash_failure_keeps_the_prompt_it_just_wrote(data_root, homes, m
     assert skill_dir.exists() and prompt.exists()
     cmd = data_root / "commands" / "dcr.md"
     copied: list = []
-    real_copy = shutil.copy
+    real_copy = ins.atomic_copy_file
     real_sha = ins._sha_file
 
     def spy_copy(src, dst, *a, **kw):
@@ -554,7 +554,7 @@ def test_command_hash_failure_keeps_the_prompt_it_just_wrote(data_root, homes, m
             raise OSError(errno.EACCES, "Permission denied")
         return real_sha(path)
 
-    monkeypatch.setattr(ins.shutil, "copy", spy_copy)
+    monkeypatch.setattr(ins, "atomic_copy_file", spy_copy)
     monkeypatch.setattr(ins, "_sha_file", unreadable)
     summ = _install(data_root, homes)
 

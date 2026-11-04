@@ -176,7 +176,7 @@ Once enabled, browse to `http://<machine>:8321` using the MagicDNS short name, t
 
 Account authorization works from a remote browser. When you open the dashboard from a different machine, the Add Account, Re-auth, and CC-token flows show an authorization link instead of opening a browser on the server. Click the link and approve in your own browser. Claude then shows a code. Copy the code and paste it into the dashboard to finish.
 
-**Turning remote access on also hands out credential control.** A remote browser inside the enabled scope can switch accounts and trigger upgrades, exactly as the confirmation dialog says. That is the point of the setting: it is the one switch that decides who may do it. Outside the scope, and whenever remote access is off, account switching returns 403 and the dashboard greys the **Use Account** button out with the reason. The same rule applies to settings changes and to auto-swap changes (the swap settings, pause, and resume): from such a browser they return 403 with the code `REMOTE_ACCESS_OFF` or `OUTSIDE_SCOPE`. The generic settings API never changes the account pointers (`desired_account_id` and the `active_account_id` keys): use **Use Account** to change the account. The setting itself is host-only: the toggle and the scope picker are read-only from a remote browser, and `PUT`/restart on the remote-access API are refused with `REMOTE_ACCESS_SETTINGS_LOCAL_ONLY`, so reaching the port is never enough to grant yourself credential control. Remote switches are rate limited per browser and logged with the client address, and Swap History labels them with the machine they came from.
+**Turning remote access on also hands out credential control.** A remote browser inside the enabled scope can switch accounts and trigger upgrades, exactly as the confirmation dialog says. That is the point of the setting: it is the one switch that decides who may do it. Outside the scope, and whenever remote access is off, account switching returns 403 and the dashboard greys the **Use Account** button out with the reason. The same rule applies to every other change through the API (each `POST`, `PUT`, `PATCH` or `DELETE`): Claude Code settings and hooks, permissions, packs, project files, analytics settings, account edits and deletes, settings changes, and auto-swap changes. From such a browser they return 403 with the code `REMOTE_ACCESS_OFF` or `OUTSIDE_SCOPE`. Usage refresh and account validation still work from such a browser, but they do not renew a token. A Claude sign-in that starts there stores the new login and does not make it active. The generic settings API never changes the account pointers (`desired_account_id` and the `active_account_id` keys): use **Use Account** to change the account. The setting itself is host-only: the toggle and the scope picker are read-only from a remote browser, and `PUT`/restart on the remote-access API are refused with `REMOTE_ACCESS_SETTINGS_LOCAL_ONLY`, so reaching the port is never enough to grant yourself credential control. Remote switches are rate limited per browser and logged with the client address, and Swap History labels them with the machine they came from.
 
 Prefer the CLI? These write the same setting (no more baked hosts in autostart files):
 
@@ -199,7 +199,7 @@ A network bind is hardened server-side: CORS is never wildcarded (the frontend i
 - `JACKED_ALLOWED_ORIGINS`: extra exact origins (`scheme://host[:port]`) allowed cross-origin API/WebSocket access. Needed behind a reverse proxy that rewrites `Host` to the loopback upstream (symptom: page loads but every write and the live WebSocket fail with 403; `tailscale serve` preserves `Host` and needs nothing).
 - `JACKED_ALLOWED_HOSTS`: extra hostnames accepted in the `Host` header, e.g. a custom DNS name pointing at the machine.
 
-Prefer not to rebind at all? `tailscale serve --bg 8321` proxies the loopback-bound dashboard to your tailnet over HTTPS with no jacked configuration changes. Viewers still arrive as their tailnet address, so the dashboard is view-only for them until the remote access toggle is on: the toggle, not the proxy, grants account switching, settings and auto-swap changes, and upgrades. A remote `POST /api/upgrade` follows the same toggle and scope, and it is refused with a 409 while an account switch holds the switch lease.
+Prefer not to rebind at all? `tailscale serve --bg 8321` proxies the loopback-bound dashboard to your tailnet over HTTPS with no jacked configuration changes. Viewers still arrive as their tailnet address, so the dashboard is view-only for them until the remote access toggle is on: the toggle, not the proxy, grants account switching, upgrades, and every other change through the API. A remote `POST /api/upgrade` follows the same toggle and scope, and it is refused with a 409 while an account switch holds the switch lease.
 
 ### Account switching, auto-swap, and session truth
 
@@ -444,7 +444,7 @@ jacked upgrade
 
 That's it. One command. Works on macOS, Linux, and Windows. Does all four things `uv tool install --force` alone doesn't do:
 
-1. `uv tool install claude-jacked --force` - new package on disk
+1. `uv tool install "claude-jacked[tray]>=<installed>" --force --refresh` - new package on disk (the `>=<installed>` floor is described in [No upgrade goes back to an older version](#no-upgrade-goes-back-to-an-older-version))
 2. `jacked service preflight` - prove the new version can start its service
 3. `jacked install --force` - migrate `settings.json` hooks to the shim form (`jacked _hook <name>`) so they survive Python version bumps
 4. `jacked service restart` - reload the running service with the new code (only if a service is running)
@@ -456,6 +456,23 @@ That's it. One command. Works on macOS, Linux, and Windows. Does all four things
 An upgrade never leaves you without a service. Step 2 runs before anything replaces the old install: it asks the NEW version to build its service definition and refuses the upgrade if that version cannot. Step 4 then proves the new service comes back up.
 
 If either step fails, jacked reinstalls the exact version that was running, runs `jacked install --force`, restarts that service, and exits with a non-zero code. It writes the reason and the manual recovery commands to `~/.claude/jacked-update-failed.txt`. The tray Update button and the Windows helper follow the same sequence.
+
+### No upgrade goes back to an older version
+
+No upgrade path installs a version that is older than the installed build. This applies to `jacked upgrade`, to the tray **Update** item, and to the dashboard **Upgrade** button. For a short time after a release, the package index can serve only an older version. Before the install, each path reads the package index. If the newest version that the index serves is older than the installed version, the path installs nothing and shows this message:
+
+```text
+Nothing to upgrade. The package index serves vX. The installed version is vY.
+```
+
+`jacked upgrade` then stops with one of these exit codes:
+
+- `0`: the installed version is the newest version that the index names. You do not have to do more.
+- `4`: the index names a newer release, but it does not serve that release yet. Try again in a few minutes.
+
+The upgrade command also has a version floor. The command that `jacked upgrade` prints has the form `uv tool install "claude-jacked[tray]>=<installed>" --force --refresh`, where `<installed>` is the installed version (`pipx install "claude-jacked[tray]>=<installed>" --force` for a pipx install). With this floor, uv cannot install an older version, also when the index changes after the check. The tray **Update** item uses the same floor. The dashboard **Upgrade** button runs `uv tool upgrade claude-jacked`, which keeps the installed version when the index serves only older versions.
+
+A refusal is not a failure. The tray shows the message in a notification, and the service continues to run. If the index changes after the tray check, the updater refuses, the update page shows the message, and the service starts again. No refusal writes the `~/.claude/jacked-update-failed.txt` file, so the tray does not show "Jacked Update Failed Earlier" at its next start. The dashboard **Upgrade** button shows the message too.
 
 ### Check a build before you upgrade
 

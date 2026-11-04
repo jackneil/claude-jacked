@@ -585,7 +585,7 @@ def test_cli_batch_claims_the_status_record_before_installing():
 
 import re  # noqa: E402
 
-_PACKAGE_MARK = '"tool" "install" "claude-jacked[tray]" '
+_PACKAGE_MARK = '"tool" "install" "claude-jacked[tray]>='  # #295i: the floor
 _ROLLBACK_MARK = '"claude-jacked[tray]=='
 
 
@@ -1302,3 +1302,44 @@ class TestUpdateStatusFailCommand:
         from jacked.cli import main
 
         assert main.commands["_update_status_fail"].hidden
+
+
+class TestTheVersionFloorNeverRedirects:
+    """#295i: the install requirement carries ``>=<installed>``. In cmd.exe a
+    ``>`` outside double quotes is a redirection, so an echo of the label
+    with the quotes swapped out would write the recovery text to a file
+    named ``=0.111.2'`` and lose it. Every ``>=`` of the floor must sit
+    inside a double-quoted part of its line."""
+
+    @staticmethod
+    def _floor_lines(body: str) -> list[str]:
+        return [line for line in body.split("\r\n") if "claude-jacked[tray]>=" in line]
+
+    @staticmethod
+    def _unquoted_floor(line: str) -> bool:
+        start = 0
+        while (at := line.find(">=", start)) != -1:
+            if line.count('"', 0, at) % 2 == 0:
+                return True
+            start = at + 2
+        return False
+
+    @pytest.mark.parametrize(
+        "which, variant",
+        [("tray", "rollback"), ("tray", "no-rollback"), ("cli", "rollback"),
+         ("cli", "no-rollback")],
+    )
+    def test_every_floor_is_inside_double_quotes(self, which, variant):
+        if which == "tray":
+            if variant == "no-rollback":
+                with patch("jacked.__version__", 'evil" & del C:\\ &'):
+                    body = _tray_batch()["body"]
+            else:
+                body = _tray_batch()["body"]
+        else:
+            args = ("--no-rollback",) if variant == "no-rollback" else ()
+            body = _cli_batch(args)["body"]
+        lines = self._floor_lines(body)
+        assert lines, "the batch carries no version floor"
+        bad = [line for line in lines if self._unquoted_floor(line)]
+        assert bad == []

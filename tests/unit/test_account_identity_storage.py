@@ -786,23 +786,24 @@ class TestStorePathsPersistUuid:
 class TestOAuthErrorLogging:
     """A failed completion logs the exception TYPE only. The exception text
     can carry emails (the re-auth identity check names both), so it goes to
-    the UI error field, never the log."""
+    the UI error field, never the log. The identity refusal is an
+    ``OAuthIdentityError``: text written for the user (#289i)."""
 
     _MSG = "Re-auth email (bob@test.com) does not match target (alice@test.com)"
 
     def _flow(self):
-        from jacked.web.oauth import OAuthFlow
+        from jacked.web.oauth import OAuthFlow, OAuthIdentityError
 
         flow = OAuthFlow(MagicMock(), purpose="primary")
         flow._state = "state-1"
-        flow._complete_auth = AsyncMock(side_effect=ValueError(self._MSG))
+        flow._complete_auth = AsyncMock(side_effect=OAuthIdentityError(self._MSG))
         return flow
 
     def _assert_values_free(self, flow, caplog):
         errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert errors, "the failure must still be logged"
         text = " ".join(r.getMessage() for r in errors)
-        assert "ValueError" in text
+        assert "OAuthIdentityError" in text
         assert "bob@test.com" not in text and "alice@test.com" not in text
         assert flow._status == "error"
         assert flow._error == self._MSG

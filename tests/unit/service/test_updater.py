@@ -130,7 +130,7 @@ def _script_port_mock(mock, results, run_mock) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _stub_native_restart():
+def _stub_native_restart(monkeypatch):
     """Keep the real native lifecycle adapter out of every test in this file.
 
     The final guard of run_update calls native_restart when a run ends
@@ -139,12 +139,16 @@ def _stub_native_restart():
     temporary HOME. Only the missing supervisor artifact and the conftest
     launchctl tripwire stopped it. A test that asserts on native_restart
     patches its own mock, and that patch replaces this stub for the test.
+
+    The stub goes through the test's own ``monkeypatch``. A ``patch()``
+    context here was undone BEFORE ``monkeypatch`` (conftest fixtures set
+    ``monkeypatch`` up first), so a test that set native_restart with
+    ``monkeypatch.setattr`` put this stub back for every later test file
+    (test_native_restart.py then read "stubbed native_restart").
     """
-    with patch(
-        "jacked.service.platform.native_restart",
-        return_value=(True, "stubbed native_restart"),
-    ) as stub:
-        yield stub
+    stub = MagicMock(return_value=(True, "stubbed native_restart"))
+    monkeypatch.setattr("jacked.service.platform.native_restart", stub)
+    return stub
 
 
 def test_no_test_in_this_file_runs_the_real_native_restart():
@@ -209,7 +213,8 @@ class TestRunUpdate:
         uv_args = mock_run.call_args_list[0][0][0]
         assert "/fake/uv" in uv_args
         assert "tool" in uv_args and "install" in uv_args
-        assert "claude-jacked[tray]" in uv_args
+        # #295i: the requirement carries the installed version as a floor.
+        assert any(arg.startswith("claude-jacked[tray]>=") for arg in uv_args)
         assert "--force" in uv_args
 
         assert mock_run.call_args_list[1][0][0] == [
@@ -252,7 +257,8 @@ class TestRunUpdate:
 
         install_argv = mock_run.call_args_list[0][0][0]
         assert install_argv[0] == "/fake/home/.local/bin/pipx"
-        assert "install" in install_argv and "claude-jacked[tray]" in install_argv
+        assert "install" in install_argv
+        assert any(arg.startswith("claude-jacked[tray]>=") for arg in install_argv)
 
     @patch("jacked.install_method.can_auto_upgrade", return_value=(True, ""))
     @patch("jacked.install_method.detect_install_method", return_value="pipx")
@@ -2881,3 +2887,126 @@ class TestFinalGuardFollowsTheOutcome:
             f"{self.REFUSED_ROLLBACK}; {self.GUARD_RESTARTED_CLAUSE}"
         )
         assert status["recovery"] == self.ROLLBACK_RECOVERY
+
+
+class TestTrayUpdaterNeverDowngrades:
+    """#295i: the tray updater never installs an older version than the one
+    on disk. The shared guard (jacked.upgrade_guard) refuses before the
+    install, and the install command carries a version floor."""
+
+    REFUSAL = (
+        "Nothing to upgrade. The package index serves v0.111.1. "
+        "The installed version is v0.111.2."
+    )
+
+    @staticmethod
+    def _setup(monkeypatch, installable):
+        from jacked import upgrade_guard
+        from jacked.service import updater
+
+        monkeypatch.setattr("jacked.install_method.can_auto_upgrade", lambda: (True, ""))
+        monkeypatch.setattr("jacked.install_method.detect_install_method", lambda: "uv")
+        monkeypatch.setattr(upgrade_guard, "installed_version", lambda: "0.111.2")
+        monkeypatch.setattr(
+            upgrade_guard,
+            "probe_index_versions",
+            lambda timeout=5.0: upgrade_guard.IndexVersions("0.111.2", installable),
+        )
+        monkeypatch.setattr(updater, "wait_for_exit", lambda pid, timeout=0: True)
+
+    def test_pin_295i_an_older_index_installs_nothing_and_restores_the_service(
+        self, monkeypatch
+    ):
+        from jacked.service import update_status as us
+        from jacked.service import updater
+
+        self._setup(monkeypatch, installable="0.111.1")
+        ran = []
+        monkeypatch.setattr(updater.subprocess, "run", lambda *a, **k: ran.append(a))
+        restarts = []
+        monkeypatch.setattr(
+            "jacked.service.platform.native_restart",
+            lambda: restarts.append(1) or (True, "stubbed"),
+        )
+
+        # The tray writes the status record before it spawns the updater.
+        us.init_status(us.UPDATE_STATUS_FILE, from_version="0.111.2",
+                       to_version="0.111.3", method="uv", preinit=True)
+
+        updater.run_update(4242, "tray", target_version="0.111.3", port=8321)
+
+        assert ran == []
+        assert f"REFUSED: {self.REFUSAL}" in updater.UPDATE_LOG.read_text()
+        # UG-1: nothing failed, so the next tray start shows no
+        # "Jacked Update Failed Earlier" toast.
+        assert not updater.RECOVERY_FILE.exists()
+        data = us.read_status(us.UPDATE_STATUS_FILE)
+        assert data["overall"] == "succeeded"
+        assert data["to_version"] == "0.111.2"
+        assert data["note"] == self.REFUSAL
+        assert "preinit" not in data and not data.get("error")
+        # The tray stopped the service for the update: the refusal starts it again.
+        assert restarts == [1]
+
+    def test_a_no_op_leaves_an_earlier_closed_record_and_recovery_file_alone(
+        self, monkeypatch
+    ):
+        """Only the record of THIS click (the tray pre-init) closes as a no-op.
+        A record and a recovery file from an earlier real failure stay."""
+        from jacked.service import update_status as us
+        from jacked.service import updater
+
+        self._setup(monkeypatch, installable="0.111.1")
+        monkeypatch.setattr(
+            "jacked.service.platform.native_restart", lambda: (True, "stubbed")
+        )
+        us.init_status(us.UPDATE_STATUS_FILE, from_version="0.111.0",
+                       to_version="0.111.2", method="uv")
+        us.mark_failed(us.UPDATE_STATUS_FILE, error="an earlier failure")
+        updater.RECOVERY_FILE.write_text("an earlier failure\n")
+
+        updater.run_update(4242, "tray", target_version="0.111.3", port=8321)
+
+        data = us.read_status(us.UPDATE_STATUS_FILE)
+        assert data["overall"] == "failed" and data["error"] == "an earlier failure"
+        assert updater.RECOVERY_FILE.read_text() == "an earlier failure\n"
+
+    def test_same_version_reinstalls_with_the_floor(self, monkeypatch):
+        from jacked.service import updater
+
+        self._setup(monkeypatch, installable="0.111.2")
+        ran = []
+
+        def _run(cmd, *a, **k):
+            ran.append(cmd)
+            return _fail(1)  # stop after the install step
+
+        monkeypatch.setattr(updater.subprocess, "run", _run)
+        monkeypatch.setattr(updater, "find_bin", lambda name: f"/fake/{name}")
+
+        updater.run_update(4242, "tray", target_version="0.111.2", port=8321)
+
+        assert ran[0] == [
+            "/fake/uv", "tool", "install", "claude-jacked[tray]>=0.111.2", "--force", "--refresh",
+        ]
+
+    def test_the_windows_tray_batch_carries_the_floor(self, monkeypatch):
+        from jacked.service import updater
+
+        self._setup(monkeypatch, installable="0.111.2")
+        captured = {}
+
+        class _Popen:
+            def __init__(self, args, **kwargs):
+                captured["args"] = args
+
+        with (
+            patch.object(updater.subprocess, "Popen", _Popen),
+            patch("jacked.findbin.find_bin", side_effect=lambda n: {"uv": r"C:\uv\uv.exe"}.get(n)),
+            patch("sys.platform", "win32"),
+        ):
+            updater._spawn_windows_tray_updater(4242, "tray", target_version="0.111.2", port=8321)
+        from pathlib import Path as _P
+
+        body = _P(captured["args"][-1]).read_text(encoding="utf-8")
+        assert '"claude-jacked[tray]>=0.111.2"' in body

@@ -96,4 +96,4 @@ async def put_skill_listing(body: SkillListingRequest):
         except SettingsUnreadableError:
             return features._settings_unreadable_response()
         except skill_listing.ListingSettingsError as exc:
-            return _invalid(str(exc))
+            return _invalid(exc.public_message)

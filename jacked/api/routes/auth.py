@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from jacked.api.mutation_gate import mutation_decision
+from jacked.api.write_gate import mutation_refusal
 from jacked.api.remote_access import (
     LOOPBACK_HOSTS,
     REASON_OUTSIDE_SCOPE,
@@ -441,15 +442,13 @@ def _credential_mutation_decision(
     """Resolve ``(allowed, reason, client_host)`` for this request.
 
     The policy and the audit line live in ``jacked.api.mutation_gate`` (one
-    gate for switches, status and the service upgrade); this name stays for
-    the routes and tests in this module.
+    gate for every write route); this name stays for this module's callers.
     """
     return mutation_decision(request, audit=audit)
 
 
 def _credential_mutation_allowed(request: Request) -> bool:
-    """Boolean half of :func:`_credential_mutation_decision`, for the OAuth
-    flow sites that only need to know whether to offer activation."""
+    """Boolean half of :func:`_credential_mutation_decision`: OAuth activation, token renewal."""
     return _credential_mutation_decision(request)[0]
 
 
@@ -935,6 +934,8 @@ async def start_add_account(
     if provider == "codex":
         from jacked.codex.accounts import CodexImportError, add_codex_account
 
+        if refused := await asyncio.to_thread(mutation_refusal, request, "add-codex"):
+            return refused
         try:
             acct = await asyncio.to_thread(add_codex_account, db, run_login=False)
         except CodexImportError as exc:
@@ -942,7 +943,7 @@ async def start_add_account(
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={
-                    "error": {"message": str(exc), "code": exc.code},
+                    "error": {"message": exc.public_message, "code": exc.code},
                     "needs_login": True,
                     "command": "codex login",
                 },
@@ -1293,6 +1294,7 @@ async def refresh_usage(account_id: int, request: Request):
 
     from jacked.api.credential_helpers import read_fresh_active_token
 
+    allow_refresh = await asyncio.to_thread(_credential_mutation_allowed, request)
     fresh_token = read_fresh_active_token(account_id)
     # Only pass fresh_token when it differs from DB token — passing a non-None
     # access_token to fetch_usage() bypasses its cache freshness guard (auth.py:339).
@@ -1300,7 +1302,7 @@ async def refresh_usage(account_id: int, request: Request):
     effective_token = fresh_token if (fresh_token and fresh_token != db_token) else None
     try:
         usage_data = await asyncio.wait_for(
-            fetch_usage(account_id, db, access_token=effective_token, manual=True),
+            fetch_usage(account_id, db, access_token=effective_token, manual=True, allow_refresh=allow_refresh),
             timeout=_SINGLE_USAGE_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -1471,9 +1473,8 @@ async def refresh_all_usage(
         my_task = asyncio.current_task()
         _bulk_refresh_task = my_task
         try:
-            accounts = await asyncio.to_thread(
-                db.list_accounts, include_inactive=False
-            )
+            accounts = await asyncio.to_thread(db.list_accounts, include_inactive=False)
+            allow_refresh = await asyncio.to_thread(_credential_mutation_allowed, request)
             ws_registry = getattr(request.app.state, "ws_registry", None)
             total = len(accounts)
 
@@ -1535,7 +1536,7 @@ async def refresh_all_usage(
                                 acct["id"],
                                 db,
                                 access_token=effective_token,
-                                manual=user_initiated,
+                                manual=user_initiated, allow_refresh=allow_refresh,
                             ),
                             timeout=_BULK_PER_ACCOUNT_TIMEOUT,
                         )
@@ -1651,7 +1652,7 @@ async def refresh_all_usage(
                 # one-pass-at-a-time invariant for any immediate retry.
                 try:
                     return await _refresh_one(acct)
-                except Exception as exc:
+                except Exception:  # the text goes to the log only (#289i)
                     logger.exception(
                         "Bulk refresh: unexpected error for account %d",
                         acct["id"],
@@ -1661,7 +1662,7 @@ async def refresh_all_usage(
                         "account_id": acct["id"],
                         "email": acct["email"],
                         "success": False,
-                        "error": f"internal error during refresh: {exc}",
+                        "error": "An internal error stopped the refresh. Check the jacked log.",
                     }
 
             results = list(
@@ -1702,10 +1703,9 @@ async def validate_token(account_id: int, request: Request):
         return _not_found(f"No account with id={account_id}")
 
     try:
+        allow_refresh = await asyncio.to_thread(_credential_mutation_allowed, request)
         result = await asyncio.wait_for(
-            validate_account(account_id, db),
-            timeout=_VALIDATE_TIMEOUT,
-        )
+            validate_account(account_id, db, allow_refresh=allow_refresh), timeout=_VALIDATE_TIMEOUT)
     except asyncio.TimeoutError:
         logger.warning(
             "validate_token: account %d validate_account exceeded %.0fs — returning 504",
@@ -1882,7 +1882,7 @@ async def use_account(account_id: int, request: Request):
         except CodexSwapError as exc:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                content={"error": {"message": str(exc), "code": "CODEX_SWAP_FAILED"}},
+                content={"error": {"message": exc.public_message, "code": "CODEX_SWAP_FAILED"}},
             )
         return JSONResponse(
             status_code=status.HTTP_200_OK,

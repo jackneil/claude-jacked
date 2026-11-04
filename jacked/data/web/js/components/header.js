@@ -119,12 +119,24 @@ function _updateUpgradeModal(message) {
 }
 
 function _showUpgradeError(message) {
+    _showUpgradeMessage(message, true);
+}
+
+// A result that is not a failure, for example "Nothing to upgrade".
+function _showUpgradeNote(message) {
+    _showUpgradeMessage(message, false);
+}
+
+function _showUpgradeMessage(message, isError) {
     const modal = _getOrCreateUpgradeModal();
     modal.style.display = 'flex';
     const spinner = document.getElementById('upgrade-modal-spinner');
     if (spinner) spinner.style.display = 'none';
     const msg = document.getElementById('upgrade-modal-msg');
-    if (msg) { msg.textContent = message; msg.className = 'upgrade-modal__msg upgrade-modal__msg--error'; }
+    if (msg) {
+        msg.textContent = message;
+        msg.className = isError ? 'upgrade-modal__msg upgrade-modal__msg--error' : 'upgrade-modal__msg';
+    }
     if (!modal.querySelector('.upgrade-modal__dismiss')) {
         const btn = document.createElement('button');
         btn.className = 'upgrade-modal__dismiss';

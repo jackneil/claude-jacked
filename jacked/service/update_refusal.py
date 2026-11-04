@@ -11,7 +11,9 @@ leaves jacked down until the user restarts it by hand.
 transaction: it logs the reason and writes the recovery file. Then it takes
 the update lock without waiting. With the lock, it closes the tray's status
 record as failed, waits for the old service to exit, restarts it, and
-releases the lock. Without the lock (another updater holds it, or the lock
+releases the lock. A no-op refusal (the index serves only an older version,
+#295i) is not a failure: it writes no recovery file, and it closes the
+tray's pre-init record as done at the installed version. Without the lock (another updater holds it, or the lock
 cannot be taken), another updater can own the record and the restart, so it
 changes neither. Each step is best effort, because the reason for the
 refusal (a package that cannot import its own modules, for example) can
@@ -38,17 +40,21 @@ def refuse_and_restore(
     write_recovery,
     wait_for_exit,
     start_fallback=None,
+    noop_version=None,
 ) -> bool:
     """Refuse the update and restart the service the tray stopped.
 
     ``reason`` goes into the update log after ``REFUSED:`` and into the
     status record. ``recovery_text`` is the whole recovery file.
     ``start_fallback`` starts the service without its supervisor; it runs
-    when the supervisor restart fails. Returns True when a restart ran and
-    reported success.
+    when the supervisor restart fails. With ``noop_version`` (the installed
+    version), the refusal is a no-op: no recovery file, and the tray's
+    pre-init record closes as done at that version, with ``reason`` as its
+    note. Returns True when a restart ran and reported success.
     """
     log(f"REFUSED: {reason}")
-    write_recovery(recovery_text)
+    if noop_version is None:
+        write_recovery(recovery_text)
     try:
         from jacked.service import update_status
 
@@ -62,11 +68,16 @@ def refuse_and_restore(
         return False
     try:
         try:
-            update_status.mark_failed(
-                update_status.UPDATE_STATUS_FILE,
-                error=f"update refused: {reason}",
-                recovery="see ~/.claude/jacked-update-failed.txt",
-            )
+            if noop_version is not None:
+                from jacked.service.update_noop import close_preinit_as_noop
+
+                close_preinit_as_noop(update_status.UPDATE_STATUS_FILE, noop_version, reason)
+            else:
+                update_status.mark_failed(
+                    update_status.UPDATE_STATUS_FILE,
+                    error=f"update refused: {reason}",
+                    recovery="see ~/.claude/jacked-update-failed.txt",
+                )
         except Exception:
             logger.exception("Could not close the status record of a refused update")
         if not wait_for_exit(parent_pid, timeout=PARENT_EXIT_TIMEOUT_SECONDS):
@@ -104,11 +115,12 @@ def _restart(log, start_fallback) -> bool:
 def refuser(parent_pid: int, log, write_recovery, wait_for_exit, *, close, start_fallback=None):
     """Bind :func:`refuse_and_restore` to one updater run.
 
-    The returned function takes ``reason`` and ``recovery_text``, refuses,
-    and then calls ``close`` (the update log).
+    The returned function takes ``reason``, ``recovery_text`` and
+    ``noop_version`` (see :func:`refuse_and_restore`), refuses, and then
+    calls ``close`` (the update log).
     """
 
-    def refuse(reason: str, recovery_text: str) -> bool:
+    def refuse(reason: str, recovery_text: "str | None", *, noop_version=None) -> bool:
         try:
             return refuse_and_restore(
                 reason,
@@ -118,8 +130,31 @@ def refuser(parent_pid: int, log, write_recovery, wait_for_exit, *, close, start
                 write_recovery=write_recovery,
                 wait_for_exit=wait_for_exit,
                 start_fallback=start_fallback,
+                noop_version=noop_version,
             )
         finally:
             close()
 
     return refuse
+
+
+def record_tray_refusal(reason: str) -> None:
+    """Record a refusal that the tray makes before it spawns an updater. Never raises.
+
+    The install cannot upgrade itself (``can_auto_upgrade``), so the tray
+    writes ``reason`` to the recovery file and removes a stale status record.
+    The tray keeps running, so there is no service to restart.
+    """
+    try:
+        from jacked.service.updater import RECOVERY_FILE
+
+        RECOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RECOVERY_FILE.write_text(reason + "\n")
+    except Exception:
+        logger.exception("Could not write recovery file on refusal")
+    try:
+        from jacked.service import update_status
+
+        update_status.clear_status(update_status.UPDATE_STATUS_FILE)
+    except Exception:
+        logger.exception("Could not clear stale status file on refusal")

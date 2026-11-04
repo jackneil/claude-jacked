@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 from jacked.findbin import find_bin
+from jacked.public_errors import PublicError, describe
 from jacked.service.menubar_summary import _epoch_to_iso
 from jacked.service.pill_text import percent_reading
 
@@ -41,14 +42,13 @@ from .credentials import codex_home
 
 logger = logging.getLogger(__name__)
 
-# Whole handshake + read budget. A usage read is fast (~1-2s); this is a safety
-# cap for a hung app-server. Kept tight because fetch_codex_usage holds the swap
-# lock for this whole duration, and a user swap waits on that lock.
+# Whole handshake + read budget: a read takes ~1-2s, this caps a hung app-server.
+# Kept tight: fetch_codex_usage holds the swap lock that a user swap waits on.
 _APP_SERVER_TIMEOUT = 12.0
 
 
-class CodexUsageError(Exception):
-    """The codex app-server call failed (no binary, timeout, RPC error)."""
+class CodexUsageError(PublicError):
+    """The codex app-server call failed. The message is written for the user."""
 
 
 # A window under a day (24 * 60 minutes) is the "short" (5h-style) window;
@@ -224,8 +224,7 @@ async def _send(proc: asyncio.subprocess.Process, obj: dict) -> None:
 async def _read_result(proc: asyncio.subprocess.Process, want_id: int) -> dict:
     """Read newline-delimited JSON-RPC until the message with ``id == want_id``.
 
-    Notifications (no/other id) are skipped. Raises ``CodexUsageError`` on a
-    JSON-RPC ``error`` or if the stream closes first.
+    Skips notifications. Raises ``CodexUsageError`` on an error or an early EOF.
     """
     assert proc.stdout is not None
     while True:
@@ -241,8 +240,9 @@ async def _read_result(proc: asyncio.subprocess.Process, want_id: int) -> dict:
             continue  # tolerate non-JSON log lines
         if msg.get("id") != want_id:
             continue  # a notification or a different request's reply
-        if msg.get("error"):
-            raise CodexUsageError(f"codex app-server error: {msg['error']}")
+        if error := msg.get("error"):  # values-free: its message can echo an HTTP body
+            code = error.get("code") if isinstance(error, dict) else None
+            raise CodexUsageError(f"codex app-server returned JSON-RPC error {code}")
         return msg.get("result") or {}
 
 
@@ -311,8 +311,8 @@ async def read_codex_rate_limits(
             stderr=asyncio.subprocess.DEVNULL,
             env=run_env,
         )
-    except (OSError, ValueError) as exc:
-        raise CodexUsageError(f"failed to start codex app-server: {exc}") from exc
+    except (OSError, ValueError) as exc:  # describe(): str(exc) names the binary path
+        raise CodexUsageError(f"failed to start codex app-server: {describe(exc)}") from exc
 
     try:
         return await asyncio.wait_for(_drive(proc, _client_version()), timeout=timeout)
@@ -417,7 +417,7 @@ async def fetch_codex_usage(
                 "Codex usage fetch failed for account %s: %s", account_id, exc
             )
             try:
-                await asyncio.to_thread(db.record_account_error, account_id, str(exc))
+                await asyncio.to_thread(db.record_account_error, account_id, exc.public_message)
             except Exception:  # pragma: no cover - bookkeeping must not mask failure
                 logger.debug("record_account_error failed", exc_info=True)
             return None

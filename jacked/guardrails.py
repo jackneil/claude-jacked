@@ -7,12 +7,15 @@ hook installation for jacked-managed projects.
 
 from __future__ import annotations
 
-import shutil
+import logging
 import stat
 from pathlib import Path
 from typing import Optional
 
-from jacked.atomic_io import atomic_write_text
+from jacked.atomic_install import atomic_copy_file
+from jacked.atomic_io import atomic_write_bytes, atomic_write_text
+
+logger = logging.getLogger(__name__)
 
 # Where bundled templates live inside the package
 _DATA_DIR = Path(__file__).parent / "data"
@@ -37,6 +40,18 @@ GUARDRAILS_FILENAMES = [
     "guardrails.md",
     "Guardrails.md",
 ]
+
+# Each supported language and its two bundled templates: the guardrails
+# document and the pre-push hook. A template path comes only from this table,
+# never from the language text, so a caller value such as "../../x" cannot
+# name a file outside the template folders.
+_LANGUAGE_TEMPLATES = {
+    "python": ("python.md", "pre-push-python.sh"),
+    "node": ("node.md", "pre-push-node.sh"),
+    "rust": ("rust.md", "pre-push-rust.sh"),
+    "go": ("go.md", "pre-push-go.sh"),
+}
+SUPPORTED_LANGUAGES = tuple(_LANGUAGE_TEMPLATES)
 
 # Language detection: config file -> language name
 _LANGUAGE_INDICATORS = [
@@ -83,6 +98,15 @@ def detect_language(repo_path: str | Path) -> Optional[str]:
     return None
 
 
+def _unknown_language_reason(language: str) -> str:
+    """The refusal text for a language that has no bundled templates.
+
+    >>> _unknown_language_reason("cobol")
+    "Unknown language: 'cobol'. Use one of: python, node, rust, go."
+    """
+    return f"Unknown language: {language!r}. Use one of: {', '.join(SUPPORTED_LANGUAGES)}."
+
+
 def create_guardrails(
     repo_path: str | Path,
     language: Optional[str] = None,
@@ -91,7 +115,8 @@ def create_guardrails(
     """Create JACKED_GUARDRAILS.md in a project from templates.
 
     Combines base.md + language-specific template into a single file.
-    Returns dict with status info.
+    Returns dict with status info. A language that is not in
+    ``SUPPORTED_LANGUAGES`` is refused before any file changes.
 
     >>> import tempfile
     >>> d = tempfile.mkdtemp()
@@ -103,6 +128,9 @@ def create_guardrails(
     """
     repo = Path(repo_path)
     target = repo / "JACKED_GUARDRAILS.md"
+
+    if language is not None and language not in _LANGUAGE_TEMPLATES:
+        return {"created": False, "path": str(target), "reason": _unknown_language_reason(language)}
 
     # Check for any existing variant before creating
     if not force:
@@ -136,9 +164,10 @@ def create_guardrails(
 
     # Append language-specific template if available
     if language:
-        lang_src = GUARDRAILS_TEMPLATES / f"{language}.md"
+        lang_name = _LANGUAGE_TEMPLATES[language][0]
+        lang_src = GUARDRAILS_TEMPLATES / lang_name
         if not lang_src.exists():
-            lang_src = GUARDRAILS_GLOBAL / f"{language}.md"
+            lang_src = GUARDRAILS_GLOBAL / lang_name
         if lang_src.exists():
             content += "\n" + lang_src.read_text(encoding="utf-8")
 
@@ -185,7 +214,10 @@ def install_hook(
     """Install a pre-push lint hook in a project's .git/hooks/.
 
     Copies the language-appropriate hook template to .git/hooks/pre-push
-    (extensionless, as git requires).
+    (extensionless, as git requires). A language that is not in
+    ``SUPPORTED_LANGUAGES`` is refused before any file changes. A link at
+    the hook path is replaced by a plain file, so the install never writes
+    through the link to the file that it points at.
 
     >>> import tempfile, os
     >>> d = tempfile.mkdtemp()
@@ -198,6 +230,9 @@ def install_hook(
     """
     repo = Path(repo_path)
     git_dir = repo / ".git"
+
+    if language is not None and language not in _LANGUAGE_TEMPLATES:
+        return {"installed": False, "reason": _unknown_language_reason(language)}
 
     if not git_dir.is_dir():
         return {"installed": False, "reason": "no .git directory found"}
@@ -239,27 +274,98 @@ def install_hook(
         return {"installed": False, "reason": "could not detect language. Specify it with --language."}
 
     # Find the template
-    template_name = f"pre-push-{language}.sh"
+    template_name = _LANGUAGE_TEMPLATES[language][1]
     src = HOOK_TEMPLATES / template_name
     if not src.exists():
         src = HOOKS_GLOBAL / template_name
     if not src.exists():
         return {"installed": False, "reason": f"no hook template for language: {language}"}
 
-    # Copy template to .git/hooks/pre-push (extensionless)
-    shutil.copy2(src, target)
-
-    # Set executable bit (no-op on Windows/NTFS, but correct for Unix)
-    try:
-        target.chmod(target.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    except Exception:
-        pass
+    # Copy the template bytes to .git/hooks/pre-push (extensionless). The
+    # shared writer replaces a link at the target with a plain file, and the
+    # bytes keep the template's LF line endings on every platform.
+    write_hook(target, src.read_bytes())
 
     return {
         "installed": True,
         "path": str(target),
         "language": language,
     }
+
+
+def write_hook(target: Path, data: bytes) -> None:
+    """Write a git hook script at ``target`` and make it executable.
+
+    The shared atomic writer replaces a link at ``target`` with a plain
+    file, so a hook install never writes through the link. On POSIX a new
+    hook is 0o755. A hook that replaces a regular file keeps that file's
+    mode, and then gets the execute bits. Windows ignores the execute bits.
+
+    >>> import tempfile, os
+    >>> hook = Path(tempfile.mkdtemp()) / "hooks" / "pre-push"
+    >>> write_hook(hook, b"#!/bin/sh\\nexit 0\\n")
+    >>> hook.read_bytes()
+    b'#!/bin/sh\\nexit 0\\n'
+    >>> os.name != "posix" or os.access(hook, os.X_OK)
+    True
+    """
+    atomic_write_bytes(target, data, new_file_mode=0o755)
+    # The target is now the plain file that the writer made.
+    try:
+        target.chmod(target.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    except OSError:
+        pass
+
+
+def read_project_env(repo_path: str | Path) -> Optional[str]:
+    """Return the Python env path that ``.git/jacked/env`` sets for a project.
+
+    The pre-push hook uses only the first line of the file, so this function
+    returns only the first line, with the spaces at each end removed. It
+    returns ``None`` when the file is missing, empty or not readable.
+
+    A repository can make the file a link, or make a folder above it a link.
+    A read through the link shows the content of a different file. So the
+    function also returns ``None``, and logs a line that has no path or
+    content, when the file is a link, when it is not a regular file (a pipe
+    can stop the read), or when its real path is not in the ``.git`` folder
+    of the project (a ``.git`` link to a different folder is outside).
+
+    >>> import tempfile
+    >>> repo = Path(tempfile.mkdtemp())
+    >>> (repo / ".git" / "jacked").mkdir(parents=True)
+    >>> _ = (repo / ".git" / "jacked" / "env").write_text("/opt/env \\n/other\\n")
+    >>> read_project_env(repo)
+    '/opt/env'
+    >>> read_project_env(Path(tempfile.mkdtemp())) is None
+    True
+    """
+    git_dir = Path(repo_path) / ".git"
+    env_file = git_dir / "jacked" / "env"
+    try:
+        info = env_file.lstat()
+    except OSError:
+        return None
+    reason = None
+    if stat.S_ISLNK(info.st_mode):
+        reason = "the file is a link"
+    elif not stat.S_ISREG(info.st_mode):
+        reason = "the file is not a regular file"
+    else:
+        try:
+            inside = Path(repo_path).resolve(strict=True) / ".git"
+            env_file.resolve(strict=True).relative_to(inside)
+        except (OSError, RuntimeError, ValueError):
+            reason = "the real path of the file is not in the .git folder"
+    if reason:
+        logger.warning("The project env file is not used: %s.", reason)
+        return None
+    try:
+        with env_file.open(encoding="utf-8") as handle:
+            first_line = handle.readline().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return first_line or None
 
 
 def check_project_setup(repo_path: str | Path) -> dict:
@@ -318,15 +424,7 @@ def check_project_setup(repo_path: str | Path) -> dict:
         except Exception:
             pass
 
-    # Read .git/jacked/env if present
-    env_file = repo / ".git" / "jacked" / "env"
-    if env_file.exists():
-        try:
-            env_path = env_file.read_text(encoding="utf-8").strip()
-            if env_path:
-                result["env_path"] = env_path
-        except Exception:
-            pass
+    result["env_path"] = read_project_env(repo)
 
     # Detect language
     result["detected_language"] = detect_language(repo)
@@ -352,7 +450,7 @@ def deploy_templates(force: bool = False) -> dict:
         if dst.exists() and not force:
             results["guardrails"].append({"file": src.name, "skipped": True})
             continue
-        shutil.copy2(src, dst)
+        atomic_copy_file(src, dst)
         results["guardrails"].append({"file": src.name, "deployed": True})
 
     # Deploy hook templates
@@ -362,7 +460,7 @@ def deploy_templates(force: bool = False) -> dict:
         if dst.exists() and not force:
             results["hooks"].append({"file": src.name, "skipped": True})
             continue
-        shutil.copy2(src, dst)
+        atomic_copy_file(src, dst)
         results["hooks"].append({"file": src.name, "deployed": True})
 
     return results

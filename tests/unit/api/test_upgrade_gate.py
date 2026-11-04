@@ -472,7 +472,11 @@ def test_do_upgrade_holds_the_switch_lease_for_its_whole_run(monkeypatch, caplog
         "upgrade_complete",
         "upgrade_failed",
     ]
-    assert "exec stubbed out" in registry.events[-1][1]["error"]
+    # The OSError's own text stays out of the dialog (#289i).
+    assert registry.events[-1][1]["error"] == (
+        "Upgrade failed at the restart step. "
+        "Check the jacked log on the host machine for the cause."
+    )
     # Everything is released after the failure, so a later upgrade can start.
     _assert_lease_is_free()
     assert system._upgrade_lock.locked() is False
@@ -552,8 +556,13 @@ def test_cancellation_stops_the_installer_before_the_lease_is_released(monkeypat
     awaited inside the lease, so no switch can start beside a live installer."""
     child = _FakeChild()
     lease_held_when_child_stopped: list[bool] = []
+    # Set when the upgrade starts the installer. A fixed count of loop ticks
+    # was not enough on a loaded machine: the upgrade does thread work before
+    # the start, and a cancel before the start has no child to stop.
+    child_started = asyncio.Event()
 
     async def _fake_exec(*cmd, **kwargs):
+        child_started.set()
         return child
 
     original_terminate = child.terminate
@@ -571,7 +580,8 @@ def test_cancellation_stops_the_installer_before_the_lease_is_released(monkeypat
 
     async def _run():
         task = asyncio.create_task(system._do_upgrade(registry, "127.0.0.1"))
-        for _ in range(20):  # let the upgrade reach the child
+        await child_started.wait()
+        for _ in range(20):  # let the upgrade read from the child
             await asyncio.sleep(0)
             if registry.events and registry.events[-1][0] == "upgrade_progress":
                 break
@@ -593,8 +603,12 @@ def test_a_noisy_child_that_ignores_sigterm_is_killed_and_drained(monkeypatch):
     grace period, its stdout drained to EOF, and the cancellation still
     propagates with the lease released afterwards."""
     child = _FakeChild(ignores_sigterm=True)
+    # Wait for the real start, not a fixed count of loop ticks: the upgrade
+    # runs the #295i refusal check in a thread before it starts the child.
+    child_started = asyncio.Event()
 
     async def _fake_exec(*cmd, **kwargs):
+        child_started.set()
         return child
 
     real_wait_for = asyncio.wait_for
@@ -613,6 +627,7 @@ def test_a_noisy_child_that_ignores_sigterm_is_killed_and_drained(monkeypatch):
         monkeypatch.setattr(system.asyncio, "wait_for", _short_grace)
         try:
             task = asyncio.create_task(system._do_upgrade(registry, "127.0.0.1"))
+            await child_started.wait()
             for _ in range(20):
                 await real_sleep(0)
                 if registry.events and registry.events[-1][0] == "upgrade_progress":
@@ -752,8 +767,12 @@ def test_cancel_running_upgrade_stops_the_child_inside_the_lease(monkeypatch):
     terminated (and killed when it ignores SIGTERM), drained, and only then is
     the lease released."""
     child = _FakeChild(ignores_sigterm=True)
+    # Wait for the real start, not a fixed count of loop ticks: the upgrade
+    # runs the #295i refusal check in a thread before it starts the child.
+    child_started = asyncio.Event()
 
     async def _fake_exec(*cmd, **kwargs):
+        child_started.set()
         return child
 
     real_wait_for = asyncio.wait_for
@@ -773,6 +792,7 @@ def test_cancel_running_upgrade_stops_the_child_inside_the_lease(monkeypatch):
             task = asyncio.create_task(system._do_upgrade(registry, "127.0.0.1"))
             system._upgrade_tasks.add(task)
             task.add_done_callback(system._upgrade_tasks.discard)
+            await child_started.wait()
             for _ in range(20):
                 await real_sleep(0)
                 if registry.events and registry.events[-1][0] == "upgrade_progress":
@@ -852,3 +872,46 @@ def test_upgrade_denial_copy_is_user_facing_clean():
         assert "--" not in message
         assert "Settings > Advanced" in message
         assert "host machine" in message
+
+
+def test_pin_295i_the_dashboard_upgrade_never_installs_an_older_version(monkeypatch):
+    """#295i: the Upgrade button asks the shared guard before it runs uv.
+    When the index serves an older version than the one on disk, no command
+    runs, the service is not replaced, and the page shows why."""
+    from jacked import upgrade_guard
+
+    refusal = (
+        "Nothing to upgrade. The package index serves v0.111.1. "
+        "The installed version is v0.111.2."
+    )
+    commands: list[list[str]] = []
+
+    async def _forbidden_command(cmd):
+        commands.append(cmd)
+        raise AssertionError("an install command ran for a downgrade")
+
+    def _forbidden_execv(prog, argv):
+        raise AssertionError("the service was replaced for a downgrade")
+
+    monkeypatch.setattr(upgrade_guard, "installed_version", lambda: "0.111.2")
+    monkeypatch.setattr(
+        upgrade_guard,
+        "probe_index_versions",
+        lambda timeout=5.0: upgrade_guard.IndexVersions("0.111.2", "0.111.1"),
+    )
+    monkeypatch.setattr(jacked.findbin, "find_bin", lambda name, *a, **k: f"/stub/bin/{name}")
+    monkeypatch.setattr(system, "find_bin", lambda name, *a, **k: f"/stub/bin/{name}")
+    monkeypatch.setattr(system, "_upgrade_run_cmd", _forbidden_command)
+    monkeypatch.setattr(system.os, "execv", _forbidden_execv)
+    registry = _Registry()
+
+    asyncio.run(system._do_upgrade(registry, LOOPBACK))
+
+    assert commands == []
+    assert registry.events == [
+        ("upgrade_started", {}),
+        # A no-op is not a failure: the page shows a note, not an error.
+        ("upgrade_noop", {"message": refusal}),
+    ]
+    _assert_lease_is_free()
+    assert system._upgrade_lock.locked() is False

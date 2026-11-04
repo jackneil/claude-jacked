@@ -1409,10 +1409,18 @@ class ServiceRunner:
     def _version_is_clickable(self) -> bool:
         return bool(self._version_info and self._version_info.get("outdated"))
 
+    def _on_update_click_in_background(self) -> threading.Thread:
+        """Run _on_update_click in a worker: a menu callback must not wait on the
+        index probe. The worker owns the lifecycle lock and its reentrant _on_stop."""
+        worker = threading.Thread(target=self._on_update_click, name="jacked-update-click", daemon=True)
+        worker.start()
+        return worker
+
     def _on_update_click(self):
         """User clicked 'Update to vX.Y.Z' in the tray menu.
 
         Uses the reentrant _lifecycle_lock throughout the spawn+stop transition.
+        It blocks on the index probe: menus call _on_update_click_in_background.
         """
         if not self._version_is_clickable():
             return
@@ -1430,19 +1438,9 @@ class ServiceRunner:
                     self._notify(self._icon, "Jacked auto-update disabled", _reason)
                 except Exception:
                     logger.exception("Failed to notify on update refusal")
-            try:
-                from jacked.service.updater import RECOVERY_FILE
+            from jacked.service.update_refusal import record_tray_refusal
 
-                RECOVERY_FILE.parent.mkdir(parents=True, exist_ok=True)
-                RECOVERY_FILE.write_text(_reason + "\n")
-            except Exception:
-                logger.exception("Could not write recovery file on refusal")
-            try:
-                from jacked.service import update_status as _us
-
-                _us.clear_status(_us.UPDATE_STATUS_FILE)
-            except Exception:
-                logger.exception("Could not clear stale status file on refusal")
+            record_tray_refusal(_reason)
             return
 
         if not self._lifecycle_lock.acquire(blocking=False):
@@ -1453,20 +1451,20 @@ class ServiceRunner:
         # Breadcrumb FIRST — proves the click reached us even if everything
         # downstream fails. Uses the same log file the detached updater
         # appends to.
-        try:
-            import time as _time_mod
-            from jacked.service.updater import UPDATE_LOG as _bc_log
-
-            _bc_log.parent.mkdir(parents=True, exist_ok=True)
-            with open(_bc_log, "a", encoding="utf-8") as _lf:
-                _lf.write(
-                    f"[{_time_mod.strftime('%Y-%m-%d %H:%M:%S')}] tray: update clicked "
-                    f"(tray PID {os.getpid()}, target v{latest})\n"
-                )
-        except Exception:
-            logger.exception("Could not write tray-click breadcrumb")
+        from jacked import upgrade_guard
+        upgrade_guard.append_update_log(
+            f"tray: update clicked (tray PID {os.getpid()}, target v{latest})"
+        )
 
         try:
+            # #295i: ask the index BEFORE the tray stops the service.
+            if refusal := upgrade_guard.current_refusal(log_source="tray"):
+                if self._icon:
+                    try:
+                        self._notify(self._icon, "Jacked Update", refusal)
+                    except Exception:
+                        logger.exception("Could not notify the update refusal")
+                return
             if self._icon:
                 try:
                     self._apply_icon("starting")
@@ -2065,7 +2063,7 @@ class ServiceRunner:
             on_stop=self._on_stop,
             on_toggle_autostart=self._on_toggle_autostart,
             version_text_fn=self._version_menu_text,
-            version_click_fn=self._on_update_click,
+            version_click_fn=self._on_update_click_in_background,
             version_enabled_fn=self._version_is_clickable,
             on_check_for_updates=self._on_check_for_updates,
             last_check_text_fn=self._last_check_menu_text,

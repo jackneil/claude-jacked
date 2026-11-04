@@ -136,11 +136,17 @@ def exec_attempts():
 
 @pytest.fixture(autouse=True)
 def _no_pypi_lookup_in_upgrade(monkeypatch):
-    """`jacked upgrade` reads its target version from PyPI; no test may reach
-    the network for it. A test that needs a target patches it explicitly."""
-    import jacked.cli
+    """Every upgrade path (`jacked upgrade`, the tray updater, the dashboard)
+    reads the package index before it installs; no test may reach the network
+    for it. A test that needs index answers patches the probe explicitly, and
+    `upgrade_guard._probe_index_versions_impl` is the real probe."""
+    from jacked import upgrade_guard
 
-    monkeypatch.setattr(jacked.cli, "_upgrade_target_version", lambda: None)
+    monkeypatch.setattr(
+        upgrade_guard,
+        "probe_index_versions",
+        lambda timeout=upgrade_guard.PROBE_TIMEOUT_SECONDS: upgrade_guard.IndexVersions(),
+    )
 
 
 @pytest.fixture(autouse=True)

@@ -1082,3 +1082,25 @@ def test_behaviors_rule_asks_for_commit_trailers():
     assert "—" not in line
     assert block.index(line) < block.index("# end-jacked-behaviors")
     assert line in codex_installer._codex_rules_body(block)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_install_replaces_a_linked_hook_and_keeps_the_link_target(env):
+    """Refreshing our hook must not write through a link at post-merge."""
+    import os
+
+    repo = _bare_git_dir(env.tmp / "repo")
+    outside = env.tmp / "shared-hook"
+    outside.write_text("#!/bin/sh\n# jacked-memory-hook\necho old\n", encoding="utf-8")
+    outside.chmod(0o644)
+    hook = repo / ".git" / "hooks" / "post-merge"
+    hook.symlink_to(outside)
+
+    res = githook.install_post_merge(repo)
+
+    assert res["installed"] is True
+    assert outside.read_text(encoding="utf-8") == "#!/bin/sh\n# jacked-memory-hook\necho old\n"
+    assert outside.stat().st_mode & 0o111 == 0
+    assert not hook.is_symlink()
+    assert "capture-merge" in hook.read_text(encoding="utf-8")
+    assert os.access(hook, os.X_OK)

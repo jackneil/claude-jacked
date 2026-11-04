@@ -22,6 +22,8 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 from pydantic import BaseModel, computed_field
 
+from jacked.web import project_activity
+
 logger = logging.getLogger(__name__)
 
 # Upper bound on the JSON text of a stored raw usage payload, in characters.
@@ -467,6 +469,7 @@ CREATE TABLE IF NOT EXISTS session_accounts (
     credential_revision TEXT,
     launch_nonce TEXT,
     event_idempotency_key TEXT,
+    pid_token TEXT,
     UNIQUE(session_id, detected_at)
 );
 
@@ -985,6 +988,7 @@ class Database:
                 ("credential_revision", "TEXT"),
                 ("launch_nonce", "TEXT"),
                 ("event_idempotency_key", "TEXT"),
+                ("pid_token", "TEXT"),
             ]:
                 if col_name not in cols:
                     try:
@@ -2659,7 +2663,7 @@ class Database:
 
     def find_open_sessions(self, pids) -> dict:
         """The newest open tracked session of each Claude Code process id in
-        *pids*: ``{pid: {"account_id": int or None, "detected_at": str}}``.
+        *pids*: ``{pid: {"account_id", "detected_at", "pid_token"}}``.
 
         A session whose account is unknown is kept with ``account_id`` None:
         the caller decides, never an older row or an outer session.
@@ -2682,15 +2686,15 @@ class Database:
         marks = ",".join("?" * len(wanted))
         with self._reader() as conn:
             rows = conn.execute(
-                f"SELECT pid, account_id, detected_at FROM session_accounts "
+                f"SELECT pid, account_id, detected_at, pid_token FROM session_accounts "
                 f"WHERE pid IN ({marks}) AND ended_at IS NULL ORDER BY id DESC",
                 wanted,
             ).fetchall()
         found: dict = {}
-        for pid, account_id, detected_at in rows:
+        for pid, account_id, detected_at, pid_token in rows:
             found.setdefault(int(pid), {
                 "account_id": None if account_id is None else int(account_id),
-                "detected_at": detected_at,
+                "detected_at": detected_at, "pid_token": pid_token,
             })
         return found
 
@@ -2995,11 +2999,13 @@ class Database:
         credential_revision: Optional[str] = None,
         launch_nonce: Optional[str] = None,
         event_idempotency_key: Optional[str] = None,
+        pid_token: Optional[str] = None,
     ) -> int:
-        """Record which account a session is using.
+        """Record which account a session is using (rules: ``write_span``).
 
-        Closes stale records for different accounts on the same session and
-        prevents duplicate rows for the same session+account combo.
+        Closes stale records for different accounts on the same session,
+        prevents duplicate rows for the same session+account combo, and
+        starts a new span when the session runs in a new process.
 
         >>> db = Database(":memory:")
         >>> rid = db.record_session_account("sess-1", account_id=1, email="a@b.com", detection_method="session_start")
@@ -3020,82 +3026,20 @@ class Database:
         >>> rows[0]["account_id"]
         2
         """
-        ts = datetime.now(timezone.utc).isoformat()
+        from jacked.session_tracking_store import write_span
+
+        fields = {
+            "credential_scope": credential_scope, "observed_at": observed_at,
+            "evidence": evidence, "observation_state": observation_state,
+            "credential_revision": credential_revision, "launch_nonce": launch_nonce,
+            "event_idempotency_key": event_idempotency_key, "pid_token": pid_token,
+        }
         with self._writer() as conn:
-            # End any open records for this session under a DIFFERENT account
-            # (account_id != ? doesn't match NULLs, so OR account_id IS NULL)
-            if account_id is not None:
-                conn.execute(
-                    """UPDATE session_accounts SET ended_at = ?
-                       WHERE session_id = ? AND ended_at IS NULL
-                         AND (account_id != ? OR account_id IS NULL)""",
-                    (ts, session_id, account_id),
-                )
-
-            # Check if open record already exists for same session+account
-            # (IS used instead of = for NULL-safe comparison)
-            existing = conn.execute(
-                """SELECT id FROM session_accounts
-                   WHERE session_id = ? AND account_id IS ? AND ended_at IS NULL
-                   LIMIT 1""",
-                (session_id, account_id),
-            ).fetchone()
-
-            if existing:
-                conn.execute(
-                    """UPDATE session_accounts
-                       SET last_activity_at = ?,
-                           credential_scope = COALESCE(?, credential_scope),
-                           observed_at = COALESCE(?, observed_at),
-                           evidence = COALESCE(?, evidence),
-                           observation_state = COALESCE(?, observation_state),
-                           credential_revision = COALESCE(?, credential_revision),
-                           launch_nonce = COALESCE(?, launch_nonce),
-                           event_idempotency_key = COALESCE(?, event_idempotency_key)
-                       WHERE id = ?""",
-                    (
-                        ts,
-                        credential_scope,
-                        observed_at,
-                        evidence,
-                        observation_state,
-                        credential_revision,
-                        launch_nonce,
-                        event_idempotency_key,
-                        existing[0],
-                    ),
-                )
-                return existing[0]
-
-            from jacked.session_tracking_store import unique_detected_at
-
-            ts = unique_detected_at(conn, session_id, ts)
-            cursor = conn.execute(
-                """INSERT OR IGNORE INTO session_accounts
-                   (session_id, account_id, email, detected_at, last_activity_at,
-                    detection_method, repo_path, pid, credential_scope, observed_at,
-                    evidence, observation_state, credential_revision, launch_nonce,
-                    event_idempotency_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    account_id,
-                    email,
-                    ts,
-                    ts,
-                    detection_method,
-                    repo_path,
-                    pid,
-                    credential_scope,
-                    observed_at,
-                    evidence,
-                    observation_state,
-                    credential_revision,
-                    launch_nonce,
-                    event_idempotency_key,
-                ),
+            row_id, _ = write_span(
+                conn, session_id, account_id, email, detection_method, repo_path,
+                pid, fields,
             )
-            return cursor.lastrowid or 0
+            return row_id
 
     def end_session_account(self, session_id: str) -> bool:
         """Mark the latest session-account record as ended.
@@ -3530,7 +3474,7 @@ class Database:
         """Get sessions that are stale (past staleness window) but not ended.
 
         Inverse of get_active_sessions — returns sessions that have gone
-        silent but were never closed. Used by the process-alive sweeper.
+        silent but were never closed. Used by the sweeper and the holder set.
 
         >>> db = Database(":memory:")
         >>> db.get_stale_open_sessions()
@@ -3543,7 +3487,7 @@ class Database:
                 """SELECT s.session_id,
                           s.last_activity_at,
                           s.detected_at,
-                          s.pid
+                          s.pid, s.pid_token, s.account_id
                    FROM session_accounts s
                    INNER JOIN (
                        SELECT session_id,
@@ -3853,43 +3797,23 @@ class Database:
         2
         """
         with self._reader() as conn:
-            cursor = conn.execute(
-                """
-                SELECT
-                    repo_path,
-                    SUM(cmd_total) as commands_run,
-                    SUM(hook_total) as hook_executions,
-                    MAX(last_ts) as last_activity,
-                    MIN(first_ts) as first_seen,
-                    unique_sessions
-                FROM (
-                    SELECT REPLACE(repo_path, char(92), '/') as repo_path,
-                           COUNT(*) as cmd_total, 0 as hook_total,
-                           MAX(timestamp) as last_ts,
-                           MIN(timestamp) as first_ts,
-                           COUNT(DISTINCT session_id) as unique_sessions
-                    FROM command_usage
-                    WHERE repo_path IS NOT NULL AND repo_path != ''
-                    GROUP BY REPLACE(repo_path, char(92), '/')
+            return project_activity.activity_summary(conn, limit)
 
-                    UNION ALL
+    def find_recorded_project(self, candidates: Iterable[str]) -> Optional[str]:
+        """Return the recorded project path that is equal to one of ``candidates``.
 
-                    SELECT REPLACE(repo_path, char(92), '/') as repo_path,
-                           0 as cmd_total, COUNT(*) as hook_total,
-                           MAX(timestamp) as last_ts,
-                           MIN(timestamp) as first_ts,
-                           COUNT(DISTINCT session_id) as unique_sessions
-                    FROM hook_executions
-                    WHERE repo_path IS NOT NULL AND repo_path != ''
-                    GROUP BY REPLACE(repo_path, char(92), '/')
-                )
-                GROUP BY repo_path
-                ORDER BY last_activity DESC
-                LIMIT ?
-                """,
-                (limit,),
-            )
-            return [dict(row) for row in cursor.fetchall()]
+        The lookup is exact, for each project that jacked recorded, at any age
+        (``project_activity.recorded_project``). ``None`` means no match.
+
+        >>> db = Database(":memory:")
+        >>> _ = db.record_hook_execution("Stop", hook_name="h", repo_path="/repo/a")
+        >>> db.find_recorded_project(["/repo/a/", "/repo/a"])
+        '/repo/a'
+        >>> db.find_recorded_project(["/repo"]) is None
+        True
+        """
+        with self._reader() as conn:
+            return project_activity.recorded_project(conn, candidates)
 
     def list_command_usage(
         self,

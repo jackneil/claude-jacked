@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 
@@ -16,7 +17,9 @@ from pydantic import BaseModel, Field
 # after the first tray restart. Do NOT auto-tidy this back to a from-import.
 from jacked.api.project_paths import (
     LinkOutsideProject,
+    ProjectRefused,
     first_outside_project,
+    known_project_path,
     outside_project_response,
     refuse_outside_project,
 )
@@ -29,6 +32,7 @@ from jacked.api.routes.features import (
 from jacked.memory.settings_io import SettingsUnreadableError
 from jacked.memory.vault import atomic_write_text
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _project_settings_lock = asyncio.Lock()
@@ -77,46 +81,74 @@ def _write_project_settings(repo_path: str, data: dict):
     atomic_write_text(claude_dir / "settings.local.json", json.dumps(data, indent=2))
 
 
-def _validate_repo_path(repo_path: str, db=None) -> Path | None:
-    """Validate repo_path is a real git project directory known to jacked.
+def _validate_repo_path(repo_path: str | None, db) -> Path:
+    """Return the project folder for ``repo_path``, resolved.
 
-    Rejects root, home, non-directories, paths without .git, and
-    projects not known to jacked (matching _validate_project_path
-    pattern in system.py).
+    The folder must be a project that jacked recorded
+    (``known_project_path``). The check uses the recorded text, not the
+    request text, and it does the disk checks only after that match. The
+    folder must also be a git project, and not the root folder or the home
+    folder: ``.claude`` in the home folder is the user's global settings
+    folder.
+
+    Raise ``ProjectRefused`` for each refusal. The route answers it with
+    ``ProjectRefused.response``. A route calls this in a worker thread,
+    because it reads the database and the disk.
     """
-    if not repo_path:
-        return None
-    p = Path(repo_path).resolve()
-    if not p.is_dir() or p == Path("/") or p == Path.home():
-        return None
+    p = Path(known_project_path(repo_path, db)).resolve()
+    if p == Path(p.anchor) or p == Path.home():
+        raise ProjectRefused(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "INVALID_REPO_PATH",
+            "The dashboard does not write project settings in the root folder "
+            "or in the home folder.",
+        )
+    if not p.is_dir():
+        raise ProjectRefused(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "NOT_DIRECTORY",
+            f"The project folder {p} does not exist.",
+        )
     if not (p / ".git").exists():
-        return None
-    # Must be a project known to jacked (has session activity in DB)
-    if db is not None:
-        try:
-            rows = db.get_project_activity_summary(limit=100)
-            known_paths = {r["repo_path"] for r in rows if r.get("repo_path")}
-            normalized = str(p).replace("\\", "/")
-            if str(p) not in known_paths and normalized not in known_paths:
-                return None
-        except Exception:
-            return None  # Fail closed — reject if DB unavailable
+        raise ProjectRefused(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "NOT_GIT_REPO",
+            f"The project folder {p} is not a git project.",
+        )
     return p
 
 
 # --- Endpoints ---
 
 
+@router.get("/claude-settings/projects")
+def list_recorded_projects(request: Request):
+    """List every project that jacked recorded, for the project-permissions list.
+
+    The installations overview gives only the 20 most recent projects. This
+    list has no limit. It reads only the database, never a project folder.
+    No database, or a read that fails, gives an empty list.
+    """
+    from jacked.web.project_activity import list_recorded_projects as _recorded
+
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return {"projects": []}
+    try:
+        return {"projects": _recorded(db)}
+    except Exception:
+        logger.exception("Could not read the recorded projects")
+        return {"projects": []}
+
+
 @router.get("/claude-settings/project-permissions")
 def get_project_permissions(repo_path: str, request: Request):
     """Read project-level Claude Code permissions."""
     db = getattr(request.app.state, "db", None)
-    resolved = _validate_repo_path(repo_path, db=db)
-    if not resolved:
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={"error": {"message": "Invalid repo_path"}},
-        )
+    try:
+        resolved = _validate_repo_path(repo_path, db)
+    except ProjectRefused as refused:
+        return refused.response()
     link_error = _settings_link_error(resolved)
     if link_error:
         return link_error
@@ -147,12 +179,10 @@ async def set_project_permissions(body: ProjectPermissionsRequest, request: Requ
             content={"error": {"message": f"Invalid mode: {body.defaultMode}"}},
         )
     db = getattr(request.app.state, "db", None)
-    resolved = await asyncio.to_thread(_validate_repo_path, body.repo_path, db=db)
-    if not resolved:
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={"error": {"message": "Invalid repo_path"}},
-        )
+    try:
+        resolved = await asyncio.to_thread(_validate_repo_path, body.repo_path, db)
+    except ProjectRefused as refused:
+        return refused.response()
     link_error = await asyncio.to_thread(_settings_link_error, resolved)
     if link_error:
         return link_error
@@ -290,12 +320,10 @@ async def add_permission_rule(body: AddRuleRequest, request: Request):
 
     if body.scope == "project":
         db = getattr(request.app.state, "db", None)
-        resolved = await asyncio.to_thread(_validate_repo_path, body.repo_path, db=db)
-        if not resolved:
-            return JSONResponse(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                content={"error": {"message": "Invalid repo_path"}},
-            )
+        try:
+            resolved = await asyncio.to_thread(_validate_repo_path, body.repo_path, db)
+        except ProjectRefused as refused:
+            return refused.response()
         link_error = await asyncio.to_thread(_settings_link_error, resolved)
         if link_error:
             return link_error

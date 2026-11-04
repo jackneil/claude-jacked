@@ -12,13 +12,21 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from jacked import upgrade_guard
 from jacked.api.mutation_gate import denied_response, mutation_decision
-from jacked.api.project_paths import first_outside_project, outside_project_response
+from jacked.api.project_paths import (
+    ProjectRefused,
+    first_outside_project,
+    known_project_path,
+    outside_project_response,
+)
 from jacked.api.remote_access import REASON_OUTSIDE_SCOPE, REASON_REMOTE_ACCESS_OFF
 from jacked.api.routes.settings_swap import SWAP_SETTING_KEYS
+from jacked.api.upgrade_steps import UpgradeStepError, _drain, _stop_child, _upgrade_run_cmd  # noqa: F401
 from jacked.findbin import find_bin
 from jacked.install_summary import last_install_path
 from jacked.memory.vault import atomic_write_text
+from jacked.public_errors import describe, public_message
 from jacked.service import update_status as _update_status_mod
 from jacked.web.database import SELECTED_ACCOUNT_KEYS, Database
 
@@ -256,59 +264,31 @@ class ProjectInitRequest(BaseModel):
     force: bool = False
 
 
-def _validate_project_path(repo_path: str, request: Request) -> Optional[JSONResponse]:
-    """Validate repo_path for init endpoints: exists, has .git, is known."""
-    from pathlib import Path
+def _validate_project_path(repo_path: str, request: Request) -> str:
+    """Return the recorded project path for ``repo_path``.
 
-    p = Path(repo_path)
+    The project must be one that jacked recorded (``known_project_path``),
+    and the route uses the recorded text, not the request text. The disk
+    checks run only after that match: the folder must exist and must hold a
+    ``.git`` folder. Raise ``ProjectRefused`` for each refusal; the route
+    answers it with ``ProjectRefused.response``.
+    """
+    db = getattr(request.app.state, "db", None)
+    recorded = known_project_path(repo_path, db)
+    p = Path(recorded)
     if not p.is_dir():
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={
-                "error": {
-                    "message": f"Not a directory: {repo_path}",
-                    "code": "NOT_DIRECTORY",
-                }
-            },
+        raise ProjectRefused(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "NOT_DIRECTORY",
+            f"The project folder {recorded} does not exist.",
         )
     if not (p / ".git").is_dir():
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={
-                "error": {
-                    "message": f"No .git directory in: {repo_path}",
-                    "code": "NOT_GIT_REPO",
-                }
-            },
+        raise ProjectRefused(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "NOT_GIT_REPO",
+            f"The project folder {recorded} has no .git folder.",
         )
-    # Verify project is known to jacked (has activity in DB)
-    db = getattr(request.app.state, "db", None)
-    if db is not None:
-        try:
-            rows = db.get_project_activity_summary(limit=100)
-            known_paths = {r["repo_path"] for r in rows if r.get("repo_path")}
-            normalized = str(p).replace("\\", "/")
-            if normalized not in known_paths and str(p) not in known_paths:
-                return JSONResponse(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    content={
-                        "error": {
-                            "message": f"Unknown project: {repo_path}. Must have jacked activity.",
-                            "code": "UNKNOWN_PROJECT",
-                        }
-                    },
-                )
-        except Exception:
-            return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={
-                    "error": {
-                        "message": "Database unavailable for project verification",
-                        "code": "DB_ERROR",
-                    }
-                },
-            )
-    return None
+    return recorded
 
 
 @router.get("/update/status")
@@ -353,26 +333,28 @@ async def get_install_summary():
 @router.post("/project/guardrails-init")
 def project_guardrails_init(body: ProjectInitRequest, request: Request):
     """Create JACKED_GUARDRAILS.md in a project from templates."""
-    error = _validate_project_path(body.repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(body.repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
 
     from jacked.guardrails import create_guardrails
 
-    result = create_guardrails(body.repo_path, language=body.language, force=body.force)
+    result = create_guardrails(project, language=body.language, force=body.force)
     return result
 
 
 @router.post("/project/lint-hook-init")
 def project_lint_hook_init(body: ProjectInitRequest, request: Request):
     """Install a pre-push lint hook in a project's .git/hooks/."""
-    error = _validate_project_path(body.repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(body.repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
 
     from jacked.guardrails import install_hook
 
-    result = install_hook(body.repo_path, language=body.language, force=body.force)
+    result = install_hook(project, language=body.language, force=body.force)
     return result
 
 
@@ -390,29 +372,22 @@ def get_project_env(repo_path: str, request: Request):
 
     >>> # GET /api/project/env?repo_path=/some/repo
     """
-    from pathlib import Path
+    from jacked.guardrails import read_project_env
 
-    error = _validate_project_path(repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
 
-    env_path = None
-    source = None
-
-    # Read from .git/jacked/env
-    env_file = Path(repo_path) / ".git" / "jacked" / "env"
-    if env_file.exists():
-        try:
-            env_path = env_file.read_text(encoding="utf-8").strip()
-            source = "file"
-        except Exception:
-            pass
+    # The first line of .git/jacked/env, the line that the pre-push hook uses.
+    env_path = read_project_env(project)
+    source = "file" if env_path else None
 
     # Also check DB
     db = getattr(request.app.state, "db", None)
     if db and not env_path:
         try:
-            inst = db.get_installation_by_repo(repo_path)
+            inst = db.get_installation_by_repo(project)
             if inst and inst.get("env_path"):
                 env_path = inst["env_path"]
                 source = "db"
@@ -430,9 +405,10 @@ def update_project_env(body: EnvUpdateRequest, request: Request):
     """
     from jacked.cli import _validate_env_path, _write_project_env
 
-    error = _validate_project_path(body.repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(body.repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
 
     # Validate the env path
     validation_error = _validate_env_path(body.env_path)
@@ -445,13 +421,13 @@ def update_project_env(body: EnvUpdateRequest, request: Request):
         )
 
     # Write to .git/jacked/env
-    _write_project_env(body.repo_path, body.env_path)
+    _write_project_env(project, body.env_path)
 
     # Write to DB
     db = getattr(request.app.state, "db", None)
     if db:
         try:
-            db.update_installation_env(body.repo_path, body.env_path)
+            db.update_installation_env(project, body.env_path)
         except Exception:
             pass
 
@@ -466,9 +442,10 @@ def detect_project_env(body: ProjectInitRequest, request: Request):
     """
     from jacked.cli import _detect_project_env, _validate_env_path, _write_project_env
 
-    error = _validate_project_path(body.repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(body.repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
 
     env_path = _detect_project_env()
     if not env_path:
@@ -491,12 +468,12 @@ def detect_project_env(body: ProjectInitRequest, request: Request):
             },
         )
 
-    _write_project_env(body.repo_path, env_path)
+    _write_project_env(project, env_path)
 
     db = getattr(request.app.state, "db", None)
     if db:
         try:
-            db.update_installation_env(body.repo_path, env_path)
+            db.update_installation_env(project, env_path)
         except Exception:
             pass
 
@@ -522,14 +499,15 @@ def get_project_lessons(repo_path: str, request: Request):
     from pathlib import Path
     import re
 
-    error = _validate_project_path(repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
     # A repository can ship lessons.md as a link to a private file.
-    if first_outside_project(repo_path, "lessons.md"):
+    if first_outside_project(project, "lessons.md"):
         return outside_project_response("lessons.md")
 
-    lessons_path = Path(repo_path) / "lessons.md"
+    lessons_path = Path(project) / "lessons.md"
     if not lessons_path.exists():
         return {"exists": False, "lessons": []}
 
@@ -571,15 +549,16 @@ def update_project_lessons(body: LessonsUpdateRequest, request: Request):
             },
         )
 
-    error = _validate_project_path(body.repo_path, request)
-    if error:
-        return error
+    try:
+        project = _validate_project_path(body.repo_path, request)
+    except ProjectRefused as refused:
+        return refused.response()
     # The save keeps the file's header lines, so a lessons.md that links to
     # a private file would copy that file's text into the project.
-    if first_outside_project(body.repo_path, "lessons.md"):
+    if first_outside_project(project, "lessons.md"):
         return outside_project_response("lessons.md")
 
-    lessons_path = Path(body.repo_path) / "lessons.md"
+    lessons_path = Path(project) / "lessons.md"
 
     # Preserve any header content (lines before the first lesson bullet)
     header_lines = []
@@ -613,7 +592,7 @@ def update_project_lessons(body: LessonsUpdateRequest, request: Request):
     # The link check runs again right before the write: this handler runs in
     # the threadpool, and a link made after the check above would move the
     # write outside the project.
-    if first_outside_project(body.repo_path, "lessons.md"):
+    if first_outside_project(project, "lessons.md"):
         return outside_project_response("lessons.md")
 
     try:
@@ -838,65 +817,6 @@ async def _upgrade_broadcast(ws_registry, event: str, payload: dict) -> None:
             logger.exception("Failed to broadcast %s", event)
 
 
-async def _upgrade_run_cmd(cmd: list[str]) -> None:
-    """Run a subprocess command list, raising RuntimeError on failure or timeout.
-
-    On cancellation (the service shutting down mid-upgrade) the child is
-    terminated and awaited BEFORE the cancellation propagates, so the switch
-    lease the caller holds is never released while an installer still runs.
-    """
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
-    except asyncio.TimeoutError:
-        proc.kill()
-        raise RuntimeError(f"{cmd[0]} timed out after 120s")
-    except asyncio.CancelledError:
-        await _stop_child(proc)
-        raise
-    if proc.returncode != 0:
-        raise RuntimeError((stdout or b"").decode()[-500:] or "Unknown error")
-
-
-async def _stop_child(proc) -> None:
-    """Terminate a child and wait for it, escalating to kill after 5 s.
-
-    The cancelled ``communicate()`` no longer drains the child's stdout, and
-    asyncio reports a child as finished only once its pipes close. A noisy
-    child that ignores SIGTERM would fill the pipe and never be seen to
-    exit, so a drain task reads the pipe to EOF while the child is stopped.
-    """
-    if proc.returncode is not None:
-        return
-    drain = asyncio.create_task(_drain(proc.stdout)) if proc.stdout is not None else None
-    try:
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=5)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-    finally:
-        if drain is not None:
-            try:
-                await asyncio.wait_for(drain, timeout=5)
-            except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - best effort
-                drain.cancel()
-
-
-async def _drain(stream) -> None:
-    """Read a pipe to EOF, discarding the data."""
-    while await stream.read(65536):
-        pass
-
-
 # Reason-keyed denial copy for a refused remote upgrade. The two denials
 # have different fixes, so they get different sentences. No em-dashes
 # (user-facing). The codes are the policy reasons themselves.
@@ -976,10 +896,13 @@ async def _run_upgrade_steps(ws_registry) -> None:
     stage = "upgrade"
     try:
         await _upgrade_broadcast(ws_registry, "upgrade_started", {})
-
+        # #295i: never install an older version. A refusal is a no-op, not a failure.
+        if refusal := await asyncio.to_thread(upgrade_guard.current_refusal):
+            await _upgrade_broadcast(ws_registry, "upgrade_noop", {"message": refusal})
+            return
         uv_bin = find_bin("uv")
         if not uv_bin:
-            raise RuntimeError("uv not found on PATH. Cannot upgrade.")
+            raise UpgradeStepError("uv not found on PATH. Cannot upgrade.")
         await _upgrade_broadcast(ws_registry, "upgrade_progress",
                                  {"step": "upgrade", "message": "Upgrading claude-jacked\u2026"})
         await _upgrade_run_cmd([uv_bin, "tool", "upgrade", "claude-jacked"])
@@ -987,7 +910,7 @@ async def _run_upgrade_steps(ws_registry) -> None:
         stage = "reinstall"
         jacked_bin = find_bin("jacked")
         if not jacked_bin:
-            raise RuntimeError("jacked not found on PATH. Cannot reinstall.")
+            raise UpgradeStepError("jacked not found on PATH. Cannot reinstall.")
         await _upgrade_broadcast(ws_registry, "upgrade_progress",
                                  {"step": "reinstall", "message": "Reinstalling files\u2026"})
         await _upgrade_run_cmd([jacked_bin, "install", "--force"])
@@ -1007,10 +930,11 @@ async def _run_upgrade_steps(ws_registry) -> None:
         os.execv(prog, argv)
 
     except Exception as exc:
-        # Durable, values-free: the stage and the exception type. The raw
-        # text goes to the dashboard modal only.
-        logger.warning("Upgrade failed at stage %s: %s", stage, type(exc).__name__)
-        await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": str(exc)})
+        # Durable, values-free: the stage and the exception type. The dialog gets
+        # an UpgradeStepError's report, else fixed text: str(exc) can name a path.
+        logger.warning("Upgrade failed at stage %s: %s", stage, describe(exc))
+        fixed = f"Upgrade failed at the {stage} step. Check the jacked log on the host machine for the cause."
+        await _upgrade_broadcast(ws_registry, "upgrade_failed", {"error": public_message(exc, fixed)})
 
 
 @router.post("/upgrade")
@@ -1056,8 +980,6 @@ async def system_upgrade(request: Request):
     return {"status": "started"}
 
 
-
-
 @router.get("/logs/hooks")
 def list_hook_logs(
     request: Request,
@@ -1101,8 +1023,6 @@ def list_version_check_logs(
         "limit": clamped_limit,
         "offset": clamped_offset,
     }
-
-
 
 
 @router.get("/settings", response_model=list[SettingResponse])

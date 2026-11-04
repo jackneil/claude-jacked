@@ -1381,6 +1381,124 @@ class TestOnUpdateClick:
         assert names.index("spawn") < names.index("stop")
 
 
+class TestUpdateClickOffTheMenuThread:
+    """UG-2: the no-downgrade check reads the package index (two network
+    probes). The menu callback must not wait for them, so the click runs in
+    a worker thread. The worker owns the lifecycle lock for the whole click,
+    so the reentrant _on_stop still runs under the same lock."""
+
+    def test_the_callback_returns_before_the_index_probe_answers(self, monkeypatch, tmp_path):
+        import threading as _threading
+        from jacked import upgrade_guard
+        from jacked.service import update_status as us
+        from jacked.service.tray import ServiceRunner
+
+        monkeypatch.setattr(us, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+        probe_started, release = _threading.Event(), _threading.Event()
+
+        def _slow_refusal(log_source=None):
+            probe_started.set()
+            assert release.wait(10)
+            return None
+
+        monkeypatch.setattr(upgrade_guard, "current_refusal", _slow_refusal)
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.42.0", "outdated": True}
+        runner._icon = MagicMock()
+        with (
+            patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")),
+            patch("jacked.service.updater.spawn_updater_from_tray") as spawn,
+            patch.object(runner, "_on_stop") as stop,
+            patch("webbrowser.open"),
+        ):
+            worker = runner._on_update_click_in_background()
+            # The callback is back while the probe still waits.
+            assert probe_started.wait(10)
+            assert worker.is_alive()
+            spawn.assert_not_called()
+            # A second click while the first one probes does nothing.
+            runner._on_update_click_in_background().join(10)
+            release.set()
+            worker.join(10)
+        assert not worker.is_alive()
+        spawn.assert_called_once()
+        stop.assert_called_once()
+        assert runner._lifecycle_lock.acquire(blocking=False)
+        runner._lifecycle_lock.release()
+
+    def test_the_tray_menu_and_the_mac_menu_bar_use_the_worker(self):
+        import inspect
+
+        from jacked.service import menubar_mac, tray
+
+        assert "version_click_fn=self._on_update_click_in_background" in inspect.getsource(
+            tray.ServiceRunner._run
+        )
+        assert "_on_update_click_in_background()" in inspect.getsource(menubar_mac)
+
+
+class TestOnUpdateClickNeverDowngrades:
+    """#295i: an Update click never installs an older version than the one on
+    disk. The tray asks the shared guard BEFORE it stops the service, so a
+    refusal leaves the tray and the service running."""
+
+    REFUSAL = (
+        "Nothing to upgrade. The package index serves v0.111.1. "
+        "The installed version is v0.111.2."
+    )
+
+    def _click(self, monkeypatch, tmp_path, installable):
+        from jacked import upgrade_guard
+        from jacked.service import update_status as us
+        from jacked.service import updater
+        from jacked.service.tray import ServiceRunner
+
+        monkeypatch.setattr(us, "UPDATE_STATUS_FILE", tmp_path / "status.json")
+        monkeypatch.setattr(updater, "UPDATE_LOG", tmp_path / "jacked-update.log")
+        monkeypatch.setattr(upgrade_guard, "installed_version", lambda: "0.111.2")
+        monkeypatch.setattr(
+            upgrade_guard,
+            "probe_index_versions",
+            lambda timeout=5.0: upgrade_guard.IndexVersions("0.111.2", installable),
+        )
+        runner = ServiceRunner()
+        runner._version_info = {"latest": "0.111.2", "outdated": True}
+        runner._icon = MagicMock()
+        with (
+            patch("jacked.install_method.can_auto_upgrade", return_value=(True, "")),
+            patch("jacked.service.updater.spawn_updater_from_tray") as spawn,
+            patch.object(runner, "_on_stop") as stop,
+            patch.object(runner, "_notify") as notify,
+            patch("webbrowser.open") as browser,
+        ):
+            runner._on_update_click()
+        return runner, spawn, stop, notify, browser
+
+    def test_pin_295i_an_older_index_keeps_the_tray_running_and_says_so(
+        self, monkeypatch, tmp_path
+    ):
+        runner, spawn, stop, notify, browser = self._click(
+            monkeypatch, tmp_path, installable="0.111.1"
+        )
+        spawn.assert_not_called()
+        stop.assert_not_called()
+        browser.assert_not_called()
+        notify.assert_called_once_with(runner._icon, "Jacked Update", self.REFUSAL)
+        # No update started, so no status record claims one is in progress.
+        assert not (tmp_path / "status.json").exists()
+        assert self.REFUSAL in (tmp_path / "jacked-update.log").read_text()
+        # The click lock is free again for a later click.
+        assert runner._lifecycle_lock.acquire(blocking=False)
+        runner._lifecycle_lock.release()
+
+    def test_same_version_still_spawns_the_updater(self, monkeypatch, tmp_path):
+        _runner, spawn, stop, _notify, _browser = self._click(
+            monkeypatch, tmp_path, installable="0.111.2"
+        )
+        spawn.assert_called_once()
+        stop.assert_called_once()
+
+
 class TestCheckForUpdatesMenu:
     def test_menu_has_check_for_updates_item(self):
         from jacked.service.tray import build_menu
