@@ -203,33 +203,29 @@ def _recorded(manifest: Optional[dict], key: str, name: str) -> Optional[str]:
     return value if isinstance(value, str) else None
 
 
-def is_jacked_skill_dir(skill_dir, name: str, manifest: Optional[dict]) -> bool:
+def is_jacked_skill_dir(skill_dir, name: str, manifest: Optional[dict], src_dir=None) -> bool:
     """True iff `skill_dir` is still jacked's own copy of skill `name`.
 
     Requires the ``SKILL.md`` hash to match what `manifest` recorded AND, when a
     full-dir hash was recorded for it, the whole dir to match too — so an edited
-    SIDECAR also marks the dir as the user's. Only a format-1 manifest (which
-    never recorded dir hashes) is owned on the SKILL.md match alone.
+    SIDECAR also marks the dir as the user's. A format-1 manifest (which never
+    recorded dir hashes) owns the dir on the SKILL.md match only when every file
+    path in it is also in ``src_dir``: the install replaces the whole dir, so a
+    file the user added must make it the user's (it is backed up, not deleted).
 
-    False when there is no ``skills`` entry at all: pre-manifest installs are
-    treated as potentially user-owned. This is a HASH judgement only; the
-    uninstall/install callers additionally accept a dir that is still consistent
-    with the packaged source (`is_source_subset`)."""
+    False with no ``skills`` entry (pre-manifest installs may be the user's).
+    Callers also accept a dir consistent with the source (`is_source_subset`)."""
     recorded_md = _recorded(manifest, "skills", name)
     if recorded_md is None or skill_dir_hash(skill_dir) != recorded_md:
         return False
     recorded_dir = _recorded(manifest, SKILLS_DIRS_KEY, name)
     if recorded_dir is not None:
         return skill_content_hash(skill_dir) == recorded_dir
-    # No dir hash for this skill. Two DIFFERENT causes, and only one is benign:
-    #   format < 2 : the manifest predates dir hashes entirely, so the SKILL.md
-    #                match is all the evidence that exists -> accept it, which is
-    #                what lets old installs upgrade without spurious backups.
-    #   format >= 2: this manifest DOES record dir hashes, so a missing entry
-    #                means jacked never recorded writing this dir (install error,
-    #                hand-edited manifest, ...) -> provenance unknown, not ours.
-    #                `is_source_subset` is then the only route to ownership.
-    return _manifest_format(manifest) < 2
+    # No dir hash: format >= 2 records them, so a missing entry is unknown
+    # provenance. Format 1 predates them: accept the SKILL.md match (no spurious
+    # backups on upgrade) only for a dir with no path the source lacks.
+    return _manifest_format(manifest) < 2 and src_dir is not None and all(
+        (Path(src_dir) / f.relative_to(skill_dir)).is_file() for f in _hashable_files(Path(skill_dir)))
 
 
 def _manifest_format(manifest: Optional[dict]) -> int:
@@ -299,7 +295,7 @@ def preserve_user_skill_dir(
     skill_dir = Path(skill_dir)
     if not (skill_dir.exists() or skill_dir.is_symlink()):
         return None
-    if is_jacked_skill_dir(skill_dir, name, manifest):
+    if is_jacked_skill_dir(skill_dir, name, manifest, src_dir):
         return None
     if src_dir is not None and is_source_subset(skill_dir, src_dir):
         return None  # nothing here that the source doesn't already carry
@@ -318,7 +314,7 @@ def skill_removal_decision(
     Removes a dir jacked owns per the manifest, or (when the manifest is absent,
     corrupt, or silent about it) one whose every file still matches the packaged
     source. Anything else is kept, with a reason the caller can print."""
-    if is_jacked_skill_dir(skill_dir, name, manifest):
+    if is_jacked_skill_dir(skill_dir, name, manifest, src_dir):
         return True, ""
     if src_dir is not None and is_source_subset(skill_dir, src_dir):
         return True, ""
@@ -455,10 +451,9 @@ def prune_removed(
     Returns ``(pruned, preserved)``. When `prior` (the manifest that recorded
     them) is supplied, a skill DIR is deleted only if its content still matches
     what jacked installed; a dir the user modified or recreated is left in place
-    and logged. A FLAT artifact (command/agent/lens/template) whose bytes no
-    longer match the recorded hash was edited by the user: it is moved into
-    ``~/.claude/jacked-backups/<category>/`` instead of unlinked, and reported
-    in `preserved`."""
+    and logged. A format-1 skill dir whose SKILL.md still matches, and a FLAT
+    artifact whose bytes no longer match, move into ``~/.claude/jacked-backups/``
+    instead, and are reported in `preserved`."""
     home = Path(home)
     pruned: list[str] = []
     preserved: list[str] = []
@@ -474,6 +469,10 @@ def prune_removed(
             if (cat.is_skill_dir and prior is not None and target.is_dir()
                     and not target.is_symlink()
                     and not is_jacked_skill_dir(target, name, prior)):
+                if _manifest_format(prior) < 2 and skill_dir_hash(target) == _recorded(prior, "skills", name):
+                    preserve_user_skill_dir(target, name, None, prior)  # files unproven: move aside
+                    preserved.append(f"{key}/{name}")
+                    continue
                 logger.warning(
                     "leaving skill dir %s in place: it no longer matches what "
                     "jacked installed (you likely modified or recreated it)", target,

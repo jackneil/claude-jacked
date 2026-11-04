@@ -59,7 +59,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from jacked.atomic_io import atomic_write_text
-from jacked.data.hooks.issue_queue import cache_path, kept_issue, repo_slug
+from jacked.data.hooks.issue_queue import STALE_AFTER, cache_path, kept_issue, repo_slug
 from jacked.findbin import find_bin
 from jacked.git_guard import GIT_CONFIG_OVERRIDE_ARGS
 from jacked.issue_labels import QUEUE_LABEL_NAMES
@@ -321,13 +321,36 @@ def refresh_repo(path: str, *, now: datetime | None = None) -> bool:
         return False
 
 
-def _known_repos(db) -> list[str]:
-    """One path for each repository slug, in the order of last activity."""
+def _recently_active(row: dict, now: datetime) -> bool:
+    """True when the project had activity inside ``STALE_AFTER``.
+
+    The hook drops a cache that age or older, so a refresh for a project idle
+    longer than that spends GitHub API budget on a file no session reads. A
+    timestamp that does not parse counts as not recent.
+
+    >>> now = datetime(2026, 11, 4, 12, tzinfo=timezone.utc)
+    >>> _recently_active({"last_activity": "2026-11-04T01:00:00+00:00"}, now)
+    True
+    >>> _recently_active({"last_activity": "2026-10-01T01:00:00"}, now), _recently_active({}, now)
+    (False, False)
+    """
+    try:
+        seen = datetime.fromisoformat(str(row.get("last_activity") or ""))
+    except ValueError:
+        return False
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return now - seen < STALE_AFTER
+
+
+def _known_repos(db, now: datetime | None = None) -> list[str]:
+    """One path for each recently active repository slug, newest activity first."""
     rows = db.get_project_activity_summary(limit=PROJECT_LIMIT)
+    now = now or datetime.now(timezone.utc)
     chosen: dict[str, str] = {}
     for row in rows:
         path = (row or {}).get("repo_path")
-        if not path:
+        if not path or not _recently_active(row, now):
             continue
         try:
             slug = repo_slug(path)
