@@ -23,7 +23,19 @@ from jacked.service.supervisors._artifacts import (
     reconcile_artifact,
 )
 from jacked.service.supervisors._helpers import systemd_quote, windows_quote
-from jacked.winproc import system_program
+
+try:
+    from jacked.winproc import system_program
+except ImportError:
+    # The process that runs `jacked upgrade` from a release before 0.111.0
+    # imports this package for the first time after the install replaced the
+    # package on disk, while it still holds that release's `jacked.winproc`,
+    # which has no `system_program`. Put the on-disk module into it, then
+    # import again; the submodules below import the same name.
+    from jacked.mixed_generation import reload_missing
+
+    reload_missing("jacked.winproc", "system_program")
+    from jacked.winproc import system_program
 from jacked.service.supervisors._task_xml import encode_task_xml, query_task_xml
 from jacked.service.supervisors._transition import (
     SupervisorTransitionLease,
