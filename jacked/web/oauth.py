@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, urlencode
 import httpx
 from aiohttp import web
 
+from jacked.public_errors import describe, http_failure
 from jacked.web.database import Database, selected_account_id
 from jacked.web.oauth_errors import OAuthIdentityError, OAuthVerificationError, flow_error_text
 
@@ -381,7 +382,7 @@ class OAuthFlow:
         except Exception as e:
             logger.debug(
                 "Could not load re-auth target account %s: %s",
-                self._target_account_id, e,
+                self._target_account_id, describe(e),
             )
             return None
 
@@ -469,7 +470,7 @@ class OAuthFlow:
                     self._browser_mode,
                 )
             except Exception as e:
-                logger.warning(f"Could not open a local browser for OAuth: {e}")
+                logger.warning("Could not open a local browser for OAuth: %s", describe(e))
 
             # Wait for callback in background — don't block the API response
             asyncio.create_task(self._wait_for_callback(runner))
@@ -513,7 +514,7 @@ class OAuthFlow:
                 open_auth_url, self._auth_url, self._target_account, self.db
             )
         except Exception as e:
-            logger.warning("Could not re-open the OAuth browser: %s", e)
+            logger.warning("Could not re-open the OAuth browser: %s", describe(e))
             return {
                 **self.get_status(),
                 "reopen_error": "Could not open a browser on the jacked machine.",
@@ -784,7 +785,7 @@ class OAuthFlow:
                     cc_result = await cc_flow.start()
                     self._cc_flow_id = cc_result.get("flow_id")
                 except Exception as e:
-                    logger.warning(f"CC auto-flow failed (non-fatal): {e}")
+                    logger.warning("CC auto-flow failed (non-fatal): %s", describe(e))
                     self._cc_flow_id = None
 
             response = {
@@ -833,9 +834,8 @@ class OAuthFlow:
             },
         )
         if resp.status_code != 200:
-            # Truncate response body to avoid logging sensitive data
-            body_preview = (resp.text or "")[:200]
-            logger.error(f"Token exchange HTTP {resp.status_code}: {body_preview}")
+            # Values-free: the body of a failed exchange can echo the code.
+            logger.error("Token exchange failed: %s", http_failure(resp.status_code, resp.text))
             resp.raise_for_status()
 
         tokens = resp.json()
@@ -895,12 +895,11 @@ class OAuthFlow:
                     logger.info("Created long-lived API key (1 year)")
                     return api_key_data["api_key"], tokens
             else:
-                body_preview = (resp.text or "")[:200]
                 logger.warning(
-                    f"API key creation HTTP {resp.status_code}: {body_preview}"
+                    "API key creation failed: %s", http_failure(resp.status_code, resp.text)
                 )
         except Exception as e:
-            logger.warning(f"API key creation failed: {e} — using short-lived token")
+            logger.warning("API key creation failed: %s; using short-lived token", describe(e))
 
         return access_token, tokens
 
@@ -920,7 +919,7 @@ class OAuthFlow:
                 return resp.json()
             logger.warning(f"Profile fetch HTTP {resp.status_code}")
         except Exception as e:
-            logger.warning(f"Profile fetch failed: {e}")
+            logger.warning("Profile fetch failed: %s", describe(e))
         return {}
 
     async def _fetch_usage(
@@ -939,7 +938,7 @@ class OAuthFlow:
                 return resp.json()
             logger.warning(f"Usage fetch HTTP {resp.status_code}")
         except Exception as e:
-            logger.warning(f"Usage fetch failed: {e}")
+            logger.warning("Usage fetch failed: %s", describe(e))
         return {}
 
     def _store_account(self, tokens: dict, profile: dict, usage: dict) -> dict:

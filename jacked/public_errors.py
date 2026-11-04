@@ -18,7 +18,9 @@ Use :func:`public_message` at each place that sends an error to a client.
 from __future__ import annotations
 
 import errno as _errno
+import json
 import os
+import re
 
 
 class PublicError(Exception):
@@ -91,3 +93,37 @@ def os_error_reason(exc: OSError) -> str:
     if _errno_name(exc) is None:
         return "a file system error"
     return os.strerror(exc.errno)
+
+
+# An error code in an HTTP error body: one token, no spaces, no value. OAuth
+# (RFC 6749 section 5.2) and the Anthropic API both send one.
+_ERROR_CODE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def http_failure(status_code: int, body: str) -> str:
+    """Return the HTTP status and the error code of a failed response.
+
+    The result has no value from the body. A JSON body gives its ``error``
+    string, or the ``type`` of its ``error`` object, when that is one short
+    token. Use it to log a failed HTTP call: the body of an OAuth or API
+    error can echo a token or an account value.
+
+    >>> http_failure(400, '{"error": "invalid_grant", "error_description": "code abc"}')
+    'HTTP 400 (error=invalid_grant)'
+    >>> http_failure(401, '{"type": "error", "error": {"type": "authentication_error", "message": "key sk-1"}}')
+    'HTTP 401 (error=authentication_error)'
+    >>> http_failure(400, '{"error": "the token sk-1 is bad"}')
+    'HTTP 400'
+    >>> http_failure(502, '<html>bad gateway</html>')
+    'HTTP 502'
+    """
+    try:
+        data = json.loads(body)
+    except (TypeError, ValueError):
+        data = None
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        error = error.get("type")
+    if isinstance(error, str) and _ERROR_CODE.fullmatch(error):
+        return f"HTTP {status_code} (error={error})"
+    return f"HTTP {status_code}"

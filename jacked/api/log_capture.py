@@ -6,6 +6,10 @@ periodically flushes accumulated entries to connected WebSocket clients.
 The handler starts in **buffer-only mode** — it collects log entries
 but does not broadcast until ``set_loop``/``set_registry`` are called
 from the async lifespan.
+
+The buffer reaches every dashboard client, remote ones too, so an entry
+names each exception by its type only. The host's log file keeps the full
+text.
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ import asyncio
 import logging
 import threading
 from collections import deque
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -40,7 +45,10 @@ class _CaptureHandler(logging.Handler):
         self._buf = buf
 
     def emit(self, record: logging.LogRecord) -> None:
-        self._buf._handle_record(record)
+        try:
+            self._buf._handle_record(record)
+        except Exception:
+            self.handleError(record)
 
 
 class ServerLogBuffer:
@@ -177,13 +185,97 @@ class ServerLogBuffer:
 # -- Helpers ---------------------------------------------------------------
 
 
+class _Described:
+    """An exception in a log record, as the dashboard shows it.
+
+    ``%s``, ``%r`` and ``format()`` all give :func:`describe`, so the record
+    template formats as written and no exception text gets into the entry.
+    """
+
+    __slots__ = ("_text",)
+
+    def __init__(self, exc: BaseException) -> None:
+        self._text = describe(exc)
+
+    def __str__(self) -> str:
+        return self._text
+
+    __repr__ = __str__
+
+    def __format__(self, spec: str) -> str:
+        return format(self._text, spec)
+
+
+def _client_value(value: object) -> object:
+    """Return ``value`` with each exception in it replaced by its description.
+
+    A list, tuple or set is examined one level deep.
+
+    >>> _client_value(ValueError("secret"))
+    ValueError
+    >>> _client_value([KeyError("k"), 3])
+    [KeyError, 3]
+    >>> _client_value("text")
+    'text'
+    """
+    if isinstance(value, BaseException):
+        return _Described(value)
+    if isinstance(value, (list, tuple, set, frozenset)) and any(
+        isinstance(item, BaseException) for item in value
+    ):
+        items = [_client_value(item) for item in value]
+        # Base types only: a namedtuple or a subclass can need other arguments.
+        if isinstance(value, list):
+            return items
+        return tuple(items) if isinstance(value, tuple) else set(items)
+    return value
+
+
+def _client_message(record: logging.LogRecord) -> str:
+    """Format the message of ``record`` for a dashboard client.
+
+    Each exception in ``record.args`` (or an exception that is the message
+    itself) gives :func:`describe`, not its text. Other values format as
+    usual. The host's log file formats the same record with the full text.
+
+    >>> rec = logging.LogRecord("t", logging.WARNING, "", 0, "failed: %s", (OSError("/home/u/x"),), None)
+    >>> _client_message(rec)
+    'failed: OSError'
+    >>> rec.getMessage()
+    'failed: /home/u/x'
+
+    A template that does not format gives the template only:
+
+    >>> rec = logging.LogRecord("t", logging.WARNING, "", 0, "n=%d", (ValueError("v"),), None)
+    >>> _client_message(rec)
+    'n=%d [message did not format]'
+    """
+    if isinstance(record.msg, BaseException):
+        return describe(record.msg)
+    template = str(record.msg)
+    args = record.args
+    if not args:
+        return template
+    if isinstance(args, Mapping):
+        safe: object = {key: _client_value(val) for key, val in args.items()}
+    else:
+        safe = tuple(_client_value(arg) for arg in args)
+    try:
+        return template % safe
+    except Exception:
+        # Never fall back to getMessage(): that would format the raw text.
+        return f"{template} [message did not format]"
+
+
 def _format_entry(record: logging.LogRecord) -> dict:
     """Convert a LogRecord into a JSON-serialisable dict.
 
-    The entry goes to every dashboard client, remote ones too. A record with
-    ``exc_info`` gives its message and the exception type only: the
-    traceback contains the exception text, which can name a path or a
-    response body. The host's log file keeps the full traceback (#289i).
+    The entry goes to every dashboard client, remote ones too. The message
+    names each exception it formats by its type only (see
+    :func:`_client_message`). A record with ``exc_info`` gives its message
+    and the exception type only: the traceback contains the exception text,
+    which can name a path or a response body. The host's log file keeps the
+    full text and the traceback (#289i).
 
     >>> import sys
     >>> try:
@@ -193,7 +285,7 @@ def _format_entry(record: logging.LogRecord) -> dict:
     >>> _format_entry(rec)["msg"]
     'failed [OSError]'
     """
-    msg = record.getMessage()
+    msg = _client_message(record)
     if record.exc_info and record.exc_info[1] is not None:
         msg = f"{msg} [{describe(record.exc_info[1])}]"
     if len(msg) > MAX_MSG_LENGTH:
