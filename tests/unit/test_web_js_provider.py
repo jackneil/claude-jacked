@@ -40,10 +40,13 @@ def test_node_syntax_check():
 
 
 def test_provider_meta_claude_and_codex(tmp_path):
-    r = _run(tmp_path, "out({claude: providerMeta('claude'), codex: providerMeta('codex')});")
+    r = _run(tmp_path, "out({claude: providerMeta('claude'), codex: providerMeta('codex'), grok: providerMeta('grok')});")
     assert r["claude"]["label"] == "Claude" and r["claude"]["color"] == "#a78bfa"
     assert r["codex"]["label"] == "Codex" and r["codex"]["color"] == "#60a5fa"
-    assert "<svg" in r["claude"]["svg"] and "<svg" in r["codex"]["svg"]
+    assert r["grok"]["label"] == "Grok" and r["grok"]["key"] == "grok"
+    assert "<svg" in r["claude"]["svg"] and "<svg" in r["codex"]["svg"] and "<svg" in r["grok"]["svg"]
+    assert r["grok"]["svg"] != r["claude"]["svg"]
+    assert r["grok"]["svg"] != r["codex"]["svg"]
 
 
 def test_provider_meta_unknown_falls_back_to_claude(tmp_path):

@@ -22,6 +22,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from jacked.api.mutation_gate import mutation_decision
+from jacked.api import provider_accounts
+from jacked.providers import is_claude, provider_of
 from jacked.api.remote_access import (
     LOOPBACK_HOSTS,
     REASON_OUTSIDE_SCOPE,
@@ -955,6 +957,9 @@ async def start_add_account(
             "plan": acct.get("subscription_type"),
         }
 
+    if provider == "grok":
+        return await provider_accounts.add_grok(db, _manual_oauth(request, remote))
+
     allow_activation = await asyncio.to_thread(_credential_mutation_allowed, request)
     flow = OAuthFlow(
         db,
@@ -990,7 +995,7 @@ async def start_reauth(account_id: int, request: Request, remote: bool = False):
         # One thread hop for the account read and the activation decision,
         # which ran back to back on the loop before.
         account = db.get_account(account_id)
-        if not account or (account.get("provider") or "claude") == "codex":
+        if not account or not is_claude(account):
             return account, False
         return account, _credential_mutation_allowed(request)
 
@@ -1001,6 +1006,9 @@ async def start_reauth(account_id: int, request: Request, remote: bool = False):
             content={"error": {"message": "Account not found", "code": "NOT_FOUND"}},
         )
 
+    if provider_of(account) == "grok":
+        return await provider_accounts.reauth_grok(db, account, _manual_oauth(request, remote))
+
     # Codex accounts don't use the Anthropic OAuth flow — re-auth is `codex login`.
     if (account.get("provider") or "claude") == "codex":
         return JSONResponse(
@@ -1009,6 +1017,16 @@ async def start_reauth(account_id: int, request: Request, remote: bool = False):
                 "error": {
                     "message": "Codex accounts re-authenticate with `codex login`, then Add Account → Codex.",
                     "code": "CODEX_NOT_OAUTH",
+                }
+            },
+        )
+    if not is_claude(account):
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "error": {
+                    "message": "jacked cannot re-authenticate this account in a browser.",
+                    "code": "NOT_OAUTH",
                 }
             },
         )
@@ -1183,22 +1201,10 @@ def delete_account(account_id: int, request: Request):
 
     db.delete_account(account_id)
 
-    if (account.get("provider") or "claude") == "codex":
-        # Codex account: clear its active pointer + remove its per-account auth
-        # slot (a Codex account has no ~/.claude credential dir).
-        try:
-            if db.get_active_account_id("codex") == account_id:
-                db.delete_setting(db.active_account_setting_key("codex"))
-        except Exception:
-            logger.debug("clearing codex active pointer failed", exc_info=True)
-        try:
-            from jacked.codex.switching import codex_account_home
-
-            slot_dir = codex_account_home(account_id)
-            if slot_dir.exists() and slot_dir.is_dir() and not slot_dir.is_symlink():
-                shutil.rmtree(slot_dir, ignore_errors=True)
-        except Exception:
-            logger.debug("removing codex slot dir failed", exc_info=True)
+    if not is_claude(account):
+        # Clear its active pointer and remove its per-account auth slot (a
+        # Codex or Grok account has no ~/.claude credential dir).
+        provider_accounts.forget_slot(db, account)
     else:
         # Remove per-account Claude credential dir to prevent orphaned files
         acct_dir = Path.home() / ".claude" / "accounts" / str(account_id)
@@ -1737,7 +1743,7 @@ async def start_cc_auth(account_id: int, request: Request, remote: bool = False)
         # One thread hop for the account read and the activation decision,
         # which ran back to back on the loop before.
         account = db.get_account(account_id)
-        if not account or (account.get("provider") or "claude") == "codex":
+        if not account or not is_claude(account):
             return account, False
         return account, _credential_mutation_allowed(request)
 
@@ -1745,15 +1751,20 @@ async def start_cc_auth(account_id: int, request: Request, remote: bool = False)
     if not account:
         return _not_found(f"No account with id={account_id}")
 
-    # "CC token" is a Claude Code concept — Codex accounts have none and must not
-    # start an Anthropic OAuth flow.
-    if (account.get("provider") or "claude") == "codex":
+    # "CC token" is a Claude Code concept. A Codex or Grok account has none and
+    # must not start an Anthropic OAuth flow.
+    if not is_claude(account):
+        codex = provider_of(account) == "codex"
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={
                 "error": {
-                    "message": "Codex accounts have no Claude Code token to authorize.",
-                    "code": "CODEX_NO_CC",
+                    "message": (
+                        "Codex accounts have no Claude Code token to authorize."
+                        if codex
+                        else "This account has no Claude Code token to authorize."
+                    ),
+                    "code": "CODEX_NO_CC" if codex else "NO_CC_TOKEN",
                 }
             },
         )
@@ -1866,37 +1877,10 @@ async def use_account(account_id: int, request: Request):
             },
         )
 
-    # Codex accounts switch by swapping ~/.codex/auth.json (guardrailed), not by
-    # writing the Claude credential stores — and Codex has no CC tokens, so this
-    # branches before the Claude-only checks below.
-    if account.get("provider") == "codex":
-        from jacked.codex.switching import CodexSwapError, swap_codex_account
-
-        try:
-            # swap_codex_account is SYNC and its file lock sleeps up to seconds;
-            # it shares the swap lock with the async usage poll, so running it
-            # on the event loop would freeze every coroutine (incl. the
-            # lock-holding poll) and deadlock the collision. Off-load it — the
-            # same convention the Claude swap path follows (usage_monitor).
-            result = await asyncio.to_thread(swap_codex_account, db, account_id)
-        except CodexSwapError as exc:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content={"error": {"message": str(exc), "code": "CODEX_SWAP_FAILED"}},
-            )
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={
-                "success": True,
-                "provider": "codex",
-                "account_id": account_id,
-                "restart_required": result.restart_required,
-                "message": (
-                    "Switched the active Codex account. Restart Codex (or the "
-                    "Codex app/IDE) to pick it up. Codex caches auth at startup."
-                ),
-            },
-        )
+    # Codex and Grok switch by swapping their own auth.json (guardrailed), not
+    # by writing the Claude credential stores, and they have no CC tokens.
+    if not is_claude(account):
+        return await provider_accounts.switch(db, account)
 
     if not account.get("cc_access_token"):
         return JSONResponse(

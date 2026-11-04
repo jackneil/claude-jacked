@@ -28,6 +28,7 @@ from jacked.api.usage_monitor import (
     full_sweep_loop,
 )
 from jacked.api.log_capture import server_log_buffer
+from jacked.api.provider_slot_sync import sync_provider_slots
 from jacked.api.security import (
     HostValidationMiddleware,
     build_allowed_origins,
@@ -67,6 +68,7 @@ async def _token_refresh_loop():
     """Background task to refresh tokens every 30 minutes."""
     while True:
         await asyncio.sleep(TOKEN_REFRESH_INTERVAL)
+        await sync_provider_slots()
         try:
             from jacked.web.auth import refresh_all_expiring_tokens
 
@@ -79,16 +81,13 @@ async def _token_refresh_loop():
             if result["refreshed"] > 0 or result["failed"] > 0:
                 logger.info(
                     "Token refresh: checked=%d, refreshed=%d, skipped=%d, failed=%d",
-                    result["checked"],
-                    result["refreshed"],
-                    result["skipped"],
-                    result["failed"],
+                    result["checked"], result["refreshed"],
+                    result["skipped"], result["failed"],
                 )
             else:
                 logger.debug(
                     "Token refresh: checked=%d, refreshed=0, skipped=%d, failed=0",
-                    result["checked"],
-                    result["skipped"],
+                    result["checked"], result["skipped"],
                 )
         except asyncio.TimeoutError:
             # wait_for cancels the pass; an in-flight token exchange is

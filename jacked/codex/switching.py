@@ -217,6 +217,63 @@ def find_codex_account_id(db, identity) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Timer copy of the live login into the active slot
+# ---------------------------------------------------------------------------
+
+def sync_active_slot_from_live(
+    db,
+    base: Optional[Path] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> bool:
+    """Copy the live auth.json into the active account's slot when Codex rotated it.
+
+    Codex refresh tokens are single-use. A normal ``codex exec`` can spend
+    the refresh token and write a new one into auth.json, so the slot is then
+    the spent copy. The swap captures the live file when it switches away,
+    but a ``codex login`` or another writer can replace the live file first.
+    This copy closes most of that window. It never calls the token endpoint.
+
+    The copy takes the swap lock without waiting: while a swap or a usage
+    poll holds it, this pass skips. It does nothing when the store is not
+    switchable (keyring), when the live file belongs to another account, or
+    when the slot already holds the same tokens. Returns True when it wrote
+    the slot.
+    """
+    active_id = db.get_active_account_id(provider="codex")
+    if not active_id:
+        return False
+    base = base or codex_home(env)
+    try:
+        refuse_unswitchable_store(base, env)
+    except CodexSwapError:
+        return False
+    with _codex_swap_lock(base, retries=1) as locked:
+        if not locked:
+            return False
+        try:
+            live = _read_live_root(base / "auth.json")
+        except CodexSwapError:
+            return False
+        if not live:
+            return False
+        if find_codex_account_id(db, extract_identity(live)) != active_id:
+            return False
+        slot_path = codex_slot_auth_path(active_id, base)
+        slot = _read_json(slot_path) or {}
+        same_token = _refresh_token_of(slot) == _refresh_token_of(live)
+        if same_token and slot.get("last_refresh") == live.get("last_refresh"):
+            return False
+        _atomic_write_json(slot_path, live)
+    logger.info("Copied the live Codex login into the slot of account %s", active_id)
+    return True
+
+
+def _refresh_token_of(auth: dict) -> Optional[str]:
+    tokens = auth.get("tokens")
+    return tokens.get("refresh_token") if isinstance(tokens, dict) else None
+
+
+# ---------------------------------------------------------------------------
 # The swap
 # ---------------------------------------------------------------------------
 

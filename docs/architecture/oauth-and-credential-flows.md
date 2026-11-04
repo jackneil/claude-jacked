@@ -30,6 +30,14 @@ observations do not fall back to a database preference or a guessed file stamp.
 
 ## 2. OAuth token model
 
+Credentials for Claude, Codex, and Grok stay on the one machine that runs
+jacked. Jacked does not copy them to another machine, and it does not have to
+survive two machines refreshing one login. The race that matters is two
+processes on this machine: a Claude session and jacked, or the Codex or Grok
+CLI and jacked. The live credential file or keychain on this machine is the
+authority. A stored copy is refreshed only by reading that local credential
+again, never by calling the token endpoint with the copy.
+
 Each Claude account row keeps two token sets:
 
 | Fields | Consumer | Publication rule |

@@ -26,6 +26,7 @@ import click
 
 from jacked.atomic_io import atomic_write_text
 from jacked.findbin import find_bin
+from jacked.providers import is_claude, launch_refusal
 from jacked.api.credential_helpers import (
     FOREIGN_PRIMARY_MESSAGE,
     _malformed_expiry,
@@ -606,13 +607,11 @@ def prepare_account_dir(account: dict, db: Database) -> Path:
     account_id = account["id"]
     if account_id <= 0:
         raise click.ClickException(f"Invalid account ID: {account_id}")
-    # Defense-in-depth: never write a Codex account into the Claude credential
-    # stores / launch it as Claude Code (resolve_account already blocks the CLI
-    # path; this guards any other caller).
-    if (account.get("provider") or "claude") == "codex":
-        raise click.ClickException(
-            f"Account {account_id} is a Codex account. Use `jacked codex launch {account_id}`."
-        )
+    # Defense-in-depth: never write a non-Claude account into the Claude
+    # credential stores or launch it as Claude Code (resolve_account already
+    # blocks the CLI path; this guards any other caller).
+    if not is_claude(account):
+        raise click.ClickException(launch_refusal(account))
 
     config_dir = ACCOUNTS_DIR / str(account_id)
 
@@ -968,15 +967,13 @@ def resolve_account(account_ref, db: Database) -> dict:
             f"Account {account.get('id')} ({account.get('email')}) has no access token. "
             "Try /login in Claude Code first."
         )
-    # A Codex account must NEVER be launched as Claude Code: its access_token is a
-    # sentinel ("codex-managed"), and prepare_account_dir would overwrite the
-    # global 'Claude Code-credentials' keychain with it + launch `claude`,
-    # breaking the user's real Claude Code login. Codex has its own launcher.
-    if (account.get("provider") or "claude") == "codex":
-        raise click.ClickException(
-            f"Account {account.get('id')} ({account.get('email')}) is a Codex account. "
-            f"Launch it with: jacked codex launch {account.get('id')}"
-        )
+    # A non-Claude account must NEVER be launched as Claude Code: its
+    # access_token is a marker ("codex-managed", "grok-managed"), and
+    # prepare_account_dir would overwrite the global 'Claude Code-credentials'
+    # keychain with it + launch `claude`, breaking the user's real Claude Code
+    # login. Codex has its own launcher.
+    if not is_claude(account):
+        raise click.ClickException(launch_refusal(account, with_email=True))
     _refuse_foreign_primary(account)
 
     return account

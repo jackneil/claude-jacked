@@ -22,6 +22,8 @@ from typing import Literal, Optional
 
 import httpx
 
+from jacked.providers import is_claude
+from jacked.web.provider_validation import validate_non_claude
 from jacked.service.pill_text import percent_reading
 from jacked.web.database import Database
 from jacked.web.refresh_verdict import FOREIGN_TOKEN_ERROR as _FOREIGN_TOKEN_ERROR
@@ -1378,10 +1380,10 @@ def should_refresh(account: dict, buffer_seconds: int | None = None) -> bool:
     >>> should_refresh({"provider": "codex", "refresh_token": "x", "expires_at": 0})
     False
     """
-    # Codex tokens are never Anthropic-refreshed (Codex manages its own). This is
-    # already implied by refresh_token being NULL, but gate explicitly so a future
-    # change can't accidentally drive a Codex row into an Anthropic token exchange.
-    if (account.get("provider") or "claude") == "codex":
+    # Only a Claude row is exchanged at Anthropic (Codex and Grok rotate their
+    # own tokens). A NULL refresh_token implies this, but gate explicitly so a
+    # later change cannot send a non-Claude row to the Anthropic token endpoint.
+    if not is_claude(account):
         return False
     if not account.get("refresh_token"):
         return False
@@ -1405,8 +1407,8 @@ def should_refresh_cc(account: dict, buffer_seconds: int | None = None) -> bool:
     >>> should_refresh_cc({"provider": "codex", "cc_refresh_token": "rt", "cc_expires_at": 0})
     False
     """
-    if (account.get("provider") or "claude") == "codex":
-        return False  # Codex has no Claude Code tokens to refresh
+    if not is_claude(account):
+        return False  # Only a Claude row has Claude Code tokens to refresh
     if not account.get("cc_refresh_token"):
         return False
     cc_expires_at = account.get("cc_expires_at")
@@ -1454,7 +1456,7 @@ async def refresh_cc_token_result(
     account = await asyncio.to_thread(db.get_account, account_id)
     if not account:
         return CCRefreshResult(CCRefreshOutcome.FAILED, error="account_not_found")
-    if (account.get("provider") or "claude") == "codex" or not account.get("cc_refresh_token"):
+    if not is_claude(account) or not account.get("cc_refresh_token"):
         return CCRefreshResult(CCRefreshOutcome.NO_REFRESH_TOKEN)
     if not force and not should_refresh_cc(account, buffer_seconds):
         return CCRefreshResult(CCRefreshOutcome.SKIPPED_NOT_DUE)
@@ -1551,7 +1553,7 @@ def choose_usage_token(account: dict) -> Optional[TokenChoice]:
     ...                     "foreign_token_fp": token_fingerprint("rt")}) is None
     True
     """
-    if (account.get("provider") or "claude") == "codex":
+    if not is_claude(account):
         return None
     if cc_token_usable(account):
         return TokenChoice(account["cc_access_token"], "cc")
@@ -1923,6 +1925,9 @@ async def fetch_usage(
         if await asyncio.to_thread(live_codex_account_id, db) != account_id:
             return {"_cached": True}
         return await fetch_codex_usage(account_id, db, state=state)
+
+    if not is_claude(account):  # Grok has no usage reader; its token is a marker
+        return {"_cached": True}
 
     if token == account.get("access_token") and _primary_tokens_foreign(account):
         # The stored primary tokens belong to another account (#154i): their
@@ -2373,37 +2378,6 @@ def log_identity_coverage(
         )
 
 
-def _validate_codex_account(account_id: int, db: Database) -> dict:
-    """Validate a Codex account by its signed-in state (its slot holds a real
-    credential), NOT the Anthropic profile API — Codex tokens aren't Anthropic
-    tokens, so the profile call would always 401 and falsely mark it invalid."""
-    try:
-        from jacked.codex.credentials import read_auth_json
-        from jacked.codex.switching import codex_account_home
-
-        auth = read_auth_json(codex_account_home(account_id))
-        signed_in = bool(auth and (auth.get("tokens") or auth.get("OPENAI_API_KEY")))
-    except Exception:
-        logger.debug("codex validation read failed for %s", account_id, exc_info=True)
-        signed_in = True  # never false-invalidate on a transient read error
-    if signed_in:
-        # A signed-in auth.json says nothing about whether usage is readable:
-        # the usage fetch's error and failure counter stay until a successful
-        # fetch clears them (fetch_codex_usage -> clear_account_errors).
-        db.mark_account_validated(account_id)
-        return {"valid": True, "error": None}
-    db.update_account(
-        account_id,
-        validation_status="invalid",
-        last_validated_at=int(time.time()),
-        last_error="Codex account signed out. Run `codex login`.",
-        last_error_at=datetime.now(timezone.utc).isoformat(),
-    )
-    return {"valid": False, "error": "Codex signed out"}
-
-
-
-
 def _begin_validation(account_id: int, db: Database) -> tuple[Optional[dict], Optional[dict]]:
     """Read the row and mark it "checking" in one thread hop.
 
@@ -2416,8 +2390,8 @@ def _begin_validation(account_id: int, db: Database) -> tuple[Optional[dict], Op
     account = db.get_account(account_id)
     if not account:
         return None, {"valid": False, "error": "Account not found"}
-    if (account.get("provider") or "claude") == "codex":
-        return account, _validate_codex_account(account_id, db)
+    if not is_claude(account):
+        return account, validate_non_claude(account, db)
     db.update_account(account_id, validation_status="checking")
     return account, None
 

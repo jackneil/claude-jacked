@@ -312,12 +312,15 @@ function renderAccountMenu(acct) {
                 ${orgLine}
             </div>`;
 
-    let items = renderAccountMenuItem(
+    // Grok has no jacked launcher, so it gets no launch command to copy.
+    const launchCmd = provider === 'codex' ? `jacked codex launch ${acct.id}`
+        : (provider === 'grok' ? '' : `jacked claude ${acct.id}`);
+    let items = launchCmd ? renderAccountMenuItem(
         'btn-copy-cmd',
-        `data-id="${acct.id}" data-cmd="jacked claude ${acct.id}"`,
+        `data-id="${acct.id}" data-cmd="${launchCmd}"`,
         'copy',
         'Copy launch command',
-    );
+    ) : '';
 
     items += renderAccountMenuItem(
         'btn-edit-label',
@@ -329,7 +332,17 @@ function renderAccountMenu(acct) {
     // Codex re-auth is `codex login` in a terminal (the Codex pill's
     // "re-login" tooltip guides that); the backend rejects browser OAuth for
     // it, so the row is omitted entirely rather than rendered and failing.
-    if (provider !== 'codex') {
+    // Grok re-auth opens the Grok sign-in in the account's browser profile.
+    // It is a different control: it has no usage or Claude Code token.
+    if (provider === 'grok') {
+        items += renderAccountMenuItem(
+            'btn-reauth-grok',
+            `data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}" title="Sign in to this Grok account again, in its browser profile."`,
+            'reauth',
+            'Re-auth',
+        );
+    }
+    if (provider === 'claude') {
         const emailAttr = `data-id="${acct.id}" data-email="${escapeHtml(acct.email || '')}"`;
         items += renderAccountMenuItem(
             'btn-reauth',
@@ -657,7 +670,7 @@ function renderEmptyState() {
                 <svg class="w-8 h-8 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
             </div>
             <h3 class="text-lg font-semibold text-white mb-1">No accounts connected</h3>
-            <p class="text-sm text-slate-400 mb-6">Connect a Claude or Codex account to get started</p>
+            <p class="text-sm text-slate-400 mb-6">Connect a Claude, Codex, or Grok account to get started</p>
             <button id="btn-add-account" class="flex items-center gap-2 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition active:scale-[0.96]">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
                 Add Account
