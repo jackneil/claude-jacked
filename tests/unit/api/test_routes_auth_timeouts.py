@@ -403,6 +403,8 @@ def test_bulk_refresh_one_account_error_does_not_strand_siblings(monkeypatch):
     assert resp.failed == 1
     bad = next(r for r in resp.results if r["account_id"] == 2)
     assert bad["success"] is False
-    assert "synthetic db explosion" in (bad["error"] or "")
+    # Fixed text: the exception text stays in the server log (#289i).
+    assert "synthetic db explosion" not in (bad["error"] or "")
+    assert "internal error" in (bad["error"] or "")
     from jacked.api.routes.auth import _bulk_refresh_lock  # noqa: F401
     assert not routes_auth._bulk_refresh_lock.locked()

@@ -43,7 +43,9 @@ import time
 from pathlib import Path
 
 from jacked.atomic_io import atomic_write_text
+from jacked.dcr_errors import DcrSettingsAccessError, DcrSettingsUnreadableError, DcrSettingsValueError
 from jacked.findbin import find_bin
+from jacked.public_errors import os_error_reason
 
 try:  # POSIX advisory locking. Absent on Windows -- see ``_config_lock``.
     import fcntl
@@ -102,25 +104,6 @@ DEFAULTS = {
     "effort": "xhigh",
     "keep_on_claude": ["Security", "Frontend Design"],
 }
-
-
-class DcrSettingsUnreadableError(Exception):
-    """jacked-dcr.json exists but cannot be safely read, or was written corrupt.
-
-    Raised instead of silently falling back to ``DEFAULTS`` so a read-modify-write
-    never overwrites a config file we failed to parse.
-    """
-
-
-class DcrSettingsAccessError(Exception):
-    """The config could not be WRITTEN or DELETED (a filesystem refusal).
-
-    Distinct from ``DcrSettingsUnreadableError``, which means "the bytes are
-    there but unusable". This one means the operating system said no --
-    permissions, a read-only volume, a full disk. Raised instead of leaking a
-    bare ``PermissionError`` so both surfaces can turn it into a friendly
-    failure (CLI: ``[FAIL]`` + exit 1; API: 503) instead of a traceback.
-    """
 
 
 def jacked_home() -> Path:
@@ -217,28 +200,28 @@ def _keep_ok(keep) -> bool:
 
 
 def _validate(config: dict) -> None:
-    """Raise ``ValueError`` unless every known field is a value we can run with."""
+    """Raise ``DcrSettingsValueError`` unless every known field is a value we can run with."""
     engine = config.get("engine")
     if not _choice_ok(engine, VALID_ENGINES):
-        raise ValueError(
+        raise DcrSettingsValueError(
             f"engine must be one of {sorted(VALID_ENGINES)}, got {engine!r}"
         )
     effort = config.get("effort")
     if not _choice_ok(effort, VALID_EFFORTS):
-        raise ValueError(
+        raise DcrSettingsValueError(
             f"effort must be one of {list(EFFORT_CHOICES)}, got {effort!r}"
         )
     model = config.get("model")
     if not isinstance(model, str) or not model.strip():
-        raise ValueError(f"model must be a non-empty string, got {model!r}")
+        raise DcrSettingsValueError(f"model must be a non-empty string, got {model!r}")
     if not _MODEL_RE.fullmatch(model):
-        raise ValueError(
+        raise DcrSettingsValueError(
             "model may only contain letters, digits, and . _ : / - "
             f"(no spaces or shell characters), got {model!r}"
         )
     keep = config.get("keep_on_claude")
     if not _keep_ok(keep):
-        raise ValueError(
+        raise DcrSettingsValueError(
             f"keep_on_claude must be a list of non-empty strings, got {keep!r}"
         )
 
@@ -343,7 +326,7 @@ def write_config(home: Path | str, config: dict) -> None:
         atomic_write_text(path, json.dumps(data, indent=2))
     except OSError as e:
         raise DcrSettingsAccessError(
-            f"cannot write {path}: {e}. Check the permissions on {path.parent}."
+            f"cannot write {path}: {os_error_reason(e)}. Check the permissions on {path.parent}."
         ) from e
 
     try:
@@ -478,7 +461,7 @@ def clear_config(home: Path | str) -> bool:
         return False
     except OSError as e:
         raise DcrSettingsAccessError(
-            f"cannot delete {path}: {e}. Check the permissions on {path.parent}."
+            f"cannot delete {path}: {os_error_reason(e)}. Check the permissions on {path.parent}."
         ) from e
     return True
 

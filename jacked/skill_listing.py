@@ -49,6 +49,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from jacked.findbin import find_bin
+from jacked.public_errors import PublicError
 
 logger = logging.getLogger(__name__)
 
@@ -165,8 +166,7 @@ BUILTIN_ENTRIES: tuple[tuple[str, int, bool], ...] = (
 
 MAX_DESC_MIN = 100
 MAX_DESC_MAX = 1536
-FRACTION_MAX = 1.0
-"""Claude Code accepts any fraction above 0 up to 1."""
+FRACTION_MAX = 1.0  # Claude Code accepts any fraction above 0 up to 1.
 
 RECOMMEND_MAX_DESC_CANDIDATES = tuple(range(150, 1501, 50)) + (1536,)
 RECOMMEND_FALLBACK_MAX_DESC = 250
@@ -180,8 +180,8 @@ SOURCE_LABELS = {
 }
 
 
-class ListingSettingsError(ValueError):
-    """A listing setting value is out of range or the wrong type."""
+class ListingSettingsError(PublicError, ValueError):
+    """A listing setting is out of range or the wrong type. The text is for the user."""
 
 
 # --------------------------------------------------------------------------- #

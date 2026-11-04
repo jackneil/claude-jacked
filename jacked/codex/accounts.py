@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 from jacked.findbin import find_bin
+from jacked.public_errors import PublicError
 
 from .credentials import (
     CodexCredentialStatus,
@@ -35,8 +36,10 @@ logger = logging.getLogger(__name__)
 CODEX_EXPIRES_SENTINEL = 4102444800  # 2100-01-01T00:00:00Z
 
 
-class CodexImportError(Exception):
+class CodexImportError(PublicError):
     """A Codex account could not be added (not logged in / keyring-only / no CLI).
+
+    The message is written for the user, so the dashboard shows it as it is.
 
     ``code`` is the stable reason the dashboard keys on. The fix for this
     class is a ``codex login`` on the machine that runs jacked.

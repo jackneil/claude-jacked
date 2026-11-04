@@ -15,6 +15,7 @@ from jacked import integrity
 from jacked.memory import load_budget
 from jacked.memory.settings_io import SETTINGS_MAX_BYTES, SettingsTooLargeError, SettingsUnreadableError, write_settings
 from jacked.memory.vault import atomic_write_text
+from jacked.public_errors import os_error_reason, public_message
 
 logger = logging.getLogger(__name__)
 
@@ -823,7 +824,7 @@ async def _toggle_skill(skill_name: str, src_dir: Path, enabled: bool, name: str
             except OSError as e:
                 return _error(
                     status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    f"Could not install the {skill_name} skill: {e}",
+                    f"Could not install the {skill_name} skill: {os_error_reason(e)}.",
                     "SKILL_INSTALL_FAILED",
                 )
             backup, err, restored = await asyncio.to_thread(
@@ -832,7 +833,7 @@ async def _toggle_skill(skill_name: str, src_dir: Path, enabled: bool, name: str
             if backup is not None:
                 logger.warning("Preserved your existing skill %s at %s", skill_name, backup)
             if err is not None:
-                message = f"Could not install the {skill_name} skill: {err}."
+                message = f"Could not install the {skill_name} skill: {os_error_reason(err)}."
                 if restored:
                     message += f" Your existing {skill_name} skill was restored."
                 elif backup is not None:
@@ -853,7 +854,7 @@ async def _toggle_skill(skill_name: str, src_dir: Path, enabled: bool, name: str
         except OSError as e:
             return _error(
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
-                f"Could not remove the {skill_name} skill: {e}",
+                f"Could not remove the {skill_name} skill: {os_error_reason(e)}.",
                 "SKILL_REMOVE_FAILED",
             )
         if keep_why:
@@ -1446,19 +1447,18 @@ async def set_dcr_engine(body: DcrEngineRequest):
         except DcrSettingsUnreadableError:
             return _dcr_unreadable_response()
         except DcrSettingsAccessError as exc:
-            # The filesystem refused the write (permissions, read-only volume,
-            # full disk). Nothing was changed; the message names the path and
-            # the directory whose permissions to check.
+            # The OS refused the write (permissions, read-only, full disk); nothing changed.
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 content={"error": {
-                    "message": str(exc),
+                    "message": exc.public_message,
                     "code": "DCR_SETTINGS_UNWRITABLE",
                 }},
             )
         except ValueError as exc:
-            # write_config rejected a field (an empty model is the reachable case).
+            # write_config rejected a field: a DcrSettingsValueError. Other text is hidden.
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                content={"error": {"message": str(exc), "code": "INVALID_VALUE"}},
+                content={"error": {"code": "INVALID_VALUE", "message": public_message(
+                    exc, "The DCR settings have a value that jacked cannot use.")}},
             )

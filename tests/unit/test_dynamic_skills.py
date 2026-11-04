@@ -307,6 +307,26 @@ class TestToggleSkillTree:
         skills = tree_env["dst"].parent
         assert [p.name for p in skills.iterdir() if p.name.startswith(".dcr.")] == []
 
+    def test_enable_failure_message_has_no_oserror_text(self, tree_env, monkeypatch):
+        """#289i: the response names the errno text, never the OSError text.
+
+        ``str(OSError)`` names the full path (the user's home directory),
+        and the dashboard can be reachable from another machine."""
+        import errno
+
+        import jacked.cli as cli
+
+        def refuse(src_root, skill_dir):
+            raise PermissionError(errno.EACCES, "Permission denied", "/marker/home/path")
+
+        monkeypatch.setattr(cli, "_copy_skill_tree", refuse)
+        result = _run(_toggle_knowledge("skill_dcr", True))
+        err = _body(result)["error"]
+        assert err["code"] == "SKILL_INSTALL_FAILED"
+        assert "/marker/home/path" not in err["message"]
+        assert "[Errno" not in err["message"]
+        assert "Permission denied" in err["message"]
+
     def test_enable_over_jackeds_own_copy_publishes_the_new_tree_whole(self, tree_env):
         """A second enable replaces jacked's own copy through the staged
         publish: a sidecar that the source no longer ships is gone, and no

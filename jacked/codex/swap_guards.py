@@ -12,10 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Optional
 
+from jacked.public_errors import PublicError
+
 from .credentials import detect_codex_account, extract_identity
 
 
-class CodexSwapError(Exception):
+class CodexSwapError(PublicError):
     """A Codex account swap was refused or failed (guardrail tripped).
 
     ``str(exc)`` is the message for the user. ``reason`` is a short code for
