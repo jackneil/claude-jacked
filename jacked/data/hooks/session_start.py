@@ -16,7 +16,8 @@ Step order is FIXED -- do not reorder, the cache keys on these exact bytes:
   3. memory-vault recall brief -> stdout
   4. open work (GitHub issues) -> stdout (from a cache; changes with the queue)
   5. git reality block         -> stdout (changes with the repo, so after 2-4)
-  6. load budget warnings      -> stdout (LAST: only when a file nears its cap)
+  6. load budget warnings      -> stdout (only when a file nears its cap)
+  7. integrity tripwire        -> stdout (LAST: only on drift or a quarantine)
 
 Each step is guarded on its own: a failure in one NEVER stops the ones after
 it, and nothing here may crash a session start (every path exits 0). Steps 2
@@ -30,8 +31,13 @@ refreshes, and a cache that exists stays in use until it is 24 hours old. Step 5
 in every git work tree and prints nothing anywhere else, so a session start
 outside a git repo adds zero bytes. Step 6 prints only when a file that Claude
 Code loads at session start (MEMORY.md, a CLAUDE.md) is over 90% of its load
-cap, so a healthy machine gets zero bytes from it, and it goes last because
-its text changes as the files grow.
+cap, so a healthy machine gets zero bytes from it. Step 7 prints only when
+settings.json or a hook script changed outside jacked, or when it found a
+suspected injected line in MEMORY.md (``jacked.integrity``; the line moves to a
+quarantine file, or stays and is reported when the file is a link or a
+repo-local setting chose its folder), so a healthy machine gets zero bytes
+from it too. It goes last because its text changes
+whenever something outside jacked changes.
 """
 
 import json
@@ -143,7 +149,7 @@ def _emit_git_reality(data: dict) -> None:
 
 
 def _emit_load_budget(data: dict) -> None:
-    """Step 6 (LAST): warn about each file Claude Code loads at session start
+    """Step 6: warn about each file Claude Code loads at session start
     that is over 90% of its load cap (or print nothing).
 
     The cwd is the payload's ``cwd``, else the process cwd (the recall rule).
@@ -160,6 +166,25 @@ def _emit_load_budget(data: dict) -> None:
         print(block)
 
 
+def _emit_integrity(data: dict) -> None:
+    """Step 7 (LAST): warn about changes that jacked did not make (or print nothing).
+
+    Moves suspected injected lines out of the session's MEMORY.md into a dated
+    quarantine file beside it, then compares settings.json and the hook
+    scripts with the baseline. It never blocks and never deletes. A subagent
+    session gets nothing, the same as the recall brief.
+    """
+    if os.environ.get("CLAUDE_CODE_PARENT_SESSION_ID") or os.environ.get("CLAUDE_CODE_AGENT_TYPE"):
+        return
+    from jacked import integrity
+    from jacked.memory import vault
+
+    cwd = str(data.get("cwd") or os.getcwd())
+    block = integrity.session_start_block(cwd, vault.jacked_home())
+    if block:
+        print(block)
+
+
 # The emitting steps, in the order their output must appear. Order is the
 # whole point of this module. The (silent) tracker step is not listed: main()
 # starts it first and joins it last, so its DB write overlaps these renders.
@@ -169,6 +194,7 @@ STEPS = (
     ("open work", _emit_issue_queue),
     ("git reality", _emit_git_reality),
     ("load budget", _emit_load_budget),
+    ("integrity", _emit_integrity),
 )
 
 

@@ -26,7 +26,10 @@ from rich.panel import Panel
 # stdlib-only at import time too, so this costs nothing at startup.
 from jacked.dcr_settings import EFFORT_CHOICES as _DCR_EFFORT_CHOICES
 from jacked.dcr_settings import ENGINE_CHOICES as _DCR_ENGINE_CHOICES
+from jacked.integrity_cli import integrity_group, print_doctor_lines
 from jacked.issues_cli import issues_group
+from jacked.memory.settings_io import SettingsUnreadableError as _SettingsUnreadable
+from jacked.memory.settings_io import read_settings as _read_settings_strict
 from jacked.service import REPLACEMENT_READY_TIMEOUT
 
 
@@ -2842,15 +2845,10 @@ def _rotate_backups(dir_path: Path, prefix: str, keep: int = 5) -> None:
 
 
 def _write_settings_atomic(settings_path: Path, data: dict) -> None:
-    """Atomically write the UTF-8 bytes of settings.json, LF on every platform.
+    """Write settings.json via ``settings_io.write_settings`` (atomic, size-checked; rebaselines integrity, #99i)."""
+    from jacked.memory.settings_io import write_settings
 
-    Prevents half-written JSON if the process is killed mid-install. Settings
-    over the read limit raise ``SettingsTooLargeError`` before the write.
-    """
-    from jacked.atomic_io import atomic_write_bytes
-    from jacked.memory.settings_io import settings_text
-
-    atomic_write_bytes(settings_path, settings_text(data).encode("utf-8"))
+    write_settings(settings_path, data, reason="jacked cli")
 
 
 def _link_or_copy(src: Path, dst: Path) -> str:
@@ -3497,8 +3495,6 @@ def _replace_stale_sound_hook(hook_entries: list, marker: str, hook_type: str) -
 
 def _install_sound_hooks(existing: dict, settings_path: Path):
     """Install sound notification hooks."""
-    import json
-
     marker = _sound_hook_marker()
 
     # Notification hook
@@ -3551,7 +3547,7 @@ def _install_sound_hooks(existing: dict, settings_path: Path):
     else:
         console.print("[yellow][-][/yellow] Stop sound hook exists")
 
-    settings_path.write_text(json.dumps(existing, indent=2))
+    _write_settings_atomic(settings_path, existing)
 
 
 def _remove_sound_hooks(settings_path: Path) -> bool:
@@ -3576,7 +3572,7 @@ def _remove_sound_hooks(settings_path: Path) -> bool:
                 modified = True
 
     if modified:
-        settings_path.write_text(json.dumps(settings, indent=2))
+        _write_settings_atomic(settings_path, settings)
     return modified
 
 
@@ -3670,7 +3666,7 @@ def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
             backup_path = claude_md_path.with_suffix(".md.pre-jacked")
             if not backup_path.exists():
                 shutil.copy2(claude_md_path, backup_path)
-                console.print(f"[dim]Backup: {backup_path}[/dim]")
+                console.print(f"[dim]Backup: {backup_path}[/dim]", soft_wrap=True)
 
             # Replace the block (symmetric with _remove_behavioral_rules)
             before = existing_content[:start_idx].rstrip("\n")
@@ -3710,7 +3706,7 @@ def _install_behavioral_rules(claude_md_path: Path, force: bool = False):
         backup_path = claude_md_path.with_suffix(".md.pre-jacked")
         if not backup_path.exists():
             shutil.copy2(claude_md_path, backup_path)
-            console.print(f"[dim]Backup: {backup_path}[/dim]")
+            console.print(f"[dim]Backup: {backup_path}[/dim]", soft_wrap=True)
 
     # Ensure parent directory exists
     claude_md_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4048,7 +4044,7 @@ def _remove_security_hook(settings_path: Path) -> bool:
             modified = True
 
     if modified:
-        settings_path.write_text(json.dumps(settings, indent=2))
+        _write_settings_atomic(settings_path, settings)
         console.print("[green][OK][/green] Removed security gatekeeper hook")
         # The gatekeeper feature is gone — its prompt file is dead config.
         prompt_path = _jacked_home() / ".claude" / "gatekeeper-prompt.txt"
@@ -4086,7 +4082,7 @@ def _remove_session_tracker_hooks(settings_path: Path) -> bool:
             modified = True
 
     if modified:
-        settings_path.write_text(json.dumps(settings, indent=2))
+        _write_settings_atomic(settings_path, settings)
         console.print("[green][OK][/green] Removed session tracker hooks")
         return True
 
@@ -4176,7 +4172,7 @@ def _remove_qa_hook(settings_path: Path) -> bool:
     ]
 
     if len(settings["hooks"]["Stop"]) < before:
-        settings_path.write_text(json.dumps(settings, indent=2))
+        _write_settings_atomic(settings_path, settings)
         console.print("[green][OK][/green] Removed QA suggest hook")
         return True
 
@@ -4214,7 +4210,7 @@ def _remove_session_start_hook(settings_path: Path) -> bool:
         return False
 
     settings["hooks"]["SessionStart"] = kept
-    settings_path.write_text(json.dumps(settings, indent=2))
+    _write_settings_atomic(settings_path, settings)
     console.print("[green][OK][/green] Removed session start hook")
     return True
 
@@ -4255,7 +4251,7 @@ def _remove_chain_of_command_hook(settings_path: Path) -> bool:
     ]
 
     if len(settings["hooks"]["SessionStart"]) < before:
-        settings_path.write_text(json.dumps(settings, indent=2))
+        _write_settings_atomic(settings_path, settings)
         console.print("[green][OK][/green] Removed chain-of-command hook")
         return True
 
@@ -5051,7 +5047,6 @@ def _run_install(
     ``{"name": <skill>, "error": <exception class name>}``, so the JSON record
     can say which skills were not installed and why.
     """
-    import json
     import shutil
 
     if not as_json:
@@ -5064,10 +5059,12 @@ def _run_install(
         backup = _snapshot_settings(settings_path)
         if backup:
             _rotate_backups(settings_path.parent, prefix="settings.json.bak-", keep=5)
+        # A corrupt file stops the install: read as {}, it would be written over every hook the user has.
         try:
-            existing = json.loads(settings_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            existing = {}
+            existing = _read_settings_strict(settings_path)
+        except _SettingsUnreadable as exc:
+            console.print(f"[red][FAIL][/red] {_rich_escape(str(exc))}. Fix it, then run jacked install again. Backup: {backup}", soft_wrap=True)
+            raise SystemExit(1)
     else:
         existing = {}
 
@@ -5101,7 +5098,7 @@ def _run_install(
             _pruned_legacy.append(f"gatekeeper {_ev} hook")
     if _pruned_legacy:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_path.write_text(json.dumps(existing, indent=2))
+        _write_settings_atomic(settings_path, existing)
         console.print(
             "[green][OK][/green] Removed legacy hooks retired in 0.70.0: "
             + ", ".join(_pruned_legacy)
@@ -6204,6 +6201,8 @@ def doctor():
         )
         console.print("  Recovery: [cyan]jacked service restart[/cyan]")
 
+    print_doctor_lines(console)
+
     # Install-method-specific recovery
     if method == "editable":
         console.print(
@@ -6311,7 +6310,7 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
                 ]
                 removed_count = original_count - len(settings["hooks"]["Stop"])
                 if removed_count > 0:
-                    settings_path.write_text(json.dumps(settings, indent=2))
+                    _write_settings_atomic(settings_path, settings)
                     console.print(
                         f"[green][OK][/green] Removed Stop hook from {settings_path}"
                     )
@@ -7094,6 +7093,7 @@ def dcr_engine_clear():
 
 
 main.add_command(issues_group)
+main.add_command(integrity_group)
 
 
 @main.group(name="memory")

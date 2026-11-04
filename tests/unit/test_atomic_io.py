@@ -354,6 +354,107 @@ def test_the_mode_lands_on_the_result(tmp_path, mode):
     assert target.stat().st_mode & 0o777 == mode
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+@pytest.mark.parametrize("writer", ["text", "bytes"])
+def test_a_rewrite_keeps_the_mode_of_the_file_it_replaces(tmp_path, writer):
+    """K4: mkstemp makes the temp file 0o600; a rewrite of a 0o644 file stays 0o644."""
+    target = tmp_path / "MEMORY.md"
+    target.write_text("old\n", encoding="utf-8")
+    target.chmod(0o644)
+
+    if writer == "text":
+        atomic_io.atomic_write_text(target, "new\n")
+    else:
+        atomic_io.atomic_write_bytes(target, b"new\n")
+
+    assert target.read_text(encoding="utf-8") == "new\n"
+    assert target.stat().st_mode & 0o7777 == 0o644
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_a_new_file_and_a_replaced_symlink_stay_owner_only(tmp_path):
+    new = tmp_path / "new.json"
+    atomic_io.atomic_write_text(new, "{}")
+    assert new.stat().st_mode & 0o777 == 0o600
+
+    pointed = tmp_path / "pointed.txt"
+    pointed.write_text("x", encoding="utf-8")
+    pointed.chmod(0o644)
+    link = tmp_path / "link.json"
+    link.symlink_to(pointed)
+    atomic_io.atomic_write_text(link, "{}")  # the link itself is replaced
+    assert not link.is_symlink() and link.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_a_rewrite_keeps_only_the_permission_bits(tmp_path):
+    """A setuid or sticky bit on the old file is not copied."""
+    target = tmp_path / "state.json"
+    target.write_text("{}", encoding="utf-8")
+    target.chmod(0o4755)
+
+    atomic_io.atomic_write_text(target, "{}")
+
+    assert target.stat().st_mode & 0o7777 == 0o755
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_an_explicit_mode_wins_over_the_old_mode(tmp_path):
+    target = tmp_path / ".credentials.json"
+    target.write_text("{}", encoding="utf-8")
+    target.chmod(0o644)
+
+    atomic_io.atomic_write_text(target, "{}", mode=0o600)
+
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("writer", ["text", "bytes"])
+def test_before_replace_runs_once_before_the_replace(tmp_path, writer):
+    target = tmp_path / "MEMORY.md"
+    seen: list = []
+
+    def before_replace():
+        seen.append(_stray_temps(tmp_path))  # the temp file is complete by now
+
+    if writer == "text":
+        atomic_io.atomic_write_text(target, "new", before_replace=before_replace)
+    else:
+        atomic_io.atomic_write_bytes(target, b"new", before_replace=before_replace)
+
+    assert len(seen) == 1 and len(seen[0]) == 1
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_before_replace_can_stop_the_write(tmp_path):
+    target = tmp_path / "MEMORY.md"
+    target.write_text("old", encoding="utf-8")
+
+    class Changed(Exception):
+        pass
+
+    def before_replace():
+        raise Changed
+
+    with pytest.raises(Changed):
+        atomic_io.atomic_write_bytes(target, b"new", before_replace=before_replace)
+
+    assert target.read_text(encoding="utf-8") == "old"
+    assert _stray_temps(tmp_path) == []
+
+
+def test_before_replace_runs_again_before_each_windows_retry(tmp_path, monkeypatch):
+    _on_windows(monkeypatch)
+    _record_pauses(monkeypatch)
+    calls = _flaky_replace(monkeypatch, failures=2)
+    checks: list = []
+
+    atomic_io.atomic_write_bytes(tmp_path / "state.json", b"{}", before_replace=lambda: checks.append(1))
+
+    assert len(calls) == 3
+    assert len(checks) == 3  # the first try and each of the two retries
+
+
 def _chmod_not_supported(monkeypatch) -> list:
     """Storage that creates and replaces files but refuses chmod (ENOTSUP),
     by descriptor and by path."""

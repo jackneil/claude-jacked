@@ -210,8 +210,10 @@ def test_step_8_completion_condition(engine: str) -> None:
 def test_step_8_verify_block_guarded(engine: str) -> None:
     """Anchor on strings that live ONLY inside the Verify checklist."""
     s = _section(engine, "## Step 8")
-    assert "Verify — run each and show the output" in s
-    assert "with NEW tests covering every milestone" in s
+    # K10: the per-milestone items cover done entries only (a blocked entry
+    # carries its reason), so the old "every milestone" anchor is gone.
+    assert "Verify: run each item and show the output" in s
+    assert "with NEW tests covering the behavior of each done milestone" in s
     assert "works when run for real" in s
 
 
