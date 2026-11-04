@@ -54,6 +54,36 @@ def activity_summary(conn: sqlite3.Connection, limit: int) -> list[dict]:
     return [dict(row) for row in conn.execute(_SUMMARY_SQL, (limit,)).fetchall()]
 
 
+_PATHS_SQL = " UNION ".join(
+    f"SELECT REPLACE(repo_path, char(92), '/') AS repo_path FROM {table} "
+    "WHERE repo_path IS NOT NULL AND repo_path != ''"
+    for table in ACTIVITY_TABLES
+) + " ORDER BY repo_path"
+
+
+def recorded_paths(conn: sqlite3.Connection) -> list[str]:
+    """Return every recorded project path once, with forward slashes, in path order.
+
+    There is no limit and no age rule: each project that a table records is
+    in the list. ``UNION`` removes the duplicates.
+
+    >>> conn = sqlite3.connect(":memory:")
+    >>> for table in ACTIVITY_TABLES:
+    ...     _ = conn.execute(f"CREATE TABLE {table} (repo_path TEXT)")
+    >>> _ = conn.execute("INSERT INTO hook_executions VALUES ('C:\\\\w\\\\r'), ('/b'), (''), (NULL)")
+    >>> _ = conn.execute("INSERT INTO command_usage VALUES ('/b'), ('C:/w/r'), ('/a')")
+    >>> recorded_paths(conn)
+    ['/a', '/b', 'C:/w/r']
+    """
+    return [row[0] for row in conn.execute(_PATHS_SQL).fetchall()]
+
+
+def list_recorded_projects(db) -> list[str]:
+    """Return :func:`recorded_paths` from ``db`` (a ``Database``) with a read connection."""
+    with db._reader() as conn:
+        return recorded_paths(conn)
+
+
 def recorded_project(conn: sqlite3.Connection, candidates: Iterable[str]) -> Optional[str]:
     """Return the recorded path that is equal to one of ``candidates``.
 
