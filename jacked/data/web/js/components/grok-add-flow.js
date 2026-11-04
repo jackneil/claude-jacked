@@ -6,12 +6,13 @@
  * buildOAuthBanner and OAUTH_ACCENT_BLUE (oauth-flows.js), and api,
  * showToast and refreshAndRender (app.js).
  *
- * Grok keeps its own login. Add imports the account that `grok login`
- * signed in on the computer that runs jacked. When nobody is signed in, the
- * server opens the Grok sign-in in a browser profile, and the user adds the
- * account again after the sign-in. Re-auth opens that sign-in for one
- * account. The messages come from the server, so the banner is built node by
- * node and never reaches innerHTML.
+ * Grok keeps its own login. Add imports a login that a terminal `grok login`
+ * signed in on the computer that runs jacked. Else the server opens the Grok
+ * sign-in in a browser profile. Re-auth opens that sign-in for one account.
+ * When the sign-in ends, the server stores the login and pushes the result
+ * over the WebSocket (provider_login_finished, websocket.js), and
+ * handleProviderLoginFinished shows it. The messages come from the server,
+ * so the banner is built node by node and never reaches innerHTML.
  */
 
 const GROK_NOTICE_CLASS = 'bg-amber-900/30 border border-amber-700 rounded-lg px-4 py-3 text-sm text-amber-200';
@@ -67,4 +68,21 @@ async function startGrokReauthFlow(id, email) {
         `Opening the Grok sign-in for ${email || 'this account'}…`,
         async () => { await refreshAndRender(); },
     );
+}
+
+/**
+ * Show the result of a Grok sign-in that the server pushed, then re-render.
+ * @param {{payload?: {provider?: string, ok?: boolean, message?: string}}} msg
+ */
+async function handleProviderLoginFinished(msg) {
+    const result = (msg && msg.payload) || {};
+    if (result.provider !== 'grok') return;
+    const slot = document.getElementById('oauth-flow-status');
+    if (slot) slot.textContent = '';
+    if (result.ok) {
+        showToast(result.message || 'The Grok sign-in is done.', 'success');
+    } else {
+        showGrokNotice(result.message || 'The Grok sign-in did not finish.');
+    }
+    await refreshAndRender();
 }

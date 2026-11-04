@@ -481,10 +481,13 @@ function renderAccountCard(acct, idx, total) {
 
     // Usage bars: the window key reads the plan's window state and length
     // (acct.windows), so a plan with no 5-hour window reads "none".
-    const usage5h = renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, windowElapsed(acct, 'five_hour'), '5h limit', usageBarOpts(acct, 'five_hour'));
-    const usage7d = renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, windowElapsed(acct, 'seven_day'), '7d limit', usageBarOpts(acct, 'seven_day'));
+    // A provider with no usage reader (Grok) gets one line in place of the
+    // bars, and no usage age or refresh control.
+    const hasUsage = typeof providerHasUsage !== 'function' || providerHasUsage(acct);
+    const usage5h = hasUsage ? renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, windowElapsed(acct, 'five_hour'), '5h limit', usageBarOpts(acct, 'five_hour')) : renderNoUsageNote(acct);
+    const usage7d = hasUsage ? renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, windowElapsed(acct, 'seven_day'), '7d limit', usageBarOpts(acct, 'seven_day')) : '';
     const usageBlockBadge = renderUsageBlockBadge(acct);
-    const cacheAgeHtml = renderCacheAge(acct.usage_cached_at, acct.id);
+    const cacheAgeHtml = hasUsage ? renderCacheAge(acct.usage_cached_at, acct.id) : '';
 
     // Priority reorder buttons
     const upDisabled = idx === 0 ? 'disabled' : '';
@@ -537,11 +540,11 @@ function renderAccountCard(acct, idx, total) {
                         <span class="text-xs text-slate-400">${escapeHtml(email)}${orgLabel ? ` (${escapeHtml(orgLabel)})` : ''}</span>
                         <span class="text-slate-600">|</span>
                         ${renderPlanLabel(acct)}
-                        <span class="text-slate-600">|</span>
+                        ${hasUsage ? `<span class="text-slate-600">|</span>
                         ${cacheAgeHtml}
                         <button class="btn-refresh-single text-slate-500 hover:text-slate-300 transition-colors p-1.5 -m-1 rounded relative" data-id="${acct.id}" title="Refresh usage" aria-label="Refresh usage">
                             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
-                        </button>
+                        </button>` : ''}
                     </div>
                     <!-- data-usage-container: queried by _usageUpdateCardDOM (websocket.js) for surgical bar updates -->
                     <div class="ml-5" data-usage-container>

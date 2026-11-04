@@ -267,11 +267,12 @@ def test_route_keeps_login_required_for_a_file_store_with_no_credential(
 def test_route_logs_the_refusal_code_without_values(client, tmp_path, monkeypatch, caplog):
     home = _home(tmp_path, auth=_auth_json(email=STALE_EMAIL), config=KEYRING)
     monkeypatch.setenv("CODEX_HOME", str(home))
-    caplog.set_level("INFO", logger="jacked.api.routes.auth")
+    # The Codex add body lives in jacked.api.provider_accounts (size ratchet).
+    caplog.set_level("INFO", logger="jacked.api.provider_accounts")
 
     client.post("/api/auth/accounts/add?provider=codex")
 
-    lines = [r.getMessage() for r in caplog.records if r.name == "jacked.api.routes.auth"]
+    lines = [r.getMessage() for r in caplog.records if r.name == "jacked.api.provider_accounts"]
     assert any("CODEX_STORE_UNSWITCHABLE" in line for line in lines), lines
     assert all(STALE_EMAIL not in line for line in lines)
 

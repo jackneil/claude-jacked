@@ -348,7 +348,10 @@ function _usageUpdateCardDOM(card, acctData) {
 
     // Re-render usage bars using the shared bar helpers (usage.js)
     const usageContainer = card.querySelector('[data-usage-container]');
-    if (usageContainer &&
+    // A provider with no usage reader (Grok) has no bars to replace: its
+    // first children are other rows.
+    const noUsage = typeof providerHasUsage === 'function' && !providerHasUsage(merged);
+    if (usageContainer && !noUsage &&
         typeof renderUsageBar === 'function' &&
         typeof windowElapsed === 'function' &&
         typeof usageBarOpts === 'function' &&
@@ -540,6 +543,12 @@ jackedWS.on('restart_started', (msg) => {
     }
     if (typeof _showUpgradeModal === 'function') _showUpgradeModal(d.message || 'Applying network settings...');
     if (typeof _startHealthPolling === 'function') _startHealthPolling();
+});
+
+// A provider sign-in that jacked started (Grok) ended: the server stored the
+// login, or says why not (grok-add-flow.js).
+jackedWS.on('provider_login_finished', async (msg) => {
+    if (typeof handleProviderLoginFinished === 'function') await handleProviderLoginFinished(msg);
 });
 
 jackedWS.on('auto_swap_triggered', (msg) => {

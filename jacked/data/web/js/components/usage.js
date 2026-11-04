@@ -264,6 +264,51 @@ function _keeperReadDate(epochSecs) {
 /** Longest reason caption the compact panel column holds ("Oct 27 3:45 PM"). */
 const USAGE_REASON_SHORT_MAX = 14;
 
+// The providers that jacked has a usage reader for. Any other provider
+// (Grok) shows no usage windows: an empty bar would read as 0% used.
+const USAGE_READER_PROVIDERS = ['claude', 'codex'];
+
+function _usageProviderKey(acct) {
+    return String((acct && acct.provider) || 'claude').trim().toLowerCase() || 'claude';
+}
+
+/**
+ * True when jacked reads the usage limits of this account's provider.
+ * @param {object} acct - Account payload.
+ * @returns {boolean}
+ */
+function providerHasUsage(acct) {
+    return USAGE_READER_PROVIDERS.includes(_usageProviderKey(acct));
+}
+
+/**
+ * The company or product that reports the usage of this account, for the
+ * hover text: Anthropic for a Claude account, else the provider label
+ * (providerMeta, util/provider.js).
+ * @param {object} acct - Account payload.
+ * @returns {string}
+ */
+function usageReporterName(acct) {
+    const key = _usageProviderKey(acct);
+    if (key === 'claude') return 'Anthropic';
+    if (typeof providerMeta === 'function') return providerMeta(key).label;
+    return key.charAt(0).toUpperCase() + key.slice(1);
+}
+
+/**
+ * The line that replaces the usage bars of an account whose provider has no
+ * usage reader, or '' when the provider has one.
+ * @param {object} acct - Account payload.
+ * @param {boolean} [compact] - The panel form (shorter text).
+ * @returns {string} HTML string.
+ */
+function renderNoUsageNote(acct, compact) {
+    if (providerHasUsage(acct)) return '';
+    const name = escapeHtml(usageReporterName(acct));
+    const text = compact ? 'No usage data' : 'jacked cannot read the usage limits of ' + name + ' accounts.';
+    return `<div class="text-xs text-slate-400" data-no-usage>${text}</div>`;
+}
+
 /**
  * Explain a usage window that the plan does not have, that the provider did
  * not report, or that has no future reset (window keeper state and usage
@@ -311,7 +356,7 @@ function windowReason(acct, windowKey, nowMs) {
     const value = acct[fields.value];
     const unreported = (win && win.state === 'unknown') || acct.provider === 'codex';
     if (unreported && (value === null || value === undefined) && Number(acct.usage_cached_at) > 0) {
-        const provider = acct.provider === 'codex' ? 'Codex' : 'Anthropic';
+        const provider = usageReporterName(acct);
         return {
             text: 'not reported', short: 'not reported', tone: 'muted', muted: false, absent: true,
             hint: provider + ' does not report this limit for this account.',
@@ -418,7 +463,7 @@ function usageBlockText(acct, nowMs) {
     if (!block) return null;
     const label = block.reason === 'spend_limit' ? 'Spend limit reached'
         : block.reason === 'limit_reached' ? 'Limit reached' : 'Usage blocked';
-    const provider = acct.provider === 'codex' ? 'Codex' : 'The provider';
+    const provider = usageReporterName(acct);
     const reset = block.resets_at ? formatResetTime(block.resets_at) : '';
     let title = label + '. ' + provider + ' blocks new requests for this account.';
     if (/^resets\s+/i.test(reset)) title += ' The limit ' + reset + '.';

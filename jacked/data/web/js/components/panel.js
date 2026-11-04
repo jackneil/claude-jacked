@@ -94,6 +94,10 @@ function formatCountdown(nextAt) {
  * payload get just the two window bars. The window key reads the plan's window
  * state and length (org.windows): a plan with no 5-hour window reads "none". */
 function orgBarsHtml(org) {
+    // A provider with no usage reader (Grok): one line, no empty bars.
+    if (typeof providerHasUsage === 'function' && !providerHasUsage(org)) {
+        return renderNoUsageNote(org, true);
+    }
     let html =
         renderUsageBar(org.cached_usage_5h, org.cached_5h_resets_at, windowElapsed(org, 'five_hour'), '5h', usageBarOpts(org, 'five_hour', { compact: true })) +
         renderUsageBar(org.cached_usage_7d, org.cached_7d_resets_at, windowElapsed(org, 'seven_day'), '7d', usageBarOpts(org, 'seven_day', { compact: true }));

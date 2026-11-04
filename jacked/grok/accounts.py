@@ -5,6 +5,27 @@ The live credential is ``<grok home>/auth.json``. jacked copies it into
 or when a switch captures the outgoing login. The database row stores the
 email and a non-secret marker. The refresh token stays in those files, which
 Grok itself rotates.
+
+Decisions, with the evidence (grok 1.0.50, scratch GROK_HOME, 2026-11-04):
+
+* The slots stay under ``<grok home>/jacked-accounts``. ``grok logout``
+  removes only ``auth.json``, and ``grok du`` lists the folder and removes
+  nothing (``--clean`` acts only on Grove redirect folders). The slots then
+  follow ``GROK_HOME``, as the live file does.
+* jacked does not take Grok's ``auth.json.lock``. Grok holds an OS lock
+  (``flock``) on that file. Its pid text is only a note: Grok wrote over a
+  live pid and did not wait. With ``flock`` held by another process,
+  ``grok logout`` printed "Logged out" and left ``auth.json`` in place. A
+  Grok refresh that met a lock held by jacked could skip its write in the
+  same way, and lose a refresh token that the server already rotated. The
+  switch lock below, the capture of the outgoing login, the atomic replace
+  and the stale-replay refusal cover the switch instead.
+* A switch needs no Grok restart. The Grok docs (Authentication > Hot
+  Reload) say that Grok reads a changed ``auth.json`` on the next API call.
+  Leader mode is off by default (``cli.use_leader``).
+* On Windows the file is ``%USERPROFILE%\\.grok\\auth.json``: the Grok
+  installer (``x.ai/cli/install.ps1``) sets ``$GrokDir`` from
+  ``USERPROFILE``, and ``Path.home()`` reads ``USERPROFILE`` on Windows.
 """
 
 from __future__ import annotations
@@ -75,6 +96,19 @@ def _records(data: Optional[dict]) -> list[dict]:
         ):
             found.append(value)
     return found
+
+
+def usable_login(data: Optional[dict]) -> bool:
+    """True when ``data`` names an identity and holds a key or a refresh token.
+
+    >>> usable_login({"s": {"email": "a@x.com", "refresh_token": "r"}})
+    True
+    >>> usable_login({"s": {"email": "a@x.com"}}), usable_login(None)
+    (False, False)
+    """
+    return bool(identity_email(data)) and any(
+        record.get("key") or record.get("refresh_token") for record in _records(data)
+    )
 
 
 def identity_email(data: Optional[dict]) -> Optional[str]:
@@ -206,9 +240,7 @@ def live_login_owner(db, home: Optional[Path] = None) -> tuple[bool, Optional[in
     """
     root = home if home is not None else grok_home()
     live = _read_json(root / "auth.json")
-    if not identity_email(live) or not any(
-        record.get("key") or record.get("refresh_token") for record in _records(live)
-    ):
+    if not usable_login(live):
         return False, None
     return True, find_grok_account_id(db, live)
 
@@ -265,7 +297,7 @@ def import_grok_account(
             "No Grok login found. Re-auth to sign in. jacked opens that login "
             "in this account's browser profile."
         )
-    if not any(record.get("key") or record.get("refresh_token") for record in _records(data)):
+    if not usable_login(data):
         raise GrokAccountError("Grok auth.json has no usable login. Re-auth this account.")
 
     account = db.create_account(

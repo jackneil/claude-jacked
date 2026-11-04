@@ -8,6 +8,8 @@ keeps the escape opens a broken address.
 
 import io
 import sys
+import threading
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,9 +38,17 @@ class _Proc:
         self.stdout = io.StringIO(text)
         self._code = code
         self.pid = 4242
+        self.killed = False
 
     def poll(self):
         return self._code
+
+    def wait(self, timeout=None):
+        return -9 if self.killed else (self._code if self._code is not None else 0)
+
+    def kill(self):
+        self.killed = True
+        self._code = -9
 
 
 @pytest.mark.parametrize("text, url", [
@@ -54,12 +64,100 @@ def test_the_watcher_opens_the_clean_url_once(text, url):
 
 
 def test_the_watcher_stops_at_end_of_output_without_spinning():
-    """A closed pipe returns "" at once. The loop must end, not spin to the deadline."""
+    """A closed pipe returns "" at once. The loop must end, not spin."""
     proc = _Proc("", code=None)
-    with patch("jacked.web.browser_launch.open_auth_url") as opener, \
-            patch.object(el.time, "time", side_effect=[0.0, 0.0, 1.0, 2.0, 999.0]):
-        el._watch_for_url(proc, {"provider": "grok"}, db=None)
+    with patch("jacked.web.browser_launch.open_auth_url") as opener:
+        assert el._watch_for_url(proc, {"provider": "grok"}, db=None) is True
     opener.assert_not_called()
+
+
+def test_the_watcher_reads_every_line_after_the_url():
+    """It used to stop reading after 90 seconds. A CLI that keeps printing then
+    blocks on a full pipe and never exits, so the login is never imported."""
+    text = GROK_OUT + "".join(f"poll {n}\n" for n in range(20000))
+    proc = _Proc(text)
+    with patch("jacked.web.browser_launch.open_auth_url"):
+        el._watch_for_url(proc, {"provider": "grok"}, db=None)
+    assert proc.stdout.read() == ""
+
+
+def test_a_url_that_no_browser_can_open_stops_the_sign_in():
+    """Nobody can see the URL ("manual"), so the CLI would wait for 15 minutes."""
+    proc = _Proc(GROK_OUT, code=None)
+    with patch("jacked.web.browser_launch.open_auth_url",
+               return_value=SimpleNamespace(mode="manual")):
+        assert el._watch_for_url(proc, {"provider": "grok"}, db=None) is False
+    assert proc.killed
+
+
+def _watch(proc, open_mode="profile"):
+    outcomes = []
+    el._live_logins["grok"] = proc
+    with patch("jacked.web.browser_launch.open_auth_url",
+               return_value=SimpleNamespace(mode=open_mode)):
+        el._watch_login(proc, {"provider": "grok"}, None, "grok", outcomes.append)
+    return outcomes
+
+
+@pytest.mark.parametrize("code, open_mode, outcome", [
+    (0, "profile", el.SIGNED_IN),
+    (1, "profile", el.FAILED),
+    (None, "manual", el.NO_BROWSER),
+])
+def test_the_watcher_reports_how_the_login_ended(code, open_mode, outcome):
+    proc = _Proc(GROK_OUT, code=code)
+    assert _watch(proc, open_mode) == [outcome]
+    # The live slot is free again once the result is handled.
+    assert "grok" not in el._live_logins
+
+
+def test_a_login_past_the_device_code_life_is_stopped(monkeypatch):
+    """The timer kills the CLI. Its pipe closes, and the outcome is TIMED_OUT."""
+    monkeypatch.setattr(el, "LOGIN_TIMEOUT_SECONDS", 0.05)
+
+    class _Hung(_Proc):
+        def __init__(self):
+            super().__init__("", code=None)
+            self._stopped = threading.Event()
+            self.stdout = self
+
+        def readline(self):
+            self._stopped.wait(5)
+            return ""
+
+        def kill(self):
+            super().kill()
+            self._stopped.set()
+
+    proc = _Hung()
+    assert _watch(proc) == [el.TIMED_OUT]
+    assert proc.killed
+
+
+def test_only_one_login_of_a_provider_runs_at_a_time(tmp_path, monkeypatch):
+    monkeypatch.setattr("jacked.web.browser_launch.PROFILE_ROOT", tmp_path / "profiles")
+    prepared = []
+    started = []
+
+    def _popen(argv, **kwargs):
+        started.append(argv)
+        return _Proc("", code=None)
+
+    with patch.object(el, "find_bin", return_value="/home/u/.grok/bin/grok"), \
+            patch.object(el.subprocess, "Popen", side_effect=_popen), \
+            patch.object(el.threading, "Thread"):
+        el.start_provider_login(
+            "grok", {"email": "g@x.com", "id": 3}, db=None, env={},
+            prepare=lambda: prepared.append(1) or ({"GROK_HOME": "/i"}, ("--x",)),
+        )
+        assert el.login_running("grok")
+        with pytest.raises(el.LoginInProgressError):
+            el.start_provider_login("grok", {"email": "h@x.com", "id": 4}, db=None,
+                                    env={}, prepare=lambda: prepared.append(2) or ({}, ()))
+    # The second request never cleared the first login's isolated home.
+    assert prepared == [1]
+    assert started == [["/home/u/.grok/bin/grok", "login", "--device-auth", "--x"]]
+    el._live_logins.clear()
 
 
 def test_an_unknown_provider_is_refused():

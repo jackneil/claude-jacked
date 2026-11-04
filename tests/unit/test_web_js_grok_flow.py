@@ -55,9 +55,9 @@ def test_a_profile_sign_in_shows_the_server_message(tmp_path):
     result = _run_grok(tmp_path, "await startAddGrokFlow();", """async (path) => {
         calls.post.push(path);
         return { profile_login: true, needs_login: true, provider: 'grok',
-                 message: 'The Grok sign-in opened. Then add the Grok account again.' };
+                 message: 'The Grok sign-in opened. jacked adds the account when the sign-in is done.' };
     }""")
-    assert "The Grok sign-in opened. Then add the Grok account again." in result["text"]
+    assert "jacked adds the account when the sign-in is done." in result["text"]
     assert result["refreshCalls"] == 0
     assert result["guard"] is False
 
@@ -86,14 +86,46 @@ def test_reauth_posts_to_the_account_and_shows_the_message(tmp_path):
 
 
 @needs_node
-def test_reauth_refused_for_another_live_login_shows_why(tmp_path):
+def test_a_second_sign_in_while_one_runs_shows_why(tmp_path):
     result = _run_grok(tmp_path, "await startGrokReauthFlow('7', 'g@x.com');", """async (path) => {
         calls.post.push(path);
-        const err = new Error('Grok is signed in to a different account.');
-        err.code = 'GROK_SIGNED_IN_AS_OTHER';
+        const err = new Error('A Grok sign-in is already open.');
+        err.code = 'GROK_LOGIN_IN_PROGRESS';
         throw err;
     }""")
-    assert "Grok is signed in to a different account." in result["text"]
+    assert "A Grok sign-in is already open." in result["text"]
+
+
+@needs_node
+def test_a_pushed_success_is_announced_and_rendered(tmp_path):
+    result = _run_grok(tmp_path, """await handleProviderLoginFinished({ payload: {
+        provider: 'grok', ok: true, message: 'Signed in to Grok as n@x.com.' } });""",
+        "async () => ({})")
+    assert result["toasts"] == [{"msg": "Signed in to Grok as n@x.com.", "type": "success"}]
+    assert result["refreshCalls"] == 1
+
+
+@needs_node
+def test_a_pushed_failure_shows_the_reason_in_the_banner(tmp_path):
+    result = _run_grok(tmp_path, """await handleProviderLoginFinished({ payload: {
+        provider: 'grok', ok: false, message: 'You signed in as <b>b@x.com</b>.' } });""",
+        "async () => ({})")
+    assert "You signed in as <b>b@x.com</b>." in result["text"]
+    assert "<b>" not in result["html"]
+    assert result["refreshCalls"] == 1
+
+
+@needs_node
+def test_a_push_for_another_provider_is_ignored(tmp_path):
+    result = _run_grok(tmp_path, """await handleProviderLoginFinished({ payload: {
+        provider: 'codex', ok: true, message: 'x' } });""", "async () => ({})")
+    assert result["toasts"] == [] and result["refreshCalls"] == 0
+
+
+def test_the_websocket_routes_the_push_to_the_grok_handler():
+    ws = (WEB / "js" / "websocket.js").read_text(encoding="utf-8")
+    assert "jackedWS.on('provider_login_finished'" in ws
+    assert "handleProviderLoginFinished(msg)" in ws
 
 
 def test_no_em_dashes_in_the_grok_copy():
@@ -115,10 +147,10 @@ def test_the_module_reads_no_other_script_at_load_time(tmp_path):
     script = tmp_path / "load-only.js"
     script.write_text(
         GROK_JS.read_text(encoding="utf-8")
-        + "\nprocess.stdout.write(typeof startAddGrokFlow + ' ' + typeof startGrokReauthFlow);\n",
+        + "\nprocess.stdout.write(typeof startAddGrokFlow + ' ' + typeof startGrokReauthFlow + ' ' + typeof handleProviderLoginFinished);\n",
         encoding="utf-8",
     )
     proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "function function"
+    assert proc.stdout == "function function function"
     assert json.dumps  # keep the import used
