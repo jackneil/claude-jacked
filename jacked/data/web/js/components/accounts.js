@@ -78,6 +78,11 @@ const PLAN_DRIFT_HINT = 'The plan catalog in this jacked release does not match 
  */
 function renderPlanLabel(acct) {
     const plan = (acct && acct.plan) || {};
+    // A provider with no plan that jacked can read (Grok) gets no label:
+    // "Unknown subscription" would say nothing. Claude keeps "Unknown", because
+    // its plan comes from the profile and can still arrive.
+    const known = (typeof plan.label === 'string' && plan.label.trim()) || (acct && acct.subscription_type);
+    if (!known && String((acct && acct.provider) || 'claude').toLowerCase() !== 'claude') return '';
     const parts = [];
     if (plan.formerly) parts.push('Formerly ' + plan.formerly);
     const drift = Array.isArray(plan.drift) && plan.drift.length > 0;
@@ -484,6 +489,7 @@ function renderAccountCard(acct, idx, total) {
     // A provider with no usage reader (Grok) gets one line in place of the
     // bars, and no usage age or refresh control.
     const hasUsage = typeof providerHasUsage !== 'function' || providerHasUsage(acct);
+    const planLabelHtml = renderPlanLabel(acct);
     const usage5h = hasUsage ? renderUsageBar(acct.cached_usage_5h, acct.cached_5h_resets_at, windowElapsed(acct, 'five_hour'), '5h limit', usageBarOpts(acct, 'five_hour')) : renderNoUsageNote(acct);
     const usage7d = hasUsage ? renderUsageBar(acct.cached_usage_7d, acct.cached_7d_resets_at, windowElapsed(acct, 'seven_day'), '7d limit', usageBarOpts(acct, 'seven_day')) : '';
     const usageBlockBadge = renderUsageBlockBadge(acct);
@@ -538,8 +544,7 @@ function renderAccountCard(acct, idx, total) {
                     </div>
                     <div class="flex items-center gap-3 mb-2 ml-5">
                         <span class="text-xs text-slate-400">${escapeHtml(email)}${orgLabel ? ` (${escapeHtml(orgLabel)})` : ''}</span>
-                        <span class="text-slate-600">|</span>
-                        ${renderPlanLabel(acct)}
+                        ${planLabelHtml ? `<span class="text-slate-600">|</span>${planLabelHtml}` : ''}
                         ${hasUsage ? `<span class="text-slate-600">|</span>
                         ${cacheAgeHtml}
                         <button class="btn-refresh-single text-slate-500 hover:text-slate-300 transition-colors p-1.5 -m-1 rounded relative" data-id="${acct.id}" title="Refresh usage" aria-label="Refresh usage">
