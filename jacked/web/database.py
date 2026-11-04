@@ -3532,7 +3532,7 @@ class Database:
         """Get sessions that are stale (past staleness window) but not ended.
 
         Inverse of get_active_sessions — returns sessions that have gone
-        silent but were never closed. Used by the process-alive sweeper.
+        silent but were never closed. Used by the sweeper and the holder set.
 
         >>> db = Database(":memory:")
         >>> db.get_stale_open_sessions()
@@ -3545,7 +3545,7 @@ class Database:
                 """SELECT s.session_id,
                           s.last_activity_at,
                           s.detected_at,
-                          s.pid
+                          s.pid, s.account_id
                    FROM session_accounts s
                    INNER JOIN (
                        SELECT session_id,

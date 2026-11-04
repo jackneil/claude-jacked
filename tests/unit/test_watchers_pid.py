@@ -1,39 +1,48 @@
-"""Regression tests for _is_pid_alive safety on Windows.
+"""The process sweeper's per-session verdict is safe on every platform.
 
-Previously used os.kill(pid, 0) unconditionally which on Windows could
+The sweeper once called ``os.kill(pid, 0)`` directly, which on Windows could
 surface CPython SystemError ("returned a result with an exception set").
-Now delegates to jacked.service.process.is_process_alive and fail-safe
-returns True on any exception so user sessions are never incorrectly
-closed.
+It now asks ``session_processes_running`` (the verdict the credential holder
+set uses too). An error in the probe gives an unknown answer, and the sweeper
+never closes a session on an unknown answer.
 """
 
+import os
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from jacked.session_ancestry import session_processes_running
 
-def test_returns_false_for_none_or_zero():
-    from jacked.api.watchers import _is_pid_alive
-    assert _is_pid_alive(None) is False
-    assert _is_pid_alive(0) is False
-    assert _is_pid_alive(-1) is False
-
-
-def test_returns_true_for_current_process():
-    import os as _os
-    from jacked.api.watchers import _is_pid_alive
-    assert _is_pid_alive(_os.getpid()) is True
+def _row(pid, written=None):
+    written = written or datetime.now(timezone.utc)
+    return {"session_id": f"s-{pid}", "pid": pid, "detected_at": written.isoformat()}
 
 
-def test_returns_false_for_dead_pid():
-    from jacked.api.watchers import _is_pid_alive
-    assert _is_pid_alive(999_999_999) is False
+def test_no_usable_pid_is_unknown():
+    assert session_processes_running([_row(None), _row(0), _row(-1), _row(1)]) == [
+        None, None, None, None,
+    ]
 
 
-def test_fail_safe_on_unexpected_exception():
-    """If is_process_alive raises (Windows SystemError quirk), fall back
-    to True so we don't incorrectly close live sessions."""
-    from jacked.api import watchers
+def test_the_current_process_runs_a_row_written_after_it_started():
+    assert session_processes_running([_row(os.getpid())]) == [True]
+
+
+def test_a_row_written_before_the_process_started_is_a_reused_pid():
+    """This process started after a row dated a year ago: the id was reused."""
+    old = datetime.now(timezone.utc) - timedelta(days=365)
+    assert session_processes_running([_row(os.getpid(), old)]) == [False]
+
+
+def test_a_dead_pid_does_not_run_the_session():
+    assert session_processes_running([_row(999_999_999)]) == [False]
+
+
+def test_a_probe_error_is_unknown_never_a_close():
+    """A liveness probe that raises (the Windows SystemError quirk) gives an
+    unknown answer, so the sweeper leaves the session open."""
     with patch(
-        "jacked.service.process.is_process_alive",
+        "jacked.service.process.process_liveness",
         side_effect=SystemError("returned a result with an exception set"),
     ):
-        assert watchers._is_pid_alive(12345) is True
+        assert session_processes_running([_row(12345)]) == [None]

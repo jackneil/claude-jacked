@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from jacked.api.token_expiry import _malformed_expiry, expiry_seconds  # noqa: F401
+from jacked.session_ancestry import tracked_holder_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -690,11 +691,10 @@ def _row_holds_live_tokens(row: dict, live: dict | None) -> bool:
     return bool(refresh) and refresh == row.get("cc_refresh_token")
 
 
-# How long a tracked session counts as a holder of its account's refresh
-# lineage with no heartbeat: the life of a Claude Code access token (about
-# 8 hours). An idle session keeps its refresh token in memory and spends it
-# when its access token expires, so the 60-minute dashboard staleness window
-# (SESSION_STALENESS_MINUTES) would let jacked rotate a lineage it holds.
+# A tracked session holds its account's refresh lineage while it was active
+# inside the life of a Claude Code access token (about 8 hours), not the
+# 60-minute dashboard window (SESSION_STALENESS_MINUTES): an idle session
+# spends its in-memory refresh token when its access token expires.
 HOLDER_WINDOW_MINUTES = 480
 
 
@@ -710,7 +710,8 @@ def live_holder_account_ids(db, live: dict | None = None) -> set[int] | None:
     The session tracker's accounts join the set: a session started on X
     keeps X's refresh token in memory even after the authority moved to Y,
     so rotating X would send that session to /login (2026-09-05). A session
-    counts while it was active in the last ``HOLDER_WINDOW_MINUTES``.
+    counts while it was active in the last ``HOLDER_WINDOW_MINUTES`` or its
+    process still runs it, idle or asleep (``tracked_holder_sessions``).
 
     Returns ``None`` when the holders are UNKNOWN: the live store could not
     be read, the account list or the session tracker failed, or an active
@@ -721,6 +722,7 @@ def live_holder_account_ids(db, live: dict | None = None) -> set[int] | None:
     ...     def __init__(self, sessions): self.sessions = sessions
     ...     def list_accounts(self, include_inactive=False): return []
     ...     def get_active_sessions(self, staleness_minutes=60): return self.sessions
+    ...     def get_stale_open_sessions(self, staleness_minutes=60): return []
     >>> live_holder_account_ids(_Db([{"account_id": 9}]), {})
     {9}
     >>> live_holder_account_ids(_Db([{"account_id": 9}, {"account_id": None}]), {}) is None
@@ -739,7 +741,7 @@ def live_holder_account_ids(db, live: dict | None = None) -> set[int] | None:
         for row in db.list_accounts(include_inactive=True):
             if _row_holds_live_tokens(row, live):
                 held.add(int(row["id"]))
-        sessions = list(db.get_active_sessions(staleness_minutes=HOLDER_WINDOW_MINUTES))
+        sessions = tracked_holder_sessions(db, HOLDER_WINDOW_MINUTES)
     except Exception:
         logger.debug("live_holder_account_ids: holder discovery failed", exc_info=True)
         return None
@@ -1158,9 +1160,6 @@ def _clear_keeper_backoff(account_id: int) -> None:
     except Exception:  # noqa: BLE001 - never fail a reconcile over this
         logger.debug("Could not clear the keeper backoff", exc_info=True)
 
-
-# Backward-compatible alias
-reconcile_outgoing_credentials = reconcile_credentials_from_live_store
 
 def reconcile_outgoing_before_activation(db, target_id: int) -> bool:
     """Save the active account's live tokens before the store is overwritten.
