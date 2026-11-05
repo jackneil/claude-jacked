@@ -150,8 +150,13 @@ def test_fragments_before_the_handshake_completes_close_cleanly(caplog):
     ).encode()
     frames = _masked_frame(0x1, False) + _masked_frame(0x0, False) * MAX_FRAGMENTS
 
+    async def close_before_accept(scope, receive, send):
+        # The /api/ws Origin refusal: close before accept.
+        await receive()
+        await send({"type": "websocket.close", "code": 4003})
+
     async def scenario():
-        config = uvicorn.Config(_echo_app, **SERVER_SETTINGS)
+        config = uvicorn.Config(close_before_accept, **SERVER_SETTINGS)
         config.load()
         protocol = BoundedFragmentsProtocol(
             config=config, server_state=MagicMock(connections=set(), tasks=set()),
@@ -167,10 +172,14 @@ def test_fragments_before_the_handshake_completes_close_cleanly(caplog):
         assert not protocol.handshake_complete
         assert protocol.frames == []
         transport.close.assert_called()
-        for task in list(protocol.tasks):
-            task.cancel()
+        # Let the app run its first step after the refusal.
+        tasks = list(protocol.tasks)
+        if tasks:
+            await asyncio.wait(tasks, timeout=5)
 
     asyncio.run(scenario())
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not errors, [r.getMessage() for r in errors]
     records = _wait_for_refusal(caplog, timeout=0)
     assert len(records) == 1
     assert "handshake not complete" in records[0].getMessage()

@@ -78,4 +78,8 @@ class BoundedFragmentsProtocol(WebSocketsSansIOProtocol):
         # so close the transport. connection_lost tells the app.
         self.transport.write(b"".join(self.conn.data_to_send()))
         self.close_sent = True
+        # Set now what connection_lost sets a moment later. Until then an app
+        # that sends before it accepts gets ClientDisconnected, not a second
+        # end-of-stream that websockets refuses with an assert.
+        self.disconnected = True
         self.transport.close()
