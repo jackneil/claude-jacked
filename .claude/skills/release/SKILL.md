@@ -11,7 +11,7 @@ description: "Cut a release the way this repo actually ships: detects PyPI/npm/c
 - **Base Branch**: master
 - **Shipping Model**: pypi
 - **Version Source**: `jacked/__init__.py` `__version__` (hatch dynamic version: pyproject.toml declares `dynamic = ["version"]` with `[tool.hatch.version] path = "jacked/__init__.py"`; do NOT add a static version to pyproject.toml)
-- **Gate Commands**: mirror `.github/workflows/tests.yml`, then the build check of `.github/workflows/publish.yml`. Run them from the repo root in this order, each as `cmd > log 2>&1; echo EXIT:$?`, and quote pytest's own summary line; never trust a piped exit code. CI runs pytest on ubuntu, macos and windows; the ruff rule set is pinned in `[tool.ruff.lint]`. The two audit tools come from the hash-locked `.github/requirements/ci-audit.txt`, not from the dev group.
+- **Gate Commands**: mirror `.github/workflows/tests.yml`, then the release build of `.github/workflows/build-dist.yml` (the job publish.yml runs; `--no-config` keeps the project `exclude-newer` out of a pip-equivalent install). Run them from the repo root in this order, each as `cmd > log 2>&1; echo EXIT:$?`, and quote pytest's own summary line; never trust a piped exit code. CI runs pytest on ubuntu, macos and windows; the ruff rule set is pinned in `[tool.ruff.lint]`. The two audit tools come from the hash-locked `.github/requirements/ci-audit.txt`, not from the dev group.
   ```bash
   uv lock --check
   uv run --frozen ruff check .
@@ -29,9 +29,13 @@ description: "Cut a release the way this repo actually ships: detects PyPI/npm/c
   PY
   uv run --isolated --no-project --with-requirements .github/requirements/ci-audit.txt pip-audit -r "$GATE_TMP/locked.txt" --no-deps --disable-pip --vulnerability-service osv
   uv run --isolated --no-project --with-requirements .github/requirements/ci-audit.txt zizmor --no-progress --strict-collection .github/workflows
-  uv build --out-dir "$GATE_TMP/dist" && uvx twine check "$GATE_TMP"/dist/*
+  uv venv -q -p 3.11 "$GATE_TMP/pub"
+  uv pip install -q --no-config -p "$GATE_TMP/pub" --require-hashes --only-binary=:all: -r .github/requirements/ci-publish.txt
+  "$GATE_TMP/pub/bin/python" -m build --no-isolation --outdir "$GATE_TMP/dist"
+  "$GATE_TMP/pub/bin/twine" check "$GATE_TMP"/dist/*
+  "$GATE_TMP/pub/bin/cyclonedx-py" environment -o "$GATE_TMP/sbom.cdx.json"
   ```
-- **Publish Mechanism**: GitHub Release published on `master` -> `.github/workflows/publish.yml` (build job: `python -m build`, `twine check dist/*`, CycloneDX SBOM; publish job in the `pypi` environment) -> PyPI Trusted Publisher (OIDC, `pypa/gh-action-pypi-publish`) -> https://pypi.org/p/claude-jacked. Cutting the GitHub Release (e.g. `gh release create vX.Y.Z`) IS the publish trigger: treat it as the irreversible step.
+- **Publish Mechanism**: GitHub Release published on `master` -> `.github/workflows/publish.yml` (build job = `.github/workflows/build-dist.yml`: hash-locked `python -m build --no-isolation`, `twine check dist/*`, CycloneDX SBOM; publish job in the `pypi` environment) -> PyPI Trusted Publisher (OIDC, `pypa/gh-action-pypi-publish`) -> https://pypi.org/p/claude-jacked. Cutting the GitHub Release (e.g. `gh release create vX.Y.Z`) IS the publish trigger: treat it as the irreversible step.
 - **Verify**: poll `https://pypi.org/pypi/claude-jacked/json` until the new version appears; confirm the publish.yml run succeeded (`gh run list --workflow=publish.yml`); optionally `uv tool install --upgrade claude-jacked` and check `jacked --version`. Before tagging, confirm README's "Version History" table carries the new version's row, and that the merged PR's Tests run shows a real "N passed" line on each OS leg (a green check alone has hidden a pytest that died early with exit 0).
 
 <!-- Staleness fingerprint - the engine compares these against the live repo on each run -->

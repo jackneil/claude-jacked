@@ -12,7 +12,7 @@ on:
     # code that did not change.
     - cron: "31 7 * * 1"
 
-permissions: read-all
+permissions: {}
 
 concurrency:
   group: codeql-${{ github.workflow }}-${{ github.ref }}

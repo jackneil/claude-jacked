@@ -25,6 +25,8 @@ SERVER_SETTINGS = MappingProxyType(
         # The dashboard socket (/api/ws) runs on the websockets Sans-I/O
         # protocol. "auto" picks uvicorn's legacy implementation before 0.50,
         # and websockets deprecated that API in 14.0 and plans to remove it.
-        "ws": "websockets-sansio",
+        # jacked's subclass adds a limit on the fragments of one message
+        # (jacked/api/ws_protocol.py). uvicorn imports it when a server starts.
+        "ws": "jacked.api.ws_protocol:BoundedFragmentsProtocol",
     }
 )

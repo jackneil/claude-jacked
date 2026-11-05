@@ -21,11 +21,10 @@ Validate paths before reading (skip missing ones silently):
 - `jacked/data/commands/goal-maker.md` section `## Ledger contract` (the worklist.json + progress.md run state every forged brief must carry)
 - `.claude/goals/` (gitignored run directories of earlier /goal runs: `<YYYYMMDD>-<slug>.md` briefs, `<YYYYMMDD>-<slug>/worklist.json` + `progress.md` ledgers)
 - `docs/future-work.md`
-- `docs/DESIGN.md`
 - `docs/plans/` (design + implementation plans, `.md` and `.html`; newest: `2026-10-26-window-keeper-recovery.html`, `2026-09-04-service-self-heal-upgrade-transaction.html`)
 - `docs/architecture/` (auto-swap system, oauth/credential flows, work ledger)
 - `docs/design/` (codex integration, remote-access toggle, mac UI mockups)
-- `docs/lockdown/` (supply-chain audit reports; newest `2026-10-29-claude-jacked-lockdown.html`)
+- `docs/lockdown/` (supply-chain audit reports; newest `2026-11-05-claude-jacked-lockdown.html`)
 - `docs/research/`, `docs/superpowers/plans/` + `docs/superpowers/research/` (past initiative plans and research)
 - `design/` (feature design notes, incl. `2026-10-01-skill-diet.html`, `20260724-night-shift-research-and-design.html`, `memory-vault-design.html` + `memory-vault-implementation-plan.html`)
 - `.claude/research/` (local research reports, `.html`; gitignored, often absent in a fresh clone or worktree)

@@ -59,9 +59,12 @@ def test_the_settings_resolve_to_the_sans_io_protocol():
         WebSocketsSansIOProtocol,
     )
 
+    from jacked.api.ws_protocol import BoundedFragmentsProtocol
+
     config = uvicorn.Config("jacked.api.main:app", **SERVER_SETTINGS)
     config.load()
-    assert config.ws_protocol_class is WebSocketsSansIOProtocol
+    assert config.ws_protocol_class is BoundedFragmentsProtocol
+    assert issubclass(config.ws_protocol_class, WebSocketsSansIOProtocol)
 
 
 def test_the_sans_io_protocol_has_flow_control_and_keepalive():

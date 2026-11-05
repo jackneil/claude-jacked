@@ -23,6 +23,9 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.0,<9",
+    # No jacked module imports dotenv. The line is a security floor for the
+    # copy that uvicorn[standard] pulls in: it keeps a fresh tool install
+    # from resolving a release older than the CVE-2026-28684 fix (1.2.2).
     "python-dotenv>=1.2.2,<2",
     "rich>=13.0,<16",
     "fastapi>=0.100,<1",
@@ -33,9 +36,10 @@ dependencies = [
     # SERVER_SETTINGS (jacked/api/serving.py) pins the websockets Sans-I/O
     # protocol. Before 0.52.1 that protocol had no write flow control (and
     # before 0.44 no keepalive), so a client that stops reading never blocks
-    # send_text and the dashboard registry cannot evict it. The protocol also
-    # needs websockets 13 or newer, which uvicorn[standard] (>=10.4) does not
-    # promise.
+    # send_text and the dashboard registry cannot evict it. jacked caps the
+    # fragments of one message in jacked/api/ws_protocol.py, which subclasses
+    # that protocol. The websockets line below carries the upper bound and
+    # backs up uvicorn's own websockets>=13 floor.
     "uvicorn[standard]>=0.52.1,<1",
     "websockets>=13.0,<18",
     "httpx>=0.24,<1",

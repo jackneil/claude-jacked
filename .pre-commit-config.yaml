@@ -6,11 +6,11 @@ repos:
       - id: gitleaks
 
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.7
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca  # v1.7.12
     hooks:
       - id: actionlint
 
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.25.2
+    rev: c92afdf2c6ca336aaa8f39e2bd8d48f62dbd8e1f  # v1.31.1 (keep equal to zizmor in .github/requirements/ci-audit.txt)
     hooks:
       - id: zizmor
