@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="jacked:type" content="lockdown">
+  <meta name="jacked:status" content="audit-complete">
+  <meta name="jacked:branch" content="jack_20261105_deps_batch">
+  <meta name="jacked:date" content="2026-11-05">
+  <title>Supply-Chain Lockdown - claude-jacked dependabot batch</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#fafaf7; --card:#fff; --fg:#1b1b1b; --muted:#5d5d5d; --border:#d9d5cc; --ok:#19733b; --warn:#a55b0a; --danger:#b42318; --info:#2463a3; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#151515; --card:#202020; --fg:#ece9e3; --muted:#b4b0aa; --border:#383838; --ok:#69cc8c; --warn:#efad55; --danger:#f47b70; --info:#79afe8; } }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:2rem 1rem; background:var(--bg); color:var(--fg); font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:960px; margin:auto; }
+    h1 { margin:.25rem 0; font-size:2rem; }
+    h2 { margin-top:2.2rem; padding-bottom:.3rem; border-bottom:1px solid var(--border); }
+    h3 { margin-bottom:.4rem; }
+    .meta,.score,.finding,aside { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:1rem; margin:1rem 0; }
+    .meta { display:flex; flex-wrap:wrap; gap:.5rem 1.5rem; color:var(--muted); }
+    .score { display:flex; align-items:center; gap:1.5rem; }
+    .score strong { color:var(--warn); font:700 4rem/1 ui-monospace,monospace; }
+    .badge { display:inline-block; padding:.15rem .55rem; border-radius:999px; font-size:.78rem; font-weight:700; }
+    .ok { color:var(--ok); } .warn { color:var(--warn); } .danger { color:var(--danger); } .info { color:var(--info); } .muted { color:var(--muted); }
+    table { width:100%; border-collapse:collapse; background:var(--card); }
+    caption { text-align:left; font-weight:700; margin-bottom:.5rem; }
+    th,td { text-align:left; vertical-align:top; border:1px solid var(--border); padding:.55rem .7rem; }
+    code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:color-mix(in srgb,var(--card),var(--muted) 12%); padding:.1rem .3rem; border-radius:3px; }
+    ul.tasks { list-style:none; padding:0; } ul.tasks li { margin:.55rem 0; } input { margin-right:.5rem; }
+    @media print { body { background:#fff; color:#000; padding:0; } .finding,table,aside { break-inside:avoid; } }
+  </style>
+  </style>
+</head>
+<body>
+<main>
+  <h1>Supply-Chain Lockdown - dependabot batch (#296pr to #303pr)</h1>
+  <div class="meta">
+    <span>Date: 2026-11-05</span><span>Mode: audit, scoped to 8 pull-request deltas</span>
+    <span>Scope: branch jack_20261105_deps_batch (worktree claude-jacked-deps) against master ca39318</span>
+    <span>Method: 3 read-only audit agents (Opus) plus main-loop re-verification of every merge-blocking claim</span>
+    <span>Not evaluated: packages that the 8 deltas do not touch (see the 2026-10-29 report)</span>
+  </div>
+
+  <h2>Score &amp; Verdict</h2>
+  <div class="score"><strong>96</strong><div><b>Hardened</b> after this branch. Merging the 8 pull requests as dependabot opened them: <b>40</b>, because #298pr and #300pr break the next release build.<br>All 8 deltas: hashes match PyPI, no known advisory (OSV), every release is older than the 7-day cooldown, no install scripts (wheels only).</div></div>
+
+  <table>
+    <caption>Per pull request</caption>
+    <tr><th>PR</th><th>Change</th><th>Age</th><th>Verdict</th><th>Evidence</th></tr>
+    <tr><td>#296pr</td><td>step-security/harden-runner 2.22.2 to 2.22.3 (3 workflows)</td><td>9 d</td><td class="ok">MERGE (10/10)</td><td>SHA 46b06ce is the v2.22.3 tag commit and the head of upstream main (no impostor commit).</td></tr>
+    <tr><td>#297pr</td><td>uv 0.13.5 to 0.13.6 (ci-uv.txt)</td><td>9 d</td><td class="ok">MERGE (10/10)</td><td>Regenerated with a uv header so dependabot can re-run the compile.</td></tr>
+    <tr><td>#298pr</td><td>hatchling 1.32.4 to 1.33.0 (ci-publish.txt)</td><td>8 d</td><td class="danger">REPLACED (2/10 as opened)</td><td>The dependabot file drops the Python 3.11 pins. Proven: pip 3.11 <code>--require-hashes</code> install fails. Taken in a regenerated file instead.</td></tr>
+    <tr><td>#299pr</td><td>websockets 15.0.1 to 17.3 (runtime and dev)</td><td>16 d</td><td class="ok">MERGE (9/10)</td><td>No 16.x or 17.x breaking change touches jacked; uvicorn 0.52+ supports 17; 154/154 artifact hashes match PyPI; the live socket test passes.</td></tr>
+    <tr><td>#300pr</td><td>cyclonedx-bom 7.5.0 to 7.6.0 (ci-publish.txt)</td><td>7 d</td><td class="danger">REPLACED (2/10 as opened)</td><td>Same broken rewrite as #298pr, and the two conflict. Taken in the same regenerated file.</td></tr>
+    <tr><td>#301pr</td><td>python-dotenv 1.2.2 to 1.2.4 (uv.lock)</td><td>35 d</td><td class="ok">MERGE (10/10)</td><td>Patch only. The pin is a CVE-2026-28684 floor for uvicorn's copy; pyproject now says so.</td></tr>
+    <tr><td>#302pr</td><td>click 8.3.3 to 8.5.0 (uv.lock)</td><td>70 d</td><td class="ok">MERGE (10/10)</td><td>Cosmetic help-text changes only; 8.5.0 drops colorama, which no jacked output used.</td></tr>
+    <tr><td>#303pr</td><td>packaging 26.2 to 26.3 (uv.lock)</td><td>92 d</td><td class="ok">MERGE (10/10)</td><td>Patch only.</td></tr>
+  </table>
+
+  <h2>Findings</h2>
+
+  <div class="finding">
+    <h3><span class="badge danger">[lockfile][CRITICAL]</span> SCSC-101: The pip updater rewrote ci-publish.txt for the wrong Python (#298pr, #300pr)</h3>
+    <p>Dependabot's pip ecosystem re-ran pip-compile for its own Python and removed the 3.11-only lines (<code>backports-tarfile</code>, the <code>colorama</code> marker, the <code>cffi</code> and <code>cryptography</code> markers). publish.yml installs that file on Python 3.11 with <code>--require-hashes</code>, so the install fails after the GitHub Release is already cut. Reproduced: <code>pip install --require-hashes --only-binary=:all: -r</code> the #298pr file on 3.11 exits 1.</p>
+    <p><b>Fixed:</b> ci-publish.txt and ci-uv.txt regenerated with <code>uv pip compile --universal --python-version 3.11 --exclude-newer 2026-10-29</code> and a uv header. The <code>/.github/requirements</code> dependabot entry is now the <code>uv</code> ecosystem, whose updater re-runs <code>--universal</code> and <code>--python-version</code> from that header (dependabot-core <code>uv/lib/dependabot/uv/file_updater/compile_file_updater.rb</code>).</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge warn">[actions-hardening][HIGH]</span> SCSC-102: Release-only files were never tested before a release</h3>
+    <p>ci-publish.txt was used only by publish.yml, which runs on <code>release: published</code>. No pull request exercised it, which is why SCSC-101 would have reached a release. The uv updater also does not pass <code>--only-binary</code>, so a later bump can still pick an sdist-only version.</p>
+    <p><b>Fixed:</b> the build job moved to a reusable workflow, <code>build-dist.yml</code>. publish.yml calls it for the release; tests.yml calls it on every pull request as "Release rehearsal". A bad lock now fails on its own pull request.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge warn">[provenance][HIGH]</span> SCSC-103: The wheel was built by an unpinned, unhashed hatchling</h3>
+    <p><code>python -m build</code> builds in an isolated environment and downloads the <code>[build-system]</code> backend from PyPI again, with no pin, no hash and no cooldown. The hash-locked hatchling in ci-publish.txt was installed but never used. The local release gate had the same gap (<code>uv build</code>, <code>uvx twine</code>).</p>
+    <p><b>Fixed:</b> build-dist.yml installs ci-publish.txt into a new venv with no pip and no setuptools, then runs <code>python -m build --no-isolation</code> from it. The release skill gate now builds the same way in a Python 3.11 venv from ci-publish.txt, through <code>uv run -p &lt;venv&gt;</code> so the commands also work on Windows (<code>--no-config</code>, so the project <code>exclude-newer</code> does not change a pip-equivalent install). A test pins the gate to the workflow. Rehearsed locally: wheel and sdist built by hatchling 1.33.0, twine check passed, SBOM written.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge warn">[runtime][MEDIUM]</span> SCSC-104: The dashboard socket kept an unlimited number of empty fragments (pre-existing)</h3>
+    <p>uvicorn 0.54 <code>websockets_sansio_impl.py:272</code> appends every continuation frame to a list with no count. <code>ws_max_size</code> counts bytes, and an empty frame has none. The audit agent's probe kept 6,000,000 empty frames (about 49 MB) on one connection. The <code>/api/ws</code> Origin check does not stop a non-browser client. The bug is present on websockets 15.0.1 too, so #299pr neither caused nor fixed it.</p>
+    <p><b>Fixed:</b> <code>jacked/api/ws_protocol.py</code> subclasses the uvicorn protocol and closes with 1009 when a message passes 4096 fragments, the same limit as websockets 17.4. <code>SERVER_SETTINGS["ws"]</code> names the subclass. Each refusal logs one values-free WARNING line. The /dcr Security review found that frames read before the 101 response reach the limit in the CONNECTING state, where websockets sends no close frame and uvicorn's handler asserts; the subclass now closes the transport itself there. <code>ws_max_size</code> drops from uvicorn's 16 MiB to 64 KiB, because the dashboard client never sends a message. If a uvicorn release renames a member that the subclass uses, the service logs a warning and a test fails. Live tests: 4096 frames arrive whole; frame 4097 and an empty-fragment stream are refused. With the stock protocol, the refusal tests fail.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge info">[actions-hardening][LOW]</span> SCSC-105: Workflow-level <code>permissions: read-all</code> (pre-existing)</h3>
+    <p>Every job sets its own permissions, so the default was inert, but a new job would inherit read-all. <b>Fixed:</b> <code>permissions: {}</code> in codeql.yml, publish.yml, tests.yml and build-dist.yml.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge info">[hygiene][LOW]</span> SCSC-106: Stale dependency documentation (pre-existing)</h3>
+    <p>docs/DESIGN.md described the Qdrant session search that 3fd0c84 removed, including a dependency list with qdrant-client. The pyproject comment on websockets said uvicorn does not promise websockets 13. <b>Fixed:</b> DESIGN.md deleted (git keeps it), comments corrected, python-dotenv's reason recorded.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge info">[precommit][LOW]</span> SCSC-108: pre-commit hooks pinned by tag, and zizmor behind CI (pre-existing)</h3>
+    <p>actionlint (v1.7.7) and zizmor (v1.25.2) were pinned by a movable tag, and the pre-commit zizmor was six releases behind the CI zizmor (1.31.1). The newer zizmor flags <code>uses: ./</code> workflow calls (self-repository audit), so the two gates disagreed. <b>Fixed:</b> both hooks pinned to full SHAs (actionlint v1.7.12, zizmor v1.31.1). The build-dist calls use GitHub's <code>$/</code> self-repository syntax, which zizmor requires. actionlint does not know <code>$/</code> yet (rhysd/actionlint issue 711), so <code>.github/actionlint.yaml</code> ignores only that message. <code>pre-commit run --all-files</code>: gitleaks, actionlint and zizmor pass.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge muted">[currency][INFO]</span> SCSC-107: websockets 17.4 waits for the cooldown</h3>
+    <p>17.4 caps fragments in websockets' own assemblers. jacked's server path does not use them (SCSC-104 covers that path), and only the tests use the client. The <code>exclude-newer</code> cutoff and the 7-day cooldown hold 17.4 until dependabot's next cycle. No action.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge muted">[lockfile][LOW]</span> SCSC-109: The cooldown does not cover new transitive CI pins (pre-existing, filed)</h3>
+    <p>Dependabot's uv updater does not pass <code>--exclude-newer</code>, so a bump can pull in a transitive pin that is hours old. The same gap existed under the pip updater. Filed as #312i with the evidence and a pin-age check design.</p>
+  </div>
+
+  <h2>Remediation Plan</h2>
+  <ul class="tasks">
+    <li><input type="checkbox" checked disabled> Merge #296pr, #297pr, #299pr, #301pr, #302pr, #303pr into one batch branch; <code>uv lock --check</code> clean</li>
+    <li><input type="checkbox" checked disabled> SCSC-101: regenerate ci-publish.txt and ci-uv.txt with headers; dependabot uv ecosystem</li>
+    <li><input type="checkbox" checked disabled> SCSC-102: build-dist.yml shared by publish.yml and the pull-request rehearsal</li>
+    <li><input type="checkbox" checked disabled> SCSC-103: <code>--no-isolation</code> build in CI and in the release gate</li>
+    <li><input type="checkbox" checked disabled> SCSC-104: fragment limit on the dashboard socket</li>
+    <li><input type="checkbox" checked disabled> SCSC-105, SCSC-106, SCSC-108</li>
+    <li><input type="checkbox" disabled> Close #298pr and #300pr as replaced; the other six close when master carries their versions</li>
+    <li><input type="checkbox" disabled> SCSC-109: pin-age check (#312i)</li>
+    <li><input type="checkbox" disabled> Settings: require the Tests checks, the Release rehearsal included, on master. A red rehearsal does not block a merge today (no branch protection, no ruleset).</li>
+  </ul>
+</main>
+</body>
+</html>

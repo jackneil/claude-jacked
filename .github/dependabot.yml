@@ -18,7 +18,14 @@ updates:
       include: "scope"
 
   # Hash-locked CI tooling (uv, build, hatchling, twine, cyclonedx-bom).
-  - package-ecosystem: "pip"
+  # "uv", not "pip": each .txt here is `uv pip compile --universal` output,
+  # and the uv updater re-runs that compile with the --universal and
+  # --python-version flags from the file header. The pip updater re-ran
+  # pip-compile for the runner's Python and dropped the 3.11-only pins
+  # (#298pr: backports-tarfile), which breaks the release build. The
+  # "Release rehearsal" job in tests.yml installs ci-publish.txt the way
+  # publish.yml does, so a bad bump fails on its own pull request.
+  - package-ecosystem: "uv"
     directory: "/.github/requirements"
     schedule:
       interval: "weekly"

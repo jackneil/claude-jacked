@@ -1,0 +1,8 @@
+# actionlint does not know GitHub's self-repository `uses: $/...` syntax yet
+# (rhysd/actionlint issue 711). zizmor's self-repository audit, which CI
+# enforces, requires that syntax for the build-dist.yml calls. Ignore only
+# that one actionlint message; remove this file when actionlint supports $/.
+paths:
+  .github/workflows/**/*.yml:
+    ignore:
+      - 'reusable workflow call "\$/\.github/workflows/[^"]+" at "uses" is not following the format'

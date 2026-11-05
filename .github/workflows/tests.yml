@@ -4,7 +4,7 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions: read-all
+permissions: {}
 
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}
@@ -25,7 +25,7 @@ jobs:
       contents: read
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: audit
           disable-sudo: true
@@ -57,6 +57,14 @@ jobs:
       - name: Run tests
         run: uv run --frozen python -m pytest
 
+  release-rehearsal:
+    # Runs the release build job (build-dist.yml) without publishing, so a
+    # broken ci-publish.txt fails here instead of after a release is cut.
+    name: Release rehearsal (build + twine check + SBOM)
+    uses: $/.github/workflows/build-dist.yml
+    permissions:
+      contents: read
+
   supply-chain:
     # Blocks a merge on a known advisory in any locked package (OSV) and on a
     # workflow finding (zizmor). One Linux runner, a few minutes.
@@ -66,7 +74,7 @@ jobs:
       contents: read
     steps:
       - name: Harden Runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: audit
           disable-sudo: true
