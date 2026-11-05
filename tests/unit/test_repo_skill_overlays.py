@@ -79,6 +79,8 @@ def _pin_age_step(workflow_text: str) -> dict:
         assert "if" not in holder, f"pin-age {where} carries an if: condition"
         assert not holder.get("continue-on-error"), f"pin-age {where} is continue-on-error"
     assert "timeout-minutes" in steps[0], "pin-age step has no timeout-minutes"
+    assert "needs" not in job, "supply-chain job needs another job, which a skip upstream would skip too"
+    assert "shell" not in steps[0], "pin-age step overrides shell:, which can run nothing"
     others = [name for name, other in jobs.items() if name != "supply-chain" and "check_pin_age" in str(other)]
     assert not others, f"pin-age also runs in {others}; keep one source of truth"
     return steps[0]
@@ -96,6 +98,8 @@ def test_pin_age_step_detector_refuses_a_disabled_step():
         "continue-on-error": live.replace(run_line, f"continue-on-error: true\n        {run_line}"),
         "if false": live.replace(run_line, f"if: false\n        {run_line}"),
         "no timeout": live.replace("timeout-minutes: 5\n        " + run_line, run_line),
+        "custom shell": live.replace(run_line, f'shell: "true {{0}}"\n        {run_line}'),
+        "needs a job": live.replace("  supply-chain:\n", "  supply-chain:\n    needs: [tests]\n", 1),
     }
     for label, text in disabled.items():
         assert text != live, label
@@ -119,7 +123,12 @@ def test_pin_age_gate_covers_every_lock_at_its_dependabot_cooldown():
     uv_entries = {e["directory"]: e for e in config["updates"] if e["package-ecosystem"] == "uv"}
     assert set(uv_entries) == {"/", "/.github/requirements"}
     for directory, entry in uv_entries.items():
-        assert entry["cooldown"]["default-days"] == min_days, directory
+        cooldown = entry["cooldown"]
+        assert cooldown["default-days"] == min_days, directory
+        # A shorter semver cooldown would open PRs this gate must reject.
+        for key, days in cooldown.items():
+            if key.endswith("-days"):
+                assert days >= min_days, (directory, key, days)
     # pyproject's exclude-newer comment states the same 7-day floor.
     assert "≥ 7 days ago is the minimum standard" in (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert min_days == 7

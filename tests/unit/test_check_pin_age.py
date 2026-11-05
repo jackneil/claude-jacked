@@ -136,11 +136,32 @@ def test_requirements_parse_reads_crlf_files(tmp_path):
         f"twine==6.2.0 --hash=sha256:{H1} --hash sha256:{H2}",
         f"twine==6.2.0 --hash=sha256:{H1} --foo",
         f"twine==6.2.0 junk --hash=sha256:{H1}",
+        # pip ends the requirement at the first token that starts with "-",
+        # shlex-splits the rest and expands ${VAR}; each of these hides a hash
+        # from a looser parser while pip still honors it (/dcr wave 2).
+        f"twine==6.2.0 ; os_name == 'nt' - '--hash=sha512:{'d' * 128}' --hash=sha256:{H1}",
+        f"twine==6.2.0 ; os_name == 'nt' -i x '--hash=sha512:{'d' * 128}' --hash=sha256:{H1}",
+        f"twine==6.2.0 ; os_name == 'nt' -c unused.txt\t--hash=sha256:{H2} --hash=sha256:{H1}",
+        f"twine==6.2.0 ; os_name == 'nt' ${{X}} --hash=sha256:{H1}",
+        f"twine==6.2.0\t--hash=sha256:{H1}",
+        f"twine==6.2.0 --hash=sha256:{H1} #note",
+        f"twine==6.2.0 ; os_name == 'n-t' --hash=sha256:{H1}",
     ],
 )
 def test_requirements_parse_refuses_a_line_whose_age_cannot_be_proven(tmp_path, line):
     with pytest.raises(pin_age.CheckError, match="not a name==version pin"):
         pin_age.pins_from_requirements(_requirements(tmp_path, line + "\n"))
+
+
+def test_parse_pin_line_is_linear_on_a_crafted_marker():
+    """Possessive quantifiers: a long marker that fails to match returns at
+    once instead of backtracking exponentially."""
+    import time
+
+    started = time.monotonic()
+    assert pin_age.parse_pin_line("a==1 ;" + " a" * 200_000 + " -") is None
+    assert pin_age.parse_pin_line("a==1 ; " + "a" * 200_000 + " -") is None
+    assert time.monotonic() - started < 5
 
 
 def test_requirements_parse_refuses_an_empty_lock(tmp_path):

@@ -10,8 +10,9 @@ updates:
     schedule:
       interval: "weekly"
     cooldown:
+      # No shorter patch cooldown: the pin-age step in tests.yml fails any
+      # lock file under 7 days old (SECURITY.md, pyproject exclude-newer).
       default-days: 7
-      semver-patch-days: 3
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"

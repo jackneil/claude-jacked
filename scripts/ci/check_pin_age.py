@@ -61,10 +61,23 @@ MAX_WORKERS = 16
 ATTEMPTS = 4
 TIMEOUT_SECONDS = 20
 
-_PIN = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)==(?P<version>[^\s;\\]+)(?P<rest>.*)$")
-# uv writes lowercase sha256 only. pip lowercases any digest and also honors
-# sha384/sha512 and "--hash <value>", so every other spelling is refused
-# rather than ignored: an ignored hash is a file pip installs unproven.
+# The whole logical line must be what uv writes, nothing else:
+#   name==version[ ; marker] --hash=sha256:<hex>[ --hash=sha256:<hex>...]
+# pip ends the requirement at the first space-separated token that starts
+# with "-", runs shlex on the rest, expands ${VAR}, strips "#" comments, and
+# accepts any --hash spelling (any case, sha384/sha512, "--hash <v>"). A
+# marker here may hold only identifiers, operators, parentheses and quoted
+# strings without "-", "$", "#", quotes or whitespace, so no token before the
+# hashes can start with "-" and pip sees exactly the hashes this check sees.
+# Spaces only: a tab is a separator to pip and is refused here. The
+# quantifiers are possessive (Python 3.11+), so a crafted marker cannot make
+# the match backtrack exponentially.
+_MARKER_TOKEN = r"""(?:[A-Za-z_][A-Za-z0-9_.]*+|===|==|!=|<=|>=|~=|<|>|\(|\)|'[A-Za-z0-9._+*]*'|"[A-Za-z0-9._+*]*")"""
+_LINE = re.compile(
+    r"(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)==(?P<version>[A-Za-z0-9._+!]+)"
+    rf"(?P<marker> +;(?: *{_MARKER_TOKEN})++)?"
+    r"(?P<hashes>(?: +--hash=sha256:[0-9a-f]{64})+) *"
+)
 _HASH_TOKEN = re.compile(r"--hash=sha256:(?P<digest>[0-9a-f]{64})")
 _SHA256 = re.compile(r"sha256:(?P<digest>[0-9a-f]{64})")
 
@@ -154,19 +167,14 @@ def parse_pin_line(line: str) -> tuple[str, str, frozenset[str]] | None:
     True
     >>> parse_pin_line("twine==6.2.0 --hash=sha256:" + "a" * 64 + " --hash=sha512:" + "b" * 128) is None
     True
+    >>> parse_pin_line("twine==6.2.0 ; os_name == 'nt' - '--hash=sha512:" + "b" * 128 + "' --hash=sha256:" + "a" * 64) is None
+    True
     """
-    match = _PIN.match(line)
+    match = _LINE.fullmatch(line)
     if not match:
         return None
-    rest = match["rest"]
-    split = rest.find(" --")
-    marker, options = (rest, "") if split < 0 else (rest[:split], rest[split:])
-    marker = marker.strip()
-    if marker and not marker.startswith(";"):
-        return None
-    tokens = options.split()
-    if not tokens or any(not _HASH_TOKEN.fullmatch(token) for token in tokens):
-        return None
+    tokens = match["hashes"].split(" ")
+    tokens = [token for token in tokens if token]
     hashes = frozenset(_HASH_TOKEN.fullmatch(token)["digest"] for token in tokens)
     return normalize(match["name"]), match["version"], hashes
 
