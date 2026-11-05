@@ -31,9 +31,9 @@ description: "Cut a release the way this repo actually ships: detects PyPI/npm/c
   uv run --isolated --no-project --with-requirements .github/requirements/ci-audit.txt zizmor --no-progress --strict-collection .github/workflows
   uv venv -q -p 3.11 "$GATE_TMP/pub"
   uv pip install -q --no-config -p "$GATE_TMP/pub" --require-hashes --only-binary=:all: -r .github/requirements/ci-publish.txt
-  "$GATE_TMP/pub/bin/python" -m build --no-isolation --outdir "$GATE_TMP/dist"
-  "$GATE_TMP/pub/bin/twine" check "$GATE_TMP"/dist/*
-  "$GATE_TMP/pub/bin/cyclonedx-py" environment -o "$GATE_TMP/sbom.cdx.json"
+  uv run --no-project --no-config -p "$GATE_TMP/pub" python -m build --no-isolation --outdir "$GATE_TMP/dist"
+  uv run --no-project --no-config -p "$GATE_TMP/pub" twine check "$GATE_TMP"/dist/*
+  uv run --no-project --no-config -p "$GATE_TMP/pub" cyclonedx-py environment -o "$GATE_TMP/sbom.cdx.json"
   ```
 - **Publish Mechanism**: GitHub Release published on `master` -> `.github/workflows/publish.yml` (build job = `.github/workflows/build-dist.yml`: hash-locked `python -m build --no-isolation`, `twine check dist/*`, CycloneDX SBOM; publish job in the `pypi` environment) -> PyPI Trusted Publisher (OIDC, `pypa/gh-action-pypi-publish`) -> https://pypi.org/p/claude-jacked. Cutting the GitHub Release (e.g. `gh release create vX.Y.Z`) IS the publish trigger: treat it as the irreversible step.
 - **Verify**: poll `https://pypi.org/pypi/claude-jacked/json` until the new version appears; confirm the publish.yml run succeeded (`gh run list --workflow=publish.yml`); optionally `uv tool install --upgrade claude-jacked` and check `jacked --version`. Before tagging, confirm README's "Version History" table carries the new version's row, and that the merged PR's Tests run shows a real "N passed" line on each OS leg (a green check alone has hidden a pytest that died early with exit 0).

@@ -75,13 +75,13 @@
   <div class="finding">
     <h3><span class="badge warn">[provenance][HIGH]</span> SCSC-103: The wheel was built by an unpinned, unhashed hatchling</h3>
     <p><code>python -m build</code> builds in an isolated environment and downloads the <code>[build-system]</code> backend from PyPI again, with no pin, no hash and no cooldown. The hash-locked hatchling in ci-publish.txt was installed but never used. The local release gate had the same gap (<code>uv build</code>, <code>uvx twine</code>).</p>
-    <p><b>Fixed:</b> <code>python -m build --no-isolation</code> in build-dist.yml. The release skill gate now builds the same way in a Python 3.11 venv from ci-publish.txt (<code>--no-config</code>, so the project <code>exclude-newer</code> does not change a pip-equivalent install). A test pins the gate to the workflow. Rehearsed locally: wheel and sdist built by hatchling 1.33.0, twine check passed, SBOM written.</p>
+    <p><b>Fixed:</b> build-dist.yml installs ci-publish.txt into a new venv with no pip and no setuptools, then runs <code>python -m build --no-isolation</code> from it. The release skill gate now builds the same way in a Python 3.11 venv from ci-publish.txt, through <code>uv run -p &lt;venv&gt;</code> so the commands also work on Windows (<code>--no-config</code>, so the project <code>exclude-newer</code> does not change a pip-equivalent install). A test pins the gate to the workflow. Rehearsed locally: wheel and sdist built by hatchling 1.33.0, twine check passed, SBOM written.</p>
   </div>
 
   <div class="finding">
     <h3><span class="badge warn">[runtime][MEDIUM]</span> SCSC-104: The dashboard socket kept an unlimited number of empty fragments (pre-existing)</h3>
     <p>uvicorn 0.54 <code>websockets_sansio_impl.py:272</code> appends every continuation frame to a list with no count. <code>ws_max_size</code> counts bytes, and an empty frame has none. The audit agent's probe kept 6,000,000 empty frames (about 49 MB) on one connection. The <code>/api/ws</code> Origin check does not stop a non-browser client. The bug is present on websockets 15.0.1 too, so #299pr neither caused nor fixed it.</p>
-    <p><b>Fixed:</b> <code>jacked/api/ws_protocol.py</code> subclasses the uvicorn protocol and closes with 1009 when a message passes 4096 fragments, the same limit as websockets 17.4. <code>SERVER_SETTINGS["ws"]</code> names the subclass. Live tests: 4096 frames arrive whole, frame 4097 and an empty-fragment stream get 1009. With the stock protocol, the two refusal tests fail.</p>
+    <p><b>Fixed:</b> <code>jacked/api/ws_protocol.py</code> subclasses the uvicorn protocol and closes with 1009 when a message passes 4096 fragments, the same limit as websockets 17.4. <code>SERVER_SETTINGS["ws"]</code> names the subclass. Each refusal logs one values-free WARNING line. The /dcr Security review found that frames read before the 101 response reach the limit in the CONNECTING state, where websockets sends no close frame and uvicorn's handler asserts; the subclass now closes the transport itself there. <code>ws_max_size</code> drops from uvicorn's 16 MiB to 64 KiB, because the dashboard client never sends a message. If a uvicorn release renames a member that the subclass uses, the service logs a warning and a test fails. Live tests: 4096 frames arrive whole; frame 4097 and an empty-fragment stream are refused. With the stock protocol, the refusal tests fail.</p>
   </div>
 
   <div class="finding">
@@ -104,6 +104,11 @@
     <p>17.4 caps fragments in websockets' own assemblers. jacked's server path does not use them (SCSC-104 covers that path), and only the tests use the client. The <code>exclude-newer</code> cutoff and the 7-day cooldown hold 17.4 until dependabot's next cycle. No action.</p>
   </div>
 
+  <div class="finding">
+    <h3><span class="badge muted">[lockfile][LOW]</span> SCSC-109: The cooldown does not cover new transitive CI pins (pre-existing, filed)</h3>
+    <p>Dependabot's uv updater does not pass <code>--exclude-newer</code>, so a bump can pull in a transitive pin that is hours old. The same gap existed under the pip updater. Filed as #312i with the evidence and a pin-age check design.</p>
+  </div>
+
   <h2>Remediation Plan</h2>
   <ul class="tasks">
     <li><input type="checkbox" checked disabled> Merge #296pr, #297pr, #299pr, #301pr, #302pr, #303pr into one batch branch; <code>uv lock --check</code> clean</li>
@@ -113,6 +118,8 @@
     <li><input type="checkbox" checked disabled> SCSC-104: fragment limit on the dashboard socket</li>
     <li><input type="checkbox" checked disabled> SCSC-105, SCSC-106, SCSC-108</li>
     <li><input type="checkbox" disabled> Close #298pr and #300pr as replaced; the other six close when master carries their versions</li>
+    <li><input type="checkbox" disabled> SCSC-109: pin-age check (#312i)</li>
+    <li><input type="checkbox" disabled> Settings: require the Tests checks, the Release rehearsal included, on master. A red rehearsal does not block a merge today (no branch protection, no ruleset).</li>
   </ul>
 </main>
 </body>

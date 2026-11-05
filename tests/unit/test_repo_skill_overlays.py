@@ -87,6 +87,12 @@ def test_release_gate_builds_like_the_release_job():
         assert re.search(pattern, gate), pattern
     assert "uv build" not in gate
     assert "uvx twine" not in gate
+    # The lock is compiled for one Python; the gate must build on the same one.
+    workflow_python = re.search(r'python-version: "([0-9.]+)"', workflow).group(1)
+    assert f'uv venv -q -p {workflow_python} "$GATE_TMP/pub"' in gate
+    assert f"--python-version {workflow_python}" in (
+        REPO_ROOT / ".github" / "requirements" / "ci-publish.txt"
+    ).read_text(encoding="utf-8")
 
 
 def test_dcr_wild_card_scopes_data_framing_to_the_context_data_steps():

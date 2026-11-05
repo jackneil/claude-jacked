@@ -28,5 +28,9 @@ SERVER_SETTINGS = MappingProxyType(
         # jacked's subclass adds a limit on the fragments of one message
         # (jacked/api/ws_protocol.py). uvicorn imports it when a server starts.
         "ws": "jacked.api.ws_protocol:BoundedFragmentsProtocol",
+        # The dashboard client only reads from /api/ws; it never sends a
+        # message. 64 KiB stops one client from holding uvicorn's default
+        # 16 MiB per connection.
+        "ws_max_size": 64 * 1024,
     }
 )
