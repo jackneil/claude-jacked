@@ -53,8 +53,54 @@ def test_release_gate_runs_every_command_of_the_ci_workflow():
     assert audit.replace("$RUNNER_TEMP", "$GATE_TMP") in gate
     zizmor = re.search(r"run: (zizmor .*)", workflow).group(1)
     assert zizmor in gate
-    pin_age = re.search(r"run: python (scripts/ci/check_pin_age\.py .*)", workflow).group(1)
-    assert f"uv run --frozen python {pin_age}" in gate
+    pin_age = _pin_age_step(workflow)["run"]
+    assert pin_age.startswith("python scripts/ci/check_pin_age.py ")
+    assert f"uv run --frozen {pin_age}" in gate
+
+
+PIN_AGE_RUN = "python scripts/ci/check_pin_age.py --min-days 7 uv.lock .github/requirements/*.txt"
+
+
+def _pin_age_step(workflow_text: str) -> dict:
+    """The one live, blocking pin-age step of the supply-chain job. Parsed
+    from YAML, so a commented-out step, a skipped job or a non-blocking step
+    does not count as present."""
+    import yaml
+
+    jobs = yaml.safe_load(workflow_text)["jobs"]
+    job = jobs["supply-chain"]
+    steps = [
+        step
+        for step in job["steps"]
+        if str(step.get("run", "")).strip().startswith("python scripts/ci/check_pin_age.py")
+    ]
+    assert len(steps) == 1, f"expected one pin-age step in jobs.supply-chain, found {len(steps)}"
+    for where, holder in (("job", job), ("step", steps[0])):
+        assert "if" not in holder, f"pin-age {where} carries an if: condition"
+        assert not holder.get("continue-on-error"), f"pin-age {where} is continue-on-error"
+    assert "timeout-minutes" in steps[0], "pin-age step has no timeout-minutes"
+    others = [name for name, other in jobs.items() if name != "supply-chain" and "check_pin_age" in str(other)]
+    assert not others, f"pin-age also runs in {others}; keep one source of truth"
+    return steps[0]
+
+
+def test_pin_age_step_detector_refuses_a_disabled_step():
+    """The detector itself must fail on the ways a step gets switched off."""
+    import pytest
+
+    live = TESTS_YML.read_text(encoding="utf-8")
+    run_line = f"run: {PIN_AGE_RUN}"
+    assert run_line in live
+    disabled = {
+        "commented out": live.replace(run_line, f"# {run_line}\n        run: echo skipped"),
+        "continue-on-error": live.replace(run_line, f"continue-on-error: true\n        {run_line}"),
+        "if false": live.replace(run_line, f"if: false\n        {run_line}"),
+        "no timeout": live.replace("timeout-minutes: 5\n        " + run_line, run_line),
+    }
+    for label, text in disabled.items():
+        assert text != live, label
+        with pytest.raises(AssertionError):
+            _pin_age_step(text)
 
 
 def test_pin_age_gate_covers_every_lock_at_its_dependabot_cooldown():
@@ -63,8 +109,8 @@ def test_pin_age_gate_covers_every_lock_at_its_dependabot_cooldown():
     at the default-days of the Dependabot entry that writes it."""
     import yaml
 
-    workflow = TESTS_YML.read_text(encoding="utf-8")
-    command = re.search(r"run: python scripts/ci/check_pin_age\.py (.*)", workflow).group(1).split()
+    command = _pin_age_step(TESTS_YML.read_text(encoding="utf-8"))["run"].split()
+    assert " ".join(command) == PIN_AGE_RUN
     min_days = float(command[command.index("--min-days") + 1])
     paths = command[command.index("--min-days") + 2 :]
     assert paths == ["uv.lock", ".github/requirements/*.txt"]

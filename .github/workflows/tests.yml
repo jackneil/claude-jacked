@@ -90,10 +90,12 @@ jobs:
 
       - name: Prove every locked file is past the cooldown
         # Dependabot's cooldown covers the package it bumps, not the new
-        # transitive pins that bump pulls in (#312i). This fails when any
-        # file in uv.lock or a hash-locked CI file was uploaded less than 7
-        # days ago (the default-days of each Dependabot entry and the
-        # exclude-newer rule in pyproject.toml). Standard library only.
+        # transitive pins that bump pulls in (#312i). This fails when PyPI
+        # says any file in uv.lock or a hash-locked CI file was uploaded less
+        # than 7 days ago (the default-days of each Dependabot entry and the
+        # exclude-newer rule in pyproject.toml) or is yanked. Standard
+        # library only; ~160 PyPI requests, 16 at a time, a few seconds.
+        timeout-minutes: 5
         run: python scripts/ci/check_pin_age.py --min-days 7 uv.lock .github/requirements/*.txt
 
       - name: Install uv, pip-audit and zizmor

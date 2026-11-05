@@ -1,13 +1,15 @@
 """scripts/ci/check_pin_age.py: every locked file must be past the cooldown.
 
-The script talks to PyPI only through the ``fetch`` seam, which these tests
-replace, so no test reaches the network.
+The script talks to PyPI only through ``urllib.request.urlopen`` or the
+``fetch`` seam. An autouse fixture makes ``urlopen`` fail, so no test can
+reach the network by accident.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import doctest
+import http.client
 import importlib.util
 import io
 import sys
@@ -22,7 +24,7 @@ SCRIPT = REPO_ROOT / "scripts" / "ci" / "check_pin_age.py"
 
 _spec = importlib.util.spec_from_file_location("check_pin_age", SCRIPT)
 pin_age = importlib.util.module_from_spec(_spec)
-sys.modules["check_pin_age"] = pin_age
+sys.modules["check_pin_age"] = pin_age  # dataclasses resolves annotations through sys.modules
 _spec.loader.exec_module(pin_age)
 
 UTC = dt.timezone.utc
@@ -32,18 +34,45 @@ YOUNG = "2026-11-03T12:00:00.000000Z"
 H1, H2, H3 = "a" * 64, "b" * 64, "c" * 64
 
 
-def _release(*files):
-    """A PyPI JSON body: files are (filename, sha256, upload time, yanked)."""
-    return {
-        "urls": [
-            {"filename": name, "digests": {"sha256": digest}, "upload_time_iso_8601": when, "yanked": yanked}
-            for name, digest, when, yanked in files
-        ]
-    }
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("test reached urllib.request.urlopen")
+
+    monkeypatch.setattr(pin_age.urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(pin_age.time, "sleep", lambda seconds: None)
 
 
-def _requirements(tmp_path, body):
-    path = tmp_path / "ci-x.txt"
+def _entry(name, digest, when=OLD, yanked=False):
+    return {"filename": name, "digests": {"sha256": digest}, "upload_time_iso_8601": when, "yanked": yanked}
+
+
+def _release(*entries):
+    return {"urls": list(entries)}
+
+
+def _fetch_from(table):
+    calls = []
+
+    def fetch(name, version):
+        calls.append((name, version))
+        answer = table[(name, version)]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    fetch.calls = calls
+    return fetch
+
+
+def _run(paths, fetch, min_days=7):
+    out = io.StringIO()
+    rc = pin_age.check(paths, min_days, NOW, fetch=fetch, out=out)
+    return rc, out.getvalue()
+
+
+def _requirements(tmp_path, body, name="ci-x.txt"):
+    path = tmp_path / name
     path.write_text(textwrap.dedent(body), encoding="utf-8")
     return path
 
@@ -61,37 +90,34 @@ backports-tarfile==1.2.0 ; python_full_version < '3.12' \\
     #   jaraco-context
 """
 
-
-def _fetch_from(table):
-    calls = []
-
-    def fetch(name, version):
-        calls.append((name, version))
-        return table[(name, version)]
-
-    fetch.calls = calls
-    return fetch
-
-
-def _run(paths, fetch, min_days=7):
-    out = io.StringIO()
-    rc = pin_age.check(paths, min_days, NOW, fetch=fetch, out=out)
-    return rc, out.getvalue()
+OLD_RELEASES = {
+    ("twine", "6.2.0"): _release(_entry("t.whl", H1), _entry("t.tar.gz", H2)),
+    ("backports-tarfile", "1.2.0"): _release(_entry("b.whl", H3)),
+}
 
 
 def test_doctests_pass():
     result = doctest.testmod(pin_age)
-    assert result.attempted >= 5
+    assert result.attempted >= 8
     assert result.failed == 0
 
 
+# --- requirements (.txt) parsing -------------------------------------------
+
+
 def test_requirements_parse_reads_markers_hashes_and_skips_via_comments(tmp_path):
-    pins = pin_age.parse_requirements(_requirements(tmp_path, LOCK_TXT))
+    pins = pin_age.pins_from_requirements(_requirements(tmp_path, LOCK_TXT))
     assert [(p.name, p.version, p.hashes) for p in pins] == [
         ("twine", "6.2.0", frozenset({H1, H2})),
         ("backports-tarfile", "1.2.0", frozenset({H3})),
     ]
-    assert pins[0].source.endswith("ci-x.txt:3")
+    assert pins[0].source.endswith(":3")
+
+
+def test_requirements_parse_reads_crlf_files(tmp_path):
+    path = tmp_path / "ci-crlf.txt"
+    path.write_bytes(LOCK_TXT.replace("\n", "\r\n").encode())
+    assert len(pin_age.pins_from_requirements(path)) == 2
 
 
 @pytest.mark.parametrize(
@@ -102,16 +128,24 @@ def test_requirements_parse_reads_markers_hashes_and_skips_via_comments(tmp_path
         "-e .",
         "https://example.com/twine-6.2.0.tar.gz --hash=sha256:" + H1,
         "--index-url https://example.com/simple",
+        "twine[keyring]==6.2.0 --hash=sha256:" + H1,
+        # Hash spellings pip honors but uv never writes: an ignored one would
+        # be a file pip installs without proof.
+        f"twine==6.2.0 --hash=sha256:{H1} --hash=sha256:{H2.upper()}",
+        f"twine==6.2.0 --hash=sha256:{H1} --hash=sha512:{'d' * 128}",
+        f"twine==6.2.0 --hash=sha256:{H1} --hash sha256:{H2}",
+        f"twine==6.2.0 --hash=sha256:{H1} --foo",
+        f"twine==6.2.0 junk --hash=sha256:{H1}",
     ],
 )
 def test_requirements_parse_refuses_a_line_whose_age_cannot_be_proven(tmp_path, line):
-    with pytest.raises(pin_age.CheckError, match="not a hashed name==version pin"):
-        pin_age.parse_requirements(_requirements(tmp_path, line + "\n"))
+    with pytest.raises(pin_age.CheckError, match="not a name==version pin"):
+        pin_age.pins_from_requirements(_requirements(tmp_path, line + "\n"))
 
 
 def test_requirements_parse_refuses_an_empty_lock(tmp_path):
     with pytest.raises(pin_age.CheckError, match="no pins"):
-        pin_age.parse_requirements(_requirements(tmp_path, "# only a header\n"))
+        pin_age.pins_from_requirements(_requirements(tmp_path, "# only a header\n"))
 
 
 def test_every_repo_requirements_lock_parses():
@@ -119,83 +153,96 @@ def test_every_repo_requirements_lock_parses():
     locks = sorted((REPO_ROOT / ".github" / "requirements").glob("*.txt"))
     assert locks
     for lock in locks:
-        assert pin_age.parse_requirements(lock)
+        assert pin_age.pins_from_requirements(lock)
+
+
+# --- requirements (.txt) verdicts ------------------------------------------
 
 
 def test_old_requirements_pass_and_each_release_is_fetched_once(tmp_path):
-    path = _requirements(tmp_path, LOCK_TXT + LOCK_TXT.split("\n", 2)[2])  # twine pinned twice
-    fetch = _fetch_from(
-        {
-            ("twine", "6.2.0"): _release(("t.whl", H1, OLD, False), ("t.tar.gz", H2, OLD, False)),
-            ("backports-tarfile", "1.2.0"): _release(("b.whl", H3, OLD, False)),
-        }
-    )
+    path = _requirements(tmp_path, LOCK_TXT + LOCK_TXT.split("\n", 2)[2])  # every pin twice
+    fetch = _fetch_from(OLD_RELEASES)
     rc, out = _run([path], fetch)
     assert rc == 0, out
     assert sorted(fetch.calls) == [("backports-tarfile", "1.2.0"), ("twine", "6.2.0")]
-    assert "pin age: PASS, minimum 7 days" in out
+    assert "pin age: PASS, 0 problems, 0 errors; minimum 7 days" in out
 
 
 def test_a_young_transitive_pin_fails_with_the_date_it_passes(tmp_path):
-    fetch = _fetch_from(
-        {
-            ("twine", "6.2.0"): _release(("t.whl", H1, OLD, False), ("t.tar.gz", H2, OLD, False)),
-            ("backports-tarfile", "1.2.0"): _release(("b.whl", H3, YOUNG, False)),
-        }
-    )
+    fetch = _fetch_from({**OLD_RELEASES, ("backports-tarfile", "1.2.0"): _release(_entry("b.whl", H3, YOUNG))})
     rc, out = _run([_requirements(tmp_path, LOCK_TXT)], fetch)
     assert rc == 1
-    assert "FAIL" in out and "backports-tarfile==1.2.0 has 1 of 1 files younger than 7 days" in out
+    assert "backports-tarfile==1.2.0 has 1 of 1 files younger than 7 days" in out
     assert "2.0 days old (passes after 2026-11-10T12:00Z)" in out
     assert "twine==6.2.0 has" not in out
+    assert "pin age: FAIL, 1 problems, 0 errors" in out
 
 
 def test_a_young_file_added_to_an_old_release_fails(tmp_path):
     """A new wheel uploaded to an old version is as fresh as a new version."""
-    fetch = _fetch_from(
-        {
-            ("twine", "6.2.0"): _release(("t.whl", H1, OLD, False), ("t-new.whl", H2, YOUNG, False)),
-            ("backports-tarfile", "1.2.0"): _release(("b.whl", H3, OLD, False)),
-        }
-    )
+    fetch = _fetch_from({**OLD_RELEASES, ("twine", "6.2.0"): _release(_entry("t.whl", H1), _entry("t-new.whl", H2, YOUNG))})
     rc, out = _run([_requirements(tmp_path, LOCK_TXT)], fetch)
     assert rc == 1
     assert "twine==6.2.0 has 1 of 2 files younger than 7 days; youngest t-new.whl" in out
 
 
 def test_a_yanked_file_fails(tmp_path):
-    fetch = _fetch_from(
-        {
-            ("twine", "6.2.0"): _release(("t.whl", H1, OLD, True), ("t.tar.gz", H2, OLD, False)),
-            ("backports-tarfile", "1.2.0"): _release(("b.whl", H3, OLD, False)),
-        }
-    )
+    fetch = _fetch_from({**OLD_RELEASES, ("twine", "6.2.0"): _release(_entry("t.whl", H1, yanked=True), _entry("t.tar.gz", H2))})
     rc, out = _run([_requirements(tmp_path, LOCK_TXT)], fetch)
     assert rc == 1
     assert "twine==6.2.0 t.whl is yanked on PyPI" in out
 
 
-def test_a_pinned_hash_that_pypi_does_not_list_is_an_error(tmp_path):
+def test_uppercase_pypi_digests_still_match(tmp_path):
+    fetch = _fetch_from({**OLD_RELEASES, ("twine", "6.2.0"): _release(_entry("t.whl", H1.upper()), _entry("t.tar.gz", H2))})
+    assert _run([_requirements(tmp_path, LOCK_TXT)], fetch)[0] == 0
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        (None, "PyPI lists no file with sha256 " + H2),
+        ({**_entry("t.tar.gz", H2), "upload_time_iso_8601": None}, "lacks a filename, an upload_time_iso_8601"),
+        ({k: v for k, v in _entry("t.tar.gz", H2).items() if k != "yanked"}, "or a boolean yanked"),
+        ({**_entry("t.tar.gz", H2), "yanked": None}, "or a boolean yanked"),
+        ({**_entry("t.tar.gz", H2), "upload_time_iso_8601": "not-a-date"}, "bad upload time"),
+        ({**_entry("t.tar.gz", H2), "digests": None}, "PyPI lists no file with sha256 " + H2),
+    ],
+)
+def test_a_pypi_entry_that_cannot_prove_a_hash_is_an_error(tmp_path, entry, message):
+    entries = [_entry("t.whl", H1)] + ([entry] if entry else [])
+    fetch = _fetch_from({**OLD_RELEASES, ("twine", "6.2.0"): _release(*entries)})
+    rc, out = _run([_requirements(tmp_path, LOCK_TXT)], fetch)
+    assert rc == 2
+    assert message in out
+    assert "ci-x.txt:3: twine==6.2.0" in out
+
+
+def test_one_unreachable_release_does_not_hide_a_young_pin_elsewhere(tmp_path):
+    """Every lock is checked and printed; an error still wins the exit code."""
+    young_lock = _requirements(tmp_path, f"uv==1.0 --hash=sha256:{'e' * 64}\n", name="ci-uv.txt")
     fetch = _fetch_from(
         {
-            ("twine", "6.2.0"): _release(("t.whl", H1, OLD, False)),
-            ("backports-tarfile", "1.2.0"): _release(("b.whl", H3, OLD, False)),
+            **OLD_RELEASES,
+            ("twine", "6.2.0"): pin_age.CheckError("twine==6.2.0: PyPI request failed 4 times, last: HTTP 503"),
+            ("uv", "1.0"): _release(_entry("uv.whl", "e" * 64, YOUNG)),
         }
     )
-    with pytest.raises(pin_age.CheckError, match=f"PyPI lists no file with sha256 {H2}"):
-        _run([_requirements(tmp_path, LOCK_TXT)], fetch)
+    rc, out = _run([_requirements(tmp_path, LOCK_TXT), young_lock], fetch)
+    assert rc == 2
+    assert "ERROR " in out and "ci-x.txt:3: twine==6.2.0: PyPI request failed 4 times" in out
+    assert "FAIL " in out and "uv==1.0 has 1 of 1 files younger" in out
+    assert "pin age: ERROR, 1 problems, 1 errors" in out
 
 
-def test_a_file_with_no_upload_time_is_an_error(tmp_path):
-    fetch = _fetch_from(
-        {
-            ("twine", "6.2.0"): _release(("t.whl", H1, None, False), ("t.tar.gz", H2, OLD, False)),
-            ("backports-tarfile", "1.2.0"): _release(("b.whl", H3, OLD, False)),
-        }
-    )
-    with pytest.raises(pin_age.CheckError, match="has no upload time"):
-        _run([_requirements(tmp_path, LOCK_TXT)], fetch)
+def test_an_unexpected_fetch_exception_is_an_error_not_a_crash(tmp_path):
+    fetch = _fetch_from({**OLD_RELEASES, ("twine", "6.2.0"): AttributeError("boom")})
+    rc, out = _run([_requirements(tmp_path, LOCK_TXT)], fetch)
+    assert rc == 2
+    assert "twine==6.2.0: AttributeError: boom" in out
 
+
+# --- uv.lock ----------------------------------------------------------------
 
 UV_LOCK = f"""\
 version = 1
@@ -211,56 +258,75 @@ version = "4.12.0"
 source = {{ registry = "https://pypi.org/simple" }}
 sdist = {{ url = "https://files.pythonhosted.org/a/anyio-4.12.0.tar.gz", hash = "sha256:{H1}", size = 1, upload-time = "{OLD}" }}
 wheels = [
-    {{ url = "https://files.pythonhosted.org/a/anyio-4.12.0-py3-none-any.whl", hash = "sha256:{H2}", size = 1, upload-time = "{{wheel_time}}" }},
+    {{ url = "https://files.pythonhosted.org/a/anyio-4.12.0-py3-none-any.whl", hash = "sha256:{H2}", size = 1, upload-time = "{OLD}" }},
 ]
 """
+ANYIO = {("anyio", "4.12.0"): _release(_entry("anyio-4.12.0.tar.gz", H1), _entry("anyio-4.12.0-py3-none-any.whl", H2))}
 
 
-def _uv_lock(tmp_path, wheel_time=OLD, extra=""):
+def _uv_lock(tmp_path, text=UV_LOCK):
     path = tmp_path / "uv.lock"
-    path.write_text(UV_LOCK.replace("{wheel_time}", wheel_time) + extra, encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
     return path
 
 
-def _no_network(name, version):
-    raise AssertionError("uv.lock must be checked offline")
-
-
-def test_uv_lock_is_checked_offline_and_skips_the_editable_project(tmp_path):
-    rc, out = _run([_uv_lock(tmp_path)], _no_network)
+def test_uv_lock_is_proven_against_pypi_and_skips_the_editable_project(tmp_path):
+    fetch = _fetch_from(ANYIO)
+    rc, out = _run([_uv_lock(tmp_path)], fetch)
     assert rc == 0, out
-    assert "uv.lock: 1 pins, 2 files, 0 problems" in out
+    assert fetch.calls == [("anyio", "4.12.0")]
+    assert "uv.lock: 1 pins, 2 files proven, 0 problems, 0 errors, 1 local project skipped" in out
 
 
-def test_uv_lock_young_wheel_fails(tmp_path):
-    rc, out = _run([_uv_lock(tmp_path, wheel_time=YOUNG)], _no_network)
+def test_uv_lock_ignores_its_own_upload_time_and_trusts_pypi(tmp_path):
+    """The lock says old; PyPI says one file is young: PyPI wins."""
+    fetch = _fetch_from({("anyio", "4.12.0"): _release(_entry("anyio-4.12.0.tar.gz", H1), _entry("anyio.whl", H2, YOUNG))})
+    rc, out = _run([_uv_lock(tmp_path)], fetch)
     assert rc == 1
     assert "anyio==4.12.0 has 1 of 2 files younger than 7 days" in out
 
 
-def test_uv_lock_refuses_a_git_source(tmp_path):
-    extra = '\n[[package]]\nname = "x"\nversion = "1"\nsource = { git = "https://example.com/x" }\n'
-    with pytest.raises(pin_age.CheckError, match="non-registry source"):
-        _run([_uv_lock(tmp_path, extra=extra)], _no_network)
+def test_uv_lock_yanked_file_fails(tmp_path):
+    fetch = _fetch_from({("anyio", "4.12.0"): _release(_entry("anyio-4.12.0.tar.gz", H1), _entry("anyio.whl", H2, yanked=True))})
+    rc, out = _run([_uv_lock(tmp_path)], fetch)
+    assert rc == 1
+    assert "anyio==4.12.0 anyio.whl is yanked on PyPI" in out
 
 
-def test_uv_lock_refuses_a_file_with_no_upload_time(tmp_path):
-    path = _uv_lock(tmp_path)
-    path.write_text(path.read_text(encoding="utf-8").replace(f', upload-time = "{OLD}" }}\nwheels', " }\nwheels"), encoding="utf-8")
-    with pytest.raises(pin_age.CheckError, match="has no upload-time"):
-        _run([path], _no_network)
+@pytest.mark.parametrize(
+    "old, new, message",
+    [
+        ('registry = "https://pypi.org/simple"', 'registry = "https://other.example/simple"', "only https://pypi.org/simple"),
+        ('registry = "https://pypi.org/simple"', 'git = "https://example.com/x"', "only https://pypi.org/simple"),
+        (f'hash = "sha256:{H1}"', f'hash = "sha512:{"d" * 128}"', "not sha256"),
+        (f'hash = "sha256:{H1}"', f'hash = "sha256:{H1.upper()}"', "not sha256"),
+    ],
+)
+def test_uv_lock_refuses_what_pypi_cannot_prove(tmp_path, old, new, message):
+    rc, out = _run([_uv_lock(tmp_path, UV_LOCK.replace(old, new))], _fetch_from(ANYIO))
+    assert rc == 2
+    assert message in out
 
 
-def test_the_repo_uv_lock_parses_and_every_registry_file_has_an_upload_time():
-    files = pin_age.files_from_uv_lock(REPO_ROOT / "uv.lock")
-    assert len({(f.name, f.version) for f in files}) > 10
+def test_the_repo_uv_lock_parses():
+    pins, skipped = pin_age.pins_from_uv_lock(REPO_ROOT / "uv.lock")
+    assert len(pins) > 10
+    assert skipped == 1
 
 
-def test_an_unknown_lock_kind_is_an_error(tmp_path):
-    path = tmp_path / "requirements.in"
-    path.write_text("twine\n", encoding="utf-8")
-    with pytest.raises(pin_age.CheckError, match="not a uv.lock or a .txt"):
-        _run([path], _no_network)
+def test_an_unreadable_lock_is_reported_and_the_rest_still_checked(tmp_path):
+    bad = tmp_path / "bad" / "uv.lock"
+    bad.parent.mkdir()
+    bad.write_text("not = [toml", encoding="utf-8")
+    rc, out = _run([bad, _uv_lock(tmp_path), tmp_path / "missing.txt", tmp_path / "x.in"], _fetch_from(ANYIO))
+    assert rc == 2
+    assert "cannot read lock: TOMLDecodeError" in out
+    assert "cannot read lock: FileNotFoundError" in out
+    assert "not a uv.lock or a .txt requirements lock" in out
+    assert "uv.lock: 1 pins, 2 files proven, 0 problems" in out
+
+
+# --- PyPI transport ---------------------------------------------------------
 
 
 class _Response(io.BytesIO):
@@ -271,58 +337,118 @@ class _Response(io.BytesIO):
         return False
 
 
+class _CutOff(_Response):
+    """A body that dies mid-read, the way a dropped connection does."""
+
+    def __init__(self, error):
+        super().__init__(b"")
+        self.error = error
+
+    def read(self, *args):
+        raise self.error
+
+
 def _http_error(code):
     return urllib.error.HTTPError("https://pypi.org/x", code, "x", {}, None)
 
 
-def test_fetch_retries_a_transient_failure_then_succeeds(monkeypatch):
-    answers = [_http_error(503), urllib.error.URLError("reset"), _Response(b'{"urls": []}')]
-    sleeps = []
+def _urlopen_sequence(monkeypatch, answers):
+    calls = []
 
     def urlopen(request, timeout):
         assert request.full_url == "https://pypi.org/pypi/twine/6.2.0/json"
+        assert timeout == pin_age.TIMEOUT_SECONDS
+        calls.append(1)
         answer = answers.pop(0)
         if isinstance(answer, Exception):
             raise answer
         return answer
 
     monkeypatch.setattr(pin_age.urllib.request, "urlopen", urlopen)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "transient",
+    [
+        _http_error(503),
+        _http_error(429),
+        urllib.error.URLError("dns"),
+        TimeoutError("slow"),
+        _CutOff(http.client.IncompleteRead(b"{")),
+        _CutOff(ConnectionResetError("reset")),
+        _Response(b'{"urls": ['),
+        _Response(b"\xff\xfe"),
+    ],
+    ids=["503", "429", "urlerror", "timeout", "incomplete-read", "reset-mid-body", "cut-json", "not-utf8"],
+)
+def test_fetch_retries_a_transient_failure_then_succeeds(monkeypatch, transient):
+    sleeps = []
     monkeypatch.setattr(pin_age.time, "sleep", sleeps.append)
+    calls = _urlopen_sequence(monkeypatch, [transient, _Response(b'{"urls": []}')])
     assert pin_age.fetch_release("twine", "6.2.0") == {"urls": []}
-    assert sleeps == [1, 2]
+    assert len(calls) == 2
+    assert sleeps == [1]
 
 
 def test_fetch_gives_up_after_the_last_attempt(monkeypatch):
-    def urlopen(request, timeout):
-        raise _http_error(429)
-
-    monkeypatch.setattr(pin_age.urllib.request, "urlopen", urlopen)
-    monkeypatch.setattr(pin_age.time, "sleep", lambda seconds: None)
+    calls = _urlopen_sequence(monkeypatch, [_http_error(429) for _ in range(pin_age.ATTEMPTS)])
     with pytest.raises(pin_age.CheckError, match=f"failed {pin_age.ATTEMPTS} times, last: HTTP 429"):
         pin_age.fetch_release("twine", "6.2.0")
+    assert len(calls) == pin_age.ATTEMPTS
 
 
 @pytest.mark.parametrize("code, message", [(404, "no such release"), (403, "HTTP 403")])
 def test_fetch_does_not_retry_a_permanent_answer(monkeypatch, code, message):
-    calls = []
-
-    def urlopen(request, timeout):
-        calls.append(1)
-        raise _http_error(code)
-
-    monkeypatch.setattr(pin_age.urllib.request, "urlopen", urlopen)
+    calls = _urlopen_sequence(monkeypatch, [_http_error(code)])
     with pytest.raises(pin_age.CheckError, match=message):
         pin_age.fetch_release("twine", "6.2.0")
     assert calls == [1]
 
 
-def test_main_exit_codes(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(pin_age, "fetch_release", _no_network)
-    assert pin_age.main(["--min-days", "7", str(_uv_lock(tmp_path))]) == 0
-    young = tmp_path / "young"
-    young.mkdir()
-    assert pin_age.main(["--min-days", "7", str(_uv_lock(young, wheel_time="2999-01-01T00:00:00Z"))]) == 1
-    assert pin_age.main(["--min-days", "7", str(tmp_path / "missing.txt")]) == 2
-    assert "pin age: ERROR" in capsys.readouterr().err
+@pytest.mark.parametrize("body", [b"[]", b'{"info": {}}', b'{"urls": {}}'])
+def test_fetch_refuses_a_body_without_a_urls_list(monkeypatch, body):
+    _urlopen_sequence(monkeypatch, [_Response(body)])
+    with pytest.raises(pin_age.CheckError, match="no 'urls' list"):
+        pin_age.fetch_release("twine", "6.2.0")
+
+
+# --- command line -----------------------------------------------------------
+
+
+def test_main_exit_codes(tmp_path, capsys):
+    lock = _requirements(tmp_path, LOCK_TXT)
+    assert pin_age.main(["--min-days", "7", str(lock)], fetch=_fetch_from(OLD_RELEASES)) == 0
+    future = "2999-01-01T00:00:00Z"
+    young = _fetch_from({**OLD_RELEASES, ("twine", "6.2.0"): _release(_entry("t.whl", H1, future), _entry("t.tar.gz", H2))})
+    assert pin_age.main(["--min-days", "7", str(lock)], fetch=young) == 1
+    assert pin_age.main(["--min-days", "7", str(tmp_path / "missing.txt")], fetch=_fetch_from({})) == 2
+    assert "pin age: ERROR" in capsys.readouterr().out
+
+
+def test_main_uses_the_real_fetch_by_default(tmp_path, capsys):
+    """No seam passed: the real fetch_release runs, the autouse fixture's
+    urlopen trips, and the check reports an error (exit 2), never a pass."""
+    assert pin_age.main(["--min-days", "7", str(_requirements(tmp_path, LOCK_TXT))]) == 2
+    assert "test reached urllib.request.urlopen" in capsys.readouterr().out
+
+
+def test_main_turns_an_unexpected_defect_into_exit_2(monkeypatch, capsys, tmp_path):
+    def broken(*args, **kwargs):
+        raise RuntimeError("defect")
+
+    monkeypatch.setattr(pin_age, "check", broken)
+    assert pin_age.main(["--min-days", "7", str(tmp_path / "uv.lock")]) == 2
+    assert "pin age: ERROR RuntimeError: defect" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_main_refuses_a_min_days_that_is_not_positive_and_finite(tmp_path, value):
     with pytest.raises(SystemExit):
-        pin_age.main(["--min-days", "0", str(_uv_lock(tmp_path))])
+        pin_age.main(["--min-days", value, str(tmp_path / "uv.lock")])
+
+
+def test_the_log_names_the_slowest_pypi_answer(tmp_path):
+    rc, out = _run([_requirements(tmp_path, LOCK_TXT)], _fetch_from(OLD_RELEASES))
+    assert rc == 0
+    assert "PyPI: 2 releases in " in out and ", 16 at a time; slowest " in out

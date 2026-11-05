@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
-"""Fail when a locked package file is younger than the cooldown.
+"""Fail when a locked package file is younger than the cooldown, or yanked.
 
 The 7-day Dependabot cooldown covers only the package that Dependabot bumps.
 A bump can pull in a new transitive pin that is hours old, because the uv
 updater re-runs ``uv pip compile`` without ``--exclude-newer`` (#312i). This
-check reads every pin of every lock and proves that each locked file was
-uploaded at least ``--min-days`` days before the run.
+check reads every pin of every lock and proves, from PyPI, that each locked
+file was uploaded at least ``--min-days`` days before the run and is not
+yanked.
 
-Two lock formats are read:
+Two lock formats are read. Both are checked against PyPI, never against
+times that the lock records, because a lock is text in a pull request:
 
-* ``uv.lock``: each registry file carries its own ``upload-time``, so the
-  check is offline.
-* ``uv pip compile --generate-hashes`` output (``.github/requirements/*.txt``):
-  the file names no upload time, so the check asks PyPI for each
-  ``name==version`` and matches every pinned ``sha256`` to a PyPI file.
+* ``uv.lock``: every registry package, with the ``sha256`` of each file.
+  Only the PyPI registry is accepted.
+* ``uv pip compile --generate-hashes`` output (``.github/requirements/*.txt``).
 
-The check fails closed. A pin it cannot parse, a hash PyPI does not list, a
-file with no upload time, a yanked file, or a PyPI request that still fails
-after the retries is an error, never a skip.
+For each ``name==version`` the check reads ``https://pypi.org/pypi/<name>/
+<version>/json`` and matches every pinned ``sha256`` to a PyPI file.
 
-Exit status: 0 when every file is old enough, 1 when a file is too young or
-yanked, 2 when the check cannot run (bad arguments, a parse error, a network
-error).
+The check fails closed. A pin it cannot parse, a hash token that pip would
+accept but this check cannot prove, a hash PyPI does not list, a PyPI answer
+with a missing field, or a PyPI request that still fails after the retries is
+an error, never a skip. One bad lock or pin does not hide the others: every
+lock is checked and every result is printed.
+
+Exit status: 0 when every file is old enough and not yanked, 1 when a file is
+too young or yanked, 2 when the check could not prove every file (bad
+arguments, a parse error, a PyPI error), also when it found problems too.
 
 Usage::
 
@@ -36,7 +41,9 @@ import argparse
 import concurrent.futures
 import dataclasses
 import datetime as dt
+import http.client
 import json
+import math
 import re
 import sys
 import time
@@ -47,23 +54,38 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 PYPI_JSON = "https://pypi.org/pypi/{name}/{version}/json"
+PYPI_REGISTRY = "https://pypi.org/simple"
 # PyPI documents no rate limit for the JSON API; 16 parallel requests finish
-# the ~100 CI pins in about a second without a burst large enough to throttle.
+# the ~160 pins in a few seconds without a burst large enough to throttle.
 MAX_WORKERS = 16
 ATTEMPTS = 4
 TIMEOUT_SECONDS = 20
 
 _PIN = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)==(?P<version>[^\s;\\]+)(?P<rest>.*)$")
-_HASH = re.compile(r"--hash=sha256:(?P<digest>[0-9a-f]{64})\b")
+# uv writes lowercase sha256 only. pip lowercases any digest and also honors
+# sha384/sha512 and "--hash <value>", so every other spelling is refused
+# rather than ignored: an ignored hash is a file pip installs unproven.
+_HASH_TOKEN = re.compile(r"--hash=sha256:(?P<digest>[0-9a-f]{64})")
+_SHA256 = re.compile(r"sha256:(?P<digest>[0-9a-f]{64})")
 
 
 class CheckError(Exception):
-    """The check cannot reach a verdict (exit 2)."""
+    """The check cannot reach a verdict for one lock or pin (exit 2)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Pin:
+    """One ``name==version`` of a lock and the sha256 of each locked file."""
+
+    source: str
+    name: str
+    version: str
+    hashes: frozenset[str]
 
 
 @dataclasses.dataclass(frozen=True)
 class LockedFile:
-    """One locked distribution file and the time PyPI received it."""
+    """One locked distribution file, as PyPI describes it."""
 
     source: str
     name: str
@@ -71,16 +93,6 @@ class LockedFile:
     filename: str
     uploaded: dt.datetime
     yanked: bool = False
-
-
-@dataclasses.dataclass(frozen=True)
-class Pin:
-    """One ``name==version`` line of a hash-locked requirements file."""
-
-    source: str
-    name: str
-    version: str
-    hashes: frozenset[str]
 
 
 def normalize(name: str) -> str:
@@ -95,14 +107,16 @@ def normalize(name: str) -> str:
 
 
 def parse_time(value: str) -> dt.datetime:
-    """Parse an ISO-8601 time that PyPI or uv wrote (always UTC).
+    """Parse an ISO-8601 UTC time as PyPI writes it.
 
     >>> parse_time("2026-10-11T01:05:12.408Z").isoformat()
     '2026-10-11T01:05:12.408000+00:00'
+    >>> parse_time("2025-09-04T15:43:15.994841Z").isoformat()
+    '2025-09-04T15:43:15.994841+00:00'
     """
     parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        raise CheckError(f"upload time {value!r} has no time zone")
+        raise ValueError(f"upload time {value!r} has no time zone")
     return parsed
 
 
@@ -130,99 +144,137 @@ def logical_lines(text: str) -> Iterable[tuple[int, str]]:
         yield start, " ".join(part for part in parts if part)
 
 
-def parse_requirements(path: Path) -> list[Pin]:
+def parse_pin_line(line: str) -> tuple[str, str, frozenset[str]] | None:
+    """Split one logical line into name, version and hashes. Return None
+    unless the line is exactly ``name==version [; marker] --hash=sha256:...``.
+
+    >>> parse_pin_line("Twine==6.2.0 ; os_name == 'nt' --hash=sha256:" + "a" * 64)[:2]
+    ('twine', '6.2.0')
+    >>> parse_pin_line("twine==6.2.0 --hash=sha256:" + "A" * 64) is None
+    True
+    >>> parse_pin_line("twine==6.2.0 --hash=sha256:" + "a" * 64 + " --hash=sha512:" + "b" * 128) is None
+    True
+    """
+    match = _PIN.match(line)
+    if not match:
+        return None
+    rest = match["rest"]
+    split = rest.find(" --")
+    marker, options = (rest, "") if split < 0 else (rest[:split], rest[split:])
+    marker = marker.strip()
+    if marker and not marker.startswith(";"):
+        return None
+    tokens = options.split()
+    if not tokens or any(not _HASH_TOKEN.fullmatch(token) for token in tokens):
+        return None
+    hashes = frozenset(_HASH_TOKEN.fullmatch(token)["digest"] for token in tokens)
+    return normalize(match["name"]), match["version"], hashes
+
+
+def pins_from_requirements(path: Path) -> list[Pin]:
     """Read a ``--generate-hashes`` lock. Every non-comment line must be a
-    hashed exact pin; anything else (an editable, a URL, a range, an option)
-    is refused, because its age cannot be proven."""
+    hashed exact pin. Anything else (an editable, a URL, a range, an option,
+    a hash spelling that uv does not write) is refused, because its age
+    cannot be proven."""
     pins = []
     for number, line in logical_lines(path.read_text(encoding="utf-8")):
-        match = _PIN.match(line)
-        hashes = frozenset(_HASH.findall(line))
-        if not match or not hashes:
-            raise CheckError(f"{path}:{number}: not a hashed name==version pin: {line[:80]!r}")
-        pins.append(Pin(f"{path}:{number}", normalize(match["name"]), match["version"], hashes))
+        parsed = parse_pin_line(line)
+        if parsed is None:
+            raise CheckError(
+                f"{path}:{number}: not a name==version pin with only --hash=sha256 hashes: {line[:100]!r}"
+            )
+        pins.append(Pin(f"{path}:{number}", *parsed))
     if not pins:
         raise CheckError(f"{path}: no pins found")
     return pins
 
 
-def files_from_uv_lock(path: Path) -> list[LockedFile]:
-    """Every registry file of a ``uv.lock``, with the upload time the lock
-    records. The editable project itself is skipped; every other source
-    (git, URL, path) is refused, because it has no upload time to prove."""
+def pins_from_uv_lock(path: Path) -> tuple[list[Pin], int]:
+    """Every PyPI package of a ``uv.lock`` and the sha256 of each of its
+    files, plus the count of local projects skipped (the editable project
+    itself). Any other source (git, URL, path, another registry) is refused,
+    because PyPI cannot prove its age."""
     data = tomllib.loads(path.read_text(encoding="utf-8"))
-    files = []
+    pins, skipped = [], 0
     for package in data.get("package", []):
-        name, version = package["name"], package.get("version", "?")
+        name, version = package.get("name", "?"), package.get("version", "?")
         source = package.get("source", {})
-        if "registry" not in source:
-            if "editable" in source or "virtual" in source:
-                continue
-            raise CheckError(f"{path}: {name}=={version} has a non-registry source {source}")
+        where = f"{path}: {name}=={version}"
+        if set(source) & {"editable", "virtual"}:
+            skipped += 1
+            continue
+        if source.get("registry") != PYPI_REGISTRY:
+            raise CheckError(f"{where} has source {source}; only {PYPI_REGISTRY} can be proven")
         entries = ([package["sdist"]] if "sdist" in package else []) + package.get("wheels", [])
         if not entries:
-            raise CheckError(f"{path}: {name}=={version} lists no files")
+            raise CheckError(f"{where} lists no files")
+        hashes = set()
         for entry in entries:
-            filename = entry.get("url", "?").rsplit("/", 1)[-1]
-            if "upload-time" not in entry:
-                raise CheckError(f"{path}: {name}=={version} {filename} has no upload-time")
-            files.append(LockedFile(str(path), name, version, filename, parse_time(entry["upload-time"])))
-    if not files:
-        raise CheckError(f"{path}: no registry files found")
-    return files
+            match = _SHA256.fullmatch(str(entry.get("hash", "")))
+            if not match:
+                raise CheckError(f"{where} file {entry.get('url', '?')} has hash {entry.get('hash')!r}, not sha256")
+            hashes.add(match["digest"])
+        pins.append(Pin(str(path), normalize(name), version, frozenset(hashes)))
+    if not pins:
+        raise CheckError(f"{path}: no PyPI packages found")
+    return pins, skipped
 
 
 def fetch_release(name: str, version: str) -> dict:
     """GET the PyPI JSON for one release, retrying transient failures."""
     url = PYPI_JSON.format(name=name, version=version)
-    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "claude-jacked-pin-age-check"})
+    headers = {"Accept": "application/json", "User-Agent": "claude-jacked-pin-age-check"}
+    request = urllib.request.Request(url, headers=headers)
     for attempt in range(1, ATTEMPTS + 1):
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-                return json.load(response)
+                body = json.load(response)
+            break
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 raise CheckError(f"{name}=={version}: PyPI has no such release (404)") from error
             if error.code != 429 and error.code < 500:
                 raise CheckError(f"{name}=={version}: PyPI answered HTTP {error.code}") from error
             reason = f"HTTP {error.code}"
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as error:
+            # OSError: a reset or timeout during the body read. HTTPException:
+            # IncompleteRead. ValueError: a cut-off or non-UTF-8 JSON body.
             reason = f"{type(error).__name__}: {error}"
         if attempt == ATTEMPTS:
             raise CheckError(f"{name}=={version}: PyPI request failed {ATTEMPTS} times, last: {reason}")
         time.sleep(2 ** (attempt - 1))
-    raise AssertionError("unreachable")
+    if not isinstance(body, dict) or not isinstance(body.get("urls"), list):
+        raise CheckError(f"{name}=={version}: PyPI JSON has no 'urls' list (API change?)")
+    return body
 
 
 def files_for_pin(pin: Pin, release: dict) -> list[LockedFile]:
-    """Match each pinned hash to the PyPI file that carries it."""
-    by_hash = {entry["digests"]["sha256"]: entry for entry in release.get("urls", [])}
+    """Match each pinned hash to the PyPI file that carries it. Every field
+    that the verdict reads must be present, with the right type."""
+    by_hash = {}
+    for entry in release["urls"]:
+        digests = entry.get("digests") if isinstance(entry, dict) else None
+        digest = digests.get("sha256") if isinstance(digests, dict) else None
+        if isinstance(digest, str):
+            by_hash[digest.lower()] = entry
+    where = f"{pin.source}: {pin.name}=={pin.version}"
     files = []
     for digest in sorted(pin.hashes):
         entry = by_hash.get(digest)
         if entry is None:
-            raise CheckError(f"{pin.source}: {pin.name}=={pin.version}: PyPI lists no file with sha256 {digest}")
-        uploaded = entry.get("upload_time_iso_8601")
-        if not uploaded:
-            raise CheckError(f"{pin.source}: {pin.name}=={pin.version} {entry['filename']} has no upload time")
-        files.append(
-            LockedFile(pin.source, pin.name, pin.version, entry["filename"], parse_time(uploaded), bool(entry.get("yanked")))
-        )
+            raise CheckError(f"{where}: PyPI lists no file with sha256 {digest}")
+        filename, uploaded, yanked = entry.get("filename"), entry.get("upload_time_iso_8601"), entry.get("yanked")
+        if not isinstance(filename, str) or not isinstance(uploaded, str) or not isinstance(yanked, bool):
+            raise CheckError(
+                f"{where} sha256 {digest}: PyPI file entry lacks a filename, an upload_time_iso_8601 "
+                f"or a boolean yanked (got {filename!r}, {uploaded!r}, {yanked!r}; API change?)"
+            )
+        try:
+            when = parse_time(uploaded)
+        except ValueError as error:
+            raise CheckError(f"{where} {filename}: bad upload time {uploaded!r}: {error}") from error
+        files.append(LockedFile(pin.source, pin.name, pin.version, filename, when, yanked))
     return files
-
-
-def files_from_requirements(
-    path: Path, fetch: Callable[[str, str], dict] = fetch_release, workers: int = MAX_WORKERS
-) -> list[LockedFile]:
-    """Resolve every pin of a hash-locked file to its PyPI files, in parallel."""
-    pins = parse_requirements(path)
-    releases: dict[tuple[str, str], dict] = {}
-    keys = sorted({(pin.name, pin.version) for pin in pins})
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, len(keys)))) as pool:
-        futures = {pool.submit(fetch, *key): key for key in keys}
-        for future in concurrent.futures.as_completed(futures):
-            releases[futures[future]] = future.result()
-    return [file for pin in pins for file in files_for_pin(pin, releases[(pin.name, pin.version)])]
 
 
 def violations(files: Iterable[LockedFile], now: dt.datetime, min_days: float) -> list[str]:
@@ -260,50 +312,126 @@ def violations(files: Iterable[LockedFile], now: dt.datetime, min_days: float) -
     return problems
 
 
+def read_lock(path: Path) -> tuple[list[Pin], int]:
+    """Pins of one lock file and its count of skipped local projects."""
+    if path.name == "uv.lock":
+        return pins_from_uv_lock(path)
+    if path.suffix == ".txt":
+        return pins_from_requirements(path), 0
+    raise CheckError(f"{path}: not a uv.lock or a .txt requirements lock")
+
+
+def fetch_all(
+    keys: set[tuple[str, str]], fetch: Callable[[str, str], dict], workers: int
+) -> tuple[dict, dict[tuple[str, str], float]]:
+    """Fetch every release once, in parallel. Return the results and the
+    seconds each fetch took. A failure is kept as the CheckError for its key,
+    so one bad release never hides the others."""
+    results: dict[tuple[str, str], dict | CheckError] = {}
+    seconds: dict[tuple[str, str], float] = {}
+    if not keys:
+        return results, seconds
+
+    def timed(key):
+        started = time.monotonic()
+        try:
+            return fetch(*key)
+        finally:
+            seconds[key] = time.monotonic() - started
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, len(keys)))) as pool:
+        futures = {pool.submit(timed, key): key for key in sorted(keys)}
+        for future in concurrent.futures.as_completed(futures):
+            name, version = futures[future]
+            try:
+                results[(name, version)] = future.result()
+            except CheckError as error:
+                results[(name, version)] = error
+            except Exception as error:  # noqa: BLE001 - a fetch defect is an unproven pin, never a crash
+                results[(name, version)] = CheckError(f"{name}=={version}: {type(error).__name__}: {error}")
+    return results, seconds
+
+
 def check(
     paths: Iterable[Path],
     min_days: float,
     now: dt.datetime,
-    fetch: Callable[[str, str], dict] = fetch_release,
-    out=sys.stdout,
+    fetch: Callable[[str, str], dict] | None = None,
+    out=None,
+    workers: int = MAX_WORKERS,
 ) -> int:
-    """Run the check over every path; print one summary line per lock."""
-    problems = []
+    """Check every lock. For each lock, print a summary line, then each of
+    its problems and errors. Return the exit status (see the module
+    docstring)."""
+    fetch = fetch or fetch_release  # resolved per call, so a test seam or patch applies
+    out = out or sys.stdout
+    started = time.monotonic()
+    locks: list[tuple[Path, list[Pin], int, str | None]] = []
     for path in paths:
-        started = time.monotonic()
-        if path.name == "uv.lock":
-            files = files_from_uv_lock(path)
-        elif path.suffix == ".txt":
-            files = files_from_requirements(path, fetch)
-        else:
-            raise CheckError(f"{path}: not a uv.lock or a .txt requirements lock")
-        found = violations(files, now, min_days)
-        problems += found
-        pins = len({(file.name, file.version) for file in files})
-        youngest = max(files, key=lambda file: file.uploaded)
+        try:
+            pins, skipped = read_lock(path)
+            locks.append((path, pins, skipped, None))
+        except (CheckError, OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            # tomllib.TOMLDecodeError and UnicodeDecodeError are ValueErrors.
+            locks.append((path, [], 0, f"{path}: cannot read lock: {type(error).__name__}: {error}"))
+    fetch_started = time.monotonic()
+    releases, seconds = fetch_all({(pin.name, pin.version) for _, pins, _, _ in locks for pin in pins}, fetch, workers)
+    if seconds:
+        slowest = max(seconds, key=seconds.get)
         print(
-            f"{path}: {pins} pins, {len(files)} files, {len(found)} problems; youngest "
-            f"{youngest.name}=={youngest.version} uploaded {youngest.uploaded:%Y-%m-%dT%H:%MZ} "
-            f"({time.monotonic() - started:.1f}s)",
+            f"PyPI: {len(seconds)} releases in {time.monotonic() - fetch_started:.1f}s, {workers} at a time; "
+            f"slowest {slowest[0]}=={slowest[1]} {seconds[slowest]:.1f}s",
             file=out,
         )
-    for problem in problems:
-        print(f"FAIL {problem}", file=out)
-    print(f"pin age: {'FAIL' if problems else 'PASS'}, minimum {min_days:g} days before {now:%Y-%m-%dT%H:%MZ}", file=out)
-    return 1 if problems else 0
+
+    problem_count = error_count = 0
+    for path, pins, skipped, read_error in locks:
+        files, errors = [], [read_error] if read_error else []
+        for pin in pins:
+            release = releases[(pin.name, pin.version)]
+            try:
+                if isinstance(release, CheckError):
+                    raise CheckError(f"{pin.source}: {release}")
+                files += files_for_pin(pin, release)
+            except CheckError as error:
+                errors.append(str(error))
+        problems = violations(files, now, min_days)
+        problem_count += len(problems)
+        error_count += len(errors)
+        youngest = max(files, key=lambda file: file.uploaded, default=None)
+        newest = f"{youngest.name}=={youngest.version} uploaded {youngest.uploaded:%Y-%m-%dT%H:%MZ}" if youngest else "none"
+        note = f", {skipped} local project skipped" if skipped else ""
+        print(
+            f"{path}: {len(pins)} pins, {len(files)} files proven, {len(problems)} problems, "
+            f"{len(errors)} errors{note}; youngest {newest}",
+            file=out,
+        )
+        for problem in problems:
+            print(f"FAIL {problem}", file=out)
+        for error in errors:
+            print(f"ERROR {error}", file=out)
+
+    verdict = "ERROR" if error_count else "FAIL" if problem_count else "PASS"
+    print(
+        f"pin age: {verdict}, {problem_count} problems, {error_count} errors; minimum {min_days:g} days "
+        f"before {now:%Y-%m-%dT%H:%MZ} ({time.monotonic() - started:.1f}s)",
+        file=out,
+        flush=True,
+    )
+    return 2 if error_count else 1 if problem_count else 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, fetch: Callable[[str, str], dict] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--min-days", type=float, required=True, help="minimum age of every locked file, in days")
     parser.add_argument("paths", nargs="+", type=Path, help="uv.lock and/or hash-locked .txt files")
     args = parser.parse_args(argv)
-    if args.min_days <= 0:
-        parser.error("--min-days must be positive")
+    if not math.isfinite(args.min_days) or args.min_days <= 0:
+        parser.error("--min-days must be a positive finite number")
     try:
-        return check(args.paths, args.min_days, dt.datetime.now(dt.timezone.utc))
-    except (CheckError, OSError, tomllib.TOMLDecodeError, KeyError) as error:
-        print(f"pin age: ERROR {error}", file=sys.stderr)
+        return check(args.paths, args.min_days, dt.datetime.now(dt.timezone.utc), fetch=fetch)
+    except Exception as error:  # noqa: BLE001 - an unexpected defect must exit 2, never 1 ("too young")
+        print(f"pin age: ERROR {type(error).__name__}: {error}", flush=True)
         return 2
 
 
