@@ -53,6 +53,30 @@ def test_release_gate_runs_every_command_of_the_ci_workflow():
     assert audit.replace("$RUNNER_TEMP", "$GATE_TMP") in gate
     zizmor = re.search(r"run: (zizmor .*)", workflow).group(1)
     assert zizmor in gate
+    pin_age = re.search(r"run: python (scripts/ci/check_pin_age\.py .*)", workflow).group(1)
+    assert f"uv run --frozen python {pin_age}" in gate
+
+
+def test_pin_age_gate_covers_every_lock_at_its_dependabot_cooldown():
+    """#312i: the pin-age step is the only proof that a Dependabot bump did not
+    drag in a fresh transitive pin. It must read every lock Dependabot writes,
+    at the default-days of the Dependabot entry that writes it."""
+    import yaml
+
+    workflow = TESTS_YML.read_text(encoding="utf-8")
+    command = re.search(r"run: python scripts/ci/check_pin_age\.py (.*)", workflow).group(1).split()
+    min_days = float(command[command.index("--min-days") + 1])
+    paths = command[command.index("--min-days") + 2 :]
+    assert paths == ["uv.lock", ".github/requirements/*.txt"]
+
+    config = yaml.safe_load((REPO_ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8"))
+    uv_entries = {e["directory"]: e for e in config["updates"] if e["package-ecosystem"] == "uv"}
+    assert set(uv_entries) == {"/", "/.github/requirements"}
+    for directory, entry in uv_entries.items():
+        assert entry["cooldown"]["default-days"] == min_days, directory
+    # pyproject's exclude-newer comment states the same 7-day floor.
+    assert "≥ 7 days ago is the minimum standard" in (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert min_days == 7
 
 
 def test_release_gate_takes_the_audit_tools_from_the_hash_locked_file():

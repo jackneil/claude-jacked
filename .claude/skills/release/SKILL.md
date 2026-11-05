@@ -16,6 +16,7 @@ description: "Cut a release the way this repo actually ships: detects PyPI/npm/c
   uv lock --check
   uv run --frozen ruff check .
   uv run --frozen python -m pytest
+  uv run --frozen python scripts/ci/check_pin_age.py --min-days 7 uv.lock .github/requirements/*.txt
   GATE_TMP="$(mktemp -d)"
   uv export --frozen --format requirements-txt --no-emit-project --no-hashes --no-annotate --no-header -o "$GATE_TMP/export.txt"
   sed -E 's/ *;.*$//' "$GATE_TMP/export.txt" | sort -u > "$GATE_TMP/locked.txt"

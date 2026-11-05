@@ -25,6 +25,11 @@ updates:
   # (#298pr: backports-tarfile), which breaks the release build. The
   # "Release rehearsal" job in tests.yml installs ci-publish.txt the way
   # publish.yml does, so a bad bump fails on its own pull request.
+  # The cooldown covers only the bumped package: the updater compiles
+  # without --exclude-newer, so a bump can drag in a transitive pin that is
+  # hours old. The pin-age step in tests.yml (scripts/ci/check_pin_age.py)
+  # fails that pull request until every locked file is 7 days old (#312i).
+  # Keep default-days here equal to its --min-days (a test pins this).
   - package-ecosystem: "uv"
     directory: "/.github/requirements"
     schedule:
