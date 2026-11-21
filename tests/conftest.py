@@ -13,8 +13,20 @@ from pathlib import Path
 import pytest
 from unittest.mock import patch
 
-# The developer's real home, captured before anything can move HOME.
-REAL_HOME = Path.home()
+# The developer's real home, captured before anything can move HOME. The
+# first pytest process records it in JACKED_TESTS_REAL_HOME (the root
+# conftest.py does this first). A pytest-xdist worker starts with the HOME
+# that the controller already moved (line below), so it must read the real
+# home from that variable and not from Path.home(); without it every
+# real-home tripwire in a worker guarded a temporary directory.
+REAL_HOME = Path(os.environ.setdefault("JACKED_TESTS_REAL_HOME", str(Path.home())))
+if not (REAL_HOME.is_absolute() and REAL_HOME.is_dir()):
+    # An empty, relative or wrong value would point every real-home tripwire
+    # at the wrong folder and let the run pass: refuse to start instead.
+    raise RuntimeError(
+        f"JACKED_TESTS_REAL_HOME={str(REAL_HOME)!r} is not an existing absolute folder; "
+        "unset it so the tests record the real home themselves"
+    )
 
 # Isolate HOME (and USERPROFILE on Windows) BEFORE the first jacked import.
 # Eleven modules compute a path from ``Path.home()`` at import time
@@ -118,6 +130,14 @@ def pytest_configure(config):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    workeroutput = getattr(session.config, "workeroutput", None)
+    if workeroutput is not None:
+        # A pytest-xdist worker. xdist reads the worker's exit status before
+        # this hook runs, so a status set here never reaches the controller.
+        # The attempts go to the controller in the worker output instead
+        # (pytest_testnodedown below), and the controller fails the run.
+        workeroutput["exec_attempts"] = list(_EXEC_ATTEMPTS)
+        return
     if _EXEC_ATTEMPTS:
         session.config.get_terminal_writer().line(
             "\nTRIPWIRE: something tried to replace the pytest process: "
@@ -125,6 +145,17 @@ def pytest_sessionfinish(session, exitstatus):
             red=True,
         )
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    """Collect the exec attempts of a pytest-xdist worker that finished.
+
+    Runs in the controller, before its own pytest_sessionfinish, so the
+    attempts of every worker fail the run the same way a serial run fails.
+    """
+    attempts = getattr(node, "workeroutput", {}).get("exec_attempts", ())
+    _EXEC_ATTEMPTS.extend(f"{attempt} (worker {node.gateway.id})" for attempt in attempts)
 
 
 @pytest.fixture

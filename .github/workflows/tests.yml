@@ -21,6 +21,9 @@ jobs:
         # on 2026-11-02, actions/runner-images issue 13518).
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # The default is 360 minutes: a hung test would hold the runner for six
+    # hours. 40 is above the slowest serial run seen (Windows, 37 minutes).
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:
@@ -54,8 +57,41 @@ jobs:
         # The rule set is pinned in pyproject.toml ([tool.ruff.lint]).
         run: uv run --frozen ruff check .
 
+      - name: Fast temp folder and more test workers (Windows)
+        # The Windows tests wait on disk and on process starts, not on CPU,
+        # and TEMP (every tmp_path and test home) is on the slow C: drive.
+        # Measured on windows-latest (#321i, runs 44914344094 and 44915971937):
+        # pytest took 872 s with TEMP on C: and 4 workers, 445 s with TEMP on
+        # D:, and 258 to 281 s with TEMP on D: and 8 workers (the runner has
+        # 4 CPUs; 12 workers were not faster).
+        # PYTEST_XDIST_AUTO_NUM_WORKERS sets what `-n auto` means, so the
+        # test command below stays the same on every OS. The folder is inside
+        # RUNNER_TEMP, which the runner empties at the start and the end of
+        # each job, so no file from another job can be there (Python 3.11.9
+        # does not restrict the ACL of a mkdtemp folder outside the user
+        # profile, CVE-2024-4030). A runner whose RUNNER_TEMP is not on D:
+        # keeps the defaults and says so.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_TEMP -like 'D:\*') {
+            $tmp = Join-Path $env:RUNNER_TEMP 'pytest-tmp'
+            New-Item -ItemType Directory -Force $tmp | Out-Null
+            "TEMP=$tmp" >> $env:GITHUB_ENV
+            "TMP=$tmp" >> $env:GITHUB_ENV
+            "PYTEST_XDIST_AUTO_NUM_WORKERS=8" >> $env:GITHUB_ENV
+            Write-Output "TEMP and TMP: $tmp; pytest-xdist workers: 8"
+          } else {
+            Write-Output "::warning::RUNNER_TEMP ($env:RUNNER_TEMP) is not on D: on this runner image: TEMP stays on C: and the Windows tests run about 3 times slower"
+          }
+
       - name: Run tests
-        run: uv run --frozen python -m pytest
+        # -n auto: one pytest-xdist worker per CPU that the runner reports
+        # (Windows: the step above). Serial, the Windows leg took 26 to 37
+        # minutes. --durations=30 names the slowest tests in every log, so a
+        # slow test shows up in the first run that carries it; a hung test
+        # prints its stack after faulthandler_timeout (pyproject.toml).
+        run: uv run --frozen python -m pytest -n auto --durations=30
 
   release-rehearsal:
     # Runs the release build job (build-dist.yml) without publishing, so a

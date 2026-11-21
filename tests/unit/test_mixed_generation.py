@@ -13,6 +13,7 @@ transactions importing their modules before the install.
 from __future__ import annotations
 
 import importlib
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -389,6 +390,56 @@ class TestWalkEdges:
         # Its own source lookup raises: no source, no lazy imports.
         assert mixed_generation.lazy_imports("jacked.service.supervisors.launchd") == set()
         assert mixed_generation._is_submodule("jacked.service.supervisors.launchd.anything") is False
+
+
+class TestStatementCache:
+    """The parse of a module is kept per file identity: a second walk of an
+    unchanged file reads nothing, and a replaced file is read again."""
+
+    def test_an_unchanged_module_is_parsed_once(self, monkeypatch):
+        first = mixed_generation.lazy_imports("jacked.service.supervisors")
+        parses = []
+        real_parse = mixed_generation.ast.parse
+        monkeypatch.setattr(mixed_generation.ast, "parse", lambda *a, **k: parses.append(a) or real_parse(*a, **k))
+        assert mixed_generation.lazy_imports("jacked.service.supervisors") == first
+        assert parses == []
+
+    def test_the_entry_is_part_of_the_key(self):
+        whole = mixed_generation.lazy_imports("jacked.cli")
+        upgrade = mixed_generation.lazy_imports("jacked.cli", entry="_run_upgrade_inline")
+        assert upgrade < whole
+
+    def test_a_rewrite_that_keeps_the_size_and_the_mtime_is_read_again(self, tmp_path):
+        """The case file times cannot see: the same size, the mtime put back,
+        and on Windows a ctime that is the creation time."""
+        source = tmp_path / "mod.py"
+        source.write_bytes(b"def f():\n    import jacked.a\n")
+        before = source.stat()
+        assert mixed_generation._import_statements(str(source), None) == ((None, None, ("jacked.a",)),)
+        with open(source, "r+b") as handle:  # in place: the inode stays
+            handle.write(b"def f():\n    import jacked.b\n")
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = source.stat()
+        assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+        assert mixed_generation._import_statements(str(source), None) == ((None, None, ("jacked.b",)),)
+
+    def test_a_file_an_install_renames_into_place_is_read_again(self, tmp_path):
+        source = tmp_path / "mod.py"
+        source.write_bytes(b"def f():\n    import jacked.a\n")
+        assert mixed_generation._import_statements(str(source), None) == ((None, None, ("jacked.a",)),)
+        staged = tmp_path / "mod.py.new"
+        staged.write_bytes(b"def f():\n    import jacked.b\n")
+        os.replace(staged, source)
+        assert mixed_generation._import_statements(str(source), None) == ((None, None, ("jacked.b",)),)
+
+    def test_a_file_that_does_not_parse_is_not_cached(self, tmp_path):
+        source = tmp_path / "mod.py"
+        source.write_text("def f(:\n", encoding="utf-8")
+        assert mixed_generation._import_statements(str(source), None) is None
+        assert not any(key[0] == str(source) for key in mixed_generation._STATEMENTS)
+
+    def test_a_missing_file_gives_none(self, tmp_path):
+        assert mixed_generation._import_statements(str(tmp_path / "gone.py"), None) is None
 
 
 class TestNamesFromMissingOnDisk:
