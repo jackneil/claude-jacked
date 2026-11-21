@@ -409,16 +409,26 @@ class TestStatementCache:
         upgrade = mixed_generation.lazy_imports("jacked.cli", entry="_run_upgrade_inline")
         assert upgrade < whole
 
-    def test_a_replaced_file_is_read_again(self, tmp_path):
+    def test_a_rewrite_that_keeps_the_size_and_the_mtime_is_read_again(self, tmp_path):
+        """The case file times cannot see: the same size, the mtime put back,
+        and on Windows a ctime that is the creation time."""
         source = tmp_path / "mod.py"
-        source.write_text("def f():\n    import jacked.a\n", encoding="utf-8")
+        source.write_bytes(b"def f():\n    import jacked.a\n")
+        before = source.stat()
         assert mixed_generation._import_statements(str(source), None) == ((None, None, ("jacked.a",)),)
-        # The way an install writes a file: a new file renamed over the old one
-        # (a new inode), here with the same size and a later mtime as well.
+        with open(source, "r+b") as handle:  # in place: the inode stays
+            handle.write(b"def f():\n    import jacked.b\n")
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = source.stat()
+        assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+        assert mixed_generation._import_statements(str(source), None) == ((None, None, ("jacked.b",)),)
+
+    def test_a_file_an_install_renames_into_place_is_read_again(self, tmp_path):
+        source = tmp_path / "mod.py"
+        source.write_bytes(b"def f():\n    import jacked.a\n")
+        assert mixed_generation._import_statements(str(source), None) == ((None, None, ("jacked.a",)),)
         staged = tmp_path / "mod.py.new"
-        staged.write_text("def f():\n    import jacked.b\n", encoding="utf-8")
-        old = source.stat()
-        os.utime(staged, ns=(old.st_atime_ns, old.st_mtime_ns + 1_000_000_000))
+        staged.write_bytes(b"def f():\n    import jacked.b\n")
         os.replace(staged, source)
         assert mixed_generation._import_statements(str(source), None) == ((None, None, ("jacked.b",)),)
 

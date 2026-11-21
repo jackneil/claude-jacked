@@ -35,9 +35,9 @@ fallback at each call site, and a unit test holds the set.
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
 import importlib.util
-import os
 import re
 import sys
 from pathlib import Path
@@ -192,15 +192,16 @@ def lazy_imports(module: str, entry: str | None = None) -> set[str]:
     return found
 
 
-# The import statements of a source file, keyed on the file's identity and
-# the entry function. Reading and walking the whole package is the cost of a
-# preload (about 0.8 s here): one upgrade transaction pays it once, and the
-# test suite, which runs the transaction in-process for each upgrade test,
-# paid it per test. A file that was replaced or rewritten has a new key (an
-# atomic replace changes the inode; a rewrite changes the mtime, the ctime or
-# the size), so a release on disk never reads as the old one. Only the parse
-# is kept: which names are submodules is asked again on every call.
-_STATEMENTS: dict[tuple, tuple | None] = {}
+# The import statements of a source file, keyed on the bytes of the file
+# (a SHA-256 digest) and the entry function. Reading and walking the whole
+# package is the cost of a preload (about 0.85 s here): one upgrade
+# transaction pays it once, and the test suite, which runs the transaction
+# in-process for each upgrade test, paid it per test. The file is read on
+# every call, so a file with other content always gets a new parse; file
+# times and inode numbers are not used (on Windows the ctime is the creation
+# time, and a rewrite can keep the size and the mtime). Only the parse is
+# kept: which names are submodules is asked again on every call.
+_STATEMENTS: dict[tuple, tuple] = {}
 
 
 def _import_statements(origin: str, entry: str | None) -> tuple | None:
@@ -210,15 +211,15 @@ def _import_statements(origin: str, entry: str | None) -> tuple | None:
     plain ``import``. ``None`` when the file cannot be read or parsed.
     """
     try:
-        st = os.stat(origin)
+        data = Path(origin).read_bytes()
     except OSError:
         return None
-    key = (origin, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size, entry)
+    key = (origin, entry, hashlib.sha256(data).digest())
     if key in _STATEMENTS:
         return _STATEMENTS[key]
     try:
-        tree = ast.parse(Path(origin).read_text(encoding="utf-8"))
-    except (OSError, SyntaxError, ValueError):
+        tree = ast.parse(data.decode("utf-8"))
+    except (SyntaxError, ValueError):
         return None  # not cached: a file mid-write can parse on the next call
     if entry is None:
         bodies = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]

@@ -118,6 +118,14 @@ def pytest_configure(config):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    workeroutput = getattr(session.config, "workeroutput", None)
+    if workeroutput is not None:
+        # A pytest-xdist worker. xdist reads the worker's exit status before
+        # this hook runs, so a status set here never reaches the controller.
+        # The attempts go to the controller in the worker output instead
+        # (pytest_testnodedown below), and the controller fails the run.
+        workeroutput["exec_attempts"] = list(_EXEC_ATTEMPTS)
+        return
     if _EXEC_ATTEMPTS:
         session.config.get_terminal_writer().line(
             "\nTRIPWIRE: something tried to replace the pytest process: "
@@ -125,6 +133,17 @@ def pytest_sessionfinish(session, exitstatus):
             red=True,
         )
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    """Collect the exec attempts of a pytest-xdist worker that finished.
+
+    Runs in the controller, before its own pytest_sessionfinish, so the
+    attempts of every worker fail the run the same way a serial run fails.
+    """
+    attempts = getattr(node, "workeroutput", {}).get("exec_attempts", ())
+    _EXEC_ATTEMPTS.extend(f"{attempt} (worker {node.gateway.id})" for attempt in attempts)
 
 
 @pytest.fixture

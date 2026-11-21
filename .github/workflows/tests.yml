@@ -58,10 +58,11 @@ jobs:
         run: uv run --frozen ruff check .
 
       - name: Run tests
-        # -n auto: one pytest-xdist worker per runner CPU (4 on ubuntu and
-        # windows, 3 on macos). Serial, the Windows leg took 26 to 37 minutes.
-        # --durations=30 names the slowest tests in every log, so a slow
-        # test shows up in the first run that carries it.
+        # -n auto: one pytest-xdist worker per CPU that the runner reports.
+        # Serial, the Windows leg took 26 to 37 minutes. --durations=30 names
+        # the slowest tests in every log, so a slow test shows up in the
+        # first run that carries it; a hung test prints its stack after
+        # faulthandler_timeout (pyproject.toml).
         run: uv run --frozen python -m pytest -n auto --durations=30
 
   release-rehearsal:
