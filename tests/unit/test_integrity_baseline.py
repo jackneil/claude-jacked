@@ -550,9 +550,20 @@ class TestFindingsNeverQuoteACommand:
 # --------------------------------------------------------------------------- #
 
 class TestConcurrentJackedWrites:
-    def test_three_writers_leave_no_finding_and_every_log_entry(self, home):
+    def test_three_writers_leave_no_finding_and_every_log_entry(self, home, monkeypatch, caplog):
+        """The baseline lock serializes jacked's writers. The lock fails open
+        after 5 s by design (``vault._file_lock``): a hook must never wait
+        longer. That budget is not under test here, and on a loaded Windows
+        runner one of 120 writes once waited past it and its entry was
+        dropped as designed. So the lock gets a hang guard of 120 s, and the
+        test fails if the fail-open path ran at all."""
         import threading
 
+        from jacked.memory import vault
+
+        real_lock = vault._file_lock
+        monkeypatch.setattr(vault, "_file_lock", lambda lock_path, timeout=120.0: real_lock(lock_path, timeout))
+        caplog.set_level(logging.WARNING, logger="jacked.memory.vault")
         path = _seed(home, {})
         errors = []
 
@@ -573,6 +584,7 @@ class TestConcurrentJackedWrites:
             t.join()
 
         assert errors == []
+        assert "unavailable" not in caplog.text  # every writer held the lock
         assert integrity.check(path) == []
         log = integrity.load_baseline(path)["log"]
         assert sum(1 for e in log if e["reason"].startswith("race ")) == 120

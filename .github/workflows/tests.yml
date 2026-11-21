@@ -57,12 +57,35 @@ jobs:
         # The rule set is pinned in pyproject.toml ([tool.ruff.lint]).
         run: uv run --frozen ruff check .
 
+      - name: Fast temp folder and more test workers (Windows)
+        # The Windows tests wait on disk and on process starts, not on CPU,
+        # and TEMP (every tmp_path and test home) is on the slow C: drive.
+        # Measured on windows-latest (#321i, runs 44914344094 and 44915971937):
+        # pytest took 872 s with TEMP on C: and 4 workers, 445 s with TEMP on
+        # D:, and 258 to 281 s with TEMP on D: and 8 workers (the runner has
+        # 4 CPUs; 12 workers were not faster).
+        # PYTEST_XDIST_AUTO_NUM_WORKERS sets what `-n auto` means, so the
+        # test command below stays the same on every OS. An image without a
+        # D: drive keeps the defaults and says so.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path 'D:\') {
+            New-Item -ItemType Directory -Force 'D:\tmp' | Out-Null
+            "TEMP=D:\tmp" >> $env:GITHUB_ENV
+            "TMP=D:\tmp" >> $env:GITHUB_ENV
+            "PYTEST_XDIST_AUTO_NUM_WORKERS=8" >> $env:GITHUB_ENV
+            Write-Output "TEMP and TMP: D:\tmp; pytest-xdist workers: 8"
+          } else {
+            Write-Output "::warning::No D: drive on this runner image: TEMP stays on C: and the Windows tests run about 3 times slower"
+          }
+
       - name: Run tests
-        # -n auto: one pytest-xdist worker per CPU that the runner reports.
-        # Serial, the Windows leg took 26 to 37 minutes. --durations=30 names
-        # the slowest tests in every log, so a slow test shows up in the
-        # first run that carries it; a hung test prints its stack after
-        # faulthandler_timeout (pyproject.toml).
+        # -n auto: one pytest-xdist worker per CPU that the runner reports
+        # (Windows: the step above). Serial, the Windows leg took 26 to 37
+        # minutes. --durations=30 names the slowest tests in every log, so a
+        # slow test shows up in the first run that carries it; a hung test
+        # prints its stack after faulthandler_timeout (pyproject.toml).
         run: uv run --frozen python -m pytest -n auto --durations=30
 
   release-rehearsal:

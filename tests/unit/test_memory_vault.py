@@ -784,7 +784,10 @@ def test_status_surfaces_health(env):
 
 def test_update_state_concurrent_writers_keep_both(env):
     # Two subprocesses each bump a DIFFERENT key under the state lock; both must
-    # survive (a naive load/save would lose one).
+    # survive (a naive load/save would lose one). The lock fails open after 5 s
+    # by design, and that budget is not under test: on a loaded runner a child
+    # can wait longer, so each child gives the lock a 120 s hang guard, and the
+    # test fails if the fail-open path ran at all.
     import sys
     import textwrap
 
@@ -794,6 +797,8 @@ def test_update_state_concurrent_writers_keep_both(env):
         import os, sys
         os.environ["JACKED_HOME"] = sys.argv[1]
         from jacked.memory import vault as v
+        real_lock = v._file_lock
+        v._file_lock = lambda lock_path, timeout=120.0: real_lock(lock_path, timeout)
         key = sys.argv[2]
         for _ in range(20):
             v.update_state(None, lambda s: s.__setitem__(key, int(s.get(key, 0)) + 1))
@@ -801,11 +806,13 @@ def test_update_state_concurrent_writers_keep_both(env):
     )
     procs = [
         subprocess.Popen([sys.executable, "-c", prog, str(env.home), key],
-                         cwd=str(REPO_ROOT_VAULT))
+                         cwd=str(REPO_ROOT_VAULT), stderr=subprocess.PIPE, text=True)
         for key in ("drift_added", "capture_failures")
     ]
     for p in procs:
-        assert p.wait(timeout=60) == 0
+        _, err = p.communicate(timeout=180)
+        assert p.returncode == 0, err
+        assert "unavailable" not in err, err  # every update held the lock
 
     st = vault_mod.load_state(env.home)
     assert st["drift_added"] == 20
