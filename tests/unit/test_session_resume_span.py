@@ -31,13 +31,36 @@ def db(tmp_path):
 
 
 def _age(db, session_id, hours):
-    seen = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    """Move each open span of ``session_id`` back ``hours``.
+
+    Each row gets an instant that no other row of the session holds, because
+    the table is UNIQUE(session_id, detected_at). The Windows clock of Python
+    3.11 moves in 15.6 ms steps: two calls in one step once gave the ended
+    span and the new span the same instant, and the UPDATE failed. Production
+    avoids the same collision with ``unique_detected_at``.
+    """
+    seen = datetime.now(timezone.utc) - timedelta(hours=hours)
     with db._writer() as conn:
-        conn.execute(
-            "UPDATE session_accounts SET detected_at = ?, last_activity_at = ? "
-            "WHERE session_id = ? AND ended_at IS NULL",
-            (seen, seen, session_id),
-        )
+        taken = {
+            row[0] for row in conn.execute(
+                "SELECT detected_at FROM session_accounts WHERE session_id = ?", (session_id,)
+            )
+        }
+        open_ids = [
+            row[0] for row in conn.execute(
+                "SELECT id FROM session_accounts WHERE session_id = ? AND ended_at IS NULL",
+                (session_id,),
+            )
+        ]
+        for row_id in open_ids:
+            while seen.isoformat() in taken:
+                seen -= timedelta(microseconds=1)
+            stamp = seen.isoformat()
+            taken.add(stamp)
+            conn.execute(
+                "UPDATE session_accounts SET detected_at = ?, last_activity_at = ? WHERE id = ?",
+                (stamp, stamp, row_id),
+            )
 
 
 def _rows(db, session_id):
@@ -201,3 +224,25 @@ def test_the_hook_records_the_token_of_its_parent(monkeypatch):
     assert seen["pid_token"] == "tok-4100"
     hook._record_session("s", 4, "a@b.com", "session_start", None, 1)
     assert seen["pid_token"] is None
+
+
+def test_two_ages_in_one_clock_step_keep_the_spans_distinct(db, monkeypatch):
+    """The Windows clock of Python 3.11 moves in 15.6 ms steps. With the clock
+    held still, two ``_age`` calls must still give two distinct instants, as
+    UNIQUE(session_id, detected_at) requires."""
+    import sys
+
+    still = datetime(2026, 11, 21, 12, 0, tzinfo=timezone.utc)
+
+    class _StillClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return still
+
+    monkeypatch.setattr(sys.modules[__name__], "datetime", _StillClock)
+    db.record_session_account("s", account_id=4, pid=4100, pid_token="tok-a")
+    _age(db, "s", 9)
+    db.record_session_account("s", account_id=4, pid=5200, pid_token="tok-b")
+    _age(db, "s", 9)
+    stamps = [row["detected_at"] for row in _rows(db, "s")]
+    assert len(stamps) == 2 and len(set(stamps)) == 2, stamps
