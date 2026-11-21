@@ -52,3 +52,12 @@ updates:
     commit-message:
       prefix: "chore(actions)"
       include: "scope"
+    # Dependabot treats each `uses:` path as its own dependency, so it bumped
+    # github/codeql-action/init and /analyze in two pull requests (#316pr,
+    # #317pr), and each one failed: every codeql-action step of a workflow
+    # must run the same version. The group bumps them in one pull request.
+    # tests/unit/test_workflow_action_pins.py fails on any version skew.
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
