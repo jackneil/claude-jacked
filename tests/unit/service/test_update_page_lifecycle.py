@@ -95,8 +95,10 @@ def _run(tmp_path, steps):
         ["node", str(tmp_path / "harness.js"), str(tmp_path / "page.js"),
          str(tmp_path / "steps.json")],
         # node writes UTF-8; Windows' default code page would mangle the
-        # heading's ellipsis.
-        capture_output=True, text=True, encoding="utf-8", timeout=30, check=False,
+        # heading's ellipsis. The timeout is a hang guard only: a run takes
+        # 2 to 6 s, and a cold node start on a loaded Windows runner (8 test
+        # workers) once took more than 30 s.
+        capture_output=True, text=True, encoding="utf-8", timeout=120, check=False,
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout)

@@ -35,6 +35,7 @@ fallback at each call site, and a unit test holds the set.
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
 import importlib.util
 import re
@@ -170,36 +171,78 @@ def lazy_imports(module: str, entry: str | None = None) -> set[str]:
     >>> lazy_imports("jacked.module_that_does_not_exist")
     set()
     """
-    tree = _source_tree(module)
-    if tree is None:
+    origin = _origin(module)
+    if origin is None:
         return set()
+    statements = _import_statements(origin, entry)
+    if statements is None:
+        return set()
+    package = module if Path(origin).name == "__init__.py" else module.rpartition(".")[0]
+    found: set[str] = set()
+    for level, base_name, names in statements:
+        if level is None:  # ``import a, b``
+            found.update(name for name in names if _is_jacked(name))
+            continue
+        base = _absolute(level, base_name, package)
+        if not _is_jacked(base):
+            continue
+        if base_name:
+            found.add(base)
+        found.update(f"{base}.{name}" for name in names if _is_submodule(f"{base}.{name}"))
+    return found
+
+
+# The import statements of a source file, keyed on the bytes of the file
+# (a SHA-256 digest) and the entry function. Reading and walking the whole
+# package is the cost of a preload (about 0.85 s here): one upgrade
+# transaction pays it once, and the test suite, which runs the transaction
+# in-process for each upgrade test, paid it per test. The file is read on
+# every call, so a file with other content always gets a new parse; file
+# times and inode numbers are not used (on Windows the ctime is the creation
+# time, and a rewrite can keep the size and the mtime). Only the parse is
+# kept: which names are submodules is asked again on every call.
+_STATEMENTS: dict[tuple, tuple] = {}
+
+
+def _import_statements(origin: str, entry: str | None) -> tuple | None:
+    """The ``jacked``-relevant import statements in ``origin``'s functions.
+
+    Each item is ``(level, module, names)``; ``level`` is ``None`` for a
+    plain ``import``. ``None`` when the file cannot be read or parsed.
+    """
+    try:
+        data = Path(origin).read_bytes()
+    except OSError:
+        return None
+    key = (origin, entry, hashlib.sha256(data).digest())
+    if key in _STATEMENTS:
+        return _STATEMENTS[key]
+    try:
+        tree = ast.parse(data.decode("utf-8"))
+    except (SyntaxError, ValueError):
+        return None  # not cached: a file mid-write can parse on the next call
     if entry is None:
         bodies = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
     else:
         top = _top_functions(tree)
         bodies = [top[name] for name in sorted(reachable_functions(tree, entry))]
-    package = module if Path(_origin(module) or "").name == "__init__.py" else module.rpartition(".")[0]
-    found: set[str] = set()
+    statements = []
     for function in bodies:
         for node in ast.walk(function):
             if isinstance(node, ast.Import):
-                found.update(a.name for a in node.names if _is_jacked(a.name))
+                statements.append((None, None, tuple(a.name for a in node.names)))
             elif isinstance(node, ast.ImportFrom):
-                base = _absolute(node, package)
-                if not _is_jacked(base):
-                    continue
-                if node.module:
-                    found.add(base)
-                found.update(f"{base}.{a.name}" for a in node.names if _is_submodule(f"{base}.{a.name}"))
-    return found
+                statements.append((node.level, node.module, tuple(a.name for a in node.names)))
+    _STATEMENTS[key] = result = tuple(statements)
+    return result
 
 
-def _absolute(node: ast.ImportFrom, package: str) -> str | None:
+def _absolute(level: int, module: str | None, package: str) -> str | None:
     """The absolute module name of ``from ... import``, relative ones too."""
-    if node.level == 0:
-        return node.module
+    if level == 0:
+        return module
     try:
-        return importlib.util.resolve_name("." * node.level + (node.module or ""), package)
+        return importlib.util.resolve_name("." * level + (module or ""), package)
     except (ImportError, ValueError):
         return None
 
@@ -237,16 +280,6 @@ def _origin(module: str) -> str | None:
         return None
     origin = getattr(spec, "origin", None) if spec else None
     return origin if origin and origin.endswith(".py") else None
-
-
-def _source_tree(module: str) -> ast.Module | None:
-    origin = _origin(module)
-    if origin is None:
-        return None
-    try:
-        return ast.parse(Path(origin).read_text(encoding="utf-8"))
-    except (OSError, SyntaxError, ValueError):
-        return None
 
 
 def _is_jacked(name: str | None) -> bool:

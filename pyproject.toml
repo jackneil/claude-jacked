@@ -95,6 +95,7 @@ dev = [
     # on each import. The service code keeps httpx (see [project].dependencies).
     # tests/unit/test_testclient_backend.py fails if httpx2 is missing.
     "httpx2>=2.16,<3",
+    "pytest-xdist>=3.8,<4",
 ]
 
 [project.scripts]
@@ -113,6 +114,10 @@ packages = ["jacked"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A test that runs longer than this prints the stack of every thread once
+# (it is not stopped). Under pytest-xdist this is the only record of where a
+# hung worker waits, before the CI job timeout cancels the run.
+faulthandler_timeout = 300
 python_files = ["test_*.py"]
 markers = [
     "real_process: the test deliberately executes a sandboxed stub process (opts out of the real-service tripwire in tests/conftest.py)",

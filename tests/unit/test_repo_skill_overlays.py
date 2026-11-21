@@ -37,7 +37,7 @@ def test_release_gate_runs_every_command_of_the_ci_workflow():
     for command in (
         "uv lock --check",
         "uv run --frozen ruff check .",
-        "uv run --frozen python -m pytest",
+        "uv run --frozen python -m pytest -n auto --durations=30",
     ):
         assert f"run: {command}" in workflow, command
         assert command in gate, command
