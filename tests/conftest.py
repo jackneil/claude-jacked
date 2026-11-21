@@ -13,8 +13,13 @@ from pathlib import Path
 import pytest
 from unittest.mock import patch
 
-# The developer's real home, captured before anything can move HOME.
-REAL_HOME = Path.home()
+# The developer's real home, captured before anything can move HOME. The
+# first pytest process records it in JACKED_TESTS_REAL_HOME (the root
+# conftest.py does this first). A pytest-xdist worker starts with the HOME
+# that the controller already moved (line below), so it must read the real
+# home from that variable and not from Path.home(); without it every
+# real-home tripwire in a worker guarded a temporary directory.
+REAL_HOME = Path(os.environ.setdefault("JACKED_TESTS_REAL_HOME", str(Path.home())))
 
 # Isolate HOME (and USERPROFILE on Windows) BEFORE the first jacked import.
 # Eleven modules compute a path from ``Path.home()`` at import time

@@ -4,6 +4,8 @@ import threading
 
 import pytest
 
+from tests._nested_pytest import nested_pytest
+
 EXEC_NAMES = ("execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe")
 
 
@@ -54,29 +56,11 @@ def test_nothing():
 '''
 
 
-def _nested_pytest(tmp_path, probe, *extra):
-    """Run ``probe`` in a nested pytest with this suite's conftest as a plugin."""
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    repo_root = Path(__file__).resolve().parents[2]
-    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
-    (tmp_path / "test_probe.py").write_text(probe, encoding="utf-8")
-    env = dict(os.environ, PYTHONPATH=str(repo_root))
-    return subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "tests.conftest",
-         "-c", str(tmp_path / "pytest.ini"), "--rootdir", str(tmp_path),
-         *extra, str(tmp_path / "test_probe.py")],
-        cwd=repo_root, env=env, capture_output=True, text=True, timeout=180,
-    )
-
-
 @pytest.mark.parametrize("mode", [(), ("-n", "2")], ids=["serial", "xdist"])
 def test_a_caught_exec_attempt_fails_the_run(tmp_path, mode):
     """Under pytest-xdist the worker's own exit status never reaches the
     controller, so the attempt must travel in the worker output."""
-    proc = _nested_pytest(tmp_path, _LEAVES_AN_ATTEMPT, *mode)
+    proc = nested_pytest(tmp_path, _LEAVES_AN_ATTEMPT, *mode)
     out = proc.stdout + proc.stderr
     assert proc.returncode == pytest.ExitCode.TESTS_FAILED, out
     assert "1 passed" in out, out  # the test itself passed: only the tripwire failed the run
@@ -86,5 +70,5 @@ def test_a_caught_exec_attempt_fails_the_run(tmp_path, mode):
 @pytest.mark.parametrize("mode", [(), ("-n", "2")], ids=["serial", "xdist"])
 def test_a_run_with_no_attempt_passes(tmp_path, mode):
     """Negative control: the nested run itself is green without an attempt."""
-    proc = _nested_pytest(tmp_path, _DOES_NOTHING, *mode)
+    proc = nested_pytest(tmp_path, _DOES_NOTHING, *mode)
     assert proc.returncode == pytest.ExitCode.OK, proc.stdout + proc.stderr

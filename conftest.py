@@ -22,7 +22,9 @@ from pathlib import Path
 import pytest
 
 # The developer's real home, captured before any fixture can move HOME.
-REAL_HOME = Path.home()
+# pytest-xdist workers inherit a HOME that tests/conftest.py already moved,
+# so the value goes to them in JACKED_TESTS_REAL_HOME (see tests/conftest.py).
+REAL_HOME = Path(os.environ.setdefault("JACKED_TESTS_REAL_HOME", str(Path.home())))
 
 # Terminal-size variables that readline writes into the C environment.
 _READLINE_SIZE_VARS = ("COLUMNS", "LINES")

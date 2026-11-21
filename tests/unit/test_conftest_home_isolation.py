@@ -70,3 +70,38 @@ def test_every_name_bound_to_the_shared_replace_is_guarded(tmp_path):
         with pytest.raises(RuntimeError, match="real ~/.claude"):
             writer(str(src), real_dst)
     assert src.exists()
+
+
+def test_the_real_home_is_not_a_test_home():
+    """A pytest-xdist worker starts with the HOME that the controller already
+    moved. REAL_HOME must still name the developer's home there, or every
+    real-home tripwire above guards a temporary directory."""
+    import conftest as root_conftest
+
+    assert not any(p.name.startswith("jacked-tests-home-") for p in (REAL_HOME, *REAL_HOME.parents)), REAL_HOME
+    assert REAL_HOME == root_conftest.REAL_HOME
+
+
+_PROBE_REAL_HOME = '''
+import os
+from pathlib import Path
+
+def test_real_home_in_this_process():
+    from tests.conftest import REAL_HOME
+    assert REAL_HOME == Path(os.environ["PROBE_EXPECTED_REAL_HOME"]), REAL_HOME
+'''
+
+
+@pytest.mark.parametrize("mode", [(), ("-n", "2")], ids=["serial", "xdist"])
+def test_a_worker_sees_the_home_the_run_started_with(tmp_path, mode):
+    """A fresh run from a given HOME: the workers report that HOME as
+    REAL_HOME, not the temporary home that the controller moved to."""
+    from tests._nested_pytest import nested_pytest
+
+    developer_home = tmp_path / "developer-home"
+    developer_home.mkdir()
+    env = {k: v for k, v in os.environ.items() if k != "JACKED_TESTS_REAL_HOME"}
+    env.update(HOME=str(developer_home), USERPROFILE=str(developer_home),
+               PROBE_EXPECTED_REAL_HOME=str(developer_home))
+    proc = nested_pytest(tmp_path / "run", _PROBE_REAL_HOME, *mode, env=env)
+    assert proc.returncode == pytest.ExitCode.OK, proc.stdout + proc.stderr
