@@ -29,7 +29,7 @@ Read these for reviewer context (validate with `ls` first, skip missing):
 - `design/memory-vault-design.html`
 - `docs/architecture/oauth-and-credential-flows.md`, `docs/architecture/auto-swap-system.md`, `docs/architecture/work-ledger.html`
 - `tests/unit/test_module_size_ratchet.py` (the per-module line BASELINE: a module may not grow past its entry; split instead)
-- `.github/workflows/tests.yml` (the real gate: `uv lock --check`, `uv run --frozen ruff check .`, `uv run --frozen python -m pytest` on three OSes)
+- `.github/workflows/tests.yml` (the real gate: `uv lock --check`, `uv run --frozen ruff check .`, `uv run --frozen python -m pytest -n auto --durations=30` on three OSes)
 
 ## Domain Wild Cards
 In addition to the standard pool, include:

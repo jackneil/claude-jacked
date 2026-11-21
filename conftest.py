@@ -15,6 +15,7 @@ collapse into one database shared by the whole session.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -22,6 +23,45 @@ import pytest
 
 # The developer's real home, captured before any fixture can move HOME.
 REAL_HOME = Path.home()
+
+# Terminal-size variables that readline writes into the C environment.
+_READLINE_SIZE_VARS = ("COLUMNS", "LINES")
+
+
+def drop_readline_terminal_size(environ=os.environ, unsetenv=os.unsetenv) -> list[str]:
+    """Remove the terminal size that readline put in the process environment.
+
+    When the pytest process imports ``readline`` (libedit on macOS, GNU
+    readline on Linux), readline calls ``setenv`` for ``COLUMNS`` and
+    ``LINES``. ``os.environ`` does not see that call, but every child
+    process inherits it, the pytest-xdist workers too. A worker then starts
+    with ``COLUMNS=80`` and every module-level ``rich`` ``Console`` keeps a
+    fixed width of 80. A test that sets ``COLUMNS`` itself then gets wrapped
+    output that it does not get in a serial run (``test_usage_cmd``,
+    ``test_claude_skill_preservation``). A value that ``os.environ`` holds
+    (exported by the user, or set from Python) stays. Returns the names it
+    removed from the C environment.
+
+    >>> removed = []
+    >>> drop_readline_terminal_size({"LINES": "40"}, removed.append)
+    ['COLUMNS']
+    >>> removed
+    ['COLUMNS']
+    """
+    dropped = [name for name in _READLINE_SIZE_VARS if name not in environ]
+    for name in dropped:
+        unsetenv(name)
+    return dropped
+
+
+drop_readline_terminal_size()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionstart(session):
+    # Again just before pytest-xdist starts its workers (its own
+    # pytest_sessionstart runs last), in case readline loaded after import.
+    drop_readline_terminal_size()
 
 
 def _is_doctest(node) -> bool:

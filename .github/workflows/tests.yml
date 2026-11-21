@@ -21,6 +21,9 @@ jobs:
         # on 2026-11-02, actions/runner-images issue 13518).
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # The default is 360 minutes: a hung test would hold the runner for six
+    # hours. 40 is above the slowest serial run seen (Windows, 37 minutes).
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:
@@ -55,7 +58,11 @@ jobs:
         run: uv run --frozen ruff check .
 
       - name: Run tests
-        run: uv run --frozen python -m pytest
+        # -n auto: one pytest-xdist worker per runner CPU (4 on ubuntu and
+        # windows, 3 on macos). Serial, the Windows leg took 26 to 37 minutes.
+        # --durations=30 names the slowest tests in every log, so a slow
+        # test shows up in the first run that carries it.
+        run: uv run --frozen python -m pytest -n auto --durations=30
 
   release-rehearsal:
     # Runs the release build job (build-dist.yml) without publishing, so a
