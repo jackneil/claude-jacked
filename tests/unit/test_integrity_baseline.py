@@ -584,7 +584,9 @@ class TestConcurrentJackedWrites:
             t.join()
 
         assert errors == []
-        assert "unavailable" not in caplog.text  # every writer held the lock
+        # Neither fail-open path ran (lock file not opened, or lock not taken).
+        assert [r.getMessage() for r in caplog.records
+                if r.name == "jacked.memory.vault" and r.levelno >= logging.WARNING] == []
         assert integrity.check(path) == []
         log = integrity.load_baseline(path)["log"]
         assert sum(1 for e in log if e["reason"].startswith("race ")) == 120
