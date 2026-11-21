@@ -866,6 +866,23 @@ def _reset_mutation_gate_throttle():
 
 
 @pytest.fixture(autouse=True)
+def _reset_usage_fetch_state():
+    """The per-account usage poll state and the 6-hour profile throttle of
+    jacked.web.auth live in the process. A test that passed only because an
+    earlier test in the same process stamped the throttle failed under
+    pytest-xdist, where other tests share the process (Windows, #322pr). No
+    test may inherit another test's stamp: a test that must skip the
+    piggybacked profile GET stamps the throttle itself."""
+    from jacked.web import auth
+
+    auth._account_usage_state.clear()
+    auth._profile_refreshed_at.clear()
+    yield
+    auth._account_usage_state.clear()
+    auth._profile_refreshed_at.clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_keychain_latches():
     from jacked.credentials.macos_store import (
         clear_keychain_latches,

@@ -126,6 +126,7 @@ class TestCacheFreshnessGuard:
     def setup_method(self):
         import jacked.web.auth as mod
         mod._account_usage_state.clear()
+        mod._profile_refreshed_at[1] = time.time()  # no piggybacked profile GET
 
     def test_fresh_cache_returns_cached_sentinel(self):
         """last_fetched_at recent -> return _cached."""
