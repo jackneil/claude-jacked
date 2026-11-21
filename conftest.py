@@ -25,6 +25,13 @@ import pytest
 # pytest-xdist workers inherit a HOME that tests/conftest.py already moved,
 # so the value goes to them in JACKED_TESTS_REAL_HOME (see tests/conftest.py).
 REAL_HOME = Path(os.environ.setdefault("JACKED_TESTS_REAL_HOME", str(Path.home())))
+if not (REAL_HOME.is_absolute() and REAL_HOME.is_dir()):
+    # An empty, relative or wrong value would point every real-home tripwire
+    # at the wrong folder and let the run pass: refuse to start instead.
+    raise RuntimeError(
+        f"JACKED_TESTS_REAL_HOME={str(REAL_HOME)!r} is not an existing absolute folder; "
+        "unset it so the tests record the real home themselves"
+    )
 
 # Terminal-size variables that readline writes into the C environment.
 _READLINE_SIZE_VARS = ("COLUMNS", "LINES")

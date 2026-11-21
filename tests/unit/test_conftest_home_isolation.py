@@ -80,6 +80,7 @@ def test_the_real_home_is_not_a_test_home():
 
     assert not any(p.name.startswith("jacked-tests-home-") for p in (REAL_HOME, *REAL_HOME.parents)), REAL_HOME
     assert REAL_HOME == root_conftest.REAL_HOME
+    assert REAL_HOME.is_absolute() and REAL_HOME.is_dir(), REAL_HOME
 
 
 _PROBE_REAL_HOME = '''
@@ -105,3 +106,23 @@ def test_a_worker_sees_the_home_the_run_started_with(tmp_path, mode):
                PROBE_EXPECTED_REAL_HOME=str(developer_home))
     proc = nested_pytest(tmp_path / "run", _PROBE_REAL_HOME, *mode, env=env)
     assert proc.returncode == pytest.ExitCode.OK, proc.stdout + proc.stderr
+
+
+_PROBE_NOTHING = """
+def test_nothing():
+    pass
+"""
+
+
+@pytest.mark.parametrize("value", ["", "relative/dir", "missing"], ids=["empty", "relative", "missing"])
+def test_a_bad_real_home_value_refuses_to_start(tmp_path, value):
+    """A value that names no existing absolute folder would aim the real-home
+    tripwires at the wrong place: the run must stop at conftest load."""
+    from tests._nested_pytest import nested_pytest
+
+    if value == "missing":
+        value = str(tmp_path / "does-not-exist")
+    env = dict(os.environ, JACKED_TESTS_REAL_HOME=value)
+    proc = nested_pytest(tmp_path / "run", _PROBE_NOTHING, env=env)
+    assert proc.returncode != pytest.ExitCode.OK, proc.stdout + proc.stderr
+    assert "JACKED_TESTS_REAL_HOME" in proc.stdout + proc.stderr

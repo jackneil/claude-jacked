@@ -20,6 +20,13 @@ from unittest.mock import patch
 # home from that variable and not from Path.home(); without it every
 # real-home tripwire in a worker guarded a temporary directory.
 REAL_HOME = Path(os.environ.setdefault("JACKED_TESTS_REAL_HOME", str(Path.home())))
+if not (REAL_HOME.is_absolute() and REAL_HOME.is_dir()):
+    # An empty, relative or wrong value would point every real-home tripwire
+    # at the wrong folder and let the run pass: refuse to start instead.
+    raise RuntimeError(
+        f"JACKED_TESTS_REAL_HOME={str(REAL_HOME)!r} is not an existing absolute folder; "
+        "unset it so the tests record the real home themselves"
+    )
 
 # Isolate HOME (and USERPROFILE on Windows) BEFORE the first jacked import.
 # Eleven modules compute a path from ``Path.home()`` at import time
