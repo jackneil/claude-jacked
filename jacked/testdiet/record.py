@@ -389,13 +389,15 @@ def _read_reports(top: Path, report: Path | None, globs: Sequence[str],
 def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, label: str | None,
                  runner: str | None, commit: str | None, exit_code: int | None,
                  wall_seconds: float | None, machine: str | None,
-                 report_root: str | None) -> RunMeta:
+                 report_root: str | None, started: str | None = None) -> RunMeta:
     """Record the JUnit files of a run that was not wrapped, and return the record.
 
     The source is "record". With no ``commit``, the record has no tree. With
     a ``commit``, the tree is the tree of that commit, clean. ``machine`` is a
     label for a different machine: the record then has no machine identity.
-    With no ``exit_code`` the verdict is "unknown". A file that cannot be
+    With no ``exit_code`` the verdict is "unknown". ``started`` is the start
+    time of the gate as ISO 8601 with a time zone; when it is not given, the
+    start time is the time of this call. A file that cannot be
     read raises ``JUnitError`` and nothing is recorded. Outside a git
     repository, ``TreeError``.
     """
@@ -403,6 +405,7 @@ def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, la
     check_label(machine, "machine label")
     if wall_seconds is not None and not wall_seconds >= 0:
         raise ValueError("the wall time must be 0 or more seconds")
+    started_text = parse_started(started) if started is not None else _now()
     cwd = Path(cwd)
     top = work_tree_top(cwd)
     store = tree.store_dir(top)
@@ -410,7 +413,7 @@ def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, la
     data = junit.read_junit([Path(p) for p in junit_paths], root=top, report_root=report_root,
                             runner=runner)
     meta = RunMeta(
-        id=history.new_run_id(), started=_now(), source="record", wall_seconds=wall_seconds,
+        id=history.new_run_id(), started=started_text, source="record", wall_seconds=wall_seconds,
         exit_code=exit_code, verdict=history.verdict_of(exit_code, data), kind=kind, label=label,
         runner=runner or data.runner, command_sha=None, inputs_sha=None,
         machine=machine or _LOCAL, machine_id=None if machine else tree.machine_id(),
@@ -422,6 +425,21 @@ def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, la
     )
     history.write_run(store, meta, data)
     return meta
+
+
+def parse_started(text: str) -> str:
+    """Return the ISO 8601 time ``text`` in UTC, to the second. Raise ``ValueError`` when it is not valid.
+
+    The time must have a time zone, because the times of two machines are
+    never compared as local times.
+
+    >>> parse_started("2026-11-26T09:25:01-05:00")
+    '2026-11-26T14:25:01+00:00'
+    """
+    moment = datetime.fromisoformat(text)
+    if moment.tzinfo is None:
+        raise ValueError("the start time must have a time zone (for example +00:00 or Z)")
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
 def _commit_tree(top: Path, commit: str) -> TreeId:

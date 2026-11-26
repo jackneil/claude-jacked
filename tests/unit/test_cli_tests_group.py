@@ -125,3 +125,18 @@ def test_cli_tests_does_not_ask_to_install(repo, monkeypatch):
     assert buf.getvalue() == ""
     result = _invoke("tests", "seen", "--", *gate(GREEN, 0))
     assert result.exit_code == 1 and buf.getvalue() == ""
+
+
+def test_cli_record_takes_a_start_time_and_else_uses_the_record_time(repo):
+    given = _invoke("tests", "record", "--junit", str(GREEN), "--started", "2026-11-20T08:00:00-05:00")
+    assert given.exit_code == 0
+    store = tree.store_dir(repo)
+    by_id = {m.id: m for m in history.iter_runs(store)}
+    assert by_id[given.stdout.split()[0]].started == "2026-11-20T13:00:00+00:00"
+    plain = _invoke("tests", "record", "--junit", str(GREEN))
+    by_id = {m.id: m for m in history.iter_runs(store)}
+    assert by_id[plain.stdout.split()[0]].started[:10] == plain.stdout.split()[0][:4] + "-" \
+        + plain.stdout.split()[0][4:6] + "-" + plain.stdout.split()[0][6:8]
+    assert _invoke("tests", "record", "--junit", str(GREEN), "--started", "2026-11-20T08:00:00").exit_code == 2
+    assert _invoke("tests", "record", "--junit", str(GREEN), "--started", "yesterday").exit_code == 2
+    assert "time of the record" in _invoke("tests", "record", "--help").stdout

@@ -7036,6 +7036,18 @@ def _tests_label(ctx, param, value):
         raise click.BadParameter(str(exc)) from exc
 
 
+def _tests_started(ctx, param, value):
+    """Refuse a start time that is not ISO 8601 with a time zone (usage error, exit 2)."""
+    from jacked.testdiet import record as _record
+
+    if value is None:
+        return None
+    try:
+        return _record.parse_started(value)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+
+
 @tests_group.command(name="run", context_settings={"ignore_unknown_options": True,
                                                     "allow_interspersed_args": False})
 @click.option("--junit", "junit", multiple=True, metavar="GLOB",
@@ -7083,7 +7095,10 @@ def tests_run(ctx, junit, inputs, kind, label, runner, strict, command):
               help="The label of the machine that ran the gate.")
 @click.option("--report-root", "report_root", default=None, metavar="PATH",
               help="The root folder of the machine that wrote the report.")
-def tests_record(junit, kind, label, runner, exit_code, wall, commit, machine, report_root):
+@click.option("--started", default=None, callback=_tests_started, metavar="ISO",
+              help="The start time of the gate, ISO 8601 with a time zone. "
+                   "Without it, the start time is the time of the record.")
+def tests_record(junit, kind, label, runner, exit_code, wall, commit, machine, report_root, started):
     """Record the JUnit files of a gate run that was not wrapped."""
     import os as _os
 
@@ -7094,7 +7109,8 @@ def tests_record(junit, kind, label, runner, exit_code, wall, commit, machine, r
     try:
         meta = _record.record_files(list(junit), cwd=Path(_os.getcwd()), kind=kind, label=label,
                                     runner=runner, commit=commit, exit_code=exit_code,
-                                    wall_seconds=wall, machine=machine, report_root=report_root)
+                                    wall_seconds=wall, machine=machine, report_root=report_root,
+                                    started=started)
     except (JUnitError, TreeError, OSError) as exc:
         _record.emit(f"nothing is recorded: {exc}")
         raise SystemExit(1)
