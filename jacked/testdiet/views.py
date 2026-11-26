@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from jacked.testdiet import history as _history
-from jacked.testdiet.model import CaseResult, RunMeta
+from jacked.testdiet.model import CaseResult, RunMeta, label_text
 from jacked.testdiet.record import clean_text
 
 VERDICTS = ("passed", "failed", "conflict", "no-data", "unknown")
@@ -31,17 +31,9 @@ class ViewError(ValueError):
     """A view cannot be made (no run, or no run of the given machine or ID)."""
 
 
-#: The text of a machine whose record holds no valid label.
-NO_LABEL = "(no label)"
-
-
 def _key(meta: RunMeta) -> tuple[str | None, str | None]:
     """The machine of a run: its label and its identity. Each part can be None."""
     return (meta.machine, meta.machine_id)
-
-
-def _show(label: str | None) -> str:
-    return NO_LABEL if label is None else label
 
 
 def _identity_note(runs: list[RunMeta], pick: RunMeta, which: str) -> list[str]:
@@ -49,7 +41,7 @@ def _identity_note(runs: list[RunMeta], pick: RunMeta, which: str) -> list[str]:
     identities = {m.machine_id for m in runs if m.machine == pick.machine}
     if len(identities) < 2:
         return []
-    return [f"the label {_show(pick.machine)} has {len(identities)} machine identities. "
+    return [f"the label {label_text(pick.machine)} has {len(identities)} machine identities. "
             f"This view uses the identity of {which}."]
 
 
@@ -67,7 +59,7 @@ def _select(runs: list[RunMeta], machine: str | None) -> tuple[tuple[str | None,
             "the machine of the newest run, because no run has the kind full"
     else:
         why = "the machine label that you gave"
-    notes = [f"machine: {_show(pick.machine)} ({why})"]
+    notes = [f"machine: {label_text(pick.machine)} ({why})"]
     notes += _identity_note(runs, pick, "its newest full run" if full else "its newest run")
     return _key(pick), notes
 
@@ -159,9 +151,9 @@ def profile(store: Path, run_id: str | None = None, *, machine: str | None = Non
         if meta is None:
             raise ViewError(f"the history has no run {run_id}")
         if machine is not None and meta.machine != machine:
-            raise ViewError(f"the run {run_id} is a run of the machine {_show(meta.machine)}, not {machine}")
+            raise ViewError(f"the run {run_id} is a run of the machine {label_text(meta.machine)}, not {machine}")
         key = _key(meta)
-        notes = [f"machine: {_show(meta.machine)} (the machine of the run that you gave)"]
+        notes = [f"machine: {label_text(meta.machine)} (the machine of the run that you gave)"]
         notes += _identity_note(runs, meta, "the run that you gave")
     else:
         key, notes = _select(runs, machine)
@@ -269,7 +261,7 @@ def history(store: Path, *, machine: str | None = None, days: int | None = None,
     others: list[str] = []
     for meta in runs:
         if _key(meta) != key:
-            label = _show(meta.machine)
+            label = label_text(meta.machine)
             if meta.machine == key[0]:
                 label += " (another identity)"
             if label not in others:

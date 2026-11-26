@@ -893,3 +893,23 @@ def test_a_bare_name_only_in_an_install_folder_off_path_does_not_start(repo, tmp
     assert findbin.find_on_path(name) is None
     assert record.run_gate([name], cwd=repo) == 127
     assert name in capsys.readouterr().err
+
+
+def test_the_repeat_notice_shows_a_record_with_no_label_after_each_real_label(tmp_path):
+    from tests._testdiet import make_case, store_run
+
+    store = tmp_path / "store"
+    red = [make_case("tests/test_x.py::test_fails", "tests/test_x.py", 0.1, "failed")]
+    no_label = store_run(store, "20261120T080000", exit_code=1, tests=red, machine=None)
+    ci = store_run(store, "20261121T080000", exit_code=1, tests=red, machine="ci", machine_id=None,
+                   source="record", command_sha=None)
+    now = store_run(store, "20261122T080000", exit_code=1, tests=red)
+    meta = next(m for m in history.iter_runs(store) if m.id == now)
+    assert {m.id: m.machine for m in history.iter_runs(store)}[no_label] is None
+    notice = record.repeat_notice(store, meta)
+    assert notice is not None
+    lines = notice.splitlines()
+    assert lines[0].startswith("the same failing set is in 2 earlier records")
+    records = lines[lines.index("the earlier records, by machine:") + 1:]
+    assert [line.split()[:2] for line in records] == [["ci", ci], ["(no", "label)"]]
+    assert no_label in records[1] and "None" not in notice

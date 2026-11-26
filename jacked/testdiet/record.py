@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from jacked.testdiet import history, junit, tree
-from jacked.testdiet.model import LABEL_RE, RUNNERS, STATES, RunData, RunMeta, TreeId
+from jacked.testdiet.model import LABEL_RE, RUNNERS, STATES, RunData, RunMeta, TreeId, label_order, label_text
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +240,8 @@ def repeat_notice(store: Path, meta: RunMeta) -> str | None:
         return None
     # Times of two machines are never compared: no range over all records.
     # The records are grouped by machine label, and in run-ID order in a group.
-    earlier.sort(key=lambda m: (m.machine, m.id))
+    # A record with no label sorts after each real label.
+    earlier.sort(key=lambda m: (*label_order(m.machine), m.id))
     trees = {m.tree.tree for m in earlier if m.tree is not None}
     no_tree = sum(1 for m in earlier if m.tree is None)
     default = sum(1 for m in earlier if m.on_default_branch is True)
@@ -256,7 +257,7 @@ def repeat_notice(store: Path, meta: RunMeta) -> str | None:
     for m in earlier:
         place = m.tree.commit[:12] if m.tree is not None else "no tree"
         flag = ", default branch" if m.on_default_branch is True else ""
-        lines.append(f"  {m.machine} {m.id} {m.started} {m.source} {place}{flag}")
+        lines.append(f"  {label_text(m.machine)} {m.id} {m.started} {m.source} {place}{flag}")
     return "\n".join(lines)
 
 

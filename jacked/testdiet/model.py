@@ -11,6 +11,26 @@ RUNNERS = ("pytest", "vitest", "jest", "playwright", "go", "nextest", "unknown")
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]+")
 #: The pattern of a machine identity: 32 lowercase hex characters.
 MACHINE_ID_RE = re.compile(r"[0-9a-f]{32}")
+#: The text of a machine whose record holds no valid label.
+NO_LABEL = "(no label)"
+
+
+def label_text(label: str | None) -> str:
+    """Return a machine label for output. A record with no valid label shows as ``NO_LABEL``.
+
+    >>> label_text("ci"), label_text(None)
+    ('ci', '(no label)')
+    """
+    return NO_LABEL if label is None else label
+
+
+def label_order(label: str | None) -> tuple[bool, str]:
+    """A sort key for a machine label: each real label first, then the empty label.
+
+    >>> sorted(["ci", None, "box"], key=label_order)
+    ['box', 'ci', None]
+    """
+    return (label is None, label or "")
 
 
 @dataclass(frozen=True)
