@@ -203,7 +203,7 @@ jacked tests loss [--base REF] [--json]
 - `jacked tests profile` shows where the time of a run goes, by file and by test.
   - By default, it shows the newest run with the kind full. When no run has the kind full, it shows the newest run. The default machine is the machine of the newest full run.
   - It prints the number of files that hold half of the test seconds. When each file took 0 seconds, it prints `every file took 0 seconds`. When some files have no time and each other file took 0 seconds, it prints `every file with a time took 0 seconds`.
-  - A value that the record does not hold prints as text (`no time recorded`, `no time`), never as 0. The JSON gives `null`.
+  - A value that the record does not hold prints as text (`no time recorded`, `no time`, `kind not given`), never as 0 or as an empty space. The JSON gives `null`.
   - `--top N` sets the rows of each text table, and `--json` prints all rows. It prints a setup share only when the record holds one, and a JUnit report never holds one.
   - With no run in the history, `profile` gives exit 1. An unknown `--run` or `--machine` also gives exit 1.
 - `jacked tests history` shows the runs of one machine.

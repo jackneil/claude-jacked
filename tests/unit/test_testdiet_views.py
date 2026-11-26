@@ -245,6 +245,17 @@ def test_a_test_with_no_seconds_is_not_counted_as_zero_seconds(store):
     assert json.loads(views.to_json(empty))["total_test_seconds"] is None
 
 
+def test_profile_says_no_kind_for_a_run_that_has_no_kind(store):
+    # A record without --kind has no kind; the header must say so, never "kind ,".
+    run_id = store_run(store, "20261126T090000", exit_code=0, tests=[make_case("k::t", "k.py", 1.0)], kind=None)
+    result = views.profile(store, run_id)
+    assert result["kind"] is None
+    header = next(x for x in views.render_profile(result).splitlines() if x.startswith("run: "))
+    assert "kind not given, verdict passed" in header
+    assert "kind ," not in header
+    assert json.loads(views.to_json(result))["kind"] is None
+
+
 def test_cli_prune_prints_each_run_that_it_deletes(repo, monkeypatch):
     store = tree.store_dir(repo)
     old = [store_run(store, when, exit_code=0, tests=[make_case("t::t", "t.py", 1.0)])

@@ -331,7 +331,7 @@ def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
     """The text output of ``profile``. ``top`` is the number of rows of each table."""
     lines = list(result["notes"])
     lines.append(f"run: {one_line(result['run'])} started {one_line(result['started'])}, "
-                 f"kind {one_line(result['kind'])}, verdict {one_line(result['verdict'])}")
+                 f"kind {one_line(result['kind']) or 'not given'}, verdict {one_line(result['verdict'])}")
     lines.append(f"test seconds: {_time(result['total_test_seconds'])}")
     if result["tests_without_seconds"]:
         lines.append(f"tests with no seconds in the report: {_num(result['tests_without_seconds'])}")
