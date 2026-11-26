@@ -21,6 +21,8 @@ The script changes no other byte of a report. It installs nothing outside
 the temporary folder. It downloads the release binaries of ``gotestsum`` and
 ``cargo-nextest`` and checks their published SHA-256. It needs ``uv``,
 ``npm``, ``node``, ``go`` and ``cargo`` on the PATH.
+It uses these toolchains as they are and does not install them: rustup and
+``cargo`` with the default ``CARGO_HOME``, ``go``, ``node`` and ``npm``.
 
 Each tool version, and each package that it needs, was published 14 days
 or more before the capture date (``CUTOFF``).
