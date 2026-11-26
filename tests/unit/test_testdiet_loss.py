@@ -17,7 +17,7 @@ import pytest
 from click.testing import CliRunner
 
 from jacked.cli import main
-from jacked.testdiet import loss
+from jacked.testdiet import loss, loss_scan
 from tests._testdiet import make_repo
 
 CALC = b"""\
@@ -381,3 +381,101 @@ def test_a_base_with_no_shared_history_exits_1_with_one_line(repo):
     out = _invoke("tests", "loss", "--base", "other")
     assert out.exit_code == 1
     assert out.output.count("\n") == 1 and "no merge base" in out.output
+
+
+# The scanners: cases, bodies that are not read, and the gaps of the first review.
+
+def by_name(path: str, body: str) -> dict[str, loss.Declaration]:
+    return {d.name: d for d in loss.scan(path, body)}
+
+
+def test_a_jsx_apostrophe_marks_only_its_own_body_as_not_read():
+    body = ('test("before", () => { expect(1).toBe(1); });\n'
+            'test("jsx", () => {\n  render(<p>Don\'t</p>);\n  expect(1).toBe(1);\n});\n'
+            'test("after", () => { expect(2).toBe(2); });\n')
+    found = by_name("a.test.tsx", body)
+    assert (found["jsx"].asserts, found["jsx"].unread) == (None, (loss_scan.BODY_NOT_READ,))
+    assert (found["before"].asserts, found["after"].asserts) == (1, 1)
+    assert found["after"].unread == ()
+
+
+def test_python_cases_are_the_product_of_the_literal_parametrize_lists():
+    body = ('import pytest\n\n@pytest.mark.parametrize("a", [1, 2])\nclass TestA:\n'
+            '    @pytest.mark.parametrize("b", (1, 2, 3))\n    def test_x(self, a, b):\n        pass\n\n'
+            '@pytest.mark.parametrize("n", VALUES)\ndef test_computed(n):\n    pass\n\n'
+            'def test_plain():\n    pass\n')
+    found = by_name("t/test_a.py", body)
+    assert found["TestA::test_x"].cases == 6
+    assert (found["test_computed"].cases, found["test_computed"].unread) == (None, (loss_scan.COMPUTED_CASES,))
+    assert found["test_plain"].cases == 1
+
+
+def test_js_cases_are_the_rows_of_a_literal_each_table():
+    body = ('test.each([[1, 2], [3, 4], [5, 6],])("row %i", () => {});\n'
+            'test.each`\n  a | b\n  ${1} | ${2}\n  ${3} | ${4}\n`("tagged $a", () => {});\n'
+            'test.each(rows)("computed", () => {});\n'
+            'test("plain", () => {});\n')
+    found = by_name("a.test.ts", body)
+    assert [found[n].cases for n in ("row %i", "tagged $a", "computed", "plain")] == [3, 2, None, 1]
+    assert found["computed"].unread == (loss_scan.COMPUTED_CASES,)
+
+
+def test_go_reads_the_receiver_name_and_counts_its_subtests():
+    body = ('package calc\n\nfunc TestTable(tt *testing.T) {\n\ttt.Run("a", func(tt *testing.T) {})\n'
+            '\ttt.Run("b", func(tt *testing.T) { tt.Fatal("x") })\n\ttt.Errorf("y")\n}\n\n'
+            'func TestSkip(tt *testing.T) {\n\ttt.Skip("later")\n}\n')
+    found = by_name("calc_test.go", body)
+    assert (found["TestTable"].cases, found["TestTable"].asserts) == (2, 2)
+    assert (found["TestSkip"].skipped, found["TestTable"].skipped) == (True, False)
+
+
+def test_a_js_test_inside_a_comment_is_not_a_declaration():
+    body = ('// test("in a line comment", () => {});\n/* it("in a block comment", () => {}); */\n'
+            'test("real", () => {});\n')
+    assert loss.declarations("a.test.js", body) == ["real"]
+
+
+def test_rust_allows_attributes_and_doc_comments_between_the_test_attribute_and_fn():
+    body = ('#[test]\n/// Adds.\n#[should_panic]\n// #[ignore] is only a comment here\nfn adds() {\n'
+            '    assert!(true);\n}\n')
+    found = by_name("src/lib.rs", body)
+    assert (found["adds"].asserts, found["adds"].skipped) == (1, False)
+
+
+def test_python_finds_tests_in_an_if_block_and_reads_pytestmark_and_an_in_body_skip():
+    body = ('import pytest, sys\npytestmark = [pytest.mark.skipif(sys.platform == "x", reason="r")]\n\n'
+            'if sys.version_info >= (3, 9):\n    def test_new():\n        pass\nelse:\n'
+            '    def test_old():\n        pass\n')
+    assert [(d.name, d.skipped) for d in loss.scan("t/test_a.py", body)] == [
+        ("test_new", True), ("test_old", True)]
+    cls = ('import pytest\n\nclass TestA:\n    pytestmark = pytest.mark.skip\n\n    def test_one(self):\n'
+           '        pass\n\ndef test_body():\n    pytest.skip("later")\n\ndef test_free():\n    pass\n')
+    assert [(d.name, d.skipped) for d in loss.scan("t/test_b.py", cls)] == [
+        ("TestA::test_one", True), ("test_body", True), ("test_free", False)]
+
+
+def test_the_line_pattern_skips_a_nested_def_and_keeps_the_class_across_a_docstring():
+    body = ('class TestA:\n    """Doc.\n\nColumn zero text.\n"""\n\n    def test_one(self):\n'
+            '        def test_helper():\n            pass\n\ndef test_two(:\n')
+    found = loss.scan("t/test_a.py", body)
+    assert [d.name for d in found] == ["TestA::test_one", "test_two"]
+    assert {d.unread for d in found} == {(loss_scan.NOT_PARSED,)}
+
+
+def test_a_recursion_error_of_the_parser_uses_the_line_pattern(monkeypatch):
+    def deep(*args, **kwargs):
+        raise RecursionError("too deep")
+
+    monkeypatch.setattr(loss_scan.ast, "parse", deep)
+    found = loss.scan("t/test_a.py", "def test_one():\n    assert 1\n")
+    assert [(d.name, d.asserts, d.unread) for d in found] == [("test_one", None, (loss_scan.NOT_PARSED,))]
+
+
+def test_a_large_file_with_bodies_that_do_not_close_is_read_in_one_pass():
+    import time
+
+    body = 'test("t%d", () => {\n' * 4000
+    start = time.monotonic()
+    found = [d for d in loss.scan("big.test.js", body % tuple(range(4000)))]
+    assert len(found) == 4000 and all(d.asserts is None for d in found)
+    assert time.monotonic() - start < 5.0
