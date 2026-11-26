@@ -8,7 +8,7 @@
   Replace placeholders, keep what you need, delete sections you don't.
   Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
 -->
-<title>Test diet: implementation plan</title>
+<title>Test diet: implementation plan A</title>
 
 <!-- Metadata block — adjust fields per artifact type -->
 <meta name="jacked:type" content="plan">
@@ -258,10 +258,10 @@
 <body>
 <div class="wrap">
 
-<h1>Test diet: implementation plan</h1>
+<h1>Test diet: implementation plan A (recorder, ledger, skill)</h1>
 
 <div class="meta">
-  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">ready for review</span></span></div>
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">revised after review, ready for a second read</span></span></div>
   <div class="kv"><span class="k">Date:</span><span class="v">2026-11-26</span></div>
   <div class="kv"><span class="k">Branch:</span><span class="v">jack_20261125_test_diet</span></div>
   <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
@@ -278,6 +278,7 @@
   <h2>Contents</h2>
   <ol>
     <li><a href="#goal">Goal</a></li>
+    <li><a href="#review">What the review changed</a></li>
     <li><a href="#architecture">Architecture</a></li>
     <li><a href="#constraints">Global constraints</a></li>
     <li><a href="#focus">Review focus</a></li>
@@ -291,44 +292,78 @@
 
 <h2 id="goal">Goal</h2>
 <p>Ship a gate recorder (<code>jacked tests</code>) and a skill (<code>/test-diet</code>) in
-claude-jacked, for Claude Code and for Codex. The recorder measures each gate and can run a gate on
-a different machine. The skill uses those records to make a repository's test suite smaller and
-faster on a branch, with evidence for each cut, and opens a pull request.</p>
+claude-jacked, for Claude Code and for Codex. The recorder measures each gate. The skill uses those
+records to make a repository's test suite smaller and faster on a branch, with a proof for each
+cut, and opens a pull request.</p>
+<p>The gate machine (<code>jacked tests run --on</code>) is in
+<a href="2026-11-26-test-diet-gate-machine.html">plan B</a>. Plan B builds on this plan.</p>
 <p><strong>Spec:</strong>
 <a href="../specs/2026-11-25-test-diet-design.html">2026-11-25-test-diet-design.html</a> (approved by
 the owner on 2026-11-26). <strong>Research:</strong>
 <a href="../research/2026-11-25-test-suite-diet-research.html">2026-11-25-test-suite-diet-research.html</a>.
 The executor reads both.</p>
-<p><strong>Tech stack:</strong> Python 3.10+, the standard library only for the new package, click
-for the command group, pytest for the tests. No new dependency.</p>
+<p><strong>Tech stack:</strong> Python 3.11+ (<code>requires-python</code> of this package), click,
+pytest. No new third-party package.</p>
+
+<h2 id="review">What the review changed</h2>
+<p>Three reviewers read the first version of this plan on 2026-11-26: a main review, a security
+review and a pre-mortem. The verdict was "needs work". These are the changes to the design. Task 15
+puts them into the spec, and the owner reads them there.</p>
+<table>
+  <thead><tr><th>Subject</th><th>First version</th><th>Now</th></tr></thead>
+  <tbody>
+    <tr><td><code>seen</code></td><td>Trusted the label <code>--kind full</code> and the exit code.</td>
+    <td>Matches the tree, the exact gate command, the machine and the declared input files. A pass
+    needs a JUnit file with no failure and at least one test. Only a record that the wrapper made
+    counts.</td></tr>
+    <tr><td>Exit code 0 with failures in the JUnit file</td><td>Recorded as a pass.</td><td>Recorded
+    as a conflict and printed. Never a pass. <code>--strict</code> returns 1 for it.</td></tr>
+    <tr><td>Ledger</td><td>Checked that each evidence field has text.</td><td>A cut of kind covered,
+    shape or test, and each speed or fix row, needs a proof record that
+    <code>jacked tests prove</code> wrote from a real run. A duplicate or covered cut names its
+    keeper. The baseline is required and must be green.</td></tr>
+    <tr><td>Protected classes</td><td>The agent set the class and the approval.</td><td>A detector
+    marks a test that a rule file names. An approval is written only by a person at a
+    terminal.</td></tr>
+    <tr><td>ID check</td><td>Two files that the caller names.</td><td>Two records of the history,
+    each tied to its tree, for one batch.</td></tr>
+    <tr><td>Report</td><td>IDs and numbers only.</td><td>Also the evidence of each cut. Failure text
+    stays out. The saving is judged against the tests that the run did not touch.</td></tr>
+    <tr><td>Fixtures</td><td>Real reports, as written.</td><td>Real reports with the host name and
+    the home path replaced by the capture script, and a test that scans them.</td></tr>
+    <tr><td>Gate machine</td><td>Task 7 of one plan.</td><td>Its own plan, with process identity, a
+    grammar for each value that crosses SSH, and a lock that survives a restart.</td></tr>
+  </tbody>
+</table>
 
 <h2 id="architecture">Architecture</h2>
 <p>One new package, <code>jacked/testdiet/</code>, holds the mechanical work: it reads JUnit XML,
-gives each tree an identity, keeps a local history, compares test IDs with a ledger, and sends a
-gate to a gate machine over SSH. One new skill directory holds the judgment as guidance for a
-model. The skill calls the commands. The commands never decide that a test is junk.</p>
+gives each tree an identity, keeps a local history, runs a planted-defect proof, and compares test
+IDs with a ledger. One new skill directory holds the judgment as guidance for a model. The skill
+calls the commands. The commands never decide that a test is junk.</p>
 
 <div class="diagram">
   <pre class="mermaid">
 flowchart LR
     CLI[jacked tests: cli.py group] --> REC[record.py: run, record, seen]
     CLI --> VIEW[views.py: profile, history]
-    CLI --> LED[ledger.py + ids.py: ledger verify, ids]
+    CLI --> LED[ledger.py: verify, protect, approve]
+    CLI --> IDS[collect.py: collect, ids]
+    CLI --> PRV[prove.py: planted-defect proof]
+    CLI --> REP[report.py + covdiff.py]
     CLI --> LOSS[loss.py: loss report]
-    CLI --> REP[report.py: HTML report]
-    REC --> JU[junit.py: JUnit reader]
+    REC --> JU[junit.py + ids.py]
     REC --> TREE[tree.py: tree identity]
     REC --> HIST[(history.py: git common dir)]
-    REC --> REM[remote.py: run --on]
-    REM -->|scp + ssh| DRV[gate_driver.py on the gate machine]
     VIEW --> HIST
+    IDS --> HIST
+    LED --> HIST
     SKILL[/test-diet SKILL.md/] --> CLI
   </pre>
   <pre class="mermaid-source">
-jacked tests (cli.py group) -> record.py (run, record, seen) -> junit.py, tree.py, history.py
-record.py -> remote.py (run --on) -> scp + ssh -> gate_driver.py on the gate machine
-views.py (profile, history) -> history.py
-ledger.py + ids.py (ledger verify, ids); loss.py (loss report); report.py (HTML report)
+jacked tests (cli.py group) -> record.py (run, record, seen) -> junit.py + ids.py, tree.py, history.py
+views.py (profile, history), collect.py (collect, ids), ledger.py (verify, protect, approve) -> history.py
+prove.py (planted-defect proof); report.py + covdiff.py; loss.py
 /test-diet SKILL.md -> jacked tests
   </pre>
 </div>
@@ -336,19 +371,32 @@ ledger.py + ids.py (ledger verify, ids); loss.py (loss report); report.py (HTML 
 <h2 id="constraints">Global constraints</h2>
 <p>Each task's requirements include this section.</p>
 <ul>
-  <li><strong>Standard library only</strong> in <code>jacked/testdiet/</code>. <code>gate_driver.py</code>
-  imports nothing from jacked and runs on Python 3.8 or later, on Linux, macOS and Windows.</li>
-  <li><strong>No module name starts with <code>test_</code></strong> in the package (pytest
-  collects <code>test_*.py</code>).</li>
-  <li><strong>The history holds IDs, numbers and states only.</strong> No failure text, no test
-  output, no log text. It is in the common git directory of the clone and git never commits it.</li>
-  <li><strong>A value that a file does not hold stays empty</strong> (<code>None</code> in Python,
-  <code>null</code> in JSON). It is never zero.</li>
+  <li><strong>No third-party package</strong> in <code>jacked/testdiet/</code>. Use the helpers that
+  jacked has, and do not write them again: <code>jacked.atomic_io.atomic_write_bytes</code>
+  (<code>atomic_io.py:332</code>) for each file of the history, the ledger and the report;
+  <code>jacked.packs.jacked_home</code> (<code>packs.py:97</code>);
+  <code>jacked.git_guard.run_git</code> and <code>guarded_git_env</code> for a git read that needs
+  no filter; <code>jacked.findbin.find_bin</code>; <code>jacked.regular_file.open_regular_fd</code>
+  for each path that a caller gives; <code>jacked.skill_listing.parse_frontmatter</code> and
+  <code>_truthy</code> for frontmatter.</li>
+  <li><strong>Each child process is an argument list.</strong> No <code>shell=True</code>.</li>
+  <li><strong>No module name starts with <code>test_</code></strong> in the package, and no class
+  name starts with <code>Test</code>.</li>
+  <li><strong>The history holds IDs, numbers, states and the class name of a failure.</strong> No
+  failure message, no test output, no log text, no command text (only its SHA-256). It is in the
+  common git directory of the clone and git never commits it.</li>
+  <li><strong>A value that a file does not hold stays empty</strong> (<code>None</code>,
+  <code>null</code>). It is never zero.</li>
   <li><strong><code>jacked tests run</code> returns the exit code of the command that it
-  wraps.</strong> A recorder error never changes that code. A run with no verdict returns 75.</li>
-  <li><strong>Times of two machines are never compared.</strong></li>
-  <li><strong>No committed file holds a host name, an address or a user name of a machine.</strong>
-  Tests and documents use the label <code>shed</code> and the address <code>gate.example</code>.</li>
+  wraps.</strong> A recorder error never changes that code. The one exception is the flag
+  <code>--strict</code>.</li>
+  <li><strong>Times of two machines are never compared.</strong> A machine is its label and a local
+  fingerprint.</li>
+  <li><strong>No committed file holds a host name, an address, a user name or a home path.</strong>
+  Tests and documents use the label <code>shed</code> and the host <code>gate.example</code>.</li>
+  <li><strong>A test ID is free text.</strong> Escape it in HTML. Remove control characters, except
+  the newline and the tab, before a print to a terminal. A label matches
+  <code>[A-Za-z0-9._-]+</code>.</li>
   <li><strong>No arbitrary threshold decides a verdict.</strong> A command prints numbers. It does
   not call a test slow, junk or flaky.</li>
   <li><strong>The skill text is guidance for a model.</strong> No point tables, no regular
@@ -357,16 +405,17 @@ ledger.py + ids.py (ledger verify, ids); loss.py (loss report); report.py (HTML 
   <code>disable-model-invocation: true</code>.</li>
   <li><strong>Documentation, docstrings and user-visible messages are in ASD-STE100.</strong> No
   em-dash in them.</li>
-  <li><strong>Sample JUnit files come from real runs.</strong> Nobody writes one by hand.</li>
+  <li><strong>Sample reports come from real runs.</strong> The capture script changes only the host
+  name and the root path. Nobody edits a report by hand.</li>
   <li><strong>A test name in this plan is a requirement.</strong> The test asserts what its name
   says, with the values of the rules of its task. A task can add tests. It does not drop one.</li>
-  <li><strong>The suite runs on Linux, macOS and Windows in hosted CI.</strong> A value that a
-  system does not give (the load average and the processor time of child processes on Windows) is
-  empty there.</li>
-  <li><strong>Tests:</strong> <code>uv run python -m pytest &lt;files&gt;</code>, never bare
-  <code>python -m pytest</code>. Each task runs its own test files plus
-  <code>grep -rl &lt;changed module or directory name&gt; tests/</code>. The full suite runs one
-  time, in Task 14. Each task reports <code>--durations=10</code> of its new test files.</li>
+  <li><strong>The suite runs on Linux, macOS and Windows in hosted CI</strong>
+  (<code>.github/workflows/tests.yml</code>). Write text files as bytes or with
+  <code>newline=""</code>. A value that a system does not give is empty there.</li>
+  <li><strong>Tests:</strong> <code>uv run python -m pytest &lt;files&gt;</code>. Each task runs its
+  own test files plus <code>grep -rl &lt;changed module or directory name&gt; tests/</code>. The
+  full suite runs one time, in Task 16. Each task reports <code>--durations=10</code> of its new
+  test files.</li>
   <li><strong>Process rule, verbatim in each brief:</strong> NEVER <code>pkill -f</code> /
   <code>killall</code> a generic pattern (<code>pytest</code>, <code>python</code>, <code>node</code>, a
   server name) on this machine; stop only processes you started, by PID.</li>
@@ -375,50 +424,48 @@ ledger.py + ids.py (ledger verify, ids); loss.py (loss report); report.py (HTML 
 </ul>
 
 <h2 id="focus">Review focus</h2>
-<p>The inputs that the spec implies and that are most likely to break the tool for a person. Each
-line has a test in the task that owns the code.</p>
 <ol>
-  <li><strong>The gate writes no JUnit file, an old one, or half of one</strong> (the runner was
-  killed). Expected: the exit code of the gate comes back unchanged, the record has no test data,
-  and an old file is never recorded as this run. Tests in Task 3.</li>
-  <li><strong>The tree changes while the gate runs, or the tree has changes that are not
-  committed.</strong> Expected: <code>seen</code> never says that such a tree passed because its
-  commit passed. Tests in Tasks 2 and 3.</li>
+  <li><strong>The gate writes no JUnit file, an old one, or half of one.</strong> Expected: the
+  exit code comes back unchanged, the record has no test data and can never satisfy
+  <code>seen</code>, and an old file is never read as this run. Tests in Task 3.</li>
+  <li><strong>The gate script exits 0 and the JUnit file holds failures</strong> (a pipe, or
+  <code>|| true</code>). Expected: a conflict, printed, never a pass. Tests in Task 3.</li>
+  <li><strong>The tree changes while the gate runs, has changes that are not committed, or the gate
+  writes its own output into the tree.</strong> Expected: <code>seen</code> never says yes for a
+  tree that did not run, and a tree that changed is named. Tests in Tasks 2 and 3.</li>
   <li><strong>Several sessions finish a gate in the same second.</strong> Expected: each record is
-  complete and readable. Test in Task 2.</li>
-  <li><strong>pytest IDs from a JUnit file and from a collection list differ in form</strong> for a
-  test in a class, a parametrized test and a nested class. Expected: one normalized ID. Test in
-  Task 1.</li>
-  <li><strong>The connection to the gate machine drops, the gate machine restarts, or a lock holder
-  dies.</strong> Expected: no record and exit code 75 for a run with no exit marker, and a dead
-  holder does not block the next gate. Tests in Task 7.</li>
+  complete. Test in Task 2.</li>
+  <li><strong>A ledger row whose claim is false</strong>: a cut with no keeper, a "covered" cut whose
+  keeper does not catch the defect, a faster test that no longer catches it, a cut of a test that
+  failed in the baseline. Expected: <code>ledger verify</code> refuses each one. Tests in Tasks 6
+  and 8.</li>
 </ol>
 
 <h2 id="files">File structure</h2>
 <table>
   <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
   <tbody>
-    <tr><td><code>jacked/testdiet/__init__.py</code></td><td>Package marker and the public names.</td></tr>
-    <tr><td><code>jacked/testdiet/model.py</code></td><td><code>TestCase</code>, <code>RunData</code>, <code>TreeId</code>, <code>RunMeta</code>.</td></tr>
-    <tr><td><code>jacked/testdiet/junit.py</code></td><td>Read one or more JUnit XML files into a <code>RunData</code>.</td></tr>
-    <tr><td><code>jacked/testdiet/ids.py</code></td><td>One normalized test ID for each runner, and the parse of a collection list.</td></tr>
-    <tr><td><code>jacked/testdiet/tree.py</code></td><td>The identity of a tree, and the common git directory.</td></tr>
-    <tr><td><code>jacked/testdiet/history.py</code></td><td>The local store: write a run, list runs, load the tests of a run.</td></tr>
+    <tr><td><code>jacked/testdiet/__init__.py</code>, <code>model.py</code></td><td><code>CaseResult</code>, <code>RunData</code>, <code>TreeId</code>, <code>RunMeta</code>.</td></tr>
+    <tr><td><code>jacked/testdiet/junit.py</code>, <code>ids.py</code></td><td>Read JUnit XML. One normalized test ID for each runner. Parse a listing.</td></tr>
+    <tr><td><code>jacked/testdiet/tree.py</code></td><td>The identity of a tree, the fingerprint of input files, the common git directory.</td></tr>
+    <tr><td><code>jacked/testdiet/history.py</code></td><td>The local store: runs and collections.</td></tr>
     <tr><td><code>jacked/testdiet/record.py</code></td><td><code>run_gate</code>, <code>record_files</code>, <code>seen</code>, the repeat-failure notice.</td></tr>
     <tr><td><code>jacked/testdiet/views.py</code></td><td>The numbers of <code>profile</code> and <code>history</code>.</td></tr>
     <tr><td><code>jacked/testdiet/loss.py</code></td><td>The loss report from git.</td></tr>
-    <tr><td><code>jacked/testdiet/ledger.py</code></td><td>The ledger file: load, verify, compare with two ID sets.</td></tr>
-    <tr><td><code>jacked/testdiet/report.py</code></td><td>The HTML report of a diet run.</td></tr>
-    <tr><td><code>jacked/testdiet/remote.py</code></td><td>The gate machine list, the transport, <code>run_on</code>.</td></tr>
-    <tr><td><code>jacked/testdiet/gate_driver.py</code></td><td>The one file that runs on a gate machine.</td></tr>
-    <tr><td><code>jacked/cli.py</code></td><td>The group <code>jacked tests</code>. Each command imports its module inside the function, as the other groups do.</td></tr>
+    <tr><td><code>jacked/testdiet/ledger.py</code></td><td>Load, verify, protect, approve.</td></tr>
+    <tr><td><code>jacked/testdiet/collect.py</code></td><td><code>collect</code> and the ID check of one batch.</td></tr>
+    <tr><td><code>jacked/testdiet/prove.py</code></td><td>The planted-defect proof.</td></tr>
+    <tr><td><code>jacked/testdiet/covdiff.py</code>, <code>report.py</code></td><td>The coverage comparison and the HTML report.</td></tr>
+    <tr><td><code>jacked/cli.py</code></td><td>The group <code>jacked tests</code>, after the <code>dcr</code> group. Each command imports its module inside the function. <code>tests</code> joins the commands that <code>_maybe_prompt_first_run</code> skips.</td></tr>
     <tr><td><code>jacked/data/skills/test-diet/</code></td><td><code>SKILL.md</code>, <code>references/</code>, <code>agents/openai.yaml</code>.</td></tr>
     <tr><td><code>jacked/data/skills/review-animations/agents/openai.yaml</code></td><td>The Codex policy file for the skill that has the same defect today.</td></tr>
     <tr><td><code>jacked/codex/_generate.py</code>, <code>_fsutil.py</code>, <code>installer.py</code></td><td>The Codex policy file for a command that has <code>disable-model-invocation</code>.</td></tr>
-    <tr><td><code>jacked/data/rules/</code>, <code>commands/</code>, <code>skills/</code>, <code>agents/</code></td><td>The approved text changes (<a href="#wording">wording</a>).</td></tr>
+    <tr><td><code>jacked/data/</code> and <code>.claude/skills/</code> text files</td><td>The approved text changes (<a href="#wording">wording</a>).</td></tr>
     <tr><td><code>README.md</code>, <code>jacked/data/rules/jacked-reference.md</code></td><td>29 skills, the new command group, the new skill.</td></tr>
-    <tr><td><code>tests/unit/test_testdiet_*.py</code>, <code>tests/unit/test_cli_tests_group.py</code>, <code>tests/unit/test_codex_implicit_invocation.py</code>, <code>tests/unit/test_skill_test_diet_contract.py</code></td><td>The tests.</td></tr>
-    <tr><td><code>tests/fixtures/testdiet/</code></td><td>Real JUnit files of six runners, the collection lists, <code>PROVENANCE.json</code>, and the scripts that made them.</td></tr>
+    <tr><td><code>tests/testdiet_support.py</code></td><td>Shared test helpers: <code>make_repo(path)</code> (follows <code>tests/unit/test_git_reality.py:45</code>: the identity from <code>GIT_AUTHOR_*</code> and <code>GIT_COMMITTER_*</code>, <code>git init -b main</code>, one commit), <code>fixture_reports</code>, <code>fixture_project</code>, <code>fixture_listing</code>, <code>provenance</code>, <code>fill_store</code>.</td></tr>
+    <tr><td><code>tests/unit/test_testdiet_*.py</code>, <code>test_cli_tests_group.py</code>, <code>test_codex_implicit_invocation.py</code>, <code>test_skill_test_diet_contract.py</code>, <code>test_test_cost_guidance.py</code></td><td>The tests.</td></tr>
+    <tr><td><code>tests/fixtures/testdiet/</code></td><td><code>reports/</code> (real JUnit files and listings), <code>projects/</code> (the six small projects and the capture scripts), <code>PROVENANCE.json</code>.</td></tr>
+    <tr><td><code>tests/conftest.py</code>, <code>.gitignore</code></td><td><code>collect_ignore_glob</code> for <code>fixtures/testdiet/projects/*</code>; ignore <code>node_modules/</code> and <code>target/</code> there.</td></tr>
   </tbody>
 </table>
 
@@ -427,197 +474,202 @@ line has a test in the task that owns the code.</p>
   <thead><tr><th>Subject</th><th>Decision</th><th>Reason</th></tr></thead>
   <tbody>
     <tr><td>History format</td><td>Two files for each run in <code>&lt;git common dir&gt;/jacked-tests/runs/</code>:
-    <code>&lt;id&gt;.meta.json</code> (small) and <code>&lt;id&gt;.tests.json.gz</code> (each test).
-    The ID is <code>&lt;UTC time&gt;-&lt;8 random hex&gt;</code>. Each file is written to a temporary
-    name and renamed.</td><td>No shared file, so parallel sessions cannot damage a record.</td></tr>
+    <code>&lt;id&gt;.tests.json.gz</code> first, then <code>&lt;id&gt;.meta.json</code>. The meta file
+    is the commit marker: a run with no meta file does not exist. The ID is
+    <code>&lt;UTC time&gt;-&lt;8 random hex&gt;</code>.</td><td>No shared file, so parallel sessions
+    cannot damage a record.</td></tr>
     <tr><td>Retention</td><td>Nothing is deleted automatically. <code>history --size</code> prints
     the size. <code>jacked tests prune --before DATE</code> deletes on request and prints each
     deleted run.</td><td>An automatic limit drops data silently.</td></tr>
-    <tr><td>Tree identity</td><td><code>TreeId(commit, tree, clean)</code>. <code>tree</code> is the
-    git tree hash of the working state: copy the index to a temporary file, set
-    <code>GIT_INDEX_FILE</code>, run <code>git add -A</code> and <code>git write-tree</code>. The
-    real index does not change. <code>seen</code> matches on <code>tree</code>.</td><td>Two commits
-    with the same content are one tree. Changes that are not committed are in the identity. Files
-    that git ignores are not: <code>seen</code> and the skill text say this limit.</td></tr>
-    <tr><td>Kind of a run</td><td><code>--kind full|targeted</code>. With no flag the kind is
-    empty, and an empty kind is never a full gate.</td><td>The recorder cannot know which command
-    is the full gate.</td></tr>
-    <tr><td>JUnit path</td><td><code>--junit GLOB</code>, one or more times. Only a file with a
-    modification time at or after the start of the run is read.</td><td>An old report must not
-    become this run.</td></tr>
+    <tr><td>Tree identity</td><td><code>TreeId(commit, tree, clean)</code>. A clean tree uses
+    <code>HEAD^{tree}</code>. A tree with changes uses a copy of the index
+    (<code>git rev-parse --git-path index</code>) and a temporary object directory
+    (<code>GIT_OBJECT_DIRECTORY</code>, with the real one in
+    <code>GIT_ALTERNATE_OBJECT_DIRECTORIES</code>), then <code>git add -A</code> and
+    <code>git write-tree</code>. The real index and the real object store do not change. The clean
+    and smudge filters stay on, because the hash must be equal to the tree of a commit. A
+    repository with no commit, or a bare one, has no tree.</td><td>Two commits with the same content
+    are one tree. Changes that are not committed are in the identity. No blob of a large file that
+    is not tracked goes into the repository.</td></tr>
+    <tr><td>Limits of the identity</td><td>It does not hold a file that git ignores, and it does
+    not hold a change inside the work tree of a submodule. <code>--input GLOB</code> adds a
+    fingerprint of named files (path, size, modification time in nanoseconds, not content) to the
+    record and to <code>seen</code>.</td><td>In the owner's data service a stale ignored file
+    changed the result of a gate.</td></tr>
+    <tr><td>The gate command</td><td>The record holds <code>command_sha</code>: the SHA-256 of the
+    arguments joined by a NUL. <code>seen</code> and the choice of a baseline match on it.
+    <code>--kind full|targeted</code> is a label for the views only.</td><td>A label that the caller
+    picks cannot prove which command ran.</td></tr>
+    <tr><td>Verdict of a run</td><td><code>passed</code>: exit code 0, a JUnit file was read, no
+    failed and no error test, at least one test. <code>failed</code>: exit code not 0.
+    <code>conflict</code>: exit code 0 and a failed or an error test. <code>no-data</code>: exit
+    code 0 and no JUnit data.</td><td>A pipe can turn a red gate into exit code 0.</td></tr>
+    <tr><td>JUnit path</td><td><code>--junit GLOB</code>, one or more times. Before the run, the
+    recorder takes the size, the modification time and the inode of each match. After the run it
+    reads a file that is new or changed, and prints one line for each match that it did not
+    read.</td><td>A clock or a coarse file system must not hide a fresh report. An old report must
+    not become this run.</td></tr>
+    <tr><td>One ID two times</td><td>One <code>CaseResult</code> for each ID. <code>attempts</code>
+    counts the elements. The seconds are the sum. The state is <code>flaky</code> when one attempt
+    passed and one did not, else the worst state (error, failed, passed, skipped). A flaky test is
+    not in the failing set.</td><td>A rerun tool writes one test more than one time.</td></tr>
     <tr><td>pytest file names</td><td>A pytest JUnit file has a dotted class name and no file path.
     The reader finds the file by a lookup in the tree: the longest dotted prefix that is a
-    <code>.py</code> file. When no prefix is a file, <code>file</code> is empty and the ID keeps the
-    dotted name.</td><td>The profile works by file. The default pytest report has no file
-    attribute.</td></tr>
+    <code>.py</code> file inside the root. A value that would leave the root gives
+    <code>file=None</code>.</td><td>The profile works by file.</td></tr>
     <tr><td>Setup share</td><td><code>profile</code> prints a setup share only when the record
     holds one. A JUnit file does not. The skill gets the setup, call and teardown times of one slow
-    file from the runner (<code>references/runners.md</code>).</td><td>This is a change to one line
-    of the spec. Task 13 corrects the spec.</td></tr>
-    <tr><td>Ledger format</td><td>One JSON file, <code>docs/test-diet/&lt;date&gt;-&lt;slug&gt;/ledger.json</code>.
-    The person reads <code>report.html</code> beside it, which
-    <code>jacked tests report</code> makes.</td><td>Commands read the ledger. A person reads the
-    report.</td></tr>
-    <tr><td>Gate machine list</td><td><code>~/.claude/jacked-gate-machines.json</code>, mode 0600:
-    <code>{"version": 1, "this": "&lt;label&gt;", "machines": {"&lt;label&gt;": {"ssh": "...",
-    "python": "python3", "root": "~/.jacked-gate", "workers": N, "priority": "low"}}}</code>.</td>
-    <td>The address stays local. A committed file names the label.</td></tr>
-    <tr><td>Transport</td><td><code>scp</code> copies <code>gate_driver.py</code>. Each step is
-    <code>ssh &lt;dest&gt; &lt;python&gt; &lt;driver&gt; &lt;verb&gt; &lt;plain arguments&gt;</code>
-    with the payload on standard input or output. The commit goes as a git bundle.</td><td>Plain
-    arguments need no quoting, so one driver works with a POSIX shell and with a Windows shell.
-    Proven on the owner's Windows machine on 2026-11-26: 1 MB of binary standard input arrived
-    with the same SHA-256.</td></tr>
-    <tr><td>Detached gate on Windows</td><td><code>subprocess.Popen</code> with
-    <code>DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB</code>. When the
-    system refuses the breakaway flag, the driver stops with an error. It does not start the gate
-    without the flag.</td><td>Proven on 2026-11-26: with the flag the process lived after the SSH
-    session ended. Without it the process died with the session.</td></tr>
-    <tr><td>The gate command on a gate machine</td><td>One command line for the shell of the gate
-    machine, given as one argument after <code>--</code>. The driver sets
-    <code>JACKED_GATE=1</code> and <code>JACKED_GATE_WORKERS</code> from the list.</td><td>A
-    command line for one shell does not survive a second shell.</td></tr>
+    file from the runner.</td><td>A change to one line of the spec (Task 15).</td></tr>
+    <tr><td>Ledger and report</td><td><code>docs/test-diet/&lt;date&gt;-&lt;slug&gt;/ledger.json</code>,
+    <code>proofs/&lt;row key&gt;.patch</code> and <code>report.html</code>. A row has a short key
+    (<code>R001</code>). A commit trailer names row keys, not test IDs.</td><td>Commands read the
+    ledger. A person reads the report.</td></tr>
+    <tr><td>Proof</td><td><code>jacked tests prove</code> runs in the present worktree. It refuses a
+    tree that is not clean, applies the patch, runs the command of the subject test and of the
+    keeper, reverses the patch, and checks that the tree identity is the same as before. It writes
+    the exit codes into the row.</td><td>A new scratch worktree has no installed environment. The
+    present worktree has one.</td></tr>
     <tr><td>Which jacked runs</td><td>Until the release, the installed jacked has no
-    <code>tests</code> group. Tasks 12 and 14 use the build of this worktree:
-    <code>uv run jacked tests ...</code> from the worktree folder. A gate line that the skill
-    writes into a repository must work with an older jacked: it runs the bare gate command when
-    <code>jacked tests --help</code> fails.</td><td>A gate script must not break on a machine
-    that has an older jacked.</td></tr>
-    <tr><td>When the pull request opens</td><td>After the two transport legs of Task 12 pass. If
-    the owner gives no gate machine, Task 7 and the <code>--on</code> flag move to a second pull
-    request on top of this one, and this one ships the recorder and the skill without
-    them.</td><td>One pull request must not wait on machine access with no end.</td></tr>
-    <tr><td>Codex policy file</td><td>For a skill: a real file
-    <code>agents/openai.yaml</code> in the skill directory, and a test that fails when a skill has
-    the key and no file. For a command: the generator writes the file into the skill that it makes
-    from the command.</td><td>The installer compares the hash of a skill directory with its source.
-    A file that only the installer adds would make each jacked skill look like the user's own.
-    This is a change to one sentence of the spec. Task 13 corrects the spec.</td></tr>
+    <code>tests</code> group. The live proof uses
+    <code>uv run --project &lt;feature worktree&gt; jacked tests ...</code> with the target
+    worktree as the working directory. A gate line that the skill writes into a repository checks
+    <code>jacked tests run --help</code> and runs the bare gate command, with one printed line,
+    when it fails.</td><td>A gate script must not break on a machine that has an older
+    jacked.</td></tr>
+    <tr><td>Codex policy file</td><td>For a skill: a real file <code>agents/openai.yaml</code> in the
+    skill directory, and a test that fails when a skill has the key and no file. For a command:
+    the generator writes the file into the skill that it makes from the command.</td><td>The
+    installer refuses a target file that the source does not have
+    (<code>install_manifest.py:238</code>), so a file that only the installer adds would send each
+    jacked skill to the backup folder. A change to one sentence of the spec (Task 15).</td></tr>
   </tbody>
 </table>
 
 <h2 id="tasks">Tasks</h2>
 
-<h3>Task 1: JUnit reader and test IDs</h3>
+<h3>Task 1: fixtures, JUnit reader and test IDs</h3>
 <p><strong>Files.</strong> Create <code>jacked/testdiet/__init__.py</code>, <code>model.py</code>,
 <code>junit.py</code>, <code>ids.py</code>, <code>tests/fixtures/testdiet/</code>,
-<code>tests/unit/test_testdiet_junit.py</code>, <code>tests/unit/test_testdiet_ids.py</code>.</p>
-<p><strong>Produces.</strong></p>
+<code>tests/testdiet_support.py</code>, <code>tests/unit/test_testdiet_junit.py</code>,
+<code>tests/unit/test_testdiet_ids.py</code>; modify <code>tests/conftest.py</code>,
+<code>.gitignore</code>.</p>
 <pre><code>@dataclass(frozen=True)
-class TestCase:
-    id: str                 # normalized, see ids.normalize
-    file: str | None        # repo-relative POSIX path
+class CaseResult:
+    id: str                    # normalized, see ids.normalize
+    file: str | None           # repo-relative POSIX path, always inside the root
     seconds: float | None
-    state: str              # "passed" | "failed" | "error" | "skipped"
+    state: str                 # "passed" | "failed" | "error" | "skipped" | "flaky"
+    failure_type: str | None   # the `type` attribute of the failure element; never its message
+    attempts: int
 
 @dataclass(frozen=True)
 class RunData:
-    runner: str             # "pytest" | "vitest" | "jest" | "playwright" | "go" | "nextest" | "unknown"
-    tests: tuple[TestCase, ...]
+    runner: str                # "pytest" | "vitest" | "jest" | "playwright" | "go" | "nextest" | "unknown"
+    tests: tuple[CaseResult, ...]
     seconds_reported: float | None
 
 class JUnitError(ValueError): ...
+class ListingError(ValueError): ...
 
 def read_junit(paths: Sequence[Path], *, root: Path, runner: str | None = None) -> RunData
-def normalize(runner: str, classname: str, name: str, file: str | None, *, root: Path) -> tuple[str, str | None]   # (id, file)
-def ids_from_listing(runner: str, text: str, *, root: Path) -> list[str]   # the runner's own list output
+def normalize(runner: str, classname: str, name: str, file: str | None, *, root: Path) -> tuple[str, str | None]
+def ids_from_listing(runner: str, text: str, *, root: Path) -> list[str]   # raises ListingError on an error line
 def detect_runner(root_element) -> str</code></pre>
+<p><strong>Rules.</strong> Open each path with <code>open_regular_fd</code>. Parse with
+<code>xml.etree.ElementTree.iterparse</code> and clear each element. A file with a DOCTYPE or an
+entity declaration raises <code>JUnitError</code> (set the handlers of the expat parser). No size
+limit. Never read the message attribute or the text of a failure element into a field.</p>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 1.1 Make the fixtures from real runs. Write
-  <code>tests/fixtures/testdiet/capture/</code> with one small project for each runner (pytest,
-  Vitest, Jest with jest-junit, Playwright with tests that open no browser, Go with gotestsum,
-  Rust with cargo-nextest). Each project has: a passing test, a failing test, a skipped test, a parametrized or table test, a test in a class or a nested suite, and a test that sleeps for
-  0.5 seconds. Run each one and keep the
-  JUnit file, the console total, and the output of the runner's list command. Write
-  <code>PROVENANCE.json</code>: the tool versions, the commands, the date. Read each command in the
-  runner's own documentation first. Install a missing tool in a temporary folder, not in the
-  system.</li>
-  <li><input type="checkbox" disabled> 1.2 Write the failing tests (below). Run them. Expected:
-  FAIL, the module does not exist.</li>
-  <li><input type="checkbox" disabled> 1.3 Implement the four functions. Use
-  <code>xml.etree.ElementTree.iterparse</code>. Never read failure text into a field.</li>
-  <li><input type="checkbox" disabled> 1.4 Run the two test files. Expected: PASS.</li>
-  <li><input type="checkbox" disabled> 1.5 Commit: <code>feat(testdiet): read JUnit of six runners into one form</code>.</li>
+  <li><input type="checkbox" disabled> 1.1 Write one small project for each runner under
+  <code>tests/fixtures/testdiet/projects/</code> (pytest, Vitest, Jest with jest-junit, Playwright
+  with tests that open no browser, Go with gotestsum, Rust with cargo-nextest). Each project has: a
+  passing test, a failing test, a skipped test, a parametrized or table test, a test in a class or a
+  nested suite, and a test named <code>sleeps_half_a_second</code> that sleeps for 0.5 seconds. Add
+  for pytest: a run with pytest-rerunfailures in which one test fails and then passes, and a second
+  project with a module that cannot import (its JUnit file and its
+  <code>--collect-only -q</code> output). Add for Playwright: a second report of the same tests
+  after one test moved down in its file.</li>
+  <li><input type="checkbox" disabled> 1.2 Write the capture script. It runs each project under the
+  neutral path <code>/work</code> or rewrites the absolute root prefix to <code>/work</code>, sets
+  each <code>hostname</code> attribute to <code>gate.example</code>, keeps the JUnit file, the
+  listing and the console total in <code>reports/</code>, and writes
+  <code>PROVENANCE.json</code>: the tool versions, the commands, the date, and the two rewrites as
+  the only changes. Read each command in the runner's own documentation first. Install a missing
+  tool in a temporary folder, not in the system. Add the <code>collect_ignore_glob</code> entry and
+  the <code>.gitignore</code> lines.</li>
+  <li><input type="checkbox" disabled> 1.3 Write the failing tests. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 1.4 Implement.</li>
+  <li><input type="checkbox" disabled> 1.5 Run the two test files. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 1.6 Commit: <code>feat(testdiet): read JUnit of six runners into one form</code>.</li>
 </ul>
 <pre><code>RUNNERS = ["pytest", "vitest", "jest", "playwright", "go", "nextest"]
+LISTED_BY_NAME = ("pytest", "vitest", "playwright", "nextest")    # this tuple is fixed by the plan
 
 @pytest.mark.parametrize("runner", RUNNERS)
-def test_real_report_gives_the_normalized_fields(runner):
-    data = read_junit(fixture_reports(runner), root=fixture_project(runner))
-    assert data.runner == runner
-    states = {t.state for t in data.tests}
-    assert {"passed", "failed", "skipped"} <= states
-    assert all(t.seconds is None or t.seconds >= 0 for t in data.tests)
-
+def test_real_report_gives_the_normalized_fields(runner): ...          # passed, failed and skipped are present
 @pytest.mark.parametrize("runner", RUNNERS)
 def test_a_test_that_sleeps_half_a_second_reads_as_half_a_second(runner):
-    # Both sides: a report in milliseconds reads as 500, a wrong divisor reads as 0.0005.
     data = read_junit(fixture_reports(runner), root=fixture_project(runner))
     slept = [t for t in data.tests if "sleeps_half_a_second" in t.id]
     assert len(slept) == 1 and 0.4 &lt;= slept[0].seconds &lt;= 5.0
-
-LISTED_BY_NAME = ("pytest", "vitest", "playwright", "nextest")    # this tuple is fixed by the plan
-
 @pytest.mark.parametrize("runner", LISTED_BY_NAME)
-def test_ids_of_the_report_equal_ids_of_the_listing(runner):
-    data = read_junit(fixture_reports(runner), root=fixture_project(runner))
-    listed = ids_from_listing(runner, fixture_listing(runner), root=fixture_project(runner))
-    assert {t.id for t in data.tests} == set(listed)
-
+def test_ids_of_the_report_equal_ids_of_the_listing(runner): ...
 def test_jest_lists_files_only_and_each_report_file_is_listed(): ...
-def test_go_lists_top_level_tests_and_each_report_id_starts_with_a_listed_name(): ...   # subtests exist only in a run
-
-def test_pytest_class_parametrized_and_nested_ids_have_the_file():
-    data = read_junit(fixture_reports("pytest"), root=fixture_project("pytest"))
-    assert "tests/test_sample.py::TestGroup::test_in_class" in {t.id for t in data.tests}
-    assert any(t.id.endswith("test_param[2]") and t.file == "tests/test_sample.py" for t in data.tests)
-
-def test_a_playwright_id_has_no_line_or_column():
-    data = read_junit(fixture_reports("playwright"), root=fixture_project("playwright"))
-    assert not any(re.search(r":\d+:\d+", t.id) for t in data.tests)
-
-def test_no_failure_text_is_kept():
-    data = read_junit(fixture_reports("pytest"), root=fixture_project("pytest"))
-    assert "AssertionError" not in repr(data)
-
-def test_a_truncated_file_raises_junit_error(tmp_path):
-    whole = fixture_reports("pytest")[0].read_bytes()
-    cut = tmp_path / "cut.xml"; cut.write_bytes(whole[: len(whole) // 2])
-    with pytest.raises(JUnitError):
-        read_junit([cut], root=tmp_path)</code></pre>
+def test_go_lists_top_level_tests_and_each_report_id_starts_with_a_listed_name(): ...
+def test_pytest_class_parametrized_and_nested_ids_have_the_file(): ...
+def test_a_playwright_id_has_no_line_or_column(): ...
+def test_a_playwright_test_that_moved_down_keeps_its_id(): ...            # the two real reports
+@pytest.mark.parametrize("runner", RUNNERS)
+def test_no_message_and_no_text_of_a_failure_is_kept(runner): ...         # take each message attribute and element text
+                                                                          # from the raw file; none is in repr(data)
+def test_the_failure_type_is_kept_as_a_class_name(): ...
+def test_a_test_that_failed_and_passed_on_a_rerun_is_flaky_with_two_attempts(): ...
+def test_a_testcase_with_failure_and_error_is_an_error(): ...
+def test_two_report_files_with_one_id_give_one_case(): ...
+def test_a_truncated_file_raises_junit_error(tmp_path): ...
+def test_a_file_with_a_doctype_raises_junit_error(tmp_path): ...
+def test_a_class_name_that_leaves_the_root_gives_no_file(tmp_path): ...   # "..", an absolute value, an empty part
+def test_a_listing_of_a_module_that_cannot_import_raises_listing_error(): ...
+def test_the_report_of_a_collection_error_has_an_error_case_for_the_module(): ...
+def test_no_fixture_holds_a_host_name_or_a_home_path(): ...               # each hostname= is gate.example; no /Users/, /home/, \Users\
+def test_pytest_collects_nothing_under_the_fixture_projects(): ...        # a child pytest --collect-only on that folder</code></pre>
 
 <h3>Task 2: tree identity and the history store</h3>
 <p><strong>Files.</strong> Create <code>jacked/testdiet/tree.py</code>, <code>history.py</code>;
 extend <code>model.py</code>; create <code>tests/unit/test_testdiet_tree_history.py</code>.</p>
-<p><strong>Consumes.</strong> <code>RunData</code>, <code>TestCase</code>. <strong>Produces.</strong></p>
 <pre><code>@dataclass(frozen=True)
 class TreeId:
-    commit: str     # full SHA of HEAD
-    tree: str       # git tree hash of the working state
-    clean: bool     # tree == HEAD^{tree}
+    commit: str; tree: str; clean: bool
 
 @dataclass(frozen=True)
 class RunMeta:
-    id: str; started: str; wall_seconds: float | None; exit_code: int | None
-    kind: str | None; runner: str | None; machine: str; gate_machine: bool
-    tree: TreeId | None; tree_changed: bool | None
-    counts: dict[str, int] | None; seconds_reported: float | None
+    id: str; started: str; source: str               # "run" | "record"
+    wall_seconds: float | None; exit_code: int | None; verdict: str   # "passed" | "failed" | "conflict" | "no-data"
+    kind: str | None; label: str | None; runner: str | None
+    command_sha: str | None; inputs_sha: str | None
+    machine: str; machine_fp: str; gate_machine: bool
+    tree: TreeId | None; tree_changed: bool | None; on_default_branch: bool | None
+    counts: dict[str, int] | None; collected: int | None; seconds_reported: float | None
     load_start: float | None; load_end: float | None; child_cpu_seconds: float | None
-    failing: tuple[str, ...]; failing_sig: str | None; label: str | None; source: str   # "run" | "record"
+    failing: tuple[str, ...]; flaky: tuple[str, ...]; failing_sig: str | None
 
-def tree_id(cwd: Path) -> TreeId
+def tree_id(cwd: Path) -> TreeId | None
+def changed_paths(cwd: Path, a: TreeId, b: TreeId) -> list[str]
+def inputs_fingerprint(cwd: Path, globs: Sequence[str]) -> str | None      # None when no glob is given
 def common_dir(cwd: Path) -> Path
-def store_dir(cwd: Path) -> Path                      # common_dir / "jacked-tests"
-def machine_label(home: Path | None = None) -> str    # "this" of the machine list, else "local"
-def failing_signature(ids: Iterable[str]) -> str | None   # sha256 of the sorted IDs, None when empty
+def store_dir(cwd: Path) -> Path                       # common_dir / "jacked-tests"
+def machine_label(home: Path | None = None) -> str     # "this" of the machine list in jacked_home(), else "local"
+def machine_fingerprint() -> str                       # sha256 of platform, processor count and node name; local only
+def command_sha(argv: Sequence[str]) -> str
+def failing_signature(cases: Iterable[CaseResult]) -> str | None   # sha256 of the sorted (id, failure_type) pairs
+def verdict_of(exit_code: int | None, data: RunData | None) -> str
 def write_run(store: Path, meta: RunMeta, data: RunData | None) -> None
-def iter_runs(store: Path) -> Iterator[RunMeta]       # newest first; a damaged file is skipped with a warning
+def iter_runs(store: Path) -> Iterator[RunMeta]        # newest first; a damaged file is skipped with a warning
 def load_tests(store: Path, run_id: str) -> RunData | None
 def prune(store: Path, before: date) -> list[str]</code></pre>
 <ul class="tasks">
   <li><input type="checkbox" disabled> 2.1 Write the failing tests. Run them. Expected: FAIL.</li>
-  <li><input type="checkbox" disabled> 2.2 Implement. <code>tree_id</code> must not change the real
-  index: prove it in the test with the hash of <code>.git/index</code> before and after.</li>
+  <li><input type="checkbox" disabled> 2.2 Implement.</li>
   <li><input type="checkbox" disabled> 2.3 Run the test file. Expected: PASS.</li>
   <li><input type="checkbox" disabled> 2.4 Commit: <code>feat(testdiet): tree identity and a local history that no session can damage</code>.</li>
 </ul>
@@ -625,117 +677,155 @@ def prune(store: Path, before: date) -> list[str]</code></pre>
 def test_an_edit_that_is_not_committed_changes_the_tree_and_is_not_clean(repo): ...
 def test_a_new_file_that_git_does_not_ignore_changes_the_tree(repo): ...
 def test_an_ignored_file_does_not_change_the_tree(repo): ...
-def test_two_commits_with_the_same_content_have_one_tree(repo): ...      # commit, amend the message
+def test_two_commits_with_the_same_content_have_one_tree(repo): ...
 def test_tree_id_does_not_change_the_real_index(repo): ...
-def test_two_worktrees_of_one_clone_share_one_store(repo): ...           # store_dir equal
-def test_a_run_comes_back_the_same(tmp_path): ...                        # write_run, iter_runs, load_tests
+def test_tree_id_in_a_linked_worktree_does_not_change_its_index(repo): ...
+def test_tree_id_of_a_dirty_tree_writes_no_object_into_the_repository(repo): ...   # git count-objects before and after
+def test_a_repository_with_no_commit_has_no_tree(tmp_path): ...
+def test_changed_paths_names_the_file_that_differs(repo): ...
+def test_the_inputs_fingerprint_changes_when_an_ignored_input_changes(repo): ...
+def test_two_worktrees_of_one_clone_share_one_store(repo): ...
+def test_the_store_is_outside_the_work_tree(repo): ...
+def test_a_run_comes_back_the_same(tmp_path): ...
 def test_a_value_that_is_absent_comes_back_as_none_not_zero(tmp_path): ...
-def test_two_processes_write_runs_at_once_and_both_are_readable(tmp_path): ...   # two subprocesses, 20 runs each
+def test_a_run_with_no_meta_file_does_not_exist(tmp_path): ...            # only the tests file was written
+def test_two_processes_write_runs_at_once_and_both_are_readable(tmp_path): ...
 def test_a_damaged_meta_file_is_skipped_and_the_others_are_listed(tmp_path): ...
-def test_the_store_is_outside_the_work_tree(repo): ...                   # git status stays empty
-def test_prune_deletes_only_runs_before_the_date_and_names_them(tmp_path): ...</code></pre>
+def test_prune_deletes_only_runs_before_the_date_and_names_them(tmp_path): ...
+@pytest.mark.parametrize("code,failed,expected", [(0, 0, "passed"), (1, 2, "failed"), (0, 2, "conflict"), (0, None, "no-data")])
+def test_verdict_of(code, failed, expected): ...
+def test_a_run_with_no_test_is_not_passed(): ...                           # exit 0, a report with zero cases
+def test_the_failing_signature_differs_when_the_failure_type_differs(): ...
+def test_the_machine_fingerprint_is_not_the_node_name(): ...</code></pre>
 
 <h3>Task 3: <code>run</code>, <code>record</code>, <code>seen</code> and the command group</h3>
 <p><strong>Files.</strong> Create <code>jacked/testdiet/record.py</code>,
 <code>tests/unit/test_testdiet_run.py</code>, <code>tests/unit/test_cli_tests_group.py</code>;
-modify <code>jacked/cli.py</code> (add the group after the <code>dcr</code> group).</p>
-<p><strong>Consumes.</strong> Tasks 1 and 2. <strong>Produces.</strong></p>
-<pre><code>NO_VERDICT = 75
-
-def run_gate(argv: Sequence[str], *, cwd: Path, junit: Sequence[str] = (), kind: str | None = None,
-             label: str | None = None, runner: str | None = None) -> int
+modify <code>jacked/cli.py</code>.</p>
+<pre><code>def run_gate(argv: Sequence[str], *, cwd: Path, junit: Sequence[str] = (), inputs: Sequence[str] = (),
+             kind: str | None = None, label: str | None = None, runner: str | None = None,
+             strict: bool = False) -> int
 def record_files(junit: Sequence[Path], *, cwd: Path, kind: str | None, label: str | None, runner: str | None,
                  commit: str | None, exit_code: int | None, wall_seconds: float | None,
-                 machine: str | None, gate_machine: bool = False) -> RunMeta
-def seen(store: Path, tree: TreeId, *, machine: str | None = None) -> RunMeta | None
-def repeat_notice(store: Path, meta: RunMeta, *, cwd: Path) -> str | None
+                 machine: str | None) -> RunMeta           # source "record"; tree is None when commit is None
+def seen(store: Path, tree: TreeId, command: str, *, inputs_sha: str | None,
+         machine: str, machine_fp: str, any_machine: bool = False) -> RunMeta | None
+def repeat_notice(store: Path, meta: RunMeta) -> str | None
 
-# cli.py
-@main.group(name="tests")
-def tests_group(): """Record and read the gate runs of this repository."""
-# jacked tests run [--junit GLOB]... [--kind full|targeted] [--label TEXT] [--runner NAME] [--on LABEL] -- CMD...
+# jacked tests run [--junit GLOB]... [--input GLOB]... [--kind full|targeted] [--label TEXT] [--runner NAME] [--strict] -- CMD...
 # jacked tests record --junit PATH... [--kind ..] [--exit-code N] [--wall SECONDS] [--commit SHA] [--machine LABEL]
-# jacked tests seen [--json]        exit 0: this tree passed a full gate. exit 1: not seen.</code></pre>
-<p><strong>Rules.</strong> The child inherits standard output and standard error. The tree identity
-is read before the child starts and again after it ends; when they differ,
-<code>tree_changed</code> is true. Outside a git repository, <code>run</code> runs the command,
-prints one line, records nothing and returns the exit code. A child that a signal stops gives 128
-plus the signal number. A
-command that cannot start gives 127. <code>seen</code> returns a run only when: kind is
-<code>full</code>, exit code is 0, <code>tree_changed</code> is false, and the tree hash is equal.
-The notice goes to standard error after the child ends, and says how many earlier records hold
-the same failing set, the first and the last date, the number of trees, and if a clean record of a
-commit on the default branch is one of them.</p>
+# jacked tests seen [--input GLOB]... [--any-machine] [--json] -- CMD...     exit 0: passed before. exit 1: not seen.</code></pre>
+<p><strong>Rules of <code>run</code>.</strong> The child inherits standard output and standard
+error. The tree identity is read before the child starts and after it ends; the record holds the
+identity before. When they differ, <code>tree_changed</code> is true and <code>run</code> prints
+the changed paths. The processor time of the child is the difference of
+<code>RUSAGE_CHILDREN</code> around the child only. After an interrupt of the parent,
+<code>run</code> waits for the child. A child that a signal stops gives 128 plus the signal number.
+A command that cannot start gives 127. Outside a git repository, <code>run</code> runs the command,
+prints one line, records nothing and returns the exit code. On a conflict it prints one line on
+standard error that says that the gate returned 0 and that the report holds failures; with
+<code>--strict</code> it returns 1.</p>
+<p><strong>Rule of <code>seen</code>.</strong> It returns a run only when all of these are true:
+<code>source</code> is <code>run</code>; <code>verdict</code> is <code>passed</code>;
+<code>tree_changed</code> is false (not empty); the tree hash, the command SHA and the inputs
+fingerprint are equal; the machine label and fingerprint are equal, unless
+<code>--any-machine</code>.</p>
+<p><strong>Rule of the notice.</strong> It states facts: how many earlier records hold the same
+failing signature, the first and the last date, the number of trees, and how many of those records
+have <code>on_default_branch</code> true. It does not say whose defect it is.
+<code>on_default_branch</code> is set when the record is written: the commit is an ancestor of the
+remote default branch and the tree is clean.</p>
 <ul class="tasks">
   <li><input type="checkbox" disabled> 3.1 Write the failing tests. Each gate in a test is
   <code>sys.executable -c</code> with a small script that writes a copy of a real fixture and exits
   with a chosen code. Run them. Expected: FAIL.</li>
-  <li><input type="checkbox" disabled> 3.2 Implement <code>record.py</code> and the group with
-  <code>run</code>, <code>record</code>, <code>seen</code>. <code>--on</code> prints "not available
-  yet" and exits 2 until Task 7.</li>
+  <li><input type="checkbox" disabled> 3.2 Implement <code>record.py</code> and the group. Exempt
+  <code>tests</code> in <code>_maybe_prompt_first_run</code> (<code>cli.py:179</code>).</li>
   <li><input type="checkbox" disabled> 3.3 Run the two test files and
-  <code>tests/unit/test_cli_dcr.py</code>. Expected: PASS.</li>
+  <code>tests/unit/test_cli_dcr.py</code>, <code>tests/unit/test_cli_first_run_and_tray.py</code>.
+  Expected: PASS.</li>
   <li><input type="checkbox" disabled> 3.4 Commit: <code>feat(testdiet): jacked tests run wraps a gate and keeps its exit code</code>.</li>
 </ul>
 <pre><code>@pytest.mark.parametrize("code", [0, 1, 2, 5])
 def test_run_returns_the_exit_code_of_the_gate(repo, code): ...
-def test_run_records_counts_failing_ids_and_the_tree(repo): ...
-def test_run_without_junit_records_meta_only_and_keeps_the_exit_code(repo): ...     # counts is None
-def test_run_ignores_a_junit_file_older_than_the_run(repo): ...                      # focus 1
-def test_run_with_a_truncated_junit_keeps_the_exit_code_and_records_no_tests(repo): ...   # focus 1
-def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch): ...      # write_run raises
+def test_run_records_counts_failing_ids_the_tree_and_the_command_sha(repo): ...
+def test_the_store_holds_the_sha_of_the_command_and_not_its_text(repo): ...
+def test_run_without_junit_is_no_data_and_keeps_the_exit_code(repo): ...
+def test_run_reads_a_fresh_report_whose_time_is_before_the_start(repo): ...        # set the mtime back; focus 1
+def test_run_does_not_read_a_report_that_did_not_change_and_says_so(repo, capsys): ...   # focus 1
+def test_run_with_a_truncated_junit_keeps_the_exit_code_and_is_no_data(repo): ...  # focus 1
+def test_a_junit_path_that_is_a_fifo_does_not_block_the_run(repo): ...             # POSIX
+def test_exit_0_with_failures_in_the_report_is_a_conflict_and_is_printed(repo, capsys): ...   # focus 2
+def test_strict_returns_1_on_a_conflict_and_the_gate_code_in_each_other_case(repo): ...
+def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch): ...
 def test_a_command_that_cannot_start_returns_127(repo): ...
+def test_a_child_that_a_signal_stops_returns_128_plus_the_signal(repo): ...        # POSIX
 def test_run_outside_a_git_repository_records_nothing_and_keeps_the_exit_code(tmp_path): ...
-def test_a_tree_that_changed_during_the_run_is_never_seen(repo): ...                 # focus 2
-def test_seen_is_false_for_a_dirty_tree_whose_head_passed(repo): ...                 # focus 2
-def test_seen_is_false_for_a_green_run_with_no_kind(repo): ...
+def test_a_gate_that_writes_a_file_into_the_tree_is_named_and_never_seen(repo, capsys): ...   # focus 3
+def test_seen_is_false_for_a_dirty_tree_whose_head_passed(repo): ...               # focus 3
+def test_seen_is_false_when_the_gate_command_differs(repo): ...
+def test_seen_is_false_for_a_conflict_and_for_no_data(repo): ...
+def test_seen_is_false_for_a_green_record_that_was_not_wrapped(repo): ...          # jacked tests record
+def test_seen_is_false_when_a_declared_input_changed(repo): ...
+def test_seen_is_false_for_a_record_of_a_different_machine_without_the_flag(repo): ...
 def test_seen_is_true_for_a_second_commit_with_the_same_content(repo): ...
+def test_record_without_a_commit_has_no_tree(repo): ...
 def test_a_red_run_with_a_failing_set_in_two_earlier_records_prints_them(repo, capsys): ...
 def test_a_red_run_with_a_new_failing_set_prints_no_notice(repo, capsys): ...
-def test_the_notice_names_the_default_branch_when_a_clean_record_of_it_has_the_set(repo, capsys): ...
-def test_record_reads_a_file_of_a_run_that_was_not_wrapped_and_leaves_wall_empty(repo): ...
-def test_record_writes_to_no_tracked_file(repo): ...                                 # git status is empty
-def test_the_store_holds_no_failure_text(repo): ...                                  # grep the store for the assert message
-def test_cli_run_passes_the_exit_code_through(repo): ...                             # CliRunner, standalone_mode
-def test_cli_seen_exits_1_for_a_tree_that_did_not_run(repo): ...</code></pre>
+def test_the_notice_counts_default_branch_records_and_gives_no_cause(repo, capsys): ...
+def test_the_load_and_the_processor_time_are_recorded_or_empty_on_windows(repo): ...
+def test_record_writes_to_no_tracked_file(repo): ...
+def test_the_store_holds_no_failure_text(repo): ...                                # read the gzip file, then search
+def test_a_printed_id_has_no_escape_sequence(repo, capsys): ...
+def test_cli_run_passes_the_exit_code_through(repo): ...
+def test_cli_tests_does_not_ask_to_install(repo): ...</code></pre>
 
 <h3>Task 4: <code>profile</code> and <code>history</code></h3>
 <p><strong>Files.</strong> Create <code>jacked/testdiet/views.py</code>,
 <code>tests/unit/test_testdiet_views.py</code>; modify <code>jacked/cli.py</code>.</p>
-<p><strong>Produces.</strong></p>
-<pre><code>def profile(store: Path, run_id: str | None = None, *, machine: str, top: int = 20) -> dict
+<pre><code>def profile(store: Path, run_id: str | None = None, *, machine: str | None = None, top: int | None = 20) -> dict
 # keys: run, machine, total_test_seconds, files_for_half, file_count, files: [{file, seconds, tests}],
-#       tests: [{id, seconds}], setup_share: None, noise: [{tree, runs, wall_min, wall_max, test_seconds_min, test_seconds_max}]
-def history(store: Path, *, machine: str, days: int | None = None) -> dict
-# keys: machine, full_runs, red_full_runs, failing_counts: [int], repeated_green_trees: [{tree, runs}],
-#       failing_sets: [{sig, runs, first, last, trees, ids}], other_machines: [labels], size_bytes
-# jacked tests profile [--run ID] [--top N] [--json]
-# jacked tests history [--days N] [--json] [--size]
+#       tests: [{id, seconds}], hidden_rows, setup_share: None,
+#       repeats: [{tree, command_sha, runs, wall_min, wall_max, test_seconds_min, test_seconds_max}]
+def history(store: Path, *, machine: str | None = None, days: int | None = None) -> dict
+# keys: machine, labelled_full_runs, verdicts: {passed, failed, conflict, no-data}, failing_counts: [int],
+#       repeated_green: [{tree, command_sha, runs}], failing_sets: [{sig, runs, first, last, trees, on_default_branch, ids}],
+#       flaky: [{id, runs}], other_machines: [labels], size_bytes
+# jacked tests profile [--run ID] [--machine LABEL] [--top N] [--json]
+# jacked tests history [--machine LABEL] [--days N] [--json] [--size]
 # jacked tests prune --before YYYY-MM-DD</code></pre>
+<p><strong>Rules.</strong> With no <code>--machine</code>, a view uses the machine of the newest
+run with the label <code>full</code> and prints which machine it used. A group never mixes two
+machines (label and fingerprint). <code>--json</code> prints every row; <code>--top</code> shortens
+the text output only, and the text says how many rows it hides.</p>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 4.1 Write the failing tests on a store that the test fills
-  with <code>write_run</code>. Run them. Expected: FAIL.</li>
-  <li><input type="checkbox" disabled> 4.2 Implement. The text output is plain lines with no
-  verdict words. <code>--json</code> prints the dictionary.</li>
+  <li><input type="checkbox" disabled> 4.1 Write the failing tests on a store that
+  <code>fill_store</code> makes. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 4.2 Implement.</li>
   <li><input type="checkbox" disabled> 4.3 Run the test file. Expected: PASS.</li>
   <li><input type="checkbox" disabled> 4.4 Commit: <code>feat(testdiet): profile and history show where the gate time is</code>.</li>
 </ul>
-<pre><code>def test_files_for_half_counts_the_fewest_files_that_hold_half_the_seconds(store): ...   # 10,5,3,1,1 -> 1
-def test_profile_uses_the_newest_full_run_of_this_machine_by_default(store): ...
-def test_profile_never_mixes_two_machines(store): ...                 # noise groups are per machine
-def test_noise_needs_two_full_runs_of_one_tree_and_is_empty_with_one(store): ...
+<pre><code>def test_files_for_half_counts_the_fewest_files_that_hold_half_the_seconds(store): ...   # 10,5,3,1,1 gives 1
+def test_profile_uses_the_machine_of_the_newest_full_run_and_prints_it(store): ...
+def test_profile_reads_a_gate_machine_record_with_the_machine_flag(store): ...
+def test_a_group_never_mixes_two_machines_with_one_label(store): ...                 # same label, two fingerprints
+def test_repeats_need_two_runs_of_one_tree_and_one_command(store): ...
 def test_setup_share_is_none_for_a_junit_record(store): ...
-def test_history_groups_red_runs_by_failing_set(store): ...           # 3 runs one set, 1 run another
+def test_json_output_is_not_shortened_and_the_text_says_what_it_hides(store): ...
+def test_history_groups_red_runs_by_failing_set(store): ...
 def test_history_lists_a_tree_that_ran_green_two_times(store): ...
-def test_history_names_other_machines_and_does_not_count_their_runs(store): ...
-def test_a_test_with_no_seconds_is_not_counted_as_zero_seconds(store): ...</code></pre>
+def test_history_counts_each_verdict(store): ...
+def test_a_test_with_no_seconds_is_not_counted_as_zero_seconds(store): ...
+@pytest.mark.parametrize("runner", RUNNERS)
+def test_a_real_report_goes_through_record_and_profile(repo, runner): ...             # record_files, then profile</code></pre>
 
 <h3>Task 5: the loss report</h3>
 <p><strong>Files.</strong> Create <code>jacked/testdiet/loss.py</code>,
 <code>tests/unit/test_testdiet_loss.py</code>; modify <code>jacked/cli.py</code>.</p>
 <pre><code>@dataclass(frozen=True)
 class LossReport:
-    base: str; added: tuple[str, ...]; removed: tuple[str, ...]; net: int    # names are "path::name"
+    base: str; added: tuple[str, ...]; removed: tuple[str, ...]; net: int      # names are "path::name"
+    fewer_assertions: tuple[str, ...]; skips_added: tuple[str, ...]
 
 def loss_report(cwd: Path, base: str | None = None) -> LossReport   # base default: merge-base with the default branch
 def declarations(path: str, text: str) -> list[str]
@@ -745,13 +835,16 @@ def declarations(path: str, text: str) -> list[str]
 the first string argument of <code>test(</code> and <code>it(</code>, with <code>.each</code>,
 <code>.skip</code> and <code>.only</code>. Go: <code>func TestXxx(</code>. Rust: the function after
 <code>#[test]</code>. A name that leaves one touched file and arrives in a different touched file
-is not in <code>removed</code>. The working tree counts, not only the commits.</p>
+is not in <code>removed</code>. The working tree counts, not only the commits.
+<code>fewer_assertions</code> names a test that is in both versions and has fewer assertion
+statements or calls now. <code>skips_added</code> names a test that has a skip mark now and had
+none. Both are report lines. They are not a verdict.</p>
 <ul class="tasks">
   <li><input type="checkbox" disabled> 5.1 Write the failing tests on small temporary repositories.
   Run them. Expected: FAIL.</li>
   <li><input type="checkbox" disabled> 5.2 Implement.</li>
   <li><input type="checkbox" disabled> 5.3 Run the test file. Expected: PASS.</li>
-  <li><input type="checkbox" disabled> 5.4 Commit: <code>feat(testdiet): loss reports the tests that a change removes</code>.</li>
+  <li><input type="checkbox" disabled> 5.4 Commit: <code>feat(testdiet): loss reports the tests that a change removes or weakens</code>.</li>
 </ul>
 <pre><code>def test_a_removed_test_is_named_and_net_is_minus_one(repo): ...
 def test_a_renamed_file_with_the_same_tests_reports_no_loss(repo): ...
@@ -759,195 +852,277 @@ def test_a_test_moved_to_a_different_file_reports_no_loss(repo): ...
 def test_an_edited_parameter_value_reports_no_loss(repo): ...
 def test_added_tests_are_reported_as_growth(repo): ...
 def test_a_method_in_a_test_class_is_a_declaration(repo): ...
+def test_a_test_with_one_assertion_less_is_named(repo): ...
+def test_a_new_skip_mark_is_named(repo): ...
 @pytest.mark.parametrize("ext,body", TS_GO_RUST_CASES)
 def test_declarations_of_typescript_go_and_rust(ext, body): ...
 def test_cli_loss_exits_0_with_a_loss_and_with_none(repo): ...
 def test_a_python_file_with_a_syntax_error_still_gives_declarations(repo): ...</code></pre>
 
-<h3>Task 6: ledger, ID check and report</h3>
-<p><strong>Files.</strong> Create <code>jacked/testdiet/ledger.py</code>, <code>report.py</code>,
+<h3>Task 6: the ledger: verify, protect, approve</h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/ledger.py</code>,
 <code>tests/unit/test_testdiet_ledger.py</code>; modify <code>jacked/cli.py</code>.</p>
 <pre><code>MARKS = ("retain", "fix", "consolidate", "delete", "speed", "tier")
 KINDS = ("dead-target", "the-past", "shape", "duplicate", "covered", "test")
 EVIDENCE = ("detects", "callers", "remaining_proof", "history", "dead_code", "risk", "validate")
-# a row: id, mark, kind, area, batch, the seven EVIDENCE fields, keeper, renamed_to,
-#        protected, approved_by, tier_runner, tier_cadence, status ("planned" | "applied")
+# the ledger: version, base (commit), baseline_run (run ID), protected_globs, coverage, rows
+# a row: key ("R001"), id, mark, kind, area, batch (int), the seven EVIDENCE fields, keeper, renamed_to,
+#        protected, protected_by ("detector" | "agent"), approved_by, proof, tier_runner, tier_cadence,
+#        status ("planned" | "applied")
+# a proof (written only by `jacked tests prove`): kind ("defect" | "refactor"), patch_sha, base_tree,
+#        subject_rc, keeper_rc, after_rc, at
 
 @dataclass(frozen=True)
 class Problem: row: str | None; text: str
 
 def load_ledger(path: Path) -> dict
-def verify_ledger(ledger: dict, failing: frozenset[str] = frozenset()) -> list[Problem]
-def reconcile(before: set[str], after: set[str], ledger: dict) -> list[Problem]
-def render_report(ledger: dict, before: RunMeta | None, after: RunMeta | None,
-                  tests_before: RunData | None, tests_after: RunData | None, noise: list[dict]) -> str
-# jacked tests ledger verify PATH [--baseline RUN_ID]           exit 1 when a row is not ready
-# jacked tests ids --before PATH --after PATH --ledger PATH     exit 1 on a difference with no row
-#     PATH is a JUnit file, or a text file with the runner's list output and --runner NAME
-# jacked tests report --ledger PATH [--before RUN_ID] [--after RUN_ID] -o PATH</code></pre>
-<p><strong>Rules of <code>verify_ledger</code>.</strong> A <code>delete</code> row needs a kind and
-each of the seven evidence fields with text. A <code>consolidate</code> row needs the same and a
-<code>keeper</code> or a <code>renamed_to</code>. A <code>fix</code> or a <code>speed</code> row
-needs <code>detects</code> and <code>validate</code>. A <code>tier</code> row needs
-<code>tier_runner</code> and <code>tier_cadence</code>. A <code>delete</code> row with a
-<code>protected</code> class needs <code>approved_by</code>. An unknown mark or kind is a
-problem. With <code>--baseline</code>, a <code>delete</code> or a <code>consolidate</code> row
-whose test fails in that run is a problem: a failing test is never a candidate.</p>
-<p><strong>Rules of <code>reconcile</code>.</strong> Each ID in <code>before</code> and not in
-<code>after</code> needs a <code>delete</code> row or a <code>consolidate</code> row. Each ID in
-<code>after</code> and not in <code>before</code> must be the <code>renamed_to</code> of a row. A
-<code>delete</code> row whose ID is in <code>after</code> is a problem. A <code>keeper</code> that
-is not in <code>after</code> is a problem.</p>
-<p><strong>Rules of the report.</strong> One self-contained HTML file: IDs and numbers only. The
-times of <code>before</code> and <code>after</code> are compared only when both records are of one
-machine. The report prints processor seconds, the sum of the test seconds and the wall time with
-the load. When the list of noise samples is empty it says that the noise was not measured. When
-the difference is inside the noise it says "not measurable".</p>
+def save_ledger(path: Path, ledger: dict) -> None
+def detect_protected(ledger: dict, repo: Path) -> dict[str, str]      # row key to the reason
+def verify_ledger(ledger: dict, store: Path, repo: Path) -> list[Problem]
+# jacked tests ledger verify PATH                exit 1 when a row is not ready
+# jacked tests ledger protect PATH               marks rows; it never removes a mark
+# jacked tests ledger approve PATH --row KEY     needs a terminal; writes approved_by</code></pre>
+<p><strong>Rules of <code>verify_ledger</code>.</strong></p>
+<ul>
+  <li>A ledger with a <code>delete</code>, a <code>consolidate</code>, a <code>speed</code> or a
+  <code>fix</code> row needs <code>baseline_run</code>. That run must be in the store, have source
+  <code>run</code> and verdict <code>passed</code>. If not, each such row is a problem, and each row
+  with status <code>applied</code> is a problem: a baseline that is red or unknown gives a report
+  only.</li>
+  <li>The test of a <code>delete</code> or a <code>consolidate</code> row must be in the baseline
+  with state <code>passed</code>. A test that failed, had an error, was flaky, or is not in the
+  baseline is a problem: a failing test is never a candidate.</li>
+  <li>A <code>delete</code> row needs a kind and each of the seven evidence fields with text. A
+  <code>consolidate</code> row needs the same and a <code>keeper</code> or a
+  <code>renamed_to</code>.</li>
+  <li>A <code>delete</code> row of kind <code>duplicate</code> or <code>covered</code> needs a
+  <code>keeper</code>.</li>
+  <li>Proof. Kind <code>covered</code>: a proof of kind <code>defect</code> with
+  <code>subject_rc</code> not 0 and <code>keeper_rc</code> not 0. Kind <code>shape</code>: a proof of
+  kind <code>defect</code> with <code>subject_rc</code> 0. Kind <code>test</code>: a proof of kind
+  <code>defect</code> with <code>subject_rc</code> 0, or a proof of kind <code>refactor</code> with
+  <code>subject_rc</code> not 0 and <code>keeper_rc</code> 0. A <code>speed</code> or a
+  <code>fix</code> row: a proof of kind <code>defect</code> with <code>subject_rc</code> not 0 and
+  <code>after_rc</code> not 0, and <code>detects</code> and <code>validate</code>. Kinds
+  <code>dead-target</code>, <code>the-past</code> and <code>duplicate</code> need no proof
+  record.</li>
+  <li>The patch file of a proof must be in <code>proofs/</code> beside the ledger and have the
+  recorded SHA-256.</li>
+  <li>A <code>tier</code> row needs <code>tier_runner</code> and <code>tier_cadence</code>.</li>
+  <li>A row that <code>detect_protected</code> names and that has no <code>protected</code> value
+  is a problem. A <code>delete</code> or a <code>consolidate</code> row with a
+  <code>protected</code> value needs <code>approved_by</code>, and has status <code>applied</code>
+  only with it.</li>
+  <li>An unknown mark or kind, a key that two rows have, and a key that does not match
+  <code>R[0-9]{3,}</code> are problems.</li>
+</ul>
+<p><strong><code>detect_protected</code></strong> names a row when a rule file of the repository
+(<code>CLAUDE.md</code>, <code>AGENTS.md</code>, <code>lessons.md</code>, a file under
+<code>.claude/rules/</code>) holds the path or the name of the test file, or when the path matches
+a glob of <code>protected_globs</code>. A match only adds protection. <strong><code>approve</code></strong>
+refuses when standard input is not a terminal. It shows the row, asks the person to type the row
+key, and writes the git user name and the date.</p>
 <ul class="tasks">
   <li><input type="checkbox" disabled> 6.1 Write the failing tests. Run them. Expected: FAIL.</li>
   <li><input type="checkbox" disabled> 6.2 Implement.</li>
   <li><input type="checkbox" disabled> 6.3 Run the test file. Expected: PASS.</li>
-  <li><input type="checkbox" disabled> 6.4 Commit: <code>feat(testdiet): no deletion without evidence, and IDs checked on both sides</code>.</li>
+  <li><input type="checkbox" disabled> 6.4 Commit: <code>feat(testdiet): no cut without a proof, and no cut of a test that fails</code>.</li>
 </ul>
 <pre><code>@pytest.mark.parametrize("field", EVIDENCE)
 def test_a_delete_row_with_one_missing_evidence_field_is_refused(field): ...
-def test_a_complete_delete_row_is_ready(): ...
-def test_a_delete_of_a_protected_class_needs_a_named_approval(): ...
+def test_a_complete_dead_target_row_on_a_green_baseline_is_ready(): ...
+def test_a_ledger_with_a_delete_row_and_no_baseline_is_refused(): ...                  # focus 5
+def test_a_baseline_that_is_red_refuses_each_cut_and_each_applied_row(): ...
+def test_a_baseline_with_no_test_data_refuses_each_cut(): ...
+def test_a_baseline_that_was_not_wrapped_refuses_each_cut(): ...
+def test_a_delete_row_for_a_test_that_fails_in_the_baseline_is_refused(): ...          # focus 5
+def test_a_delete_row_for_a_test_that_is_not_in_the_baseline_is_refused(): ...
+def test_a_covered_delete_with_no_keeper_is_refused(): ...                             # focus 5
+def test_a_covered_delete_with_no_proof_is_refused(): ...
+def test_a_covered_delete_whose_keeper_did_not_fail_on_the_defect_is_refused(): ...    # keeper_rc == 0; focus 5
+def test_a_shape_delete_whose_test_failed_on_the_defect_is_refused(): ...
+def test_a_speed_row_whose_new_form_does_not_fail_on_the_defect_is_refused(): ...      # after_rc == 0; focus 5
+def test_a_proof_whose_patch_file_is_absent_or_changed_is_refused(tmp_path): ...
 def test_a_tier_row_needs_a_runner_and_a_cadence(): ...
-def test_a_delete_row_for_a_test_that_fails_in_the_baseline_is_refused(): ...
+def test_a_test_that_a_rule_file_names_is_protected(repo): ...
+def test_a_test_under_a_protected_glob_is_protected(repo): ...
+def test_protect_never_removes_a_mark(repo): ...
+def test_a_row_that_the_detector_names_and_the_ledger_does_not_is_refused(repo): ...
+def test_a_protected_delete_without_an_approval_is_refused_and_is_not_applied(repo): ...
+def test_approve_refuses_when_standard_input_is_not_a_terminal(repo): ...
+def test_two_rows_with_one_key_are_refused(): ...</code></pre>
+
+<h3>Task 7: <code>collect</code> and the ID check of a batch</h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/collect.py</code>,
+<code>tests/unit/test_testdiet_collect.py</code>; extend <code>history.py</code>; modify
+<code>jacked/cli.py</code>.</p>
+<pre><code>def collect(argv: Sequence[str], *, cwd: Path, runner: str) -> tuple[int, str]     # (exit code, collection ID)
+def id_set(store: Path, ref: str) -> tuple[set[str], TreeId, dict[str, str] | None]  # ref: a collection ID or a run ID;
+                                                                                    # the dict is id to state for a run
+def reconcile(before: set[str], after: set[str], ledger: dict, batch: int,
+              after_states: dict[str, str] | None = None) -> list[Problem]
+# jacked tests collect --runner NAME -- LISTCMD...        runs the list command in a clean tree, stores the IDs by tree
+# jacked tests ids --before REF --after REF --ledger PATH --batch N       exit 1 on a problem</code></pre>
+<p><strong>Rules.</strong> <code>collect</code> refuses a tree that is not clean, runs the list
+command, and stores the IDs with the tree identity and the command SHA in
+<code>&lt;store&gt;/collections/</code>. A list command with an exit code that is not 0, or a
+<code>ListingError</code>, stores nothing and exits 1: a collection error fails the check.
+<code>ids</code> refuses a collection for Jest and for Go, whose listings do not name each test:
+those runners use two recorded runs of the touched files with one command SHA. <code>ids</code>
+refuses when the tree of <code>--before</code> is not the tree of the ledger base or of the batch
+before, or when the two refs have different commands.</p>
+<p><strong>Rules of <code>reconcile</code>.</strong> Only rows with status <code>applied</code> and a
+batch number up to <code>N</code> count as done. Each ID in <code>before</code> and not in
+<code>after</code> needs such a <code>delete</code> or <code>consolidate</code> row, or is the old
+ID of a row with <code>renamed_to</code> (any mark). Each ID in <code>after</code> and not in
+<code>before</code> must be a <code>renamed_to</code>. An applied <code>delete</code> row whose ID
+is in <code>after</code> is a problem. A <code>keeper</code> that is not in <code>after</code> is a
+problem; when <code>after</code> is a run, a keeper that did not pass is a problem. A planned row
+of a later batch is not a problem.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 7.1 Write the failing tests. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 7.2 Implement.</li>
+  <li><input type="checkbox" disabled> 7.3 Run the test file. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 7.4 Commit: <code>feat(testdiet): test IDs checked on both sides of each batch</code>.</li>
+</ul>
+<pre><code>def test_collect_stores_the_ids_with_the_tree_and_the_command(repo): ...
+def test_collect_refuses_a_tree_that_is_not_clean(repo): ...
+def test_a_list_command_that_fails_stores_nothing_and_exits_1(repo): ...
+def test_a_real_collection_error_stores_nothing_and_exits_1(repo): ...        # the real pytest listing of Task 1
 def test_a_removal_with_no_row_is_a_problem(): ...
-def test_a_delete_row_whose_test_is_still_collected_is_a_problem(): ...
+def test_an_applied_delete_row_whose_test_is_still_collected_is_a_problem(): ...
+def test_a_planned_row_of_a_later_batch_is_not_a_problem(): ...
 def test_a_consolidation_that_renames_tests_passes_with_the_map(): ...
+def test_a_speed_row_that_renames_its_test_passes_with_renamed_to(): ...
 def test_an_added_id_that_no_row_names_is_a_problem(): ...
 def test_a_keeper_that_does_not_exist_after_the_batch_is_a_problem(): ...
-def test_a_line_shift_in_a_playwright_file_is_not_a_change(): ...      # two real reports, test moved down
-def test_cli_ids_exits_1_when_a_report_cannot_be_read(tmp_path): ...   # a collection error fails the check
+def test_a_keeper_that_did_not_pass_in_the_after_run_is_a_problem(): ...
+def test_ids_refuses_a_before_that_is_not_the_base_tree(repo): ...
+def test_ids_refuses_two_refs_with_different_commands(repo): ...
+def test_ids_refuses_a_listing_for_jest_and_for_go(repo): ...</code></pre>
+
+<h3>Task 8: <code>prove</code></h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/prove.py</code>,
+<code>tests/unit/test_testdiet_prove.py</code>; modify <code>jacked/cli.py</code>.</p>
+<pre><code>def prove(ledger_path: Path, row_key: str, *, cwd: Path, patch: Path | None, kind: str,
+          subject: Sequence[str], keeper: Sequence[str] | None, stage: str) -> int
+# jacked tests prove --ledger PATH --row KEY [--patch FILE] [--kind defect|refactor] [--stage before|after]
+#                    --subject "CMD" [--keeper "CMD"]
+#   stage before (default): needs --patch; writes kind, patch_sha, base_tree, subject_rc, keeper_rc; copies the patch to proofs/KEY.patch
+#   stage after: uses proofs/KEY.patch; writes after_rc
+#   exit 0: the exit codes are what the row needs. exit 1: they are not. exit 2: refused.</code></pre>
+<p><strong>Rules.</strong> <code>--subject</code> and <code>--keeper</code> are command lines; split
+them with <code>shlex.split</code> and run them as argument lists. <code>prove</code> refuses a
+tree that is not clean and a patch that touches a test file of the row. It applies the patch with
+<code>git apply</code>, runs the commands, reverses the patch, and checks that the tree identity is
+the identity before. When the identity differs it stops with a loud error and names the paths. An
+interrupt reverses the patch too. It never writes <code>approved_by</code>.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 8.1 Write the failing tests on a small repository with one
+  function, one test to cut and one keeper. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 8.2 Implement.</li>
+  <li><input type="checkbox" disabled> 8.3 Run the test file and
+  <code>tests/unit/test_testdiet_ledger.py</code>. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 8.4 Commit: <code>feat(testdiet): prove runs the planted defect and writes what happened</code>.</li>
+</ul>
+<pre><code>def test_a_defect_that_both_tests_catch_writes_two_exit_codes_that_are_not_0(repo): ...
+def test_a_defect_that_the_keeper_misses_exits_1_and_the_ledger_refuses_the_row(repo): ...
+def test_the_tree_is_the_same_after_a_proof(repo): ...
+def test_prove_refuses_a_tree_that_is_not_clean(repo): ...
+def test_prove_refuses_a_patch_that_changes_the_subject_test(repo): ...
+def test_a_patch_that_does_not_apply_changes_nothing_and_exits_2(repo): ...
+def test_stage_after_runs_the_same_patch_and_writes_after_rc(repo): ...
+def test_the_patch_is_copied_beside_the_ledger_with_its_sha(repo): ...
+def test_a_command_that_fails_to_start_is_not_a_caught_defect(repo): ...     # exit 2, no proof record</code></pre>
+
+<h3>Task 9: the coverage comparison and the report</h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/covdiff.py</code>, <code>report.py</code>,
+<code>tests/unit/test_testdiet_report.py</code>; modify <code>jacked/cli.py</code>.</p>
+<pre><code>def lost_lines(before: Path, after: Path, *, test_globs: Sequence[str]) -> list[dict]   # Cobertura XML; [{file, lines}]
+def control_ratio(before: RunData, after: RunData, touched: set[str]) -> dict | None
+# {tests, seconds_before, seconds_after, ratio}: the tests that are in both runs and in no ledger row
+def render_report(ledger: dict, before: RunMeta | None, after: RunMeta | None,
+                  tests_before: RunData | None, tests_after: RunData | None) -> str
+def private_values(home: Path | None = None) -> list[str]     # the user name, the home path, the node name, each value of the machine list
+# jacked tests covdiff --before A.xml --after B.xml --ledger PATH     writes the coverage block of the ledger
+# jacked tests report --ledger PATH [--before RUN_ID] [--after RUN_ID] -o PATH</code></pre>
+<p><strong>Rules of the report.</strong> One HTML file with its own small style sheet. It loads
+nothing from the network. Each value is escaped. Order: the rows that need an approval, the rows
+with no proof record, then each <code>delete</code>, <code>consolidate</code>, <code>speed</code>
+and <code>fix</code> row with its evidence fields, its keeper, its proof and its protected class;
+then the numbers. No failure text. The times of the two runs are compared only when the machine
+(label and fingerprint) and the command SHA are equal. The report prints the processor seconds,
+the sum of the test seconds and the wall time with the load, and the control ratio: the same
+figures for the tests that the run did not touch. A change that is not larger than the change of
+the control is "not measurable". When no control exists the report says so. When the ledger has
+no coverage block the report says "coverage not run" in its first section.
+<code>report</code> and <code>ledger verify</code> refuse, with exit 1 and the name of the field,
+when the ledger or the report holds a value of <code>private_values</code>.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 9.1 Write the failing tests. The Cobertura files come from
+  two real runs of the pytest fixture project (<code>coverage xml</code>), made by the capture
+  script. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 9.2 Implement.</li>
+  <li><input type="checkbox" disabled> 9.3 Run the test file. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 9.4 Commit: <code>feat(testdiet): a report that shows the proof of each cut and a saving against a control</code>.</li>
+</ul>
+<pre><code>def test_a_production_line_that_lost_its_only_test_is_listed(): ...
+def test_a_line_of_a_test_file_is_not_a_lost_line(): ...
+def test_the_control_is_the_tests_that_no_row_names(): ...
+def test_a_saving_that_is_not_larger_than_the_change_of_the_control_is_not_measurable(): ...
 def test_the_report_does_not_compare_two_machines(): ...
-def test_the_report_says_not_measurable_inside_the_noise(): ...
-def test_the_report_says_when_the_noise_was_not_measured(): ...
+def test_the_report_does_not_compare_two_commands(): ...
+def test_the_report_says_when_no_control_exists(): ...
+def test_the_report_says_coverage_not_run(): ...
+def test_rows_that_need_an_approval_come_first(): ...
+def test_the_report_shows_the_evidence_and_the_proof_of_each_cut(): ...
+def test_the_report_escapes_a_test_id_with_markup(): ...
+def test_the_report_loads_nothing_from_the_network(): ...                   # no http, no src=, no @import
+def test_the_report_is_refused_when_an_id_holds_the_home_path(tmp_path): ...
+def test_the_report_is_refused_when_a_field_holds_a_value_of_the_machine_list(tmp_path): ...
 def test_the_report_has_no_em_dash_and_no_failure_text(): ...</code></pre>
 
-<h3>Task 7: a gate on a gate machine</h3>
-<p><strong>Files.</strong> Create <code>jacked/testdiet/gate_driver.py</code>, <code>remote.py</code>,
-<code>tests/unit/test_testdiet_remote.py</code>; modify <code>jacked/testdiet/record.py</code>
-(<code>--on</code>), <code>jacked/cli.py</code> (<code>machines</code>, <code>--attach</code>,
-<code>--cancel</code>).</p>
-<pre><code># gate_driver.py: python gate_driver.py &lt;verb&gt; [plain arguments]; JSON on standard output
-#   probe                          -> {platform, python, cpus, load_1m|null, cpu_percent|null, mem_free_gb, git|null, root}
-#   have REPO                      -> {"commits": [...]}                 commits that the gate clone holds
-#   recv REPO SHA RUN              stdin: git bundle -> {"commit": SHA, "clean": true}
-#   start RUN                      stdin: {"command": str, "kind": str|null, "junit": [globs], "env": {}, "priority": "low"|"normal"}
-#                                  -> {"state": "queued"|"running"}
-#   supervise RUN                  (internal, detached) lock for kind "full", run, write log.txt and exit.json
-#   status RUN                     -> {"state": "queued"|"running"|"done"|"lost", "holder": {...}|null}
-#   fetch RUN junit|log [TAIL]     -> stdout: a tar of the JUnit files and exit.json, or the log bytes
-#   cancel RUN                     stops the supervisor and its children by the PID in the run folder
-#   cleanup RUN                    removes the worktree and the run folder
-# layout under root: repos/&lt;REPO&gt;.git (bare, core.autocrlf=false), runs/&lt;RUN&gt;/{tree,log.txt,exit.json,pid}, full-gate.lock/
-
-@dataclass(frozen=True)
-class GateMachine: label: str; ssh: str; python: str = "python3"; root: str = "~/.jacked-gate"; workers: int | None = None; priority: str = "low"
-
-def load_machines(home: Path | None = None) -> dict[str, GateMachine]
-class Transport(Protocol):
-    def call(self, verb: str, *args: str, stdin: bytes | None = None) -> bytes: ...
-class SshTransport: ...      # scp the driver when its SHA-256 differs; ssh -o BatchMode=yes
-class LocalTransport: ...    # the driver as a child process with a temporary root; for the unit tests
-def run_on(machine: GateMachine, command: str, *, cwd: Path, junit: Sequence[str], kind: str | None,
-           label: str | None, runner: str | None, transport: Transport | None = None, poll_seconds: float = 5.0) -> int</code></pre>
-<p><strong>Order of <code>run_on</code>.</strong> Refuse a tree that is not clean (exit 2). Probe and
-print the load and the free memory. Ask <code>have</code>, make a bundle of the commit without the
-commits that the gate clone holds, <code>recv</code>. Stop with no record when the reported commit
-is not the sent commit or the tree was not clean. <code>start</code>. Poll <code>status</code>;
-while the state is <code>queued</code>, print who holds the lock and since when, one time for each
-change. On <code>done</code>: fetch the JUnit tar, record with the label of the gate machine and
-<code>gate_machine=True</code>, print the end of the log, <code>cleanup</code>, return the exit
-code of <code>exit.json</code>. On <code>lost</code>: print it, make no record, return 75. An
-interrupt of the local command leaves the gate alive and prints the <code>--attach</code>
-command.</p>
-<p><strong>Rules of the driver.</strong> A lock is the folder <code>full-gate.lock</code>, made with
-one <code>mkdir</code>, with a file that names the run, the PID and the start time. A holder whose
-PID is not alive is released. Only kind <code>full</code> takes the lock. The supervisor releases
-it in a <code>finally</code> block. <code>cancel</code> stops only the PIDs that the run folder
-names. <code>start</code> has two modes. <code>--detach session</code> is the default and is for
-SSH: the gate must live after the session, so on Windows it needs the breakaway flag and stops
-with an error when the system refuses it. <code>--detach child</code> is for
-<code>LocalTransport</code>: an ordinary child process, because no session ends. With
-<code>--on</code>, the command is one argument; more than one argument after <code>--</code> is
-refused with exit 2 and a line that says to quote the command.</p>
-<ul class="tasks">
-  <li><input type="checkbox" disabled> 7.1 Write the failing tests with <code>LocalTransport</code>
-  and small temporary repositories. Keep the gate commands short (<code>python -c</code>). Run
-  them. Expected: FAIL.</li>
-  <li><input type="checkbox" disabled> 7.2 Implement the driver, then <code>remote.py</code>, then
-  the flags.</li>
-  <li><input type="checkbox" disabled> 7.3 Run the test file and
-  <code>tests/unit/test_testdiet_run.py</code>. Expected: PASS on this machine. The hosted Windows
-  job runs the same file in Task 14.</li>
-  <li><input type="checkbox" disabled> 7.4 Commit: <code>feat(testdiet): run --on sends a full gate to a gate machine, one at a time</code>.</li>
-</ul>
-<pre><code>def test_run_on_refuses_a_tree_that_is_not_clean(repo, local): ...                      # exit 2, nothing sent
-def test_run_on_refuses_more_than_one_command_argument(repo, local): ...                # exit 2
-def test_run_on_prints_the_load_and_the_free_memory_before_the_gate(repo, local, capsys): ...
-def test_cli_machines_lists_the_labels_and_probe_prints_the_numbers(tmp_path): ...
-def test_run_on_returns_the_exit_code_of_the_remote_gate(repo, local): ...             # 0 and 3
-def test_run_on_records_with_the_label_of_the_gate_machine(repo, local): ...
-def test_the_gate_runs_the_commit_that_was_sent(repo, local): ...                      # the gate prints git rev-parse HEAD
-def test_a_report_of_a_different_commit_makes_no_record(repo, local, monkeypatch): ... # the transport lies
-def test_a_run_with_no_exit_marker_makes_no_record_and_returns_75(repo, local): ...    # focus 5: kill the supervisor by PID
-def test_a_second_full_gate_waits_for_the_first(repo, local): ...                      # focus 5: order of the two exit.json times
-def test_a_targeted_run_does_not_take_the_lock(repo, local): ...
-def test_a_lock_whose_holder_is_dead_is_released(repo, local): ...                     # focus 5
-def test_the_second_send_is_a_thin_bundle(repo, local): ...                            # bytes of send 2 &lt; bytes of send 1
-def test_the_driver_sets_the_worker_variable_from_the_list(repo, local): ...
-def test_cleanup_leaves_no_worktree(repo, local): ...
-def test_no_time_of_a_gate_machine_is_in_the_local_noise(repo, local): ...             # views.profile(machine="local")
-def test_the_driver_imports_only_the_standard_library(): ...                           # ast walk of gate_driver.py
-def test_the_machine_list_is_read_from_the_home_folder_and_never_from_the_repository(tmp_path): ...
-def test_windows_session_start_uses_the_breakaway_flag(monkeypatch): ...                # Popen arguments, platform patched
-def test_windows_session_start_stops_when_the_breakaway_flag_is_refused(monkeypatch): ...  # no gate without the flag</code></pre>
-
-<h3>Task 8: the Codex policy file</h3>
+<h3>Task 10: the Codex policy file</h3>
 <p><strong>Files.</strong> Create <code>jacked/data/skills/review-animations/agents/openai.yaml</code>,
 <code>tests/unit/test_codex_implicit_invocation.py</code>; modify
-<code>jacked/codex/_generate.py</code>, <code>jacked/codex/_fsutil.py</code>,
-<code>jacked/codex/installer.py</code>.</p>
-<pre><code># the file, exact content
+<code>jacked/codex/_generate.py</code>, <code>_fsutil.py</code>, <code>installer.py</code>.</p>
+<pre><code># the file, exact content (Codex documentation, read 2026-11-26: with false, "Codex won't implicitly invoke the
+# skill based on user prompt; explicit $skill invocation still works")
 policy:
   allow_implicit_invocation: false
 
-# _generate.py
 CODEX_NO_IMPLICIT = "policy:\n  allow_implicit_invocation: false\n"
-def _command_codex_policy(cmd: Path) -> str | None      # the text above when the command has disable-model-invocation: true
-
-# _fsutil.py: both take the extra files of a generated skill, {relative POSIX path: text}
+def _command_codex_policy(cmd: Path) -> str | None      # uses _split_command_frontmatter and skill_listing._truthy
 def _sha_solo_skill(content: str, extras: Mapping[str, str] | None = None) -> str
 def _write_solo_skill(skill_dir: Path, content: str, extras: Mapping[str, str] | None = None) -> None</code></pre>
-<p><strong>Rule.</strong> <code>_sha_solo_skill</code> must give the value that
-<code>_sha_dir</code> gives for the written folder on each system. <code>_sha_dir</code> sorts
-<code>Path</code> objects, and that order is different on Windows. Sort the same objects in the
-same way. Read the Codex documentation for the form of the file before you write it; the saved
-page of 2026-11-25 is the source of the content above.</p>
+<p><strong>Rules.</strong> <code>_sha_solo_skill</code> must give the value that
+<code>_sha_dir</code> (<code>_fsutil.py:120</code>) gives for the written folder on each system:
+sort the same <code>Path</code> objects in the same way, because that order is different on
+Windows. Write <code>SKILL.md</code> and each extra file as bytes, so that Windows does not write
+a carriage return that the hash does not have. Each part of an extra path must pass
+<code>_is_safe_name</code>; an absolute path or a path with <code>..</code> is refused. Note in the
+commit: <code>jacked/data/skills/dcr/references/conditional.md:34</code> tells a reviewer to invoke
+review-animations by name, which stays possible.</p>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 8.1 Write the failing tests. Run them. Expected: FAIL.</li>
-  <li><input type="checkbox" disabled> 8.2 Add the file to <code>review-animations</code>. Change
+  <li><input type="checkbox" disabled> 10.1 Write the failing tests. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 10.2 Add the file to <code>review-animations</code>. Change
   the generator, the two helpers and the call in <code>install_codex</code> (step 2).</li>
-  <li><input type="checkbox" disabled> 8.3 Run the new file, <code>tests/unit/test_codex_installer.py</code>
+  <li><input type="checkbox" disabled> 10.3 Run the new file, <code>tests/unit/test_codex_installer.py</code>
   and <code>tests/unit/test_no_dual_shipped_names.py</code>. Expected: PASS.</li>
-  <li><input type="checkbox" disabled> 8.4 Commit: <code>fix(codex): a skill that only the user starts stays that way in Codex</code>.</li>
+  <li><input type="checkbox" disabled> 10.4 Commit: <code>fix(codex): a skill that only the user starts stays that way in Codex</code>.</li>
 </ul>
-<pre><code>def test_each_skill_with_the_key_ships_the_policy_file(): ...           # walk jacked/data/skills
+<pre><code>def test_each_skill_with_the_key_ships_the_policy_file_with_the_exact_content(): ...
 def test_install_gives_review_animations_the_policy_file(tmp_path): ...
 def test_install_gives_the_cleanup_command_skill_the_policy_file(tmp_path): ...
 def test_a_command_without_the_key_gets_no_policy_file(tmp_path): ...
-def test_sha_solo_skill_with_extras_equals_sha_dir_of_the_written_folder(tmp_path): ...
-def test_a_second_install_moves_nothing_aside(tmp_path): ...            # summary.preserved == [] and no jacked-backups folder</code></pre>
+def test_sha_solo_skill_with_extras_equals_sha_dir_of_the_written_folder(tmp_path): ...     # runs on each system
+def test_write_solo_skill_refuses_an_extra_path_outside_the_skill_folder(tmp_path): ...
+def test_a_second_install_moves_nothing_aside(tmp_path): ...</code></pre>
 
-<h3>Task 9: the skill</h3>
+<h3>Task 11: the skill</h3>
 <p><strong>Files.</strong> Create <code>jacked/data/skills/test-diet/SKILL.md</code>,
-<code>agents/openai.yaml</code> (the content of Task 8), <code>references/runners.md</code>,
-<code>references/evidence.md</code>, <code>references/slow-causes.md</code>,
-<code>references/repo-wiring.md</code>, <code>references/ledger.md</code>,
+<code>agents/openai.yaml</code>, <code>references/runners.md</code>, <code>evidence.md</code>,
+<code>slow-causes.md</code>, <code>repo-wiring.md</code>, <code>ledger.md</code>,
 <code>tests/unit/test_skill_test_diet_contract.py</code>.</p>
 <p><strong>Frontmatter.</strong> <code>name: test-diet</code>;
 <code>disable-model-invocation: true</code>; <code>argument-hint: "[report | full | &lt;path&gt;]"</code>;
@@ -956,73 +1131,89 @@ a description that says what it does and that only the user starts it.</p>
 run does", "What proves a cut" and "Safety rules" are the source. Write guidance, not an
 algorithm.</p>
 <ol>
-  <li>The rules that have no exception: a failing test is never a candidate; a red baseline gives a
-  report only; slow is not a reason to delete; no deletion without each evidence field; the
-  protected classes; never merge; stop inside an autonomous run or when a subagent starts the
+  <li>The rules that have no exception: stop when the tree has changes that are not committed; a
+  failing test is never a candidate; a red baseline gives a report only; slow is not a reason to
+  delete; no cut without its proof; the protected classes; the model never writes
+  <code>approved_by</code>; never merge; stop inside an autonomous run or when a subagent starts the
   skill.</li>
   <li>The four ways to start it.</li>
-  <li>The nine steps of a run, each with the <code>jacked tests</code> command that it uses. The
-  steps say: each batch is one commit with a <code>Tests-removed:</code> trailer that names its
-  ledger rows; the side files that name tests change in the same batch; the tests of a batch run
-  alone, in random order, with two workers.</li>
+  <li>The steps of a run, each with the <code>jacked tests</code> command that it uses:
+  <code>seen</code> and <code>history</code> for the baseline, <code>profile</code>,
+  <code>ledger protect</code>, <code>prove</code> before an edit and after it, one commit for each
+  batch with a <code>Tests-removed:</code> trailer of row keys, <code>collect</code> and
+  <code>ids</code> for each batch, <code>covdiff</code>, <code>ledger verify</code>,
+  <code>report</code>. The side files that name tests change in the same batch. The tests of a
+  batch run alone, in random order, with two workers.</li>
   <li>The six kinds of proof, with the calibration on four tests of this repository.</li>
   <li>Agents and budget: the chain-of-command tier, the model for each lane, read-only ledger
-  agents, one preservation reviewer, the process rule verbatim.</li>
-  <li>The gate machine: when the repository names one, each full gate goes there.</li>
-  <li>The end: the report, the pull request, what the user gets.</li>
+  agents, one preservation reviewer that runs a sample of proofs again, the process rule
+  verbatim.</li>
+  <li>A thin history: when the store has few gates, the model can read the local session
+  transcripts for gate summary lines. That is a pointer to look at. It is not a record.</li>
+  <li>The end: the report, the pull request with the rows that need an approval first, what the
+  user gets.</li>
 </ol>
 <p><strong>The references.</strong> <code>runners.md</code>: for each of the six runners, the full
 gate with a JUnit file, one file, the list of IDs, random order, two workers, the time of setup,
-call and teardown for one file, and the related-test feature. Read each command in the runner's
-own documentation; the research document lists what is verified. It also has the coverage
-command that compares the covered production lines before and after a batch.
-<code>evidence.md</code>: the six
-kinds with one worked case each. <code>slow-causes.md</code>: how to find each cause and its
-repair. <code>repo-wiring.md</code>: the Tests section, the gate lines with
-<code>jacked tests run</code> and its fallback to the bare command, the rule for a red gate, the
-label of a gate machine, and the limit of <code>seen</code> (files that git ignores).
-<code>ledger.md</code>: the ledger fields and one complete row for each mark.</p>
+call and teardown for one file, the related-test feature, and the coverage command that writes
+Cobertura XML. Read each command in the runner's own documentation. <code>evidence.md</code>: the
+six kinds with one worked case each; a skip counts as a dead target only when it has no condition
+and the test is skipped in each recorded run. <code>slow-causes.md</code>: how to find each cause
+and its repair, and that a repair needs a proof. <code>repo-wiring.md</code>: the Tests section;
+the gate line (an <code>sh</code> block marked as the gate line) that makes a private folder with
+<code>mktemp -d</code> for the JUnit file, checks <code>jacked tests run --help</code>, and runs
+the bare command with one printed line when the check fails; the rule for a red gate (a failure
+of the same tests on the base branch means: repair the checkout or the base, then run again; it
+never clears the branch); the limits of <code>seen</code> and <code>--input</code>.
+<code>ledger.md</code>: the ledger fields, one complete row for each mark, and the limit of
+parametrized IDs that are an index.</p>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 9.1 Write the failing contract tests. Run them. Expected:
+  <li><input type="checkbox" disabled> 11.1 Write the failing contract tests. Run them. Expected:
   FAIL.</li>
-  <li><input type="checkbox" disabled> 9.2 Write the skill and the references.</li>
-  <li><input type="checkbox" disabled> 9.3 Run the new file, <code>tests/unit/test_codex_installer.py</code>,
+  <li><input type="checkbox" disabled> 11.2 Write the skill and the references.</li>
+  <li><input type="checkbox" disabled> 11.3 Run the new file, <code>tests/unit/test_codex_installer.py</code>,
   <code>tests/unit/test_skill_listing.py</code>, <code>tests/unit/test_no_dual_shipped_names.py</code>
   and <code>grep -rl "data/skills" tests/unit</code>. Expected: PASS.</li>
-  <li><input type="checkbox" disabled> 9.4 Commit: <code>feat(skill): /test-diet cuts and speeds up a suite with evidence</code>.</li>
+  <li><input type="checkbox" disabled> 11.4 Commit: <code>feat(skill): /test-diet cuts and speeds up a suite with proof</code>.</li>
 </ul>
 <pre><code>def test_frontmatter_has_the_name_and_blocks_model_invocation(): ...
 def test_the_skill_has_no_engine_marker(): ...
 def test_each_reference_that_the_skill_names_exists(): ...
-def test_each_jacked_tests_command_in_the_skill_text_exists_in_the_cli(): ...   # parse `jacked tests &lt;word&gt;`, compare with tests_group.commands
+def test_each_jacked_tests_command_in_the_skill_text_exists_in_the_cli(): ...
 def test_each_ledger_field_in_ledger_md_is_a_field_of_the_ledger_module(): ...
 def test_the_skill_and_its_references_have_no_em_dash(): ...
 def test_the_skill_text_names_no_host_and_no_address(): ...
-def test_the_gate_line_of_repo_wiring_runs_the_bare_command_with_an_older_jacked(tmp_path): ...
-    # Take the sh block that repo-wiring.md marks as the gate line. Put a fake `jacked` that exits 2 first on PATH.
-    # The bare command runs and its exit code (3) comes back. Skip where `sh` does not exist.
-def test_the_gate_line_of_repo_wiring_uses_jacked_tests_run_when_it_exists(tmp_path): ...
+def test_the_gate_line_runs_the_bare_command_and_prints_one_line_with_an_older_jacked(tmp_path): ...
+    # Take the sh block that repo-wiring.md marks as the gate line and write it as bytes. Put a fake `jacked` that
+    # exits 2 first on PATH. The bare command runs and its exit code (3) comes back. Skip where `sh` does not exist.
+def test_the_gate_line_uses_jacked_tests_run_when_it_exists(tmp_path): ...
+def test_the_gate_line_puts_the_junit_file_in_a_private_folder(tmp_path): ...
 def test_claude_install_puts_the_skill_and_its_references_in_the_skills_folder(tmp_path): ...
 def test_codex_install_puts_the_skill_and_the_policy_file_in_the_agents_folder(tmp_path): ...
-def test_the_claude_listing_excludes_the_skill(tmp_path): ...                   # skill_listing reason disable-model-invocation
+def test_the_claude_listing_excludes_the_skill(tmp_path): ...
 def test_uninstall_removes_the_skill_from_both_folders(tmp_path): ...
-def test_the_dashboard_feature_list_has_the_skill_with_a_toggle(tmp_path): ...  # follow the test of an existing skill</code></pre>
+def test_the_dashboard_feature_list_has_the_skill_with_a_toggle(tmp_path): ...   # follow the test of an existing skill</code></pre>
 <p>No test pins a sentence of the skill.</p>
 
-<h3>Task 10: the shipped text</h3>
-<p><strong>Files.</strong> Modify the eight files of the <a href="#wording">wording table</a> and
-<code>tests/unit/test_command_whats_next_goal.py:217</code>.</p>
+<h3>Task 12: the shipped text</h3>
+<p><strong>Files.</strong> Modify the ten files of the <a href="#wording">wording table</a> and
+<code>tests/unit/test_command_whats_next_goal.py:217</code>; create
+<code>tests/unit/test_test_cost_guidance.py</code>. <strong>Waits on the owner:</strong> his read of
+the wording table.</p>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 10.1 Change the pin at
+  <li><input type="checkbox" disabled> 12.1 Change the pin at
   <code>test_command_whats_next_goal.py:217</code> to
   <code>assert "with a test at the owning boundary for each contract of a done milestone" in s</code>.
-  Add <code>tests/unit/test_test_cost_guidance.py</code> (below). Run both. Expected: FAIL.</li>
-  <li><input type="checkbox" disabled> 10.2 Make each change of the wording table, exactly.</li>
-  <li><input type="checkbox" disabled> 10.3 Run the two files and each file that
+  Add <code>test_test_cost_guidance.py</code> (below). Run both. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 12.2 Make each change of the wording table, exactly. The two
+  files under <code>.claude/skills/</code> are the wrappers of this repository; a test requires
+  the shipped text word for word in them
+  (<code>test_command_whats_next_goal.py:371</code>).</li>
+  <li><input type="checkbox" disabled> 12.3 Run the two files and each file that
   <code>grep -rlE "goal-maker|whats-next|bhag|jacked_behaviors|test-coverage|commands/dc|skills/dcr" tests/unit</code>
   prints. Expected: PASS. A pin that fails on old wording gets the new wording. A pin that guards a
   rule that this change did not touch stays.</li>
-  <li><input type="checkbox" disabled> 10.4 Commit: <code>feat(rules): a test has a cost, and a removed thing gets no test</code>.</li>
+  <li><input type="checkbox" disabled> 12.4 Commit: <code>feat(rules): a test has a cost, and a removed thing gets no test</code>.</li>
 </ul>
 <pre><code>FORGERS = ("commands/goal-maker.md", "skills/whats-next/SKILL.md", "commands/bhag.md")
 
@@ -1038,85 +1229,81 @@ def test_bhag_keeps_the_ban_on_a_weakened_test_and_names_the_one_exception():
 def test_the_rules_block_has_the_test_cost_rule_between_its_markers():
     text = _read("rules/jacked_behaviors.md")
     assert "A test has a cost" in text.split("# end-jacked-behaviors")[0]
-    assert "/test-diet" in text</code></pre>
+    assert "/test-diet" in text
 
-<h3>Task 11: README and reference</h3>
-<p><strong>Files.</strong> Modify <code>README.md</code>,
-<code>jacked/data/rules/jacked-reference.md</code>.</p>
+def test_the_repository_wrappers_have_the_new_wording(): ...       # .claude/skills/whats-next and .claude/skills/dcr</code></pre>
+
+<h3>Task 13: README and reference</h3>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 11.1 <code>README.md</code>: "28 skills" becomes "29 skills"
-  at lines 5, 20, 68, 84, 578 and 840. "all 48" becomes "all 49" at line 20. Add
-  <code>test-diet</code> to the list of skill names near line 140. Do not change the marketing pack
-  ("28-skill" at line 20, "(28 skills)" at line 141) and do not change the history at lines 912
-  and 914.</li>
-  <li><input type="checkbox" disabled> 11.2 <code>README.md</code>: add one section for
-  <code>jacked tests</code> and <code>/test-diet</code>: what each command does, the gate line for
-  a repository, the gate machine list with the label <code>shed</code>.</li>
-  <li><input type="checkbox" disabled> 11.3 <code>jacked-reference.md</code>: the count at line 21,
+  <li><input type="checkbox" disabled> 13.1 <code>README.md</code>: "28 skills" becomes "29 skills"
+  at lines 5, 20, 68, 84, 578 and 840. "28 Skills" becomes "29 Skills" at line 140. "all 48"
+  becomes "all 49" at line 20. Add <code>test-diet</code> to the list of skill names. Do not change
+  the marketing pack ("28-skill" at line 20, "(28 skills)" at line 141) and do not change the
+  history at lines 912 and 914.</li>
+  <li><input type="checkbox" disabled> 13.2 <code>README.md</code>: one section for
+  <code>jacked tests</code> and <code>/test-diet</code>: what each command does, the gate line for a
+  repository, where the history is.</li>
+  <li><input type="checkbox" disabled> 13.3 <code>jacked-reference.md</code>: the count at line 21,
   the skill, the command group, where the history is, how to delete it.</li>
-  <li><input type="checkbox" disabled> 11.4 Run each file that
+  <li><input type="checkbox" disabled> 13.4 Run each file that
   <code>grep -rlE "README|jacked-reference" tests/unit</code> prints. Expected: PASS.</li>
-  <li><input type="checkbox" disabled> 11.5 Commit: <code>docs: jacked tests and /test-diet</code>.</li>
+  <li><input type="checkbox" disabled> 13.5 Commit: <code>docs: jacked tests and /test-diet</code>.</li>
 </ul>
 
-<h3>Task 12: live proof in this repository</h3>
-<p>The main session does this task. It is not for a subagent.</p>
+<h3>Task 14: live proof in this repository</h3>
+<p>The main session does this task. It is not for a subagent. Each command is
+<code>uv run --project &lt;feature worktree&gt; jacked tests ...</code> with the target worktree as
+the working directory. The session loads the skill by reading
+<code>jacked/data/skills/test-diet/SKILL.md</code> of the feature worktree.</p>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 12.1 Install into a scratch home folder (not the real one)
+  <li><input type="checkbox" disabled> 14.1 Install into a scratch home folder (not the real one)
   and show: the skill and its references under <code>.claude/skills/test-diet</code>, the Codex
   copy with <code>agents/openai.yaml</code>, the same file for <code>review-animations</code> and
-  <code>cleanup</code>, and the listing that leaves the skill out.</li>
-  <li><input type="checkbox" disabled> 12.2 Gate machine, Windows. The gate is a selection of this
-  repository's tests that runs for about 30 seconds with one worker, marked
-  <code>--kind full</code> for the lock. It is not the whole suite. Add the label to the local list
-  and show: the commit check; the record with the label; a gate whose command is a shell line with
-  child processes and a log, alive after the SSH session ends; a second full gate that waits; and a
-  run whose supervisor is stopped by PID that returns 75 with no record. <strong>Waits on the
-  owner:</strong> his consent for this small load on the second machine.</li>
-  <li><input type="checkbox" disabled> 12.3 Gate machine, Linux: the same five checks. A Linux
-  container with an SSH server on the second machine's container layer is enough for these
-  checks. <strong>Waits on the owner:</strong> his consent for that container, or a different
-  Linux machine.</li>
-  <li><input type="checkbox" disabled> 12.4 Run <code>/test-diet report</code> on claude-jacked in a
-  new worktree, from recorded gates. Then run <code>/test-diet</code>: the ledger, the batches, the
-  ID check, the report, and its own pull request. Each command is <code>uv run jacked tests ...</code> from the feature worktree. Full gates of
-  this proof run on a gate machine when one has room; if not, the owner decides if they run on the
-  laptop.</li>
-  <li><input type="checkbox" disabled> 12.5 Try the refusal: start the skill from a brief of an
-  autonomous run one time and show that it stops.</li>
+  <code>cleanup</code>, and the listing that leaves the skill out. Where Codex is installed: a
+  prompt that matches the description does not select the skill, and <code>$test-diet</code>
+  does.</li>
+  <li><input type="checkbox" disabled> 14.2 In a new worktree of claude-jacked, run one recorded
+  full gate as the baseline (the first real record). Show <code>seen</code> exit 0 for that
+  command, and exit 1 for a different command and after an edit.</li>
+  <li><input type="checkbox" disabled> 14.3 Run <code>/test-diet report</code>, then
+  <code>/test-diet</code>: the ledger, the proofs, the batches, the ID check, the coverage
+  comparison, the report, and its own pull request.</li>
+  <li><input type="checkbox" disabled> 14.4 Try the refusals one time each and show that the skill
+  stops: a tree with a change that is not committed, and a start from a brief of an autonomous
+  run.</li>
 </ul>
 
-<h3>Task 13: the spec follows the plan</h3>
+<h3>Task 15: the spec follows the plan</h3>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 13.1 In the spec: <code>profile</code> prints the setup share
-  only when the record holds it. The Codex policy file is a file of the skill directory for a
-  skill, and the generator writes it for a command. <code>jacked tests report</code> makes the
-  report. The line numbers of the shipped text are those of the wording table.</li>
-  <li><input type="checkbox" disabled> 13.2 Commit: <code>docs(spec): three points that the plan settled</code>.</li>
+  <li><input type="checkbox" disabled> 15.1 Put each row of <a href="#review">What the review
+  changed</a> and of the decisions table into the spec: the rule of <code>seen</code>, the verdict
+  of a run, the proof record, the keeper, the baseline, the detector and the approval, the batch
+  ID check, the report with evidence and a control, the setup share, the Codex policy file, the
+  commands <code>prove</code>, <code>collect</code>, <code>covdiff</code>, <code>report</code>, and
+  the line numbers of the wording table. Mark each as changed on 2026-11-26 after the review.</li>
+  <li><input type="checkbox" disabled> 15.2 Commit: <code>docs(spec): what the plan review changed</code>.</li>
 </ul>
 
-<h3>Task 14: one full gate, review, pull request</h3>
+<h3>Task 16: one full gate, review, pull request</h3>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 14.1 One targeted run of each pin, sweep and help-copy test
+  <li><input type="checkbox" disabled> 16.1 One targeted run of each pin, sweep and help-copy test
   and each <code>grep -rl</code> hit of the changed modules.</li>
-  <li><input type="checkbox" disabled> 14.2 Read <code>.github/workflows/*.yml</code> and run each
-  step in order. The full suite runs one time, wrapped by the build of this worktree so that this
-  run is the first real record:
-  <code>uv run jacked tests run --kind full --junit "$J" -- uv run python -m pytest -n auto --junitxml="$J" &gt; log 2&gt;&amp;1; rc=$?</code>
-  with <code>J</code> a path in the temporary folder. Quote the summary line of the log and show
-  the record with <code>uv run jacked tests history</code>.</li>
-  <li><input type="checkbox" disabled> 14.3 <code>/dcr</code> on the combined tree beside that
+  <li><input type="checkbox" disabled> 16.2 Read <code>.github/workflows/*.yml</code> and run each
+  step in order. The full suite runs one time, wrapped by the build of this worktree:
+  <code>J=$(mktemp -d)/junit.xml; uv run jacked tests run --kind full --junit "$J" -- uv run python -m pytest -n auto --junitxml="$J" &gt; log 2&gt;&amp;1; rc=$?</code>.
+  Quote the summary line of the log and show the record with
+  <code>uv run jacked tests history</code>.</li>
+  <li><input type="checkbox" disabled> 16.3 <code>/dcr</code> on the combined tree beside that
   gate. A fix that changes code costs one more gate.</li>
-  <li><input type="checkbox" disabled> 14.4 <code>/pr</code>. Read the summary line of each
-  operating system's job before the word green. Stop at the pull request.</li>
-  <li><input type="checkbox" disabled> 14.5 After the merge and with a gate machine that has room:
-  the live proof in the Python data service (spec, acceptance item 12), and the message to the
-  three other sessions.</li>
+  <li><input type="checkbox" disabled> 16.4 <code>/pr</code>. The body says that the live proof in
+  the Python data service (spec, acceptance item 12) is open, why, and links the issue that tracks
+  it. Read the summary line of each operating system's job before the word green. Stop at the pull
+  request.</li>
 </ul>
 
 <h2 id="wording">Shipped text: old and new wording</h2>
-<p>The owner approved these changes on 2026-11-26 and has not read the wording yet. Task 10 waits
-for that.</p>
+<p>The owner approved these changes on 2026-11-26 and has not read the wording yet. Task 12 waits
+for that. A reviewer compared each old text with its file, character by character.</p>
 <table>
   <thead><tr><th>File and line</th><th>Old</th><th>New</th></tr></thead>
   <tbody>
@@ -1133,9 +1320,10 @@ for that.</p>
     repo's real test command green; a test at the boundary that owns each new behavior, one for
     each contract, and the tests that the change made obsolete deleted in the same change (never
     kept as "stays removed" checks).</code></td></tr>
-    <tr><td><code>jacked/data/commands/goal-maker.md:133</code> and
-    <code>jacked/data/skills/whats-next/SKILL.md:313</code> (the end of the line)</td><td><code>,
-    with NEW tests covering the behavior of each done milestone and its edge cases</code></td>
+    <tr><td><code>jacked/data/commands/goal-maker.md:133</code>,
+    <code>jacked/data/skills/whats-next/SKILL.md:313</code> and
+    <code>.claude/skills/whats-next/SKILL.md:363</code> (the end of the line)</td><td><code>, with
+    NEW tests covering the behavior of each done milestone and its edge cases</code></td>
     <td><code>, with a test at the owning boundary for each contract of a done milestone, the tests
     that a milestone made obsolete deleted, and the run time of the added tests
     reported</code></td></tr>
@@ -1149,8 +1337,9 @@ for that.</p>
     is a BLOCKED condition, not a merge. The one exception: when the cell removes behavior on
     purpose, delete the tests of that behavior in the same commit and name them in the commit
     message.</code></td></tr>
-    <tr><td><code>jacked/data/skills/dcr/SKILL.md:90</code></td><td><code>| 7 | **Testing** | Unit
-    test coverage, edge case tests, regression detection, test quality |</code></td><td><code>| 7 |
+    <tr><td><code>jacked/data/skills/dcr/SKILL.md:90</code> and
+    <code>.claude/skills/dcr/SKILL.md:161</code></td><td><code>| 7 | **Testing** | Unit test
+    coverage, edge case tests, regression detection, test quality |</code></td><td><code>| 7 |
     **Testing** | Unit test coverage, edge case tests, regression detection, test quality, test
     cost (a new test that repeats an existing proof, pins the implementation, asserts that a
     removed thing stays removed, or is slow for what it proves) |</code></td></tr>
@@ -1173,16 +1362,37 @@ for that.</p>
   </tbody>
 </table>
 
+<h3>A proposal that the owner has not approved</h3>
+<p>The pre-mortem found that the history stays empty when no session records its gate: only a
+<code>/test-diet</code> run wires a repository. This row is my proposal. It is not in a task. With
+the owner's approval it joins Task 12.</p>
+<table>
+  <thead><tr><th>File and line</th><th>Old</th><th>Proposed</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/data/rules/jacked_behaviors.md:7</code>, one sentence added at the end of
+    the gate cadence rule</td><td>(the rule ends with "A brief that asks for a full suite per
+    milestone is wrong: fix the brief.")</td><td><code>When `jacked tests run --help` works, run
+    that one full suite through it (`jacked tests run --kind full --junit &lt;a file outside the
+    tree&gt; -- &lt;the test command&gt;`), and ask `jacked tests seen -- &lt;the test command&gt;`
+    first: a tree that passed that command on this machine does not run it
+    again.</code></td></tr>
+  </tbody>
+</table>
+
 <h2 id="open-questions">Open questions</h2>
 <ul>
-  <li><strong>The gate machine.</strong> The owner's second machine has no room for a large suite
-  at this time. Task 14.5 waits for the owner's choice: make room there, or a rented Linux machine
-  in his account. Tasks 12.2 and 12.3 need only his consent for a load of about 30 seconds with
-  one worker.</li>
-  <li><strong>The wording of Task 10.</strong> The owner reads the table above before Task 10
+  <li><strong>The wording of Task 12.</strong> The owner reads the wording table before Task 12
   starts.</li>
-  <li><strong>The release.</strong> This plan stops at the pull request. The version and the
-  changelog belong to the release flow.</li>
+  <li><strong>The proposal above.</strong> Yes or no.</li>
+  <li><strong>One pull request or two.</strong> The owner approved <code>run --on</code> as a part
+  of jacked. My proposal: this plan is one pull request, and plan B is a second one on top of it,
+  because plan B needs a gate machine for its proof and this plan does not. The owner can ask for
+  one pull request.</li>
+  <li><strong>The red baseline.</strong> A reviewer proposed that a run with a red baseline can
+  still repair tests (speed and fix rows, no cut). The approved design says report only. No
+  change without the owner.</li>
+  <li><strong>The release.</strong> This plan stops at the pull request. The version belongs to
+  the release flow.</li>
 </ul>
 
 <hr>

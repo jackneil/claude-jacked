@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!--
+  jacked artifact template — for plans, specs, research, checkpoints.
+  Replace placeholders, keep what you need, delete sections you don't.
+  Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
+-->
+<title>Test diet: implementation plan B (the gate machine)</title>
+
+<!-- Metadata block — adjust fields per artifact type -->
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="draft">
+<meta name="jacked:branch" content="on top of jack_20261125_test_diet">
+<meta name="jacked:date" content="2026-11-26">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 .25rem;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 .5rem;
+    color: var(--fg-muted);
+  }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+
+  /* Metadata strip under title */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    margin: .5rem 0 2rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    font-size: .9rem;
+  }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+
+  /* Status badges — drop into a <span class="badge X"> */
+  .badge {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 99px;
+    font-size: .8rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .badge.ok       { background: var(--ok-bg);     color: var(--ok); }
+  .badge.warn     { background: var(--warn-bg);   color: var(--warn); }
+  .badge.danger   { background: var(--danger-bg); color: var(--danger); }
+  .badge.info     { background: var(--accent-bg); color: var(--accent); }
+
+  /* Table of contents */
+  nav.toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    margin: 0 0 .5rem;
+    font-size: .9rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--fg-muted);
+    border: none;
+    padding: 0;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.5rem;
+  }
+  nav.toc li { margin: .15rem 0; }
+
+  /* Callouts — drop into <aside class="callout warn"> ... </aside> */
+  aside.callout {
+    margin: 1rem 0;
+    padding: .9rem 1.1rem;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  aside.callout.warn   { border-color: var(--warn);   background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok     { border-color: var(--ok);     background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child  { margin-bottom: 0; }
+
+  /* Code */
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: var(--code-bg);
+    padding: .12em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: .88rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    font-size: .9rem;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  /* Task checklist — use <ul class="tasks"> + <li><input type="checkbox" disabled> ...</li> */
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li {
+    padding: .25rem 0;
+    display: flex;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+
+  /* Mermaid diagram wrappers */
+  .diagram {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  /* If mermaid fails (no network), fall back to showing the source in a code block */
+  .diagram pre.mermaid-source {
+    text-align: left;
+    display: none;
+  }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+
+  blockquote {
+    border-left: 3px solid var(--border);
+    padding: .2rem 1rem;
+    margin: 1rem 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  /* Print: paginate cleanly, drop the dark-mode flip, expand TOC */
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Test diet: implementation plan B (the gate machine)</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">written after the review of plan A, ready for a first read</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-11-26</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">a branch on top of jack_20261125_test_diet</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
+</div>
+
+<aside class="callout info">
+  <strong>For agentic workers.</strong> REQUIRED SUB-SKILL: use
+  <code>superpowers:subagent-driven-development</code> to implement this plan task by task. Read
+  <a href="2026-11-26-test-diet.html">plan A</a> and the spec first. Plan A must be complete: this
+  plan uses its package. If a task needs a design decision that this plan does not make, stop and
+  report.
+</aside>
+
+<aside class="callout warn">
+  <strong>A gate machine can be a host that serves production.</strong> The driver must never stop,
+  signal or disturb a process that it did not start, and must never write or delete outside its
+  own folder. Each rule below that has the word "never" has a test.
+</aside>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#constraints">Global constraints</a></li>
+    <li><a href="#focus">Review focus</a></li>
+    <li><a href="#files">File structure</a></li>
+    <li><a href="#decisions">Decisions</a></li>
+    <li><a href="#tasks">Tasks</a></li>
+    <li><a href="#open-questions">Open questions</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal</h2>
+<p><code>jacked tests run --on &lt;label&gt; -- "&lt;gate command&gt;"</code> runs a gate on a gate
+machine over SSH and records it in the local history. The gate runs the commit that was sent, one
+exclusive gate at a time on that machine, and a lost connection never gives a verdict.</p>
+<p><strong>Spec:</strong>
+<a href="../specs/2026-11-25-test-diet-design.html">2026-11-25-test-diet-design.html</a>, section "A
+gate on a different machine", and acceptance item "Gate machine".</p>
+<p><strong>Tech stack:</strong> Python 3.11+ on the local side. The file
+<code>gate_driver.py</code> runs on the gate machine with Python 3.8 or later and the standard
+library only, on Linux, macOS and Windows. <code>ssh</code>, <code>scp</code> and <code>git</code>
+on both sides.</p>
+
+<h2 id="architecture">Architecture</h2>
+<div class="diagram">
+  <pre class="mermaid">
+sequenceDiagram
+    participant L as Local: remote.py
+    participant D as Gate machine: gate_driver.py
+    participant S as Supervisor (detached)
+    L->>D: probe
+    L->>D: have REPO
+    L->>D: recv REPO SHA RUN (stdin: git bundle)
+    D-->>L: commit, clean
+    L->>D: start RUN (stdin: JSON)
+    D->>S: spawn in its own session or job
+    S->>S: take the exclusive lock, run the gate, write the heartbeat
+    loop until done or lost
+        L->>D: status RUN
+    end
+    S->>S: write exit.json, release the lock
+    L->>D: fetch RUN junit, fetch RUN log
+    L->>L: record the run with the label
+    L->>D: cleanup RUN
+  </pre>
+  <pre class="mermaid-source">
+local remote.py -> driver: probe, have REPO, recv REPO SHA RUN (stdin: bundle) -> commit and clean
+local -> driver: start RUN (stdin: JSON) -> driver spawns the supervisor in its own session or job
+supervisor: take the exclusive lock, run the gate, write the heartbeat, write exit.json, release the lock
+local -> driver: status RUN (until done or lost), fetch RUN junit, fetch RUN log; local records the run; cleanup RUN
+  </pre>
+</div>
+
+<h2 id="constraints">Global constraints</h2>
+<p>The global constraints of plan A apply. These are added.</p>
+<ul>
+  <li><strong>The driver imports nothing from jacked.</strong> It restates the rules of
+  <code>jacked/pid_lockdir.py</code>, <code>jacked/process_identity.py</code>
+  (<code>creation_id</code>, line 187) and <code>jacked/service/process.py</code>, because it
+  cannot import them. Each restated rule names its source in a comment.</li>
+  <li><strong>One grammar for each value that crosses SSH or becomes a part of a path.</strong> The
+  local side checks it before it sends. The driver checks it again, because any SSH client can
+  call the driver. RUN: <code>^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$</code>. SHA:
+  <code>^[0-9a-f]{40}([0-9a-f]{24})?$</code>. REPO: <code>^[0-9a-f]{16}$</code>. A number: digits
+  only. A verb: one of a fixed set. A label and an environment key:
+  <code>[A-Za-z0-9._-]+</code> and <code>^[A-Za-z_][A-Za-z0-9_]*$</code>.</li>
+  <li><strong>REPO is not a folder name.</strong> It is the first 16 hex characters of the SHA-256
+  of the root commit of the repository.</li>
+  <li><strong>The driver never calls <code>os.kill</code> on Windows</strong>, and never signals
+  PID 0, PID 1 or a negative PID. On Windows <code>os.kill</code> stops a process for almost
+  every signal value.</li>
+  <li><strong>A process is its PID and its creation token.</strong> A PID with no readable token
+  is "unknown", and unknown never permits a stop.</li>
+  <li><strong>A delete is self-evidencing.</strong> <code>cleanup</code> and <code>cancel</code>
+  act only on a folder that is inside <code>root/runs</code> after the path is resolved, is not a
+  link, and holds the marker file that the driver wrote in <code>recv</code>.</li>
+  <li><strong>The gate machine is less trusted than the local machine.</strong> Each answer is
+  checked for its type. A tar from it is never extracted. An XML file from it goes through the
+  reader of plan A.</li>
+  <li><strong>The SSH destination and the remote root are never printed</strong> and never go into
+  a record. A message names the label.</li>
+  <li><strong>The tests of this plan use <code>LocalTransport</code></strong>: the driver as a
+  child process with a temporary root. No test opens a network connection.</li>
+</ul>
+
+<h2 id="focus">Review focus</h2>
+<ol>
+  <li><strong>A PID that the system used again</strong> after a restart of the gate machine or the
+  end of a supervisor. Expected: <code>cancel</code> stops nothing, and a lock whose holder has a
+  different token is stale. Tests in Tasks 2 and 3.</li>
+  <li><strong>A value that changes the meaning of a command or a path</strong>: a RUN of
+  <code>..</code>, a folder name with <code>;</code>, a <code>have</code> answer of
+  <code>--all</code>, an <code>ssh</code> value that starts with <code>-</code>. Expected: refused
+  on both sides. Tests in Tasks 1 and 4.</li>
+  <li><strong>The connection drops, the local command is stopped by a tool timeout, or the gate
+  machine restarts.</strong> Expected: no record and exit 75 with no exit marker; a later command
+  collects a run that finished; a run with no client does not start. Tests in Tasks 3 and 5.</li>
+  <li><strong>Two sessions send a gate at the same time</strong>, for two repositories or for one
+  commit. Expected: one exclusive gate at a time, the second attaches to a run of the same commit
+  and command, and no session waits with no end. Tests in Tasks 3 and 5.</li>
+  <li><strong>A wrong or hostile answer from the gate machine</strong>: a tar member with a parent
+  path, a link or a device; an exit marker with a wrong type; a log with escape sequences.
+  Expected: nothing is written outside a private local folder, and a wrong type is no verdict.
+  Tests in Task 5.</li>
+</ol>
+
+<h2 id="files">File structure</h2>
+<table>
+  <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/testdiet/gate_driver.py</code></td><td>The one file that runs on a gate machine: the grammar, the layout, <code>recv</code>, the supervisor, the lock, <code>status</code>, <code>fetch</code>, <code>cancel</code>, <code>cleanup</code>.</td></tr>
+    <tr><td><code>jacked/testdiet/remote.py</code></td><td>The gate machine list, the transports, the install of the driver, <code>run_on</code>, the pending markers.</td></tr>
+    <tr><td><code>jacked/testdiet/record.py</code>, <code>history.py</code>, <code>jacked/cli.py</code></td><td><code>--on</code>, <code>--attach</code>, <code>--detach</code>, <code>--cancel</code>, <code>--exclusive</code>, <code>--setup</code>, <code>--env</code>, <code>--max-wait</code>; the <code>machines</code> commands; the pending folder of the store.</td></tr>
+    <tr><td><code>jacked/data/skills/test-diet/references/gate-machine.md</code>, <code>README.md</code>, <code>jacked-reference.md</code></td><td>How to add a gate machine, how a repository names its label, the setup command.</td></tr>
+    <tr><td><code>tests/unit/test_testdiet_driver.py</code>, <code>test_testdiet_remote.py</code></td><td>The tests.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="decisions">Decisions</h2>
+<table>
+  <thead><tr><th>Subject</th><th>Decision</th><th>Reason</th></tr></thead>
+  <tbody>
+    <tr><td>Gate machine list</td><td><code>jacked_home()/jacked-gate-machines.json</code>, written
+    only by <code>jacked tests machines add</code> through <code>atomic_write_bytes(mode=0o600)</code>:
+    <code>{"version": 1, "this": "&lt;label&gt;", "machines": {"&lt;label&gt;": {"ssh": "...",
+    "python": "python3", "workers": N, "priority": "low"}}}</code>. <code>load_machines</code>
+    refuses a file that group or others can read (POSIX), an <code>ssh</code> value that starts
+    with <code>-</code> or has white space, and a <code>python</code> value outside
+    <code>[A-Za-z0-9._/\\:-]+</code>. The README says to use an alias of the SSH configuration as
+    the <code>ssh</code> value, so that the list holds no address.</td><td>The address stays
+    local.</td></tr>
+    <tr><td>Root on the gate machine</td><td>The driver resolves its own root:
+    <code>~/.jacked-gate</code> through <code>os.path.expanduser</code>. No path crosses SSH. The
+    root, <code>repos</code>, <code>runs</code> and each run folder have mode 0700, and each file
+    0600. The driver refuses a root that is a link, that the user does not own, or that group or
+    others can write.</td><td>A Windows shell does not expand <code>~</code>, and a path with a
+    space breaks the argument split.</td></tr>
+    <tr><td>Transport</td><td>Each step is <code>ssh -a -x -T -o BatchMode=yes -o
+    ClearAllForwardings=yes -- &lt;dest&gt; &lt;python&gt; &lt;driver file&gt; &lt;verb&gt;
+    &lt;values of the grammar&gt;</code>, with the payload on standard input or output.
+    <code>ssh</code>, <code>scp</code> and <code>git</code> come from
+    <code>jacked.findbin.find_bin</code>. Proven on the owner's Windows machine on 2026-11-26: 1 MB
+    of binary standard input arrived with the same SHA-256.</td><td>A value of the grammar needs no
+    quoting in a POSIX shell or a Windows shell. The gate machine never gets the local SSH
+    agent.</td></tr>
+    <tr><td>Driver install</td><td>The driver file on the gate machine is
+    <code>gate_driver-&lt;first 12 hex of its SHA-256&gt;.py</code> in the remote home.
+    <code>scp</code> sends it to a temporary name; the driver checks its own hash and renames
+    itself. Each run folder records the driver hash.</td><td>Two jacked builds must not replace
+    each other's driver in the middle of a run.</td></tr>
+    <tr><td>Sending the commit</td><td>The local side makes a temporary ref
+    <code>refs/jacked/gate/&lt;RUN&gt;</code>, makes a bundle of that ref without the commits of
+    the <code>have</code> answer, and deletes the ref. Each element of the <code>have</code> answer
+    must match the SHA grammar, be a commit in the local repository and be an ancestor of the sent
+    commit; if not, it is dropped with one printed line. The elements go to git on standard input.
+    When the gate clone holds the commit, no bundle is sent.</td><td>A bundle needs a ref name. A
+    <code>have</code> answer of <code>--all</code> must not widen the bundle.</td></tr>
+    <tr><td>The gate clone</td><td><code>repos/&lt;REPO&gt;.git</code>, bare, with
+    <code>core.autocrlf=false</code>, <code>core.fsmonitor=false</code> and
+    <code>core.hooksPath</code> at the null device. The driver sets
+    <code>GIT_TERMINAL_PROMPT=0</code> and fetches the bundle into
+    <code>refs/jacked/gate/&lt;RUN&gt;</code>.</td><td>Nothing of a repository runs on
+    <code>git worktree add</code>.</td></tr>
+    <tr><td>The gate command</td><td>One command line, in the JSON of <code>start</code>. The
+    driver runs it with <code>/bin/sh -c</code> on POSIX and with <code>cmd.exe /d /s /c</code> on
+    Windows, with the null device as standard input. It sets <code>JACKED_GATE=1</code> and
+    <code>JACKED_GATE_WORKERS</code> from the list. <code>--setup "CMD"</code> runs first in the
+    same way; a setup that fails gives no gate and exit 75.</td><td>A new worktree has none of the
+    files that git ignores. The repository says how to provide them.</td></tr>
+    <tr><td>Environment</td><td>No local variable goes to the gate machine by default.
+    <code>--env KEY</code> sends one. A key that starts with <code>JACKED_GATE</code> is refused.
+    No value is printed or recorded.</td><td>A credential must not reach a less trusted
+    machine by accident.</td></tr>
+    <tr><td>Containment</td><td>POSIX: the supervisor starts the gate in a new session, so the
+    gate is a process group whose ID is the PID of its leader. Windows: the driver starts the
+    supervisor with <code>DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
+    CREATE_BREAKAWAY_FROM_JOB</code> and stops with an error when the system refuses the
+    breakaway; the supervisor puts the gate in a Job Object with "kill on job close" through
+    <code>ctypes</code>.</td><td>The children of a gate are a fact of the kernel, not a walk over
+    parent PIDs. Proven on 2026-11-26: with the breakaway flag a process lived after the SSH
+    session ended, and without it the process died.</td></tr>
+    <tr><td>Liveness</td><td>The supervisor writes a heartbeat file each 5 seconds. A run is alive
+    when its heartbeat is newer than 30 seconds by the clock of the gate machine. No PID is probed
+    for liveness.</td><td>A PID can be used again. A probe with <code>os.kill</code> stops a
+    process on Windows.</td></tr>
+    <tr><td>States</td><td><code>queued</code>, <code>running</code>, <code>done</code> (an exit
+    marker exists), <code>lost</code> (no marker, the heartbeat is stale, no member of the group or
+    the job is alive), <code>orphaned</code> (no marker, the heartbeat is stale, a member is
+    alive: the lock stays).</td><td>A gate whose supervisor died can still use the machine.</td></tr>
+    <tr><td>The lock</td><td>The folder <code>full-gate.lock</code>. To take it, the supervisor
+    makes a private folder with the holder file (the run, the PID, the creation token, the start
+    time) and renames it to the lock name. To break a stale lock, a waiter renames the lock to a
+    private name, checks that the moved holder file is the one that it judged stale, and deletes
+    it. A supervisor removes the lock only while the holder file names its run. A lock with no
+    holder file is stale after 30 seconds. The answer of <code>status</code> names the holder by
+    its run ID and its start time only.</td><td>A crash between two steps must not leave a lock
+    that blocks each gate, and two waiters must not both take it.</td></tr>
+    <tr><td>Which run takes the lock</td><td><code>--exclusive</code>. It is the default for kind
+    <code>full</code>. The flag does not change the kind of the record.</td><td>A short proof run
+    must be able to take the lock and stay a targeted record.</td></tr>
+    <tr><td>A queued run and its client</td><td>Each <code>status</code> call touches the file
+    <code>client</code> of the run. A queued run whose <code>client</code> file is older than 60
+    seconds does not start and becomes <code>lost</code>, unless it was started with
+    <code>--detach</code>.</td><td>A session that was stopped must not leave a full gate that
+    starts later with no reader.</td></tr>
+    <tr><td>The same gate two times</td><td>Before <code>recv</code>, the driver answers
+    <code>find REPO SHA COMMAND_SHA</code>. When a queued or a running run has the three values,
+    <code>run_on</code> attaches to it.</td><td>Two sessions that gate one commit share one
+    gate.</td></tr>
+    <tr><td>A stopped local command</td><td>Before <code>start</code>, <code>run_on</code> writes
+    <code>&lt;store&gt;/pending/&lt;RUN&gt;.json</code> (the label, the commit, the command SHA,
+    the JUnit globs). Each later <code>jacked tests run</code>, <code>seen</code> and
+    <code>history</code> collects the pending runs that are done, and prints one line for each.
+    <code>--attach RUN</code> waits for one. <code>--detach</code> returns 0 after
+    <code>start</code> and prints the run ID. An interrupt prints the attach line and leaves the
+    gate alive.</td><td>A full gate is longer than the limit of a tool call.</td></tr>
+    <tr><td>Waiting</td><td><code>run_on</code> prints the holder and the time that it has held the
+    lock, one time for each change. <code>--max-wait SECONDS</code> gives up, cancels its own
+    queued run and returns 75. A failed <code>ssh</code> call in the poll (exit 255) is printed
+    and tried again with a delay that grows to 60 seconds; the same flag bounds it.</td><td>The
+    caller chooses how long it waits. No fixed limit drops a gate.</td></tr>
+    <tr><td>Reading the answer</td><td>Each JSON answer is checked for its types: a commit matches
+    the grammar, <code>clean</code> is the value true, an exit code is an integer from 0 to 255
+    and not a boolean. A wrong type is no verdict: exit 75. The tar of <code>fetch</code> is read
+    as a stream (<code>tarfile.open(mode="r|")</code>); only regular members are read through
+    <code>extractfile</code>, and each is written under a name that the local side makes in a new
+    private folder. The driver adds only regular files (lstat) that resolve inside the worktree,
+    and refuses a JUnit glob that is absolute or has <code>..</code>. The driver decides which
+    JUnit file is fresh, with its own stat snapshot.</td><td>A tar can write outside its target.
+    Two clocks cannot be compared.</td></tr>
+    <tr><td>The log</td><td><code>fetch RUN log</code> gives the full log. The local side writes it
+    to a private file in the temporary folder, prints its path and its last lines with control
+    characters removed and the run folder path replaced by <code>&lt;run&gt;</code>, and does not
+    put it into the history.</td><td>The cleanup must not delete the only log of a gate. A log
+    holds test output, which the history never holds.</td></tr>
+    <tr><td>Processor time</td><td>The supervisor measures the processor time of the gate: the
+    difference of <code>RUSAGE_CHILDREN</code> on POSIX, the accounting of the Job Object on
+    Windows. It is in <code>exit.json</code>.</td><td>The processor time is the figure that the
+    load changes least.</td></tr>
+    <tr><td>Leftovers</td><td><code>probe</code> reports the free disk space and the number and
+    size of the run folders. <code>jacked tests machines gc LABEL</code> lists and removes the runs
+    in a final state and prints each one. <code>jacked tests machines forget-repo LABEL</code>
+    removes the gate clone of the present repository.</td><td>A full disk on a host that serves
+    production is an outage.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="tasks">Tasks</h2>
+
+<h3>Task 1: the driver: grammar, folders, <code>probe</code>, <code>have</code>, <code>recv</code>, <code>cleanup</code></h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/gate_driver.py</code>,
+<code>tests/unit/test_testdiet_driver.py</code>.</p>
+<pre><code># python gate_driver-HASH.py VERB [values]; one JSON object on standard output; exit 2 on a refused value
+#   selfcheck SHA256               the file checks its own hash, then renames itself to its final name
+#   probe                          {platform, python, cpus, load_1m|null, cpu_percent|null, mem_free_gb, disk_free_gb, git|null, runs, runs_bytes}
+#   have REPO                      {"commits": [...]}
+#   find REPO SHA COMMAND_SHA      {"run": RUN|null, "state": ...}
+#   recv REPO SHA RUN              stdin: a git bundle, or empty when the clone holds SHA -> {"commit": SHA, "clean": true}
+#   cleanup RUN                    removes the worktree and the run folder of a run in a final state
+# layout under ~/.jacked-gate: repos/REPO.git, runs/RUN/{marker,tree/,log.txt,exit.json,holder,heartbeat,client,cancel,driver}, full-gate.lock/
+def check_value(kind: str, value: str) -> str          # raises Refused
+def inside(base: str, *parts: str) -> str              # the resolved path, or raises Refused when it leaves base</code></pre>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 1.1 Write the failing tests. They run the driver as a child
+  process with a temporary home folder. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 1.2 Implement.</li>
+  <li><input type="checkbox" disabled> 1.3 Run the test file. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 1.4 Commit: <code>feat(testdiet): a gate driver that refuses each value it cannot prove</code>.</li>
+</ul>
+<pre><code>BAD = ["..", "../repos", "a/b", "a b", "a;b", "a&amp;b", "$(x)", "-rf", "", "C:\\x"]
+@pytest.mark.parametrize("value", BAD)
+@pytest.mark.parametrize("verb", ["recv", "cleanup", "status", "cancel", "fetch"])
+def test_the_driver_refuses_a_bad_run_or_repo(driver, verb, value): ...             # focus 2; nothing is made or removed
+def test_the_driver_refuses_a_verb_that_it_does_not_know(driver): ...
+def test_the_root_and_each_run_folder_are_private(driver): ...                       # POSIX: 0700 and 0600
+def test_the_driver_refuses_a_root_that_is_a_link(driver): ...
+def test_recv_makes_a_worktree_of_the_sent_commit_and_reports_it_clean(driver, repo): ...
+def test_recv_refuses_a_run_that_exists(driver, repo): ...
+def test_recv_with_no_bundle_uses_a_commit_that_the_clone_holds(driver, repo): ...
+def test_a_hook_of_the_repository_does_not_run_in_recv(driver, repo): ...
+def test_cleanup_refuses_a_folder_without_the_driver_marker(driver): ...
+def test_cleanup_does_not_follow_a_link_out_of_the_run_folder(driver): ...
+def test_cleanup_refuses_a_run_that_is_queued_or_running(driver, repo): ...
+def test_cleanup_leaves_no_worktree(driver, repo): ...
+def test_probe_names_no_path_and_no_user(driver): ...
+def test_selfcheck_refuses_a_file_with_a_different_hash(driver): ...
+def test_the_driver_imports_only_the_standard_library_and_parses_as_python_3_8(): ...   # ast.parse(src, feature_version=(3, 8))</code></pre>
+
+<h3>Task 2: the driver: the supervisor, containment, <code>status</code>, <code>cancel</code>, <code>fetch</code></h3>
+<p><strong>Files.</strong> Modify <code>gate_driver.py</code>, <code>test_testdiet_driver.py</code>.</p>
+<pre><code>#   start RUN [--detach-mode session|child]   stdin: {"command": str, "setup": str|null, "kind": str|null, "exclusive": bool,
+#                                             "junit": [globs], "env": {KEY: value}, "priority": "low"|"normal",
+#                                             "command_sha": str, "detached": bool}  -> {"state": "queued"|"running"}
+#   supervise RUN                  (internal) lock when exclusive, setup, gate, heartbeat, exit.json, release
+#   status RUN                     {"state": ..., "holder": {"run": RUN, "since": str}|null, "waited_seconds": float}
+#   cancel RUN                     writes the cancel file; the supervisor stops its own group or job and releases the lock
+#   fetch RUN junit                stdout: a tar of the fresh JUnit files and exit.json
+#   fetch RUN log                  stdout: the bytes of log.txt
+# exit.json: {"rc": int, "started": str, "ended": str, "wall": float, "cpu_seconds": float|null, "commit": SHA, "clean": bool, "setup_rc": int|null}
+def creation_token(pid: int) -> str | None     # restates jacked/process_identity.py creation_id</code></pre>
+<p><strong>Rules.</strong> <code>--detach-mode session</code> is the default and is for SSH.
+<code>--detach-mode child</code> is for <code>LocalTransport</code>: an ordinary child process,
+because no session ends. <code>cancel</code> is cooperative: the supervisor reads the cancel file
+in its loop. When the supervisor is not alive, <code>cancel</code> stops the group or the job only
+when the stored creation token of its leader is equal to the token now, and the group ID is the
+stored PID, larger than 1, and not the group of the driver. In each other case it stops nothing
+and says so. The priority is <code>os.nice(10)</code> on POSIX and
+<code>BELOW_NORMAL_PRIORITY_CLASS</code> on Windows for <code>low</code>.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 2.1 Write the failing tests. A gate in a test is
+  <code>python -c</code>; a gate that must block waits for a release file. Run them. Expected:
+  FAIL.</li>
+  <li><input type="checkbox" disabled> 2.2 Implement.</li>
+  <li><input type="checkbox" disabled> 2.3 Run the test file. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 2.4 Commit: <code>feat(testdiet): a gate that lives after its session and stops only what it started</code>.</li>
+</ul>
+<pre><code>def test_a_gate_writes_its_exit_code_its_commit_and_its_processor_time(driver, repo): ...
+@pytest.mark.parametrize("line,expected", COMPOUND_LINES)           # "a &amp;&amp; b" with a failing first command, and a pipe
+def test_a_compound_command_line_gives_the_exit_code_of_the_shell(driver, repo, line, expected): ...
+def test_a_setup_that_fails_gives_no_gate(driver, repo): ...
+def test_a_setup_can_provide_a_file_that_git_ignores(driver, repo): ...
+def test_the_gate_gets_the_worker_variable_and_only_the_named_environment(driver, repo): ...
+def test_a_key_that_starts_with_jacked_gate_is_refused(driver, repo): ...
+def test_the_gate_has_the_null_device_as_standard_input(driver, repo): ...
+def test_status_is_lost_when_the_heartbeat_is_stale_and_no_member_is_alive(driver, repo): ...     # focus 3
+def test_status_is_orphaned_when_the_supervisor_is_gone_and_a_child_is_alive(driver, repo): ...   # POSIX
+def test_cancel_stops_the_gate_through_the_cancel_file(driver, repo): ...
+def test_cancel_refuses_a_pid_whose_creation_token_differs(driver, repo): ...                     # focus 1
+def test_cancel_never_signals_pid_0_1_or_a_negative_value(driver, repo): ...
+def test_the_windows_code_path_never_calls_os_kill(): ...                                         # ast walk
+def test_windows_session_start_uses_the_breakaway_flag(monkeypatch): ...
+def test_windows_session_start_stops_when_the_breakaway_flag_is_refused(monkeypatch): ...
+def test_posix_session_start_uses_a_new_session_and_no_inherited_stream(monkeypatch): ...
+def test_fetch_gives_only_fresh_regular_junit_files_inside_the_worktree(driver, repo): ...
+def test_the_driver_refuses_a_junit_glob_that_is_absolute_or_has_a_parent_part(driver, repo): ...
+def test_a_link_at_the_junit_path_is_not_sent(driver, repo): ...</code></pre>
+
+<h3>Task 3: the driver: the lock and the queue</h3>
+<p><strong>Files.</strong> Modify <code>gate_driver.py</code>, <code>test_testdiet_driver.py</code>.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 3.1 Write the failing tests. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 3.2 Implement the lock rules and the queue rules of the
+  decisions table.</li>
+  <li><input type="checkbox" disabled> 3.3 Run the test file. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 3.4 Commit: <code>feat(testdiet): one exclusive gate at a time on a gate machine</code>.</li>
+</ul>
+<pre><code>def test_a_second_exclusive_gate_is_queued_while_the_first_blocks_then_runs(driver, repo): ...   # focus 4; the first gate
+                                                            # waits for a release file; status of the second is "queued" with the holder
+def test_a_run_that_is_not_exclusive_does_not_take_the_lock(driver, repo): ...
+def test_an_exclusive_targeted_run_takes_the_lock_and_keeps_its_kind(driver, repo): ...
+def test_a_lock_whose_holder_heartbeat_is_stale_is_released(driver, repo): ...                   # focus 1
+def test_a_reused_holder_pid_with_a_different_token_is_stale(driver, repo): ...                  # focus 1
+def test_a_lock_with_no_holder_file_is_released_after_the_grace_time(driver, repo): ...
+def test_two_waiters_break_one_stale_lock_and_only_one_takes_it(driver, repo): ...
+def test_a_supervisor_does_not_remove_a_lock_that_names_a_different_run(driver, repo): ...
+def test_an_orphaned_run_keeps_the_lock(driver, repo): ...
+def test_a_queued_run_that_no_client_polls_does_not_start(driver, repo): ...                     # focus 3
+def test_a_queued_run_that_was_detached_starts_with_no_client(driver, repo): ...
+def test_the_lock_holder_answer_names_no_repository(driver, repo): ...
+def test_find_gives_the_run_of_the_same_commit_and_command(driver, repo): ...</code></pre>
+
+<h3>Task 4: the local side: the machine list and the transport</h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/remote.py</code>,
+<code>tests/unit/test_testdiet_remote.py</code>; modify <code>jacked/cli.py</code>.</p>
+<pre><code>@dataclass(frozen=True)
+class GateMachine: label: str; ssh: str; python: str = "python3"; workers: int | None = None; priority: str = "low"
+
+def load_machines(home: Path | None = None) -> dict[str, GateMachine]
+def add_machine(label: str, ssh: str, *, python: str, workers: int | None, priority: str, home: Path | None = None) -> None
+class TransportError(Exception): ...          # its text names the label and never the destination
+class Transport(Protocol):
+    def call(self, verb: str, *values: str, stdin: bytes | None = None) -> bytes: ...
+class SshTransport: ...
+class LocalTransport: ...
+def repo_key(cwd: Path) -> str                # first 16 hex of the SHA-256 of the root commit
+def new_run_id() -> str
+# jacked tests machines [list | add LABEL --ssh VALUE [--python P] [--workers N] | probe LABEL | gc LABEL | forget-repo LABEL]</code></pre>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 4.1 Write the failing tests. A test of
+  <code>SshTransport</code> puts a fake <code>ssh</code> and a fake <code>scp</code> first on
+  <code>PATH</code>; the fake prints its arguments and exits with a chosen code. Run them.
+  Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 4.2 Implement.</li>
+  <li><input type="checkbox" disabled> 4.3 Run the test file. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 4.4 Commit: <code>feat(testdiet): a gate machine list that keeps the address local</code>.</li>
+</ul>
+<pre><code>def test_the_machine_list_is_read_from_the_jacked_home_and_never_from_the_repository(tmp_path): ...
+def test_add_writes_the_list_with_mode_0600(tmp_path): ...                                   # POSIX
+def test_load_refuses_a_list_that_others_can_read(tmp_path): ...                             # POSIX
+@pytest.mark.parametrize("value", ["-oProxyCommand=x", "a b", ""])
+def test_an_ssh_value_that_starts_with_a_dash_or_has_white_space_is_refused(tmp_path, value): ...   # focus 2
+def test_the_ssh_call_has_the_end_of_options_mark_and_no_agent_forwarding(fake_ssh): ...
+def test_a_failed_ssh_prints_the_label_and_never_the_destination(fake_ssh, capsys): ...
+def test_machines_and_probe_never_print_the_destination(fake_ssh, capsys): ...
+def test_the_driver_is_sent_under_a_name_with_its_hash_and_checked(fake_ssh): ...
+def test_two_driver_versions_do_not_replace_each_other(tmp_path): ...
+def test_the_repo_key_is_not_the_folder_name(repo): ...
+def test_each_value_is_checked_before_it_is_sent(tmp_path): ...</code></pre>
+
+<h3>Task 5: <code>run --on</code></h3>
+<p><strong>Files.</strong> Modify <code>jacked/testdiet/remote.py</code>, <code>record.py</code>,
+<code>history.py</code>, <code>jacked/cli.py</code>, <code>test_testdiet_remote.py</code>.</p>
+<pre><code>NO_VERDICT = 75
+def run_on(machine: GateMachine, command: str, *, cwd: Path, junit: Sequence[str], inputs: Sequence[str] = (),
+           kind: str | None, exclusive: bool | None, label: str | None, runner: str | None, setup: str | None = None,
+           env_keys: Sequence[str] = (), detach: bool = False, max_wait: float | None = None,
+           transport: Transport | None = None, poll_seconds: float = 5.0) -> int
+def attach(machine: GateMachine, run_id: str, *, cwd: Path, max_wait: float | None, transport: Transport | None = None) -> int
+def collect_pending(cwd: Path, *, transports: Mapping[str, Transport] | None = None) -> list[str]
+# jacked tests run --on LABEL [--exclusive | --no-exclusive] [--setup "CMD"] [--env KEY]... [--detach] [--max-wait SECONDS] ... -- "COMMAND"
+# jacked tests run --on LABEL --attach RUN | --cancel RUN</code></pre>
+<p><strong>Order of <code>run_on</code>.</strong> Refuse more than one argument after
+<code>--</code> (exit 2, with a line that says to quote the command). Refuse a tree that is not
+clean (exit 2). Probe, and print the load, the free memory, the free disk space and the leftover
+runs. <code>find</code>: attach when the same gate is queued or running. <code>have</code>, the
+bundle, <code>recv</code>. Stop with no record when the reported commit is not the sent commit or
+the tree was not clean. Write the pending marker. <code>start</code>. With <code>--detach</code>,
+print the run ID and return 0. Poll <code>status</code>. On <code>done</code>: fetch the JUnit tar
+and the log, check <code>exit.json</code>, record with the label of the gate machine,
+<code>gate_machine=True</code> and the processor time of the marker, remove the pending marker,
+<code>cleanup</code>, and return the exit code of the marker. When the fetch fails after
+<code>done</code>, print it, keep the pending marker and return the exit code of the last status
+answer if it had one, else 75. On <code>lost</code> or <code>orphaned</code>: print it, make no
+record, return 75. Each "no verdict" prints one line that starts with
+<code>jacked tests: no verdict</code>.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 5.1 Write the failing tests with <code>LocalTransport</code>
+  and with a transport that the test controls. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 5.2 Implement.</li>
+  <li><input type="checkbox" disabled> 5.3 Run the test file, <code>test_testdiet_run.py</code> and
+  <code>test_testdiet_views.py</code>. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 5.4 Commit: <code>feat(testdiet): run --on sends a gate to a gate machine and never invents a verdict</code>.</li>
+</ul>
+<pre><code>def test_run_on_refuses_a_tree_that_is_not_clean(repo, local): ...
+def test_run_on_refuses_more_than_one_command_argument(repo, local): ...
+def test_run_on_returns_the_exit_code_of_the_remote_gate(repo, local): ...                      # 0 and 3
+def test_run_on_records_with_the_label_the_command_sha_and_the_processor_time(repo, local): ...
+def test_the_gate_runs_the_commit_that_was_sent(repo, local): ...
+def test_a_report_of_a_different_commit_makes_no_record(repo, lying): ...
+def test_an_exit_marker_with_a_wrong_type_makes_no_record_and_returns_75(repo, lying): ...      # focus 5
+def test_a_run_with_no_exit_marker_makes_no_record_and_returns_75(repo, local): ...             # focus 3
+def test_a_tar_member_with_a_parent_path_a_link_or_a_device_is_never_written(repo, lying, tmp_path): ...   # focus 5
+def test_a_have_answer_that_is_not_an_ancestor_commit_is_dropped(repo, lying): ...              # "--all", "--reflog", "-x", random hex
+def test_a_commit_that_the_gate_clone_holds_is_not_sent_again(repo, local): ...
+def test_the_second_send_is_a_thin_bundle(repo, local): ...
+def test_the_temporary_ref_is_removed(repo, local): ...
+def test_two_sessions_with_one_commit_and_one_command_share_one_run(repo, local): ...           # focus 4
+def test_max_wait_gives_up_cancels_its_queued_run_and_returns_75(repo, local): ...              # focus 4
+def test_a_failed_poll_is_printed_and_tried_again(repo, flaky_transport, capsys): ...
+def test_an_interrupt_leaves_the_gate_alive_and_prints_the_attach_line(repo, local, capsys): ...
+def test_attach_records_a_run_that_finished_after_the_first_command_was_stopped(repo, local): ...   # focus 3
+def test_a_later_command_collects_a_pending_run_that_is_done(repo, local, capsys): ...
+def test_detach_returns_0_and_the_run_is_recorded_by_a_later_command(repo, local): ...
+def test_a_fetch_that_fails_after_done_keeps_the_pending_marker(repo, flaky_transport): ...
+def test_the_full_log_is_in_a_private_local_file_and_not_in_the_history(repo, local): ...
+def test_the_printed_log_has_no_escape_sequence_and_no_run_folder_path(repo, local, capsys): ...
+def test_no_local_environment_value_reaches_the_gate(repo, local, monkeypatch): ...
+def test_no_time_of_a_gate_machine_is_in_a_local_group(repo, local): ...
+def test_seen_is_false_on_the_laptop_for_a_pass_on_the_gate_machine_without_the_flag(repo, local): ...
+def test_cli_run_on_a_label_that_the_list_does_not_have_exits_2(repo): ...</code></pre>
+
+<h3>Task 6: documents and the skill reference</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 6.1 Write
+  <code>jacked/data/skills/test-diet/references/gate-machine.md</code>: when a repository names a
+  gate machine label in its Tests section, each full gate of a diet run goes there; the baseline
+  and the final gate are records of one machine; the setup command; the limits. Name it in
+  <code>SKILL.md</code>.</li>
+  <li><input type="checkbox" disabled> 6.2 <code>README.md</code> and
+  <code>jacked-reference.md</code>: <code>machines add</code> with an alias of the SSH
+  configuration and the label <code>shed</code>, <code>run --on</code>, <code>--detach</code> and
+  <code>--attach</code>, the exit code 75, <code>machines gc</code>.</li>
+  <li><input type="checkbox" disabled> 6.3 Run
+  <code>tests/unit/test_skill_test_diet_contract.py</code> and each file that
+  <code>grep -rlE "README|jacked-reference" tests/unit</code> prints. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 6.4 Commit: <code>docs: the gate machine</code>.</li>
+</ul>
+
+<h3>Task 7: live proof on two real gate machines</h3>
+<p>The main session does this task. The gate is a selection of this repository's tests that runs
+for about 30 seconds with one worker, with <code>--kind targeted --exclusive</code>. It is not the
+whole suite.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 7.1 Windows. Add the label with
+  <code>jacked tests machines add</code>. Show: the commit check; the record with the label and no
+  address; a gate whose command is a shell line with child processes, alive after the SSH session
+  ends, with its log; a second exclusive gate that is queued and then runs; a run whose supervisor
+  is stopped by its own cancel file; a run with no exit marker that returns 75 with no record;
+  <code>--detach</code> and a later collect; the processor time in the record. Then
+  <code>machines gc</code> and show that the gate folder holds no run. <strong>Waits on the
+  owner:</strong> his consent for this small load on the second machine.</li>
+  <li><input type="checkbox" disabled> 7.2 Linux. The same checks. A Linux container with an SSH
+  server is enough. <strong>Waits on the owner:</strong> his consent for that container on the
+  second machine, or a different Linux machine.</li>
+  <li><input type="checkbox" disabled> 7.3 Check the file system of the gate machine for the
+  repository's test database before a time from it is trusted (spec, "Left to the
+  builder").</li>
+</ul>
+
+<h3>Task 8: one full gate, review, pull request</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 8.1 One targeted run of each pin and each
+  <code>grep -rl</code> hit of the changed modules.</li>
+  <li><input type="checkbox" disabled> 8.2 The full suite one time, wrapped by
+  <code>jacked tests run</code> as in plan A, Task 16.2. Quote the summary line.</li>
+  <li><input type="checkbox" disabled> 8.3 <code>/dcr</code> with the Security lens beside that
+  gate.</li>
+  <li><input type="checkbox" disabled> 8.4 <code>/pr</code> on top of the pull request of plan A.
+  Read the summary line of each operating system's job. Stop at the pull request.</li>
+  <li><input type="checkbox" disabled> 8.5 After the merge and with a gate machine that has room:
+  the live proof in the Python data service (spec, acceptance item 12), and the message to the
+  three other sessions that the owner asked for on 2026-11-26.</li>
+</ul>
+
+<h2 id="open-questions">Open questions</h2>
+<ul>
+  <li><strong>The gate machine for a large suite.</strong> The owner's second machine has no room
+  for one at this time. Task 8.5 waits for his choice: make room there, or a rented Linux machine
+  in his account.</li>
+  <li><strong>The small load of Task 7.</strong> About 30 seconds with one worker on the second
+  machine, and a small Linux container there.</li>
+  <li><strong>A queued run with no client.</strong> The rule "it does not start" is my call. The
+  lock is my addition to the approved design, so its rules are the owner's to change.</li>
+  <li><strong>A shipped rule for the gate machine.</strong> The owner asked that the sessions of
+  three other repositories use the second machine for tests. A rule in the text that jacked ships
+  ("when the machine list names a gate machine and the repository names its label, run the full
+  gate with <code>--on</code>") would do that for each session. It is not in this plan. It needs
+  the owner's approval and a gate machine that has room.</li>
+</ul>
+
+<hr>
+
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated with the <a href="https://github.com/jackneil/claude-jacked">jacked</a>
+  HTML artifact template. Edit freely.
+</p>
+
+</div>
+
+<!-- Mermaid: render diagrams, fail gracefully if CDN unreachable -->
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    // startOnLoad waits for the window "load" event, which has already fired by the time this
+    // dynamic import resolves, so it never renders. Render explicitly instead.
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+    await mermaid.run({ querySelector: ".diagram pre.mermaid" });
+  } catch (err) {
+    // Network unreachable or import failed — show source instead of broken diagrams.
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>
