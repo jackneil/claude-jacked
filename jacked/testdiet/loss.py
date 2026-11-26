@@ -15,10 +15,11 @@ that gets a new name inside one file shows as one removed and one added name.
 
 ``fewer_assertions``, ``fewer_cases`` and ``skips_added`` are report lines,
 not a verdict. ``not_read`` names each paired test (a test on both sides,
-or a moved pair) that the report cannot compare: a file that does not
-parse, a body that the scanner cannot read, a computed case list. An added
-or a removed test has nothing to compare, so it is never in ``not_read``.
-It also names each file that is a symbolic link, a submodule or a type change.
+or a moved pair) that the report cannot compare: a body that the scanner
+cannot read, or a computed case list. An added or a removed test has
+nothing to compare, so it is never in ``not_read``. ``files_not_read``
+names each touched file that is not read: a file that does not parse, a
+symbolic link, a submodule and a type change.
 A symbolic link, a submodule and a type change are never read as absent, so
 their tests are never reported as removed.
 """
@@ -33,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from jacked.testdiet import tree
-from jacked.testdiet.loss_scan import Declaration, declarations, scan, scan_kind
+from jacked.testdiet.loss_scan import NOT_PARSED, Declaration, declarations, scan, scan_file, scan_kind
 from jacked.testdiet.model import one_line
 
 __all__ = ["DEFAULT_NAME", "DEFAULT_REF", "Declaration", "LossError", "LossReport", "NotInWorkTree",
@@ -66,7 +67,10 @@ class LossReport:
     is the number of declarations now, minus the number at the base, over
     the touched files. ``moved`` holds (old name, new name) pairs.
     ``fewer_cases`` holds (name, cases at the base, cases now).
-    ``not_read`` holds (name or file, reason).
+    ``not_read`` holds (name, reason) for each paired test that cannot be
+    compared. ``files_not_read`` holds (path, kind) for each touched file
+    that is not read: a symbolic link, a submodule, a type change, or a
+    file that does not parse.
     """
 
     base: str
@@ -79,6 +83,7 @@ class LossReport:
     moved: tuple[tuple[str, str], ...] = ()
     fewer_cases: tuple[tuple[str, int, int], ...] = ()
     not_read: tuple[tuple[str, str], ...] = ()
+    files_not_read: tuple[tuple[str, str], ...] = ()
 
 
 # Git --------------------------------------------------------------------
@@ -192,7 +197,9 @@ def loss_report(cwd: Path, base: str | None = None) -> LossReport:
             for side, blob in zip(sides, blobs):
                 data = _read(top, blob, env)
                 if data is not None:
-                    side[path] = scan(path, data.decode("utf-8", "replace"))
+                    side[path], reason = scan_file(path, data.decode("utf-8", "replace"))
+                    if reason is not None and (path, reason) not in skipped:
+                        skipped.append((path, reason))
     finally:
         tree.remove_tree(objects)
     return _compare(commit, *sides, base_ref=DEFAULT_NAME if base is None else base, files_not_read=skipped)
@@ -239,7 +246,7 @@ def _compare(base: str, before: Sides, after: Sides, *, base_ref: str = DEFAULT_
              files_not_read=()) -> LossReport:
     pairs, removed, added = _match(before, after)
     weaker, fewer, skips, moved = [], [], [], []
-    unread = set(files_not_read)
+    unread = set()
     for old_path, then, path, now in pairs:
         name = f"{path}::{now.name}"
         if (old_path, then.name) != (path, now.name):
@@ -250,13 +257,13 @@ def _compare(base: str, before: Sides, after: Sides, *, base_ref: str = DEFAULT_
             fewer.append((name, then.cases, now.cases))
         if now.skipped is True and then.skipped is False:
             skips.append(name)
-        unread.update((name, reason) for reason in then.unread + now.unread)
+        unread.update((name, reason) for reason in then.unread + now.unread if reason != NOT_PARSED)
     net = sum(len(found) for found in after.values()) - sum(len(found) for found in before.values())
     return LossReport(base=base, base_ref=base_ref, added=tuple(sorted(f"{p}::{d.name}" for p, d in added)),
                       removed=tuple(sorted(f"{p}::{d.name}" for p, d in removed)), net=net,
                       fewer_assertions=tuple(sorted(weaker)), skips_added=tuple(sorted(skips)),
                       moved=tuple(sorted(moved)), fewer_cases=tuple(sorted(fewer)),
-                      not_read=tuple(sorted(unread)))
+                      not_read=tuple(sorted(unread)), files_not_read=tuple(sorted(set(files_not_read))))
 
 
 def render(report: LossReport) -> str:
@@ -272,4 +279,5 @@ def render(report: LossReport) -> str:
     lines += [f"fewer cases {one_line(name)} {then} -> {now}" for name, then, now in report.fewer_cases]
     lines += [f"skip mark added {one_line(name)}" for name in report.skips_added]
     lines += [f"not read {one_line(name)} ({reason})" for name, reason in report.not_read]
+    lines += [f"not read file {one_line(path)} ({kind})" for path, kind in report.files_not_read]
     return clean_text("\n".join(lines))

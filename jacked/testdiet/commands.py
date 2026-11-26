@@ -257,8 +257,12 @@ def loss_command(base, as_json):
     \b
     Counted cases: the literal lists of Python parametrize marks, the rows of
     a literal .each table (TypeScript and JavaScript) and the t.Run calls of
-    a Go test. A computed case list and a fixture parameter are not counted.
-    A test whose cases or body the report cannot read prints a not read line.
+    a Go test. A t.Run inside a for-range loop over a slice literal that the
+    same function assigns counts each element of that literal. A t.Run in a
+    loop over any other value, a computed case list and a fixture parameter
+    are not counted. A test on both sides whose cases or body the report
+    cannot read prints a not read line. A file that is not read prints a
+    not read file line.
     """
     import dataclasses
     import json as _json

@@ -1,0 +1,285 @@
+"""The scanners of the loss report for the languages with braces: TypeScript, JavaScript, Go and Rust.
+
+``jacked.testdiet.loss_scan`` says what each scanner counts. One pass over
+a file (``_Index``) finds where each bracket closes, the comments and
+strings, and the damage (a string that does not close, a bracket with no
+partner). A body that holds damage is not read.
+"""
+
+from __future__ import annotations
+
+import bisect
+import functools
+import re
+
+from jacked.testdiet.loss_scan import BODY_NOT_READ, COMPUTED_CASES, Declaration
+
+# A scanner for the languages with braces --------------------------------
+
+def _skip_quoted(text: str, i: int, quote: str, multiline: bool) -> int:
+    """Return the index after the string that starts at ``text[i]``, or -1 when it does not close."""
+    j = i + 1
+    while j < len(text):
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == quote:
+            return j + 1
+        if text[j] == "\n" and not multiline:
+            return -1
+        j += 1
+    return -1
+
+
+_CHAR = re.compile(r"'(?:\\.[^'\n]{0,9}|[^'\\\n])'")
+_PAIRS = {"(": ")", "[": "]", "{": "}"}
+
+
+class _Index:
+    """One pass over a file: where each bracket closes, the comments and strings, and the damage.
+
+    Damage is a string that does not close (it ends at the line end) or a
+    bracket that has no partner. A body that holds damage is not read.
+    """
+
+    def __init__(self, text: str, quotes: str, multiline: str, chars: bool) -> None:
+        self.closes: dict[int, int] = {}
+        self.spans: dict[int, int] = {}
+        damage: list[int] = []
+        stack: list[tuple[str, int]] = []
+        j, size = 0, len(text)
+        while j < size:
+            ch = text[j]
+            char = _CHAR.match(text, j) if chars and ch == "'" else None
+            if char:
+                end = char.end()
+            elif ch in quotes:
+                end = _skip_quoted(text, j, ch, ch in multiline)
+                if end < 0:
+                    damage.append(j)
+                    newline = text.find("\n", j)
+                    end = size if newline < 0 else newline
+            elif text.startswith("//", j):
+                newline = text.find("\n", j)
+                end = size if newline < 0 else newline
+            elif text.startswith("/*", j):
+                close = text.find("*/", j + 2)
+                if close < 0:
+                    damage.append(j)
+                end = size if close < 0 else close + 2
+            else:
+                if ch in _PAIRS:
+                    stack.append((_PAIRS[ch], j))
+                elif ch in ")]}":
+                    if any(want == ch for want, _ in stack):
+                        while stack[-1][0] != ch:
+                            damage.append(stack.pop()[1])
+                        self.closes[stack.pop()[1]] = j + 1
+                    else:
+                        damage.append(j)
+                j += 1
+                continue
+            self.spans[j] = end
+            j = end
+        self._starts = sorted(self.spans)
+        self._damage = sorted(damage)
+
+    def in_code(self, pos: int) -> bool:
+        """Return True when ``pos`` is not in a comment or a string."""
+        k = bisect.bisect_right(self._starts, pos) - 1
+        return k < 0 or pos >= self.spans[self._starts[k]]
+
+    def body(self, start: int) -> int:
+        """Return the index after the bracket that closes the one at ``start``, or -1 when it is not read."""
+        end = self.closes.get(start, -1)
+        k = bisect.bisect_left(self._damage, start)
+        if end < 0 or (k < len(self._damage) and self._damage[k] < end):
+            return -1
+        return end
+
+
+def _count(pattern: re.Pattern[str], text: str, start: int, end: int) -> int | None:
+    return None if end < 0 else len(pattern.findall(text, start, end))
+
+
+def _unread(end: int, cases: int | None) -> tuple[str, ...]:
+    return ((BODY_NOT_READ,) if end < 0 else ()) + ((COMPUTED_CASES,) if cases is None else ())
+
+
+# TypeScript and JavaScript ----------------------------------------------
+
+_JS_HEAD = re.compile(r"(?<![\w$.])(?P<fn>test|it|xit|xtest)(?P<mods>(?:\s*\.\s*[A-Za-z]+)*)\s*")
+_JS_MODS = {"each", "skip", "only", "concurrent", "failing", "fixme"}
+_JS_SKIPS = {"skip", "fixme"}
+_JS_ASSERT = re.compile(r"(?<![\w$.])(?:expect|assert)\s*[.(]")
+_JS_QUOTES = "'\"`"
+
+
+def _ws(text: str, i: int) -> int:
+    while i < len(text) and text[i].isspace():
+        i += 1
+    return i
+
+
+def _elements(text: str, index: _Index, start: int, close: int) -> int:
+    """The number of top-level elements between the bracket at ``start`` and the index ``close``."""
+    rows, content, j = 0, False, start + 1
+    while j < close - 1:
+        if j in index.spans:
+            content = content or text[j] in "'\"`"
+            j = index.spans[j]
+            continue
+        if text[j] in _PAIRS:
+            content, j = True, index.closes.get(j, close - 1)
+            continue
+        if text[j] == ",":
+            rows, content = rows + 1, False
+        elif not text[j].isspace():
+            content = True
+        j += 1
+    return rows + (1 if content else 0)
+
+
+def _array_rows(text: str, index: _Index, start: int, end: int) -> int | None:
+    """The number of elements of the literal array that fills the call ``text[start:end]``, else None."""
+    k = _ws(text, start + 1)
+    close = index.closes.get(k, -1) if k < len(text) and text[k] == "[" else -1
+    if close < 0 or _ws(text, close) != end - 1:
+        return None
+    return _elements(text, index, k, close)
+
+
+def script(text: str) -> list[Declaration]:
+    index = _Index(text, _JS_QUOTES, "`", chars=False)
+    found: list[Declaration] = []
+    for head in _JS_HEAD.finditer(text):
+        mods = re.findall(r"[A-Za-z]+", head["mods"])
+        if not set(mods) <= _JS_MODS or not index.in_code(head.start()):
+            continue
+        i, cases = head.end(), 1
+        if "each" in mods:
+            if text.startswith("(", i):
+                close = index.closes.get(i, -1)
+                cases = None if close < 0 else _array_rows(text, index, i, close)
+            elif text.startswith("`", i):
+                close = _skip_quoted(text, i, "`", True)
+                rows = [line for line in text[i + 1:close - 1].splitlines() if line.strip()]
+                cases = max(len(rows) - 1, 0)
+            else:
+                continue
+            if close < 0:
+                continue
+            i = _ws(text, close)
+        if not text.startswith("(", i):
+            continue
+        start = _ws(text, i + 1)
+        if start >= len(text) or text[start] not in _JS_QUOTES:
+            continue
+        name_end = _skip_quoted(text, start, text[start], text[start] == "`")
+        if name_end < 0:
+            continue
+        end = index.body(i)
+        skipped = head["fn"].startswith("x") or bool(_JS_SKIPS & set(mods))
+        found.append(Declaration(text[start + 1:name_end - 1], _count(_JS_ASSERT, text, name_end, end),
+                                 skipped, cases, _unread(end, cases)))
+    return found
+
+
+# Go and Rust ------------------------------------------------------------
+
+_GO_HEAD = re.compile(r"^func[ \t]+(?P<name>Test(?![a-z])\w*)[ \t]*\((?P<params>[^)]*)\)", re.M)
+_GO_RECEIVER = re.compile(r"\s*(\w+)\s+\*testing\.(?:T|B|F|TB)\b")
+_GO_LOOP = re.compile(r"\bfor\b(?P<head>[^{]*)\{")
+_GO_RANGE = re.compile(r"\brange\s+(\w+)\s*$")
+_RUST_TEST = re.compile(r"#\[(?:\w+::)*test\b")
+_RUST_FN = re.compile(r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(?P<name>\w+)")
+_RUST_ASSERT = re.compile(r"\b\w*assert\w*!")
+
+
+@functools.lru_cache(maxsize=64)
+def _go_patterns(receiver: str) -> tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]]:
+    name = re.escape(receiver)
+    return (re.compile(rf"(?<![\w.]){name}\.(?:Errorf?|Fatalf?|Fail|FailNow)\(|(?<![\w.])(?:assert|require)\.\w+\("),
+            re.compile(rf"(?<![\w.]){name}\.Skip(?:f|Now)?\("),
+            re.compile(rf"(?<![\w.]){name}\.Run\("))
+
+
+def _go_table(text: str, index: _Index, brace: int, loop: int, name: str) -> int | None:
+    """The elements of the slice literal ``name`` that the function assigns before the loop, else None."""
+    found = list(re.finditer(rf"(?<![\w.]){re.escape(name)}\s*:?=\s*\[\]", text[:loop]))
+    found = [m for m in found if m.start() > brace and index.in_code(m.start())]
+    if not found:
+        return None
+    open_ = text.find("{", found[-1].end(), loop)
+    if open_ >= 0 and re.search(r"\bstruct\s*$", text[found[-1].end():open_]):
+        close = index.closes.get(open_, -1)
+        open_ = _ws(text, close) if close >= 0 else -1
+    close = index.closes.get(open_, -1) if 0 <= open_ < loop and text[open_] == "{" else -1
+    return None if close < 0 else _elements(text, index, open_, close)
+
+
+def _go_cases(text: str, index: _Index, brace: int, end: int, runs: re.Pattern[str]) -> int | None:
+    """Each t.Run outside a loop counts 1. In a range loop over a local slice literal, its rows."""
+    loops = []
+    for loop in _GO_LOOP.finditer(text, brace + 1, end):
+        open_ = loop.end() - 1
+        if index.in_code(loop.start()) and open_ in index.closes:
+            loops.append((open_, index.closes[open_], loop["head"]))
+    total: int | None = 0
+    for run in runs.finditer(text, brace, end):
+        if not index.in_code(run.start()):
+            continue
+        inside = [item for item in loops if item[0] < run.start() < item[1]]
+        if not inside:
+            rows = 1
+        else:
+            open_, _, head = max(inside)
+            target = _GO_RANGE.search(head.strip())
+            rows = None if target is None else _go_table(text, index, brace, open_, target.group(1))
+        total = None if total is None or rows is None else total + rows
+    return total
+
+
+def go(text: str) -> list[Declaration]:
+    index = _Index(text, "\"`", "`", chars=True)
+    found: list[Declaration] = []
+    for head in _GO_HEAD.finditer(text):
+        if head["name"] == "TestMain" or not index.in_code(head.start()):
+            continue
+        receiver = _GO_RECEIVER.match(head["params"])
+        asserts, skips, runs = _go_patterns(receiver.group(1) if receiver else "t")
+        brace = text.find("{", head.end())
+        end = -1 if brace < 0 else index.body(brace)
+        skipped = None if end < 0 else bool(skips.search(text, brace, end))
+        cases = None if end < 0 else _go_cases(text, index, brace, end, runs)
+        found.append(Declaration(head["name"], _count(asserts, text, brace, end), skipped, cases,
+                                 _unread(end, cases) if end >= 0 else (BODY_NOT_READ,)))
+    return found
+
+
+def rust(text: str) -> list[Declaration]:
+    index = _Index(text, "\"", "\"", chars=True)
+    found: list[Declaration] = []
+    for head in _RUST_TEST.finditer(text):
+        j = index.closes.get(head.start() + 1, -1)
+        if j < 0 or not index.in_code(head.start()) or not re.fullmatch(
+                r"#\[(?:\w+::)*test(?:\(.*\))?\]", text[head.start():j], re.S):
+            continue
+        ignored = False
+        while True:
+            k = _ws(text, j)
+            if text.startswith("//", k):
+                newline = text.find("\n", k)
+                j = len(text) if newline < 0 else newline
+            elif text.startswith("#[", k) and index.closes.get(k + 1, -1) > 0:
+                ignored = ignored or bool(re.match(r"#\[\s*ignore\b", text[k:]))
+                j = index.closes[k + 1]
+            else:
+                break
+        fn = _RUST_FN.match(text, j)
+        if fn is None:
+            continue
+        brace = text.find("{", fn.end())
+        end = -1 if brace < 0 else index.body(brace)
+        found.append(Declaration(fn["name"], _count(_RUST_ASSERT, text, brace, end), ignored, 1, _unread(end, 1)))
+    return found

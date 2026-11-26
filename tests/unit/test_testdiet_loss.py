@@ -89,7 +89,7 @@ def commit(repo: Path, message: str) -> None:
 def no_loss(report: loss.LossReport) -> None:
     assert (report.removed, report.added, report.net) == ((), (), 0)
     assert (report.fewer_assertions, report.skips_added) == ((), ())
-    assert (report.fewer_cases, report.not_read) == ((), ())
+    assert (report.fewer_cases, report.not_read, report.files_not_read) == ((), (), ())
 
 
 def _invoke(*args: str):
@@ -319,10 +319,10 @@ def test_a_python_file_with_a_syntax_error_still_gives_declarations(repo):
     assert report.removed == ()
     # The line pattern cannot count assertions, so no test is named as weaker.
     assert (report.fewer_assertions, report.skips_added) == ((), ())
-    assert ("tests/test_calc.py::test_broken", "does not parse") not in report.not_read
-    assert ("tests/test_calc.py::test_adds", "does not parse") in report.not_read
+    assert report.not_read == ()
+    assert report.files_not_read == (("tests/test_calc.py", "does not parse"),)
     out = _invoke("tests", "loss").output
-    assert "not read tests/test_calc.py::test_adds (does not parse)" in out.splitlines()
+    assert "not read file tests/test_calc.py (does not parse)" in out.splitlines()
 
 
 def _link_or_skip(link: Path, target: str) -> None:
@@ -336,7 +336,8 @@ def test_a_symbolic_link_is_not_read(repo):
     _link_or_skip(repo / "tests" / "test_link.py", "test_calc.py")
     report = loss.loss_report(repo)
     assert (report.removed, report.added, report.net) == ((), (), 0)
-    assert report.not_read == (("tests/test_link.py", "symbolic link"),)
+    assert report.files_not_read == (("tests/test_link.py", "symbolic link"),)
+    assert report.not_read == ()
 
 
 def test_a_regular_file_that_becomes_a_symbolic_link_is_not_read_and_not_removed(repo):
@@ -346,7 +347,7 @@ def test_a_regular_file_that_becomes_a_symbolic_link_is_not_read_and_not_removed
     out = _invoke("tests", "loss").output
     assert not [line for line in out.splitlines() if line.startswith("removed ")]
     assert [line for line in out.splitlines() if line.startswith("not read ")] == [
-        "not read tests/test_calc.py (type change)"]
+        "not read file tests/test_calc.py (type change)"]
 
 
 def test_one_of_two_tests_with_one_name_is_removed_from_the_file_that_lost_it():
@@ -620,3 +621,56 @@ def test_only_a_test_with_two_sides_can_be_not_read(repo):
     assert both.not_read == (("tests/test_values.py::test_values", "computed cases"),)
     assert "not read tests/test_values.py::test_values (computed cases)" in _invoke(
         "tests", "loss", "--base", "HEAD").output.splitlines()
+
+
+
+def test_rust_attributes_with_brackets_inside_strings_keep_the_test():
+    body = ('#[test]\n#[ignore = "see [1]"]\nfn later() {}\n\n'
+            '#[test]\n#[should_panic(expected = "v[0]")]\nfn panics() {\n    assert!(false);\n}\n')
+    found = by_name("src/lib.rs", body)
+    assert (found["later"].skipped, found["panics"].skipped, found["panics"].asserts) == (True, False, 1)
+
+
+GO_TABLE = """package calc
+
+import "testing"
+
+func TestTable(t *testing.T) {
+\tcases := []struct {
+\t\tname string
+\t\tin   int
+\t}{
+\t\t{"one", 1},
+\t\t{"two", 2},
+\t\t{"three", 3},
+\t}
+\tfor _, tc := range cases {
+\t\tt.Run(tc.name, func(t *testing.T) {
+\t\t\tif tc.in == 0 {
+\t\t\t\tt.Fatal("zero")
+\t\t\t}
+\t\t})
+\t}
+}
+"""
+
+
+def test_a_go_table_row_that_is_cut_prints_fewer_cases(repo):
+    assert by_name("calc_test.go", GO_TABLE)["TestTable"].cases == 3
+    write(repo, "calc/calc_test.go", GO_TABLE.encode())
+    commit(repo, "go table")
+    write(repo, "calc/calc_test.go", GO_TABLE.replace('\t\t{"three", 3},\n', "").encode())
+    report = loss.loss_report(repo, "HEAD")
+    assert report.fewer_cases == (("calc/calc_test.go::TestTable", 3, 2),)
+
+
+def test_a_go_table_built_by_a_call_prints_not_read_on_a_body_change(repo):
+    built = GO_TABLE.split("\tcases := ")[0] + "\tcases := makeCases()\n\tfor _, tc := range cases {" + \
+        GO_TABLE.split("for _, tc := range cases {")[1]
+    assert (by_name("calc_test.go", built)["TestTable"].cases,
+            by_name("calc_test.go", built)["TestTable"].unread) == (None, (loss_scan.COMPUTED_CASES,))
+    write(repo, "calc/calc_test.go", built.encode())
+    commit(repo, "go built table")
+    write(repo, "calc/calc_test.go", built.replace('t.Fatal("zero")', 't.Fatalf("zero %d", tc.in)').encode())
+    report = loss.loss_report(repo, "HEAD")
+    assert report.not_read == (("calc/calc_test.go::TestTable", "computed cases"),)
