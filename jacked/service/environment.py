@@ -21,6 +21,12 @@ _SAFE_PATHS = {
     "darwin": "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin",
     "linux": "/usr/local/bin:/usr/bin:/bin",
 }
+#: The OS programs that the service runs on macOS and Linux by a bare name.
+#: The service PATH there is the fixed ``_SAFE_PATHS`` value, never inherited,
+#: and each name resolves under an OS folder (/usr/bin, /bin, /usr/sbin,
+#: /sbin). A test fails on a bare program name in the service code that is
+#: not in this tuple. Every other program goes by an absolute path.
+SERVICE_POSIX_PROGRAMS = ("launchctl", "systemctl", "ps", "pgrep", "osascript")
 _LOCALE_RE = re.compile(
     r"^(?:[A-Za-z]{1,16}(?:_[A-Za-z]{1,16})?)(?:\.[A-Za-z0-9_-]+)?$"
 )
@@ -75,6 +81,13 @@ def inherited_allowlisted_environment(
 def _windows_part(
     inputs: EnvironmentInputs, home: str, resolvers: WindowsResolvers | None
 ) -> dict[str, str]:
+    """Return the Windows part of the service environment.
+
+    USERPROFILE is ``home``, which the caller takes from ``Path.home()``. It
+    is the one value that does not come from an OS API, on purpose: it must
+    be the same home folder that holds ``~/.claude`` (``JACKED_APP_DIR``),
+    and jacked finds that folder through ``Path.home()``.
+    """
     resolvers = default_windows_resolvers() if resolvers is None else resolvers
     env = {"USERPROFILE": home, **windows_os_environment(home, resolvers, _validate_plain)}
     if inputs.temp_dir:
