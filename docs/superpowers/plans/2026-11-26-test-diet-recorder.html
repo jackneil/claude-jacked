@@ -261,7 +261,7 @@
 <h1>Test diet: the gate recorder (implementation plan)</h1>
 
 <div class="meta">
-  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">ready to build; one task waits on the owner</span></span></div>
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">building; the owner answered the open questions on 2026-11-26</span></span></div>
   <div class="kv"><span class="k">Date:</span><span class="v">2026-11-26</span></div>
   <div class="kv"><span class="k">Branch:</span><span class="v">jack_20261125_test_diet</span></div>
   <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
@@ -1013,10 +1013,13 @@ def test_each_command_of_the_group_is_in_the_reference(): ...
 def test_the_new_sections_have_no_em_dash_and_name_no_host(): ...</code></pre>
 
 <h3>Task 8: the shipped text about the cost of a test</h3>
-<p><strong>Waits on the owner:</strong> his read of the wording table in
-<a href="2026-11-26-test-diet.html#wording">the skill plan</a>. The owner approved the changes on
-2026-11-26 and has not read the wording. If the answer is not here when Task 11 starts, this task
-moves to the pull request of the skill, and this pull request ships without it.</p>
+<p><strong>Approved by the owner on 2026-11-26:</strong> the wording table in
+<a href="2026-11-26-test-diet.html#wording">the skill plan</a>, and the sentence for the gate
+cadence rule. That sentence was written before the placeholder <code>{junit}</code> existed; this
+is the same sentence in the form of the recorder that this plan builds. It goes at the end of the
+gate cadence rule (<code>jacked/data/rules/jacked_behaviors.md:7</code>), after "A brief that asks
+for a full suite per milestone is wrong: fix the brief.":</p>
+<pre><code>When `jacked tests run --help` works, run that one full suite through it (`jacked tests run --kind full -- &lt;the test command, with its JUnit report option set to {junit}&gt;`), and ask `jacked tests seen -- &lt;the same command&gt;` first: a tree that passed that command on this machine does not run it again.</code></pre>
 <p>The last sentence of the new rule line names <code>/test-diet</code> ("To cut or speed up a
 suite that exists, the user runs /test-diet."). That sentence ships with the skill, not with this
 plan. The pin for it moves with it.</p>
@@ -1028,7 +1031,7 @@ plan. The pin for it moves with it.</p>
   <li><input type="checkbox" disabled> 8.2 Make each change of the wording table, exactly, without
   the sentence that names <code>/test-diet</code>. The two files under <code>.claude/skills/</code>
   are the wrappers of this repository; a test requires the shipped text word for word in them
-  (<code>test_command_whats_next_goal.py:371</code>).</li>
+  (<code>test_command_whats_next_goal.py:371</code>). Add the cadence sentence.</li>
   <li><input type="checkbox" disabled> 8.3 Run the two files and each file that
   <code>grep -rlE "goal-maker|whats-next|bhag|jacked_behaviors|test-coverage|commands/dc|skills/dcr" tests/unit</code>
   prints. Expected: PASS. A pin that fails on old wording gets the new wording. A pin that guards a
@@ -1049,6 +1052,10 @@ def test_bhag_keeps_the_ban_on_a_weakened_test_and_names_the_one_exception():
 def test_the_rules_block_has_the_test_cost_rule_between_its_markers():
     text = _read("rules/jacked_behaviors.md")
     assert "A test has a cost" in text.split("# end-jacked-behaviors")[0]
+
+def test_the_gate_cadence_rule_runs_the_full_suite_through_the_recorder_and_asks_seen_first():
+    rule = next(line for line in _read("rules/jacked_behaviors.md").splitlines() if "Gate cadence" in line)
+    assert "jacked tests run --kind full" in rule and "{junit}" in rule and "jacked tests seen" in rule
 
 def test_the_repository_wrappers_have_the_new_wording(): ...       # .claude/skills/whats-next and .claude/skills/dcr</code></pre>
 
@@ -1093,23 +1100,16 @@ feature worktree, so it is the build of this branch.</p>
   <code>uv run jacked tests history</code>.</li>
   <li><input type="checkbox" disabled> 11.3 <code>/dcr</code> on the combined tree beside that
   gate. A fix that changes code costs one more gate.</li>
-  <li><input type="checkbox" disabled> 11.4 <code>/pr</code>, after the owner's answer about the
-  push. The body says that the skill and the gate machine are in the two other plans, and links
+  <li><input type="checkbox" disabled> 11.4 <code>/pr</code> (the owner approved the push of the
+  research, the spec and the plans on 2026-11-26). The body says that the skill and the gate machine are in the two other plans, and links
   the issue that tracks each one. Read the summary line of each operating system's job before the
   word green. Stop at the pull request.</li>
 </ul>
 
 <h2 id="open-questions">Open questions</h2>
 <ul>
-  <li><strong>The push.</strong> The research document holds numbers of five private repositories,
-  with letters for names. This repository is public. Nothing is pushed before the owner says
-  yes.</li>
-  <li><strong>The wording of Task 8.</strong> The owner reads the wording table.</li>
-  <li><strong>The gate cadence rule.</strong> A proposal in
-  <a href="2026-11-26-test-diet.html#wording">the skill plan</a>, not approved: the rule tells a
-  session to run the one full suite through <code>jacked tests run</code> and to ask
-  <code>seen</code> first. Without it, only a repository whose gate script holds the gate line
-  makes records.</li>
+  <li><strong>Answered on 2026-11-26.</strong> Push: yes, the research with letters for the
+  private repositories. Wording table: approved. The gate cadence sentence: approved (Task 8).</li>
   <li><strong>The release.</strong> This plan stops at the pull request. The version belongs to
   the release flow.</li>
 </ul>

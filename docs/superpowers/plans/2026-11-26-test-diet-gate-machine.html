@@ -261,7 +261,7 @@
 <h1>Test diet: the gate machine plan</h1>
 
 <div class="meta">
-  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge warn">on hold: the mechanism is not decided</span></span></div>
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge warn">replaced: the owner chose a self-hosted runner on a rented machine</span></span></div>
   <div class="kv"><span class="k">Date:</span><span class="v">2026-11-26</span></div>
   <div class="kv"><span class="k">Branch:</span><span class="v">a branch on top of jack_20261125_test_diet</span></div>
   <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
@@ -346,6 +346,11 @@ leaves.</p>
 private repository that needs a gate on the second machine, and give <code>seen</code> a rule for
 a record of a CI job. Do not build the SSH job runner. This is a change to what the owner
 approved, so it is his decision.</p>
+<p><strong>The owner's decision, 2026-11-26:</strong> the self-hosted runner pattern, on a
+Linux machine that the owner rents in his own account. The SSH job runner of this document is not
+built. A new plan replaces this one. It covers the machine, the runner for each private repository
+that needs it, and the rule that lets <code>seen</code> trust a record that a CI job made. The
+second machine of the owner gets no new load.</p>
 <p><strong>The capacity is a separate question.</strong> With each mechanism, the gate uses the
 share of the second machine that the owner gave to its Linux layer. A large suite needs more of
 that machine, or a rented machine in the owner's account. Only the owner can decide that.</p>
