@@ -442,12 +442,22 @@ def _one_line(text: str, start: str) -> str:
 
 def test_profile_says_no_time_recorded_when_no_file_has_seconds(store):
     only = store_run(store, "20261126T080000", exit_code=0,
-                     tests=[make_case("n::t", "n.py", None), make_case("m::t", "m.py", 0.0)])
+                     tests=[make_case("n::t", "n.py", None), make_case("m::t", "m.py", None)])
     result = views.profile(store, only)
-    assert result["files_for_half"] is None
+    assert (result["files_for_half"], result["total_test_seconds"]) == (None, None)
     text = views.render_profile(result)
     assert _one_line(text, "files that hold half") == "files that hold half the seconds: no time recorded"
     assert json.loads(views.to_json(result))["files_for_half"] is None
+
+
+def test_profile_says_every_file_took_0_seconds_when_the_times_are_0(store):
+    only = store_run(store, "20261126T080000", exit_code=0,
+                     tests=[make_case("n::t", "n.py", 0.0), make_case("m::t", "m.py", 0.0)])
+    result = views.profile(store, only)
+    assert (result["files_for_half"], result["total_test_seconds"]) == (None, 0.0)
+    text = views.render_profile(result)
+    assert _one_line(text, "files that hold half") == "files that hold half the seconds: every file took 0 seconds"
+    assert _one_line(text, "test seconds") == "test seconds: 0"
 
 
 def test_profile_table_rows_with_no_seconds_say_no_time(store):

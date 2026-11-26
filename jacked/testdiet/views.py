@@ -337,8 +337,14 @@ def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
         lines.append(f"tests with no seconds in the report: {_num(result['tests_without_seconds'])}")
     if result["file_count"] is not None:
         half = result["files_for_half"]
-        lines.append("files that hold half the seconds: "
-                     + (NO_TIME if half is None else f"{_num(half)} of {_num(result['file_count'])}"))
+        if half is not None:
+            share = f"{_num(half)} of {_num(result['file_count'])}"
+        elif result["total_test_seconds"] is None:
+            share = NO_TIME
+        else:
+            # The record holds the times, and each one is 0: there is no time to split.
+            share = "every file took 0 seconds"
+        lines.append(f"files that hold half the seconds: {share}")
     if result["setup_share"] is not None:
         lines.append(f"setup share: {_num(result['setup_share'])}")
     lines.append("files (seconds, tests, file):")
