@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import warnings
 import subprocess
 from pathlib import Path
 
@@ -165,7 +166,8 @@ def test_a_change_that_is_not_committed_counts(repo):
     assert report.removed == ("tests/test_calc.py::test_adds",)
     assert report.added == ("tests/test_untracked.py::test_new",)
     assert report.net == 0
-    assert git(repo, "status", "--porcelain").count("\n") == 2, "the real index must not change"
+    assert git(repo, "status", "--porcelain") == " M tests/test_calc.py\n?? tests/test_untracked.py\n", \
+        "the real index must not change"
 
 
 TS = """\
@@ -325,3 +327,29 @@ def test_one_of_two_tests_with_one_name_is_removed_from_the_file_that_lost_it():
     after = {"a.test.ts": [one], "b.test.ts": [one]}
     report = loss._compare("base", before, after)
     assert (report.removed, report.added, report.net) == (("a.test.ts::works",), (), -1)
+
+
+def test_a_python_warning_does_not_turn_the_file_into_the_line_pattern():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        found = loss.scan("t/test_a.py", 'def test_a():\n    assert "\\d"\n')
+    assert [(d.name, d.asserts) for d in found] == [("test_a", 1)]
+
+
+def test_a_python_file_with_a_byte_order_mark_is_read_with_ast():
+    found = loss.scan("t/test_a.py", "\ufeffdef test_a():\n    assert 1\n")
+    assert [(d.name, d.asserts) for d in found] == [("test_a", 1)]
+
+
+def test_a_rust_char_literal_with_a_brace_does_not_move_the_end_of_a_body():
+    body = ("mod tests {\n    #[test]\n    fn one() {\n        let c = '{';\n        assert!(c == '{');\n    }\n"
+            "    #[test]\n    fn two() {\n        let d = '}';\n        assert_eq!(d, '}');\n        assert!(true);\n    }\n}\n")
+    assert {d.name: d.asserts for d in loss.scan("src/lib.rs", body)} == {"one": 1, "two": 2}
+
+
+def test_a_test_name_with_a_real_line_break_prints_on_one_line(repo):
+    write(repo, "tests/test_lines.ts", b"test(`first\nsecond`, () => {});\n")
+    commit(repo, "names")
+    write(repo, "tests/test_lines.ts", b"\n")
+    out = _invoke("tests", "loss", "--base", "HEAD").output
+    assert "removed tests/test_lines.ts::first\\nsecond" in out.splitlines()

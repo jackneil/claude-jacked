@@ -35,6 +35,7 @@ import ast
 import os
 import re
 import tempfile
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,8 +105,12 @@ def scan(path: str, text: str) -> list[Declaration]:
 # Python ------------------------------------------------------------------
 
 def _python(text: str) -> list[Declaration]:
+    text = text[1:] if text.startswith("\ufeff") else text
     try:
-        module = ast.parse(text)
+        with warnings.catch_warnings():
+            # A warning (an escape such as "\d") must not stop the parse.
+            warnings.simplefilter("ignore")
+            module = ast.parse(text)
     except (SyntaxError, ValueError):
         return _python_lines(text)
     found: list[Declaration] = []
@@ -182,16 +187,26 @@ def _skip_quoted(text: str, i: int, quote: str) -> int:
     return -1
 
 
-def _close(text: str, i: int, quotes: str) -> int:
+_CHAR = re.compile(r"'(?:\\.[^'\n]{0,9}|[^'\\\n])'")
+
+
+def _close(text: str, i: int, quotes: str, chars: bool = False) -> int:
     """Return the index after the bracket that closes the one at ``text[i]``, or -1.
 
     Strings in ``quotes`` and the comments ``//`` and ``/* */`` are skipped.
+    With ``chars``, a char literal such as ``'{'`` is skipped too (Go and
+    Rust). A Rust lifetime such as ``'a`` has no closing quote, so it is not
+    a char literal.
     """
     pairs = {"(": ")", "[": "]", "{": "}"}
     stack: list[str] = []
     j = i
     while 0 <= j < len(text):
         ch = text[j]
+        char = _CHAR.match(text, j) if chars and ch == "'" else None
+        if char:
+            j = char.end()
+            continue
         if ch in quotes:
             j = _skip_quoted(text, j, ch)
             continue
@@ -276,7 +291,7 @@ def _go(text: str) -> list[Declaration]:
         if head["name"] == "TestMain":
             continue
         brace = text.find("{", head.end())
-        end = -1 if brace < 0 else _close(text, brace, "\"`")
+        end = -1 if brace < 0 else _close(text, brace, "\"`", chars=True)
         skipped = None if end < 0 else bool(_GO_SKIP.search(text, brace, end))
         found.append(Declaration(head["name"], _count(_GO_ASSERT, text, brace, end), skipped))
     return found
@@ -286,7 +301,7 @@ def _rust(text: str) -> list[Declaration]:
     found: list[Declaration] = []
     for head in _RUST_HEAD.finditer(text):
         brace = text.find("{", head.end())
-        end = -1 if brace < 0 else _close(text, brace, "\"")
+        end = -1 if brace < 0 else _close(text, brace, "\"", chars=True)
         found.append(Declaration(head["name"], _count(_RUST_ASSERT, text, brace, end),
                                  "#[ignore" in head["attrs"]))
     return found
