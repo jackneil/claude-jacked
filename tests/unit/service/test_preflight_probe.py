@@ -46,6 +46,27 @@ def _probe(contract, code=PROBE_CODE, timeout=120.0, environment=None):
     )
 
 
+def _host_tray_note():
+    """The note that the real probe gives on this host, or None.
+
+    The probe child gets the display variables of this process (the service
+    allowlist), so this process loads the tray the same way. A host where
+    pystray cannot load (a headless Linux runner) gets the environment note.
+    """
+    import jacked.service.tray as tray
+
+    if tray.select_menubar_backend(sys.platform, tray._mac_menubar_available()) == "mac":
+        return None
+    if tray._TRAY_AVAILABLE or tray._PYSTRAY_LOAD_FAILURE is None:
+        return None
+    kind = tray._PYSTRAY_LOAD_FAILURE.split(":", 1)[0]
+    return (
+        f"The tray cannot run on this host ({kind}), so the jacked service cannot "
+        "run here. See the README Linux tray notes: "
+        + tray.LINUX_TRAY_NOTES_POINTER.rsplit(" ", 1)[-1]
+    )
+
+
 def _seam(old, new):
     """Return PROBE_CODE with one change, and prove the change happened."""
     code = PROBE_CODE.replace(old, new)
@@ -72,7 +93,7 @@ def test_the_exit_codes_stay_clear_of_sysexits_and_the_launcher():
 
 def test_the_real_probe_passes_through_the_delivered_launcher(contract):
     result = _probe(contract)
-    assert result == ProbeResult(True), result
+    assert result == ProbeResult(True, note=_host_tray_note()), result
     assert not (contract[2].root / PROBE_STDERR_NAME).exists()
 
 
@@ -274,7 +295,7 @@ def test_the_probe_sees_only_the_service_environment(contract, monkeypatch):
         f"    if os.environ.get('JACKED_SERVICE_USER') != {environment['JACKED_SERVICE_USER']!r}:\n"
         "        raise LookupError('user')",
     )
-    assert _probe(contract, code=code) == ProbeResult(True)
+    assert _probe(contract, code=code) == ProbeResult(True, note=_host_tray_note())
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the PowerShell launcher is Windows only")
