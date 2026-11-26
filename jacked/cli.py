@@ -1325,25 +1325,24 @@ def _upgrade_run_preflight(jacked: str) -> "tuple[int, str]":
     """
     import subprocess
 
-    from jacked.service.updater import PREFLIGHT_TIMEOUT_SECONDS
+    from jacked.service.preflight_probe import (
+        PREFLIGHT_EXIT_GRACE_SECONDS,
+        PREFLIGHT_TIMEOUT_SECONDS,
+        preflight_argv,
+    )
 
+    wait = PREFLIGHT_TIMEOUT_SECONDS + PREFLIGHT_EXIT_GRACE_SECONDS
     _upgrade_phase("preflight", "begin")
     console.print(f"\n[dim]$ {jacked} service preflight[/dim]")
     try:
         preflight = subprocess.run(
-            [jacked, "service", "preflight"],
-            capture_output=True,
-            text=True,
-            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+            preflight_argv(jacked), capture_output=True, text=True, timeout=wait
         )
         code = preflight.returncode
         output = ((preflight.stdout or "") + (preflight.stderr or "")).strip()
     except subprocess.TimeoutExpired:
         code = -1
-        output = (
-            "preflight did not answer within "
-            f"{PREFLIGHT_TIMEOUT_SECONDS}s"
-        )
+        output = f"preflight did not answer within {wait}s"
     except OSError as exc:
         code = -1
         output = f"preflight could not run: {exc}"
@@ -7871,12 +7870,6 @@ def _exit_hard(code: int) -> None:
     os._exit(code)
 
 
-from jacked.preflight_cli import (  # noqa: E402 - re-exported for callers
-    print_preflight_failure as _print_preflight_failure,
-    print_preflight_ok as _print_preflight_ok,
-)
-
-
 @service.command(name="preflight")
 @click.option(
     "--json",
@@ -7890,47 +7883,29 @@ from jacked.preflight_cli import (  # noqa: E402 - re-exported for callers
     default=None,
     type=float,
     help=(
-        "Fail with exit code 1 if provisioning takes longer than this many "
-        "seconds. The boot probe also stops at this limit."
+        "The time budget of the whole command, in seconds (default 120, the "
+        "upgrade helper's timeout). Provisioning and the boot probe share it. "
+        "When it ends, the command fails with exit code 1."
     ),
 )
 def service_preflight(as_json: bool, timeout_seconds: float | None):
     """Prove this build can provision and boot its service contract.
 
     The command provisions the contract. Then it runs one short probe
-    process: the service runtime, with the exact service environment, does
-    the imports that the service does at start. The command starts no
-    service and changes no supervisor. Provisioning writes the immutable
-    content-addressed launcher file, which is safe to repeat.
+    process through the launcher that the supervisor uses. The probe uses
+    the exact service environment. It makes an event loop, a socket and a
+    TLS context, and it finds the temporary directory. It also imports the
+    tray, the CLI and the dashboard API, and it does the start checks of
+    the tray. The command starts no service and changes no supervisor.
 
     Exit code 0 means this build can boot its service. Exit code 1 means it
-    cannot, and an upgrade to this build must not be trusted.
+    cannot. Do not trust an upgrade to this build.
     """
-    from jacked.service.lifecycle import (
-        default_service_paths,
-        provision_service_contract,
-    )
-    from jacked.preflight_cli import print_probe_failure, run_boot_probe
+    from jacked.preflight_cli import run_preflight
 
-    paths = default_service_paths()
-    try:
-        spec, environment = _provision_with_timeout(
-            provision_service_contract, paths, timeout_seconds
-        )
-    except (OSError, ValueError, TimeoutError) as exc:
-        _print_preflight_failure(exc, as_json)
-        if isinstance(exc, TimeoutError):
-            # The provisioning thread is still wedged; a normal exit would
-            # wait for it. The batches depend on this command returning.
-            _exit_hard(1)
-        sys.exit(1)
-    # Provisioning alone passed a build whose service died at `import
-    # asyncio` on Windows (WinError 10106). The probe boots the runtime.
-    probe = run_boot_probe(spec, environment, paths, timeout_seconds)
-    if not probe.ok:
-        print_probe_failure(probe, as_json)
-        sys.exit(1)
-    _print_preflight_ok(spec, as_json)
+    run_preflight(
+        as_json, timeout_seconds, provision=_provision_with_timeout, exit_hard=_exit_hard
+    )
 
 
 @service.command(name="stop")

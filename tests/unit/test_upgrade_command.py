@@ -106,7 +106,7 @@ class TestUpgradeCommand:
         # #295i: the requirement carries the installed version as a floor.
         assert any(arg.startswith("claude-jacked[tray]>=") for arg in uv_args)
         preflight_args = mock_run.call_args_list[1][0][0]
-        assert preflight_args == ["/fake/jacked", "service", "preflight"]
+        assert preflight_args == ["/fake/jacked", "service", "preflight", "--timeout", "120"]
         install_args = mock_run.call_args_list[2][0][0]
         assert "/fake/jacked" in install_args
         assert "install" in install_args
@@ -269,7 +269,7 @@ class TestUpgradeCommand:
         # signalled.
         assert mock_run.call_count == 4
         assert mock_run.call_args_list[1][0][0] == [
-            "/fake/jacked", "service", "preflight"
+            "/fake/jacked", "service", "preflight", "--timeout", "120"
         ]
         resolve_legacy.assert_called_once()
         stop.assert_not_called()
@@ -303,7 +303,7 @@ class TestUpgradeCommand:
         # point of the gate.
         assert mock_run.call_count == 4
         assert mock_run.call_args_list[1][0][0] == [
-            "/fake/jacked", "service", "preflight"
+            "/fake/jacked", "service", "preflight", "--timeout", "120"
         ]
         mock_popen.assert_not_called()
 
@@ -419,7 +419,7 @@ class TestUpgradeIsATransaction:
 
         assert result.exit_code == 1, result.output
         argvs = [call[0][0] for call in run.call_args_list]
-        assert argvs[1] == ["/fake/jacked", "service", "preflight"]
+        assert argvs[1] == ["/fake/jacked", "service", "preflight", "--timeout", "120"]
         assert argvs[2] == self.RB_ARGV
         assert argvs[3] == ["/fake/jacked", "install", "--force"]
         assert argvs[4] == ["/fake/jacked", "service", "restart"]
@@ -915,7 +915,7 @@ class TestUpgradePreflightSubprocessGuards:
 
         def fake_run(args, *a, **kw):
             calls.append((list(args), kw))
-            if list(args)[1:] == ["service", "preflight"]:
+            if list(args)[1:] == ["service", "preflight", "--timeout", "120"]:
                 raise exc
             return _ok()
 
@@ -936,16 +936,21 @@ class TestUpgradePreflightSubprocessGuards:
         return result, calls
 
     def test_the_preflight_carries_a_timeout(self, tmp_path):
-        from jacked.service.updater import PREFLIGHT_TIMEOUT_SECONDS
+        from jacked.service.updater import (
+            PREFLIGHT_EXIT_GRACE_SECONDS,
+            PREFLIGHT_TIMEOUT_SECONDS,
+        )
 
         _result, calls = self._invoke_with_preflight_raising(
             OSError("boom"), tmp_path
         )
         preflight = [
-            kw for argv, kw in calls if argv[1:] == ["service", "preflight"]
+            kw for argv, kw in calls if argv[1:] == ["service", "preflight", "--timeout", "120"]
         ]
         assert preflight, "the preflight step never ran"
-        assert preflight[0].get("timeout") == PREFLIGHT_TIMEOUT_SECONDS, (
+        assert preflight[0].get("timeout") == (
+            PREFLIGHT_TIMEOUT_SECONDS + PREFLIGHT_EXIT_GRACE_SECONDS
+        ), (
             "an unbounded preflight can hang the upgrade forever with the "
             "package already replaced"
         )
@@ -1688,7 +1693,7 @@ class TestNoDowngrade:
         assert "Upgrade complete" not in output
         assert "older than v0.111.2" in output
         argvs = [call[0][0] for call in run.call_args_list]
-        assert ["/fake/jacked", "service", "preflight"] not in argvs
+        assert ["/fake/jacked", "service", "preflight", "--timeout", "120"] not in argvs
         assert argvs[1] == [
             "/fake/uv", "tool", "install", "claude-jacked[tray]==0.111.2", "--force", "--refresh",
         ]

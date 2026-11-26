@@ -20,6 +20,7 @@ from typing import NamedTuple
 
 from jacked.findbin import find_bin
 from jacked.service import CLAUDE_DIR
+from jacked.service.preflight_probe import PREFLIGHT_EXIT_GRACE_SECONDS, PREFLIGHT_TIMEOUT_SECONDS, preflight_argv
 from jacked.service.process import is_process_alive, is_port_listening
 from jacked.winproc import NO_WINDOW, run_batch_detached
 
@@ -31,10 +32,6 @@ RECOVERY_FILE = CLAUDE_DIR / "jacked-update-failed.txt"
 ROLLBACK_STEP_PACKAGE = "package rollback"
 ROLLBACK_STEP_INSTALL = "settings migration"
 ROLLBACK_STEP_RESTART = "service restart"
-
-# How long the preflight gate may run before it counts as a refusal. A build
-# that cannot answer in two minutes cannot be trusted with the old service.
-PREFLIGHT_TIMEOUT_SECONDS = 120
 
 # How long one identification probe may take. The listener is on loopback and
 # /api/health is a pure local handler, so a jacked service answers in
@@ -1291,11 +1288,11 @@ def run_update(
         # forever with the tray already gone.
         try:
             preflight = subprocess.run(
-                [jacked, "service", "preflight"],
+                preflight_argv(jacked),
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=PREFLIGHT_TIMEOUT_SECONDS,
+                timeout=PREFLIGHT_TIMEOUT_SECONDS + PREFLIGHT_EXIT_GRACE_SECONDS,
                 creationflags=NO_WINDOW,
             )
             preflight_code = preflight.returncode
@@ -1305,7 +1302,7 @@ def run_update(
         except subprocess.TimeoutExpired:
             preflight_code = -1
             preflight_output = (
-                f"preflight did not answer within {PREFLIGHT_TIMEOUT_SECONDS}s"
+                f"preflight did not answer within {PREFLIGHT_TIMEOUT_SECONDS + PREFLIGHT_EXIT_GRACE_SECONDS}s"
             )
         except OSError as exc:
             preflight_code = -1
@@ -1941,8 +1938,9 @@ def _spawn_windows_tray_updater(
         + ":preflight_failed\r\n"
         "echo [%date% %time%] ERROR: jacked service preflight failed for the "
         "new build\r\n"
-        "set FAILREASON=the new build refused to provision its service "
-        "contract\r\n"
+        'jacked _update_status preflight failed --error "the new build failed its service preflight" --recovery "jacked service preflight"\r\n'
+        + DRIFT_GUARD
+        + "set FAILREASON=the new build failed its service preflight\r\n"
         "goto rollback_now\r\n"
         ":migrate_failed\r\n"
         'jacked _update_status migrating_settings failed --error "jacked '

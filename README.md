@@ -481,7 +481,18 @@ jacked service preflight          # exit 0: this build can start its service
 jacked service preflight --json   # one JSON object, for scripts
 ```
 
-The command provisions the service contract. Then it runs one short probe process: the service runtime, with the exact service environment, does the imports that the service does at start (an asyncio event loop, a socket, a TLS context, the temporary directory, and the tray module). The command prints the runtime path, the runtime target, the supervisor, and the generation. It starts no service and it changes no supervisor, so it is safe to run while the service is live. On a refusal it prints `[FAIL] <error type>: <reason>` and exits 1. A probe failure names the step, for example `ServiceProbeError: the service runtime failed its start probe at asyncio_event_loop: OSError 10106`. The `--json` object has a `probe_step` field.
+The command provisions the service contract. Then it runs one short probe process. The probe goes through the launcher that the supervisor uses, with the exact service environment. The probe does these checks, in this order:
+
+1. It makes and closes an asyncio event loop.
+2. It opens and closes a socket.
+3. It makes the default TLS context.
+4. It finds the temporary directory. This directory must not be the current directory.
+5. It imports the tray module.
+6. It does the start checks of the tray: uvicorn must be available, and the menu-bar backend must be available. A Linux host with no display skips the backend check.
+7. It imports the CLI.
+8. It imports the dashboard API.
+
+The command prints the runtime path, the runtime target, the supervisor, and the generation. It starts no service and it changes no supervisor, so it is safe to run while the service is live. `--timeout` sets the time budget of the whole command. The default is 120 seconds. On a refusal the command prints `[FAIL] <error type>: <reason>` and exits 1. A probe failure names the step first, for example `[FAIL] ServiceProbeError at asyncio_event_loop: OSError winerror 10106`. The probe writes its stderr to a private file in the service directory, and the message gives the path of that file. The `--json` object has a `probe_step` field.
 
 ### Options
 

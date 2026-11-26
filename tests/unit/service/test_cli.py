@@ -1997,10 +1997,12 @@ class TestServicePreflight:
 
         from jacked.cli import main
 
+        spec = self._spec()
+        environment = {"SENTINEL": "service-environment"}
         with (
             patch(
                 "jacked.service.lifecycle.provision_service_contract",
-                return_value=(self._spec(), {}),
+                return_value=(spec, environment),
             ),
             patch.object(subprocess, "run") as run,
             patch.object(subprocess, "Popen") as popen,
@@ -2009,16 +2011,19 @@ class TestServicePreflight:
         ):
             result = CliRunner().invoke(main, ["service", "preflight"])
 
+        from jacked.service.lifecycle import default_service_paths
+
         assert result.exit_code == 0, result.output
         run.assert_not_called()
         popen.assert_not_called()
         ensure.assert_not_called()
         restart.assert_not_called()
         self.probe.assert_called_once()
-        kwargs = self.probe.call_args.kwargs
-        assert kwargs["runtime"] == "/opt/jacked/bin/python"
-        assert kwargs["environment"] == {}
-        assert kwargs["generation"] == "abcdef0123456789"
+        probe_spec, probe_environment, cwd, options = self.probe.call_args.args
+        assert probe_spec is spec
+        assert probe_environment is environment
+        assert cwd == default_service_paths().root
+        assert 0 < options.timeout <= 120
 
 
 class TestServicePreflightTimeout:

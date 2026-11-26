@@ -1,137 +1,246 @@
 """One short probe process that proves the service runtime can boot.
 
 ``jacked service preflight`` is the upgrade transaction gate. Provisioning
-alone does not prove that the service can start: on Windows a service
-environment with no SystemRoot provisioned correctly, but the service died at
-``import asyncio`` with WinError 10106. The probe closes that gap.
+alone does not prove that the service can start. On Windows a service
+environment with no SystemRoot provisioned correctly, but the service
+stopped at ``import asyncio`` with WinError 10106. The probe closes that gap.
 
-The probe runs the exact runtime of the spec with the exact service
-environment (the mapping that the launcher and ``spawn_exact_service`` use,
-plus ``JACKED_SERVICE_GENERATION``). It runs ``-I -c`` code that does what the
-service does at start: it creates and closes an asyncio event loop, opens a
-socket, makes a TLS context, resolves the temporary directory, and imports
-``jacked.service.tray``. The probe starts no service and changes no
-supervisor. It reports only step names, exception type names and error
-numbers. It never reports an environment value.
+The probe goes through the launch shape that the supervisors use:
+
+- On Windows, a probe launcher from ``render_windows_launcher`` runs in
+  ``powershell.exe -File``, as Task Scheduler runs the real launcher. So
+  PowerShell decodes the environment, as it does for the service.
+- On POSIX, ``posix_preinterpreter_command`` runs the probe through
+  ``/usr/bin/env -i`` and the versioned launcher, as launchd and systemd do.
+
+The probe has these steps, in this order:
+
+1. ``asyncio_event_loop``: make and close an asyncio event loop.
+2. ``socket``: open and close a socket.
+3. ``ssl``: make the default TLS context (this reads the trust store).
+4. ``tempfile``: find the temporary directory. It must not be the current
+   directory.
+5. ``tray_import``: import ``jacked.service.tray``.
+6. ``tray_backend``: do the checks that the real start does. uvicorn must
+   be available. The menu-bar backend must be available, except on a Linux
+   host with no display.
+7. ``cli_import``: import ``jacked.cli``.
+8. ``api_import``: import ``jacked.api.main``. Its import opens no
+   database, starts no thread, writes no file and makes no connection.
+
+The probe starts no service and changes no supervisor. It reports only step
+names, exception type names, module names and error numbers. It never
+reports an environment value.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
-from collections.abc import Callable, Mapping
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from jacked.winproc import NO_WINDOW
+from jacked.service.environment import (
+    posix_preinterpreter_command,
+    render_windows_launcher,
+)
 
-#: How long the probe may run. The upgrade helper gives the whole preflight
-#: 120 seconds, and the probe imports take under one second on a normal host.
-PROBE_TIMEOUT_SECONDS = 45.0
+#: How long the preflight gate may run before it counts as a refusal. A
+#: build that cannot answer in two minutes cannot be trusted with the old
+#: service. Each upgrade path gives the command this ``--timeout`` budget, it
+#: is the command's default, and the Windows batches write the same number.
+PREFLIGHT_TIMEOUT_SECONDS = 120
+#: The caller waits this much longer than the budget, so the command reports
+#: its own named failure before the caller's timeout stops it.
+PREFLIGHT_EXIT_GRACE_SECONDS = 30
+
+
+def preflight_argv(jacked: str) -> list[str]:
+    """Return the preflight command line that the upgrade paths run.
+
+    >>> preflight_argv("jacked")
+    ['jacked', 'service', 'preflight', '--timeout', '120']
+    """
+    return [jacked, "service", "preflight", "--timeout", str(PREFLIGHT_TIMEOUT_SECONDS)]
+
 
 #: The probe steps, in the order that the probe runs them.
-PROBE_STEPS = ("asyncio_event_loop", "socket", "ssl", "tempfile", "tray_import")
-#: The probe exits with this code plus the step index when a step fails.
-#: The exit code is the verdict. The marker lines on stdout give the detail.
-PROBE_EXIT_BASE = 70
+PROBE_STEPS = (
+    "asyncio_event_loop",
+    "socket",
+    "ssl",
+    "tempfile",
+    "tray_import",
+    "tray_backend",
+    "cli_import",
+    "api_import",
+)
+#: A failed step exits with this code plus its index. The exit code is the
+#: verdict, because a windowless pythonw.exe can lose its stdout. Codes 40 to
+#: 63 are free: Python uses 1 and 2, sysexits starts at 64 (EX_TEMPFAIL, 75,
+#: tells a supervisor to restart), and shells use 126 and higher.
+PROBE_EXIT_BASE = 40
+#: The name of the file that holds the stderr of the last failed probe.
+PROBE_STDERR_NAME = "preflight-probe-stderr.log"
 
-_STEP_MARK = "jacked-probe-step:"
-_FAIL_MARK = "jacked-probe-fail:"
+STEP_MARK = "jacked-probe-step:"
+FAIL_MARK = "jacked-probe-fail:"
+OK_MARK = "jacked-probe-ok"
 
-# The probe code must not hold the words that the test tripwire reads as a
-# service lifecycle command (" service start" and the like). The module path
-# below has no spaces, so it does not match.
-PROBE_CODE = r'''
+_PRELUDE = r'''
+import os
 import sys
 
 
+class ProbeRefusal(Exception):
+    """A check of the real start failed. args[0] is a fixed token."""
+
+
 def _say(line):
-    # pythonw.exe can start with no usable stdout. The exit code carries the
-    # verdict, so a lost marker line never changes the result.
+    # pythonw.exe can start with no usable stdout. The exit code carries
+    # the verdict, so a lost marker line never changes the result.
     try:
         print(line, flush=True)
     except Exception:
         pass
 
 
+def _detail(exc):
+    detail = type(exc).__name__
+    if isinstance(exc, ProbeRefusal):
+        return detail + " " + str(exc.args[0])
+    if isinstance(exc, ImportError) and exc.name:
+        detail += " module " + exc.name
+    winerror = getattr(exc, "winerror", None)
+    number = getattr(exc, "errno", None)
+    if isinstance(winerror, int):
+        detail += " winerror " + str(winerror)
+    elif isinstance(number, int):
+        detail += " errno " + str(number)
+    return detail
+
+
 def _step(code, name, action):
-    _say("jacked-probe-step:" + name)
+    _say(STEP_MARK + name)
     try:
         action()
     except BaseException as exc:
-        detail = type(exc).__name__
-        number = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
-        if isinstance(number, int):
-            detail += " " + str(number)
-        _say("jacked-probe-fail:" + name + ":" + detail)
+        _say(FAIL_MARK + name + ":" + _detail(exc))
         sys.exit(code)
 
 
-def _event_loop():
+def asyncio_event_loop():
     import asyncio
 
     asyncio.new_event_loop().close()
 
 
-def _socket():
+def socket():
     import socket
 
     socket.socket().close()
 
 
-def _ssl():
+def ssl():
     import ssl
 
     ssl.create_default_context()
 
 
-def _tempfile():
-    import os
+def tempfile():
     import tempfile
 
     here = os.path.normcase(os.path.abspath(os.getcwd()))
     temp = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
     if temp == here:
-        raise RuntimeError("the temporary directory is the current directory")
+        raise ProbeRefusal("temp_is_cwd")
 
 
-def _tray():
+def tray_import():
     import jacked.service.tray  # noqa: F401
 
 
-_step(70, "asyncio_event_loop", _event_loop)
-_step(71, "socket", _socket)
-_step(72, "ssl", _ssl)
-_step(73, "tempfile", _tempfile)
-_step(74, "tray_import", _tray)
-_say("jacked-probe-ok")
+def tray_backend():
+    # The checks of ServiceRunner.run, in its order.
+    import jacked.service.tray as tray
+
+    if tray.select_menubar_backend(sys.platform, tray._mac_menubar_available()) != "mac":
+        headless = sys.platform.startswith("linux") and not (
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        )
+        if not tray._TRAY_AVAILABLE and not headless:
+            raise ProbeRefusal("tray_backend_missing")
+    if not tray._UVICORN_AVAILABLE:
+        raise ProbeRefusal("uvicorn_missing")
+
+
+def cli_import():
+    import jacked.cli  # noqa: F401
+
+
+def api_import():
+    import jacked.api.main  # noqa: F401
 '''
+
+
+def _probe_code() -> str:
+    """Build the probe code from the step and marker constants."""
+    lines = [
+        f"STEP_MARK = {STEP_MARK!r}",
+        f"FAIL_MARK = {FAIL_MARK!r}",
+        _PRELUDE,
+    ]
+    for index, step in enumerate(PROBE_STEPS):
+        lines.append(f"_step({PROBE_EXIT_BASE + index}, {step!r}, {step})")
+    lines.append(f"_say({OK_MARK!r})")
+    return "\n".join(lines) + "\n"
+
+
+PROBE_CODE = _probe_code()
 
 
 @dataclass(frozen=True)
 class ProbeResult:
-    """The probe outcome. ``step`` names the failed step, else it is None."""
+    """The probe outcome. ``step`` names the failed step, else it is None.
+
+    ``stderr_file`` is the path of the private file that holds the stderr of
+    a failed probe, when the probe wrote one.
+    """
 
     ok: bool
     step: str | None = None
     detail: str = ""
+    stderr_file: str | None = None
+
+
+@dataclass(frozen=True)
+class ProbeOptions:
+    """How to run the probe. ``code`` and ``runner`` are test seams."""
+
+    timeout: float
+    code: str = PROBE_CODE
+    runner: Any = None
 
 
 class ServiceProbeError(RuntimeError):
-    """The service runtime failed its start probe."""
+    """The service runtime failed its start probe. The text starts with the step."""
 
     def __init__(self, result: ProbeResult):
         self.result = result
-        super().__init__(
-            f"the service runtime failed its start probe at {result.step}: "
-            f"{result.detail}"
-        )
+        text = f"at {result.step}: {result.detail}. The service runtime failed its start probe."
+        if result.stderr_file:
+            text += f" Its stderr is in {result.stderr_file}"
+        super().__init__(text)
 
 
 def _last_step(stdout: str) -> str | None:
     steps = [
-        line[len(_STEP_MARK):].strip()
+        line[len(STEP_MARK):].strip()
         for line in stdout.splitlines()
-        if line.startswith(_STEP_MARK)
+        if line.startswith(STEP_MARK)
     ]
     return steps[-1] if steps else None
 
@@ -148,18 +257,16 @@ def parse_probe_output(returncode: int, stdout: str) -> ProbeResult:
     """Read the probe result. The exit code is the verdict.
 
     Exit code 0 is a pass. ``PROBE_EXIT_BASE`` plus a step index names the
-    failed step. The marker lines on stdout only add the detail, because a
-    windowless runtime can lose its stdout.
+    failed step. The marker lines on stdout only add the detail.
 
     >>> parse_probe_output(0, "")
-    ProbeResult(ok=True, step=None, detail='')
-    >>> parse_probe_output(71, "jacked-probe-step:socket\\n"
-    ...                        "jacked-probe-fail:socket:OSError 10106\\n")
-    ProbeResult(ok=False, step='socket', detail='OSError 10106')
-    >>> parse_probe_output(70, "")
-    ProbeResult(ok=False, step='asyncio_event_loop', detail='exit 70')
-    >>> parse_probe_output(-11, "jacked-probe-step:ssl\\n")
-    ProbeResult(ok=False, step='ssl', detail='exit -11')
+    ProbeResult(ok=True, step=None, detail='', stderr_file=None)
+    >>> parse_probe_output(41, "jacked-probe-fail:socket:OSError winerror 10106\\n").detail
+    'OSError winerror 10106'
+    >>> parse_probe_output(40, "").detail
+    'exit 40'
+    >>> parse_probe_output(-11, "jacked-probe-step:ssl\\n").step
+    'ssl'
     """
     if returncode == 0:
         return ProbeResult(True)
@@ -167,61 +274,138 @@ def parse_probe_output(returncode: int, stdout: str) -> ProbeResult:
     if 0 <= index < len(PROBE_STEPS):
         step = PROBE_STEPS[index]
         detail = f"exit {returncode}"
+        prefix = f"{FAIL_MARK}{step}:"
         for line in stdout.splitlines():
-            if line.startswith(f"{_FAIL_MARK}{step}:"):
-                detail = line[len(_FAIL_MARK) + len(step) + 1:].strip() or detail
+            if line.startswith(prefix):
+                detail = line[len(prefix):].strip() or detail
         return ProbeResult(False, step, detail)
     step = _last_step(stdout) or "interpreter_start"
     return ProbeResult(False, step, f"exit {returncode}")
 
 
-def run_service_probe(
-    *,
-    runtime: str,
-    environment: Mapping[str, str],
-    generation: str,
-    cwd: Path,
-    timeout: float = PROBE_TIMEOUT_SECONDS,
-    code: str = PROBE_CODE,
-    run: Callable[..., subprocess.CompletedProcess] | None = None,
-) -> ProbeResult:
-    """Run the probe once and return its result.
+def _os_error_detail(exc: OSError) -> str:
+    detail = type(exc).__name__
+    winerror = getattr(exc, "winerror", None)
+    if isinstance(winerror, int):
+        return f"{detail} winerror {winerror}"
+    if isinstance(exc.errno, int):
+        return f"{detail} errno {exc.errno}"
+    return detail
 
-    The probe environment is ``environment`` plus ``JACKED_SERVICE_GENERATION``,
-    as ``spawn_exact_service`` and the Windows launcher give it. Nothing comes
-    from ``os.environ``. ``code`` and ``run`` are test seams.
+
+def _write_private(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` with owner-only access (mode 0600)."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8", errors="replace") as handle:
+        handle.write(text)
+
+
+def _run(argv: list[str], cwd: Path, options: ProbeOptions):
+    if options.runner is not None:
+        return options.runner(argv, timeout=options.timeout, cwd=str(cwd))
+    from jacked.proctree import run_tree
+
+    return run_tree(argv, timeout=options.timeout, capture=True, cwd=str(cwd))
+
+
+def _windows_argv(spec, environment, cwd: Path, code: str) -> tuple[list[str], Path]:
+    from jacked.winproc import system_program
+
+    script = render_windows_launcher(
+        runtime=spec.runtime_path, argv=("-I", "-c", code), environment=environment
+    )
+    descriptor, name = tempfile.mkstemp(prefix="jacked-probe-", suffix=".ps1", dir=cwd)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(script.encode("ascii"))
+    argv = [
+        system_program("powershell"),
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        name,
+        "-Generation",
+        spec.generation,
+    ]
+    return argv, Path(name)
+
+
+def probe_argv(spec, environment: dict[str, str], cwd: Path, code: str):
+    """Return ``(argv, temporary_file)`` for the delivered launch shape.
+
+    ``temporary_file`` is the Windows probe launcher (the caller removes it),
+    or None on POSIX.
     """
+    if sys.platform == "win32":
+        return _windows_argv(spec, environment, cwd, code)
+    command = posix_preinterpreter_command(
+        runtime=spec.runtime_path,
+        argv=("-I", "-c", code),
+        environment={**environment, "JACKED_SERVICE_GENERATION": spec.generation},
+        launcher=spec.launcher_path,
+        runtime_target=spec.runtime_target_path,
+    )
+    return list(command), None
 
-    runner = subprocess.run if run is None else run
-    child_environment = {**environment, "JACKED_SERVICE_GENERATION": generation}
+
+def run_service_probe(
+    spec, environment: dict[str, str], cwd: Path, options: ProbeOptions
+) -> ProbeResult:
+    """Run the probe once, through the delivered launch shape.
+
+    The probe environment is ``environment`` plus
+    ``JACKED_SERVICE_GENERATION``, as the supervisors give it. Nothing comes
+    from ``os.environ``. A failed probe writes its stderr to the private
+    file ``cwd / PROBE_STDERR_NAME``.
+    """
+    stderr_path = Path(cwd) / PROBE_STDERR_NAME
+    temporary = None
     try:
-        completed = runner(
-            [runtime, "-I", "-c", code],
-            env=child_environment,
-            cwd=str(cwd),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-            check=False,
-            creationflags=NO_WINDOW,
-        )
+        argv, temporary = probe_argv(spec, environment, Path(cwd), options.code)
+        completed = _run(argv, Path(cwd), options)
     except subprocess.TimeoutExpired as exc:
-        step = _last_step(_text(exc.stdout)) or "interpreter_start"
-        return ProbeResult(False, step, f"timeout after {timeout:g}s")
+        stdout = _text(exc.stdout)
+        step = "interpreter_exit" if OK_MARK in stdout.splitlines() else (
+            _last_step(stdout) or "interpreter_start"
+        )
+        result = ProbeResult(False, step, f"timeout after {options.timeout:g}s")
+        return _with_stderr(result, _text(exc.stderr), stderr_path)
     except OSError as exc:
-        return ProbeResult(False, "interpreter_start", type(exc).__name__)
-    return parse_probe_output(completed.returncode, completed.stdout or "")
+        return ProbeResult(False, "interpreter_start", _os_error_detail(exc))
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    result = parse_probe_output(completed.returncode, _text(completed.stdout))
+    if result.ok:
+        stderr_path.unlink(missing_ok=True)
+        return result
+    return _with_stderr(result, _text(completed.stderr), stderr_path)
+
+
+def _with_stderr(result: ProbeResult, stderr: str, path: Path) -> ProbeResult:
+    try:
+        _write_private(path, stderr)
+    except OSError:
+        return result
+    return ProbeResult(result.ok, result.step, result.detail, str(path))
 
 
 __all__ = [
+    "PREFLIGHT_EXIT_GRACE_SECONDS",
+    "PREFLIGHT_TIMEOUT_SECONDS",
+    "preflight_argv",
+    "FAIL_MARK",
+    "OK_MARK",
     "PROBE_CODE",
     "PROBE_EXIT_BASE",
+    "PROBE_STDERR_NAME",
     "PROBE_STEPS",
-    "PROBE_TIMEOUT_SECONDS",
+    "STEP_MARK",
+    "ProbeOptions",
     "ProbeResult",
     "ServiceProbeError",
     "parse_probe_output",
+    "probe_argv",
     "run_service_probe",
 ]

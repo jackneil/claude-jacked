@@ -215,7 +215,7 @@ Language-specific coding standards enforced through templates and git hooks.
 | Dangerous permission wildcards | Run `jacked permissions audit --fix` to find and prune them |
 | Service will not start | Run `jacked service status`. It prints the last start failure with its reason. The statusline shows `jacked service down` while the service is not running. Correct the cause, then run `jacked service restart` |
 | Upgrade left the service down | Read `~/.claude/jacked-update-failed.txt`. `jacked upgrade` is a transaction: it runs `jacked service preflight` before it replaces the old install, and it reinstalls the previous version if the new one cannot start. The file names both versions and the manual recovery commands |
-| Is this build able to start? | Run `jacked service preflight`. Exit code 0 means the build can provision its service contract and boot its runtime in one short probe process. Exit code 1 prints `[FAIL] <error type>: <reason>`; a probe failure names the failed step. The command starts no service and changes no supervisor. Add `--json` for one machine-readable object (its `probe_step` field names a failed probe step) |
+| Is this build able to start? | Run `jacked service preflight`. Exit code 0 means the build can provision its service contract and boot its runtime. The boot check is one short probe process through the real launcher. Exit code 1 prints `[FAIL] <error type>: <reason>`. A probe failure names the failed step first, and gives the path of a private file with the probe stderr. The command starts no service and changes no supervisor. Add `--json` for one machine-readable object. Its `probe_step` field names a failed probe step |
 
 ## Load Budget
 

@@ -1,8 +1,8 @@
-"""The preflight boot probe: one short process under the exact service env."""
+"""The preflight boot probe: one short process through the delivered launcher."""
 
 import json
 import os
-import subprocess
+import stat
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,165 +10,199 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from jacked.service.environment import inherited_allowlisted_environment
-from jacked.service.lifecycle import default_environment
+from jacked.service import EX_TEMPFAIL
 from jacked.service.preflight_probe import (
+    OK_MARK,
+    PREFLIGHT_TIMEOUT_SECONDS,
     PROBE_CODE,
     PROBE_EXIT_BASE,
+    PROBE_STDERR_NAME,
     PROBE_STEPS,
+    STEP_MARK,
+    ProbeOptions,
     ProbeResult,
+    ServiceProbeError,
     run_service_probe,
 )
+from tests.unit.service.service_contract_support import provision_contract, trusted_runtime
 
-_GENERATION = "a" * 64
+
+@pytest.fixture
+def contract(tmp_path, monkeypatch):
+    """A real provisioned contract whose runtime can import jacked."""
+    runtime = trusted_runtime(tmp_path / "rt", importable=True)
+    spec, environment, paths = provision_contract(tmp_path, monkeypatch, runtime=runtime)
+    return spec, environment, paths
 
 
-def _service_environment() -> dict[str, str]:
-    """The environment exactly as provision_service_contract builds it."""
-    return default_environment(
-        home=str(Path.home()),
-        user_id="uid:test",
-        inherited_allowlisted=inherited_allowlisted_environment(sys.platform),
-        platform=sys.platform,
+def _probe(contract, code=PROBE_CODE, timeout=120.0, environment=None):
+    spec, default_environment, paths = contract
+    return run_service_probe(
+        spec,
+        default_environment if environment is None else environment,
+        paths.root,
+        ProbeOptions(timeout=timeout, code=code),
     )
 
 
-def test_every_step_is_in_the_probe_code_in_order():
+def _seam(old, new):
+    """Return PROBE_CODE with one change, and prove the change happened."""
+    code = PROBE_CODE.replace(old, new)
+    assert code != PROBE_CODE, f"the seam {old!r} is not in PROBE_CODE"
+    return code
+
+
+def test_the_probe_code_follows_its_constants():
     calls = [
-        PROBE_CODE.index(f'_step({PROBE_EXIT_BASE + index}, "{step}",')
+        PROBE_CODE.index(f"_step({PROBE_EXIT_BASE + index}, {step!r}, {step})")
         for index, step in enumerate(PROBE_STEPS)
     ]
     assert calls == sorted(calls)
+    assert PROBE_CODE.rstrip().endswith(f"_say({OK_MARK!r})")
+    assert f"STEP_MARK = {STEP_MARK!r}" in PROBE_CODE
 
 
-def test_the_real_probe_passes_on_this_host_under_the_service_environment(tmp_path):
-    result = run_service_probe(
-        runtime=sys.executable,
-        environment=_service_environment(),
-        generation=_GENERATION,
-        cwd=tmp_path,
-    )
-    assert result == ProbeResult(True)
+def test_the_exit_codes_stay_clear_of_sysexits_and_the_launcher():
+    # The POSIX launcher exits 64, 66, 77 and 78; EX_TEMPFAIL restarts.
+    assert PROBE_EXIT_BASE + len(PROBE_STEPS) <= 64
+    assert PROBE_EXIT_BASE + len(PROBE_STEPS) <= EX_TEMPFAIL
+    assert PROBE_EXIT_BASE > 2
 
 
-def test_a_failing_step_is_named_with_its_error_number_and_no_values(tmp_path):
-    # The Windows failure, simulated on every OS through the code seam.
-    code = PROBE_CODE.replace(
+def test_the_real_probe_passes_through_the_delivered_launcher(contract):
+    result = _probe(contract)
+    assert result == ProbeResult(True), result
+    assert not (contract[2].root / PROBE_STDERR_NAME).exists()
+
+
+def test_a_failing_step_is_named_with_its_error_number_and_no_values(contract):
+    code = _seam(
         "asyncio.new_event_loop().close()",
         'raise OSError(10106, "provider canary-value")',
     )
-    environment = {**_service_environment(), "JACKED_CANARY": "canary-value"}
-    result = run_service_probe(
-        runtime=sys.executable,
-        environment=environment,
-        generation=_GENERATION,
-        cwd=tmp_path,
-        code=code,
+    result = _probe(contract, code=code)
+    assert (result.ok, result.step) == (False, "asyncio_event_loop")
+    assert result.detail == "OSError errno 10106"
+    assert "canary" not in result.detail
+
+
+def test_a_missing_module_names_the_module(contract):
+    code = _seam("import jacked.cli  # noqa: F401", "import jacked_no_such_module")
+    result = _probe(contract, code=code)
+    assert (result.step, result.detail) == (
+        "cli_import",
+        "ModuleNotFoundError module jacked_no_such_module",
     )
-    assert result == ProbeResult(False, "asyncio_event_loop", "OSError 10106")
-    assert "canary" not in repr(result)
 
 
-def test_a_missing_import_fails_the_tray_step(tmp_path):
-    code = PROBE_CODE.replace("import jacked.service.tray", "import jacked_no_such_module")
-    result = run_service_probe(
-        runtime=sys.executable,
-        environment=_service_environment(),
-        generation=_GENERATION,
-        cwd=tmp_path,
-        code=code,
+def test_a_refused_start_check_names_its_token(contract):
+    code = _seam("if not tray._UVICORN_AVAILABLE:", "if True:")
+    result = _probe(contract, code=code)
+    assert (result.step, result.detail) == ("tray_backend", "ProbeRefusal uvicorn_missing")
+
+
+def test_the_exit_code_is_the_verdict_when_stdout_is_lost(contract):
+    code = "import sys\nsys.stdout = None\n" + _seam(
+        "    ssl.create_default_context()", "    raise ImportError('x')"
     )
-    assert result == ProbeResult(False, "tray_import", "ModuleNotFoundError")
+    result = _probe(contract, code=code)
+    assert (result.step, result.detail) == ("ssl", f"exit {PROBE_EXIT_BASE + 2}")
 
 
-def test_the_probe_reads_only_the_given_environment(tmp_path, monkeypatch):
+def test_a_crash_names_the_last_started_step(contract):
+    code = f'import os\nprint("{STEP_MARK}ssl", flush=True)\nos._exit(9)\n'
+    result = _probe(contract, code=code)
+    assert (result.step, result.detail) == ("ssl", "exit 9")
+
+
+def test_a_hung_probe_names_the_running_step(contract):
+    code = f'import time\nprint("{STEP_MARK}socket", flush=True)\ntime.sleep(60)\n'
+    result = _probe(contract, code=code, timeout=3.0)
+    assert (result.step, result.detail) == ("socket", "timeout after 3s")
+
+
+def test_a_hang_after_the_ok_marker_is_an_interpreter_exit(contract):
+    code = f'import time\nprint("{OK_MARK}", flush=True)\ntime.sleep(60)\n'
+    result = _probe(contract, code=code, timeout=3.0)
+    assert result.step == "interpreter_exit"
+
+
+def test_a_launch_error_is_named_with_its_number(tmp_path):
+    def runner(argv, **kwargs):
+        raise FileNotFoundError(2, "No such file", argv[0])
+
+    spec = MagicMock(
+        runtime_path="/opt/none/python",
+        runtime_target_path="/opt/none/python3",
+        launcher_path="/opt/none/launch",
+        generation="a" * 64,
+    )
+    result = run_service_probe(
+        spec, {"PATH": "/usr/bin"}, tmp_path, ProbeOptions(timeout=5, runner=runner)
+    )
+    assert result == ProbeResult(False, "interpreter_start", "FileNotFoundError errno 2")
+
+
+def test_a_failed_probe_keeps_its_stderr_in_a_private_file(contract):
+    code = _seam(
+        "    socket.socket().close()",
+        "    sys.stderr.write('stderr-canary\\n'); raise OSError(5, 'x')",
+    )
+    result = _probe(contract, code=code)
+    path = Path(result.stderr_file)
+    assert path == contract[2].root / PROBE_STDERR_NAME
+    assert "stderr-canary" in path.read_text(encoding="utf-8")
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    message = str(ServiceProbeError(result))
+    assert message.startswith("at socket: OSError errno 5.")
+    assert str(path) in message
+    assert "stderr-canary" not in message
+
+
+def test_the_probe_sees_only_the_service_environment(contract, monkeypatch):
     """A variable that only os.environ holds must not reach the probe."""
     monkeypatch.setenv("JACKED_PROBE_LEAK", "1")
-    code = PROBE_CODE.replace(
-        "socket.socket().close()",
-        "socket.socket().close()\n"
-        "    import os\n"
-        "    if 'JACKED_PROBE_LEAK' in os.environ or "
-        "len(os.environ.get('JACKED_SERVICE_GENERATION', '')) != 64:\n"
-        "        raise LookupError('environment')",
+    spec, environment, _paths = contract
+    code = _seam(
+        "    socket.socket().close()",
+        "    socket.socket().close()\n"
+        "    if 'JACKED_PROBE_LEAK' in os.environ:\n"
+        "        raise LookupError('leak')\n"
+        f"    if os.environ.get('JACKED_SERVICE_GENERATION') != {spec.generation!r}:\n"
+        "        raise LookupError('generation')\n"
+        f"    if os.environ.get('JACKED_SERVICE_USER') != {environment['JACKED_SERVICE_USER']!r}:\n"
+        "        raise LookupError('user')",
     )
-    result = run_service_probe(
-        runtime=sys.executable,
-        environment=_service_environment(),
-        generation=_GENERATION,
-        cwd=tmp_path,
-        code=code,
+    assert _probe(contract, code=code) == ProbeResult(True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the PowerShell launcher is Windows only")
+def test_windows_probe_environment_is_exactly_the_delivered_mapping(contract):
+    """PowerShell decodes every value, non-ASCII ones too, byte for byte."""
+    spec, environment, paths = contract
+    delivered = {**environment, "JACKED_TEST_NAME": "Владимир NUÑEZ Òscar O’Neil"}
+    dump = paths.root / "probe-env.json"
+    code = (
+        "import json, os\n"
+        f"open({str(dump)!r}, 'w', encoding='utf-8').write(json.dumps(dict(os.environ)))\n"
     )
-    assert result == ProbeResult(True)
+    result = _probe(contract, code=code, environment=delivered)
+    assert result.ok, result
+    seen = json.loads(dump.read_text(encoding="utf-8"))
+    expected = {**delivered, "JACKED_SERVICE_GENERATION": spec.generation}
+    # Windows environment names are not case-sensitive; os.environ upper-cases them.
+    assert seen == {key.upper(): value for key, value in expected.items()}
 
 
-def test_the_exit_code_is_the_verdict_when_stdout_is_lost(tmp_path):
-    """pythonw.exe can run with no usable stdout: the step still shows."""
-    code = PROBE_CODE.replace("import ssl\n", "import ssl\n    raise ImportError('x')\n")
-    code = "import sys, os\nsys.stdout = None\n" + code
-    result = run_service_probe(
-        runtime=sys.executable,
-        environment=_service_environment(),
-        generation=_GENERATION,
-        cwd=tmp_path,
-        code=code,
-    )
-    assert result == ProbeResult(False, "ssl", "exit 72")
-
-
-def test_a_crash_names_the_last_started_step(tmp_path):
-    code = 'import os\nprint("jacked-probe-step:ssl", flush=True)\nos._exit(9)\n'
-    result = run_service_probe(
-        runtime=sys.executable,
-        environment=_service_environment(),
-        generation=_GENERATION,
-        cwd=tmp_path,
-        code=code,
-    )
-    assert result == ProbeResult(False, "ssl", "exit 9")
-
-
-def test_a_hung_probe_is_a_failure_within_the_timeout(tmp_path):
-    code = 'import time\nprint("jacked-probe-step:socket", flush=True)\ntime.sleep(30)\n'
-    result = run_service_probe(
-        runtime=sys.executable,
-        environment=_service_environment(),
-        generation=_GENERATION,
-        cwd=tmp_path,
-        code=code,
-        timeout=1.0,
-    )
-    assert result.ok is False
-    assert result.detail == "timeout after 1s"
-    assert result.step in {"socket", "interpreter_start"}
-
-
-def test_an_unlaunchable_runtime_is_a_failure(tmp_path):
-    result = run_service_probe(
-        runtime=str(tmp_path / "no-python"),
-        environment={},
-        generation=_GENERATION,
-        cwd=tmp_path,
-    )
-    assert result == ProbeResult(False, "interpreter_start", "FileNotFoundError")
-
-
-def test_the_probe_argv_and_environment_are_the_service_ones(tmp_path):
-    run = MagicMock(return_value=subprocess.CompletedProcess([], 0, "jacked-probe-ok\n", ""))
-    result = run_service_probe(
-        runtime="/opt/jacked/bin/python",
-        environment={"PATH": "/usr/bin"},
-        generation=_GENERATION,
-        cwd=tmp_path,
-        run=run,
-    )
-    assert result.ok
-    argv = run.call_args.args[0]
-    assert argv[:3] == ["/opt/jacked/bin/python", "-I", "-c"]
-    assert run.call_args.kwargs["env"] == {
-        "PATH": "/usr/bin",
-        "JACKED_SERVICE_GENERATION": _GENERATION,
-    }
+@pytest.mark.skipif(sys.platform != "win32", reason="the PowerShell launcher is Windows only")
+def test_windows_probe_without_systemroot_fails_with_10106(contract):
+    """The negative control: the outage shape, through the real launcher."""
+    _spec, environment, _paths = contract
+    broken = {k: v for k, v in environment.items() if k not in {"SystemRoot", "windir"}}
+    result = _probe(contract, environment=broken)
+    assert result.step == "asyncio_event_loop", result
+    assert "10106" in result.detail
 
 
 def _spec():
@@ -176,46 +210,64 @@ def _spec():
         runtime_path="/opt/jacked/bin/python",
         runtime_target_path="/opt/jacked/bin/python3.11",
         supervisor=MagicMock(value="launchd"),
-        generation=_GENERATION,
+        generation="a" * 64,
     )
 
 
-@pytest.mark.parametrize("as_json", [False, True])
-def test_preflight_fails_and_names_the_probe_step(as_json):
+_FAILED = ProbeResult(False, "asyncio_event_loop", "OSError winerror 10106", "/x/stderr.log")
+
+
+def test_preflight_text_failure_puts_the_step_and_number_on_line_one(monkeypatch):
+    from rich.console import Console
+
+    import jacked.preflight_cli as preflight_cli
     from jacked.cli import main
 
-    secret_env = {"SystemRoot": "canary-value"}
+    monkeypatch.setattr(preflight_cli, "console", Console(width=80))
     with (
         patch(
             "jacked.service.lifecycle.provision_service_contract",
-            return_value=(_spec(), secret_env),
+            return_value=(_spec(), {"SystemRoot": "canary-value"}),
         ),
-        patch(
-            "jacked.service.preflight_probe.run_service_probe",
-            return_value=ProbeResult(False, "asyncio_event_loop", "OSError 10106"),
-        ),
+        patch("jacked.service.preflight_probe.run_service_probe", return_value=_FAILED),
     ):
-        args = ["service", "preflight", *(["--json"] if as_json else [])]
-        result = CliRunner().invoke(main, args)
+        result = CliRunner().invoke(main, ["service", "preflight"])
 
     assert result.exit_code == 1, result.output
-    assert "canary" not in result.output
-    message = (
-        "ServiceProbeError: the service runtime failed its start probe at "
-        "asyncio_event_loop: OSError 10106"
+    first = result.output.splitlines()[0]
+    assert first.startswith(
+        "[FAIL] ServiceProbeError at asyncio_event_loop: OSError winerror 10106"
     )
-    if as_json:
-        data = json.loads(result.output)
-        assert data["ok"] is False
-        assert data["probe_step"] == "asyncio_event_loop"
-        assert data["error"] == message
-    else:
-        assert "[FAIL]" in result.output
-        assert "asyncio_event_loop" in result.output
-        assert "OSError 10106" in result.output
+    assert "/x/stderr.log" in first
+    assert "canary" not in result.output
 
 
-def test_preflight_bounds_the_probe_by_its_timeout():
+def test_preflight_json_failure_keeps_the_contract_fields():
+    from jacked.cli import main
+
+    with (
+        patch(
+            "jacked.service.lifecycle.provision_service_contract",
+            return_value=(_spec(), {"SystemRoot": "canary-value"}),
+        ),
+        patch("jacked.service.preflight_probe.run_service_probe", return_value=_FAILED),
+    ):
+        result = CliRunner().invoke(main, ["service", "preflight", "--json"])
+
+    assert result.exit_code == 1, result.output
+    data = json.loads(result.output)
+    assert data["ok"] is False
+    assert data["probe_step"] == "asyncio_event_loop"
+    assert data["runtime_path"] == "/opt/jacked/bin/python"
+    assert data["generation"] == "a" * 64
+    assert data["error"].startswith(
+        "ServiceProbeError at asyncio_event_loop: OSError winerror 10106"
+    )
+    assert "canary" not in result.output
+
+
+@pytest.mark.parametrize(("argv", "ceiling"), [([], 120.0), (["--timeout", "5"], 5.0)])
+def test_the_probe_gets_what_is_left_of_one_budget(argv, ceiling):
     from jacked.cli import main
 
     with (
@@ -228,19 +280,85 @@ def test_preflight_bounds_the_probe_by_its_timeout():
             return_value=ProbeResult(True),
         ) as probe,
     ):
-        result = CliRunner().invoke(main, ["service", "preflight", "--timeout", "5"])
+        result = CliRunner().invoke(main, ["service", "preflight", *argv])
 
     assert result.exit_code == 0, result.output
-    assert probe.call_args.kwargs["timeout"] == 5.0
+    timeout = probe.call_args.args[3].timeout
+    assert 0 < timeout <= ceiling
 
 
-def test_preflight_real_probe_end_to_end_on_this_host():
-    """The real gate: provision in the isolated HOME, then the real probe."""
+def test_no_time_left_after_provisioning_is_a_failure(monkeypatch):
+    import jacked.preflight_cli as preflight_cli
     from jacked.cli import main
 
+    clock = iter([0.0, 999.0])
+    monkeypatch.setattr(preflight_cli.time, "monotonic", lambda: next(clock))
+    with (
+        patch(
+            "jacked.service.lifecycle.provision_service_contract",
+            return_value=(_spec(), {}),
+        ),
+        patch("jacked.service.preflight_probe.run_service_probe") as probe,
+    ):
+        result = CliRunner().invoke(main, ["service", "preflight", "--json"])
+
+    assert result.exit_code == 1
+    probe.assert_not_called()
+    assert json.loads(result.output)["probe_step"] == "interpreter_start"
+
+
+def test_one_number_ties_the_budget_the_callers_and_the_batches():
+    import jacked.service.updater as updater
+    from jacked.cli import main
+    from jacked.preflight_cli import preflight_budget
+
+    assert preflight_budget(None) == PREFLIGHT_TIMEOUT_SECONDS == updater.PREFLIGHT_TIMEOUT_SECONDS
+    assert updater.preflight_argv("j")[-2:] == ["--timeout", str(PREFLIGHT_TIMEOUT_SECONDS)]
+    literal = f"jacked service preflight --timeout {PREFLIGHT_TIMEOUT_SECONDS} 2>&1"
+    root = Path(__file__).resolve().parents[3]
+    assert literal in (root / "jacked/cli.py").read_text(encoding="utf-8")
+    assert literal in (root / "jacked/service/updater.py").read_text(encoding="utf-8")
+    help_text = CliRunner().invoke(main, ["service", "preflight", "--help"]).output
+    assert f"default {PREFLIGHT_TIMEOUT_SECONDS}" in " ".join(help_text.split())
+
+
+def test_preflight_end_to_end_through_the_real_launcher(tmp_path, monkeypatch):
+    """The real gate: real provisioning, the real probe, a trusted runtime."""
+    import jacked.service.lifecycle as lifecycle
+    from jacked.cli import main
+
+    monkeypatch.setattr(
+        lifecycle.sys, "executable", trusted_runtime(tmp_path / "rt", importable=True)
+    )
     result = CliRunner().invoke(main, ["service", "preflight", "--json"])
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
-    assert data["probe_step"] is None, result.output
-    assert data["ok"] is True, result.output
-    assert os.path.isabs(data["runtime_path"])
+    assert data["ok"] is True and data["probe_step"] is None, result.output
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX directory modes")
+def test_a_world_writable_runtime_directory_is_refused(tmp_path, monkeypatch):
+    """Why the tests above use a trusted copy: ubuntu-latest keeps Python
+    under a world-writable /opt/hostedtoolcache, and provisioning refuses it."""
+    import jacked.service.lifecycle as lifecycle
+    from jacked.cli import main
+
+    runtime = Path(trusted_runtime(tmp_path / "rt", importable=True))
+    runtime.parent.chmod(0o777)
+    monkeypatch.setattr(lifecycle.sys, "executable", str(runtime))
+    result = CliRunner().invoke(main, ["service", "preflight", "--json"])
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.output)["probe_step"] is None
+
+
+def test_the_probe_argv_carries_no_service_lifecycle_words(contract):
+    """The probe argv never matches the test tripwire for a real service start."""
+    from jacked.service.preflight_probe import probe_argv
+
+    spec, environment, paths = contract
+    argv, temporary = probe_argv(spec, environment, paths.root, PROBE_CODE)
+    if temporary is not None:
+        temporary.unlink()
+    padded = f" {' '.join(argv)} "
+    for verb in ("start", "restart", "preflight", "recover", "install"):
+        assert f" service {verb} " not in padded
