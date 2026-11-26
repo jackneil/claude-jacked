@@ -6,7 +6,10 @@ real index or the real object store: it adds the work tree to a copy of the
 index, and git writes the new objects into a temporary folder.
 
 Limits of the identity: it does not hold a file that git ignores, and it does
-not hold a change inside the work tree of a submodule. ``inputs_fingerprint``
+not hold a change inside the work tree of a submodule. On Windows, Git reads the
+creation time as the change time, so an edit that keeps the size and puts
+back the old modification time is not seen (git status does not see it
+either). ``inputs_fingerprint``
 adds named files to a record. The clean and smudge filters stay on, so the
 hash is equal to the tree of a commit. With git-lfs, the clean filter can
 write a copy of a new large file into the lfs folder of the clone. In a
@@ -227,7 +230,8 @@ def _copy_index(source: Path, target: Path) -> None:
     second. The content and the times come from one open file, so a write of
     the index between them cannot mix two versions. When the file system
     rounds the time of the copy up, the copy gets the whole second of the
-    source, so it is never later than the source.
+    source; when that is still later, it gets time zero. So the copy is never
+    later than the source.
     """
     with open(source, "rb") as src, open(target, "wb") as dst:
         info = os.fstat(src.fileno())
@@ -236,6 +240,10 @@ def _copy_index(source: Path, target: Path) -> None:
     if os.stat(target).st_mtime_ns > info.st_mtime_ns:
         floor = info.st_mtime_ns // 10**9 * 10**9
         os.utime(target, ns=(floor, floor))
+        if os.stat(target).st_mtime_ns > info.st_mtime_ns:
+            # Time zero makes each entry racy: git then checks content only,
+            # which is slower and always correct.
+            os.utime(target, ns=(0, 0))
 
 
 def remove_tree(path: Path) -> None:

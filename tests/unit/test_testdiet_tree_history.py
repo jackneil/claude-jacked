@@ -964,6 +964,8 @@ def test_a_same_size_edit_that_git_status_sees_is_never_a_clean_tree(repo):
     assert tid is not None and tid.clean is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Git for Windows reads the creation time as ctime, so an "
+                    "edit that restores the time and the size is not seen there, as with git status")
 def test_a_repo_that_does_not_trust_ctime_still_sees_an_edit_that_restores_the_time(repo):
     import time
 
@@ -992,3 +994,21 @@ def test_the_index_copy_never_has_a_later_time_than_the_index(tmp_path):
     assert copy.read_bytes() == b"DIRC"
     assert copy.stat().st_mtime_ns <= source.stat().st_mtime_ns
     assert copy.stat().st_mtime_ns >= when // 10**9 * 10**9
+
+
+def test_an_index_copy_that_stays_later_after_the_floor_gets_time_zero(tmp_path, monkeypatch):
+    source = tmp_path / "index"
+    source.write_bytes(b"DIRC")
+    when = 1_700_000_000_123_456_789
+    os.utime(source, ns=(when, when))
+    real_utime = os.utime
+
+    def rounds_up(path, *args, ns=None, **kwargs):
+        if ns is not None and ns != (0, 0) and Path(path) != source:
+            ns = (ns[0] + 2 * 10**9, ns[1] + 2 * 10**9)
+        return real_utime(path, *args, ns=ns, **kwargs)
+
+    monkeypatch.setattr(os, "utime", rounds_up)
+    copy = tmp_path / "copy"
+    tree._copy_index(source, copy)
+    assert copy.stat().st_mtime_ns == 0

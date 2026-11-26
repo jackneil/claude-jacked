@@ -674,3 +674,45 @@ def test_a_go_table_built_by_a_call_prints_not_read_on_a_body_change(repo):
     write(repo, "calc/calc_test.go", built.replace('t.Fatal("zero")', 't.Fatalf("zero %d", tc.in)').encode())
     report = loss.loss_report(repo, "HEAD")
     assert report.not_read == (("calc/calc_test.go::TestTable", "computed cases"),)
+
+
+GO_INLINE = """package calc
+
+import "testing"
+
+func TestInline(t *testing.T) {
+\tfor _, s := range []string{"a", "b", "c"} {
+\t\tt.Run(s, func(t *testing.T) {
+\t\t\tif s == "" {
+\t\t\t\tt.Fatal("empty")
+\t\t\t}
+\t\t})
+\t}
+}
+"""
+
+
+def test_a_go_inline_table_row_that_is_cut_prints_fewer_cases(repo):
+    assert by_name("calc_test.go", GO_INLINE)["TestInline"].cases == 3
+    write(repo, "calc/inline_test.go", GO_INLINE.encode())
+    commit(repo, "inline table")
+    write(repo, "calc/inline_test.go", GO_INLINE.replace('"a", "b", "c"', '"a", "b"').encode())
+    assert loss.loss_report(repo, "HEAD").fewer_cases == (("calc/inline_test.go::TestInline", 3, 2),)
+
+
+def test_a_go_table_that_is_appended_to_gives_no_case_count(repo):
+    appended = GO_TABLE.replace("\tfor _, tc := range cases {",
+                                '\tcases = append(cases, struct {\n\t\tname string\n\t\tin   int\n\t}{"four", 4})\n'
+                                "\tfor _, tc := range cases {")
+    found = by_name("calc_test.go", appended)["TestTable"]
+    assert (found.cases, found.unread) == (None, (loss_scan.COMPUTED_CASES,))
+    write(repo, "calc/calc_test.go", appended.encode())
+    commit(repo, "appended table")
+    write(repo, "calc/calc_test.go", appended.replace('t.Fatal("zero")', 't.Fatalf("zero %d", tc.in)').encode())
+    assert loss.loss_report(repo, "HEAD").not_read == (("calc/calc_test.go::TestTable", "computed cases"),)
+
+
+def test_rust_skips_a_block_comment_between_the_test_attribute_and_fn():
+    body = "#[test]\n/* a note\n   on two lines */\n#[ignore]\nfn later() {\n    assert!(true);\n}\n"
+    found = by_name("src/lib.rs", body)
+    assert (found["later"].skipped, found["later"].asserts) == (True, 1)

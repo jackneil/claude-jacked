@@ -189,8 +189,6 @@ def script(text: str) -> list[Declaration]:
 
 _GO_HEAD = re.compile(r"^func[ \t]+(?P<name>Test(?![a-z])\w*)[ \t]*\((?P<params>[^)]*)\)", re.M)
 _GO_RECEIVER = re.compile(r"\s*(\w+)\s+\*testing\.(?:T|B|F|TB)\b")
-_GO_LOOP = re.compile(r"\bfor\b(?P<head>[^{]*)\{")
-_GO_RANGE = re.compile(r"\brange\s+(\w+)\s*$")
 _RUST_TEST = re.compile(r"#\[(?:\w+::)*test\b")
 _RUST_FN = re.compile(r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(?P<name>\w+)")
 _RUST_ASSERT = re.compile(r"\b\w*assert\w*!")
@@ -204,38 +202,87 @@ def _go_patterns(receiver: str) -> tuple[re.Pattern[str], re.Pattern[str], re.Pa
             re.compile(rf"(?<![\w.]){name}\.Run\("))
 
 
-def _go_table(text: str, index: _Index, brace: int, loop: int, name: str) -> int | None:
-    """The elements of the slice literal ``name`` that the function assigns before the loop, else None."""
-    found = list(re.finditer(rf"(?<![\w.]){re.escape(name)}\s*:?=\s*\[\]", text[:loop]))
-    found = [m for m in found if m.start() > brace and index.in_code(m.start())]
-    if not found:
-        return None
-    open_ = text.find("{", found[-1].end(), loop)
-    if open_ >= 0 and re.search(r"\bstruct\s*$", text[found[-1].end():open_]):
+def _go_literal(text: str, index: _Index, start: int, limit: int) -> tuple[int, int] | None:
+    """Find the slice literal whose type starts at ``start`` (after ``[]``): (open brace, close), else None.
+
+    A struct type (``[]struct{...}{...}``) is skipped to the brace of the values.
+    """
+    open_ = text.find("{", start, limit)
+    if open_ >= 0 and re.search(r"\bstruct\s*$", text[start:open_]):
         close = index.closes.get(open_, -1)
         open_ = _ws(text, close) if close >= 0 else -1
-    close = index.closes.get(open_, -1) if 0 <= open_ < loop and text[open_] == "{" else -1
-    return None if close < 0 else _elements(text, index, open_, close)
+    close = index.closes.get(open_, -1) if 0 <= open_ < limit and text[open_] == "{" else -1
+    return None if close < 0 else (open_, close)
+
+
+def _go_table(text: str, index: _Index, brace: int, loop: int, name: str) -> int | None:
+    """The elements of the slice literal ``name`` that the function assigns before the loop, else None.
+
+    A name that is assigned again between its literal and the loop gives None.
+    """
+    word = re.escape(name)
+    found = [m for m in re.finditer(rf"(?<![\w.]){word}\s*:?=\s*\[\]", text[:loop])
+             if m.start() > brace and index.in_code(m.start())]
+    literal = _go_literal(text, index, found[-1].end(), loop) if found else None
+    if literal is None:
+        return None
+    again = re.compile(rf"(?<![\w.]){word}\s*(?:,[^=\n]*)?[:+]?=(?!=)")
+    if any(index.in_code(m.start()) for m in again.finditer(text, literal[1], loop)):
+        return None
+    return _elements(text, index, *literal)
+
+
+def _go_loops(text: str, index: _Index, brace: int, end: int) -> list[tuple[int, int, int]]:
+    """Each for loop of a body as (head start, body brace, body close).
+
+    The body brace is the first brace of the for line that does not close on
+    that line. A brace that closes on the line belongs to a literal.
+    """
+    loops = []
+    for loop in re.finditer(r"\bfor\b", text[:end]):
+        if loop.start() <= brace or not index.in_code(loop.start()):
+            continue
+        line_end = text.find("\n", loop.end())
+        line_end = end if line_end < 0 else line_end
+        j, last = text.find("{", loop.end(), line_end + 1), None
+        while 0 <= j:
+            close = index.closes.get(j, -1)
+            if close < 0:
+                break
+            last = (j, close)
+            if "\n" in text[j:close]:
+                break
+            j = text.find("{", close, line_end + 1)
+        if last is not None:
+            loops.append((loop.end(), *last))
+    return loops
+
+
+def _range_rows(text: str, index: _Index, brace: int, head: int, open_: int) -> int | None:
+    target = re.search(r"\brange\s+", text[head:open_])
+    if target is None:
+        return None
+    start = head + target.end()
+    if text.startswith("[]", start):
+        literal = _go_literal(text, index, start + 2, open_)
+        return None if literal is None or _ws(text, literal[1]) != open_ else _elements(text, index, *literal)
+    name = re.fullmatch(r"(\w+)\s*", text[start:open_])
+    return None if name is None else _go_table(text, index, brace, head, name.group(1))
 
 
 def _go_cases(text: str, index: _Index, brace: int, end: int, runs: re.Pattern[str]) -> int | None:
-    """Each t.Run outside a loop counts 1. In a range loop over a local slice literal, its rows."""
-    loops = []
-    for loop in _GO_LOOP.finditer(text, brace + 1, end):
-        open_ = loop.end() - 1
-        if index.in_code(loop.start()) and open_ in index.closes:
-            loops.append((open_, index.closes[open_], loop["head"]))
+    """Each t.Run outside a loop counts 1. In a range loop over a slice literal, its rows."""
+    loops = _go_loops(text, index, brace, end)
     total: int | None = 0
     for run in runs.finditer(text, brace, end):
         if not index.in_code(run.start()):
             continue
-        inside = [item for item in loops if item[0] < run.start() < item[1]]
+        inside = [item for item in loops if item[1] < run.start() < item[2]]
         if not inside:
             rows = 1
         else:
-            open_, _, head = max(inside)
-            target = _GO_RANGE.search(head.strip())
-            rows = None if target is None else _go_table(text, index, brace, open_, target.group(1))
+            head, open_, _ = max(inside, key=lambda item: item[1])
+            rows = _range_rows(text, index, brace, head, open_)
         total = None if total is None or rows is None else total + rows
     return total
 
@@ -271,6 +318,9 @@ def rust(text: str) -> list[Declaration]:
             if text.startswith("//", k):
                 newline = text.find("\n", k)
                 j = len(text) if newline < 0 else newline
+            elif text.startswith("/*", k):
+                close = text.find("*/", k + 2)
+                j = len(text) if close < 0 else close + 2
             elif text.startswith("#[", k) and index.closes.get(k + 1, -1) > 0:
                 ignored = ignored or bool(re.match(r"#\[\s*ignore\b", text[k:]))
                 j = index.closes[k + 1]
