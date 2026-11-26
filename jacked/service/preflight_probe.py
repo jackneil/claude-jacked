@@ -295,7 +295,7 @@ def parse_probe_output(returncode: int, stdout: str) -> ProbeResult:
     failed step. The marker lines on stdout only add the detail.
 
     >>> parse_probe_output(0, "")
-    ProbeResult(ok=True, step=None, detail='', stderr_file=None)
+    ProbeResult(ok=True, step=None, detail='', stderr_file=None, note=None)
     >>> parse_probe_output(41, "jacked-probe-fail:socket:OSError winerror 10106\\n").detail
     'OSError winerror 10106'
     >>> parse_probe_output(40, "").detail
