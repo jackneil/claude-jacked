@@ -1,4 +1,4 @@
-"""The ``jacked tests`` command group: run, record, seen, profile, history and prune.
+"""The ``jacked tests`` command group: run, record, seen, profile, history, prune and loss.
 
 ``jacked.cli`` adds this group to ``main``. Each command imports its module
 inside the function, so ``jacked --help`` does not load the recorder.
@@ -240,3 +240,36 @@ def prune_command(before):
         click.echo(_record.clean_text(f"deleted {run_id}"))
     if not deleted:
         _record.emit(f"no run is before {before:%Y-%m-%d}. Nothing is deleted.")
+
+
+@recorder_group.command(name="loss")
+@click.option("--base", default=None, metavar="REF",
+              help="The base commit. Default: the merge base of HEAD and refs/remotes/origin/HEAD.")
+@click.option("--json", "as_json", is_flag=True, help="Print the report as JSON.")
+def loss_command(base, as_json):
+    """Show the tests that the change removes or weakens. This is a report: it exits 0.
+
+    The change is the work tree against the base: commits, changes that are
+    not committed and untracked files. A renamed file, a moved test and an
+    edited parameter value give no loss.
+    """
+    import dataclasses
+    import json as _json
+    import os as _os
+
+    from jacked.testdiet import loss as _loss
+    from jacked.testdiet import record as _record
+    from jacked.testdiet.tree import TreeError
+
+    try:
+        report = _loss.loss_report(Path(_os.getcwd()), base)
+    except TreeError:
+        _record.emit("this folder is not in the work tree of a git repository.")
+        raise SystemExit(1)
+    except _loss.LossError as exc:
+        _record.emit(f"no loss report: {exc}")
+        raise SystemExit(1)
+    if as_json:
+        click.echo(_json.dumps(dataclasses.asdict(report), indent=1, sort_keys=True))
+    else:
+        click.echo(_loss.render(report))
