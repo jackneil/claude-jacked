@@ -75,7 +75,7 @@ def run_preflight(
             ServiceProbeError(probe), as_json, spec=spec, probe_step=probe.step
         )
         sys.exit(1)
-    print_preflight_ok(spec, as_json)
+    print_preflight_ok(spec, as_json, note=probe.note)
 
 
 def print_preflight_failure(
@@ -99,6 +99,7 @@ def print_preflight_failure(
                     "supervisor": _supervisor(spec) if spec is not None else None,
                     "generation": getattr(spec, "generation", None),
                     "probe_step": probe_step,
+                    "note": None,
                     "error": error,
                 }
             )
@@ -113,8 +114,12 @@ def _supervisor(spec: Any) -> str:
     return getattr(spec.supervisor, "value", str(spec.supervisor))
 
 
-def print_preflight_ok(spec: Any, as_json: bool) -> None:
-    """Print a pass with the provisioned contract fields."""
+def print_preflight_ok(spec: Any, as_json: bool, *, note: str | None = None) -> None:
+    """Print a pass with the provisioned contract fields.
+
+    ``note`` is a fact about this host that does not refuse the build (for
+    example, the tray cannot load here, as it could not before the upgrade).
+    """
     supervisor = _supervisor(spec)
     if as_json:
         click.echo(
@@ -126,6 +131,7 @@ def print_preflight_ok(spec: Any, as_json: bool) -> None:
                     "supervisor": supervisor,
                     "generation": spec.generation,
                     "probe_step": None,
+                    "note": note,
                     "error": None,
                 }
             )
@@ -136,3 +142,5 @@ def print_preflight_ok(spec: Any, as_json: bool) -> None:
     console.print(f"[dim]target:[/dim] {spec.runtime_target_path}")
     console.print(f"[dim]supervisor:[/dim] {supervisor}")
     console.print(f"[dim]generation:[/dim] {spec.generation[:12]}")
+    if note:
+        console.print(f"[yellow]Note:[/yellow] {escape(note)}", soft_wrap=True)

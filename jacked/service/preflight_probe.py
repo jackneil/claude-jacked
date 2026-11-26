@@ -22,8 +22,11 @@ The probe has these steps, in this order:
    directory.
 5. ``tray_import``: import ``jacked.service.tray``.
 6. ``tray_backend``: do the checks that the real start does. uvicorn must
-   be available. The menu-bar backend must be available, except on a Linux
-   host with no display.
+   be available. A missing tray package (pystray or Pillow) is a broken
+   build, and the probe refuses it on every platform. When pystray is
+   installed but cannot load on this host (no display, a missing typelib),
+   the probe does not refuse, because the old build fails the same way.
+   The result then holds a note that names the error type.
 7. ``cli_import``: import ``jacked.cli``.
 8. ``api_import``: import ``jacked.api.main``. Its import opens no
    database, starts no thread, writes no file and makes no connection.
@@ -91,6 +94,7 @@ PROBE_REPORT_NAME = "preflight-probe-report.log"
 STEP_MARK = "jacked-probe-step:"
 FAIL_MARK = "jacked-probe-fail:"
 OK_MARK = "jacked-probe-ok"
+NOTE_MARK = "jacked-probe-note:"
 
 _PRELUDE = r'''
 import os
@@ -189,11 +193,18 @@ def tray_backend():
     import jacked.service.tray as tray
 
     if tray.select_menubar_backend(sys.platform, tray._mac_menubar_available()) != "mac":
-        headless = sys.platform.startswith("linux") and not (
-            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-        )
-        if not tray._TRAY_AVAILABLE and not headless:
-            raise ProbeRefusal("tray_backend_missing")
+        if not tray._TRAY_AVAILABLE and tray._PYSTRAY_LOAD_FAILURE is None:
+            # A missing package (pystray or Pillow): a broken build.
+            raise ProbeRefusal("tray_package_missing")
+        if not tray._TRAY_AVAILABLE:
+            # pystray is installed but cannot load here (no display, a missing
+            # typelib). That is this host, not the build: the old build fails
+            # the same way. Report it, do not refuse.
+            kind = tray._PYSTRAY_LOAD_FAILURE.split(":", 1)[0]
+            _say(
+                NOTE_MARK + "the tray cannot run on this host, so jacked does not run here: pystray could "
+                "not load (" + kind + "). " + tray.LINUX_TRAY_NOTES_POINTER
+            )
     if not tray._UVICORN_AVAILABLE:
         raise ProbeRefusal("uvicorn_missing")
 
@@ -212,6 +223,7 @@ def _probe_code() -> str:
     lines = [
         f"STEP_MARK = {STEP_MARK!r}",
         f"FAIL_MARK = {FAIL_MARK!r}",
+        f"NOTE_MARK = {NOTE_MARK!r}",
         _PRELUDE,
     ]
     for index, step in enumerate(PROBE_STEPS):
@@ -228,13 +240,15 @@ class ProbeResult:
     """The probe outcome. ``step`` names the failed step, else it is None.
 
     ``stderr_file`` is the path of the private file that holds the stderr of
-    a failed probe, when the probe wrote one.
+    a failed probe, when the probe wrote one. ``note`` is a fact about this
+    host that is not a build defect (for example, the tray cannot load here).
     """
 
     ok: bool
     step: str | None = None
     detail: str = ""
     stderr_file: str | None = None
+    note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -289,8 +303,10 @@ def parse_probe_output(returncode: int, stdout: str) -> ProbeResult:
     >>> parse_probe_output(-11, "jacked-probe-step:ssl\\n").step
     'ssl'
     """
+    notes = [line[len(NOTE_MARK):].strip() for line in stdout.splitlines() if line.startswith(NOTE_MARK)]
+    note = notes[0] if notes else None
     if returncode == 0:
-        return ProbeResult(True)
+        return ProbeResult(True, note=note)
     index = returncode - PROBE_EXIT_BASE
     if 0 <= index < len(PROBE_STEPS):
         step = PROBE_STEPS[index]
@@ -299,9 +315,9 @@ def parse_probe_output(returncode: int, stdout: str) -> ProbeResult:
         for line in stdout.splitlines():
             if line.startswith(prefix):
                 detail = line[len(prefix):].strip() or detail
-        return ProbeResult(False, step, detail)
+        return ProbeResult(False, step, detail, note=note)
     step = _last_step(stdout) or "interpreter_start"
-    return ProbeResult(False, step, f"exit {returncode}")
+    return ProbeResult(False, step, f"exit {returncode}", note=note)
 
 
 def _os_error_detail(exc: OSError) -> str:
@@ -433,7 +449,7 @@ def _report_text(report: Path) -> str:
 
 def _trace(output: str) -> str:
     """The lines of the probe report that are not marker lines (the traceback)."""
-    marks = (STEP_MARK, FAIL_MARK, OK_MARK)
+    marks = (STEP_MARK, FAIL_MARK, OK_MARK, NOTE_MARK)
     return "".join(line for line in output.splitlines(True) if not line.startswith(marks))
 
 
@@ -442,7 +458,7 @@ def _with_stderr(result: ProbeResult, stderr: str, path: Path) -> ProbeResult:
         _write_private(path, stderr)
     except OSError:
         return result
-    return ProbeResult(result.ok, result.step, result.detail, str(path))
+    return ProbeResult(result.ok, result.step, result.detail, str(path), result.note)
 
 
 __all__ = [
@@ -450,6 +466,7 @@ __all__ = [
     "PREFLIGHT_TIMEOUT_SECONDS",
     "preflight_argv",
     "FAIL_MARK",
+    "NOTE_MARK",
     "OK_MARK",
     "PROBE_CODE",
     "PROBE_EXIT_BASE",

@@ -1967,6 +1967,7 @@ class TestServicePreflight:
             "supervisor": "launchd",
             "generation": "abcdef0123456789",
             "probe_step": None,
+            "note": None,
             "error": None,
         }
 

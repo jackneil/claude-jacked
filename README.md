@@ -488,7 +488,7 @@ The command provisions the service contract. Then it runs one short probe proces
 3. It makes the default TLS context.
 4. It finds the temporary directory. This directory must not be the current directory.
 5. It imports the tray module.
-6. It does the start checks of the tray: uvicorn must be available, and the menu-bar backend must be available. A Linux host with no display skips the backend check.
+6. It does the start checks of the tray. uvicorn must be available. A missing tray package (pystray or Pillow) is a broken build, and the probe refuses it. When pystray is installed but cannot load on this host (for example, a Linux host with no display), the probe passes and prints a note with the error type.
 7. It imports the CLI.
 8. It imports the dashboard API.
 

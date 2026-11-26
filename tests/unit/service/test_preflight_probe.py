@@ -102,6 +102,62 @@ def test_a_refused_start_check_names_its_token(contract):
     assert (result.step, result.detail) == ("tray_backend", "ProbeRefusal uvicorn_missing")
 
 
+def _tray_state(tray_available, load_failure, uvicorn=True):
+    """A seam that puts the tray module in one state, on a non-mac backend."""
+    return _seam(
+        "    import jacked.service.tray as tray\n",
+        "    import jacked.service.tray as tray\n"
+        "    tray._mac_menubar_available = lambda: False\n"
+        f"    tray._TRAY_AVAILABLE = {tray_available!r}\n"
+        f"    tray._PYSTRAY_LOAD_FAILURE = {load_failure!r}\n"
+        f"    tray._UVICORN_AVAILABLE = {uvicorn!r}\n",
+    )
+
+
+def test_a_missing_tray_package_is_a_broken_build_on_every_platform(contract):
+    result = _probe(contract, code=_tray_state(False, None))
+    assert (result.step, result.detail) == ("tray_backend", "ProbeRefusal tray_package_missing")
+
+
+def test_a_tray_that_cannot_load_on_this_host_passes_with_a_note(contract):
+    code = _tray_state(False, "DisplayNameError: Bad display name ':99'")
+    result = _probe(contract, code=code)
+    assert result.ok, result
+    assert result.note.startswith(
+        "the tray cannot run on this host, so jacked does not run here: "
+        "pystray could not load (DisplayNameError)."
+    )
+    assert "linux-tray-notes" in result.note
+    assert ":99" not in result.note  # the error type only, never its text
+
+
+def test_a_missing_uvicorn_refuses_even_with_a_working_tray(contract):
+    result = _probe(contract, code=_tray_state(True, None, uvicorn=False))
+    assert (result.step, result.detail) == ("tray_backend", "ProbeRefusal uvicorn_missing")
+
+
+def test_preflight_prints_the_host_note_on_a_pass(monkeypatch):
+    from jacked.cli import main
+
+    note = "the tray cannot run on this host, so jacked does not run here: pystray could not load (ValueError)."
+    with (
+        patch(
+            "jacked.service.lifecycle.provision_service_contract",
+            return_value=(_spec(), {}),
+        ),
+        patch(
+            "jacked.service.preflight_probe.run_service_probe",
+            return_value=ProbeResult(True, note=note),
+        ),
+    ):
+        text = CliRunner().invoke(main, ["service", "preflight"])
+        data = CliRunner().invoke(main, ["service", "preflight", "--json"])
+
+    assert text.exit_code == 0 and data.exit_code == 0
+    assert "Note: " + note in " ".join(text.output.split())
+    assert json.loads(data.output)["note"] == note
+
+
 def test_the_report_file_carries_the_detail_when_stdout_is_lost(contract):
     """On Windows the launcher child writes to a new hidden console, so the
     probe's stdout never reaches the caller. The report file still does."""
