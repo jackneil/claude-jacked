@@ -9,6 +9,7 @@ tree does not change for a wrong reason.
 
 from __future__ import annotations
 
+import dataclasses
 import gzip
 import os
 import re
@@ -22,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from jacked.testdiet import history, record, tree
+from jacked.testdiet.model import TreeId
 from tests._testdiet import fixture_project, fixture_reports, make_repo
 
 POSIX = pytest.mark.skipif(os.name == "nt", reason="needs POSIX signals, FIFOs or file names")
@@ -330,17 +332,24 @@ def test_a_child_that_a_signal_stops_returns_128_plus_the_signal(repo):
     assert _last(repo).exit_code == 128 + signal.SIGTERM
 
 
-@POSIX
-def test_an_interrupt_of_the_parent_waits_for_the_child(repo):
-    if threading.current_thread() is not threading.main_thread():
-        pytest.skip("SIGINT goes to the main thread")
-    timer = threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGINT))
-    timer.start()
-    try:
-        assert record.run_gate(gate(3, "sleep", "2"), cwd=repo) == 3
-    finally:
-        timer.cancel()
+def test_an_interrupt_of_the_parent_waits_for_the_child(repo, monkeypatch, capsys):
+    # The first wait for the gate raises KeyboardInterrupt, as a Ctrl-C does.
+    # The git calls use the same Popen class, so only the gate is changed.
+    base = subprocess.Popen
+    interrupted = []
+
+    class InterruptOnce(base):
+        def wait(self, *args, **kwargs):
+            if self.args and self.args[0] == sys.executable and not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt
+            return super().wait(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", InterruptOnce)
+    assert record.run_gate(gate(3, "sleep", "0.2"), cwd=repo) == 3
+    assert interrupted == [True]
     assert _last(repo).exit_code == 3
+    assert "interrupt" in capsys.readouterr().err
 
 
 def test_run_outside_a_git_repository_records_nothing_and_keeps_the_exit_code(hermetic_git, capsys):
@@ -367,6 +376,37 @@ def test_a_gate_that_writes_a_file_into_the_tree_is_named_and_never_seen(repo, c
     assert found is None
     (repo / "made-by-gate.txt").unlink()
     assert _seen(repo, argv) is None
+
+
+_OTHER_TREE = TreeId(commit="c" * 40, tree="d" * 40, clean=True)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("source", "record"),
+    ("verdict", "conflict"),
+    ("verdict", "no-data"),
+    ("tree_changed", None),
+    ("tree_changed", True),
+    ("tree", None),
+    ("tree", _OTHER_TREE),
+    ("command_sha", "0" * 64),
+    ("inputs_sha", "1" * 64),
+    ("machine_id", "f" * 32),
+    ("machine_id", None),
+])
+def test_seen_rejects_a_run_that_differs_in_one_field(repo, tmp_path, field, value):
+    argv = junit_gate(0, GREEN)
+    record.run_gate(argv, cwd=repo)
+    real = _last(repo)
+    control, twin = tmp_path / "control", tmp_path / "twin"
+    history.write_run(control, real, None)
+    history.write_run(twin, dataclasses.replace(real, **{field: value}), None)
+    args = dict(inputs_sha=real.inputs_sha, machine_id=tree.machine_id())
+    current = tree.tree_id(repo)
+    assert record.seen(control, current, real.command_sha, **args) is not None
+    assert record.seen(twin, current, real.command_sha, **args) is None
+    if field == "machine_id":
+        assert record.seen(twin, current, real.command_sha, any_machine=True, **args) is not None
 
 
 def test_seen_is_false_for_a_dirty_tree_whose_head_passed(repo):
@@ -561,20 +601,26 @@ def test_the_store_holds_no_failure_text(repo):
         assert text not in raw
 
 
-@POSIX
 def test_a_printed_id_has_no_escape_sequence(repo, side, capsys):
     # A test ID with a C1 control (CSI, U+009B). XML 1.0 cannot carry ESC,
     # so this is the control that a JUnit file can bring to a terminal.
     text = RED.read_bytes().decode("utf-8").replace('name="test_fails"', 'name="test_fails\u009b31m"')
     report = side / "csi.xml"
     report.write_bytes(text.encode("utf-8"))
-    argv = [*junit_gate(1, report), "write", str(repo / "evil\x1b[31m.txt")]
+    argv = junit_gate(1, report)
     record.run_gate(argv, cwd=repo)
-    (repo / "evil\x1b[31m.txt").unlink()
     record.run_gate(argv, cwd=repo)
     err = capsys.readouterr().err
-    assert "test_fails31m" in err and "evil[31m.txt" in err
-    assert "\x1b" not in err and "\u009b" not in err
+    assert "tests/test_sample.py::test_fails31m" in err
+    assert "\u009b" not in err and "\x1b" not in err
+
+
+@POSIX
+def test_a_printed_path_has_no_escape_sequence(repo, capsys):
+    name = "evil\x1b[31m.txt"
+    record.run_gate([*junit_gate(0, GREEN), "write", str(repo / name)], cwd=repo)
+    err = capsys.readouterr().err
+    assert "evil[31m.txt" in err and "\x1b" not in err
 
 
 def test_a_label_with_a_newline_at_its_end_is_refused(repo, side):
@@ -586,3 +632,37 @@ def test_a_label_with_a_newline_at_its_end_is_refused(repo, side):
         record.record_files([GREEN], cwd=repo, kind=None, label=None, runner=None, commit=None,
                             exit_code=0, wall_seconds=None, machine="ci\n", report_root=None)
     assert _runs(repo) == []
+
+
+def test_a_failed_hash_of_the_fixed_reports_reads_no_old_report(repo, side, monkeypatch, capsys):
+    fixed = side / "report.xml"
+    shutil.copyfile(GREEN, fixed)  # an old green report that this run does not write
+
+    def boom(top, globs):
+        raise RuntimeError("glob broke")
+
+    real_matches = record._matches
+    calls = []
+
+    def first_call_fails(top, globs):
+        calls.append(1)
+        return boom(top, globs) if len(calls) == 1 else real_matches(top, globs)
+
+    monkeypatch.setattr(record, "_matches", first_call_fails)
+    assert record.run_gate(gate(0), cwd=repo, junit=[str(fixed)]) == 0
+    assert _last(repo).verdict == "no-data"
+    assert "not hashed before the run" in capsys.readouterr().err
+
+
+def test_a_standard_error_that_cannot_be_written_does_not_stop_the_gate(hermetic_git, monkeypatch):
+    class Broken:
+        def write(self, text):
+            raise BrokenPipeError
+
+        def flush(self):
+            raise BrokenPipeError
+
+    plain = hermetic_git / "plain"
+    plain.mkdir()
+    monkeypatch.setattr(sys, "stderr", Broken())
+    assert record.run_gate(gate(4), cwd=plain) == 4

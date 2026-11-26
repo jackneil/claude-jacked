@@ -65,8 +65,15 @@ def clean_text(text: str) -> str:
 
 
 def emit(message: str) -> None:
-    """Print one message on standard error, with the prefix and with no control characters."""
-    print(PREFIX + clean_text(message), file=sys.stderr, flush=True)
+    """Print one message on standard error, with the prefix and with no control characters.
+
+    A standard error that cannot be written (closed, a broken pipe) is
+    ignored, because a message must never stop or change the gate.
+    """
+    try:
+        print(PREFIX + clean_text(message), file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 -- a message must never stop or change the gate
+        logger.debug("emit: standard error cannot be written", exc_info=True)
 
 
 def _guard(step: str, func: Callable[[], T], default: T) -> T:
@@ -232,8 +239,11 @@ def run_gate(argv: Sequence[str], *, cwd: Path, junit: Sequence[str] = (), input
         sha = tree.command_sha(argv)
         inputs_sha = _guard("hash the input files", lambda: tree.inputs_fingerprint(top, inputs), None)
         report_dir, report, child_argv = _placeholder(argv)
+        # None (not empty) when the hash step fails: then no fixed report is read,
+        # because an old report must not become this run.
         fixed_before = _guard("hash the fixed reports",
-                              lambda: {os.path.normpath(p): _sha_of(p) for p in _matches(top, junit)}, {})
+                              lambda: {os.path.normpath(p): _sha_of(p) for p in _matches(top, junit)},
+                              None) if junit else {}
 
         started = _now()
         load_start = _load()
@@ -339,11 +349,13 @@ def _print_changes(cwd: Path, before: TreeId, after: TreeId, objects: Path | Non
 
 
 def _read_reports(top: Path, report: Path | None, globs: Sequence[str],
-                  fixed_before: dict[str, str | None], runner: str | None) -> RunData | None:
+                  fixed_before: dict[str, str | None] | None, runner: str | None) -> RunData | None:
     """Read the report at the placeholder path and each fixed report that is new or changed.
 
     The read is all or nothing: when one file cannot be read, the run has no
-    data. A report that is left out could hold a failure.
+    data. A report that is left out could hold a failure. ``fixed_before``
+    is None when the fixed reports were not hashed before the run: then no
+    fixed report is read.
     """
     paths: list[Path] = []
     if report is not None:
@@ -351,6 +363,9 @@ def _read_reports(top: Path, report: Path | None, globs: Sequence[str],
             paths.append(report)
         else:
             emit("the gate wrote no report at the {junit} path.")
+    if fixed_before is None:
+        emit("did not read the --junit reports: they were not hashed before the run.")
+        globs = ()
     for path in _matches(top, globs):
         key = os.path.normpath(path)
         now = _sha_of(path)
