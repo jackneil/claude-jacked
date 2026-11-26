@@ -393,12 +393,13 @@ _VENDOR_HOME_BINS: dict[str, tuple[str, ...]] = {
 }
 
 
-def find_bin(name: str, *, home: str | None = None) -> str | None:
-    """Find a binary by name, searching PATH then known install locations.
+def find_on_path(name: str) -> str | None:
+    """Find a binary by bare name on PATH only, as a shell does. Return None when it is not there.
 
-    ``name`` must be a bare command name; a path-shaped name returns None.
-    ``home`` overrides the home directory used for the fallback locations
-    (tests use it so they never look at the real user's home).
+    ``shutil.which`` honors PATHEXT on Windows (``npx`` finds ``npx.cmd``).
+    A hit in the current folder that is not on PATH is skipped. Unlike
+    ``find_bin``, no install folder off PATH is searched. A path-shaped
+    name returns None.
     """
     if not _is_bare_name(name):
         return None
@@ -407,7 +408,18 @@ def find_bin(name: str, *, home: str | None = None) -> str | None:
         # Values-free: the name is a fixed command name.
         logger.debug("find_bin: skipped a %s in the current folder, which is not on PATH", name)
         found = _which_on_path(name)
-    if found:
+    return found
+
+
+def find_bin(name: str, *, home: str | None = None) -> str | None:
+    """Find a binary by name, searching PATH then known install locations.
+
+    ``name`` must be a bare command name; a path-shaped name returns None.
+    ``home`` overrides the home directory used for the fallback locations
+    (tests use it so they never look at the real user's home).
+    """
+    found = find_on_path(name)
+    if found or not _is_bare_name(name):
         return found
 
     is_win = sys.platform == "win32"

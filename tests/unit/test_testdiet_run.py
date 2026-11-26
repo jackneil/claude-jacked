@@ -783,3 +783,113 @@ def test_the_notice_groups_records_by_machine_and_has_no_date_range(repo, capsys
     assert len(rows) == 2
     assert rows[0].startswith(f"ci {ci.id} 2026-11-01T00:00:00+00:00 record")
     assert rows[1].startswith("local ")
+
+
+class _CaughtTerm:
+    """A SIGTERM handler of the test: a signal outside the run's window lands here, never on pytest."""
+
+    def __init__(self):
+        self.caught: list[int] = []
+
+    def __call__(self, signum, frame):
+        self.caught.append(signum)
+
+
+@POSIX
+def test_a_sigterm_during_the_post_run_steps_keeps_the_code_and_cleans_up(repo, tmp_path, monkeypatch,
+                                                                          capsys):
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("a signal handler needs the main thread")
+    temp = tmp_path / "tmp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    blocked = []
+
+    def slow_read(*args, **kwargs):
+        # The report read of a big repository: a SIGTERM comes while it runs.
+        blocked.append(True)
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(10)
+        raise AssertionError("the signal did not stop the recorder")
+
+    monkeypatch.setattr(run.junit, "read_junit", slow_read)
+    caught = _CaughtTerm()
+    previous = signal.signal(signal.SIGTERM, caught)
+    try:
+        started = time.monotonic()
+        code = record.run_gate(junit_gate(5, GREEN), cwd=repo)
+        elapsed = time.monotonic() - started
+        restored = signal.getsignal(signal.SIGTERM)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert blocked == [True] and caught.caught == [] and restored is caught
+    assert code == 5 and elapsed < 9
+    runs = _runs(repo)
+    assert len(runs) == 1 and runs[0].exit_code == 5
+    assert sorted(p.name for p in temp.iterdir()) == []
+    assert "skips its other steps" in capsys.readouterr().err
+
+
+@POSIX
+def test_a_sigterm_before_the_gate_starts_leaves_no_orphan(repo, side, monkeypatch):
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("a signal handler needs the main thread")
+    base = subprocess.Popen
+    pid_file = side / "pid"
+
+    class TermFirst(base):
+        def __init__(self, args, *a, **kw):
+            if args and args[0] == sys.executable:
+                # The signal comes after the handler is set and before the gate exists.
+                os.kill(os.getpid(), signal.SIGTERM)
+            super().__init__(args, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", TermFirst)
+    caught = _CaughtTerm()
+    previous = signal.signal(signal.SIGTERM, caught)
+    try:
+        started = time.monotonic()
+        code = record.run_gate(gate(0, "argv", str(pid_file), "x", "sleep", "30"), cwd=repo)
+        elapsed = time.monotonic() - started
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert caught.caught == []
+    assert code == 128 + signal.SIGTERM and elapsed < 25  # the gate did not run its 30 s
+    assert _last(repo).exit_code == 128 + signal.SIGTERM
+
+
+def test_a_signal_goes_to_the_gate_once_for_each_signal_number():
+    sent = []
+
+    class Proc:
+        def poll(self):
+            return None
+
+        def send_signal(self, signum):
+            sent.append(signum)
+
+    signals = run._Signals()
+    signals._handle(15, None)  # before the gate exists: kept
+    assert sent == []
+    signals.started(Proc())
+    signals._handle(15, None)  # the same signal again: not sent a second time
+    signals._handle(1, None)
+    assert sent == [15, 1]
+    signals.child_done = True
+    signals._handle(15, None)  # after the gate stopped, outside the post-run steps: only noted
+    assert signals.stopped == 15 and sent == [15, 1]
+
+
+def test_a_bare_name_only_in_an_install_folder_off_path_does_not_start(repo, tmp_path, monkeypatch, capsys):
+    from jacked import findbin
+
+    folder = tmp_path / "tool-bin"
+    folder.mkdir()
+    name = "jacked-offpath-tool-4471"
+    target = folder / (name + (".exe" if os.name == "nt" else ""))
+    target.write_bytes(b"#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    monkeypatch.setenv("UV_TOOL_BIN_DIR", str(folder))
+    assert findbin.find_on_path(name) is None
+    assert record.run_gate([name], cwd=repo) == 127
+    assert name in capsys.readouterr().err
