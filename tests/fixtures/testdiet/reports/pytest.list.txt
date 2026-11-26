@@ -7,4 +7,4 @@ tests/test_sample.py::TestGroup::test_in_class
 tests/test_sample.py::TestGroup::TestNested::test_in_nested_class
 tests/test_sample.py::test_sleeps_half_a_second
 
-8 tests collected in 0.01s
+8 tests collected in 0.00s

@@ -22,7 +22,8 @@ the temporary folder. It downloads the release binaries of ``gotestsum`` and
 ``cargo-nextest`` and checks their published SHA-256. It needs ``uv``,
 ``npm``, ``node``, ``go`` and ``cargo`` on the PATH.
 
-Each tool version was published 14 days or more before the capture date.
+Each tool version, and each package that it needs, was published 14 days
+or more before the capture date (``CUTOFF``).
 Read each command in the documentation of its runner before you change it:
 see ``DOCS`` below.
 """
@@ -68,6 +69,10 @@ NPM_PACKAGES = {
     "@playwright/test": ("1.65.0", "2026-11-05"),
 }
 GOTESTSUM = ("1.13.0", "2025-09-11")
+# No package (direct or transitive) published after this date is installed:
+# npm install --before and uv pip install --exclude-newer. It is 14 days
+# before the capture date of 2026-11-26.
+CUTOFF = "2026-11-12"
 NEXTEST = ("0.9.151", "2026-11-03")
 
 DOCS = {
@@ -178,13 +183,14 @@ def install_nextest(tmp: Path, bin_dir: Path) -> dict:
     return {"version": version, "published": NEXTEST[1], "asset": name, "sha256": actual}
 
 
-def install_python(tmp: Path) -> tuple[Path, dict]:
+def install_python(tmp: Path, env: dict[str, str]) -> tuple[Path, dict]:
     venv = tmp / "venv"
-    _run(["uv", "venv", "--quiet", str(venv)], tmp, os.environ.copy())
+    _run(["uv", "venv", "--quiet", str(venv)], tmp, env)
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     pins = [f"{name}=={version}" for name, (version, _) in PYTHON_PACKAGES.items()]
-    _run(["uv", "pip", "install", "--quiet", "--python", str(python), *pins], tmp, os.environ.copy())
-    py_version = _run([str(python), "-c", "import sys; print(sys.version.split()[0])"], tmp, os.environ.copy())
+    _run(["uv", "pip", "install", "--quiet", "--exclude-newer", f"{CUTOFF}T00:00:00Z",
+          "--python", str(python), *pins], tmp, env)
+    py_version = _run([str(python), "-c", "import sys; print(sys.version.split()[0])"], tmp, env)
     return python, {"python": py_version.stdout.decode().strip()}
 
 
@@ -197,7 +203,8 @@ def write_package_json(work: Path, names: list[str]) -> None:
     (work / "package.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="")
 
 
-NPM_INSTALL = ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"]
+NPM_INSTALL = ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact",
+               f"--before={CUTOFF}"]
 
 
 def captures(python: Path) -> list[dict]:
@@ -301,8 +308,7 @@ def capture_one(spec: dict, tmp: Path, env: dict[str, str], private: dict[str, s
     record: dict = {"project": f"projects/{spec['project']}", "commands": []}
     if spec["npm"]:
         write_package_json(work, spec["npm"])
-        install = NPM_INSTALL + ["--cache", str(tmp / "npm-cache")]
-        _run(install, work, env)
+        _run(NPM_INSTALL, work, env)
         record["setup"] = [" ".join(NPM_INSTALL), "package.json: " + ", ".join(
             f"{name}@{NPM_PACKAGES[name][0]}" for name in spec["npm"])]
     if spec.get("nextest_config"):
@@ -357,8 +363,6 @@ def main() -> int:
             "gotestsum": install_gotestsum(tmp, bin_dir),
             "cargo-nextest": install_nextest(tmp, bin_dir),
         }
-        python, py_info = install_python(tmp)
-        tools.update(py_info)
         env = {
             **os.environ,
             **RUN_ENV,
@@ -368,9 +372,16 @@ def main() -> int:
             "GOFLAGS": "-mod=mod",
             "GOTOOLCHAIN": "local",
             "npm_config_update_notifier": "false",
+            # Each cache, log and downloaded interpreter stays in the
+            # temporary folder.
+            "npm_config_cache": str(tmp / "npm-cache"),
+            "UV_CACHE_DIR": str(tmp / "uv-cache"),
+            "UV_PYTHON_INSTALL_DIR": str(tmp / "uv-python"),
         }
         for var in ("PYTHONPATH", "VIRTUAL_ENV", "PYTEST_ADDOPTS"):
             env.pop(var, None)
+        python, py_info = install_python(tmp, env)
+        tools.update(py_info)
         tools.update(tool_versions(env, python, tmp))
         runs = []
         written: dict[str, bytes] = {}
@@ -387,6 +398,7 @@ def main() -> int:
         (REPORTS / name).write_bytes(data)
     provenance = {
         "date": datetime.date.today().isoformat(),
+        "cutoff": CUTOFF,
         "script": "tests/fixtures/testdiet/capture.py",
         "system": f"{platform.system()} {platform.machine()}",
         "tools": tools,

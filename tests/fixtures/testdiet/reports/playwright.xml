@@ -1,8 +1,8 @@
-<testsuites id="" name="" tests="8" failures="1" skipped="1" errors="0" time="3.070148">
-<testsuite name="tests/sample.spec.js" timestamp="2026-11-26T13:34:17.204Z" hostname="gate.example" tests="8" failures="1" skipped="1" time="0.531" errors="0">
-<testcase name="passes" classname="tests/sample.spec.js" time="0.006">
+<testsuites id="" name="" tests="8" failures="1" skipped="1" errors="0" time="2.4462550000000003">
+<testsuite name="tests/sample.spec.js" timestamp="2026-11-26T14:26:04.758Z" hostname="gate.example" tests="8" failures="1" skipped="1" time="0.549" errors="0">
+<testcase name="passes" classname="tests/sample.spec.js" time="0.01">
 </testcase>
-<testcase name="fails" classname="tests/sample.spec.js" time="0.005">
+<testcase name="fails" classname="tests/sample.spec.js" time="0.004">
 <system-out>
 <![CDATA[
 [[ATTACHMENT|test-results/tests-sample-fails/error-context.md]]
@@ -37,15 +37,15 @@
 <skipped>
 </skipped>
 </testcase>
-<testcase name="parametrized 1" classname="tests/sample.spec.js" time="0.012">
+<testcase name="parametrized 1" classname="tests/sample.spec.js" time="0.003">
 </testcase>
 <testcase name="parametrized 2" classname="tests/sample.spec.js" time="0">
 </testcase>
-<testcase name="group › in group" classname="tests/sample.spec.js" time="0.005">
+<testcase name="group › in group" classname="tests/sample.spec.js" time="0.002">
 </testcase>
-<testcase name="group › nested › in nested group" classname="tests/sample.spec.js" time="0.001">
+<testcase name="group › nested › in nested group" classname="tests/sample.spec.js" time="0.024">
 </testcase>
-<testcase name="sleeps_half_a_second" classname="tests/sample.spec.js" time="0.502">
+<testcase name="sleeps_half_a_second" classname="tests/sample.spec.js" time="0.506">
 </testcase>
 </testsuite>
 </testsuites>

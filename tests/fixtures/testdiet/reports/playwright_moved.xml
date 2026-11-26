@@ -1,5 +1,5 @@
-<testsuites id="" name="" tests="8" failures="1" skipped="1" errors="0" time="2.04679">
-<testsuite name="tests/sample.spec.js" timestamp="2026-11-26T13:34:29.023Z" hostname="gate.example" tests="8" failures="1" skipped="1" time="0.521" errors="0">
+<testsuites id="" name="" tests="8" failures="1" skipped="1" errors="0" time="6.225863000000001">
+<testsuite name="tests/sample.spec.js" timestamp="2026-11-26T14:26:14.143Z" hostname="gate.example" tests="8" failures="1" skipped="1" time="0.685" errors="0">
 <testcase name="fails" classname="tests/sample.spec.js" time="0.004">
 <system-out>
 <![CDATA[
@@ -35,11 +35,11 @@
 <skipped>
 </skipped>
 </testcase>
-<testcase name="parametrized 1" classname="tests/sample.spec.js" time="0.004">
+<testcase name="parametrized 1" classname="tests/sample.spec.js" time="0.082">
 </testcase>
-<testcase name="parametrized 2" classname="tests/sample.spec.js" time="0.008">
+<testcase name="parametrized 2" classname="tests/sample.spec.js" time="0.001">
 </testcase>
-<testcase name="group › in group" classname="tests/sample.spec.js" time="0.001">
+<testcase name="group › in group" classname="tests/sample.spec.js" time="0.094">
 </testcase>
 <testcase name="group › nested › in nested group" classname="tests/sample.spec.js" time="0.001">
 </testcase>

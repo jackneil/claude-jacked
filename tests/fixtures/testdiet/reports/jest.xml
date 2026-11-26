@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="jest tests" tests="9" failures="1" errors="0" time="1.338">
-  <testsuite name="undefined" errors="0" failures="0" skipped="0" timestamp="2026-11-26T13:34:11" time="0.266" tests="1">
-    <testcase classname="" name="passes in a second file" time="0.003" file="src/other.test.js">
+<testsuites name="jest tests" tests="9" failures="1" errors="0" time="2.495">
+  <testsuite name="undefined" errors="0" failures="0" skipped="0" timestamp="2026-11-26T14:25:55" time="1.037" tests="1">
+    <testcase classname="" name="passes in a second file" time="0.019" file="src/other.test.js">
     </testcase>
   </testsuite>
-  <testsuite name="undefined" errors="0" failures="1" skipped="1" timestamp="2026-11-26T13:34:11" time="0.818" tests="8">
-    <testcase classname="" name="passes" time="0.003" file="src/sample.test.js">
+  <testsuite name="undefined" errors="0" failures="1" skipped="1" timestamp="2026-11-26T14:25:55" time="1.704" tests="8">
+    <testcase classname="" name="passes" time="0.01" file="src/sample.test.js">
     </testcase>
-    <testcase classname="" name="fails" time="0.003" file="src/sample.test.js">
+    <testcase classname="" name="fails" time="0.008" file="src/sample.test.js">
       <failure>Error: expect(received).toBe(expected) // Object.is equality
 
 Expected: &quot;a different value&quot;
@@ -32,15 +32,15 @@ Received: &quot;sample-failure-message&quot;
     <testcase classname="" name="skipped" time="0" file="src/sample.test.js">
       <skipped/>
     </testcase>
-    <testcase classname="" name="parametrized 1" time="0" file="src/sample.test.js">
+    <testcase classname="" name="parametrized 1" time="0.001" file="src/sample.test.js">
     </testcase>
-    <testcase classname="" name="parametrized 2" time="0" file="src/sample.test.js">
+    <testcase classname="" name="parametrized 2" time="0.003" file="src/sample.test.js">
     </testcase>
-    <testcase classname="group" name="in group" time="0.002" file="src/sample.test.js">
+    <testcase classname="group" name="in group" time="0.001" file="src/sample.test.js">
     </testcase>
-    <testcase classname="group &gt; nested" name="in nested group" time="0.007" file="src/sample.test.js">
+    <testcase classname="group &gt; nested" name="in nested group" time="0.004" file="src/sample.test.js">
     </testcase>
-    <testcase classname="" name="sleeps_half_a_second" time="0.502" file="src/sample.test.js">
+    <testcase classname="" name="sleeps_half_a_second" time="0.505" file="src/sample.test.js">
     </testcase>
   </testsuite>
 </testsuites>

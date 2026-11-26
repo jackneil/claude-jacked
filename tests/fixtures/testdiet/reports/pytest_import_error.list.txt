@@ -15,4 +15,4 @@ E   ModuleNotFoundError: No module named 'sample_module_that_does_not_exist'
 =========================== short test summary info ============================
 ERROR tests/test_broken.py
 !!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
-1 test collected, 1 error in 0.23s
+1 test collected, 1 error in 0.34s

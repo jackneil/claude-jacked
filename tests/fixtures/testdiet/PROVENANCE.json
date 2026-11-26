@@ -1,5 +1,6 @@
 {
   "date": "2026-11-26",
+  "cutoff": "2026-11-12",
   "script": "tests/fixtures/testdiet/capture.py",
   "system": "Darwin arm64",
   "tools": {
@@ -221,7 +222,7 @@
         }
       ],
       "setup": [
-        "npm install --ignore-scripts --no-audit --no-fund --save-exact",
+        "npm install --ignore-scripts --no-audit --no-fund --save-exact --before=2026-11-12",
         "package.json: vitest@5.1.0"
       ],
       "name": "vitest",
@@ -268,7 +269,7 @@
         }
       ],
       "setup": [
-        "npm install --ignore-scripts --no-audit --no-fund --save-exact",
+        "npm install --ignore-scripts --no-audit --no-fund --save-exact --before=2026-11-12",
         "package.json: jest@30.5.2, jest-junit@17.0.0"
       ],
       "name": "jest",
@@ -310,7 +311,7 @@
         }
       ],
       "setup": [
-        "npm install --ignore-scripts --no-audit --no-fund --save-exact",
+        "npm install --ignore-scripts --no-audit --no-fund --save-exact --before=2026-11-12",
         "package.json: @playwright/test@1.65.0"
       ],
       "name": "playwright",
@@ -352,7 +353,7 @@
         }
       ],
       "setup": [
-        "npm install --ignore-scripts --no-audit --no-fund --save-exact",
+        "npm install --ignore-scripts --no-audit --no-fund --save-exact --before=2026-11-12",
         "package.json: @playwright/test@1.65.0"
       ],
       "name": "playwright_moved",
