@@ -913,3 +913,21 @@ def test_the_repeat_notice_shows_a_record_with_no_label_after_each_real_label(tm
     records = lines[lines.index("the earlier records, by machine:") + 1:]
     assert [line.split()[:2] for line in records] == [["ci", ci], ["(no", "label)"]]
     assert no_label in records[1] and "None" not in notice
+
+
+def test_a_test_id_with_a_line_break_prints_on_one_line_in_the_notice_and_in_seen(tmp_path):
+    from tests._testdiet import make_case, store_run
+
+    store = tmp_path / "store"
+    fake = "tests/test_x.py::test_fails\nthe earlier records, by machine:"
+    red = [make_case(fake, "tests/test_x.py", 0.1, "failed")]
+    store_run(store, "20261120T080000", exit_code=1, tests=red)
+    now = store_run(store, "20261121T080000", exit_code=1, tests=red)
+    meta = next(m for m in history.iter_runs(store) if m.id == now)
+    lines = record.repeat_notice(store, meta).splitlines()
+    assert lines.count("the earlier records, by machine:") == 1
+    assert "  tests/test_x.py::test_fails\\nthe earlier records, by machine:" in lines
+    shown = dataclasses.replace(meta, started="2026-11-21\nfake line", counts={"passed\nx": 1})
+    line = record.seen_line(shown)
+    assert "\n" not in line
+    assert line == f"{now} started 2026-11-21\\nfake line, wall 100.0 s, passed\\nx 1"

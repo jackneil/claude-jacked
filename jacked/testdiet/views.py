@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from jacked.testdiet import history as _history
-from jacked.testdiet.model import CaseResult, RunMeta, label_text
+from jacked.testdiet.model import CaseResult, RunMeta, label_text, one_line
 from jacked.testdiet.record import clean_text
 
 VERDICTS = ("passed", "failed", "conflict", "no-data", "unknown")
@@ -298,19 +298,6 @@ def _num(value) -> str:
     return f"{value:.3f}".rstrip("0").rstrip(".") if isinstance(value, float) else str(value)
 
 
-def _text(value) -> str:
-    """Free text (a test ID, a file, a time) on one line. None is empty.
-
-    A line break shows as ``\\n``, so a value cannot add a line to the output.
-
-    >>> _text("a\\nb")
-    'a\\\\nb'
-    """
-    if value is None:
-        return ""
-    return str(value).replace("\r", "\\r").replace("\n", "\\n")
-
-
 def _hidden(count: int, what: str) -> list[str]:
     return [f"  {_num(count)} more {what} are not shown. --json shows all rows."] if count else []
 
@@ -318,8 +305,8 @@ def _hidden(count: int, what: str) -> list[str]:
 def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
     """The text output of ``profile``. ``top`` is the number of rows of each table."""
     lines = list(result["notes"])
-    lines.append(f"run: {_text(result['run'])} started {_text(result['started'])}, "
-                 f"kind {_text(result['kind'])}, verdict {_text(result['verdict'])}")
+    lines.append(f"run: {one_line(result['run'])} started {one_line(result['started'])}, "
+                 f"kind {one_line(result['kind'])}, verdict {one_line(result['verdict'])}")
     lines.append(f"test seconds: {_num(result['total_test_seconds'])}")
     if result["tests_without_seconds"]:
         lines.append(f"tests with no seconds in the report: {_num(result['tests_without_seconds'])}")
@@ -330,12 +317,12 @@ def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
         lines.append(f"setup share: {_num(result['setup_share'])}")
     lines.append("files (seconds, tests, file):")
     rows = result["files"] if top is None else result["files"][:top]
-    lines += [f"  {_num(r['seconds']):>10} {_num(r['tests']):>6} {_text(r['file']) or '(no file)'}"
+    lines += [f"  {_num(r['seconds']):>10} {_num(r['tests']):>6} {one_line(r['file']) or '(no file)'}"
               for r in rows]
     lines += _hidden(result["hidden_rows"]["files"], "files")
     lines.append("tests (seconds, test ID):")
     rows = result["tests"] if top is None else result["tests"][:top]
-    lines += [f"  {_num(r['seconds']):>10} {_text(r['id'])}" for r in rows]
+    lines += [f"  {_num(r['seconds']):>10} {one_line(r['id'])}" for r in rows]
     lines += _hidden(result["hidden_rows"]["tests"], "tests")
     if result["repeats"]:
         lines.append("repeat runs of one tree and one command on this machine "
@@ -373,12 +360,12 @@ def render_history(result: dict, *, size: bool = False) -> str:
         branch = _num(s["on_default_branch"]) + (
             f" ({s['on_default_branch_unknown']} unknown)" if s["on_default_branch_unknown"] else "")
         lines.append(f"  {_num(s['runs'])} runs, trees {trees}, on the default branch {branch}, "
-                     f"first {_text(s['first'])}, last {_text(s['last'])}, set {s['sig'][:12]}:")
-        lines += [f"    {_text(test_id)}" for test_id in s["ids"]]
+                     f"first {one_line(s['first'])}, last {one_line(s['last'])}, set {s['sig'][:12]}:")
+        lines += [f"    {one_line(test_id)}" for test_id in s["ids"]]
     if not result["failing_sets"]:
         lines.append("  none")
     lines.append("flaky tests (runs, test ID):")
-    lines += [f"  {_num(r['runs']):>4} {_text(r['id'])}" for r in result["flaky"]] or ["  none"]
+    lines += [f"  {_num(r['runs']):>4} {one_line(r['id'])}" for r in result["flaky"]] or ["  none"]
     if result["other_machines"]:
         lines.append("other machines in the history (use --machine LABEL): "
                      + ", ".join(result["other_machines"]))

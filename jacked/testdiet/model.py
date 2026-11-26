@@ -24,6 +24,21 @@ def label_text(label: str | None) -> str:
     return NO_LABEL if label is None else label
 
 
+def one_line(value) -> str:
+    """Return stored free text (a test ID, a file, a time) as one line. None is empty.
+
+    A line break shows as ``\\n``, so a stored value cannot add a line to the output.
+
+    >>> one_line("a\\nb")
+    'a\\\\nb'
+    >>> one_line(None)
+    ''
+    """
+    if value is None:
+        return ""
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")
+
+
 def label_order(label: str | None) -> tuple[bool, str]:
     """A sort key for a machine label: each real label first, then the empty label.
 

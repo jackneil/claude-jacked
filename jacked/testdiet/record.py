@@ -21,7 +21,17 @@ from pathlib import Path
 from typing import TypeVar
 
 from jacked.testdiet import history, junit, tree
-from jacked.testdiet.model import LABEL_RE, RUNNERS, STATES, RunData, RunMeta, TreeId, label_order, label_text
+from jacked.testdiet.model import (
+    LABEL_RE,
+    RUNNERS,
+    STATES,
+    RunData,
+    RunMeta,
+    TreeId,
+    label_order,
+    label_text,
+    one_line,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -252,13 +262,24 @@ def repeat_notice(store: Path, meta: RunMeta) -> str | None:
         summary += f" ({no_tree} with no tree)"
     summary += f", {default} of them on the default branch."
     lines = [summary, f"the failing set has {len(meta.failing)} test(s):"]
-    lines += [f"  {test_id}" for test_id in meta.failing]
+    lines += [f"  {one_line(test_id)}" for test_id in meta.failing]
     lines.append("the earlier records, by machine:")
     for m in earlier:
         place = m.tree.commit[:12] if m.tree is not None else "no tree"
         flag = ", default branch" if m.on_default_branch is True else ""
-        lines.append(f"  {label_text(m.machine)} {m.id} {m.started} {m.source} {place}{flag}")
+        lines.append(f"  {label_text(m.machine)} {m.id} {one_line(m.started)} {one_line(m.source)} "
+                     f"{place}{flag}")
     return "\n".join(lines)
+
+
+def seen_line(meta: RunMeta) -> str:
+    """Return the one line that ``jacked tests seen`` prints for the run ``meta``.
+
+    Each stored text value is on one line, so the record cannot add a line.
+    """
+    counts = ", ".join(f"{one_line(k)} {v}" for k, v in (meta.counts or {}).items()) or "no counts"
+    wall = "unknown" if meta.wall_seconds is None else f"{meta.wall_seconds} s"
+    return clean_text(f"{meta.id} started {one_line(meta.started)}, wall {wall}, {counts}")
 
 
 # ``run_gate`` lives in ``jacked.testdiet.run``, which imports this module.

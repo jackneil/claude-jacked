@@ -157,9 +157,7 @@ def seen_command(inputs, any_machine, as_json, command):
             data.pop("machine_id", None)
         click.echo(_json.dumps(data, indent=1, sort_keys=True))
     elif found is not None:
-        counts = ", ".join(f"{k} {v}" for k, v in (found.counts or {}).items()) or "no counts"
-        wall = "unknown" if found.wall_seconds is None else f"{found.wall_seconds} s"
-        click.echo(_record.clean_text(f"{found.id} started {found.started}, wall {wall}, {counts}"))
+        click.echo(_record.seen_line(found))
     else:
         _record.emit("no passed run of this tree, this command and this machine.")
     raise SystemExit(0 if found is not None else 1)
