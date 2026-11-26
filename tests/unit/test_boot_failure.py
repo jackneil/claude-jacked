@@ -70,3 +70,20 @@ def test_an_entry_older_than_the_live_service_start_is_not_shown(tmp_path):
     record("Traceback\nImportError: new\n", now=2000)
     assert "ImportError: new" in boot_failure.describe_latest(after_file=manifest)
     assert "ImportError: new" in boot_failure.describe_latest(after_file=tmp_path / "none")
+
+
+def test_on_windows_the_log_gets_the_private_acl_best_effort(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(boot_failure, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "jacked.service.windows_security.secure_windows_path", lambda path: calls.append(path)
+    )
+    record("Traceback\nImportError: x\n", path=tmp_path / "boot.log", now=0)
+    assert calls == [tmp_path / "boot.log"]
+
+    def fail(path):
+        raise OSError("no ACL")
+
+    monkeypatch.setattr("jacked.service.windows_security.secure_windows_path", fail)
+    record("Traceback\nImportError: y\n", path=tmp_path / "boot.log", now=1)
+    assert latest(path=tmp_path / "boot.log")[1] == "ImportError: y"

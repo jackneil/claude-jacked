@@ -7,7 +7,10 @@ stopped at ``import asyncio``, and no file said why.
 
 ``jacked/__main__.py`` calls :func:`record_current` when that import fails,
 and then raises the error again. The log is
-``~/.claude/jacked-boot-failure.log``, with owner-only access. The file
+``~/.claude/jacked-boot-failure.log``. On macOS and Linux it has mode 0600.
+On Windows jacked then sets the private ACL of the service files (owner
+only), best effort: when that fails, the file keeps the ACL of
+``~/.claude``, and the real boot error still goes up. The file
 stays under ``MAX_BYTES``: the oldest entries go first, and one line says
 that older entries were dropped. ``jacked service status`` prints the time
 and the last line of the newest entry.
@@ -26,6 +29,7 @@ import traceback
 from pathlib import Path
 
 LOG_NAME = "jacked-boot-failure.log"
+_IS_WINDOWS = os.name == "nt"
 #: The size limit of the log. A crash loop must not fill the disk.
 MAX_BYTES = 1_000_000
 ENTRY_MARK = "=== jacked boot failure at "
@@ -52,6 +56,13 @@ def _write_private(path: Path, text: str) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(path, text, mode=0o600, mode_strict=False)
+    if _IS_WINDOWS:
+        try:
+            from jacked.service.windows_security import secure_windows_path
+
+            secure_windows_path(path)
+        except Exception:  # noqa: BLE001 - never mask the boot error
+            pass
 
 
 def record(trace: str, *, path: Path | None = None, now: float | None = None) -> None:

@@ -64,9 +64,39 @@ def is_absolute_windows_path(value: str | None) -> bool:
     return _absolute(value)
 
 
+def _os_windows_directory() -> str | None:
+    """Return the Windows directory from the OS (GetSystemWindowsDirectoryW), or None.
+
+    It goes through the resolver seam of the service environment
+    (``jacked.service.environment.default_windows_resolvers``), so every
+    program path agrees with the service SystemRoot. It is None off Windows
+    and when the call fails.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        from jacked.service.environment import default_windows_resolvers
+
+        value = default_windows_resolvers().windows_directory()
+    except Exception:  # noqa: BLE001 - the environment is the fallback
+        return None
+    return value if _absolute(value) else None
+
+
 def system_root(env: Mapping[str, str] | None = None) -> str:
-    """Return ``%SystemRoot%`` (else ``%windir%``) when it is absolute, else ``C:\\Windows``."""
-    env = os.environ if env is None else env
+    """Return the Windows directory.
+
+    With no ``env`` on Windows, the OS answers (GetSystemWindowsDirectoryW),
+    so a caller's SystemRoot cannot move a program path. The environment
+    (``%SystemRoot%``, else ``%windir%``, when absolute) is the fallback when
+    that call fails, and the source when the caller passes ``env``. The last
+    fallback is ``C:\\Windows``.
+    """
+    if env is None:
+        found = _os_windows_directory()
+        if found:
+            return found
+        env = os.environ
     for key in ("SystemRoot", "windir"):
         value = env.get(key)
         if _absolute(value):
@@ -77,17 +107,18 @@ def system_root(env: Mapping[str, str] | None = None) -> str:
 def system_program(name: str, env: Mapping[str, str] | None = None) -> str:
     """Return the absolute path of the Windows system program ``name``.
 
-    ``cmd`` is ``%ComSpec%`` when that is an absolute path to a ``cmd.exe``,
-    else ``%SystemRoot%\\System32\\cmd.exe``. An unknown name raises
-    ``ValueError``, so a new program gets a deliberate home here.
+    The root is :func:`system_root`: the OS answer when ``env`` is None on
+    Windows. ``cmd`` is ``%ComSpec%`` only when the caller passes ``env``
+    and it names an absolute ``cmd.exe``; else it is
+    ``<root>\\System32\\cmd.exe``. An unknown name raises ``ValueError``, so
+    a new program gets a deliberate home here.
 
     >>> system_program("schtasks.exe", {"SystemRoot": r"C:\\Windows"})
     'C:\\\\Windows\\\\System32\\\\schtasks.exe'
     """
-    env = os.environ if env is None else env
     base = name.lower().removesuffix(".exe")
     root = system_root(env)
-    if base == "cmd":
+    if base == "cmd" and env is not None:
         comspec = env.get("ComSpec")
         if _absolute(comspec) and ntpath.basename(comspec).lower() == "cmd.exe":
             return comspec

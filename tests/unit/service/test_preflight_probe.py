@@ -190,6 +190,7 @@ def test_a_hung_probe_names_the_running_step(contract):
     code = f'import time\nprint("{STEP_MARK}socket", flush=True)\ntime.sleep(60)\n'
     result = _probe(contract, code=code, timeout=3.0)
     assert (result.step, result.detail) == ("socket", "timeout after 3s")
+    assert not (contract[2].root / PROBE_REPORT_NAME).exists()
 
 
 def test_a_hang_after_the_ok_marker_is_an_interpreter_exit(contract):
@@ -516,3 +517,39 @@ def test_the_probe_program_is_one_line_on_every_path():
     argv = probe_python_argv(PROBE_CODE, Path("/x/report.log"))
     assert all("\n" not in part and "\r" not in part for part in argv)
     assert argv[-1] == str(Path("/x/report.log"))
+
+
+def test_program_paths_come_from_the_os_not_the_caller(monkeypatch):
+    """A caller with SYSTEMROOT=D:\\Other renders the same program paths."""
+    import xml.etree.ElementTree as ElementTree
+
+    import jacked.service.environment as environment
+    from jacked.service.batch_programs import pin_programs, utf8_code_page_line
+    from jacked.service.supervisors import _append_task_action
+    from jacked.winproc import system_program
+    from tests.unit.service.service_contract_support import fixed_windows
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(environment, "default_windows_resolvers", lambda: fixed_windows())
+    monkeypatch.setenv("SystemRoot", r"D:\Other")
+    monkeypatch.setenv("windir", r"D:\Other")
+    monkeypatch.setenv("ComSpec", r"D:\Other\cmd.exe")
+
+    assert system_program("powershell").startswith("C:\\Windows\\")
+    assert system_program("cmd") == r"C:\Windows\System32\cmd.exe"
+    assert utf8_code_page_line().startswith('"C:\\Windows\\System32\\chcp.com"')
+    pinned = pin_programs("@echo off\r\nping -n 2 h\r\npowershell -x\r\n", '"C:\\j.exe"')
+    assert "D:\\Other" not in pinned
+    root = ElementTree.Element("Task")
+    _append_task_action(root, MagicMock(launcher_path=r"C:\l\x.ps1"), {}, "-File x")
+    assert root.find("./Actions/Exec/Command").text.startswith("C:\\Windows\\")
+
+    # When the OS call fails, the environment is the fallback.
+    def broken():
+        raise OSError("no API")
+
+    monkeypatch.setattr(
+        environment, "default_windows_resolvers",
+        lambda: MagicMock(windows_directory=broken),
+    )
+    assert system_program("powershell").startswith("D:\\Other\\")
