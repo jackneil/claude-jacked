@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from jacked.testdiet import history, record, tree
+from jacked.testdiet import history, record, run, tree
 from jacked.testdiet.model import TreeId
 from tests._testdiet import fixture_project, fixture_reports, make_repo
 
@@ -313,7 +313,7 @@ def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch, capsy
     assert record.run_gate(junit_gate(6, RED), cwd=repo) == 6
     monkeypatch.setattr(tree, "tree_id", boom)
     assert record.run_gate(junit_gate(6, RED), cwd=repo) == 6
-    monkeypatch.setattr(record.junit, "read_junit", boom)
+    monkeypatch.setattr(run.junit, "read_junit", boom)
     monkeypatch.setattr(tree, "store_dir", boom)
     monkeypatch.setattr(tree, "inputs_fingerprint", boom)
     assert record.run_gate(junit_gate(7, RED), cwd=repo, inputs=["*.txt"]) == 7
@@ -390,7 +390,7 @@ def test_an_interrupt_after_the_gate_keeps_its_exit_code(repo, monkeypatch, caps
     def interrupt(*args, **kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(record.junit, "read_junit", interrupt)
+    monkeypatch.setattr(run.junit, "read_junit", interrupt)
     assert record.run_gate(junit_gate(5, RED), cwd=repo) == 5
     assert "after the gate stopped" in capsys.readouterr().err
     assert _runs(repo) == []
@@ -712,14 +712,14 @@ def test_a_failed_hash_of_the_fixed_reports_reads_no_old_report(repo, side, monk
     def boom(top, globs):
         raise RuntimeError("glob broke")
 
-    real_matches = record._matches
+    real_matches = run._matches
     calls = []
 
     def first_call_fails(top, globs):
         calls.append(1)
         return boom(top, globs) if len(calls) == 1 else real_matches(top, globs)
 
-    monkeypatch.setattr(record, "_matches", first_call_fails)
+    monkeypatch.setattr(run, "_matches", first_call_fails)
     assert record.run_gate(gate(0), cwd=repo, junit=[str(fixed)]) == 0
     assert _last(repo).verdict == "no-data"
     assert "not hashed before the run" in capsys.readouterr().err

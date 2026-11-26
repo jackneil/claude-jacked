@@ -65,7 +65,6 @@ from ._fsutil import (
     _marker_line_count as _marker_line_count,
     _sha_dir as _sha_dir,
     _sha_file as _sha_file,
-    _sha_solo_skill as _sha_solo_skill,
     _sha_text as _sha_text,
     _write_solo_skill as _write_solo_skill,
     agents_skills_dir as agents_skills_dir,
@@ -81,9 +80,6 @@ from ._generate import (
     _CODEX_ADAPTER as _CODEX_ADAPTER,
     _agent_toml as _agent_toml,
     _codex_rules_body as _codex_rules_body,
-    CODEX_NO_IMPLICIT as CODEX_NO_IMPLICIT,
-    CODEX_POLICY_PATH as CODEX_POLICY_PATH,
-    _command_codex_policy as _command_codex_policy,
     _command_skill_md as _command_skill_md,
     _first_nonempty_line as _first_nonempty_line,
     _is_jacked_owned as _is_jacked_owned,
@@ -91,6 +87,7 @@ from ._generate import (
     _skill_engine_prompt as _skill_engine_prompt,
     _split_command_frontmatter as _split_command_frontmatter,
 )
+from ._policy_files import command_skill_parts as _command_skill_parts
 from ._managed import (
     _AGENTS_BEGIN as _AGENTS_BEGIN,
     _AGENTS_END as _AGENTS_END,
@@ -367,17 +364,10 @@ def install_codex(
             # user's own, moved back after a failed write.
             # src None: this skill's content is GENERATED from the command, so
             # the expected-hash identity check is the only source test.
-            # A command that only the user may start gets the Codex policy
-            # file in its skill. The hash and the write take the same extras,
-            # so the manifest of the next install matches the dir.
-            policy = _command_codex_policy(cmd)
-            extras = {CODEX_POLICY_PATH: policy} if policy is not None else None
+            # A command that only the user may start: see _policy_files.
+            expected, copy = _command_skill_parts(cmd, content, lambda *a: _write_solo_skill(*a))
             outcome = _install_codex_skill_dir(
-                None, skill_dir, cmd.stem, prior, preserved,
-                expected=_sha_solo_skill(content, extras),
-                copy=lambda _src, dst, body=content, more=extras: _write_solo_skill(
-                    dst, body, more,
-                ),
+                None, skill_dir, cmd.stem, prior, preserved, expected=expected, copy=copy,
                 this_run=written_this_run,
             )
             if outcome.error is not None:
