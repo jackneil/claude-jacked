@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import re
 import subprocess
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+
+from jacked.winproc import _absolute as _windows_absolute
+from jacked.winproc import system_root
 
 
 _SAFE_PATHS = {
@@ -25,6 +29,37 @@ _LINUX_GUI = {
 }
 _LOCALE_KEYS = {"LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES"}
 _PROXY_KEYS = {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}
+#: Windows OS variables that the service copies from the inherited mapping.
+#: The Windows runtime needs them: without SystemRoot, ``import asyncio``
+#: fails with WinError 10106 when Winsock loads its providers. No value here
+#: holds a secret. The names use the canonical Windows spelling.
+WINDOWS_OS_KEYS = (
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "ComSpec",
+    "PATHEXT",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERNAME",
+    "USERDOMAIN",
+    "COMPUTERNAME",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "OS",
+    "PUBLIC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+)
+#: Windows temporary directory variables, in the order that Windows reads them.
+WINDOWS_TEMP_KEYS = ("TEMP", "TMP")
 
 
 @dataclass(frozen=True)
@@ -42,6 +77,49 @@ def _validate_plain(value: str, name: str) -> str:
     return value
 
 
+def _windows_os_environment(source: dict[str, str], home: str) -> dict[str, str]:
+    """Return the Windows OS variables for a service environment.
+
+    Windows variable names are not case-sensitive. This function matches the
+    inherited names without case and writes the canonical spelling. It always
+    sets SystemRoot and windir. When the inherited mapping has no absolute
+    value, ``jacked.winproc.system_root`` gives the fallback. It always sets
+    TEMP and TMP to one absolute directory, so that Python ``tempfile`` never
+    uses the current directory.
+
+    >>> env = _windows_os_environment({"SYSTEMROOT": r"D:\\Win"}, r"C:\\Users\\a")
+    >>> env["SystemRoot"], env["windir"], env["TEMP"]
+    ('D:\\\\Win', 'D:\\\\Win', 'C:\\\\Users\\\\a\\\\AppData\\\\Local\\\\Temp')
+    """
+    folded = {key.casefold(): value for key, value in source.items()}
+    env: dict[str, str] = {}
+    for key in WINDOWS_OS_KEYS:
+        value = folded.get(key.casefold())
+        if value:
+            env[key] = _validate_plain(value, key)
+    # Resolve one root for both names. A relative or missing value falls back
+    # through the same resolver that every Windows system program call uses.
+    root = system_root(env)
+    env["SystemRoot"] = root
+    env["windir"] = root
+    temp = next(
+        (
+            folded[key.casefold()]
+            for key in WINDOWS_TEMP_KEYS
+            if _windows_absolute(folded.get(key.casefold()))
+        ),
+        None,
+    )
+    if temp is None:
+        local = env.get("LOCALAPPDATA")
+        if not _windows_absolute(local):
+            local = ntpath.join(home, "AppData", "Local")
+        temp = ntpath.join(local, "Temp")
+    env["TEMP"] = _validate_plain(temp, "temp directory")
+    env["TMP"] = env["TEMP"]
+    return env
+
+
 def build_service_environment(
     inputs: EnvironmentInputs,
     *,
@@ -52,6 +130,10 @@ def build_service_environment(
 
     Callers must pass the inherited mapping explicitly.  Nothing in this
     function implicitly copies ``os.environ``.
+
+    On win32 the environment also holds the Windows OS variables in
+    ``WINDOWS_OS_KEYS`` and one TEMP and TMP directory. PATH starts from the
+    resolved SystemRoot.
     """
 
     source = inherited or {}
@@ -63,6 +145,9 @@ def build_service_environment(
     home = _validate_plain(inputs.home, "home")
     if platform == "win32":
         env["USERPROFILE"] = home
+        env.update(_windows_os_environment(source, home))
+        root = env["SystemRoot"]
+        env["PATH"] = f"{ntpath.join(root, 'System32')};{root}"
         if inputs.temp_dir:
             env["TEMP"] = _validate_plain(inputs.temp_dir, "temp directory")
             env["TMP"] = env["TEMP"]
