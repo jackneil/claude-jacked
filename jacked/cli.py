@@ -181,11 +181,12 @@ def _maybe_prompt_first_run(ctx) -> None:
     banner and (interactively) offer to run it now.
 
     Fires only for a human at an interactive terminal — never for the hook /
-    update-status shims (names starting with ``_``), for ``install`` itself, or
+    update-status shims (names starting with ``_``), for ``install`` itself, for
+    ``tests`` (a gate wrapper in scripts and agents), or
     for any non-TTY caller (scripts, CI, Claude Code hooks, the test runner), so
     it can't corrupt automated stdout/stderr."""
     sub = ctx.invoked_subcommand
-    if sub and (sub.startswith("_") or sub == "install"):
+    if sub and (sub.startswith("_") or sub in ("install", "tests")):
         return
     if not _is_interactive_tty():
         return
@@ -7010,6 +7011,142 @@ def dcr_engine_clear():
     console.print("DCR engine config cleared. Reviews use Claude (default).")
     if not existed:
         console.print("[dim](No config file was present.)[/dim]")
+
+
+@main.group(name="tests")
+def tests_group():
+    """Record the runs of a test gate and ask if a tree passed it.
+
+    The history is in the common git directory of the clone. Git never
+    commits it.
+    """
+
+
+_TESTS_KINDS = ("full", "targeted")
+_TESTS_RUNNERS = ("pytest", "vitest", "jest", "playwright", "go", "nextest")
+
+
+def _tests_label(ctx, param, value):
+    """Refuse a label that does not match [A-Za-z0-9._-]+ (usage error, exit 2)."""
+    from jacked.testdiet import record as _record
+
+    try:
+        return _record.check_label(value, param.name.replace("_", " "))
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+
+
+@tests_group.command(name="run", context_settings={"ignore_unknown_options": True,
+                                                    "allow_interspersed_args": False})
+@click.option("--junit", "junit", multiple=True, metavar="GLOB",
+              help="A report at a fixed path. It is read only when its content changes.")
+@click.option("--input", "inputs", multiple=True, metavar="GLOB",
+              help="A file that the gate reads and git does not see. Its fingerprint is recorded.")
+@click.option("--kind", type=click.Choice(_TESTS_KINDS), default=None,
+              help="A label for the views only.")
+@click.option("--label", default=None, callback=_tests_label, help="A label: [A-Za-z0-9._-]+.")
+@click.option("--runner", type=click.Choice(_TESTS_RUNNERS), default=None,
+              help="The runner of the report. Found from the report when not given.")
+@click.option("--strict", is_flag=True, help="Exit 1 when the gate returns 0 and the report holds failures.")
+@click.argument("command", nargs=-1, type=click.UNPROCESSED)
+@click.pass_context
+def tests_run(ctx, junit, inputs, kind, label, runner, strict, command):
+    """Run a gate command, record the run, and return the exit code of the gate.
+
+    Usage: jacked tests run [OPTIONS] -- CMD... An argument that holds {junit}
+    gets the path of a private report file.
+    """
+    import os as _os
+
+    from jacked.testdiet import record as _record
+
+    if not command:
+        raise click.UsageError("give the gate command after --")
+    code = _record.run_gate(list(command), cwd=Path(_os.getcwd()), junit=junit, inputs=inputs,
+                            kind=kind, label=label, runner=runner, strict=strict)
+    ctx.exit(code)
+
+
+@tests_group.command(name="record")
+@click.option("--junit", "junit", multiple=True, required=True, metavar="PATH",
+              type=click.Path(dir_okay=False, path_type=Path), help="A JUnit file of the run.")
+@click.option("--kind", type=click.Choice(_TESTS_KINDS), default=None, help="A label for the views only.")
+@click.option("--label", default=None, callback=_tests_label, help="A label: [A-Za-z0-9._-]+.")
+@click.option("--runner", type=click.Choice(_TESTS_RUNNERS), default=None,
+              help="The runner of the report. Found from the report when not given.")
+@click.option("--exit-code", "exit_code", type=int, default=None,
+              help="The exit code of the gate. With no value the verdict is unknown.")
+@click.option("--wall", "wall", type=click.FloatRange(min=0), default=None, metavar="SECONDS",
+              help="The wall time of the gate.")
+@click.option("--commit", default=None, metavar="SHA", help="The commit that the gate ran on.")
+@click.option("--machine", default=None, callback=_tests_label, metavar="LABEL",
+              help="The label of the machine that ran the gate.")
+@click.option("--report-root", "report_root", default=None, metavar="PATH",
+              help="The root folder of the machine that wrote the report.")
+def tests_record(junit, kind, label, runner, exit_code, wall, commit, machine, report_root):
+    """Record the JUnit files of a gate run that was not wrapped."""
+    import os as _os
+
+    from jacked.testdiet import record as _record
+    from jacked.testdiet.model import JUnitError
+    from jacked.testdiet.tree import TreeError
+
+    try:
+        meta = _record.record_files(list(junit), cwd=Path(_os.getcwd()), kind=kind, label=label,
+                                    runner=runner, commit=commit, exit_code=exit_code,
+                                    wall_seconds=wall, machine=machine, report_root=report_root)
+    except (JUnitError, TreeError, OSError) as exc:
+        _record.emit(f"nothing is recorded: {exc}")
+        raise SystemExit(1)
+    click.echo(f"{meta.id} {meta.verdict}")
+
+
+@tests_group.command(name="seen", context_settings={"ignore_unknown_options": True,
+                                                     "allow_interspersed_args": False})
+@click.option("--input", "inputs", multiple=True, metavar="GLOB",
+              help="The same --input globs that the run had.")
+@click.option("--any-machine", "any_machine", is_flag=True, help="Accept a run of a different machine.")
+@click.option("--json", "as_json", is_flag=True, help="Print the record as JSON (null when not seen).")
+@click.argument("command", nargs=-1, type=click.UNPROCESSED)
+def tests_seen(inputs, any_machine, as_json, command):
+    """Exit 0 when this tree passed this gate command on this machine. Exit 1 when not.
+
+    Usage: jacked tests seen [OPTIONS] -- CMD...
+    """
+    import dataclasses
+    import json as _json
+    import os as _os
+
+    from jacked.testdiet import record as _record
+    from jacked.testdiet import tree as _tree
+
+    if not command:
+        raise click.UsageError("give the gate command after --")
+    found = None
+    try:
+        top = _record.work_tree_top(Path(_os.getcwd()))
+        current = _tree.tree_id(top)
+        if current is not None:
+            found = _record.seen(_tree.store_dir(top), current, _tree.command_sha(list(command)),
+                                 inputs_sha=_tree.inputs_fingerprint(top, inputs),
+                                 machine_id=_tree.machine_id(), any_machine=any_machine)
+        else:
+            _record.emit("this repository has no tree identity (no commit, or git failed).")
+    except _tree.TreeError:
+        _record.emit("this folder is not in the work tree of a git repository.")
+    if as_json:
+        data = None
+        if found is not None:
+            data = dataclasses.asdict(found)
+            data.pop("machine_id", None)
+        click.echo(_json.dumps(data, indent=1, sort_keys=True))
+    elif found is not None:
+        counts = ", ".join(f"{k} {v}" for k, v in (found.counts or {}).items()) or "no counts"
+        wall = "unknown" if found.wall_seconds is None else f"{found.wall_seconds} s"
+        click.echo(_record.clean_text(f"{found.id} started {found.started}, wall {wall}, {counts}"))
+    else:
+        _record.emit("no passed run of this tree, this command and this machine.")
+    raise SystemExit(0 if found is not None else 1)
 
 
 main.add_command(issues_group)
