@@ -199,7 +199,9 @@ def history(store: Path, *, machine: str | None = None, days: int | None = None,
     ``days`` keeps the runs whose run ID (the clock of this machine when the
     run was recorded) is less than that number of days before ``now``.
     ``now`` must be an aware datetime. ``first`` and ``last`` of a failing
-    set are the start times of its oldest and its newest run.
+    set are the start times of its oldest and its newest run. A store with
+    no run gives a result with no machine and no rows, which is not an
+    error. A ``machine`` with no run raises ``ViewError``.
     """
     if now is not None and now.tzinfo is None:
         raise ValueError("now must be an aware datetime (UTC)")
@@ -207,6 +209,8 @@ def history(store: Path, *, machine: str | None = None, days: int | None = None,
         raise ValueError("days must be 0 or more")
     store = Path(store)
     runs = list(_history.iter_runs(store))
+    if not runs and machine is None:
+        return _empty_history(store, days)
     key, notes = _select(runs, machine)
     mine = [m for m in runs if _key(m) == key]
     if days is not None:
@@ -249,6 +253,19 @@ def history(store: Path, *, machine: str | None = None, days: int | None = None,
         "repeated_green": repeated, "failing_sets": failing_sets,
         "flaky": [{"id": i, "runs": n} for i, n in sorted(flaky.items(), key=lambda x: (-x[1], x[0]))],
         "other_machines": others, "size_bytes": _store_size(store),
+    }
+
+
+#: The one line of ``history`` on a store with no run. It is not an error.
+NO_RUN = "the history has no run."
+
+
+def _empty_history(store: Path, days: int | None) -> dict:
+    """The result of ``history`` on a store with no run: no machine, no rows, zero runs."""
+    return {
+        "machine": None, "notes": [NO_RUN], "days": days, "runs": 0, "labelled_full_runs": 0,
+        "verdicts": dict.fromkeys(VERDICTS, 0), "failing_counts": [], "repeated_green": [],
+        "failing_sets": [], "flaky": [], "other_machines": [], "size_bytes": _store_size(store),
     }
 
 
@@ -296,7 +313,12 @@ def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
 
 
 def render_history(result: dict, *, size: bool = False) -> str:
-    """The text output of ``history``. ``size`` adds the size of the store."""
+    """The text output of ``history``. ``size`` adds the size of the store.
+
+    A store with no run gives one line.
+    """
+    if result["machine"] is None:
+        return NO_RUN
     lines = list(result["notes"])
     span = "all runs" if result["days"] is None else f"the runs of the last {result['days']} days"
     lines.append(f"{span}: {result['runs']}, with the kind full: {result['labelled_full_runs']}")

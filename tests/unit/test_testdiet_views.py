@@ -266,10 +266,24 @@ def test_cli_prune_prints_each_run_that_it_deletes(repo, monkeypatch):
 
 
 def test_cli_views_outside_a_work_tree_and_with_no_run(repo, tmp_path, monkeypatch):
-    for command in (("profile",), ("history",)):
-        empty = _invoke("tests", *command)
-        assert empty.exit_code == 1 and "the history has no run" in empty.output
-    assert _invoke("tests", "profile", "--run", "nope").exit_code == 1
+    # An empty history is not an error for history. It is for profile.
+    empty = _invoke("tests", "history")
+    assert (empty.exit_code, empty.output) == (0, "the history has no run.\n")
+    data = json.loads(_invoke("tests", "history", "--json").output)
+    assert (data["machine"], data["runs"], data["failing_sets"]) == (None, 0, [])
+    assert set(data["verdicts"].values()) == {0}
+    empty = _invoke("tests", "profile")
+    assert empty.exit_code == 1 and "the history has no run" in empty.output
+    # An unknown --run or --machine is an error for each command, empty store or not.
+    for command in (("profile", "--run", "nope"), ("profile", "--machine", "ci"),
+                    ("history", "--machine", "ci")):
+        result = _invoke("tests", *command)
+        assert result.exit_code == 1 and len(result.output.splitlines()) == 1
+    store_run(tree.store_dir(repo), "20261125T080000", exit_code=0, tests=None)
+    for command in (("profile", "--run", "20261125T080000000000Z-00000000"),
+                    ("profile", "--machine", "ci"), ("history", "--machine", "ci")):
+        result = _invoke("tests", *command)
+        assert result.exit_code == 1 and len(result.output.splitlines()) == 1
     assert _invoke("tests", "history", "--machine", "a b").exit_code == 2
     outside = tmp_path / "outside"
     outside.mkdir()
