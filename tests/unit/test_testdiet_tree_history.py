@@ -669,6 +669,8 @@ def test_prune_refuses_a_naive_now(tmp_path):
     history.write_run(tmp_path, _meta("20261120T100000000000Z-00000001"), None)
     with pytest.raises(ValueError):
         history.prune(tmp_path, date(2026, 11, 25), now=datetime(2026, 11, 26, 10, 0))
+    with pytest.raises(ValueError):  # also with no runs folder
+        history.prune(tmp_path / "empty", date(2026, 11, 25), now=datetime(2026, 11, 26, 10, 0))
 
 
 def test_a_prune_failure_names_the_file_and_keeps_the_deleted_ids(tmp_path, monkeypatch):
