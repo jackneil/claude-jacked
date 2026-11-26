@@ -334,6 +334,9 @@ def _run_gate(argv: list[str], cwd: Path, signals: _Signals, junit: Sequence[str
                 if changed:
                     _guard("list the changed paths",
                            lambda: _print_changes(cwd, before, after, objects), None)
+                # No stop from here on: a signal between the tests file and the meta
+                # file, or after write_run, would leave an orphan or a second record.
+                signals.raise_ok = False
                 meta = _guard("write the record", write, None)
             finally:
                 signals.raise_ok = False

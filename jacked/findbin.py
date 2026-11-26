@@ -406,7 +406,7 @@ def find_on_path(name: str) -> str | None:
     found = shutil.which(name)
     if found and _is_unlisted_cwd_hit(found):
         # Values-free: the name is a fixed command name.
-        logger.debug("find_bin: skipped a %s in the current folder, which is not on PATH", name)
+        logger.debug("find_on_path: skipped a %s in the current folder, which is not on PATH", name)
         found = _which_on_path(name)
     return found
 
