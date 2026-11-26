@@ -67,6 +67,8 @@ _INDEX_COPY_ARGS = ("-c", "core.splitIndex=false", "-c", "core.checkStat=default
                     "-c", "core.trustctime=true")
 # The exit code of git for an option that it does not know.
 _GIT_USAGE_ERROR = 129
+# 1980-01-01 UTC, the first time that a FAT file system can store.
+_FAT_FLOOR_NS = 315_532_800 * 10**9
 # A failure of the work-tree read is logged at WARNING one time in each process.
 _warned_add = False
 # The size of the machine identity, in random bytes (32 hex characters).
@@ -230,7 +232,9 @@ def _copy_index(source: Path, target: Path) -> None:
     second. The content and the times come from one open file, so a write of
     the index between them cannot mix two versions. When the file system
     rounds the time of the copy up, the copy gets the whole second of the
-    source; when that is still later, it gets time zero. So the copy is never
+    source; when that is still later, it gets time zero. A file system that
+    cannot store time zero (FAT starts in 1980) gets 1980-01-01 UTC. When that
+    also fails, this function raises ``TreeError``. So the copy is never
     later than the source.
     """
     with open(source, "rb") as src, open(target, "wb") as dst:
@@ -243,7 +247,13 @@ def _copy_index(source: Path, target: Path) -> None:
         if os.stat(target).st_mtime_ns > info.st_mtime_ns:
             # Time zero makes each entry racy: git then checks content only,
             # which is slower and always correct.
-            os.utime(target, ns=(0, 0))
+            try:
+                os.utime(target, ns=(0, 0))
+            except OSError:
+                try:
+                    os.utime(target, ns=(_FAT_FLOOR_NS, _FAT_FLOOR_NS))
+                except OSError as exc:
+                    raise TreeError(f"cannot set an early time on the index copy: {type(exc).__name__}") from exc
 
 
 def remove_tree(path: Path) -> None:

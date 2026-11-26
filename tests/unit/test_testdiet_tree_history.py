@@ -1012,3 +1012,36 @@ def test_an_index_copy_that_stays_later_after_the_floor_gets_time_zero(tmp_path,
     copy = tmp_path / "copy"
     tree._copy_index(source, copy)
     assert copy.stat().st_mtime_ns == 0
+
+
+def _index_with_rounding_utime(tmp_path, monkeypatch, refuse):
+    """An index, and an ``os.utime`` that rounds the copy up and refuses the times in ``refuse``."""
+    source = tmp_path / "index"
+    source.write_bytes(b"DIRC")
+    when = 1_700_000_000_123_456_789
+    os.utime(source, ns=(when, when))
+    real_utime = os.utime
+
+    def fat_like(path, *args, ns=None, **kwargs):
+        if Path(path) != source and ns in refuse:
+            raise OSError(22, "Invalid argument")
+        if ns is not None and ns[1] > tree._FAT_FLOOR_NS and Path(path) != source:
+            ns = (ns[0] + 2 * 10**9, ns[1] + 2 * 10**9)
+        return real_utime(path, *args, ns=ns, **kwargs)
+
+    monkeypatch.setattr(os, "utime", fat_like)
+    return source, tmp_path / "copy"
+
+
+def test_an_index_copy_on_a_file_system_that_refuses_time_zero_gets_the_1980_floor(tmp_path, monkeypatch):
+    source, copy = _index_with_rounding_utime(tmp_path, monkeypatch, refuse={(0, 0)})
+    tree._copy_index(source, copy)
+    assert copy.stat().st_mtime_ns == 315_532_800 * 10**9
+    assert copy.stat().st_mtime_ns <= source.stat().st_mtime_ns
+
+
+def test_an_index_copy_that_cannot_get_an_early_time_raises_tree_error(tmp_path, monkeypatch):
+    floor = (tree._FAT_FLOOR_NS, tree._FAT_FLOOR_NS)
+    source, copy = _index_with_rounding_utime(tmp_path, monkeypatch, refuse={(0, 0), floor})
+    with pytest.raises(tree.TreeError, match="index copy"):
+        tree._copy_index(source, copy)

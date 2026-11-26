@@ -232,33 +232,55 @@ def _go_table(text: str, index: _Index, brace: int, loop: int, name: str) -> int
     return _elements(text, index, *literal)
 
 
-def _go_loops(text: str, index: _Index, brace: int, end: int) -> list[tuple[int, int, int]]:
-    """Each for loop of a body as (head start, body brace, body close).
+def _go_body_brace(text: str, index: _Index, start: int, end: int) -> int:
+    """Return the body brace of the for header that starts at ``start``, or -1 when there is none.
 
-    The body brace is the first brace of the for line that does not close on
-    that line. A brace that closes on the line belongs to a literal.
+    The body brace is the first ``{`` at paren and bracket depth 0 that comes
+    after a space or a ``)``. A ``{`` directly after another character
+    (``[]string{``, ``struct{``, ``Type{``) opens a composite literal, and
+    the scan goes on after its close. gofmt writes ``X {`` for a body and
+    ``T{`` for a literal. Go also requires parentheses around a bare type
+    literal in a for header. So this rule reads gofmt'ed code exactly.
+    """
+    j = start
+    while j < end:
+        if j in index.spans:
+            j = index.spans[j]
+            continue
+        ch = text[j]
+        if ch in "([{":
+            if ch == "{" and (text[j - 1].isspace() or text[j - 1] == ")"):
+                return j
+            close = index.closes.get(j, -1)
+            if close < 0:
+                return -1
+            j = close
+            continue
+        if ch in ")]}":
+            return -1
+        j += 1
+    return -1
+
+
+def _go_loops(text: str, index: _Index, brace: int, end: int) -> list[tuple[int, int, int]]:
+    """Each for loop of a body as (head end, body brace, body close).
+
+    A loop with no body brace has the body brace -1, and it holds all the
+    text from its head to ``end``. Its cases are not counted.
     """
     loops = []
     for loop in re.finditer(r"\bfor\b", text[:end]):
         if loop.start() <= brace or not index.in_code(loop.start()):
             continue
-        line_end = text.find("\n", loop.end())
-        line_end = end if line_end < 0 else line_end
-        j, last = text.find("{", loop.end(), line_end + 1), None
-        while 0 <= j:
-            close = index.closes.get(j, -1)
-            if close < 0:
-                break
-            last = (j, close)
-            if "\n" in text[j:close]:
-                break
-            j = text.find("{", close, line_end + 1)
-        if last is not None:
-            loops.append((loop.end(), *last))
+        open_ = _go_body_brace(text, index, loop.end(), end)
+        close = index.closes.get(open_, -1) if open_ >= 0 else -1
+        loops.append((loop.end(), open_, close) if close >= 0 else (loop.end(), -1, end))
     return loops
 
 
 def _range_rows(text: str, index: _Index, brace: int, head: int, open_: int) -> int | None:
+    if open_ < 0:
+        return None
     target = re.search(r"\brange\s+", text[head:open_])
     if target is None:
         return None
@@ -277,11 +299,11 @@ def _go_cases(text: str, index: _Index, brace: int, end: int, runs: re.Pattern[s
     for run in runs.finditer(text, brace, end):
         if not index.in_code(run.start()):
             continue
-        inside = [item for item in loops if item[1] < run.start() < item[2]]
+        inside = [item for item in loops if item[0] <= run.start() < item[2]]
         if not inside:
             rows = 1
         else:
-            head, open_, _ = max(inside, key=lambda item: item[1])
+            head, open_, _ = max(inside, key=lambda item: item[0])
             rows = _range_rows(text, index, brace, head, open_)
         total = None if total is None or rows is None else total + rows
     return total

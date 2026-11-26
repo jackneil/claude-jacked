@@ -716,3 +716,46 @@ def test_rust_skips_a_block_comment_between_the_test_attribute_and_fn():
     body = "#[test]\n/* a note\n   on two lines */\n#[ignore]\nfn later() {\n    assert!(true);\n}\n"
     found = by_name("src/lib.rs", body)
     assert (found["later"].skipped, found["later"].asserts) == (True, 1)
+
+
+GO_MULTILINE = """package calc
+
+import "testing"
+
+func TestMultiline(t *testing.T) {
+\tfor _, s := range []string{
+\t\t"a",
+\t\t"b",
+\t\t"c",
+\t} {
+\t\tt.Run(s, func(t *testing.T) {
+\t\t\tif s == "" {
+\t\t\t\tt.Fatal("empty")
+\t\t\t}
+\t\t})
+\t}
+}
+"""
+
+
+def test_a_go_multi_line_inline_table_row_that_is_cut_prints_fewer_cases(repo):
+    found = by_name("calc_test.go", GO_MULTILINE)["TestMultiline"]
+    assert (found.cases, found.unread) == (3, ())
+    write(repo, "calc/multi_test.go", GO_MULTILINE.encode())
+    commit(repo, "multi-line inline table")
+    write(repo, "calc/multi_test.go", GO_MULTILINE.replace('\t\t"c",\n', "").encode())
+    assert loss.loss_report(repo, "HEAD").fewer_cases == (("calc/multi_test.go::TestMultiline", 3, 2),)
+
+
+def test_a_go_for_header_with_no_body_brace_gives_no_case_count():
+    body = ('package calc\n\nfunc TestNoBody(t *testing.T) {\n\tfor _, s := range names\n'
+            '\t\tt.Run(s, func(t *testing.T) {})\n}\n')
+    found = by_name("calc_test.go", body)["TestNoBody"]
+    assert (found.cases, found.unread) == (None, (loss_scan.COMPUTED_CASES,))
+
+
+def test_a_go_loop_over_a_struct_table_in_the_header_counts_its_rows():
+    body = ('package calc\n\nfunc TestStruct(t *testing.T) {\n\tfor _, tc := range []struct{ n int }{\n'
+            '\t\t{1},\n\t\t{2},\n\t} {\n\t\tt.Run("x", func(t *testing.T) {})\n\t}\n'
+            '\tfor i := 0; i < 3; i++ {\n\t\t_ = i\n\t}\n\tt.Run("after", func(t *testing.T) {})\n}\n')
+    assert by_name("calc_test.go", body)["TestStruct"].cases == 3

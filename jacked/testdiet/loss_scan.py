@@ -32,9 +32,12 @@ The cases of a test:
 - Go: each ``t.Run(`` call in the body counts 1. A ``t.Run`` inside a
   ``for _, x := range NAME`` loop, where NAME is a slice composite literal
   that the same function assigns, or a ``range []T{...}`` over an inline
-  literal, counts the top-level elements of that literal. A literal that is
-  assigned again before the loop (``NAME =``, ``NAME = append(``) and a loop
-  over any other value give no count.
+  literal on one line or on many lines, counts the top-level elements of
+  that literal. The loop body is the first ``{`` of the for header that
+  comes after a space or a ``)``; a ``{`` directly after a type opens a
+  literal. A literal that is assigned again before the loop (``NAME =``,
+  ``NAME = append(``), a loop over any other value and a for header with no
+  body brace give no count.
 - Rust: always 1.
 
 A case list that the source computes (a name, a call, a comprehension) gives
