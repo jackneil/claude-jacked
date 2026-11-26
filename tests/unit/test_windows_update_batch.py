@@ -38,7 +38,10 @@ def _unpin(raw: str) -> str:
     absolute paths) is in ``seen["raw"]``; TestEveryProgramIsAbsolute reads it."""
     from jacked.winproc import system_program
 
-    lines = [line for line in raw.split("\r\n") if not line.startswith("set JACKED=")]
+    lines = [
+        line for line in raw.split("\r\n")
+        if not line.startswith("set JACKED=") and not line.endswith(" 65001 >NUL")
+    ]
     body = "\r\n".join(lines).replace("%JACKED%", "jacked")
     for name in ("powershell", "ping"):
         body = body.replace(f'"{system_program(name)}"', name)
@@ -54,8 +57,9 @@ def _capture_batch(spawn) -> dict:
         seen["kwargs"] = kwargs
         # newline="" — the batch is CRLF and the assertions compare against
         # CRLF-joined builders; universal-newline translation would break them.
-        with open(args[2], encoding="utf-8", newline="") as fh:
-            seen["raw"] = fh.read()
+        with open(args[2], "rb") as fh:
+            seen["bytes"] = fh.read()
+        seen["raw"] = seen["bytes"].decode("utf-8")
         seen["body"] = _unpin(seen["raw"])
 
         class _P:
@@ -1382,7 +1386,7 @@ class TestEveryProgramIsAbsolute:
 
         seen, jacked = self._with_jacked(which, monkeypatch)
         assert bare_commands(seen["raw"]) == []
-        assert f'set JACKED="{jacked}"' in seen["raw"].split("\r\n")[:3]
+        assert f'set JACKED="{jacked}"' in seen["raw"].split("\r\n")[:4]
         # The checker is not vacuous: the same batch with bare names fails it.
         assert len(bare_commands(seen["body"])) > 5
 
@@ -1453,3 +1457,51 @@ class TestEveryProgramIsAbsolute:
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "is not recognized" not in result.stdout + result.stderr
+
+
+class TestEveryBatchSurvivesAnyProfilePath:
+    """cmd.exe reads a batch in the console code page. The batch is UTF-8
+    with an ASCII `chcp 65001` line first, so Ñ and Владимир survive."""
+
+    @pytest.mark.parametrize("which", sorted(BATCH_BUILDERS))
+    def test_the_rendered_bytes_are_utf8_after_an_ascii_chcp_line(self, which, monkeypatch):
+        jacked = r"C:\Users\NUÑEZ Владимир\.local\bin\jacked.exe"
+        monkeypatch.setitem(_BINS, "jacked", jacked)
+        data = BATCH_BUILDERS[which]()["bytes"]
+        lines = data.split(b"\r\n")
+        assert lines[0].lower() == b"@echo off"
+        assert lines[1].endswith(b'chcp.com" 65001 >NUL') and lines[1].isascii()
+        assert not data.startswith(b"\xef\xbb\xbf")
+        assert f'set JACKED="{jacked}"'.encode("utf-8") in lines
+        assert data.decode("utf-8")  # strict
+
+    def test_a_non_ascii_line_before_chcp_is_refused(self):
+        from jacked.service.batch_programs import encode_batch
+
+        with pytest.raises(ValueError, match="ASCII"):
+            encode_batch('@echo off\r\nset X=Ñ\r\n"C:\\W\\chcp.com" 65001 >NUL\r\n')
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="runs cmd.exe")
+    def test_a_batch_in_a_non_ascii_folder_runs_and_writes_its_marker(self, tmp_path, monkeypatch):
+        from jacked.service import batch_programs
+        from jacked.winproc import system_program
+
+        folder = tmp_path / "NUÑEZ Владимир"
+        folder.mkdir()
+        monkeypatch.setattr(batch_programs.tempfile, "tempdir", str(folder))
+        monkeypatch.setitem(_BINS, "jacked", str(folder / "jacked.exe"))
+        monkeypatch.setattr("jacked.findbin.find_bin", lambda name, **kw: _BINS.get(name))
+        body = (
+            "@echo off\r\n"
+            'echo ok> "%~dp0marker.txt"\r\n'
+            'set "NAME=Владимир NUÑEZ"\r\n'
+            'echo %NAME%> "%~dp0name.txt"\r\n'
+        )
+        path = batch_programs.write_batch(body, "jacked-test-")
+        assert str(folder) in path
+        result = subprocess.run(
+            [system_program("cmd"), "/c", path], capture_output=True, timeout=60, check=False
+        )
+        assert result.returncode == 0, result
+        assert (folder / "marker.txt").read_text().strip() == "ok"
+        assert (folder / "name.txt").read_bytes().strip() == "Владимир NUÑEZ".encode("utf-8")

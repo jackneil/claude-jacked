@@ -17,6 +17,15 @@ resolves each program when it builds the script:
 
 :func:`bare_commands` lists each command in a batch that is not a cmd.exe
 built-in and is not an absolute path. The tests use it on every batch.
+
+The batch is UTF-8, so it survives any profile path (Ñ, Владимир). cmd.exe
+reads each batch line in the console code page, and the OEM code page
+cannot hold every character (cp437 has no Cyrillic). So the first two lines
+are ASCII: ``@echo off``, then ``chcp 65001`` by its absolute path. Every
+line after them reads as UTF-8. The file has no BOM, because a BOM breaks
+the first command. ``chcp 65001`` stops a batch at once only before
+Windows 7 (https://stackoverflow.com/questions/32182619), and jacked needs
+Windows 10 or later.
 """
 
 from __future__ import annotations
@@ -74,8 +83,8 @@ def pin_programs(body: str, jacked: str) -> str:
     """Return ``body`` with every program named by an absolute path.
 
     >>> body = '@echo off\\r\\njacked _x\\r\\n  ping -n 2 h\\r\\n'
-    >>> pin_programs(body, '"C:\\\\b\\\\jacked.exe"').splitlines()[:4]
-    ['@echo off', 'set JACKED="C:\\\\b\\\\jacked.exe"', '%JACKED% _x', '  "C:\\\\Windows\\\\System32\\\\ping.exe" -n 2 h']
+    >>> pin_programs(body, '"C:\\\\b\\\\jacked.exe"').splitlines()[2:5]
+    ['set JACKED="C:\\\\b\\\\jacked.exe"', '%JACKED% _x', '  "C:\\\\Windows\\\\System32\\\\ping.exe" -n 2 h']
     """
     from jacked.winproc import system_program
 
@@ -88,21 +97,48 @@ def pin_programs(body: str, jacked: str) -> str:
     lines = [_COMMAND_AT.sub(pin, line) for line in body.split("\r\n")]
     setter = "set JACKED=" + jacked.replace("%", "%%")
     at = 1 if lines and lines[0].lower().startswith("@echo off") else 0
-    lines.insert(at, setter)
+    lines[at:at] = [utf8_code_page_line(), setter]
     return "\r\n".join(lines)
+
+
+def utf8_code_page_line() -> str:
+    """Return the ASCII line that makes cmd.exe read the rest of a batch as UTF-8.
+
+    >>> utf8_code_page_line()
+    '"C:\\\\Windows\\\\System32\\\\chcp.com" 65001 >NUL'
+    """
+    from jacked.winproc import system_root
+
+    chcp = ntpath.join(system_root(), "System32", "chcp.com")
+    if not chcp.isascii():
+        chcp = r"%SystemRoot%\System32\chcp.com"
+    return f'"{chcp}" 65001 >NUL'
+
+
+def encode_batch(text: str) -> bytes:
+    """Encode a pinned batch: strict UTF-8, no BOM, ASCII up to the chcp line.
+
+    >>> encode_batch('@echo off\\r\\n"C:\\\\W\\\\chcp.com" 65001 >NUL\\r\\necho \\u00d1')[-2:]
+    b'\\xc3\\x91'
+    """
+    lines = text.split("\r\n")
+    head = next((i for i, line in enumerate(lines) if " 65001 >NUL" in line), None)
+    if head is None or not all(line.isascii() for line in lines[: head + 1]):
+        raise ValueError("a batch must start with ASCII lines up to chcp 65001")
+    return text.encode("utf-8", errors="strict")
 
 
 def write_batch(body: str, prefix: str) -> str:
     """Pin the programs of ``body``, write it to a new temporary .bat file, return its path.
 
-    The batch deletes itself at the end. ``newline=""``: the body already
-    carries explicit CRLF line ends, and a second translation writes CR CR LF.
+    The batch deletes itself at the end. It is written as bytes from
+    :func:`encode_batch`: the body already carries explicit CRLF line ends.
     """
-    pinned = pin_programs(body, resolve_jacked())
+    data = encode_batch(pin_programs(body, resolve_jacked()))
     descriptor, path = tempfile.mkstemp(suffix=".bat", prefix=prefix)
     try:
-        with os.fdopen(descriptor, "w", newline="") as handle:
-            handle.write(pinned)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
     except BaseException:
         Path(path).unlink(missing_ok=True)
         raise
@@ -200,7 +236,9 @@ def bare_commands(body: str) -> list[str]:
 __all__ = [
     "CMD_BUILTINS",
     "bare_commands",
+    "encode_batch",
     "pin_programs",
     "resolve_jacked",
+    "utf8_code_page_line",
     "write_batch",
 ]
