@@ -390,15 +390,16 @@ def test_one_number_ties_the_budget_the_callers_and_the_batches():
     # A 0.111.x caller passes no --timeout and stops the command after 120 s
     # (its own PREFLIGHT_TIMEOUT_SECONDS). The default must end first.
     old_caller_limit = 120
-    assert preflight_budget(None) == PREFLIGHT_TIMEOUT_SECONDS - 10
-    assert preflight_budget(None) < old_caller_limit
+    # Its clock starts at spawn, ours after the CLI import: keep 20 s spare.
+    assert preflight_budget(None) == PREFLIGHT_TIMEOUT_SECONDS - 20
+    assert preflight_budget(None) <= old_caller_limit - 20
     assert updater.preflight_argv("j")[-2:] == ["--timeout", str(PREFLIGHT_TIMEOUT_SECONDS)]
     literal = f"jacked service preflight --timeout {PREFLIGHT_TIMEOUT_SECONDS} 2>&1"
     root = Path(__file__).resolve().parents[3]
     assert literal in (root / "jacked/cli.py").read_text(encoding="utf-8")
     assert literal in (root / "jacked/service/updater.py").read_text(encoding="utf-8")
     help_text = CliRunner().invoke(main, ["service", "preflight", "--help"]).output
-    assert f"default {PREFLIGHT_TIMEOUT_SECONDS - 10}" in " ".join(help_text.split())
+    assert f"default {PREFLIGHT_TIMEOUT_SECONDS - 20}" in " ".join(help_text.split())
 
 
 def test_preflight_end_to_end_through_the_real_launcher(tmp_path, monkeypatch):
@@ -558,3 +559,25 @@ def test_program_paths_come_from_the_os_not_the_caller(monkeypatch):
         lambda: MagicMock(windows_directory=broken),
     )
     assert system_program("powershell").startswith("D:\\Other\\")
+
+
+def test_a_cleanup_that_cannot_remove_its_files_never_raises(contract, monkeypatch):
+    """On Windows a killed child can hold the report open: unlink fails."""
+    import subprocess
+
+    spec, environment, paths = contract
+    real_unlink = Path.unlink
+
+    def held(self, *args, **kwargs):
+        if self.name == PROBE_REPORT_NAME or self.suffix == ".ps1":
+            raise PermissionError(32, "the file is in use")
+        return real_unlink(self, *args, **kwargs)
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("probe", 1)
+
+    monkeypatch.setattr(Path, "unlink", held)
+    result = run_service_probe(
+        spec, environment, paths.root, ProbeOptions(timeout=1, runner=timeout)
+    )
+    assert (result.ok, result.detail) == (False, "timeout after 1s")

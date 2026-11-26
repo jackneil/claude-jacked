@@ -7873,7 +7873,7 @@ def _exit_hard(code: int) -> None:
     default=None,
     type=float,
     help=(
-        "The time budget of the whole command, in seconds (default 110, under an "
+        "The time budget of the whole command, in seconds (default 100, under an "
         "old upgrade helper's 120 s timeout). Provisioning and the probe share it. "
         "When it ends, the command fails with exit code 1."
     ),

@@ -25,7 +25,7 @@ console = Console()
 def preflight_budget(timeout_seconds: float | None) -> float:
     """Return the total time budget of the preflight command, in seconds.
 
-    The default is ``PREFLIGHT_DEFAULT_BUDGET_SECONDS``: 10 seconds less
+    The default is ``PREFLIGHT_DEFAULT_BUDGET_SECONDS``: 20 seconds less
     than the timeout of an older upgrade helper that passes no ``--timeout``.
 
     >>> preflight_budget(5.0)

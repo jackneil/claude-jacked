@@ -120,3 +120,21 @@ def test_on_windows_the_log_gets_the_private_acl_best_effort(tmp_path, monkeypat
     record("Traceback\nImportError: y\n", path=tmp_path / "boot.log", now=1)
     assert latest(path=tmp_path / "boot.log")[1] == "ImportError: y"
     assert "could not set the private ACL" in capsys.readouterr().err
+
+
+def test_status_reads_the_log_once(tmp_path, monkeypatch):
+    """A log removed after the first read must not break `service status`."""
+    log = tmp_path / "boot.log"
+    record("Traceback\nImportError: x\n", path=log, now=0)
+    real_read = boot_failure._read
+    calls = []
+
+    def read_then_remove(path):
+        calls.append(path)
+        found = real_read(path)
+        path.unlink(missing_ok=True)
+        return found
+
+    monkeypatch.setattr(boot_failure, "_read", read_then_remove)
+    assert boot_failure.describe_latest(path=log).startswith("ImportError: x (at 1970")
+    assert len(calls) == 1

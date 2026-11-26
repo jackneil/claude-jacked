@@ -128,7 +128,13 @@ def record(trace: str, *, path: Path | None = None, now: float | None = None) ->
 
 
 def record_started(*, path: Path | None = None, now: float | None = None) -> None:
-    """Append one "started OK" line when the newest entry is a failure. Never raise."""
+    """Append one "started OK" line when the newest entry is a failure. Never raise.
+
+    This is a read, then a write, with no lock. A failure that a second
+    jacked process writes in the same moment can be lost. That needs two
+    processes at once: one that starts the service, and one that cannot
+    import its CLI. That is two installs, one of them broken, at one time.
+    """
     path = log_path() if path is None else path
     try:
         _old, entries = _read(path)
@@ -143,15 +149,17 @@ def record_current() -> None:
     record(traceback.format_exc())
 
 
+def _summary(entry: str) -> tuple[str, str]:
+    lines = [line.strip() for line in entry.splitlines() if line.strip()]
+    stamp = lines[0][len(ENTRY_MARK):].removesuffix("===").strip()
+    return stamp, lines[-1] if len(lines) > 1 else ""
+
+
 def latest(*, path: Path | None = None) -> tuple[str, str] | None:
     """Return the time and the last line of the newest failure entry, or None."""
     _text, entries = _read(log_path() if path is None else path)
     failures = [entry for entry in entries if entry.startswith(ENTRY_MARK)]
-    if not failures:
-        return None
-    lines = [line.strip() for line in failures[-1].splitlines() if line.strip()]
-    stamp = lines[0][len(ENTRY_MARK):].removesuffix("===").strip()
-    return stamp, lines[-1] if len(lines) > 1 else ""
+    return _summary(failures[-1]) if failures else None
 
 
 def describe_latest(*, path: Path | None = None) -> str | None:
@@ -173,5 +181,6 @@ def describe_latest(*, path: Path | None = None) -> str | None:
     _text, entries = _read(path)
     if not entries or not entries[-1].startswith(ENTRY_MARK):
         return None
-    stamp, last = latest(path=path)
+    # One read only: a second read can find the file gone.
+    stamp, last = _summary(entries[-1])
     return f"{last} (at {stamp}, see {path})"

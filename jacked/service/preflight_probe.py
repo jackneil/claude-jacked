@@ -39,6 +39,7 @@ reports an environment value.
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import subprocess
 import sys
@@ -62,6 +63,8 @@ from jacked.service.probe_code import (
     STEP_MARK,
 )
 
+logger = logging.getLogger(__name__)
+
 #: How long the preflight gate may run before it counts as a refusal. A
 #: build that cannot answer in two minutes cannot be trusted with the old
 #: service. Each upgrade path gives the command this ``--timeout`` budget, it
@@ -72,10 +75,13 @@ PREFLIGHT_TIMEOUT_SECONDS = 120
 PREFLIGHT_EXIT_GRACE_SECONDS = 30
 #: The budget of ``jacked service preflight`` with no ``--timeout``. A 0.111.x
 #: upgrade path runs the command with no ``--timeout`` and stops it after its
-#: own 120 seconds. The default ends 10 seconds before that, so the command
-#: stops its probe and reports before the old caller kills it (which would
-#: leave the probe process behind). The new callers pass ``--timeout``.
-PREFLIGHT_DEFAULT_BUDGET_SECONDS = PREFLIGHT_TIMEOUT_SECONDS - 10
+#: own 120 seconds, counted from the spawn. The command's clock starts after
+#: ``jacked.cli`` imports, which on a cold Windows host takes seconds, and the
+#: probe tree stop takes more. So the default ends 20 seconds before that,
+#: and the command stops its probe and reports before the old caller kills
+#: it (which would leave the probe process behind). The new callers pass
+#: ``--timeout``.
+PREFLIGHT_DEFAULT_BUDGET_SECONDS = PREFLIGHT_TIMEOUT_SECONDS - 20
 
 
 def preflight_argv(jacked: str) -> list[str]:
@@ -281,6 +287,18 @@ def probe_argv(
     return list(command), None
 
 
+def _remove(path: Path) -> None:
+    """Remove ``path``. A failure is logged, never raised.
+
+    On Windows a killed probe child can still hold the file open (with no
+    FILE_SHARE_DELETE), so the removal can fail with PermissionError.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("could not remove %s: %s", path.name, type(exc).__name__)
+
+
 def run_service_probe(
     spec, environment: dict[str, str], cwd: Path, options: ProbeOptions
 ) -> ProbeResult:
@@ -314,9 +332,9 @@ def run_service_probe(
     finally:
         # Every path removes the report; the normal path reads it here first.
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            _remove(temporary)
         output_before = _report_text(report)
-        report.unlink(missing_ok=True)
+        _remove(report)
     output = output_before + _text(completed.stdout)
     result = parse_probe_output(completed.returncode, output)
     if result.ok:

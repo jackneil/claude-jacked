@@ -492,7 +492,7 @@ The command provisions the service contract. Then it runs one short probe proces
 7. It imports the CLI.
 8. It imports the dashboard API.
 
-The command prints the runtime path, the runtime target, the supervisor, and the generation. It starts no service and it changes no supervisor, so it is safe to run while the service is live. `--timeout` sets the time budget of the whole command. The default is 110 seconds, so the command ends before an older upgrade helper stops it at 120 seconds. On a refusal the command prints `[FAIL] <error type>: <reason>` and exits 1. A probe failure names the step first, for example `[FAIL] ServiceProbeError at asyncio_event_loop: OSError winerror 10106`. The probe writes its stderr to a private file in the service directory, and the message gives the path of that file. The `--json` object has a `probe_step` field.
+The command prints the runtime path, the runtime target, the supervisor, and the generation. It starts no service and it changes no supervisor, so it is safe to run while the service is live. `--timeout` sets the time budget of the whole command. The default is 100 seconds, so the command ends before an older upgrade helper stops it at 120 seconds. On a refusal the command prints `[FAIL] <error type>: <reason>` and exits 1. A probe failure names the step first, for example `[FAIL] ServiceProbeError at asyncio_event_loop: OSError winerror 10106`. The probe writes its stderr to a private file in the service directory, and the message gives the path of that file. The `--json` object has a `probe_step` field.
 
 ### Options
 
