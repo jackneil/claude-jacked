@@ -7111,7 +7111,7 @@ def tests_record(junit, kind, label, runner, exit_code, wall, commit, machine, r
                                     runner=runner, commit=commit, exit_code=exit_code,
                                     wall_seconds=wall, machine=machine, report_root=report_root,
                                     started=started)
-    except (JUnitError, TreeError, OSError) as exc:
+    except (JUnitError, TreeError, OSError, ValueError) as exc:
         _record.emit(f"nothing is recorded: {exc}")
         raise SystemExit(1)
     click.echo(f"{meta.id} {meta.verdict}")
@@ -7150,6 +7150,8 @@ def tests_seen(inputs, any_machine, as_json, command):
             _record.emit("this repository has no tree identity (no commit, or git failed).")
     except _tree.TreeError:
         _record.emit("this folder is not in the work tree of a git repository.")
+    except Exception as exc:  # noqa: BLE001 -- an unknown answer is "not seen", never a traceback
+        _record.emit(f"cannot check the history ({type(exc).__name__}). The answer is: not seen.")
     if as_json:
         data = None
         if found is not None:

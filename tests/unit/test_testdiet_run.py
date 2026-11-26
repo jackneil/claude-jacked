@@ -17,7 +17,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -320,10 +322,78 @@ def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch, capsy
     assert list(history.iter_runs(store)) == []
 
 
-def test_a_command_that_cannot_start_returns_127(repo, tmp_path):
+def test_a_command_that_cannot_start_returns_127(repo, tmp_path, capsys):
     missing = str(tmp_path / "no-such-program")
     assert record.run_gate([missing, "x"], cwd=repo) == 127
     assert _last(repo).exit_code == 127
+    lines = [line for line in capsys.readouterr().err.splitlines() if "cannot start" in line]
+    assert len(lines) == 1 and "no-such-program" in lines[0]
+
+
+def test_a_bare_program_name_that_is_not_found_returns_127_and_one_line(repo, capsys):
+    assert record.run_gate(["jacked-no-such-program-4471", "x"], cwd=repo) == 127
+    lines = [line for line in capsys.readouterr().err.splitlines() if "cannot start" in line]
+    assert len(lines) == 1 and "jacked-no-such-program-4471" in lines[0]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PATHEXT and .cmd shims exist only on Windows")
+def test_a_cmd_shim_by_its_bare_name_starts_on_windows(repo, tmp_path, monkeypatch):
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    (shims / "jackedshim.cmd").write_bytes(b"@exit /b 7\r\n")
+    monkeypatch.setenv("PATH", str(shims) + os.pathsep + os.environ.get("PATH", ""))
+    argv = ["jackedshim", "--flag"]
+    assert record.run_gate(argv, cwd=repo) == 7
+    assert _last(repo).command_sha == tree.command_sha(argv)
+
+
+@POSIX
+def test_a_sigterm_to_the_run_records_and_cleans_up(repo, side, tmp_path, monkeypatch):
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("a signal handler needs the main thread")
+    temp = tmp_path / "tmp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    ready = side / "ready"
+    leaked = []
+    # A handler of the test: a SIGTERM outside the run's own window is
+    # caught here and fails the test, and never stops the session.
+    def caught(signum, frame):
+        leaked.append(signum)
+
+    previous = signal.signal(signal.SIGTERM, caught)
+
+    def send_when_ready():
+        deadline = time.monotonic() + 60
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    sender = threading.Thread(target=send_when_ready, daemon=True)
+    sender.start()
+    try:
+        argv = gate(0, "copy", str(GREEN), "{junit}", "write", str(ready), "sleep", "20")
+        code = record.run_gate(argv, cwd=repo)
+        restored = signal.getsignal(signal.SIGTERM)
+    finally:
+        sender.join(60)
+        signal.signal(signal.SIGTERM, previous)
+    assert leaked == []
+    assert code == 128 + signal.SIGTERM
+    runs = _runs(repo)
+    assert len(runs) == 1 and runs[0].exit_code == 128 + signal.SIGTERM
+    assert sorted(p.name for p in temp.iterdir()) == []
+    assert restored is caught  # the run put the handler of the test back
+
+
+def test_an_interrupt_after_the_gate_keeps_its_exit_code(repo, monkeypatch, capsys):
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(record.junit, "read_junit", interrupt)
+    assert record.run_gate(junit_gate(5, RED), cwd=repo) == 5
+    assert "after the gate stopped" in capsys.readouterr().err
+    assert _runs(repo) == []
 
 
 @POSIX
@@ -391,6 +461,7 @@ _OTHER_TREE = TreeId(commit="c" * 40, tree="d" * 40, clean=True)
     ("tree", _OTHER_TREE),
     ("command_sha", "0" * 64),
     ("inputs_sha", "1" * 64),
+    ("inputs_sha", "unavailable"),
     ("machine_id", "f" * 32),
     ("machine_id", None),
 ])
@@ -666,3 +737,49 @@ def test_a_standard_error_that_cannot_be_written_does_not_stop_the_gate(hermetic
     plain.mkdir()
     monkeypatch.setattr(sys, "stderr", Broken())
     assert record.run_gate(gate(4), cwd=plain) == 4
+
+
+def test_a_failed_input_hash_is_unavailable_and_never_seen(repo, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("hash broke")
+
+    argv = junit_gate(0, GREEN)
+    real = tree.inputs_fingerprint
+    monkeypatch.setattr(tree, "inputs_fingerprint", boom)
+    record.run_gate(argv, cwd=repo, inputs=["cache.bin"])
+    meta = _last(repo)
+    assert meta.verdict == "passed" and meta.inputs_sha == record.INPUTS_UNAVAILABLE
+    store, current = tree.store_dir(repo), tree.tree_id(repo)
+    args = dict(machine_id=tree.machine_id())
+    # Neither the sentinel nor "no --input" matches it.
+    assert record.seen(store, current, meta.command_sha, inputs_sha=record.INPUTS_UNAVAILABLE, **args) is None
+    assert record.seen(store, current, meta.command_sha, inputs_sha=None, **args) is None
+    monkeypatch.setattr(tree, "inputs_fingerprint", real)
+    record.run_gate(argv, cwd=repo)  # no --input: inputs_sha None
+    assert _last(repo).inputs_sha is None
+
+
+def test_a_store_that_cannot_be_found_says_so(repo, monkeypatch, capsys):
+    def boom(*args, **kwargs):
+        raise RuntimeError("store broke")
+
+    monkeypatch.setattr(tree, "store_dir", boom)
+    assert record.run_gate(gate(3), cwd=repo) == 3
+    err = capsys.readouterr().err
+    assert "the history store cannot be found" in err and "not in a git repository" not in err
+
+
+def test_the_notice_groups_records_by_machine_and_has_no_date_range(repo, capsys):
+    argv = junit_gate(1, RED)
+    record.run_gate(argv, cwd=repo)
+    ci = record.record_files([RED], cwd=repo, kind=None, label=None, runner=None, commit=None,
+                             exit_code=1, wall_seconds=None, machine="ci", report_root=None,
+                             started="2026-11-01T00:00:00+00:00")
+    record.run_gate(argv, cwd=repo)
+    text = record.repeat_notice(tree.store_dir(repo), _last(repo))
+    lines = text.splitlines()
+    assert "2 earlier records" in lines[0] and " to " not in lines[0] and "from" not in lines[0]
+    rows = [line.strip() for line in lines[lines.index("the earlier records, by machine:") + 1:]]
+    assert len(rows) == 2
+    assert rows[0].startswith(f"ci {ci.id} 2026-11-01T00:00:00+00:00 record")
+    assert rows[1].startswith("local ")

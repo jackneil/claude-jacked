@@ -140,3 +140,14 @@ def test_cli_record_takes_a_start_time_and_else_uses_the_record_time(repo):
     assert _invoke("tests", "record", "--junit", str(GREEN), "--started", "2026-11-20T08:00:00").exit_code == 2
     assert _invoke("tests", "record", "--junit", str(GREEN), "--started", "yesterday").exit_code == 2
     assert "time of the record" in _invoke("tests", "record", "--help").stdout
+
+
+def test_cli_record_gives_one_line_and_exit_1_for_a_bad_value(repo, monkeypatch):
+    from jacked.testdiet import record as _record
+
+    def refuse(*args, **kwargs):
+        raise ValueError("the wall time must be 0 or more seconds")
+
+    monkeypatch.setattr(_record, "record_files", refuse)
+    result = _invoke("tests", "record", "--junit", str(GREEN))
+    assert result.exit_code == 1 and "nothing is recorded" in result.stderr

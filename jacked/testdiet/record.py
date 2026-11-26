@@ -22,9 +22,11 @@ import hashlib
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from collections.abc import Callable, Sequence
@@ -32,6 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeVar
 
+from jacked.findbin import find_bin
 from jacked.regular_file import open_regular_fd
 from jacked.testdiet import history, junit, tree
 from jacked.testdiet.model import RUNNERS, STATES, RunData, RunMeta, TreeId
@@ -48,6 +51,9 @@ PREFIX = "jacked tests: "
 EXIT_NOT_STARTED = 127
 _LOCAL = "local"
 _SIGNAL_BASE = 128
+#: The ``inputs_sha`` of a run whose ``--input`` files could not be hashed.
+#: ``seen`` never matches it. It is not None, because None means "no --input".
+INPUTS_UNAVAILABLE = "unavailable"
 
 T = TypeVar("T")
 
@@ -175,6 +181,56 @@ def _flaky(data: RunData | None) -> tuple[str, ...]:
     return tuple(sorted(case.id for case in data.tests if case.state == "flaky"))
 
 
+def _program(argv: list[str]) -> list[str]:
+    """Return the argv to start. On Windows, a bare program name is resolved first.
+
+    Popen with no shell finds only ``.exe`` files on Windows. ``find_bin``
+    uses ``shutil.which``, which honors PATHEXT, so ``npx`` finds
+    ``npx.cmd``. A name with a path separator, a name that is not found, and
+    every name on other systems stay as typed.
+    """
+    if sys.platform != "win32" or not argv or "/" in argv[0] or "\\" in argv[0]:
+        return argv
+    found = find_bin(argv[0])
+    return [found, *argv[1:]] if found else argv
+
+
+# The signals that a supervisor sends to stop a process (docker stop,
+# systemd, kill <pid>). The run sends them on to the gate and keeps waiting.
+_FORWARDED = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGHUP") if hasattr(signal, name))
+
+
+def _forward_signals(proc: subprocess.Popen) -> dict:
+    """Send SIGTERM and SIGHUP of this process to the gate. Return the old handlers.
+
+    Only the main thread can set a handler; in other threads nothing is set.
+    """
+    if os.name == "nt" or threading.current_thread() is not threading.main_thread():
+        return {}
+
+    def forward(signum, frame) -> None:
+        try:
+            proc.send_signal(signum)
+        except OSError:
+            pass
+
+    old: dict = {}
+    for signum in _FORWARDED:
+        try:
+            old[signum] = signal.signal(signum, forward)
+        except (ValueError, OSError):
+            continue
+    return old
+
+
+def _restore_signals(old: dict) -> None:
+    for signum, handler in old.items():
+        try:
+            signal.signal(signum, handler if handler is not None else signal.SIG_DFL)
+        except (ValueError, OSError):
+            continue
+
+
 def _start_and_wait(argv: list[str], cwd: Path) -> int:
     """Start the gate, wait for it, and return its exit code.
 
@@ -182,19 +238,26 @@ def _start_and_wait(argv: list[str], cwd: Path) -> int:
     command that cannot start gives 127. A child that a signal stops gives
     128 plus the signal number. An interrupt of this process does not stop
     the wait: the child gets the interrupt from the terminal too, and its
-    exit code is the result.
+    exit code is the result. On POSIX, a SIGTERM or a SIGHUP of this process
+    goes to the child, and the wait goes on, so the run still records and
+    removes its temporary folders.
     """
+    name = os.path.basename(argv[0]) if argv else ""
     try:
-        proc = subprocess.Popen(argv, cwd=cwd)
+        proc = subprocess.Popen(_program(argv), cwd=cwd)
     except (OSError, ValueError) as exc:
-        emit(f"the gate command cannot start ({type(exc).__name__}). The exit code is 127.")
+        emit(f"the gate command {name!r} cannot start ({type(exc).__name__}). The exit code is 127.")
         return EXIT_NOT_STARTED
-    while True:
-        try:
-            code = proc.wait()
-            break
-        except KeyboardInterrupt:
-            emit("the run got an interrupt. It waits for the gate command to stop.")
+    old = _forward_signals(proc)
+    try:
+        while True:
+            try:
+                code = proc.wait()
+                break
+            except KeyboardInterrupt:
+                emit("the run got an interrupt. It waits for the gate command to stop.")
+    finally:
+        _restore_signals(old)
     return _SIGNAL_BASE - code if code < 0 else code
 
 
@@ -223,7 +286,10 @@ def run_gate(argv: Sequence[str], *, cwd: Path, junit: Sequence[str] = (), input
     top = _guard("find the work tree", lambda: _top_or_none(cwd), None)
     store = _guard("find the store", lambda: tree.store_dir(top), None) if top is not None else None
     if top is None or store is None:
-        emit("this folder is not in a git repository. The gate runs, and the run is not recorded.")
+        if top is None:
+            emit("this folder is not in a git repository. The gate runs, and the run is not recorded.")
+        else:
+            emit("the history store cannot be found. The gate runs, and the run is not recorded.")
         report_dir, _report, child_argv = _placeholder(argv)
         try:
             return _start_and_wait(child_argv, cwd)
@@ -237,7 +303,8 @@ def run_gate(argv: Sequence[str], *, cwd: Path, junit: Sequence[str] = (), input
     try:
         before = _guard("read the tree", lambda: tree.tree_id(cwd, objects=objects), None)
         sha = tree.command_sha(argv)
-        inputs_sha = _guard("hash the input files", lambda: tree.inputs_fingerprint(top, inputs), None)
+        inputs_sha = _guard("hash the input files", lambda: tree.inputs_fingerprint(top, inputs),
+                            INPUTS_UNAVAILABLE if inputs else None)
         report_dir, report, child_argv = _placeholder(argv)
         # None (not empty) when the hash step fails: then no fixed report is read,
         # because an old report must not become this run.
@@ -254,48 +321,53 @@ def run_gate(argv: Sequence[str], *, cwd: Path, junit: Sequence[str] = (), input
         cpu_end = _guard("read the processor time", _child_cpu, None)
         load_end = _load()
 
-        data = _guard("read the report",
-                      lambda: _read_reports(top, report, junit, fixed_before, runner), None)
-        if report_dir is not None:
-            tree.remove_tree(report_dir)
-            report_dir = None
-        after = _guard("read the tree", lambda: tree.tree_id(cwd, objects=objects), None)
-        changed = _tree_changed(before, after)
-        if changed:
-            _guard("list the changed paths", lambda: _print_changes(cwd, before, after, objects), None)
+        try:
+            data = _guard("read the report",
+                          lambda: _read_reports(top, report, junit, fixed_before, runner), None)
+            if report_dir is not None:
+                tree.remove_tree(report_dir)
+                report_dir = None
+            after = _guard("read the tree", lambda: tree.tree_id(cwd, objects=objects), None)
+            changed = _tree_changed(before, after)
+            if changed:
+                _guard("list the changed paths", lambda: _print_changes(cwd, before, after, objects), None)
 
-        def write() -> RunMeta:
-            meta = RunMeta(
-                id=history.new_run_id(), started=started, source="run",
-                wall_seconds=round(wall, 3), exit_code=code, verdict=history.verdict_of(code, data),
-                kind=kind, label=label, runner=runner or (data.runner if data else None),
-                command_sha=sha, inputs_sha=inputs_sha, machine=_LOCAL, machine_id=tree.machine_id(),
-                tree=before, tree_changed=changed,
-                on_default_branch=tree.on_default_branch(cwd, before) if before else None,
-                counts=_counts(data), seconds_reported=data.seconds_reported if data else None,
-                load_start=load_start, load_end=load_end,
-                child_cpu_seconds=(round(cpu_end - cpu_start, 3)
-                                   if cpu_start is not None and cpu_end is not None else None),
-                failing=_failing(data), flaky=_flaky(data),
-                failing_sig=history.failing_signature(data.tests) if data else None,
-            )
-            notice = _guard("read the earlier records", lambda: repeat_notice(store, meta), None)
-            history.write_run(store, meta, data)
-            if notice:
-                for line in notice.splitlines():
-                    emit(line)
-            return meta
+            def write() -> RunMeta:
+                meta = RunMeta(
+                    id=history.new_run_id(), started=started, source="run",
+                    wall_seconds=round(wall, 3), exit_code=code, verdict=history.verdict_of(code, data),
+                    kind=kind, label=label, runner=runner or (data.runner if data else None),
+                    command_sha=sha, inputs_sha=inputs_sha, machine=_LOCAL, machine_id=tree.machine_id(),
+                    tree=before, tree_changed=changed,
+                    on_default_branch=tree.on_default_branch(cwd, before) if before else None,
+                    counts=_counts(data), seconds_reported=data.seconds_reported if data else None,
+                    load_start=load_start, load_end=load_end,
+                    child_cpu_seconds=(round(cpu_end - cpu_start, 3)
+                                       if cpu_start is not None and cpu_end is not None else None),
+                    failing=_failing(data), flaky=_flaky(data),
+                    failing_sig=history.failing_signature(data.tests) if data else None,
+                )
+                notice = _guard("read the earlier records", lambda: repeat_notice(store, meta), None)
+                history.write_run(store, meta, data)
+                if notice:
+                    for line in notice.splitlines():
+                        emit(line)
+                return meta
 
-        meta = _guard("write the record", write, None)
-        verdict = meta.verdict if meta is not None else _guard(
-            "find the verdict", lambda: history.verdict_of(code, data), None)
-        if verdict == "conflict":
-            failing = len(_failing(data))
-            emit(f"the gate returned 0, but the report holds failures ({failing} failed or error tests)."
-                 + (" --strict makes the exit code 1." if strict else ""))
-            if strict:
-                return 1
-        return code
+            meta = _guard("write the record", write, None)
+            verdict = meta.verdict if meta is not None else _guard(
+                "find the verdict", lambda: history.verdict_of(code, data), None)
+            if verdict == "conflict":
+                failing = len(_failing(data))
+                emit(f"the gate returned 0, but the report holds failures ({failing} failed or error tests)."
+                     + (" --strict makes the exit code 1." if strict else ""))
+                if strict:
+                    return 1
+            return code
+        except KeyboardInterrupt:
+            # The gate is done. An interrupt now stops only the recorder.
+            emit("the run got an interrupt after the gate stopped. The recorder stops; the exit code is the code of the gate.")
+            return code
     finally:
         if report_dir is not None:
             tree.remove_tree(report_dir)
@@ -460,12 +532,13 @@ def seen(store: Path, tree_value: TreeId, command_sha: str, *, inputs_sha: str |
 
     A run proves it when all of these are true: its source is "run"; its
     verdict is "passed"; ``tree_changed`` is False (not empty); the tree
-    hash, the command SHA and the inputs fingerprint are equal; and the
+    hash, the command SHA and the inputs fingerprint are equal (a
+    fingerprint that is "unavailable" never matches); and the
     machine identity is equal and not empty. ``any_machine`` removes the
     last condition. The commit is not compared, so a second commit with the
     same content is the same tree.
     """
-    if tree_value is None or not command_sha:
+    if tree_value is None or not command_sha or inputs_sha == INPUTS_UNAVAILABLE:
         return None
     if not any_machine and not machine_id:
         return None
@@ -473,6 +546,7 @@ def seen(store: Path, tree_value: TreeId, command_sha: str, *, inputs_sha: str |
         if (meta.source == "run" and meta.verdict == "passed" and meta.tree_changed is False
                 and meta.tree is not None and meta.tree.tree == tree_value.tree
                 and meta.command_sha == command_sha and meta.inputs_sha == inputs_sha
+                and meta.inputs_sha != INPUTS_UNAVAILABLE
                 and (any_machine or meta.machine_id == machine_id)):
             return meta
     return None
@@ -482,9 +556,11 @@ def repeat_notice(store: Path, meta: RunMeta) -> str | None:
     """Return the facts about earlier records with the failing set of ``meta``, or None.
 
     The text gives the number of earlier records with the same failing
-    signature, the first and the last date, the number of trees, and how
-    many of the records are on the default branch. Then the failing IDs and
-    one line for each earlier record. It does not say whose defect it is.
+    signature, the number of trees, and how many of the records are on the
+    default branch. Then the failing IDs, and one line for each earlier
+    record, with its own date, grouped by machine label. There is no date
+    range over all records, because times of two machines are never
+    compared. It does not say whose defect it is.
     The result is None for a run with no failing set, or with a failing set
     that no earlier record holds.
     """
@@ -494,23 +570,23 @@ def repeat_notice(store: Path, meta: RunMeta) -> str | None:
                if m.id != meta.id and m.failing_sig == meta.failing_sig]
     if not earlier:
         return None
-    earlier.sort(key=lambda m: m.id)
+    # Times of two machines are never compared: no range over all records.
+    # The records are grouped by machine label, and in run-ID order in a group.
+    earlier.sort(key=lambda m: (m.machine, m.id))
     trees = {m.tree.tree for m in earlier if m.tree is not None}
     no_tree = sum(1 for m in earlier if m.tree is None)
     default = sum(1 for m in earlier if m.on_default_branch is True)
-    first, last = earlier[0].started[:10], earlier[-1].started[:10]
     records = "record" if len(earlier) == 1 else "records"
     tree_word = "tree" if len(trees) == 1 else "trees"
-    summary = (f"the same failing set is in {len(earlier)} earlier {records}, from {first} to {last}, "
-               f"on {len(trees)} {tree_word}")
+    summary = f"the same failing set is in {len(earlier)} earlier {records}, on {len(trees)} {tree_word}"
     if no_tree:
         summary += f" ({no_tree} with no tree)"
     summary += f", {default} of them on the default branch."
     lines = [summary, f"the failing set has {len(meta.failing)} test(s):"]
     lines += [f"  {test_id}" for test_id in meta.failing]
-    lines.append("the earlier records:")
+    lines.append("the earlier records, by machine:")
     for m in earlier:
         place = m.tree.commit[:12] if m.tree is not None else "no tree"
         flag = ", default branch" if m.on_default_branch is True else ""
-        lines.append(f"  {m.id} {m.started} {m.source} {place}{flag}")
+        lines.append(f"  {m.machine} {m.id} {m.started} {m.source} {place}{flag}")
     return "\n".join(lines)
