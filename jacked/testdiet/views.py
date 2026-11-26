@@ -298,6 +298,31 @@ def _num(value) -> str:
     return f"{value:.3f}".rstrip("0").rstrip(".") if isinstance(value, float) else str(value)
 
 
+#: The text for a time that no record holds. It is never 0.
+NO_TIME = "no time recorded"
+#: The text for a table cell with no seconds.
+NO_TIME_CELL = "no time"
+
+
+def _time(value, missing: str = NO_TIME) -> str:
+    """A time as text, or ``missing`` when the record holds no time."""
+    return missing if value is None else _num(value)
+
+
+def _time_range(low, high) -> str:
+    """A min-max range of times. A side that no record holds reads ``no time recorded``."""
+    if low is None and high is None:
+        return NO_TIME
+    return f"{_time(low)}-{_time(high)}"
+
+
+def _recorded(value, missing: int, runs: int) -> str:
+    """A count that only some runs hold: ``K``, ``K (M not recorded)`` or ``not recorded (N runs)``."""
+    if value is None:
+        return f"not recorded ({runs} runs)"
+    return _num(value) + (f" ({missing} not recorded)" if missing else "")
+
+
 def _hidden(count: int, what: str) -> list[str]:
     return [f"  {_num(count)} more {what} are not shown. --json shows all rows."] if count else []
 
@@ -307,29 +332,31 @@ def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
     lines = list(result["notes"])
     lines.append(f"run: {one_line(result['run'])} started {one_line(result['started'])}, "
                  f"kind {one_line(result['kind'])}, verdict {one_line(result['verdict'])}")
-    lines.append(f"test seconds: {_num(result['total_test_seconds'])}")
+    lines.append(f"test seconds: {_time(result['total_test_seconds'])}")
     if result["tests_without_seconds"]:
         lines.append(f"tests with no seconds in the report: {_num(result['tests_without_seconds'])}")
     if result["file_count"] is not None:
-        lines.append(f"files that hold half the seconds: {_num(result['files_for_half'])} "
-                     f"of {_num(result['file_count'])}")
+        half = result["files_for_half"]
+        lines.append("files that hold half the seconds: "
+                     + (NO_TIME if half is None else f"{_num(half)} of {_num(result['file_count'])}"))
     if result["setup_share"] is not None:
         lines.append(f"setup share: {_num(result['setup_share'])}")
     lines.append("files (seconds, tests, file):")
     rows = result["files"] if top is None else result["files"][:top]
-    lines += [f"  {_num(r['seconds']):>10} {_num(r['tests']):>6} {one_line(r['file']) or '(no file)'}"
+    lines += [f"  {_time(r['seconds'], NO_TIME_CELL):>10} {_num(r['tests']):>6} "
+              f"{one_line(r['file']) or '(no file)'}"
               for r in rows]
     lines += _hidden(result["hidden_rows"]["files"], "files")
     lines.append("tests (seconds, test ID):")
     rows = result["tests"] if top is None else result["tests"][:top]
-    lines += [f"  {_num(r['seconds']):>10} {one_line(r['id'])}" for r in rows]
+    lines += [f"  {_time(r['seconds'], NO_TIME_CELL):>10} {one_line(r['id'])}" for r in rows]
     lines += _hidden(result["hidden_rows"]["tests"], "tests")
     if result["repeats"]:
         lines.append("repeat runs of one tree and one command on this machine "
                      "(runs, wall min-max, test seconds min-max, tree, command):")
         for r in result["repeats"]:
-            lines.append(f"  {_num(r['runs'])} runs, wall {_num(r['wall_min'])}-{_num(r['wall_max'])}, "
-                         f"test seconds {_num(r['test_seconds_min'])}-{_num(r['test_seconds_max'])}, "
+            lines.append(f"  {_num(r['runs'])} runs, wall {_time_range(r['wall_min'], r['wall_max'])}, "
+                         f"test seconds {_time_range(r['test_seconds_min'], r['test_seconds_max'])}, "
                          f"{r['tree'][:12]} {r['command_sha'][:12]}")
     else:
         lines.append("repeat runs: no tree and command has two runs on this machine.")
@@ -341,7 +368,9 @@ def render_history(result: dict, *, size: bool = False) -> str:
 
     A store with no run gives one line (and the size line with ``size``).
     """
-    size_line = [f"size of the history: {_num(result['size_bytes'])} bytes"] if size else []
+    size_bytes = result["size_bytes"]
+    size_text = "the folder cannot be read" if size_bytes is None else f"{_num(size_bytes)} bytes"
+    size_line = [f"size of the history: {size_text}"] if size else []
     if result["store_runs"] == 0:
         return clean_text("\n".join([NO_RUN, *size_line]))
     lines = list(result["notes"])
@@ -356,10 +385,9 @@ def render_history(result: dict, *, size: bool = False) -> str:
               for r in result["repeated_green"]] or ["  none"]
     lines.append("failing sets:")
     for s in result["failing_sets"]:
-        trees = _num(s["trees"]) + (f" ({s['trees_unknown']} unknown)" if s["trees_unknown"] else "")
-        branch = _num(s["on_default_branch"]) + (
-            f" ({s['on_default_branch_unknown']} unknown)" if s["on_default_branch_unknown"] else "")
-        lines.append(f"  {_num(s['runs'])} runs, trees {trees}, on the default branch {branch}, "
+        trees = _recorded(s["trees"], s["trees_unknown"], s["runs"])
+        branch = _recorded(s["on_default_branch"], s["on_default_branch_unknown"], s["runs"])
+        lines.append(f"  {_num(s['runs'])} runs, trees: {trees}, on the default branch: {branch}, "
                      f"first {one_line(s['first'])}, last {one_line(s['last'])}, set {s['sig'][:12]}:")
         lines += [f"    {one_line(test_id)}" for test_id in s["ids"]]
     if not result["failing_sets"]:

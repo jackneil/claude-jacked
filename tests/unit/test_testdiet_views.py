@@ -198,7 +198,7 @@ def test_history_groups_red_runs_by_failing_set(store):
     # The red runs hold no default-branch value: the count is empty, not 0.
     assert (group["trees_unknown"], group["on_default_branch"], group["on_default_branch_unknown"]) == \
         (0, None, 3)
-    assert "on the default branch  (3 unknown)" in views.render_history(result)
+    assert "on the default branch: not recorded (3 runs)," in views.render_history(result)
     assert FAILING_ID in views.render_history(result)
     # The ci record with the same set is a run of a different machine.
     ci = views.history(store, machine="ci")["failing_sets"]
@@ -241,7 +241,7 @@ def test_a_test_with_no_seconds_is_not_counted_as_zero_seconds(store):
     only = store_run(store, "20261126T080000", exit_code=0, tests=[make_case("n::t", "n.py", None)])
     empty = views.profile(store, only)
     assert (empty["total_test_seconds"], empty["files_for_half"]) == (None, None)
-    assert "test seconds: \n" in views.render_profile(empty) + "\n"
+    assert "test seconds: no time recorded\n" in views.render_profile(empty) + "\n"
     assert json.loads(views.to_json(empty))["total_test_seconds"] is None
 
 
@@ -433,3 +433,54 @@ def test_no_command_prints_a_machine_id(store, repo):
         for value in (LOCAL_ID, LOCAL_TWIN_ID, real):
             assert not value or value not in out, command
         assert "machine_id" not in out, command
+
+
+def _one_line(text: str, start: str) -> str:
+    (line,) = [x for x in text.splitlines() if x.lstrip().startswith(start)]
+    return line
+
+
+def test_profile_says_no_time_recorded_when_no_file_has_seconds(store):
+    only = store_run(store, "20261126T080000", exit_code=0,
+                     tests=[make_case("n::t", "n.py", None), make_case("m::t", "m.py", 0.0)])
+    result = views.profile(store, only)
+    assert result["files_for_half"] is None
+    text = views.render_profile(result)
+    assert _one_line(text, "files that hold half") == "files that hold half the seconds: no time recorded"
+    assert json.loads(views.to_json(result))["files_for_half"] is None
+
+
+def test_profile_table_rows_with_no_seconds_say_no_time(store):
+    text = views.render_profile(views.profile(store))
+    rows = [x.split() for x in text.splitlines() if x.lstrip().startswith("no time ")]
+    assert rows == [["no", "time", "1", "tests/test_f.py"], ["no", "time", "tests/test_f.py::test_no_time"]]
+
+
+def test_profile_repeat_line_with_no_wall_time_says_no_time_recorded(store):
+    result = views.profile(store)
+    assert result["repeats"]
+    result["repeats"][0].update(wall_min=None, wall_max=None, test_seconds_min=None, test_seconds_max=None)
+    tree = result["repeats"][0]["tree"][:12]
+    (line,) = [x for x in views.render_profile(result).splitlines() if f", {tree} " in x]
+    assert "wall no time recorded, test seconds no time recorded," in line
+    assert " -" not in line and "- " not in line
+
+
+def test_history_size_line_of_a_folder_that_cannot_be_read(store):
+    result = views.history(store)
+    result["size_bytes"] = None
+    line = _one_line(views.render_history(result, size=True), "size of the history")
+    assert line == "size of the history: the folder cannot be read"
+    result["size_bytes"] = 0
+    assert _one_line(views.render_history(result, size=True), "size of") == "size of the history: 0 bytes"
+
+
+def test_history_failing_set_counts_that_only_some_runs_hold(store):
+    result = views.history(store)
+    group = result["failing_sets"][0]
+    group.update(trees=1, trees_unknown=2, on_default_branch=1, on_default_branch_unknown=2)
+    line = views.render_history(result)
+    assert "trees: 1 (2 not recorded), on the default branch: 1 (2 not recorded)," in line
+    group.update(trees=None, trees_unknown=3, on_default_branch=0, on_default_branch_unknown=0)
+    line = views.render_history(result)
+    assert "trees: not recorded (3 runs), on the default branch: 0," in line
