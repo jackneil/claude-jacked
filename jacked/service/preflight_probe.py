@@ -38,6 +38,7 @@ reports an environment value.
 
 from __future__ import annotations
 
+import base64
 import os
 import subprocess
 import sys
@@ -381,6 +382,27 @@ def _windows_argv(spec, environment, cwd: Path, argv: tuple[str, ...]):
     return argv, Path(name)
 
 
+def probe_python_argv(code: str, report: Path | None = None) -> tuple[str, ...]:
+    """Return the interpreter argv that runs ``code``, on one line.
+
+    Every launcher refuses a value with a newline, and the probe code has
+    many lines. So the code goes as base64 of its UTF-8 bytes, and a
+    one-line ``-c`` program decodes and runs it. The Windows and the POSIX
+    probe paths both use this helper, so both run the same bytes.
+
+    >>> argv = probe_python_argv("print(1)\\nprint(2)\\n")
+    >>> argv[:2], "\\n" in argv[2]
+    (('-I', '-c'), False)
+    """
+    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    program = (
+        "import base64;exec(compile(base64.b64decode('"
+        + encoded
+        + "'),'<jacked-probe>','exec'))"
+    )
+    return ("-I", "-c", program, *((str(report),) if report else ()))
+
+
 def probe_argv(
     spec, environment: dict[str, str], cwd: Path, code: str, report: Path | None = None
 ):
@@ -390,7 +412,7 @@ def probe_argv(
     ``temporary_file`` is the Windows probe launcher (the caller removes it),
     or None on POSIX.
     """
-    python_argv = ("-I", "-c", code, *((str(report),) if report else ()))
+    python_argv = probe_python_argv(code, report)
     if sys.platform == "win32":
         return _windows_argv(spec, environment, cwd, python_argv)
     command = posix_preinterpreter_command(
@@ -428,7 +450,13 @@ def run_service_probe(
         result = ProbeResult(False, step, f"timeout after {options.timeout:g}s")
         return _with_stderr(result, _trace(output) + _text(exc.stderr), stderr_path)
     except OSError as exc:
+        report.unlink(missing_ok=True)
         return ProbeResult(False, "interpreter_start", _os_error_detail(exc))
+    except ValueError as exc:
+        # A launcher that refuses to render (a value it cannot carry) is a
+        # named refusal, never a traceback.
+        report.unlink(missing_ok=True)
+        return ProbeResult(False, "interpreter_start", f"ValueError: {exc}")
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -480,5 +508,6 @@ __all__ = [
     "ServiceProbeError",
     "parse_probe_output",
     "probe_argv",
+    "probe_python_argv",
     "run_service_probe",
 ]

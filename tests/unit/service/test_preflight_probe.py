@@ -435,3 +435,84 @@ def test_the_probe_argv_carries_no_service_lifecycle_words(contract):
     padded = f" {' '.join(argv)} "
     for verb in ("start", "restart", "preflight", "recover", "install"):
         assert f" service {verb} " not in padded
+
+
+def _windows_probe_launcher(contract, monkeypatch, environment=None):
+    """Render the real Windows probe launcher on any OS. Return (text, argv)."""
+    from types import SimpleNamespace
+
+    import jacked.service.preflight_probe as preflight_probe
+
+    spec, default_environment, paths = contract
+    monkeypatch.setattr(preflight_probe, "sys", SimpleNamespace(platform="win32"))
+    report = paths.root / PROBE_REPORT_NAME
+    argv, launcher = preflight_probe.probe_argv(
+        spec, default_environment if environment is None else environment,
+        paths.root, PROBE_CODE, report,
+    )
+    data = launcher.read_bytes()
+    launcher.unlink()
+    return data, argv, report
+
+
+def _decoded_launcher(text):
+    import base64
+    import re
+
+    found = {}
+    pattern = r"\$psi\.(FileName|Arguments|Environment\['([^']+)'\]) = \(Decode '([^']*)'\)"
+    for match in re.finditer(pattern, text):
+        found[match.group(2) or match.group(1)] = base64.b64decode(match.group(3)).decode("utf-8")
+    return found
+
+
+def test_the_real_windows_probe_launcher_renders_on_every_os(contract, monkeypatch):
+    """The counterpart of the Windows-only probe tests: the launcher is pure."""
+    import base64
+    import re
+    import subprocess
+
+    from jacked.service.preflight_probe import probe_python_argv
+
+    data, argv, report = _windows_probe_launcher(contract, monkeypatch)
+    text = data.decode("ascii")  # pure ASCII or this raises
+    assert argv[0].endswith("powershell.exe") and argv[-2:] == ["-Generation", contract[0].generation]
+    arguments = _decoded_launcher(text)["Arguments"]
+    assert arguments == subprocess.list2cmdline(list(probe_python_argv(PROBE_CODE, report)))
+    encoded = re.search(r"b64decode\('([A-Za-z0-9+/=]+)'\)", arguments).group(1)
+    assert base64.b64decode(encoded).decode("utf-8") == PROBE_CODE
+
+
+def test_the_windows_probe_launcher_carries_the_exact_environment(contract, monkeypatch):
+    """The counterpart of the Windows-only environment round trip."""
+    _spec, environment, _paths = contract
+    delivered = {**environment, "JACKED_TEST_NAME": "Владимир NUÑEZ Òscar O’Neil"}
+    data, _argv, _report = _windows_probe_launcher(contract, monkeypatch, delivered)
+    decoded = _decoded_launcher(data.decode("ascii"))
+    assert {k: v for k, v in decoded.items() if k not in {"FileName", "Arguments"}} == delivered
+
+
+def test_a_launcher_that_cannot_render_is_a_named_refusal(contract, monkeypatch):
+    from types import SimpleNamespace
+
+    import jacked.service.preflight_probe as preflight_probe
+
+    spec, environment, paths = contract
+    monkeypatch.setattr(preflight_probe, "sys", SimpleNamespace(platform="win32"))
+    ran = []
+    result = run_service_probe(
+        spec, {**environment, "BAD KEY": "x"}, paths.root,
+        ProbeOptions(timeout=5, runner=lambda *a, **k: ran.append(a)),
+    )
+    assert (result.ok, result.step) == (False, "interpreter_start")
+    assert result.detail.startswith("ValueError: invalid environment name")
+    assert ran == []
+    assert not (paths.root / PROBE_REPORT_NAME).exists()
+
+
+def test_the_probe_program_is_one_line_on_every_path():
+    from jacked.service.preflight_probe import probe_python_argv
+
+    argv = probe_python_argv(PROBE_CODE, Path("/x/report.log"))
+    assert all("\n" not in part and "\r" not in part for part in argv)
+    assert argv[-1] == str(Path("/x/report.log"))
