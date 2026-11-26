@@ -70,10 +70,12 @@ def _warn(text: str) -> None:
 
 
 def _write_private(path: Path, text: str) -> None:
-    from jacked.atomic_io import atomic_write_text  # standard library only
+    from jacked.atomic_io import atomic_write_bytes  # standard library only
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, text, mode=0o600, mode_strict=False)
+    # Bytes, not text mode: Windows text mode adds a CR to each line, after
+    # the size count. LF on every OS, so the bytes on disk are the bytes counted.
+    atomic_write_bytes(path, text.encode("utf-8"), mode=0o600, mode_strict=False)
     if _IS_WINDOWS:
         try:
             from jacked.service.windows_security import secure_windows_path

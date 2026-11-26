@@ -98,7 +98,7 @@ def test_a_failed_write_says_so_on_stderr_and_raises(tmp_path, monkeypatch, caps
     def refuse(*args, **kwargs):
         raise PermissionError("refused")
 
-    monkeypatch.setattr("jacked.atomic_io.atomic_write_text", refuse)
+    monkeypatch.setattr("jacked.atomic_io.atomic_write_bytes", refuse)
     with pytest.raises(PermissionError):
         record("Traceback\nImportError: x\n", path=tmp_path / "boot.log", now=0)
     assert "could not write the boot-failure log" in capsys.readouterr().err
@@ -111,10 +111,13 @@ def test_on_windows_the_log_gets_the_private_acl_best_effort(tmp_path, monkeypat
         "jacked.service.windows_security.secure_windows_path", lambda path: calls.append(path)
     )
     record("Traceback\nImportError: x\n", path=tmp_path / "boot.log", now=0)
-    assert calls == [tmp_path / "boot.log"]
+    # The outcome, not the call list: on Windows atomic_io also secures its
+    # temp file. The last call secures the final log.
+    assert calls and calls[-1] == tmp_path / "boot.log"
 
     def fail(path):
-        raise OSError("no ACL")
+        if path == tmp_path / "boot.log":
+            raise OSError("no ACL")
 
     monkeypatch.setattr("jacked.service.windows_security.secure_windows_path", fail)
     record("Traceback\nImportError: y\n", path=tmp_path / "boot.log", now=1)
@@ -138,3 +141,9 @@ def test_status_reads_the_log_once(tmp_path, monkeypatch):
     monkeypatch.setattr(boot_failure, "_read", read_then_remove)
     assert boot_failure.describe_latest(path=log).startswith("ImportError: x (at 1970")
     assert len(calls) == 1
+
+
+def test_the_log_is_written_with_lf_on_every_os(tmp_path):
+    log = tmp_path / "boot.log"
+    record("Traceback\nImportError: x\n", path=log, now=0)
+    assert b"\r" not in log.read_bytes()
