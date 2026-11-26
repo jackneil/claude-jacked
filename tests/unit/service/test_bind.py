@@ -716,3 +716,32 @@ def test_bind_doctests_run():
     results = doctest.testmod(bind_mod)
     assert results.failed == 0
     assert results.attempted > 0
+
+
+class TestTailscaleCliIsFoundWithoutPath:
+    """The service PATH holds only system folders, so a bare `tailscale` is
+    not found there. The CLI is resolved to an absolute path first."""
+
+    def test_find_bin_wins(self, monkeypatch):
+        from jacked.service import bind
+
+        monkeypatch.setattr("jacked.findbin.find_bin", lambda name, **kw: "/opt/ts/tailscale")
+        assert bind._tailscale_cli() == "/opt/ts/tailscale"
+
+    def test_the_windows_install_folder_is_used(self, monkeypatch, tmp_path):
+        from jacked.service import bind
+
+        exe = tmp_path / "Tailscale" / "tailscale.exe"
+        exe.parent.mkdir()
+        exe.write_bytes(b"")
+        monkeypatch.setattr("jacked.findbin.find_bin", lambda name, **kw: None)
+        monkeypatch.setenv("ProgramFiles", str(tmp_path))
+        assert bind._tailscale_cli() == str(exe)
+
+    def test_no_cli_keeps_the_bare_name_for_the_tolerant_caller(self, monkeypatch, tmp_path):
+        from jacked.service import bind
+
+        monkeypatch.setattr("jacked.findbin.find_bin", lambda name, **kw: None)
+        monkeypatch.setenv("ProgramFiles", str(tmp_path))
+        monkeypatch.setattr(bind.os.path, "isfile", lambda path: False)
+        assert bind._tailscale_cli() == "tailscale"

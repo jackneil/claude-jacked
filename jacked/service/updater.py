@@ -1816,8 +1816,6 @@ def _spawn_windows_tray_updater(
     `python -m pip install --upgrade --user`, not `uv tool install` (which
     would install the package a second time in a different location).
     """
-    import os
-    import tempfile
 
     from jacked.findbin import find_bin
     from jacked import upgrade_guard
@@ -2135,19 +2133,11 @@ def _spawn_windows_tray_updater(
         + _tray_release_failed_block(port, to_version, DRIFT_GUARD)
     )
 
-    fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-tray-update-")
-    try:
-        # newline="" — batch_body already carries explicit \r\n. Translating on
-        # top of that wrote \r\r\n; cmd.exe tolerates the stray CR but nothing
-        # here should depend on that.
-        with os.fdopen(fd, "w", newline="") as f:
-            f.write(batch_body)
-    except Exception:
-        try:
-            os.unlink(batch_path)
-        except OSError:
-            pass
-        raise
+    # Every program is pinned to an absolute path: the batch can run in the
+    # service environment, whose PATH holds only the Windows folders.
+    from jacked.service.batch_programs import write_batch
+
+    batch_path = write_batch(batch_body, "jacked-tray-update-")
 
     # CREATE_NO_WINDOW, NOT DETACHED_PROCESS. This batch is spawned by the tray,
     # which runs under the windowless pythonw.exe — so there's no console to

@@ -32,6 +32,19 @@ from click.testing import CliRunner
 NO_WINDOW = 0x08000000
 
 
+def _unpin(raw: str) -> str:
+    """Undo jacked.service.batch_programs.pin_programs, so the assertions
+    below read the batch logic with bare program names. The raw batch (with
+    absolute paths) is in ``seen["raw"]``; TestEveryProgramIsAbsolute reads it."""
+    from jacked.winproc import system_program
+
+    lines = [line for line in raw.split("\r\n") if not line.startswith("set JACKED=")]
+    body = "\r\n".join(lines).replace("%JACKED%", "jacked")
+    for name in ("powershell", "ping"):
+        body = body.replace(f'"{system_program(name)}"', name)
+    return body
+
+
 def _capture_batch(spawn) -> dict:
     """Run *spawn* with Popen stubbed; return the generated batch body."""
     seen = {}
@@ -42,7 +55,8 @@ def _capture_batch(spawn) -> dict:
         # newline="" — the batch is CRLF and the assertions compare against
         # CRLF-joined builders; universal-newline translation would break them.
         with open(args[2], encoding="utf-8", newline="") as fh:
-            seen["body"] = fh.read()
+            seen["raw"] = fh.read()
+        seen["body"] = _unpin(seen["raw"])
 
         class _P:
             pid = 1
@@ -54,6 +68,9 @@ def _capture_batch(spawn) -> dict:
 
 
 TRAY_CREATION_ID = "windows-filetime:133000000000000000"
+
+# The programs that the batch builders' find_bin knows. A test may add one.
+_BINS = {"uv": r"C:\uv\uv.exe"}
 
 
 def _tray_identity(pid):
@@ -76,7 +93,7 @@ def _tray_batch(identity=_tray_identity, port=8321):
             "jacked.install_method.detect_install_method", return_value="uv"
         ), patch(
             "jacked.findbin.find_bin",
-            side_effect=lambda n: {"uv": r"C:\uv\uv.exe"}.get(n),
+            side_effect=lambda n: _BINS.get(n),
         ), patch(
             "jacked.service.instance.process_identity", side_effect=identity
         ), patch.object(updater.sys, "platform", "win32"):
@@ -103,7 +120,7 @@ def _cli_batch(extra_args=(), precheck=None):
             "jacked.install_method.detect_install_method", return_value="uv"
         ), patch(
             "jacked.findbin.find_bin",
-            side_effect=lambda n: {"uv": r"C:\uv\uv.exe"}.get(n),
+            side_effect=lambda n: _BINS.get(n),
         ), patch(
             "jacked.service.install_release.release_install",
             side_effect=precheck or (lambda **_kw: _released()),
@@ -1343,3 +1360,70 @@ class TestTheVersionFloorNeverRedirects:
         assert lines, "the batch carries no version floor"
         bad = [line for line in lines if self._unquoted_floor(line)]
         assert bad == []
+
+
+class TestEveryProgramIsAbsolute:
+    """The batch can run in the service environment, whose PATH holds only
+    <SystemRoot>\\System32 and <SystemRoot>. A bare `jacked` there exits 9009,
+    and `if errorlevel 2` reads that as "another updater is running"."""
+
+    def _with_jacked(self, which, monkeypatch):
+        # ASCII: the batch is written in the locale code page (a separate,
+        # pre-existing limit for non-ASCII profile paths).
+        jacked = r"C:\Program Files (x86)\jk & co\jacked.exe"
+        monkeypatch.setitem(_BINS, "jacked", jacked)
+        return BATCH_BUILDERS[which](), jacked
+
+    @pytest.mark.parametrize("which", sorted(BATCH_BUILDERS))
+    def test_no_command_names_a_program_by_a_bare_word(self, which, monkeypatch):
+        from jacked.service.batch_programs import bare_commands
+
+        seen, jacked = self._with_jacked(which, monkeypatch)
+        assert bare_commands(seen["raw"]) == []
+        assert f'set JACKED="{jacked}"' in seen["raw"].split("\r\n")[:3]
+        # The checker is not vacuous: the same batch with bare names fails it.
+        assert len(bare_commands(seen["body"])) > 5
+
+    def test_the_cmd_builtin_list_is_explicit(self):
+        from jacked.service.batch_programs import CMD_BUILTINS
+
+        assert {"echo", "set", "if", "goto", "exit", "start", "del", "call"} <= CMD_BUILTINS
+        assert not ({"jacked", "powershell", "ping", "uv", "python"} & CMD_BUILTINS)
+
+    def test_a_percent_in_the_jacked_path_is_escaped(self):
+        from jacked.service.batch_programs import pin_programs
+
+        pinned = pin_programs("@echo off\r\njacked x\r\n", r'"C:\100%\jacked.exe"')
+        assert 'set JACKED="C:\\100%%\\jacked.exe"' in pinned
+
+    def test_with_no_entry_point_the_batch_runs_the_interpreter(self, monkeypatch):
+        from jacked.service import batch_programs
+
+        monkeypatch.setattr("jacked.findbin.find_bin", lambda name, **kw: None)
+        command = batch_programs.resolve_jacked()
+        assert command.endswith('" -m jacked') and command.startswith('"')
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="runs cmd.exe")
+    def test_the_tray_preamble_reaches_its_first_status_step_in_the_service_environment(
+        self, tmp_path, monkeypatch
+    ):
+        from jacked.service.batch_programs import pin_programs
+        from jacked.winproc import system_program
+        from tests.unit.service.service_contract_support import provision_contract
+
+        _spec, environment, paths = provision_contract(tmp_path, monkeypatch)
+        body = _tray_batch()["body"]
+        lines = body.split("\r\n")
+        first = next(i for i, line in enumerate(lines) if "_update_status_init" in line)
+        preamble = "\r\n".join(lines[: first + 1] + ["exit /b %ERRORLEVEL%", ""])
+        script = tmp_path / "preamble.bat"
+        script.write_bytes(
+            pin_programs(preamble, f'"{sys.executable}" -m jacked').encode("utf-8")
+        )
+        result = subprocess.run(
+            [system_program("cmd"), "/c", str(script)],
+            env=environment, cwd=paths.root, capture_output=True, text=True,
+            timeout=120, check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "is not recognized" not in result.stdout + result.stderr

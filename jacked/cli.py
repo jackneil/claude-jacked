@@ -2055,7 +2055,6 @@ def _spawn_windows_upgrade_helper(
     """
     import os
     import subprocess
-    import tempfile
     from jacked.findbin import find_bin
     from jacked.install_method import (
         rollback_command,
@@ -2301,20 +2300,11 @@ def _spawn_windows_upgrade_helper(
         + _cli_release_abort_blocks(skip_service)
     )
 
-    # Write the batch file to %TEMP% — it deletes itself at the end.
-    fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-upgrade-")
-    try:
-        # newline="" — batch_body already carries explicit \r\n. Translating on
-        # top of that wrote \r\r\n; cmd.exe tolerates the stray CR but nothing
-        # here should depend on that.
-        with os.fdopen(fd, "w", newline="") as f:
-            f.write(batch_body)
-    except Exception:
-        try:
-            os.unlink(batch_path)
-        except OSError:
-            pass
-        raise
+    # Write the batch file to %TEMP%; it deletes itself at the end. Every program is pinned to an absolute path: the batch can run in the
+    # service environment, whose PATH holds only the Windows folders.
+    from jacked.service.batch_programs import write_batch
+
+    batch_path = write_batch(batch_body, "jacked-upgrade-")
 
     # Spawn the batch CREATE_NO_WINDOW, NOT DETACHED_PROCESS. The batch runs a
     # pile of console children — the `tasklist | find "<pid>"` + `timeout /t 1`

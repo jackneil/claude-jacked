@@ -39,7 +39,9 @@ NO_WINDOW = (
 
 _DEFAULT_ROOT = "C:\\Windows"
 # Programs in %SystemRoot%\System32, by name without ".exe".
-_SYSTEM32 = frozenset({"cmd", "schtasks", "taskkill", "reg", "sc", "cscript", "wscript"})
+_SYSTEM32 = frozenset(
+    {"cmd", "schtasks", "taskkill", "reg", "sc", "cscript", "wscript", "ping", "tasklist", "find"}
+)
 
 
 def _absolute(value: str | None) -> bool:

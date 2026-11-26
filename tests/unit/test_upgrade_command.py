@@ -743,7 +743,7 @@ class TestUpgradeWindows:
             CliRunner().invoke(main, ["upgrade"])
         batch = open(created[0]).read()
         assert '_update_status_init "' in batch and '" "0.109.0" ' in batch
-        assert 'jacked _update_status_succeed --target "0.109.0" --previous "' in batch
+        assert '%JACKED% _update_status_succeed --target "0.109.0" --previous "' in batch
         assert '"next"' not in batch
 
     # test_windows_batch_uses_pip_user_when_method_is_pip: removed in 0.41.19
