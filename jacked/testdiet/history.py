@@ -263,7 +263,7 @@ def prune(store: Path, before: date, *, now: datetime | None = None) -> list[str
     step, and then its tests file. A tests file with no meta file is a write
     that is in progress or that stopped: it goes only when its run ID is
     also more than 24 hours (``ORPHAN_AGE``) before ``now``. A file that is
-    not a run file stays. When a file cannot be deleted, the other files
+    not a run file stays. ``now`` must be an aware datetime. When a file cannot be deleted, the other files
     still go, and then ``PruneError`` names each file that stays and holds
     the deleted IDs.
     """
@@ -273,6 +273,8 @@ def prune(store: Path, before: date, *, now: datetime | None = None) -> list[str
     except FileNotFoundError:
         return []
     limit = f"{before:%Y%m%d}"
+    if now is not None and now.tzinfo is None:
+        raise ValueError("now must be an aware datetime (UTC)")
     orphan_limit = (now or datetime.now(timezone.utc)) - ORPHAN_AGE
     found: dict[str, set[str]] = {}
     for name in names:

@@ -13,6 +13,11 @@ write a copy of a new large file into the lfs folder of the clone. In a
 sparse checkout, ``git add -A --sparse`` adds a file outside the sparse cone
 too, and a tracked file that the cone leaves out of the work tree stays as
 HEAD has it, so the hash is the tree of a full commit of the work tree.
+
+The minimum git is 2.31 (``rev-parse --path-format``). ``--sparse`` needs
+git 2.34. An older git rejects it with exit code 129, and then the add runs
+again with no ``--sparse``: a sparse checkout with an untracked file outside
+the cone then has no tree.
 """
 
 from __future__ import annotations
@@ -53,6 +58,8 @@ _GIT_TIMEOUT_S = 600.0
 # split index keeps part of the index in a second file of the git directory;
 # with this value git writes the copy as one file and never touches that one.
 _INDEX_COPY_ARGS = ("-c", "core.splitIndex=false")
+# The exit code of git for an option that it does not know.
+_GIT_USAGE_ERROR = 129
 # A failure of the work-tree read is logged at WARNING one time in each process.
 _warned_add = False
 # The size of the machine identity, in random bytes (32 hex characters).
@@ -162,6 +169,9 @@ def _tree_id(cwd: Path, objects: Path | None) -> TreeId | None:
             "GIT_ALTERNATE_OBJECT_DIRECTORIES": _alternates(real_objects),
         }
         code, _ = _git(cwd, *_INDEX_COPY_ARGS, "add", "-A", "--sparse", env=env)
+        if code == _GIT_USAGE_ERROR:
+            # A git before 2.34 does not know --sparse.
+            code, _ = _git(cwd, *_INDEX_COPY_ARGS, "add", "-A", env=env)
         if code != 0:
             raise _AddError(f"git add exited with {code}")
         code, out = _git(cwd, *_INDEX_COPY_ARGS, "write-tree", env=env)
@@ -174,32 +184,44 @@ def _tree_id(cwd: Path, objects: Path | None) -> TreeId | None:
 
 
 def remove_tree(path: Path) -> None:
-    """Remove the folder ``path`` and all that it holds.
+    """Remove the folder ``path`` and all that it holds. This function never raises.
 
     Git makes its loose objects read-only, and Windows does not delete a
     read-only file. So a path that cannot be removed gets write permission
-    (and its folder too), and the removal tries again. A path that still
-    cannot be removed is logged at WARNING. A missing folder is not an error.
+    (and its folder too, when that folder is inside ``path``), and the
+    removal tries again. A symbolic link never gets a new mode, because the
+    mode change would go to its target. A path that still cannot be removed
+    is logged at WARNING. A missing folder is not an error.
     """
+    try:
+        _remove_tree(Path(path), os.path.abspath(path), nested=False)
+    except Exception as exc:  # noqa: BLE001 -- a cleanup helper must never raise
+        logger.warning("remove_tree: cannot remove %s (%s)", path, type(exc).__name__)
 
-    root = os.path.abspath(path)
 
+def _remove_tree(path: Path, root: str, *, nested: bool) -> None:
     def retry(func, failed, exc) -> None:
         if isinstance(exc, FileNotFoundError):
             return
         try:
+            failed = os.fspath(failed)
             parent = os.path.dirname(os.path.abspath(failed))
             # Only a folder inside ``path`` gets a new mode, never the folder that holds it.
             if parent == root or parent.startswith(root + os.sep):
                 os.chmod(parent, stat.S_IRWXU)
-            if os.path.lexists(failed) and not os.path.isdir(failed):
-                os.chmod(failed, stat.S_IREAD | stat.S_IWRITE)
-            elif os.path.isdir(failed):
-                os.chmod(failed, stat.S_IRWXU)
-            func(failed)
+            if not os.path.islink(failed) and os.path.lexists(failed):
+                is_dir = os.path.isdir(failed)
+                os.chmod(failed, stat.S_IRWXU if is_dir else stat.S_IREAD | stat.S_IWRITE)
+            if func in (os.unlink, os.remove, os.rmdir):
+                func(failed)
+            elif not nested and os.path.isdir(failed) and not os.path.islink(failed):
+                # rmtree could not open or list this folder. Remove it one more time.
+                _remove_tree(Path(failed), root, nested=True)
+            else:
+                logger.warning("remove_tree: cannot remove %s (%s)", failed, type(exc).__name__)
         except FileNotFoundError:
             return
-        except OSError as again:
+        except Exception as again:  # noqa: BLE001 -- a cleanup helper must never raise
             logger.warning("remove_tree: cannot remove %s (%s)", failed, type(again).__name__)
 
     if sys.version_info >= (3, 12):
@@ -351,7 +373,8 @@ def _make_machine_id(path: Path) -> None:
 
     The value goes into a private temporary file first. A hard link then puts
     it at ``path``; the link fails when ``path`` exists, so the first process
-    wins and no reader sees a partial file.
+    wins and no reader sees a partial file. Where the file system has no hard
+    links, an atomic replace that checks for the file just before it is used.
     """
     value = secrets.token_hex(_MACHINE_ID_BYTES)
     temp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
@@ -360,8 +383,28 @@ def _make_machine_id(path: Path) -> None:
         os.link(temp, path)
     except FileExistsError:
         pass
+    except OSError:
+        # A file system with no hard links: an atomic replace that stops
+        # when another process made the file first.
+        _write_machine_id(path, value)
     finally:
         temp.unlink(missing_ok=True)
+
+
+class _IdExists(Exception):
+    """The machine identity file exists. The write stops."""
+
+
+def _write_machine_id(path: Path, value: str) -> None:
+    def refuse_when_made() -> None:
+        if os.path.lexists(path):
+            raise _IdExists
+
+    try:
+        atomic_write_bytes(path, (value + "\n").encode("ascii"), mode=0o600,
+                           before_replace=refuse_when_made)
+    except _IdExists:
+        pass
 
 
 def _read_machine_id(path: Path) -> str | None:

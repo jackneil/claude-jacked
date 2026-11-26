@@ -230,6 +230,96 @@ def test_remove_tree_logs_a_path_that_it_cannot_remove(tmp_path, monkeypatch, ca
     assert any("cannot remove" in r.getMessage() and "file" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows has no POSIX mode bits")
+def test_remove_tree_removes_a_folder_with_an_unreadable_subfolder(tmp_path, caplog):
+    folder = tmp_path / "objects"
+    locked = folder / "locked"
+    locked.mkdir(parents=True)
+    (locked / "inner").write_bytes(b"x")
+    os.chmod(locked, 0)
+    try:
+        with caplog.at_level(logging.WARNING, logger="jacked.testdiet.tree"):
+            tree.remove_tree(folder)  # must return, never raise
+        assert not folder.exists() or any("cannot remove" in r.getMessage() for r in caplog.records)
+        assert not folder.exists()
+    finally:
+        if locked.exists():
+            os.chmod(locked, stat.S_IRWXU)
+
+
+def test_remove_tree_never_raises(tmp_path, monkeypatch, caplog):
+    folder = tmp_path / "f"
+    folder.mkdir()
+
+    def broken(*args, **kwargs):
+        raise TypeError("a bug in a removal call")
+
+    monkeypatch.setattr(shutil, "rmtree", broken)
+    with caplog.at_level(logging.WARNING, logger="jacked.testdiet.tree"):
+        tree.remove_tree(folder)
+    assert any("TypeError" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a symbolic link needs a privilege on Windows")
+def test_remove_tree_does_not_change_the_mode_of_a_link_target(tmp_path, monkeypatch):
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"keep")
+    os.chmod(outside, 0o444)
+    folder = tmp_path / "objects"
+    folder.mkdir()
+    (folder / "link").symlink_to(outside)
+    real_unlink = os.unlink
+    refused: list[str] = []
+
+    def unlink(path, *args, **kwargs):
+        if os.fspath(path).endswith("link") and not refused:
+            refused.append(os.fspath(path))
+            raise PermissionError(13, "refused once")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    tree.remove_tree(folder)
+    assert refused and not folder.exists()
+    assert outside.read_bytes() == b"keep"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o444
+
+
+def test_a_git_that_does_not_know_sparse_still_gives_a_tree(repo, monkeypatch):
+    real = tree._git
+    seen: list[tuple[str, ...]] = []
+
+    def old_git(cwd, *args, env=None):
+        seen.append(args)
+        if "--sparse" in args:
+            return 129, b""
+        return real(cwd, *args, env=env)
+
+    monkeypatch.setattr(tree, "_git", old_git)
+    (repo / "README.md").write_bytes(b"dirty\n")
+    tid = tree.tree_id(repo)
+    assert tid is not None and tid.clean is False
+    adds = [a for a in seen if "add" in a]
+    assert len(adds) == 2 and "--sparse" in adds[0] and "--sparse" not in adds[1]
+
+
+def test_a_failed_work_tree_read_warns_one_time_with_the_exit_code(repo, monkeypatch, caplog):
+    monkeypatch.setattr(tree, "_warned_add", False)
+    real = tree._git
+
+    def failing_add(cwd, *args, env=None):
+        if "add" in args:
+            return 128, b""
+        return real(cwd, *args, env=env)
+
+    monkeypatch.setattr(tree, "_git", failing_add)
+    with caplog.at_level(logging.DEBUG, logger="jacked.testdiet.tree"):
+        assert tree.tree_id(repo) is None
+        assert tree.tree_id(repo) is None
+    records = [r for r in caplog.records if "work tree read failed" in r.getMessage()]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.DEBUG]
+    assert "128" in records[0].getMessage()
+
+
 def test_tree_id_is_empty_when_the_temporary_folder_cannot_be_made(repo, monkeypatch):
     def refuse(*args, **kwargs):
         raise PermissionError(13, "refused")
@@ -575,6 +665,12 @@ def test_prune_deletes_a_tests_file_with_no_meta_file_that_is_older_than_a_day(t
     assert history.prune(tmp_path, date(2026, 11, 25), now=young) == []
 
 
+def test_prune_refuses_a_naive_now(tmp_path):
+    history.write_run(tmp_path, _meta("20261120T100000000000Z-00000001"), None)
+    with pytest.raises(ValueError):
+        history.prune(tmp_path, date(2026, 11, 25), now=datetime(2026, 11, 26, 10, 0))
+
+
 def test_a_prune_failure_names_the_file_and_keeps_the_deleted_ids(tmp_path, monkeypatch):
     ids = ["20261120T100000000000Z-00000001", "20261121T100000000000Z-00000002",
            "20261122T100000000000Z-00000003"]
@@ -768,6 +864,17 @@ def test_two_processes_that_make_the_machine_id_at_once_get_one_id(tmp_path):
     assert len(set(outs)) == 1 and re.fullmatch(r"[0-9a-f]{32}", outs[0])
     folder = tmp_path / "home" / ".claude"
     assert sorted(p.name for p in folder.iterdir()) == ["jacked-tests-machine-id"]
+
+
+def test_the_machine_id_is_made_on_a_file_system_with_no_hard_links(tmp_path, monkeypatch):
+    def no_links(*args, **kwargs):
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", no_links)
+    first = tree.machine_id(tmp_path)
+    assert re.fullmatch(r"[0-9a-f]{32}", first)
+    assert tree.machine_id(tmp_path) == first
+    assert sorted(p.name for p in (tmp_path / ".claude").iterdir()) == ["jacked-tests-machine-id"]
 
 
 def test_the_machine_id_is_empty_when_the_file_cannot_be_read_or_made(tmp_path):
