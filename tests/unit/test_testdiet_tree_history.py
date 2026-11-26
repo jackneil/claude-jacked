@@ -285,16 +285,16 @@ def test_remove_tree_does_not_change_the_mode_of_a_link_target(tmp_path, monkeyp
 
 
 def test_a_git_that_does_not_know_sparse_still_gives_a_tree(repo, monkeypatch):
-    real = tree._git
+    real = tree.git
     seen: list[tuple[str, ...]] = []
 
-    def old_git(cwd, *args, env=None):
+    def old_git(cwd, *args, env=None, stderr=None):
         seen.append(args)
         if "--sparse" in args:
             return 129, b""
-        return real(cwd, *args, env=env)
+        return real(cwd, *args, env=env, stderr=stderr)
 
-    monkeypatch.setattr(tree, "_git", old_git)
+    monkeypatch.setattr(tree, "git", old_git)
     (repo / "README.md").write_bytes(b"dirty\n")
     tid = tree.tree_id(repo)
     assert tid is not None and tid.clean is False
@@ -304,14 +304,14 @@ def test_a_git_that_does_not_know_sparse_still_gives_a_tree(repo, monkeypatch):
 
 def test_a_failed_work_tree_read_warns_one_time_with_the_exit_code(repo, monkeypatch, caplog):
     monkeypatch.setattr(tree, "_warned_add", False)
-    real = tree._git
+    real = tree.git
 
-    def failing_add(cwd, *args, env=None):
+    def failing_add(cwd, *args, env=None, stderr=None):
         if "add" in args:
             return 128, b""
-        return real(cwd, *args, env=env)
+        return real(cwd, *args, env=env, stderr=stderr)
 
-    monkeypatch.setattr(tree, "_git", failing_add)
+    monkeypatch.setattr(tree, "git", failing_add)
     with caplog.at_level(logging.DEBUG, logger="jacked.testdiet.tree"):
         assert tree.tree_id(repo) is None
         assert tree.tree_id(repo) is None
@@ -921,3 +921,19 @@ def test_the_machine_id_file_is_for_the_user_only(tmp_path):
     tree.machine_id(tmp_path)
     mode = (tmp_path / ".claude" / "jacked-tests-machine-id").stat().st_mode & 0o777
     assert mode == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="needs POSIX modes and a user that is not root")
+def test_a_failed_work_tree_read_raises_with_the_first_error_line_of_git(repo):
+    locked = repo / "locked.txt"
+    locked.write_bytes(b"x")
+    locked.chmod(0)
+    try:
+        with pytest.raises(tree.TreeError) as caught:
+            tree.read_tree_id(repo)
+        assert tree.tree_id(repo) is None
+    finally:
+        locked.chmod(0o600)
+    assert "git add exited with" in str(caught.value)
+    assert "locked.txt" in caught.value.detail

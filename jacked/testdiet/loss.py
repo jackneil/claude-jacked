@@ -65,8 +65,8 @@ class LossReport:
 # Git --------------------------------------------------------------------
 
 def _rev(top: Path, spec: str) -> str | None:
-    code, out = tree._git(top, "rev-parse", "--verify", "-q", "--end-of-options", spec)
-    lines = tree._lines(out)
+    code, out = tree.git(top, "rev-parse", "--verify", "-q", "--end-of-options", spec)
+    lines = tree.output_lines(out)
     return lines[0] if code == 0 and len(lines) == 1 else None
 
 
@@ -86,8 +86,8 @@ def _base_commit(top: Path, base: str | None) -> str:
         if tip is None:
             raise LossError(f"{DEFAULT_REF} does not exist. Give --base <branch>, "
                             "or run: git remote set-head origin --auto")
-    code, out = tree._git(top, "merge-base", "--end-of-options", "HEAD", tip)
-    lines = tree._lines(out)
+    code, out = tree.git(top, "merge-base", "--end-of-options", "HEAD", tip)
+    lines = tree.output_lines(out)
     if code != 0 or len(lines) != 1:
         name = DEFAULT_NAME if base is None else repr(base)
         raise LossError(f"HEAD and {name} have no merge base. Give a --base that shares history with HEAD.")
@@ -96,7 +96,7 @@ def _base_commit(top: Path, base: str | None) -> str:
 
 def _touched(top: Path, base: str, head_tree: str, env: dict[str, str]) -> list[tuple[str, str, str]]:
     """Return (path, base blob, head blob) for each touched test file. An empty blob is ``""``."""
-    code, out = tree._git(top, "diff-tree", "-r", "-z", "--no-renames", "--end-of-options",
+    code, out = tree.git(top, "diff-tree", "-r", "-z", "--no-renames", "--end-of-options",
                           base, head_tree, env=env)
     if code != 0:
         raise LossError(f"git diff-tree exited with {code}")
@@ -117,7 +117,7 @@ def _touched(top: Path, base: str, head_tree: str, env: dict[str, str]) -> list[
 def _read(top: Path, blob: str, env: dict[str, str]) -> bytes | None:
     if not blob:
         return None
-    code, out = tree._git(top, "cat-file", "blob", blob, env=env)
+    code, out = tree.git(top, "cat-file", "blob", blob, env=env)
     if code != 0:
         raise LossError(f"git cannot read the object {blob}")
     return out
@@ -138,14 +138,15 @@ def loss_report(cwd: Path, base: str | None = None) -> LossReport:
     commit = _base_commit(top, base)
     objects = Path(tempfile.mkdtemp(prefix="jacked-loss-"))
     try:
-        head = tree.tree_id(top, objects=objects)
+        try:
+            head = tree.read_tree_id(top, objects=objects)
+        except tree.TreeError as exc:
+            detail = getattr(exc, "detail", "")
+            raise LossError(f"git cannot give the tree of the work tree ({exc}"
+                            + (f": {one_line(detail)})" if detail else ")")) from exc
         if head is None:
             raise LossError("git cannot give the tree of the work tree")
-        code, out = tree._git(top, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-        if code != 0:
-            raise LossError("git did not give the object path")
-        env = {"GIT_OBJECT_DIRECTORY": str(objects),
-               "GIT_ALTERNATE_OBJECT_DIRECTORIES": tree._alternates(tree._lines(out)[0])}
+        env = tree.object_env(top, objects)
         sides: tuple[dict[str, list[Declaration]], dict[str, list[Declaration]]] = ({}, {})
         for path, *blobs in _touched(top, commit, head.tree, env):
             for side, blob in zip(sides, blobs):

@@ -107,8 +107,8 @@ def _check_options(kind: str | None, label: str | None, runner: str | None) -> N
 
 def work_tree_top(cwd: Path) -> Path:
     """Return the top folder of the work tree that holds ``cwd``. Raise ``TreeError`` outside one."""
-    code, out = tree._git(Path(cwd), "rev-parse", "--show-toplevel")
-    lines = tree._lines(out)
+    code, out = tree.git(Path(cwd), "rev-parse", "--show-toplevel")
+    lines = tree.output_lines(out)
     if code != 0 or len(lines) != 1:
         raise tree.TreeError("the folder is not in the work tree of a git repository")
     return Path(lines[0])
@@ -196,8 +196,8 @@ def _commit_tree(top: Path, commit: str) -> TreeId:
     """The clean tree identity of ``commit``. A name that is not a commit raises ``TreeError``."""
     found = []
     for suffix in ("^{commit}", "^{tree}"):
-        code, out = tree._git(top, "rev-parse", "--verify", "-q", "--end-of-options", commit + suffix)
-        lines = tree._lines(out)
+        code, out = tree.git(top, "rev-parse", "--verify", "-q", "--end-of-options", commit + suffix)
+        lines = tree.output_lines(out)
         if code != 0 or len(lines) != 1:
             raise tree.TreeError("the commit is not in this repository")
         found += lines

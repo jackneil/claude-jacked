@@ -84,11 +84,13 @@ class _All:
         return None
 
 
-def _git(cwd: Path, *args: str, env: Mapping[str, str] | None = None) -> tuple[int, bytes]:
+def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
+        stderr=None) -> tuple[int, bytes]:
     """Run git in ``cwd`` and return the exit code and the output.
 
     Each call has ``GIT_OPTIONAL_LOCKS=0``, so a read never writes the real
-    index. A git that cannot start raises ``TreeError``.
+    index. A git that cannot start raises ``TreeError``. ``stderr`` is a
+    binary file for the error text of git; with no value it is discarded.
     """
     binary = find_bin("git")
     if binary is None:
@@ -100,13 +102,14 @@ def _git(cwd: Path, *args: str, env: Mapping[str, str] | None = None) -> tuple[i
     argv = [binary, "-C", str(cwd), *git_guard.GIT_CONFIG_OVERRIDE_ARGS, *args]
     try:
         code = git_guard.run_git(argv, name=args[0] if args[0] != "-c" else args[2],
-                                 env=full_env, timeout=_GIT_TIMEOUT_S, consumer=out)
+                                 env=full_env, timeout=_GIT_TIMEOUT_S, consumer=out, stderr=stderr)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise TreeError(f"git did not run: {type(exc).__name__}") from exc
     return code, bytes(out.data)
 
 
-def _lines(data: bytes) -> list[str]:
+def output_lines(data: bytes) -> list[str]:
+    """Return the lines of git output that are not empty, decoded as file names."""
     return [os.fsdecode(line) for line in data.splitlines() if line]
 
 
@@ -121,7 +124,7 @@ def tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
     this function removes.
     """
     try:
-        return _tree_id(Path(cwd), objects)
+        return read_tree_id(cwd, objects=objects)
     except _AddError as exc:
         global _warned_add
         level = logging.DEBUG if _warned_add else logging.WARNING
@@ -135,23 +138,46 @@ def tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
 
 
 class _AddError(TreeError):
-    """``git add`` or ``git write-tree`` on the copy of the index failed."""
+    """``git add`` or ``git write-tree`` on the copy of the index failed.
+
+    The message holds the exit code only. ``detail`` is the first line of the
+    error text of git, for a caller that prints it.
+    """
+
+    def __init__(self, message: str, detail: str = "") -> None:
+        super().__init__(message)
+        self.detail = detail
 
 
-def _tree_id(cwd: Path, objects: Path | None) -> TreeId | None:
-    code, out = _git(cwd, "rev-parse", "--is-bare-repository")
+def _first_line(handle) -> str:
+    handle.seek(0)
+    for line in handle.read(4096).decode("utf-8", "replace").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def read_tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
+    """Return the identity of the work tree, as ``tree_id`` does, but raise when git fails.
+
+    The result is None for a bare repository and for a repository with no
+    commit. A failed read of the work tree raises ``TreeError``; its
+    ``detail`` holds the first line of the error text of git.
+    """
+    cwd = Path(cwd)
+    code, out = git(cwd, "rev-parse", "--is-bare-repository")
     if code != 0 or out.strip() != b"false":
         return None
     heads = []
     for spec in ("HEAD^{commit}", "HEAD^{tree}"):
-        code, out = _git(cwd, "rev-parse", "--verify", "-q", spec)
-        if code != 0 or len(_lines(out)) != 1:
+        code, out = git(cwd, "rev-parse", "--verify", "-q", spec)
+        if code != 0 or len(output_lines(out)) != 1:
             return None
-        heads += _lines(out)
+        heads += output_lines(out)
     commit, head_tree = heads
-    code, out = _git(cwd, "rev-parse", "--path-format=absolute", "--git-path", "index",
+    code, out = git(cwd, "rev-parse", "--path-format=absolute", "--git-path", "index",
                      "--git-path", "objects")
-    paths = _lines(out)
+    paths = output_lines(out)
     if code != 0 or len(paths) != 2:
         raise TreeError("git did not give the index and object paths")
     real_index, real_objects = Path(paths[0]), paths[1]
@@ -166,18 +192,21 @@ def _tree_id(cwd: Path, objects: Path | None) -> TreeId | None:
         env = {
             "GIT_INDEX_FILE": str(index_copy),
             "GIT_OBJECT_DIRECTORY": str(object_dir),
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES": _alternates(real_objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates(real_objects),
         }
-        code, _ = _git(cwd, *_INDEX_COPY_ARGS, "add", "-A", "--sparse", env=env)
-        if code == _GIT_USAGE_ERROR:
-            # A git before 2.34 does not know --sparse.
-            code, _ = _git(cwd, *_INDEX_COPY_ARGS, "add", "-A", env=env)
-        if code != 0:
-            raise _AddError(f"git add exited with {code}")
-        code, out = _git(cwd, *_INDEX_COPY_ARGS, "write-tree", env=env)
-        lines = _lines(out)
-        if code != 0 or len(lines) != 1:
-            raise _AddError(f"git write-tree exited with {code}")
+        with tempfile.TemporaryFile(dir=work) as errors:
+            code, _ = git(cwd, *_INDEX_COPY_ARGS, "add", "-A", "--sparse", env=env, stderr=errors)
+            if code == _GIT_USAGE_ERROR:
+                # A git before 2.34 does not know --sparse.
+                errors.seek(0)
+                errors.truncate()
+                code, _ = git(cwd, *_INDEX_COPY_ARGS, "add", "-A", env=env, stderr=errors)
+            if code != 0:
+                raise _AddError(f"git add exited with {code}", _first_line(errors))
+            code, out = git(cwd, *_INDEX_COPY_ARGS, "write-tree", env=env, stderr=errors)
+            lines = output_lines(out)
+            if code != 0 or len(lines) != 1:
+                raise _AddError(f"git write-tree exited with {code}", _first_line(errors))
     finally:
         remove_tree(work)
     return TreeId(commit=commit, tree=lines[0], clean=lines[0] == head_tree)
@@ -230,10 +259,22 @@ def _remove_tree(path: Path, root: str, *, nested: bool) -> None:
         shutil.rmtree(path, onerror=lambda func, failed, info: retry(func, failed, info[1]))
 
 
-def _alternates(real_objects: str) -> str:
+def alternates(real_objects: str) -> str:
     """The real object folder, plus the alternates that the environment already names."""
     present = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
     return os.pathsep.join([real_objects, present] if present else [real_objects])
+
+
+def object_env(cwd: Path, objects: Path) -> dict[str, str]:
+    """Return the environment that lets git read the objects in ``objects`` and the real objects.
+
+    Raise ``TreeError`` when git does not give the real object folder.
+    """
+    code, out = git(Path(cwd), "rev-parse", "--path-format=absolute", "--git-path", "objects")
+    lines = output_lines(out)
+    if code != 0 or len(lines) != 1:
+        raise TreeError("git did not give the object path")
+    return {"GIT_OBJECT_DIRECTORY": str(objects), "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates(lines[0])}
 
 
 def changed_paths(cwd: Path, a: TreeId, b: TreeId, *, objects: Path | None = None) -> list[str]:
@@ -244,14 +285,8 @@ def changed_paths(cwd: Path, a: TreeId, b: TreeId, *, objects: Path | None = Non
     ``TreeError``: an empty list always means that no path differs.
     """
     cwd = Path(cwd)
-    env: dict[str, str] = {}
-    if objects is not None:
-        code, out = _git(cwd, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-        if code != 0:
-            raise TreeError("git did not give the object path")
-        env = {"GIT_OBJECT_DIRECTORY": str(objects),
-               "GIT_ALTERNATE_OBJECT_DIRECTORIES": _alternates(_lines(out)[0])}
-    code, out = _git(cwd, "diff-tree", "-r", "-z", "--name-only", "--no-renames", "--end-of-options",
+    env = {} if objects is None else object_env(cwd, objects)
+    code, out = git(cwd, "diff-tree", "-r", "-z", "--name-only", "--no-renames", "--end-of-options",
                      a.tree, b.tree, env=env)
     if code != 0:
         raise TreeError(f"git diff-tree exited with {code}; a tree object can be missing")
@@ -291,8 +326,8 @@ def common_dir(cwd: Path) -> Path:
     All worktrees of one clone have the same common directory. A folder that
     is not in a git repository raises ``TreeError``.
     """
-    code, out = _git(Path(cwd), "rev-parse", "--path-format=absolute", "--git-common-dir")
-    lines = _lines(out)
+    code, out = git(Path(cwd), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    lines = output_lines(out)
     if code != 0 or len(lines) != 1:
         raise TreeError("the folder is not in a git repository")
     return Path(lines[0])
@@ -316,13 +351,13 @@ def on_default_branch(cwd: Path, tree: TreeId) -> bool | None:
     """
     cwd = Path(cwd)
     try:
-        code, out = _git(cwd, "rev-parse", "--verify", "-q", "refs/remotes/origin/HEAD^{commit}")
-        lines = _lines(out)
+        code, out = git(cwd, "rev-parse", "--verify", "-q", "refs/remotes/origin/HEAD^{commit}")
+        lines = output_lines(out)
         if code != 0 or len(lines) != 1:
             return None
         if not tree.clean:
             return False
-        code, _ = _git(cwd, "merge-base", "--is-ancestor", "--end-of-options", tree.commit,
+        code, _ = git(cwd, "merge-base", "--is-ancestor", "--end-of-options", tree.commit,
                        lines[0])
     except TreeError as exc:
         logger.debug("on_default_branch: no answer (%s)", exc)
