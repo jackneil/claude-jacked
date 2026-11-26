@@ -158,24 +158,50 @@ def test_preflight_prints_the_host_note_on_a_pass(monkeypatch):
     assert json.loads(data.output)["note"] == note
 
 
-def test_the_report_file_carries_the_detail_when_stdout_is_lost(contract):
-    """On Windows the launcher child writes to a new hidden console, so the
-    probe's stdout never reaches the caller. The report file still does."""
-    code = "import sys\nsys.stdout = None\n" + _seam(
-        "    ssl.create_default_context()", "    raise OSError(10106, 'x')"
+def _no_pipes(argv, **kwargs):
+    """Run like Windows: the launched child gives no stdout or stderr back."""
+    from jacked.proctree import run_tree
+
+    completed = run_tree(argv, capture=True, **kwargs)
+    completed.stdout = completed.stderr = ""
+    return completed
+
+
+def _probe_without_pipes(contract, code, timeout=120.0):
+    spec, environment, paths = contract
+    return run_service_probe(
+        spec, environment, paths.root, ProbeOptions(timeout=timeout, code=code, runner=_no_pipes)
     )
-    result = _probe(contract, code=code)
+
+
+def test_the_report_file_carries_the_detail_when_the_pipes_are_lost(contract):
+    """On Windows the launcher child writes to a new hidden console, so its
+    pipes never reach the caller. The wrapper sends all output to the report."""
+    code = _seam("    ssl.create_default_context()", "    raise OSError(10106, 'x')")
+    result = _probe_without_pipes(contract, code)
     assert (result.step, result.detail) == ("ssl", "OSError errno 10106")
     assert "Traceback" in Path(result.stderr_file).read_text(encoding="utf-8")
     assert not (contract[2].root / PROBE_REPORT_NAME).exists()
 
 
+def test_any_code_writes_to_the_report_without_its_own_file_logic(contract):
+    """A test seam prints to stdout and stderr: the wrapper captures both,
+    unbuffered, also when the code ends with os._exit."""
+    code = (
+        "import os, sys\n"
+        f'print("{STEP_MARK}ssl")\n'
+        "sys.stderr.write('stderr-canary\\n')\n"
+        "os._exit(9)\n"
+    )
+    result = _probe_without_pipes(contract, code)
+    assert (result.step, result.detail) == ("ssl", "exit 9")
+    assert "stderr-canary" in Path(result.stderr_file).read_text(encoding="utf-8")
+
+
 def test_the_exit_code_is_the_verdict_when_every_channel_is_lost(contract):
-    code = "import sys\nsys.stdout = None\nsys.argv[1:] = []\n" + _seam(
+    code = "import sys\nsys.stdout = None\nsys.stderr = None\n" + _seam(
         "    ssl.create_default_context()", "    raise ImportError('x')"
     )
-    code = code.replace('REPORT = sys.argv[1] if len(sys.argv) > 1 else None', "REPORT = None")
-    assert "REPORT = None" in code
     result = _probe(contract, code=code)
     assert (result.step, result.detail) == ("ssl", f"exit {PROBE_EXIT_BASE + 2}")
 

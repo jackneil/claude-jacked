@@ -252,13 +252,26 @@ def probe_python_argv(code: str, report: Path | None = None) -> tuple[str, ...]:
     one-line ``-c`` program decodes and runs it. The Windows and the POSIX
     probe paths both use this helper, so both run the same bytes.
 
+    Before it runs the code, the program sets the output channel: when
+    ``report`` is given, ``sys.stdout`` and ``sys.stderr`` both write to
+    that file with no buffer (``write_through``). So each marker line and
+    the traceback reach the file even on ``os._exit`` or a process-tree
+    kill, and on Windows, where the launched child has no stdout or stderr
+    that goes back to the caller. Any code (the real probe or a test
+    change) gets the same channel. The caller makes the file private first.
+
     >>> argv = probe_python_argv("print(1)\\nprint(2)\\n")
     >>> argv[:2], "\\n" in argv[2]
     (('-I', '-c'), False)
     """
     encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
     program = (
-        "import base64;exec(compile(base64.b64decode('"
+        "import base64,io,sys;"
+        "_jacked_out=io.TextIOWrapper(open(sys.argv[1],'ab',buffering=0),"
+        "encoding='utf-8',errors='replace',write_through=True) "
+        "if len(sys.argv)>1 else None;"
+        "sys.stdout=_jacked_out or sys.stdout;sys.stderr=_jacked_out or sys.stderr;"
+        "exec(compile(base64.b64decode('"
         + encoded
         + "'),'<jacked-probe>','exec'))"
     )

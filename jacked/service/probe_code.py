@@ -35,29 +35,18 @@ import os
 import sys
 
 
-# The report file (argv[1]) carries the marker lines and the traceback. On
-# Windows the launcher starts Python with CreateNoWindow and no redirection,
-# so the child writes to a new hidden console, not to the caller's pipes.
-REPORT = sys.argv[1] if len(sys.argv) > 1 else None
+# The one-line wrapper (preflight_probe.probe_python_argv) points stdout
+# and stderr at the report file before this code runs, with no buffer. So a
+# print reaches the caller on every OS, also after os._exit or a kill.
 
 
 class ProbeRefusal(Exception):
     """A check of the real start failed. args[0] is a fixed token."""
 
 
-def _report(text):
-    if REPORT:
-        try:
-            with open(REPORT, "a", encoding="utf-8") as handle:
-                handle.write(text)
-        except Exception:
-            pass
-
-
 def _say(line):
-    # pythonw.exe can start with no usable stdout. The exit code carries
-    # the verdict, so a lost marker line never changes the result.
-    _report(line + "\n")
+    # With no report file, pythonw.exe can start with no usable stdout. The
+    # exit code carries the verdict, so a lost marker line never changes it.
     try:
         print(line, flush=True)
     except Exception:
@@ -87,7 +76,10 @@ def _step(code, name, action):
         import traceback
 
         _say(FAIL_MARK + name + ":" + _detail(exc))
-        _report(traceback.format_exc())
+        try:
+            sys.stderr.write(traceback.format_exc())
+        except Exception:
+            pass
         sys.exit(code)
 
 
