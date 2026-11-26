@@ -736,6 +736,38 @@ jacked statusline status           # registration state and the active command
 
 The dashboard toggle lives at Settings > Features > Statusline.
 
+### Gate recorder (jacked tests)
+
+A full test gate can take many minutes, and a session often runs it again on a tree that already passed. `jacked tests` records each gate run and answers three questions: did this tree already pass this gate command on this machine, where does the time of the gate go, and which tests does this change remove or weaken. It reads the JUnit XML report of pytest, vitest, jest, Playwright, Go (gotestsum) or cargo-nextest.
+
+```bash
+jacked tests run --kind full -- uv run python -m pytest -n auto --junitxml={junit}
+jacked tests seen -- uv run python -m pytest -n auto --junitxml={junit}   # exit 0: this tree passed
+jacked tests profile               # the slowest files and tests of the newest full run
+jacked tests history --size        # verdicts, failing sets, flaky tests, repeat green runs
+jacked tests loss                  # tests that the change removes or weakens, against origin/HEAD
+jacked tests record --junit report.xml --exit-code 0 --machine ci   # a run that run did not wrap
+jacked tests prune --before 2026-01-01
+```
+
+`jacked tests run` returns the exit code of the gate command. A recorder error never changes it. An argument that holds `{junit}` gets the path of a private report file. For a runner that writes its report at a fixed path, give that path with `--junit GLOB`. `seen` matches the tree hash (with the changes that are not committed), the command as you typed it and the machine. It never compares the times of two machines.
+
+To use the recorder in a gate script and keep the script working with an older jacked, use this gate line. When the `tests` group is not there, it runs the bare command and prints one line:
+
+<!-- gate-line -->
+```sh
+if jacked tests run --help >/dev/null 2>&1; then
+  jacked tests run --kind full -- uv run python -m pytest -n auto --junitxml={junit}
+else
+  echo "jacked tests is not installed: the gate runs with no record" >&2
+  uv run python -m pytest -n auto
+fi
+```
+
+**Where the history is.** The runs are in the `jacked-tests` folder of the common git directory of the clone (run `git rev-parse --git-common-dir` to find it). All linked worktrees share it, and git never commits it. A run holds test IDs, times, states and the SHA-256 of the command, never a failure message, test output or the command text. Nothing is deleted automatically: run `jacked tests prune --before YYYY-MM-DD`, or delete the `jacked-tests` folder.
+
+**Limits.** `seen` does not see a change to a file that git ignores (give such files with `--input GLOB` to `run` and to `seen`), or a change inside a submodule. A gate that writes a file that git sees cannot prove a tree, so add its cache folders to `.gitignore`. See the "Gate recorder" section of `jacked/data/rules/jacked-reference.md` for each command, the jest-junit settings and the rule for a red gate.
+
 ### QA Browser Testing
 
 The `/qa` command runs browser-based QA on UI changes from the current session. It detects modified UI files (JS, CSS, HTML, Vue, Svelte, etc.), opens the app in a browser, and runs visual checks, interactive tests, and console error scans. Auto-suggested via a Stop hook when UI files are modified. Requires Playwright MCP or Claude-in-Chrome.
