@@ -285,6 +285,7 @@
     <li><a href="#files">File structure</a></li>
     <li><a href="#decisions">Decisions that the spec left to the builder</a></li>
     <li><a href="#tasks">Tasks</a></li>
+    <li><a href="#wording">Shipped text: old and new wording</a></li>
     <li><a href="#open-questions">Open questions</a></li>
   </ol>
 </nav>
@@ -1013,8 +1014,7 @@ def test_each_command_of_the_group_is_in_the_reference(): ...
 def test_the_new_sections_have_no_em_dash_and_name_no_host(): ...</code></pre>
 
 <h3>Task 8: the shipped text about the cost of a test</h3>
-<p><strong>Approved by the owner on 2026-11-26:</strong> the wording table in
-<a href="2026-11-26-test-diet.html#wording">the skill plan</a>, and the sentence for the gate
+<p><strong>Approved by the owner on 2026-11-26:</strong> the <a href="#wording">wording table</a> below, and the sentence for the gate
 cadence rule. That sentence was written before the placeholder <code>{junit}</code> existed; this
 is the same sentence in the form of the recorder that this plan builds. It goes at the end of the
 gate cadence rule (<code>jacked/data/rules/jacked_behaviors.md:7</code>), after "A brief that asks
@@ -1105,6 +1105,70 @@ feature worktree, so it is the build of this branch.</p>
   the issue that tracks each one. Read the summary line of each operating system's job before the
   word green. Stop at the pull request.</li>
 </ul>
+
+<h2 id="wording">Shipped text: old and new wording</h2>
+<p>The owner approved this wording on 2026-11-26. A reviewer compared each old text with its file,
+character by character. Task 8 makes these changes, plus the gate cadence sentence of Task 8. The
+last sentence of the first row ("To cut or speed up a suite that exists, the user runs
+/test-diet.") ships with the skill, not with this plan.</p>
+<table>
+  <thead><tr><th>File and line</th><th>Old</th><th>New</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/data/rules/jacked_behaviors.md</code>, a new line after line 7 (the gate
+    cadence rule)</td><td>(no line)</td><td><code>- **A test has a cost: each gate pays for it
+    again.** Before you add a test, name the defect that it catches and say why the present tests
+    miss it. Put it at the boundary that owns the behavior, one test for each contract. When a
+    change removes behavior on purpose, delete the tests of that behavior in the same change and
+    name them in the commit; do not add a test that asserts that a removed thing stays removed.
+    Never delete, skip or weaken a test to get a green run. To cut or speed up a suite that
+    exists, the user runs /test-diet.</code></td></tr>
+    <tr><td><code>jacked/data/commands/goal-maker.md:53</code></td><td><code>the repo's real test
+    command green; NEW tests covering every milestone and its edge cases.</code></td><td><code>the
+    repo's real test command green; a test at the boundary that owns each new behavior, one for
+    each contract, and the tests that the change made obsolete deleted in the same change (never
+    kept as "stays removed" checks).</code></td></tr>
+    <tr><td><code>jacked/data/commands/goal-maker.md:133</code>,
+    <code>jacked/data/skills/whats-next/SKILL.md:313</code> and
+    <code>.claude/skills/whats-next/SKILL.md:363</code> (the end of the line)</td><td><code>, with
+    NEW tests covering the behavior of each done milestone and its edge cases</code></td>
+    <td><code>, with a test at the owning boundary for each contract of a done milestone, the tests
+    that a milestone made obsolete deleted, and the run time of the added tests
+    reported</code></td></tr>
+    <tr><td><code>jacked/data/commands/bhag.md:63</code></td><td><code>and show passing output; add
+    NEW tests covering the change. NEVER delete, skip, weaken, or loosen an existing test or
+    assertion to go green: a cell counts as done only when it passes end-to-end, not when the test
+    was removed; gutting a test to pass is a BLOCKED condition, not a merge.</code></td><td><code>and
+    show passing output; add a test at the boundary that owns each new contract of the change.
+    NEVER delete, skip, weaken, or loosen an existing test or assertion to go green: a cell counts
+    as done only when it passes end-to-end, not when the test was removed; gutting a test to pass
+    is a BLOCKED condition, not a merge. The one exception: when the cell removes behavior on
+    purpose, delete the tests of that behavior in the same commit and name them in the commit
+    message.</code></td></tr>
+    <tr><td><code>jacked/data/skills/dcr/SKILL.md:90</code> and
+    <code>.claude/skills/dcr/SKILL.md:161</code></td><td><code>| 7 | **Testing** | Unit test
+    coverage, edge case tests, regression detection, test quality |</code></td><td><code>| 7 |
+    **Testing** | Unit test coverage, edge case tests, regression detection, test quality, test
+    cost (a new test that repeats an existing proof, pins the implementation, asserts that a
+    removed thing stays removed, or is slow for what it proves) |</code></td></tr>
+    <tr><td><code>jacked/data/commands/dc.md:55</code></td><td><code>| 8 | **Testing** | Unit test
+    coverage, edge case tests, regression detection, test quality |</code></td><td><code>| 8 |
+    **Testing** | Unit test coverage, edge case tests, regression detection, test quality, test
+    cost (a new test that repeats an existing proof, pins the implementation, asserts that a
+    removed thing stays removed, or is slow for what it proves) |</code></td></tr>
+    <tr><td><code>jacked/data/agents/test-coverage-engineer.md</code>, a new paragraph after the
+    paragraph that ends "not that a test would *catch a bug*." (line 114)</td><td>(no
+    paragraph)</td><td><code>**A test has a cost.** Each test runs in each gate from now on. Before
+    you add one, name the defect that it catches and say why the present tests miss it, and put it
+    at the boundary that owns the behavior. Do not add a second test for a contract that a present
+    test proves. Do not add a test that asserts that removed code stays removed. Report the run
+    time of the tests that you added.</code></td></tr>
+    <tr><td><code>jacked/data/agents/test-coverage-improver.md</code>, two new lines after "-
+    Duplicate existing test coverage" (line 170)</td><td>(no lines)</td><td><code>- Assert that
+    removed code or a removed feature stays removed</code><br><code>- Have no defect that you can
+    name before you write them</code></td></tr>
+  </tbody>
+</table>
+
 
 <h2 id="open-questions">Open questions</h2>
 <ul>
