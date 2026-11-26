@@ -261,7 +261,7 @@
 <h1>Test diet: design</h1>
 
 <div class="meta">
-  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge warn">approved by the owner on 2026-11-26; the gate machine is open</span></span></div>
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge warn">approved by the owner on 2026-11-26; the owner answered the open questions the same day</span></span></div>
   <div class="kv"><span class="k">Date:</span><span class="v">2026-11-25, revised 2026-11-26</span></div>
   <div class="kv"><span class="k">Branch:</span><span class="v">jack_20261125_test_diet</span></div>
   <div class="kv"><span class="k">Type:</span><span class="v">spec</span></div>
@@ -283,6 +283,7 @@
     <li><a href="#acceptance">Acceptance criteria</a></li>
     <li><a href="#files">Files and interfaces</a></li>
     <li><a href="#builder">Left to the builder</a></li>
+    <li><a href="#review-changes">Changes after the plan review</a></li>
     <li><a href="#open">Decisions for the owner</a></li>
   </ol>
 </nav>
@@ -797,6 +798,75 @@ and the plan will show the exact old and new wording.</p>
   file system gives the repository's test database the quick clone that it has on the owner's
   machine.</li>
 </ul>
+
+<h2 id="review-changes">Changes after the plan review (the builder's calls)</h2>
+<aside class="callout warn">
+  <strong>The owner has not read this section.</strong> The owner approved this design on
+  2026-11-26. Two review cycles read the plan after that, and these are the changes that they
+  made to the recorder. Each one is my call. A rule here is stricter than the text above where
+  the two differ.
+</aside>
+<table>
+  <thead><tr><th>Subject</th><th>The text above</th><th>Now</th></tr></thead>
+  <tbody>
+    <tr><td><code>seen</code></td><td>"Did this exact tree pass the full gate?"</td><td>It says yes
+    only for a record that <code>run</code> made, with the verdict <code>passed</code>, with a tree
+    that did not change during the gate, and with the same tree, the same typed gate command, the
+    same declared input files and the same machine. <code>--any-machine</code> removes the last
+    condition. The label <code>full</code> is for the views only.</td></tr>
+    <tr><td>Verdict of a run</td><td>A pass or a failure, from the exit code.</td><td>Five
+    verdicts. <code>passed</code>: exit code 0, a report with one test or more, no failure.
+    <code>failed</code>: exit code not 0. <code>conflict</code>: exit code 0 and a failure in the
+    report; <code>run --strict</code> returns 1 for it. <code>no-data</code>: exit code 0 and no
+    report. <code>unknown</code>: no exit code.</td></tr>
+    <tr><td>The report path</td><td>Not said.</td><td>The gate command can hold
+    <code>{junit}</code>. <code>run</code> makes a private folder for the report, puts the path in,
+    reads the report and removes the folder. The hash of the command is the hash of the typed
+    command, so a new folder for each run does not change it. <code>--junit GLOB</code> names a
+    report at a fixed path; it is read only when its content changed.</td></tr>
+    <tr><td>Machine</td><td>"Each record names the machine that ran the gate."</td><td>A label
+    (<code>local</code>, or the value of <code>record --machine</code>) and a private random
+    identity that is made one time for each user of a machine. No command prints the
+    identity.</td></tr>
+    <tr><td><code>record</code></td><td>Reads a report that was not wrapped.</td><td>Also
+    <code>--report-root</code>, for a report that holds the paths of a different machine.</td></tr>
+    <tr><td>Setup share</td><td><code>profile</code> prints it.</td><td><code>profile</code> prints
+    it only when the record holds it. A JUnit file does not.</td></tr>
+    <tr><td>Retention</td><td>Not said.</td><td>Nothing is deleted automatically.
+    <code>jacked tests prune --before DATE</code> deletes on request and prints each deleted
+    run.</td></tr>
+    <tr><td>Codex policy file</td><td>"The installer must write that file for each skill and each
+    command that has the key."</td><td>A skill directory ships the file as a real source file, and
+    a test fails when a skill has the key and no file. The installer writes the file only for a
+    skill that it makes from a command. Reason: the installer refuses a target file that the
+    source does not have.</td></tr>
+  </tbody>
+</table>
+<p><strong>Three plans.</strong> The review limit of two cycles was reached with open defects, so
+the plan is three documents:
+<a href="../plans/2026-11-26-test-diet-recorder.html">the recorder</a> (built first),
+<a href="../plans/2026-11-26-test-diet.html">the skill</a> and
+<a href="../plans/2026-11-26-test-diet-gate-machine.html">the gate machine</a>.</p>
+<h3>The owner's answers (2026-11-26)</h3>
+<table>
+  <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+  <tbody>
+    <tr><td>Push the research with numbers of five private repositories, with letters for their
+    names</td><td>Yes.</td></tr>
+    <tr><td>The wording of the changes to the text that jacked ships, and one more sentence for the
+    gate cadence rule (run the one full suite through <code>jacked tests run</code>, ask
+    <code>jacked tests seen</code> first)</td><td>Both approved.</td></tr>
+    <tr><td>The gate machine</td><td>A self-hosted runner, in the pattern that the owner already
+    operates, on a Linux machine that the owner rents in his own account. The SSH design of the
+    section "A gate on a different machine" is not built.</td></tr>
+    <tr><td>Six commands that the plan review added (<code>collect</code>, <code>covdiff</code>,
+    <code>report</code>, <code>prove</code>, <code>ledger protect</code>,
+    <code>ledger approve</code>)</td><td>Build the first three. Do not build the last three as
+    commands: the skill keeps the planted-defect check as a method, a second agent runs a sample of
+    the checks again, and a run never cuts a protected test (the pull request proposes
+    it).</td></tr>
+  </tbody>
+</table>
 
 <h2 id="open">Decisions for the owner</h2>
 <ol>
