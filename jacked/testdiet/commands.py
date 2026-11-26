@@ -251,7 +251,14 @@ def loss_command(base, as_json):
 
     The change is the work tree against the base: commits, changes that are
     not committed and untracked files. A renamed file, a moved test and an
-    edited parameter value give no loss.
+    edited parameter value give no loss. A test that moves prints a moved
+    line.
+
+    \b
+    Counted cases: the literal lists of Python parametrize marks, the rows of
+    a literal .each table (TypeScript and JavaScript) and the t.Run calls of
+    a Go test. A computed case list and a fixture parameter are not counted.
+    A test whose cases or body the report cannot read prints a not read line.
     """
     import dataclasses
     import json as _json
@@ -259,15 +266,16 @@ def loss_command(base, as_json):
 
     from jacked.testdiet import loss as _loss
     from jacked.testdiet import record as _record
+    from jacked.testdiet.model import one_line
     from jacked.testdiet.tree import TreeError
 
     try:
         report = _loss.loss_report(Path(_os.getcwd()), base)
-    except TreeError:
+    except _loss.NotInWorkTree:
         _record.emit("this folder is not in the work tree of a git repository.")
         raise SystemExit(1)
-    except _loss.LossError as exc:
-        _record.emit(f"no loss report: {exc}")
+    except (_loss.LossError, TreeError) as exc:
+        _record.emit(f"no loss report: {one_line(str(exc))}")
         raise SystemExit(1)
     if as_json:
         click.echo(_json.dumps(dataclasses.asdict(report), indent=1, sort_keys=True))

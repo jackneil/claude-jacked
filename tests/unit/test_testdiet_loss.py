@@ -8,6 +8,7 @@ the default base of the command, or a ``--base`` value.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import warnings
 import subprocess
@@ -88,6 +89,7 @@ def commit(repo: Path, message: str) -> None:
 def no_loss(report: loss.LossReport) -> None:
     assert (report.removed, report.added, report.net) == ((), (), 0)
     assert (report.fewer_assertions, report.skips_added) == ((), ())
+    assert (report.fewer_cases, report.not_read) == ((), ())
 
 
 def _invoke(*args: str):
@@ -107,7 +109,9 @@ def test_a_removed_test_is_named_and_net_is_minus_one(repo):
 def test_a_renamed_file_with_the_same_tests_reports_no_loss(repo):
     git(repo, "mv", "tests/test_calc.py", "tests/test_math.py")
     commit(repo, "rename")
-    no_loss(loss.loss_report(repo))
+    report = loss.loss_report(repo)
+    no_loss(report)
+    assert ("tests/test_calc.py::test_adds", "tests/test_math.py::test_adds") in report.moved
 
 
 def test_a_test_moved_to_a_different_file_reports_no_loss(repo):
@@ -288,7 +292,9 @@ def test_cli_loss_gives_one_line_and_exit_1_for_an_input_it_cannot_read(repo, tm
     outside = tmp_path / "outside"
     outside.mkdir()
     monkeypatch.chdir(outside)
-    assert _invoke("tests", "loss", "--base", "main").exit_code == 1
+    away = _invoke("tests", "loss", "--base", "main")
+    assert away.exit_code == 1
+    assert away.output == "jacked tests: this folder is not in the work tree of a git repository.\n"
 
 
 def test_a_test_name_with_a_control_character_prints_on_one_line(repo):
@@ -313,16 +319,34 @@ def test_a_python_file_with_a_syntax_error_still_gives_declarations(repo):
     assert report.removed == ()
     # The line pattern cannot count assertions, so no test is named as weaker.
     assert (report.fewer_assertions, report.skips_added) == ((), ())
+    assert ("tests/test_calc.py::test_broken", "does not parse") in report.not_read
+    assert ("tests/test_calc.py::test_adds", "does not parse") in report.not_read
+    out = _invoke("tests", "loss").output
+    assert "not read tests/test_calc.py::test_adds (does not parse)" in out.splitlines()
+
+
+def _link_or_skip(link: Path, target: str) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("this system cannot make a symbolic link")
 
 
 def test_a_symbolic_link_is_not_read(repo):
-    if not hasattr(Path, "symlink_to"):
-        pytest.skip("no symbolic links")
-    try:
-        (repo / "tests" / "test_link.py").symlink_to("test_calc.py")
-    except OSError:
-        pytest.skip("this system cannot make a symbolic link")
-    no_loss(loss.loss_report(repo))
+    _link_or_skip(repo / "tests" / "test_link.py", "test_calc.py")
+    report = loss.loss_report(repo)
+    assert (report.removed, report.added, report.net) == ((), (), 0)
+    assert report.not_read == (("tests/test_link.py", "symbolic link"),)
+
+
+def test_a_regular_file_that_becomes_a_symbolic_link_is_not_read_and_not_removed(repo):
+    (repo / "tests" / "test_calc.py").unlink()
+    write(repo, "tests/real.py", CALC)
+    _link_or_skip(repo / "tests" / "test_calc.py", "real.py")
+    out = _invoke("tests", "loss").output
+    assert not [line for line in out.splitlines() if line.startswith("removed ")]
+    assert [line for line in out.splitlines() if line.startswith("not read ")] == [
+        "not read tests/test_calc.py (type change)"]
 
 
 def test_one_of_two_tests_with_one_name_is_removed_from_the_file_that_lost_it():
@@ -479,3 +503,105 @@ def test_a_large_file_with_bodies_that_do_not_close_is_read_in_one_pass():
     found = [d for d in loss.scan("big.test.js", body % tuple(range(4000)))]
     assert len(found) == 4000 and all(d.asserts is None for d in found)
     assert time.monotonic() - start < 5.0
+
+
+# The report: not read, cases, moves and the git errors.
+
+def test_a_jsx_apostrophe_prints_a_not_read_line(repo):
+    body = b'test("jsx", () => {\n  render(<p>Don\'t</p>);\n  expect(1).toBe(1);\n});\n'
+    write(repo, "tests/view.test.tsx", body)
+    commit(repo, "jsx")
+    write(repo, "tests/view.test.tsx", body + b"\n")
+    out = _invoke("tests", "loss", "--base", "HEAD").output
+    assert "not read tests/view.test.tsx::jsx (body not read)" in out.splitlines()
+
+
+def test_a_cut_parametrize_list_prints_fewer_cases(repo):
+    write(repo, "tests/test_calc.py", CALC.replace(b"[1, 2]", b"[1]"))
+    report = loss.loss_report(repo)
+    assert report.fewer_cases == (("tests/test_calc.py::test_doubles", 2, 1),)
+    assert (report.removed, report.fewer_assertions, report.not_read) == ((), (), ())
+    assert "fewer cases tests/test_calc.py::test_doubles 2 -> 1" in _invoke("tests", "loss").output.splitlines()
+
+
+def test_a_list_of_three_cut_to_one_prints_fewer_cases_and_an_edited_value_prints_nothing(repo):
+    write(repo, "tests/test_calc.py", CALC.replace(b"[1, 2]", b"[1, 2, 3]"))
+    commit(repo, "three cases")
+    write(repo, "tests/test_calc.py", CALC.replace(b"[1, 2]", b"[1]"))
+    assert loss.loss_report(repo, "HEAD").fewer_cases == (("tests/test_calc.py::test_doubles", 3, 1),)
+    write(repo, "tests/test_calc.py", CALC.replace(b"[1, 2]", b"[1, 2, 4]"))
+    no_loss(loss.loss_report(repo, "HEAD"))
+
+
+def test_a_computed_case_list_prints_not_read(repo):
+    write(repo, "tests/test_calc.py", CALC.replace(b"[1, 2]", b"VALUES"))
+    report = loss.loss_report(repo)
+    assert report.not_read == (("tests/test_calc.py::test_doubles", "computed cases"),)
+    assert report.fewer_cases == ()
+
+
+def test_a_test_that_leaves_one_file_and_arrives_in_another_prints_a_moved_line(repo):
+    write(repo, "tests/a_test.py", b"def test_init():\n    assert 1\n")
+    commit(repo, "a")
+    (repo / "tests" / "a_test.py").unlink()
+    write(repo, "tests/b_test.py", b"def test_init():\n    assert 2\n")
+    report = loss.loss_report(repo, "HEAD")
+    assert report.moved == (("tests/a_test.py::test_init", "tests/b_test.py::test_init"),)
+    assert (report.removed, report.added) == ((), ())
+    out = _invoke("tests", "loss", "--base", "HEAD").output
+    assert "moved tests/a_test.py::test_init -> tests/b_test.py::test_init" in out.splitlines()
+
+
+def test_a_renamed_class_prints_moved_lines_and_no_removed_or_added_line(repo):
+    write(repo, "tests/test_cls.py", b"class TestOld:\n    def test_one(self):\n        assert 1\n")
+    commit(repo, "class")
+    write(repo, "tests/test_cls.py", b"class TestNew:\n    def test_one(self):\n        assert 1\n")
+    report = loss.loss_report(repo, "HEAD")
+    assert report.moved == (("tests/test_cls.py::TestOld::test_one", "tests/test_cls.py::TestNew::test_one"),)
+    assert (report.removed, report.added, report.net) == ((), (), 0)
+
+
+def test_the_real_object_store_does_not_change(repo):
+    write(repo, "tests/test_calc.py", CALC + b"\n\ndef test_new():\n    assert 1\n")
+    write(repo, "tests/test_other.py", b"def test_x():\n    assert 1\n")
+    before = git(repo, "count-objects", "-v")
+    loss.loss_report(repo)
+    assert git(repo, "count-objects", "-v") == before
+
+
+def test_a_branch_with_no_commit_says_so(repo):
+    git(repo, "checkout", "-q", "--orphan", "fresh")
+    out = _invoke("tests", "loss", "--base", "main")
+    assert out.exit_code == 1 and out.output.count("\n") == 1
+    assert "has no commit" in out.output
+
+
+def test_a_shallow_clone_with_no_merge_base_names_fetch_unshallow(repo, tmp_path, monkeypatch):
+    commit_file = b"def test_more():\n    assert 1\n"
+    write(repo, "tests/test_more.py", commit_file)
+    commit(repo, "work commit")
+    write(repo, "tests/test_more.py", commit_file + commit_file.replace(b"more", b"most"))
+    commit(repo, "second work commit, so the fork point is not in a clone of depth 1")
+    git(repo, "checkout", "-q", "main")  # the remote HEAD of the clone is main
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", "--depth", "1", "--no-single-branch", repo.as_uri(), str(clone)],
+                   check=True, capture_output=True, stdin=subprocess.DEVNULL)
+    git(clone, "checkout", "-q", "work")
+    monkeypatch.chdir(clone)
+    out = _invoke("tests", "loss")
+    assert out.exit_code == 1 and out.output.count("\n") == 1
+    assert "git fetch --unshallow" in out.output
+
+
+@pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="needs POSIX modes and a user that is not root")
+def test_a_work_tree_that_git_cannot_read_names_the_exit_code_and_the_first_error_line(repo):
+    locked = repo / "locked.txt"
+    locked.write_bytes(b"x")
+    locked.chmod(0)
+    try:
+        out = _invoke("tests", "loss")
+    finally:
+        locked.chmod(0o600)
+    assert out.exit_code == 1 and out.output.count("\n") == 1
+    assert "git add exited with" in out.output and "locked.txt" in out.output
