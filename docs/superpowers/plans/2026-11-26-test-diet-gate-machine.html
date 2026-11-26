@@ -305,7 +305,7 @@ commit that was sent. A lost connection never gives a verdict. The laptop does n
 <a href="../specs/2026-11-25-test-diet-design.html">2026-11-25-test-diet-design.html</a>, section "A
 gate on a different machine", acceptance item "Gate machine", and the owner's answers of
 2026-11-26. The owner asked on 2026-11-26 for both lanes: a self-hosted runner on a rented box for
-his private repositories, and a gate "on a machine of your own choosing across ssh via tailscale or
+their private repositories, and a gate "on a machine of your own choosing across ssh via tailscale or
 something like that" for each user of jacked.</p>
 
 <h2 id="why">Why this design is smaller than the first one</h2>
@@ -484,8 +484,8 @@ local: read the JUnit files with the recorder's reader, write the record with th
     gives the free physical memory. When the entry has <code>min_free_mb</code> and the machine has
     less free memory at the start of a gate, the driver gives no gate, exit 75, and one line with
     the two numbers. The user sets the floor; jacked has no default.</td><td>The owner's answer of
-    2026-11-26: his Windows machine is a gate machine "at low priority", and it also runs a
-    production VM, so RAM is the hard limit. A floor that the user sets is not an arbitrary
+    2026-11-26: their Windows machine is a gate machine "at low priority", and it also runs
+    other work, so free memory is the hard limit. A floor that the user sets is not an arbitrary
     cap.</td></tr>
     <tr><td>The gate command</td><td>The driver runs the setup (when given) and then the gate with
     <code>/bin/sh -c</code> on POSIX and <code>cmd.exe /d /s /c</code> on Windows, in the worktree,
@@ -640,19 +640,19 @@ def test_the_ssh_command_line_has_the_fixed_options_and_no_value_outside_the_gra
   command is stopped by PID, with exit 75, no record, and no process of that gate left on the box
   after it (read the process list of the box); <code>gc</code>.</li>
   <li><input type="checkbox" disabled> 5.2 Windows gate machine: the same checks on a Windows host,
-  at priority <code>low</code> with a free-memory floor. The owner chose his Windows machine for
-  his gates on 2026-11-26. Also show a gate that the floor refuses.</li>
+  at priority <code>low</code> with a free-memory floor. The owner chose their Windows machine for
+  their gates on 2026-11-26. Also show a gate that the floor refuses.</li>
   <li><input type="checkbox" disabled> 5.3 The full gate of this branch runs on the POSIX gate
   machine through <code>run --on</code>, then <code>/dcr</code>, then <code>/pr</code>. Stop at the
   pull request.</li>
 </ul>
 
 <h2 id="runner-box">The second lane: a runner box for CI</h2>
-<p>This lane is infrastructure, not jacked code. The owner chose a rented Linux box in his own
-account for self-hosted GitHub Actions runners, in the pattern that he operates today: one fresh,
+<p>This lane is infrastructure, not jacked code. The owner chose a rented Linux box in their own
+account for self-hosted GitHub Actions runners, in the pattern that they operate today: one fresh,
 walled-off container for each job, a single-use runner registration, a time limit. The provider is
-open: the owner asked on 2026-11-26 about a provider where he already has an account, and about
-the platform where his services run. A research report compares them; the owner picks.</p>
+open: the owner asked on 2026-11-26 about a provider where they already have an account, and about
+the platform where their services run. A research report compares them; the owner picks.</p>
 <p>The same box is the POSIX gate machine of Task 5.1, under a second user, so a gate over SSH and
 a CI job never share files.</p>
 <p>The setup is a separate runbook that the main session writes after the order, and walks before

@@ -290,7 +290,7 @@
 
 <h2 id="intent">Intent</h2>
 <p>Agents add tests and do not retire them. The gates become slow, and a red gate costs one more
-full run. The owner wants one command that he can run in a repository folder. The command makes the
+full run. The owner wants one command that they can run in a repository folder. The command makes the
 test suite smaller and much faster, and it keeps the tests that protect real behavior. It must work
 in every place where jacked is installed, for Claude Code and for Codex.</p>
 <p>The research is in
@@ -311,7 +311,7 @@ in every place where jacked is installed, for Claude Code and for Codex.</p>
           <li>The aim: "more time developing and creating, and less time just sitting and spinning on tests"</li>
           <li>2026-11-26: the second live proof can run on the Python data service.</li>
           <li>2026-11-26: "i dont want it to cpu peg this laptop". The tests of that proof must run on
-          his second machine, "or cloud resources or something".</li>
+          their second machine, "or cloud resources or something".</li>
         </ul>
       </td>
       <td>
@@ -847,6 +847,49 @@ the plan is three documents:
 <a href="../plans/2026-11-26-test-diet-recorder.html">the recorder</a> (built first),
 <a href="../plans/2026-11-26-test-diet.html">the skill</a> and
 <a href="../plans/2026-11-26-test-diet-gate-machine.html">the gate machine</a>.</p>
+<h3 id="build-changes">Changes during the build (the builder's calls)</h3>
+<aside class="callout warn">
+  <strong>The owner has not read this table.</strong> The task reviews of the recorder found these
+  points, and I decided each one while the recorder was built. Each row says what the recorder does
+  now.
+</aside>
+<table>
+  <thead><tr><th>Subject</th><th>What the recorder does</th></tr></thead>
+  <tbody>
+    <tr><td>The base of <code>loss</code></td><td><code>--base REF</code> compares against the merge
+    base of REF and HEAD. With no <code>--base</code>, the base is the merge base of HEAD and
+    <code>origin/HEAD</code>. A branch tip that moved ahead does not show its new tests as removed.
+    Each output gives the base that it used. A shallow clone gets one line that names
+    <code>git fetch --unshallow</code>.</td></tr>
+    <tr><td>What <code>loss</code> reports</td><td>The net change, the removed tests, and these
+    lines: <code>moved</code> (a test with the same name in a different file), <code>fewer
+    assertions</code>, <code>fewer cases</code>, <code>not read</code> (a test on both sides with a
+    computed case list or a body that <code>loss</code> cannot read) and <code>not read file</code>
+    (a symbolic link, a submodule, a type change, or a file that does not parse).
+    <code>loss</code> reports and does not gate: it gives exit 0 for a report.</td></tr>
+    <tr><td>Case counts</td><td><code>loss</code> counts the items of a literal
+    <code>parametrize</code> list, the rows of a literal <code>.each</code> table, and the
+    <code>t.Run</code> calls of a Go loop over a literal table in the same function. The Go rule
+    reads code that <code>gofmt</code> formatted. Any other case list prints <code>not
+    read</code>.</td></tr>
+    <tr><td>A bad stored value</td><td>A stored machine label, machine identity or tree that fails
+    its check reads as empty. The record stays in the history, and the views show the label as
+    <code>(no label)</code>.</td></tr>
+    <tr><td>An empty value</td><td>A view prints an empty value as text (<code>no time
+    recorded</code>, <code>not recorded</code>), never as 0. JSON gives <code>null</code>.</td></tr>
+    <tr><td>Exit codes of the views</td><td><code>history</code> on an empty history prints one
+    line and gives exit 0. <code>profile</code> on an empty history, and an unknown
+    <code>--run</code> or <code>--machine</code>, give exit 1.</td></tr>
+    <tr><td>Time order</td><td>The order of runs and <code>--days</code> use the time in the run
+    ID, which this machine's clock wrote. No view compares the clocks of two machines.</td></tr>
+    <tr><td>Tree identity</td><td>The copy of the index keeps the time of the index, so git's
+    same-second rule sees an edit that keeps the file size. The copy sets
+    <code>core.checkStat=default</code> and <code>core.trustctime=true</code>, so a repository
+    setting cannot weaken it. On Windows, git reads the creation time as the change time. So, as
+    with <code>git status</code> there, an edit that keeps the size and puts back the old time is
+    not seen.</td></tr>
+  </tbody>
+</table>
 <h3>The owner's answers (2026-11-26)</h3>
 <table>
   <thead><tr><th>Question</th><th>Answer</th></tr></thead>
@@ -857,7 +900,7 @@ the plan is three documents:
     gate cadence rule (run the one full suite through <code>jacked tests run</code>, ask
     <code>jacked tests seen</code> first)</td><td>Both approved.</td></tr>
     <tr><td>The gate machine</td><td>Two lanes. A self-hosted runner, in the pattern that the
-    owner already operates, on a Linux machine that the owner rents in his own account (the provider
+    owner already operates, on a Linux machine that the owner rents in their own account (the provider
     is open). And, in the owner's words, support for "running on a machine of your own choosing
     across like ssh via tailscale or something like that": the section "A gate on a different
     machine", built in the smaller form of
@@ -878,14 +921,14 @@ the plan is three documents:
   jacked for each repository. The plan shows the old and the new wording of each shipped
   text.</li>
   <li><strong>The slow repository for the second live proof: decided.</strong> The owner picked the
-  Python data service on 2026-11-26, with its tests away from his laptop. The proof needs a branch
+  Python data service on 2026-11-26, with its tests away from their laptop. The proof needs a branch
   and a pull request in that repository.</li>
   <li><strong>The gate machine: open.</strong> SSH from the laptop to the owner's second machine
   works. An earlier version of this document said that it did not: that check used the wrong user
   name. A measurement on 2026-11-26 found no room on that machine at that time. The numbers are in
   the owner's local notes and not in this repository. The choices: make room on the second
   machine, or rent a Linux machine for each gate. The owner offered cloud resources on 2026-11-26.
-  The account and the cost need his approval.</li>
+  The account and the cost need their approval.</li>
   <li><strong>The changes to the shipped text: approved.</strong> Each row of the table above.</li>
   <li><strong>Growth: advice (approved).</strong> Not a hard limit. A hard limit for each
   change (OpenClaw uses 400 net test lines with a written allowance) gives an agent a reason to
