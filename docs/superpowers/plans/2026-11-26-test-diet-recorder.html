@@ -458,7 +458,7 @@ loss.py -> git
     <tr><td><code>jacked/data/skills/review-animations/agents/openai.yaml</code></td><td>The Codex policy file for a skill that only the user starts.</td></tr>
     <tr><td><code>jacked/codex/_generate.py</code>, <code>_fsutil.py</code>, <code>installer.py</code></td><td>The Codex policy file for a command that has <code>disable-model-invocation</code>.</td></tr>
     <tr><td><code>README.md</code>, <code>jacked/data/rules/jacked-reference.md</code></td><td>The new command group and the gate line.</td></tr>
-    <tr><td><code>tests/_testdiet.py</code></td><td>Shared test helpers, imported as <code>from tests._testdiet import ...</code> (the pattern of <code>tests/_platform.py</code>): <code>make_repo(path)</code> (follows <code>tests/unit/test_git_reality.py:45</code>), <code>fixture_reports(runner)</code>, <code>fixture_project(runner)</code>, <code>fixture_listing(runner)</code>, <code>REPORT_ROOT = "/work"</code>, <code>provenance()</code>, <code>fill_store(path)</code>, <code>private_hits(text, *, host, login, home)</code>. Each test module that needs <code>repo</code> or <code>store</code> defines that fixture from these helpers.</td></tr>
+    <tr><td><code>tests/_testdiet.py</code></td><td>Shared test helpers, imported as <code>from tests._testdiet import ...</code> (the pattern of <code>tests/_platform.py</code>): <code>make_repo(path)</code> (follows <code>tests/unit/test_git_reality.py:45</code>), <code>fixture_reports(runner)</code>, <code>fixture_project(runner)</code>, <code>fixture_listing(runner)</code>, <code>REPORT_ROOT = "/work"</code>, <code>provenance()</code>, <code>private_hits(text, *, host, login, home)</code> (Task 1), and <code>fill_store(path)</code> (Task 4, because it needs the history module). Each test module that needs <code>repo</code> or <code>store</code> defines that fixture from these helpers.</td></tr>
     <tr><td><code>tests/unit/test_testdiet_*.py</code>, <code>test_cli_tests_group.py</code>, <code>test_codex_implicit_invocation.py</code>, <code>test_tests_reference.py</code></td><td>The tests.</td></tr>
     <tr><td><code>tests/fixtures/testdiet/</code></td><td><code>reports/</code> (real JUnit files, listings and console totals), <code>projects/</code> (the source files of the small projects), <code>capture.py</code>, <code>PROVENANCE.json</code>.</td></tr>
     <tr><td><code>tests/conftest.py</code>, <code>pyproject.toml</code></td><td><code>collect_ignore_glob</code> for <code>fixtures/testdiet/projects/*</code>; <code>[tool.ruff] extend-exclude</code> for the same folder.</td></tr>
@@ -705,6 +705,7 @@ def inputs_fingerprint(cwd: Path, globs: Sequence[str]) -> str | None      # Non
 def common_dir(cwd: Path) -> Path
 def store_dir(cwd: Path) -> Path                       # common_dir / "jacked-tests"
 def machine_id(home: Path | None = None) -> str | None # None when the file cannot be read or made
+def on_default_branch(cwd: Path, tree: TreeId) -> bool | None   # no fetch; None with no refs/remotes/origin/HEAD
 def command_sha(argv: Sequence[str]) -> str
 def failing_signature(cases: Iterable[CaseResult]) -> str | None   # sha256 of the sorted (id, failure_type) pairs
 def verdict_of(exit_code: int | None, data: RunData | None) -> str
@@ -747,6 +748,9 @@ def test_verdict_of(code, failed, expected): ...                           # fai
 def test_a_run_with_no_test_is_not_passed(): ...                           # exit 0, a report with zero cases
 def test_the_failing_signature_differs_when_the_failure_type_differs(): ...
 def test_the_command_sha_differs_when_one_argument_is_split_in_two(): ...  # ["a b"] and ["a", "b"]
+def test_on_default_branch_is_true_for_a_clean_tree_at_an_ancestor_of_the_remote_head(repo): ...
+def test_on_default_branch_is_false_for_a_dirty_tree_and_for_a_commit_that_is_not_an_ancestor(repo): ...
+def test_on_default_branch_is_empty_with_no_remote_head(repo): ...
 def test_the_machine_id_is_made_one_time_and_read_back(tmp_path): ...
 def test_the_machine_id_holds_no_part_of_the_host_name(tmp_path, monkeypatch): ...
 def test_the_machine_id_file_is_for_the_user_only(tmp_path): ...           # POSIX: mode 0600</code></pre>
@@ -847,7 +851,9 @@ def test_cli_tests_does_not_ask_to_install(repo): ...</code></pre>
 
 <h3>Task 4: <code>profile</code>, <code>history</code> and <code>prune</code></h3>
 <p><strong>Files.</strong> Create <code>jacked/testdiet/views.py</code>,
-<code>tests/unit/test_testdiet_views.py</code>; modify <code>jacked/cli.py</code>.</p>
+<code>tests/unit/test_testdiet_views.py</code>; modify <code>jacked/cli.py</code> and
+<code>tests/_testdiet.py</code> (add <code>fill_store(path) -&gt; Path</code>: a store with runs of two
+machines, two trees, green and red verdicts, and one failing set in three runs).</p>
 <pre><code>def profile(store: Path, run_id: str | None = None, *, machine: str | None = None, top: int | None = 20) -> dict
 # keys: run, machine, total_test_seconds, files_for_half, file_count, files: [{file, seconds, tests}],
 #       tests: [{id, seconds}], hidden_rows, setup_share: None,
