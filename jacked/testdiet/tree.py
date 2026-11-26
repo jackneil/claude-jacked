@@ -57,7 +57,11 @@ _GIT_TIMEOUT_S = 600.0
 # The configuration of the calls that write into the copy of the index. A
 # split index keeps part of the index in a second file of the git directory;
 # with this value git writes the copy as one file and never touches that one.
-_INDEX_COPY_ARGS = ("-c", "core.splitIndex=false")
+#: The stat checks stay at full strength whatever the repository config says,
+#: so a config such as core.trustctime=false cannot hide an edit from the tree
+#: identity that ``seen`` trusts.
+_INDEX_COPY_ARGS = ("-c", "core.splitIndex=false", "-c", "core.checkStat=default",
+                    "-c", "core.trustctime=true")
 # The exit code of git for an option that it does not know.
 _GIT_USAGE_ERROR = 129
 # A failure of the work-tree read is logged at WARNING one time in each process.
@@ -101,7 +105,10 @@ def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
     out = _All()
     argv = [binary, "-C", str(cwd), *git_guard.GIT_CONFIG_OVERRIDE_ARGS, *args]
     try:
-        code = git_guard.run_git(argv, name=args[0] if args[0] != "-c" else args[2],
+        rest = list(args)
+        while rest[:1] == ["-c"]:
+            rest = rest[2:]
+        code = git_guard.run_git(argv, name=rest[0] if rest else "git",
                                  env=full_env, timeout=_GIT_TIMEOUT_S, consumer=out, stderr=stderr)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise TreeError(f"git did not run: {type(exc).__name__}") from exc
@@ -186,10 +193,7 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
     try:
         index_copy = work / "index"
         if real_index.is_file():
-            # copy2 keeps the modification time of the index. Git trusts the stat
-            # data of an entry that is older than the index file; a new time on
-            # the copy would hide a change of the same size in the same second.
-            shutil.copy2(real_index, index_copy)
+            _copy_index(real_index, index_copy)
         object_dir = Path(objects) if objects is not None else work / "objects"
         object_dir.mkdir(parents=True, exist_ok=True)
         env = {
@@ -213,6 +217,25 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
     finally:
         remove_tree(work)
     return TreeId(commit=commit, tree=lines[0], clean=lines[0] == head_tree)
+
+
+def _copy_index(source: Path, target: Path) -> None:
+    """Copy the index file, and give the copy the times of the source.
+
+    Git trusts the stat data of an entry that is older than the index file.
+    A copy with a new time would hide a change of the same size in the same
+    second. The content and the times come from one open file, so a write of
+    the index between them cannot mix two versions. When the file system
+    rounds the time of the copy up, the copy gets the whole second of the
+    source, so it is never later than the source.
+    """
+    with open(source, "rb") as src, open(target, "wb") as dst:
+        info = os.fstat(src.fileno())
+        shutil.copyfileobj(src, dst)
+    os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+    if os.stat(target).st_mtime_ns > info.st_mtime_ns:
+        floor = info.st_mtime_ns // 10**9 * 10**9
+        os.utime(target, ns=(floor, floor))
 
 
 def remove_tree(path: Path) -> None:

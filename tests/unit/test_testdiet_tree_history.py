@@ -962,3 +962,33 @@ def test_a_same_size_edit_that_git_status_sees_is_never_a_clean_tree(repo):
     assert os.stat(index).st_mtime_ns == old
     tid = tree.tree_id(repo)
     assert tid is not None and tid.clean is False
+
+
+def test_a_repo_that_does_not_trust_ctime_still_sees_an_edit_that_restores_the_time(repo):
+    import time
+
+    old = 1_000_000_000 * 10**9
+    path = repo / "same.py"
+    path.write_bytes(b"[1, 2]\n")
+    os.utime(path, ns=(old, old))
+    _git(repo, "config", "core.trustctime", "false")
+    _git(repo, "config", "core.checkStat", "minimal")
+    _git(repo, "add", "same.py")
+    _git(repo, "commit", "-q", "-m", "same size")
+    time.sleep(1.1)  # the change time of the edit is in a later second than the one in the index
+    path.write_bytes(b"VALUES\n")
+    os.utime(path, ns=(old, old))
+    tid = tree.tree_id(repo)
+    assert tid is not None and tid.clean is False
+
+
+def test_the_index_copy_never_has_a_later_time_than_the_index(tmp_path):
+    source = tmp_path / "index"
+    source.write_bytes(b"DIRC")
+    when = 1_700_000_000_123_456_789
+    os.utime(source, ns=(when, when))
+    copy = tmp_path / "copy"
+    tree._copy_index(source, copy)
+    assert copy.read_bytes() == b"DIRC"
+    assert copy.stat().st_mtime_ns <= source.stat().st_mtime_ns
+    assert copy.stat().st_mtime_ns >= when // 10**9 * 10**9
