@@ -1,4 +1,4 @@
-"""The ``jacked tests`` command group: run, record and seen.
+"""The ``jacked tests`` command group: run, record, seen, profile, history and prune.
 
 ``jacked.cli`` adds this group to ``main``. Each command imports its module
 inside the function, so ``jacked --help`` does not load the recorder.
@@ -163,3 +163,82 @@ def seen_command(inputs, any_machine, as_json, command):
     else:
         _record.emit("no passed run of this tree, this command and this machine.")
     raise SystemExit(0 if found is not None else 1)
+
+
+def _store_or_exit() -> Path:
+    """The history store of the work tree that holds the current folder. Outside one, exit 1."""
+    import os as _os
+
+    from jacked.testdiet import record as _record
+    from jacked.testdiet import tree as _tree
+
+    try:
+        return _tree.store_dir(_record.work_tree_top(Path(_os.getcwd())))
+    except _tree.TreeError:
+        _record.emit("this folder is not in the work tree of a git repository.")
+        raise SystemExit(1)
+
+
+@recorder_group.command(name="profile")
+@click.option("--run", "run_id", default=None, metavar="ID", help="The run to show. Default: the newest full run.")
+@click.option("--machine", default=None, callback=_label_option, metavar="LABEL",
+              help="The machine label. Default: the machine of the newest full run.")
+@click.option("--top", type=click.IntRange(min=1), default=20, show_default=True,
+              help="The number of rows of each table in the text output.")
+@click.option("--json", "as_json", is_flag=True, help="Print every row as JSON.")
+def profile_command(run_id, machine, top, as_json):
+    """Show where the time of a run goes, by file and by test."""
+    from jacked.testdiet import record as _record
+    from jacked.testdiet import views as _views
+
+    store = _store_or_exit()
+    try:
+        result = _views.profile(store, run_id, machine=machine, top=None if as_json else top)
+    except _views.ViewError as exc:
+        _record.emit(str(exc))
+        raise SystemExit(1)
+    click.echo(_views.to_json(result) if as_json else _views.render_profile(result, top))
+
+
+@recorder_group.command(name="history")
+@click.option("--machine", default=None, callback=_label_option, metavar="LABEL",
+              help="The machine label. Default: the machine of the newest full run.")
+@click.option("--days", type=click.IntRange(min=0), default=None, metavar="N",
+              help="Show only the runs of the last N days.")
+@click.option("--json", "as_json", is_flag=True, help="Print every row as JSON.")
+@click.option("--size", is_flag=True, help="Also print the size of the history in bytes.")
+def history_command(machine, days, as_json, size):
+    """Show the runs of one machine: verdicts, failing sets, flaky tests and green repeats."""
+    from jacked.testdiet import record as _record
+    from jacked.testdiet import views as _views
+
+    store = _store_or_exit()
+    try:
+        result = _views.history(store, machine=machine, days=days)
+    except _views.ViewError as exc:
+        _record.emit(str(exc))
+        raise SystemExit(1)
+    click.echo(_views.to_json(result) if as_json else _views.render_history(result, size=size))
+
+
+@recorder_group.command(name="prune")
+@click.option("--before", required=True, type=click.DateTime(formats=["%Y-%m-%d"]), metavar="YYYY-MM-DD",
+              help="Delete each run whose UTC date is before this date.")
+def prune_command(before):
+    """Delete the runs before a date. Print each run that is deleted."""
+    from jacked.testdiet import history as _history
+    from jacked.testdiet import record as _record
+
+    store = _store_or_exit()
+    try:
+        deleted = _history.prune(store, before.date())
+    except _history.PruneError as exc:
+        for run_id in exc.deleted:
+            click.echo(_record.clean_text(f"deleted {run_id}"))
+        for name, error in exc.failed:
+            _record.emit(f"cannot delete {name} ({error})")
+        raise SystemExit(1)
+    for run_id in deleted:
+        click.echo(_record.clean_text(f"deleted {run_id}"))
+    if not deleted:
+        _record.emit(f"no run is before {before:%Y-%m-%d}. Nothing is deleted.")

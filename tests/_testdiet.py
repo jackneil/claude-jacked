@@ -101,3 +101,97 @@ def make_repo(path: Path) -> Path:
     git("-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false",
         "commit", "-q", "-m", "first")
     return path
+
+
+#: The machine identities of ``fill_store``. Fixed values, so a test can
+#: prove that no view prints them.
+LOCAL_ID = "1f" * 16
+LOCAL_TWIN_ID = "2e" * 16
+TREE_1 = "a1" * 20
+TREE_2 = "b2" * 20
+COMMIT_1 = "c1" * 20
+COMMIT_2 = "c2" * 20
+COMMAND = "d4" * 32
+#: The failing set that ``fill_store`` puts in three runs.
+FAILING_ID = "tests/test_calc.py::test_fails"
+
+
+def make_case(test_id: str, file: str | None, seconds: float | None, state: str = "passed",
+          failure_type: str | None = None):
+    from jacked.testdiet.model import CaseResult
+
+    return CaseResult(id=test_id, file=file, seconds=seconds, state=state,
+                      failure_type=failure_type, attempts=1)
+
+
+def store_run(store: Path, when: str, *, exit_code: int | None, tests=None, kind: str | None = "full",
+              machine: str = "local", machine_id: str | None = LOCAL_ID, tree: str | None = TREE_1,
+              commit: str = COMMIT_1, command_sha: str | None = COMMAND, source: str = "run",
+              wall: float | None = 100.0, on_default_branch: bool | None = None) -> str:
+    """Write one run into ``store`` and return its run ID.
+
+    ``when`` is the UTC time of the run ID, as ``YYYYMMDDTHHMMSS``. ``tests``
+    is a list of CaseResult, or None for a run with no report.
+    """
+    from datetime import datetime, timezone
+
+    from jacked.testdiet import history
+    from jacked.testdiet.model import STATES, RunData, RunMeta, TreeId
+
+    moment = datetime.strptime(when, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+    data = None if tests is None else RunData(runner="pytest", tests=tuple(tests), seconds_reported=None)
+    cases = () if data is None else data.tests
+    meta = RunMeta(
+        id=history.new_run_id(moment), started=moment.isoformat(timespec="seconds"), source=source,
+        wall_seconds=wall, exit_code=exit_code, verdict=history.verdict_of(exit_code, data),
+        kind=kind, label=None, runner=None if data is None else "pytest", command_sha=command_sha,
+        inputs_sha=None, machine=machine, machine_id=machine_id,
+        tree=None if tree is None else TreeId(commit=commit, tree=tree, clean=True),
+        tree_changed=None if tree is None else False, on_default_branch=on_default_branch,
+        counts=None if data is None else {s: sum(1 for c in cases if c.state == s) for s in STATES},
+        seconds_reported=None, load_start=None, load_end=None, child_cpu_seconds=None,
+        failing=tuple(sorted(c.id for c in cases if c.state in ("failed", "error"))),
+        flaky=tuple(sorted(c.id for c in cases if c.state == "flaky")),
+        failing_sig=history.failing_signature(cases),
+    )
+    history.write_run(store, meta, data)
+    return meta.id
+
+
+def fill_store(path: Path) -> Path:
+    """Fill a history store at ``path`` and return ``path``.
+
+    Two machines: ``local`` (identity ``LOCAL_ID``) and ``ci`` (records with
+    no identity). Two trees. Green and red verdicts. The failing set of
+    ``FAILING_ID`` is in three runs of ``local``. The newest full run is a
+    green run of ``local`` on ``TREE_1`` whose files hold 10, 5, 3, 1 and 1
+    seconds, and one test with no seconds.
+    """
+    green = [make_case("tests/test_calc.py::test_adds", "tests/test_calc.py", 1.0)]
+    red = green + [make_case(FAILING_ID, "tests/test_calc.py", 0.5, "failed", "AssertionError")]
+    newest = [
+        make_case("tests/test_a.py::test_one", "tests/test_a.py", 6.0),
+        make_case("tests/test_a.py::test_two", "tests/test_a.py", 4.0),
+        make_case("tests/test_b.py::test_one", "tests/test_b.py", 5.0),
+        make_case("tests/test_c.py::test_one", "tests/test_c.py", 3.0),
+        make_case("tests/test_d.py::test_one", "tests/test_d.py", 1.0),
+        make_case("tests/test_e.py::test_one", "tests/test_e.py", 1.0),
+        make_case("tests/test_f.py::test_no_time", "tests/test_f.py", None),
+    ]
+    flaky = green + [make_case("tests/test_calc.py::test_flaky", "tests/test_calc.py", 0.2, "flaky")]
+    store_run(path, "20261120T080000", exit_code=0, tests=green, wall=100.0, on_default_branch=True)
+    store_run(path, "20261121T080000", exit_code=0, tests=flaky, wall=120.0, on_default_branch=True)
+    store_run(path, "20261122T080000", exit_code=1, tests=red, tree=TREE_2, commit=COMMIT_2)
+    store_run(path, "20261122T090000", exit_code=1, tests=red, tree=TREE_2, commit=COMMIT_2,
+              kind="targeted")
+    store_run(path, "20261123T080000", exit_code=1, tests=red, tree=TREE_2, commit=COMMIT_2)
+    # The ci machine: records of a different machine, with no identity.
+    ci = dict(machine="ci", machine_id=None, source="record", command_sha=None, wall=40.0)
+    store_run(path, "20261124T080000", exit_code=0, tests=[make_case("ci::test_slow", "tests/test_ci.py", 30.0),
+                                                           make_case("ci::test_fast", "tests/test_ci.py", 2.0)],
+              **ci)
+    store_run(path, "20261124T090000", exit_code=None, tests=green, **ci)
+    store_run(path, "20261124T100000", exit_code=0, tests=None, **ci)
+    store_run(path, "20261124T110000", exit_code=0, tests=red, **ci)
+    store_run(path, "20261125T080000", exit_code=0, tests=newest, wall=90.0, on_default_branch=True)
+    return path
