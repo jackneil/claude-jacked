@@ -856,9 +856,12 @@ the plan is three documents:
     <tr><td>The wording of the changes to the text that jacked ships, and one more sentence for the
     gate cadence rule (run the one full suite through <code>jacked tests run</code>, ask
     <code>jacked tests seen</code> first)</td><td>Both approved.</td></tr>
-    <tr><td>The gate machine</td><td>A self-hosted runner, in the pattern that the owner already
-    operates, on a Linux machine that the owner rents in his own account. The SSH design of the
-    section "A gate on a different machine" is not built.</td></tr>
+    <tr><td>The gate machine</td><td>Two lanes. A self-hosted runner, in the pattern that the
+    owner already operates, on a Linux machine that the owner rents in his own account (the provider
+    is open). And, in the owner's words, support for "running on a machine of your own choosing
+    across like ssh via tailscale or something like that": the section "A gate on a different
+    machine", built in the smaller form of
+    <a href="../plans/2026-11-26-test-diet-gate-machine.html">the gate machine plan</a>.</td></tr>
     <tr><td>Six commands that the plan review added (<code>collect</code>, <code>covdiff</code>,
     <code>report</code>, <code>prove</code>, <code>ledger protect</code>,
     <code>ledger approve</code>)</td><td>Build the first three. Do not build the last three as
