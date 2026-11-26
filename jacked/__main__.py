@@ -7,6 +7,17 @@ from jacked.headless import ensure_std_streams
 
 ensure_std_streams()
 
-from jacked.cli import main  # noqa: E402
+try:
+    from jacked.cli import main
+except Exception:
+    # Under a supervisor or pythonw.exe this traceback goes nowhere. Keep a
+    # trace in ~/.claude/jacked-boot-failure.log, then fail as before.
+    try:
+        from jacked.boot_failure import record_current
+
+        record_current()
+    except Exception:  # noqa: BLE001 - the original error matters more
+        pass
+    raise
 
 main()

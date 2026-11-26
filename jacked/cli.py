@@ -459,7 +459,7 @@ def _print_start_failure_breaker(paths) -> None:
     """Name the last start failure, and the give-up state, from the breaker.
 
     A boot refusal reaches only the tray log, which nobody reads. The breaker
-    keeps the reason, so status can print it.
+    keeps the reason, so status can print it, with the newest boot-failure entry.
 
     The breaker also exits the supervised service cleanly once
     START_FAILURE_LIMIT starts fail inside START_FAILURE_WINDOW_SECONDS, so
@@ -468,9 +468,13 @@ def _print_start_failure_breaker(paths) -> None:
     """
     import time as _t
 
+    from rich.markup import escape
+    from jacked.boot_failure import describe_latest
     from jacked.service import START_FAILURE_FILENAME, START_FAILURE_LIMIT
     from jacked.service.start_failures import read_start_failures
 
+    if (boot := describe_latest()) is not None:
+        console.print(f"  [yellow]Last boot failure: {escape(boot)}[/yellow]", soft_wrap=True)
     now = _t.time()
     # A missing or corrupt breaker file reads as no failures.
     recent = read_start_failures(paths.root / START_FAILURE_FILENAME, now)
@@ -1325,11 +1329,7 @@ def _upgrade_run_preflight(jacked: str) -> "tuple[int, str]":
     """
     import subprocess
 
-    from jacked.service.preflight_probe import (
-        PREFLIGHT_EXIT_GRACE_SECONDS,
-        PREFLIGHT_TIMEOUT_SECONDS,
-        preflight_argv,
-    )
+    from jacked.service.preflight_probe import PREFLIGHT_EXIT_GRACE_SECONDS, PREFLIGHT_TIMEOUT_SECONDS, preflight_argv
 
     wait = PREFLIGHT_TIMEOUT_SECONDS + PREFLIGHT_EXIT_GRACE_SECONDS
     _upgrade_phase("preflight", "begin")
