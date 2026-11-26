@@ -1,4 +1,4 @@
-"""The data that the recorder reads from a JUnit report."""
+"""The data that the recorder reads from a JUnit report, and the record of a run."""
 
 from __future__ import annotations
 
@@ -32,6 +32,57 @@ class RunData:
     runner: str
     tests: tuple[CaseResult, ...]
     seconds_reported: float | None
+
+
+@dataclass(frozen=True)
+class TreeId:
+    """The identity of the work tree of a git checkout.
+
+    ``commit`` is the HEAD commit. ``tree`` is the hash of the tree that a
+    commit of the work tree would have, changes that are not committed
+    included. ``clean`` is True when that tree is the tree of HEAD.
+    """
+
+    commit: str
+    tree: str
+    clean: bool
+
+
+@dataclass(frozen=True)
+class RunMeta:
+    """The record of one run of a gate, in the history store.
+
+    A value that the recorder did not get is None (or an empty tuple for
+    ``failing`` and ``flaky``). It is never zero. ``source`` is "run" or
+    "record". ``verdict`` is "passed", "failed", "conflict", "no-data" or
+    "unknown". ``command_sha`` is the SHA-256 of the typed command, never
+    the command text.
+    """
+
+    id: str
+    started: str
+    source: str
+    wall_seconds: float | None
+    exit_code: int | None
+    verdict: str
+    kind: str | None
+    label: str | None
+    runner: str | None
+    command_sha: str | None
+    inputs_sha: str | None
+    machine: str
+    machine_id: str | None
+    tree: TreeId | None
+    tree_changed: bool | None
+    on_default_branch: bool | None
+    counts: dict[str, int] | None
+    seconds_reported: float | None
+    load_start: float | None
+    load_end: float | None
+    child_cpu_seconds: float | None
+    failing: tuple[str, ...]
+    flaky: tuple[str, ...]
+    failing_sig: str | None
 
 
 class JUnitError(ValueError):
