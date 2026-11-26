@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import socket
 import subprocess
 import sys
@@ -338,6 +339,31 @@ def _detect_via_udp() -> str | None:
     return None
 
 
+def _tailscale_cli() -> str:
+    """Return the Tailscale CLI by an absolute path when one is known.
+
+    The service PATH holds only system folders, so a bare ``tailscale`` is
+    not found there. Order: ``find_bin`` (PATH and the user folders), the
+    Windows install folder under ProgramFiles, the macOS app bundle. When
+    none exists, the bare name stays, and the caller treats the failure as
+    "no CLI".
+    """
+    from jacked.findbin import find_bin
+
+    found = find_bin("tailscale")
+    if found:
+        return found
+    program_files = os.environ.get("ProgramFiles")
+    known = [
+        os.path.join(program_files, "Tailscale", "tailscale.exe") if program_files else "",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    ]
+    for candidate in known:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return "tailscale"
+
+
 def _detect_via_cli() -> str | None:
     """Fallback detection: shell out to ``tailscale ip -4``.
 
@@ -347,7 +373,7 @@ def _detect_via_cli() -> str | None:
     """
     try:
         result = subprocess.run(
-            ["tailscale", "ip", "-4"],
+            [_tailscale_cli(), "ip", "-4"],
             capture_output=True,
             text=True,
             timeout=3,

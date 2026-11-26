@@ -117,6 +117,55 @@ class TestNewModulesImportInAStaleInterpreter:
         assert calls == []
 
 
+class TestNamesThisReleaseAddedToHeldModules:
+    """The Windows environment fix added names to two pre-existing modules.
+
+    An upgrade process of an older release holds the older copies. Each
+    import of an added name goes through ``names_from``.
+    """
+
+    def test_windows_env_imports_when_the_held_winproc_predates_it(self, monkeypatch):
+        import jacked.winproc as winproc
+
+        monkeypatch.delattr(winproc, "is_absolute_windows_path")
+        _forget(monkeypatch, "jacked.service.windows_env")
+        loaded = importlib.import_module("jacked.service.windows_env")
+        assert loaded.is_absolute_windows_path is winproc.is_absolute_windows_path
+
+    def test_provisioning_works_when_the_held_environment_predates_it(
+        self, monkeypatch, tmp_path
+    ):
+        import jacked.service.environment as environment
+        from tests.unit.service.service_contract_support import provision_contract
+
+        monkeypatch.delattr(environment, "inherited_allowlisted_environment")
+        spec, env, _paths = provision_contract(tmp_path, monkeypatch)
+        assert hasattr(environment, "inherited_allowlisted_environment")
+        assert env["JACKED_SERVICE_USER"]
+        assert len(spec.generation) == 64
+
+    def test_the_builder_comes_from_the_same_load_as_the_allowlist(
+        self, monkeypatch, tmp_path
+    ):
+        """An old held builder must not run with the new allowlist names."""
+        import jacked.service.environment as environment
+        from tests.unit.service.service_contract_support import provision_contract
+
+        def old_builder(*args, **kwargs):
+            raise AssertionError("the held builder of the older module ran")
+
+        import jacked.service.lifecycle as lifecycle
+
+        # The held older module: no allowlist name, an older builder, which
+        # lifecycle bound at its own import.
+        monkeypatch.delattr(environment, "inherited_allowlisted_environment")
+        monkeypatch.setattr(environment, "build_service_environment", old_builder)
+        monkeypatch.setattr(lifecycle, "build_service_environment", old_builder)
+        _spec, env, _paths = provision_contract(tmp_path, monkeypatch)
+        assert environment.build_service_environment is not old_builder
+        assert env["JACKED_SERVICE_USER"]
+
+
 class TestPreloadUpgradeModules:
     def test_the_roots_and_the_supervisor_submodules_are_loaded(self, monkeypatch):
         import jacked.service as service_package

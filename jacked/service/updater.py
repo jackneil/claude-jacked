@@ -20,6 +20,7 @@ from typing import NamedTuple
 
 from jacked.findbin import find_bin
 from jacked.service import CLAUDE_DIR
+from jacked.service.preflight_probe import PREFLIGHT_EXIT_GRACE_SECONDS, PREFLIGHT_TIMEOUT_SECONDS, preflight_argv
 from jacked.service.process import is_process_alive, is_port_listening
 from jacked.winproc import NO_WINDOW, run_batch_detached
 
@@ -31,10 +32,6 @@ RECOVERY_FILE = CLAUDE_DIR / "jacked-update-failed.txt"
 ROLLBACK_STEP_PACKAGE = "package rollback"
 ROLLBACK_STEP_INSTALL = "settings migration"
 ROLLBACK_STEP_RESTART = "service restart"
-
-# How long the preflight gate may run before it counts as a refusal. A build
-# that cannot answer in two minutes cannot be trusted with the old service.
-PREFLIGHT_TIMEOUT_SECONDS = 120
 
 # How long one identification probe may take. The listener is on loopback and
 # /api/health is a pure local handler, so a jacked service answers in
@@ -1282,7 +1279,7 @@ def run_update(
             log(f"UPDATE FAILED: {error}")
 
         # Phase: preflight - the transaction gate. The new build must prove it
-        # can provision its service contract before the old service is gone.
+        # can provision and boot its contract before the old service is gone.
         _begin("preflight")
         log(f"Running: {jacked} service preflight")
         # A hung or unlaunchable preflight is a REFUSAL, not a crash: the old
@@ -1291,11 +1288,11 @@ def run_update(
         # forever with the tray already gone.
         try:
             preflight = subprocess.run(
-                [jacked, "service", "preflight"],
+                preflight_argv(jacked),
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=PREFLIGHT_TIMEOUT_SECONDS,
+                timeout=PREFLIGHT_TIMEOUT_SECONDS + PREFLIGHT_EXIT_GRACE_SECONDS,
                 creationflags=NO_WINDOW,
             )
             preflight_code = preflight.returncode
@@ -1305,7 +1302,7 @@ def run_update(
         except subprocess.TimeoutExpired:
             preflight_code = -1
             preflight_output = (
-                f"preflight did not answer within {PREFLIGHT_TIMEOUT_SECONDS}s"
+                f"preflight did not answer within {PREFLIGHT_TIMEOUT_SECONDS + PREFLIGHT_EXIT_GRACE_SECONDS}s"
             )
         except OSError as exc:
             preflight_code = -1
@@ -1322,7 +1319,7 @@ def run_update(
             _end(
                 "preflight",
                 "failed",
-                error=f"new build refused to provision its service contract: {first_line}",
+                error=f"new build failed its service preflight: {first_line}",
                 recovery=f'uv tool install "claude-jacked[{extras}]=={_current_version}" --force --refresh',
             )
             rollback = _rollback("preflight refused")
@@ -1819,8 +1816,6 @@ def _spawn_windows_tray_updater(
     `python -m pip install --upgrade --user`, not `uv tool install` (which
     would install the package a second time in a different location).
     """
-    import os
-    import tempfile
 
     from jacked.findbin import find_bin
     from jacked import upgrade_guard
@@ -1941,8 +1936,9 @@ def _spawn_windows_tray_updater(
         + ":preflight_failed\r\n"
         "echo [%date% %time%] ERROR: jacked service preflight failed for the "
         "new build\r\n"
-        "set FAILREASON=the new build refused to provision its service "
-        "contract\r\n"
+        'jacked _update_status preflight failed --error "the new build failed its service preflight" --recovery "jacked service preflight"\r\n'
+        + DRIFT_GUARD
+        + "set FAILREASON=the new build failed its service preflight\r\n"
         "goto rollback_now\r\n"
         ":migrate_failed\r\n"
         'jacked _update_status migrating_settings failed --error "jacked '
@@ -2063,7 +2059,7 @@ def _spawn_windows_tray_updater(
         + DRIFT_GUARD
         +
         # Phase: preflight - the transaction gate. The new build must prove it
-        # can provision its service contract before the old service is gone.
+        # can provision and boot its contract before the old service is gone.
         "jacked _update_status preflight in_progress\r\n"
         + DRIFT_GUARD
         + "jacked service preflight --timeout 120 2>&1\r\n"
@@ -2137,19 +2133,11 @@ def _spawn_windows_tray_updater(
         + _tray_release_failed_block(port, to_version, DRIFT_GUARD)
     )
 
-    fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-tray-update-")
-    try:
-        # newline="" — batch_body already carries explicit \r\n. Translating on
-        # top of that wrote \r\r\n; cmd.exe tolerates the stray CR but nothing
-        # here should depend on that.
-        with os.fdopen(fd, "w", newline="") as f:
-            f.write(batch_body)
-    except Exception:
-        try:
-            os.unlink(batch_path)
-        except OSError:
-            pass
-        raise
+    # Every program is pinned to an absolute path: the batch can run in the
+    # service environment, whose PATH holds only the Windows folders.
+    from jacked.service.batch_programs import write_batch
+
+    batch_path = write_batch(batch_body, "jacked-tray-update-")
 
     # CREATE_NO_WINDOW, NOT DETACHED_PROCESS. This batch is spawned by the tray,
     # which runs under the windowless pythonw.exe — so there's no console to

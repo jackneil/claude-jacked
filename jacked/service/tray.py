@@ -728,11 +728,11 @@ class ServiceRunner:
 
     def _note_ready(self, elapsed: float) -> None:
         """Record a successful start: reset the retry breaker, remember timing."""
-        from jacked.service.start_failures import clear_start_failures
+        from jacked.service.start_failures import record_ready_start
 
         self._ready_elapsed = elapsed
         try:
-            clear_start_failures(self._start_failure_path())
+            record_ready_start(self._start_failure_path())
         except OSError:
             logger.exception("Could not clear start-failure memory")
 

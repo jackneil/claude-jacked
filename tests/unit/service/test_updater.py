@@ -218,7 +218,7 @@ class TestRunUpdate:
         assert "--force" in uv_args
 
         assert mock_run.call_args_list[1][0][0] == [
-            "/fake/jacked", "service", "preflight"
+            "/fake/jacked", "service", "preflight", "--timeout", "120"
         ]
 
         jacked_install_args = mock_run.call_args_list[2][0][0]
@@ -688,7 +688,7 @@ class TestUpdaterRollback:
         )
 
         argvs = [call[0][0] for call in run.call_args_list]
-        assert argvs[1] == ["/fake/jacked", "service", "preflight"]
+        assert argvs[1] == ["/fake/jacked", "service", "preflight", "--timeout", "120"]
         assert argvs[2][1:] == self.RB_ARGV_TAIL
         assert argvs[3] == ["/fake/jacked", "install", "--force"]
         # The NEW build's settings migration never ran: the gate closed first.
@@ -1262,7 +1262,7 @@ class TestPreflightSubprocessGuards:
 
         def fake_run(args, *a, **kw):
             calls.append((list(args), kw))
-            if list(args)[1:] == ["service", "preflight"]:
+            if list(args)[1:] == ["service", "preflight", "--timeout", "120"]:
                 raise exc
             return _ok()
 
@@ -1298,10 +1298,12 @@ class TestPreflightSubprocessGuards:
             monkeypatch, tmp_path, OSError("boom")
         )
         preflight = [
-            kw for argv, kw in calls if argv[1:] == ["service", "preflight"]
+            kw for argv, kw in calls if argv[1:] == ["service", "preflight", "--timeout", "120"]
         ]
         assert preflight, "the preflight step never ran"
-        assert preflight[0]["timeout"] == updater.PREFLIGHT_TIMEOUT_SECONDS
+        assert preflight[0]["timeout"] == (
+            updater.PREFLIGHT_TIMEOUT_SECONDS + updater.PREFLIGHT_EXIT_GRACE_SECONDS
+        )
 
     def test_a_preflight_that_cannot_run_is_a_refusal(self, tmp_path, monkeypatch):
         calls, status = self._run_with_preflight_raising(

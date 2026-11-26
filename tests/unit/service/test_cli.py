@@ -1882,10 +1882,23 @@ class TestServiceRecoverLiveOwnership:
 class TestServicePreflight:
     """`jacked service preflight` is the upgrade transaction gate.
 
-    It must answer one question - can THIS build provision its service
-    contract - and it must answer it without starting a process or touching a
-    supervisor.
+    It must answer one question - can THIS build provision and boot its
+    service contract - and it must answer it without starting the service or
+    touching a supervisor. Its one process is the short boot probe.
     """
+
+    @pytest.fixture(autouse=True)
+    def _probe_passes(self):
+        """The boot probe has its own tests. Here it passes, so each test
+        reads only the provisioning half of the gate."""
+        from jacked.service.preflight_probe import ProbeResult
+
+        with patch(
+            "jacked.service.preflight_probe.run_service_probe",
+            return_value=ProbeResult(True),
+        ) as probe:
+            self.probe = probe
+            yield
 
     def _spec(self):
         return MagicMock(
@@ -1953,6 +1966,8 @@ class TestServicePreflight:
             "runtime_target_path": "/opt/jacked/bin/python3.11",
             "supervisor": "launchd",
             "generation": "abcdef0123456789",
+            "probe_step": None,
+            "note": None,
             "error": None,
         }
 
@@ -1974,17 +1989,21 @@ class TestServicePreflight:
         assert data["supervisor"] is None
         assert data["error"].startswith("ValueError: ")
 
-    def test_starts_no_process_and_drives_no_supervisor(self):
+    def test_starts_no_service_and_drives_no_supervisor(self):
         """The gate runs while the OLD service is still live. Starting or
-        stopping anything here would defeat the whole transaction."""
+        stopping anything here would defeat the whole transaction. The one
+        process it runs is the boot probe, with the exact service
+        environment and the spec runtime."""
         import subprocess
 
         from jacked.cli import main
 
+        spec = self._spec()
+        environment = {"SENTINEL": "service-environment"}
         with (
             patch(
                 "jacked.service.lifecycle.provision_service_contract",
-                return_value=(self._spec(), {}),
+                return_value=(spec, environment),
             ),
             patch.object(subprocess, "run") as run,
             patch.object(subprocess, "Popen") as popen,
@@ -1993,11 +2012,19 @@ class TestServicePreflight:
         ):
             result = CliRunner().invoke(main, ["service", "preflight"])
 
+        from jacked.service.lifecycle import default_service_paths
+
         assert result.exit_code == 0, result.output
         run.assert_not_called()
         popen.assert_not_called()
         ensure.assert_not_called()
         restart.assert_not_called()
+        self.probe.assert_called_once()
+        probe_spec, probe_environment, cwd, options = self.probe.call_args.args
+        assert probe_spec is spec
+        assert probe_environment is environment
+        assert cwd == default_service_paths().root
+        assert 0 < options.timeout <= 120
 
 
 class TestServicePreflightTimeout:

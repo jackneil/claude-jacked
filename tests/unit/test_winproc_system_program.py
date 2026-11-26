@@ -59,7 +59,16 @@ def test_the_launch_junction_runs_the_resolved_cmd(tmp_path, monkeypatch):
         raise OSError(1314, "a required privilege is not held")
 
     monkeypatch.setattr(Path, "home", lambda: home)
-    monkeypatch.setenv("ComSpec", r"Z:\Sys\cmd.exe")
+    # With no env argument, cmd comes from the Windows directory that the OS
+    # reports (the resolver seam), never from the caller's ComSpec/SystemRoot.
+    import jacked.service.environment as environment
+    import jacked.winproc as winproc
+    from tests.unit.service.service_contract_support import fixed_windows
+
+    monkeypatch.setattr(winproc.sys, "platform", "win32")
+    monkeypatch.setattr(environment, "default_windows_resolvers", lambda: fixed_windows(SystemRoot=r"Z:\Sys"))
+    monkeypatch.setenv("ComSpec", r"Y:\Evil\cmd.exe")
+    monkeypatch.setenv("SystemRoot", r"D:\Other")
     monkeypatch.setattr(launch.os, "name", "nt")
     monkeypatch.setattr(launch.os, "symlink", no_symlink)
     monkeypatch.setattr(launch.subprocess, "run", lambda argv, **k: calls.append(list(argv)))
@@ -67,4 +76,4 @@ def test_the_launch_junction_runs_the_resolved_cmd(tmp_path, monkeypatch):
     launch._ensure_shared_symlinks(config)
 
     assert calls, "the junction fallback did not run"
-    assert calls[0][:3] == [r"Z:\Sys\cmd.exe", "/c", "mklink"]
+    assert calls[0][:3] == [r"Z:\Sys\System32\cmd.exe", "/c", "mklink"]

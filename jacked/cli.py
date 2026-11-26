@@ -459,7 +459,7 @@ def _print_start_failure_breaker(paths) -> None:
     """Name the last start failure, and the give-up state, from the breaker.
 
     A boot refusal reaches only the tray log, which nobody reads. The breaker
-    keeps the reason, so status can print it.
+    keeps the reason, so status can print it, with the newest boot-failure entry.
 
     The breaker also exits the supervised service cleanly once
     START_FAILURE_LIMIT starts fail inside START_FAILURE_WINDOW_SECONDS, so
@@ -468,9 +468,13 @@ def _print_start_failure_breaker(paths) -> None:
     """
     import time as _t
 
+    from rich.markup import escape
+    from jacked.boot_failure import describe_latest
     from jacked.service import START_FAILURE_FILENAME, START_FAILURE_LIMIT
     from jacked.service.start_failures import read_start_failures
 
+    if (boot := describe_latest()) is not None:
+        console.print(f"  [yellow]Last boot failure: {escape(boot)}[/yellow]", soft_wrap=True)
     now = _t.time()
     # A missing or corrupt breaker file reads as no failures.
     recent = read_start_failures(paths.root / START_FAILURE_FILENAME, now)
@@ -840,13 +844,13 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
     cmd = upgrade_guard.guarded_upgrade_command(extras, installed)
     label = upgrade_guard.guarded_upgrade_command_label(extras, installed)
 
-    # uv-based flow requires `uv` on PATH; pip/pipx flows don't.
-    if method == "uv":
-        uv = find_bin("uv")
+    # uv and pipx flows run the tool by its resolved absolute path.
+    if method in ("uv", "pipx"):
+        uv = find_bin(method)
         if not uv:
             console.print(
-                "[red]Error:[/red] jacked was installed via `uv tool install` "
-                "but `uv` isn't on PATH. Install it from https://docs.astral.sh/uv/"
+                f"[red]Error:[/red] jacked was installed via `{method}` but `{method}` "
+                "isn't on PATH. Install it (uv: https://docs.astral.sh/uv/)."
             )
             sys.exit(1)
         cmd[0] = uv  # use resolved absolute path
@@ -1020,8 +1024,8 @@ def _run_rollback_steps(
     from jacked.findbin import find_bin
 
     cmd = list(rollback_cmd)
-    if cmd and cmd[0] == "uv":
-        resolved_uv = find_bin("uv")
+    if cmd and cmd[0] in ("uv", "pipx"):
+        resolved_uv = find_bin(cmd[0])
         if resolved_uv:
             cmd[0] = resolved_uv
 
@@ -1325,25 +1329,20 @@ def _upgrade_run_preflight(jacked: str) -> "tuple[int, str]":
     """
     import subprocess
 
-    from jacked.service.updater import PREFLIGHT_TIMEOUT_SECONDS
+    from jacked.service.preflight_probe import PREFLIGHT_EXIT_GRACE_SECONDS, PREFLIGHT_TIMEOUT_SECONDS, preflight_argv
 
+    wait = PREFLIGHT_TIMEOUT_SECONDS + PREFLIGHT_EXIT_GRACE_SECONDS
     _upgrade_phase("preflight", "begin")
     console.print(f"\n[dim]$ {jacked} service preflight[/dim]")
     try:
         preflight = subprocess.run(
-            [jacked, "service", "preflight"],
-            capture_output=True,
-            text=True,
-            timeout=PREFLIGHT_TIMEOUT_SECONDS,
+            preflight_argv(jacked), capture_output=True, text=True, timeout=wait
         )
         code = preflight.returncode
         output = ((preflight.stdout or "") + (preflight.stderr or "")).strip()
     except subprocess.TimeoutExpired:
         code = -1
-        output = (
-            "preflight did not answer within "
-            f"{PREFLIGHT_TIMEOUT_SECONDS}s"
-        )
+        output = f"preflight did not answer within {wait}s"
     except OSError as exc:
         code = -1
         output = f"preflight could not run: {exc}"
@@ -1804,7 +1803,7 @@ def _run_upgrade_inline_locked(request: "_UpgradeRequest") -> None:
 
 
 def _upgrade_preflight_or_rollback(plan, new_version: str, no_rollback: bool) -> None:
-    """Prove the NEW build can provision its service contract, or roll back.
+    """Prove the NEW build can provision and boot its service contract, or roll back.
 
     This runs before the old service is replaced, and with --skip-service too:
     it is cheap, and it is the whole point of the transaction.
@@ -1813,7 +1812,7 @@ def _upgrade_preflight_or_rollback(plan, new_version: str, no_rollback: bool) ->
     if preflight_code == 0:
         _upgrade_phase("preflight", "ok")
         return
-    reason = "the new build cannot provision its service contract"
+    reason = "the new build cannot provision or boot its service contract"
     _upgrade_phase(
         "preflight", "failed", error=reason, recovery="jacked service preflight"
     )
@@ -2056,7 +2055,6 @@ def _spawn_windows_upgrade_helper(
     """
     import os
     import subprocess
-    import tempfile
     from jacked.findbin import find_bin
     from jacked.install_method import (
         rollback_command,
@@ -2103,8 +2101,8 @@ def _spawn_windows_upgrade_helper(
             rb_cmd = []
             rollback_label = ""
         if rb_cmd:
-            if rb_cmd[0] == "uv":
-                _resolved_uv = find_bin("uv")
+            if rb_cmd[0] in ("uv", "pipx"):
+                _resolved_uv = find_bin(rb_cmd[0])
                 if _resolved_uv:
                     rb_cmd[0] = _resolved_uv
             rollback_line = " ".join(f'"{arg}"' for arg in rb_cmd)
@@ -2302,20 +2300,11 @@ def _spawn_windows_upgrade_helper(
         + _cli_release_abort_blocks(skip_service)
     )
 
-    # Write the batch file to %TEMP% — it deletes itself at the end.
-    fd, batch_path = tempfile.mkstemp(suffix=".bat", prefix="jacked-upgrade-")
-    try:
-        # newline="" — batch_body already carries explicit \r\n. Translating on
-        # top of that wrote \r\r\n; cmd.exe tolerates the stray CR but nothing
-        # here should depend on that.
-        with os.fdopen(fd, "w", newline="") as f:
-            f.write(batch_body)
-    except Exception:
-        try:
-            os.unlink(batch_path)
-        except OSError:
-            pass
-        raise
+    # Write the batch file to %TEMP%; it deletes itself at the end. Every program is pinned to an absolute path: the batch can run in the
+    # service environment, whose PATH holds only the Windows folders.
+    from jacked.service.batch_programs import write_batch
+
+    batch_path = write_batch(batch_body, "jacked-upgrade-")
 
     # Spawn the batch CREATE_NO_WINDOW, NOT DETACHED_PROCESS. The batch runs a
     # pile of console children — the `tasklist | find "<pid>"` + `timeout /t 1`
@@ -7883,81 +7872,30 @@ def _exit_hard(code: int) -> None:
     "timeout_seconds",
     default=None,
     type=float,
-    help="Fail with exit code 1 if provisioning takes longer than this many seconds.",
+    help=(
+        "The time budget of the whole command, in seconds (default 100, under an "
+        "old upgrade helper's 120 s timeout). Provisioning and the probe share it. "
+        "When it ends, the command fails with exit code 1."
+    ),
 )
 def service_preflight(as_json: bool, timeout_seconds: float | None):
-    """Prove this build can provision its service contract.
+    """Prove this build can provision and boot its service contract.
 
-    The command provisions the contract only. It starts no process and it
-    changes no supervisor. Provisioning writes the immutable
-    content-addressed launcher file, which is safe to repeat.
+    The command provisions the contract. Then it runs one short probe
+    process through the launcher that the supervisor uses. The probe uses
+    the exact service environment. It makes an event loop, a socket and a
+    TLS context, and it finds the temporary directory. It also imports the
+    tray, the CLI and the dashboard API, and it does the start checks of
+    the tray. The command starts no service and changes no supervisor.
 
     Exit code 0 means this build can boot its service. Exit code 1 means it
-    cannot, and an upgrade to this build must not be trusted.
+    cannot. Do not trust an upgrade to this build.
     """
-    from jacked.service.lifecycle import (
-        default_service_paths,
-        provision_service_contract,
+    from jacked.preflight_cli import run_preflight
+
+    run_preflight(
+        as_json, timeout_seconds, provision=_provision_with_timeout, exit_hard=_exit_hard
     )
-
-    try:
-        spec, _environment = _provision_with_timeout(
-            provision_service_contract, default_service_paths(), timeout_seconds
-        )
-    except (OSError, ValueError, TimeoutError) as exc:
-        _print_preflight_failure(exc, as_json)
-        if isinstance(exc, TimeoutError):
-            # The provisioning thread is still wedged; a normal exit would
-            # wait for it. The batches depend on this command returning.
-            _exit_hard(1)
-        sys.exit(1)
-    _print_preflight_ok(spec, as_json)
-
-
-def _print_preflight_failure(exc: BaseException, as_json: bool) -> None:
-    import json as _json
-
-    if as_json:
-        click.echo(
-            _json.dumps(
-                {
-                    "ok": False,
-                    "runtime_path": None,
-                    "runtime_target_path": None,
-                    "supervisor": None,
-                    "generation": None,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
-        )
-        return
-    console.print(f"[red][FAIL][/red] {type(exc).__name__}: {exc}")
-    console.print("[dim]Run 'jacked service status' for details.[/dim]")
-
-
-def _print_preflight_ok(spec, as_json: bool) -> None:
-    import json as _json
-
-    supervisor = getattr(spec.supervisor, "value", str(spec.supervisor))
-    if as_json:
-        click.echo(
-            _json.dumps(
-                {
-                    "ok": True,
-                    "runtime_path": spec.runtime_path,
-                    "runtime_target_path": spec.runtime_target_path,
-                    "supervisor": supervisor,
-                    "generation": spec.generation,
-                    "error": None,
-                }
-            )
-        )
-        return
-    console.print("[green][OK][/green] Service contract OK")
-    console.print(f"[dim]runtime:[/dim] {spec.runtime_path}")
-    console.print(f"[dim]target:[/dim] {spec.runtime_target_path}")
-    console.print(f"[dim]supervisor:[/dim] {supervisor}")
-    console.print(f"[dim]generation:[/dim] {spec.generation[:12]}")
 
 
 @service.command(name="stop")

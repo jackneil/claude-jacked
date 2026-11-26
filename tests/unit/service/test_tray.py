@@ -2165,6 +2165,20 @@ class TestReadinessBudget:
             runner._note_ready(0.5)
         assert not path.exists()
 
+    def test_a_ready_start_hides_an_older_boot_failure(self, tmp_path):
+        from jacked import boot_failure
+        from jacked.service.tray import ServiceRunner
+
+        log = tmp_path / "boot.log"
+        boot_failure.record("Traceback\nImportError: x\n", path=log, now=0)
+        runner = ServiceRunner()
+        with (
+            patch.object(runner, "_start_failure_path", return_value=tmp_path / "f.json"),
+            patch.object(boot_failure, "log_path", return_value=log),
+        ):
+            runner._note_ready(0.5)
+        assert boot_failure.describe_latest(path=log) is None
+
 
 class TestReleaseOwnership:
     def test_release_closes_control_then_ownership_once(self):
