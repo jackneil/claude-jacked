@@ -189,31 +189,35 @@ def test_each_usage_line_has_exactly_the_options_of_its_command():
         assert usage[sub] == _options(command) - {"--help"}, sub
 
 
-def _spans_with_context(section: str):
-    """Yield (subcommand or None, inline code span) for each span outside a fenced block.
+def _spans_with_context(section: str, commands) -> list[tuple[str | None, str]]:
+    """Return (subcommand or None, inline code span) for each span outside a fenced block.
 
     A bullet that starts with `jacked tests X` sets the subcommand for itself
-    and for its sub-bullets. A heading or another top-level bullet clears it.
+    and for its sub-bullets. Each other line uses the command that the
+    nearest heading above it names (for example "Limits of seen"), or None.
     """
-    context = None
+    spans: list[tuple[str | None, str]] = []
+    heading = bullet = None
     for line in FENCE_RE.sub("", section).splitlines():
+        if line.startswith("#"):
+            named = [w for w in re.findall(r"[a-z-]+", line) if w in commands]
+            heading, bullet = (named[-1] if named else None), None
         lead = re.match(r"- `jacked tests ([a-z-]+)", line)
         if lead:
-            context = lead.group(1)
-        elif line.startswith(("- ", "#")) or (line and not line.startswith(" ")):
-            context = None
-        for span in INLINE_RE.findall(line):
-            yield context, span.strip("`")
+            bullet = lead.group(1)
+        elif line.startswith("- ") or (line and not line.startswith((" ", "#"))):
+            bullet = None
+        spans += [(bullet or heading, span.strip("`")) for span in INLINE_RE.findall(line)]
+    return spans
 
 
 @pytest.mark.parametrize("name", sorted(DOCS))
 def test_each_option_in_the_prose_is_an_option_of_its_command(name):
     _, commands = _group()
-    every = set().union(*(_options(c) for c in commands.values()))
     section = _section(name)
     runner_flags = section.split("### Runner settings", 1)[1] if "### Runner settings" in section else ""
     checked = 0
-    for context, span in _spans_with_context(section):
+    for context, span in _spans_with_context(section, commands):
         tokens = span.split()
         if tokens[:2] == ["jacked", "tests"]:
             tokens = tokens[2:]
@@ -229,8 +233,8 @@ def test_each_option_in_the_prose_is_an_option_of_its_command(name):
             if not option.startswith("--") or option == "--":
                 continue
             checked += 1
-            allowed = _options(commands[sub]) if sub else every
-            assert option in allowed, f"{name}: `{span}` ({sub or 'no command'})"
+            assert sub, f"{name}: `{span}` names no command, and its bullet and heading name none"
+            assert option in _options(commands[sub]), f"{name}: `{span}` is not an option of {sub}"
     assert checked, f"{name}: no option span was checked"
 
 

@@ -460,6 +460,15 @@ def test_profile_says_every_file_took_0_seconds_when_the_times_are_0(store):
     assert _one_line(text, "test seconds") == "test seconds: 0"
 
 
+def test_profile_says_every_file_with_a_time_took_0_seconds_when_some_files_have_none(store):
+    only = store_run(store, "20261126T080000", exit_code=0,
+                     tests=[make_case("n::t", "n.py", 0.0), make_case("m::t", "m.py", None)])
+    result = views.profile(store, only)
+    assert (result["files_for_half"], result["total_test_seconds"]) == (None, 0.0)
+    line = _one_line(views.render_profile(result), "files that hold half")
+    assert line == "files that hold half the seconds: every file with a time took 0 seconds"
+
+
 def test_profile_table_rows_with_no_seconds_say_no_time(store):
     text = views.render_profile(views.profile(store))
     rows = [x.split() for x in text.splitlines() if x.lstrip().startswith("no time ")]

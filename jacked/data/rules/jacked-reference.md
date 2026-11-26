@@ -202,7 +202,7 @@ jacked tests loss [--base REF] [--json]
   - `--any-machine` also accepts a run of a different machine. `seen` never compares the times of two machines. `--json` prints the record, or `null`.
 - `jacked tests profile` shows where the time of a run goes, by file and by test.
   - By default, it shows the newest run with the kind full. When no run has the kind full, it shows the newest run. The default machine is the machine of the newest full run.
-  - It prints the number of files that hold half of the test seconds. When each file took 0 seconds, it prints `every file took 0 seconds`.
+  - It prints the number of files that hold half of the test seconds. When each file took 0 seconds, it prints `every file took 0 seconds`. When some files have no time and each other file took 0 seconds, it prints `every file with a time took 0 seconds`.
   - A value that the record does not hold prints as text (`no time recorded`, `no time`), never as 0. The JSON gives `null`.
   - `--top N` sets the rows of each text table, and `--json` prints all rows. It prints a setup share only when the record holds one, and a JUnit report never holds one.
   - With no run in the history, `profile` gives exit 1. An unknown `--run` or `--machine` also gives exit 1.
@@ -233,7 +233,7 @@ A machine has a label: `local` for a run of `run`, or the value of `record --mac
 
 ### Limits of seen
 
-- The tree identity does not hold a file that git ignores. When the gate reads such a file, give it with `--input GLOB` to `run`. Then give the same globs to `seen`.
+- The tree identity does not hold a file that git ignores. When the gate reads such a file, give it with `run --input GLOB`. Then give the same globs with `seen --input GLOB`.
 - The `--input` fingerprint holds the path, the size and the modification time in nanoseconds of each file. It does not hold the content.
 - The tree identity does not hold a change inside the work tree of a submodule.
 - With git-lfs, the clean filter can write a copy of a new large file into `.git/lfs/objects` of the clone. The copy uses disk space, and no commit uses it. To remove such copies, run `git lfs prune`.
@@ -248,7 +248,7 @@ When the gate is red, read the failing tests. When the same tests fail on the ba
 - pytest: give `--junitxml={junit}`.
 - vitest: give `--reporter=junit --outputFile.junit={junit}`.
 - gotestsum: give `--junitfile {junit}`.
-- Playwright, cargo-nextest and jest write the report at the path that their configuration gives. Give that path with `--junit GLOB`.
+- Playwright, cargo-nextest and jest write the report at the path that their configuration gives. Give that path with `run --junit GLOB`.
 - jest: the reader needs four jest-junit settings. In the environment, set `JEST_JUNIT_ADD_FILE_ATTRIBUTE="true"`, `JEST_JUNIT_CLASSNAME="{classname}"`, `JEST_JUNIT_TITLE="{title}"` and `JEST_JUNIT_ANCESTOR_SEPARATOR=" > "`. In the jest-junit configuration, the same settings are `addFileAttribute: "true"`, `classNameTemplate: "{classname}"`, `titleTemplate: "{title}"` and `ancestorSeparator: " > "`. With the default templates, the test ID holds the describe titles two times.
 
 ## Codex Integration

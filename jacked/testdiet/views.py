@@ -343,7 +343,8 @@ def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
             share = NO_TIME
         else:
             # The record holds the times, and each one is 0: there is no time to split.
-            share = "every file took 0 seconds"
+            some_unknown = any(r["seconds"] is None for r in result["files"])
+            share = "every file with a time took 0 seconds" if some_unknown else "every file took 0 seconds"
         lines.append(f"files that hold half the seconds: {share}")
     if result["setup_share"] is not None:
         lines.append(f"setup share: {_num(result['setup_share'])}")

@@ -750,7 +750,7 @@ jacked tests record --junit report.xml --exit-code 0 --machine ci   # a run that
 jacked tests prune --before 2026-01-01
 ```
 
-`jacked tests run` returns the exit code of the gate command. A recorder error never changes it. An argument that holds `{junit}` gets the path of a private report file. For a runner that writes its report at a fixed path, give that path with `--junit GLOB`. `seen` matches the tree hash (with the changes that are not committed), the command as you typed it and the machine. It never compares the times of two machines.
+`jacked tests run` returns the exit code of the gate command. A recorder error never changes it. An argument that holds `{junit}` gets the path of a private report file. For a runner that writes its report at a fixed path, give that path with `run --junit GLOB`. `seen` matches the tree hash (with the changes that are not committed), the command as you typed it and the machine. It never compares the times of two machines.
 
 To use the recorder in a gate script and keep the script working with an older jacked, use this gate line. When the `tests` group is not there, it runs the bare command and prints one line:
 
@@ -766,7 +766,7 @@ fi
 
 **Where the history is.** The runs are in the `jacked-tests` folder of the common git directory of the clone (run `git rev-parse --git-common-dir` to find it). All linked worktrees share it, and git never commits it. A run holds test IDs, times, states and the SHA-256 of the command, never a failure message, test output or the command text. jacked deletes nothing automatically. To delete runs, run `jacked tests prune --before YYYY-MM-DD`, or delete the `jacked-tests` folder.
 
-**Limits.** `seen` does not see a change to a file that git ignores. Give such files with `--input GLOB` to `run` and to `seen`. `seen` also does not see a change inside a submodule. A gate that writes a file that git sees cannot prove a tree. Add the cache folders of the gate to `.gitignore`. See the "Gate recorder" section of `jacked/data/rules/jacked-reference.md` for each command, the jest-junit settings and the rule for a red gate.
+**Limits.** `seen` does not see a change to a file that git ignores. Give such files with `run --input GLOB`. Then give the same globs with `seen --input GLOB`. `seen` also does not see a change inside a submodule. A gate that writes a file that git sees cannot prove a tree. Add the cache folders of the gate to `.gitignore`. See the "Gate recorder" section of `jacked/data/rules/jacked-reference.md` for each command, the jest-junit settings and the rule for a red gate.
 
 ### QA Browser Testing
 
