@@ -124,8 +124,8 @@ def test_a_tray_that_cannot_load_on_this_host_passes_with_a_note(contract):
     result = _probe(contract, code=code)
     assert result.ok, result
     assert result.note.startswith(
-        "the tray cannot run on this host, so jacked does not run here: "
-        "pystray could not load (DisplayNameError)."
+        "The tray cannot run on this host (DisplayNameError), so the jacked service "
+        "cannot run here. See the README Linux tray notes: https://"
     )
     assert "linux-tray-notes" in result.note
     assert ":99" not in result.note  # the error type only, never its text
@@ -139,7 +139,7 @@ def test_a_missing_uvicorn_refuses_even_with_a_working_tray(contract):
 def test_preflight_prints_the_host_note_on_a_pass(monkeypatch):
     from jacked.cli import main
 
-    note = "the tray cannot run on this host, so jacked does not run here: pystray could not load (ValueError)."
+    note = "The tray cannot run on this host (ValueError), so the jacked service cannot run here."
     with (
         patch(
             "jacked.service.lifecycle.provision_service_contract",

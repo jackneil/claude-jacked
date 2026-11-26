@@ -202,8 +202,9 @@ def tray_backend():
             # the same way. Report it, do not refuse.
             kind = tray._PYSTRAY_LOAD_FAILURE.split(":", 1)[0]
             _say(
-                NOTE_MARK + "the tray cannot run on this host, so jacked does not run here: pystray could "
-                "not load (" + kind + "). " + tray.LINUX_TRAY_NOTES_POINTER
+                NOTE_MARK + "The tray cannot run on this host (" + kind + "), so the "
+                "jacked service cannot run here. See the README Linux tray notes: "
+                + tray.LINUX_TRAY_NOTES_POINTER.rsplit(" ", 1)[-1]
             )
     if not tray._UVICORN_AVAILABLE:
         raise ProbeRefusal("uvicorn_missing")
