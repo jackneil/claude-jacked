@@ -14,9 +14,11 @@ test, a renamed class and an edited parameter value give no loss. A test
 that gets a new name inside one file shows as one removed and one added name.
 
 ``fewer_assertions``, ``fewer_cases`` and ``skips_added`` are report lines,
-not a verdict. ``not_read`` names each test (and each file) that the report
-cannot prove: a file that does not parse, a body that the scanner cannot
-read, a computed case list, a symbolic link, a submodule and a type change.
+not a verdict. ``not_read`` names each paired test (a test on both sides,
+or a moved pair) that the report cannot compare: a file that does not
+parse, a body that the scanner cannot read, a computed case list. An added
+or a removed test has nothing to compare, so it is never in ``not_read``.
+It also names each file that is a symbolic link, a submodule or a type change.
 A symbolic link, a submodule and a type change are never read as absent, so
 their tests are never reported as removed.
 """
@@ -249,8 +251,6 @@ def _compare(base: str, before: Sides, after: Sides, *, base_ref: str = DEFAULT_
         if now.skipped is True and then.skipped is False:
             skips.append(name)
         unread.update((name, reason) for reason in then.unread + now.unread)
-    for path, d in removed + added:
-        unread.update((f"{path}::{d.name}", reason) for reason in d.unread)
     net = sum(len(found) for found in after.values()) - sum(len(found) for found in before.values())
     return LossReport(base=base, base_ref=base_ref, added=tuple(sorted(f"{p}::{d.name}" for p, d in added)),
                       removed=tuple(sorted(f"{p}::{d.name}" for p, d in removed)), net=net,

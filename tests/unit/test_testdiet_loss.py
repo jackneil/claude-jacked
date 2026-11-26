@@ -319,7 +319,7 @@ def test_a_python_file_with_a_syntax_error_still_gives_declarations(repo):
     assert report.removed == ()
     # The line pattern cannot count assertions, so no test is named as weaker.
     assert (report.fewer_assertions, report.skips_added) == ((), ())
-    assert ("tests/test_calc.py::test_broken", "does not parse") in report.not_read
+    assert ("tests/test_calc.py::test_broken", "does not parse") not in report.not_read
     assert ("tests/test_calc.py::test_adds", "does not parse") in report.not_read
     out = _invoke("tests", "loss").output
     assert "not read tests/test_calc.py::test_adds (does not parse)" in out.splitlines()
@@ -605,3 +605,18 @@ def test_a_work_tree_that_git_cannot_read_names_the_exit_code_and_the_first_erro
         locked.chmod(0o600)
     assert out.exit_code == 1 and out.output.count("\n") == 1
     assert "git add exited with" in out.output and "locked.txt" in out.output
+
+
+def test_only_a_test_with_two_sides_can_be_not_read(repo):
+    computed = b"import pytest\n\n@pytest.mark.parametrize('n', VALUES)\ndef test_values(n):\n    assert n\n"
+    write(repo, "tests/test_values.py", computed)
+    added = loss.loss_report(repo)
+    assert added.added == ("tests/test_values.py::test_values",)
+    assert added.not_read == ()
+    assert not [line for line in _invoke("tests", "loss").output.splitlines() if line.startswith("not read ")]
+    commit(repo, "values")
+    write(repo, "tests/test_values.py", computed + b"    assert n > 0\n")
+    both = loss.loss_report(repo, "HEAD")
+    assert both.not_read == (("tests/test_values.py::test_values", "computed cases"),)
+    assert "not read tests/test_values.py::test_values (computed cases)" in _invoke(
+        "tests", "loss", "--base", "HEAD").output.splitlines()
