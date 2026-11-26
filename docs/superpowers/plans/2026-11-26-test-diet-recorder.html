@@ -1,0 +1,1141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!--
+  jacked artifact template — for plans, specs, research, checkpoints.
+  Replace placeholders, keep what you need, delete sections you don't.
+  Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
+-->
+<title>Test diet: the gate recorder plan</title>
+
+<!-- Metadata block — adjust fields per artifact type -->
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="draft">
+<meta name="jacked:branch" content="jack_20261125_test_diet">
+<meta name="jacked:date" content="2026-11-26">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 .25rem;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 .5rem;
+    color: var(--fg-muted);
+  }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+
+  /* Metadata strip under title */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    margin: .5rem 0 2rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    font-size: .9rem;
+  }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+
+  /* Status badges — drop into a <span class="badge X"> */
+  .badge {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 99px;
+    font-size: .8rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .badge.ok       { background: var(--ok-bg);     color: var(--ok); }
+  .badge.warn     { background: var(--warn-bg);   color: var(--warn); }
+  .badge.danger   { background: var(--danger-bg); color: var(--danger); }
+  .badge.info     { background: var(--accent-bg); color: var(--accent); }
+
+  /* Table of contents */
+  nav.toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    margin: 0 0 .5rem;
+    font-size: .9rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--fg-muted);
+    border: none;
+    padding: 0;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.5rem;
+  }
+  nav.toc li { margin: .15rem 0; }
+
+  /* Callouts — drop into <aside class="callout warn"> ... </aside> */
+  aside.callout {
+    margin: 1rem 0;
+    padding: .9rem 1.1rem;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  aside.callout.warn   { border-color: var(--warn);   background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok     { border-color: var(--ok);     background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child  { margin-bottom: 0; }
+
+  /* Code */
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: var(--code-bg);
+    padding: .12em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: .88rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    font-size: .9rem;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  /* Task checklist — use <ul class="tasks"> + <li><input type="checkbox" disabled> ...</li> */
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li {
+    padding: .25rem 0;
+    display: flex;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+
+  /* Mermaid diagram wrappers */
+  .diagram {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  /* If mermaid fails (no network), fall back to showing the source in a code block */
+  .diagram pre.mermaid-source {
+    text-align: left;
+    display: none;
+  }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+
+  blockquote {
+    border-left: 3px solid var(--border);
+    padding: .2rem 1rem;
+    margin: 1rem 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  /* Print: paginate cleanly, drop the dark-mode flip, expand TOC */
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Test diet: the gate recorder (implementation plan)</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">ready to build; one task waits on the owner</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-11-26</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">jack_20261125_test_diet</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
+</div>
+
+<aside class="callout info">
+  <strong>For agentic workers.</strong> REQUIRED SUB-SKILL: use
+  <code>superpowers:subagent-driven-development</code> to implement this plan task by task. Each
+  implementer gets one task and reads the spec too. If a task needs a design decision that this
+  plan does not make, stop and report. Do not invent architecture.
+</aside>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#split">Why this plan exists</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#constraints">Global constraints</a></li>
+    <li><a href="#focus">Review focus</a></li>
+    <li><a href="#files">File structure</a></li>
+    <li><a href="#decisions">Decisions that the spec left to the builder</a></li>
+    <li><a href="#tasks">Tasks</a></li>
+    <li><a href="#open-questions">Open questions</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal</h2>
+<p>Ship the gate recorder: the command group <code>jacked tests</code> with <code>run</code>,
+<code>record</code>, <code>seen</code>, <code>profile</code>, <code>history</code>,
+<code>prune</code> and <code>loss</code>. The recorder measures each gate of a repository and
+keeps a local history. A session can ask <code>seen</code> before it starts a full gate, and a
+tree that passed does not run again. This plan also repairs the Codex policy file for the two
+user-only skills that jacked ships today.</p>
+<p><strong>Spec:</strong>
+<a href="../specs/2026-11-25-test-diet-design.html">2026-11-25-test-diet-design.html</a> (approved by
+the owner on 2026-11-26), Part 1 and Part 3. <strong>Research:</strong>
+<a href="../research/2026-11-25-test-suite-diet-research.html">2026-11-25-test-suite-diet-research.html</a>.
+The executor reads both.</p>
+<p><strong>Tech stack:</strong> Python 3.11+ (<code>requires-python</code> of this package), click,
+pytest. No new third-party package.</p>
+
+<h2 id="split">Why this plan exists</h2>
+<p>Two review cycles read the plan of the full feature on 2026-11-26. Each cycle found new defects,
+and the defects of the second cycle were in the parts that the first cycle added. The review limit
+of two cycles is reached. The full plan is now three documents.</p>
+<table>
+  <thead><tr><th>Document</th><th>Holds</th><th>State</th></tr></thead>
+  <tbody>
+    <tr><td>This plan</td><td>The recorder, the loss report, the Codex policy file, the
+    reference text.</td><td>Ready to build. Each task gets its own review when it is built.</td></tr>
+    <tr><td><a href="2026-11-26-test-diet.html">The skill plan</a></td><td>The ledger, the ID
+    check, the skill <code>/test-diet</code>.</td><td>Not ready. It needs a smaller design.</td></tr>
+    <tr><td><a href="2026-11-26-test-diet-gate-machine.html">The gate machine plan</a></td>
+    <td><code>jacked tests run --on</code>.</td><td>On hold. The mechanism is not decided.</td></tr>
+  </tbody>
+</table>
+<p>These are the changes of the second review that this plan holds. No other part of the second
+review touches the recorder.</p>
+<table>
+  <thead><tr><th>Finding</th><th>Change</th><th>Task</th></tr></thead>
+  <tbody>
+    <tr><td>The hash of the gate command held the report path. A gate line makes a new report
+    folder for each run, so <code>seen</code> could never say yes.</td><td>The caller writes
+    <code>{junit}</code> in the command. <code>run</code> makes the folder and puts the path in.
+    The hash is the hash of the command as the caller typed it.</td><td>3</td></tr>
+    <tr><td>A record with no exit code had no verdict.</td><td>The verdict <code>unknown</code>.
+    It never satisfies <code>seen</code>.</td><td>2</td></tr>
+    <tr><td>The sample reports hold the path <code>/work</code> and the reader gets a real
+    folder.</td><td><code>read_junit</code> has <code>report_root</code>: a path of the report
+    that starts with it is a path under the root.</td><td>1</td></tr>
+    <tr><td>The check for private values refused text that only contains a login name
+    (<code>jack</code> in <code>jacked</code>).</td><td>A host name and a login name match as a
+    whole word. A home path matches as a prefix.</td><td>1</td></tr>
+    <tr><td>The rule for a DOCTYPE named a mechanism that Python does not have.</td><td>A parser
+    target whose <code>doctype</code> method raises. Tried on 2026-11-26: it stops a DOCTYPE and
+    an entity declaration before a test case is read.</td><td>1</td></tr>
+    <tr><td>Small findings.</td><td>A flaky test needs a pass and a failure, not a pass and a
+    skip. A fixed report path is fresh when its content changed. The machine identity is a random
+    value, not a hash of the host. Git runs with <code>GIT_OPTIONAL_LOCKS=0</code>. The lint step
+    does not read the sample projects. The fixtures <code>repo</code> and <code>store</code> have
+    a home.</td><td>1 to 4</td></tr>
+  </tbody>
+</table>
+
+<h2 id="architecture">Architecture</h2>
+<p>One new package, <code>jacked/testdiet/</code>, holds the mechanical work: it reads JUnit XML,
+gives each tree an identity, and keeps a local history. The commands print numbers. They never
+decide that a test is slow, junk or flaky.</p>
+
+<div class="diagram">
+  <pre class="mermaid">
+flowchart LR
+    CLI[jacked tests: cli.py group] --> REC[record.py: run, record, seen]
+    CLI --> VIEW[views.py: profile, history]
+    CLI --> LOSS[loss.py: loss report]
+    REC --> JU[junit.py + ids.py]
+    REC --> TREE[tree.py: tree identity]
+    REC --> HIST[(history.py: git common dir)]
+    VIEW --> HIST
+    LOSS --> GIT[(git)]
+  </pre>
+  <pre class="mermaid-source">
+jacked tests (cli.py group) -> record.py (run, record, seen) -> junit.py + ids.py, tree.py, history.py
+views.py (profile, history) -> history.py
+loss.py -> git
+  </pre>
+</div>
+
+<h2 id="constraints">Global constraints</h2>
+<p>Each task's requirements include this section.</p>
+<ul>
+  <li><strong>No third-party package</strong> in <code>jacked/testdiet/</code>. Use the helpers that
+  jacked has, and do not write them again: <code>jacked.atomic_io.atomic_write_bytes</code>
+  (<code>atomic_io.py:332</code>) for each file of the history;
+  <code>jacked.packs.jacked_home</code> (<code>packs.py:97</code>; it is the home folder, and
+  jacked keeps its state in <code>.claude/</code> under it);
+  <code>jacked.git_guard.run_git</code> for a git read that needs no filter;
+  <code>jacked.findbin.find_bin</code>; <code>jacked.regular_file.open_regular_fd</code> for each
+  path that a caller gives.</li>
+  <li><strong>Each child process is an argument list.</strong> No <code>shell=True</code>.</li>
+  <li><strong>No module name starts with <code>test_</code></strong> in the package, and no class
+  name starts with <code>Test</code>.</li>
+  <li><strong>The history holds IDs, numbers, states and the class name of a failure.</strong> No
+  failure message, no test output, no log text, no command text (only its SHA-256). It is in the
+  common git directory of the clone and git never commits it.</li>
+  <li><strong>A value that a file does not hold stays empty</strong> (<code>None</code>,
+  <code>null</code>). It is never zero.</li>
+  <li><strong><code>jacked tests run</code> returns the exit code of the command that it
+  wraps.</strong> A recorder error never changes that code. The one exception is the flag
+  <code>--strict</code>.</li>
+  <li><strong>Times of two machines are never compared.</strong> A machine is its label and a
+  private random identity.</li>
+  <li><strong>No committed file holds a host name, an address, a user name or a home path.</strong>
+  A sample report holds the host <code>gate.example</code> and the root <code>/work</code>.</li>
+  <li><strong>A test ID is free text.</strong> Remove control characters, except the newline and
+  the tab, before a print to a terminal. A label matches <code>[A-Za-z0-9._-]+</code>, checked
+  with <code>re.fullmatch</code>.</li>
+  <li><strong>No arbitrary threshold decides a verdict.</strong> A command prints numbers.</li>
+  <li><strong>Documentation, docstrings and user-visible messages are in ASD-STE100.</strong> No
+  em-dash in them.</li>
+  <li><strong>Sample reports come from real runs.</strong> The capture script changes only the host
+  name and the root path. Nobody edits a report by hand.</li>
+  <li><strong>A test name in this plan is a requirement.</strong> The test asserts what its name
+  says, with the values of the rules of its task. A task can add tests. It does not drop one. When
+  a real report contradicts a rule of this plan, the report is right: stop and report.</li>
+  <li><strong>The suite runs on Linux, macOS and Windows in hosted CI</strong>
+  (<code>.github/workflows/tests.yml</code>). Write text files as bytes or with
+  <code>newline=""</code>. A value that a system does not give is empty there.</li>
+  <li><strong>This suite guards real processes.</strong> Read the exec guard and the markers
+  <code>real_process</code> and <code>real_process_tree</code> in <code>tests/conftest.py</code>
+  before you write a test that starts <code>git</code> or a child process, and follow a present
+  test that does the same (<code>tests/unit/test_git_reality.py</code>).</li>
+  <li><strong>Tests:</strong> <code>uv run python -m pytest &lt;files&gt;</code>. Each task runs its
+  own test files plus <code>grep -rl &lt;changed module or directory name&gt; tests/</code>, and
+  <code>uv run ruff check</code> on the files that it changed. The full suite runs one time, in
+  Task 11. Each task reports <code>--durations=10</code> of its new test files.</li>
+  <li><strong>Process rule, verbatim in each brief:</strong> NEVER <code>pkill -f</code> /
+  <code>killall</code> a generic pattern (<code>pytest</code>, <code>python</code>, <code>node</code>,
+  <code>layout_qa.py</code>, <code>ci_local.py --layout</code>, a server name) on this machine; stop
+  only processes you started, by PID.</li>
+  <li><strong>Load:</strong> run <code>uptime</code> before each test run. Above a load of 15 on this
+  machine, run the targeted files with no parallel workers and say so.</li>
+</ul>
+
+<h2 id="focus">Review focus</h2>
+<ol>
+  <li><strong>The gate writes no JUnit file, an old one, or half of one.</strong> Expected: the
+  exit code comes back unchanged, the record has no test data and can never satisfy
+  <code>seen</code>, and an old file is never read as this run. Tests in Task 3.</li>
+  <li><strong>The gate script exits 0 and the JUnit file holds failures</strong> (a pipe, or
+  <code>|| true</code>). Expected: a conflict, printed, never a pass. Tests in Task 3.</li>
+  <li><strong>The tree changes while the gate runs, has changes that are not committed, or the gate
+  writes its own output into the tree.</strong> Expected: <code>seen</code> never says yes for a
+  tree that did not run, and a tree that changed is named. Tests in Tasks 2 and 3.</li>
+  <li><strong>Several sessions finish a gate in the same second.</strong> Expected: each record is
+  complete. Test in Task 2.</li>
+  <li><strong>The same gate runs a second time, and its report goes to a new folder.</strong>
+  Expected: one command SHA for both runs, and <code>seen</code> says yes. Tests in Task 3.</li>
+</ol>
+
+<h2 id="files">File structure</h2>
+<table>
+  <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/testdiet/__init__.py</code>, <code>model.py</code></td><td><code>CaseResult</code>, <code>RunData</code>, <code>TreeId</code>, <code>RunMeta</code>.</td></tr>
+    <tr><td><code>jacked/testdiet/junit.py</code>, <code>ids.py</code></td><td>Read JUnit XML. One normalized test ID for each runner. Parse a listing.</td></tr>
+    <tr><td><code>jacked/testdiet/tree.py</code></td><td>The identity of a tree, the fingerprint of input files, the common git directory, the machine identity.</td></tr>
+    <tr><td><code>jacked/testdiet/history.py</code></td><td>The local store of runs.</td></tr>
+    <tr><td><code>jacked/testdiet/record.py</code></td><td><code>run_gate</code>, <code>record_files</code>, <code>seen</code>, the repeat-failure notice.</td></tr>
+    <tr><td><code>jacked/testdiet/views.py</code></td><td>The numbers of <code>profile</code> and <code>history</code>.</td></tr>
+    <tr><td><code>jacked/testdiet/loss.py</code></td><td>The loss report from git.</td></tr>
+    <tr><td><code>jacked/cli.py</code></td><td>The group <code>jacked tests</code>, after the <code>dcr</code> group (<code>cli.py:6874</code>). Each command imports its module inside the function. <code>tests</code> joins the commands that <code>_maybe_prompt_first_run</code> skips (<code>cli.py:179</code>).</td></tr>
+    <tr><td><code>jacked/data/skills/review-animations/agents/openai.yaml</code></td><td>The Codex policy file for a skill that only the user starts.</td></tr>
+    <tr><td><code>jacked/codex/_generate.py</code>, <code>_fsutil.py</code>, <code>installer.py</code></td><td>The Codex policy file for a command that has <code>disable-model-invocation</code>.</td></tr>
+    <tr><td><code>README.md</code>, <code>jacked/data/rules/jacked-reference.md</code></td><td>The new command group and the gate line.</td></tr>
+    <tr><td><code>tests/_testdiet.py</code></td><td>Shared test helpers, imported as <code>from tests._testdiet import ...</code> (the pattern of <code>tests/_platform.py</code>): <code>make_repo(path)</code> (follows <code>tests/unit/test_git_reality.py:45</code>), <code>fixture_reports(runner)</code>, <code>fixture_project(runner)</code>, <code>fixture_listing(runner)</code>, <code>REPORT_ROOT = "/work"</code>, <code>provenance()</code>, <code>fill_store(path)</code>, <code>private_hits(text, *, host, login, home)</code>. Each test module that needs <code>repo</code> or <code>store</code> defines that fixture from these helpers.</td></tr>
+    <tr><td><code>tests/unit/test_testdiet_*.py</code>, <code>test_cli_tests_group.py</code>, <code>test_codex_implicit_invocation.py</code>, <code>test_tests_reference.py</code></td><td>The tests.</td></tr>
+    <tr><td><code>tests/fixtures/testdiet/</code></td><td><code>reports/</code> (real JUnit files, listings and console totals), <code>projects/</code> (the source files of the small projects), <code>capture.py</code>, <code>PROVENANCE.json</code>.</td></tr>
+    <tr><td><code>tests/conftest.py</code>, <code>pyproject.toml</code></td><td><code>collect_ignore_glob</code> for <code>fixtures/testdiet/projects/*</code>; <code>[tool.ruff] extend-exclude</code> for the same folder.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="decisions">Decisions that the spec left to the builder</h2>
+<p>These are the builder's calls. Task 9 puts them into the spec with that label.</p>
+<table>
+  <thead><tr><th>Subject</th><th>Decision</th><th>Reason</th></tr></thead>
+  <tbody>
+    <tr><td>History format</td><td>Two files for each run in <code>&lt;git common dir&gt;/jacked-tests/runs/</code>:
+    <code>&lt;id&gt;.tests.json.gz</code> first, then <code>&lt;id&gt;.meta.json</code>. The meta file
+    is the commit marker: a run with no meta file does not exist. The ID is
+    <code>&lt;UTC time&gt;-&lt;8 random hex&gt;</code>.</td><td>No shared file, so parallel sessions
+    cannot damage a record.</td></tr>
+    <tr><td>Retention</td><td>Nothing is deleted automatically. <code>history --size</code> prints
+    the size. <code>jacked tests prune --before DATE</code> deletes on request and prints each
+    deleted run.</td><td>An automatic limit drops data silently.</td></tr>
+    <tr><td>Tree identity</td><td><code>TreeId(commit, tree, clean)</code>. A clean tree uses
+    <code>HEAD^{tree}</code>. A tree with changes uses a copy of the index
+    (<code>git rev-parse --git-path index</code>) and a temporary object directory
+    (<code>GIT_OBJECT_DIRECTORY</code>, with the real one in
+    <code>GIT_ALTERNATE_OBJECT_DIRECTORIES</code>), then <code>git add -A</code> and
+    <code>git write-tree</code>. Each git call has <code>GIT_OPTIONAL_LOCKS=0</code>. The real index
+    and the real object store do not change. The clean and smudge filters stay on, because the hash
+    must be equal to the tree of a commit. A repository with no commit, or a bare one, has no
+    tree.</td><td>Two commits with the same content are one tree. Changes that are not committed
+    are in the identity.</td></tr>
+    <tr><td>Limits of the identity</td><td>It does not hold a file that git ignores, and it does
+    not hold a change inside the work tree of a submodule. <code>--input GLOB</code> adds a
+    fingerprint of named files (path, size, modification time in nanoseconds, not content) to the
+    record and to <code>seen</code>. With git-lfs, the clean filter can write a copy of a new large
+    file into the lfs folder of the clone. The reference text says these limits.</td><td>In the
+    owner's data service a stale ignored file changed the result of a gate.</td></tr>
+    <tr><td>The gate command and the report path</td><td>The record holds <code>command_sha</code>:
+    the SHA-256 of the arguments as the caller typed them, joined by a NUL. An argument can hold
+    the text <code>{junit}</code>. Then <code>run</code> makes a private folder with
+    <code>tempfile.mkdtemp</code>, puts <code>&lt;folder&gt;/junit.xml</code> in place of each
+    <code>{junit}</code>, reads that file after the gate, and removes the folder before it reads
+    the tree a second time. <code>seen</code> hashes the same typed command.
+    <code>--kind full|targeted</code> is a label for the views only.</td><td>A label that the caller
+    picks cannot prove which command ran. A path that changes for each run must not be in the
+    hash.</td></tr>
+    <tr><td>A report at a fixed path</td><td><code>--junit GLOB</code>, one or more times, for a
+    runner that writes its report where its own configuration says. Before the run, the recorder
+    takes the SHA-256 of the content of each match. After the run it reads a match that is new or
+    whose content changed, and prints one line for each match that it did not read.</td><td>A
+    clock or a coarse file system must not hide a fresh report. An old report must not become this
+    run.</td></tr>
+    <tr><td>Verdict of a run</td><td><code>passed</code>: exit code 0, a JUnit file was read, no
+    failed and no error test, at least one test. <code>failed</code>: exit code not 0.
+    <code>conflict</code>: exit code 0 and a failed or an error test. <code>no-data</code>: exit
+    code 0 and no JUnit data, or no test in it. <code>unknown</code>: no exit code (a
+    <code>record</code> with no <code>--exit-code</code>).</td><td>A pipe can turn a red gate into
+    exit code 0.</td></tr>
+    <tr><td>One ID two times</td><td>One <code>CaseResult</code> for each ID. <code>attempts</code>
+    counts the attempts that the report shows. The seconds are the sum. The state is
+    <code>flaky</code> when one attempt passed and one attempt failed or had an error. If not, it
+    is the worst state (error, failed, passed, skipped). A flaky test is not in the failing set.
+    If the real report of a rerun tool does not show the first attempt, the state is the state
+    that the report shows, and the task report says so.</td><td>A rerun tool can write one test
+    more than one time.</td></tr>
+    <tr><td>pytest file names</td><td>A pytest JUnit file has a dotted class name and no file path.
+    The reader finds the file by a lookup in the tree: the longest dotted prefix that is a
+    <code>.py</code> file inside the root. A value that would leave the root gives
+    <code>file=None</code>.</td><td>The profile works by file.</td></tr>
+    <tr><td>A report of a different root</td><td><code>read_junit(..., report_root=None)</code>.
+    When it is given, an absolute path of the report that starts with it is a path under
+    <code>root</code>. The match is on text with <code>/</code> separators, so it works for a
+    POSIX path on Windows. <code>jacked tests record --report-root PATH</code> gives it for a
+    report that a different machine made.</td><td>The sample reports hold <code>/work</code>. A
+    report of hosted CI holds the path of the runner.</td></tr>
+    <tr><td>Machine</td><td><code>machine</code> is a label: <code>local</code> for a wrapped run,
+    or the value of <code>record --machine</code>. <code>machine_id</code> is 32 random hex
+    characters, made one time in <code>jacked_home()/.claude/jacked-tests-machine-id</code> with
+    mode 0600 where the system has modes. No command prints it. A record that
+    <code>record --machine</code> made has no <code>machine_id</code>.</td><td>One clone can be
+    open on the host and in a container. A hash of the host name is a private value in a second
+    form.</td></tr>
+    <tr><td>Setup share</td><td><code>profile</code> prints a setup share only when the record
+    holds one. A JUnit file does not.</td><td>A value that a file does not hold stays
+    empty.</td></tr>
+    <tr><td>Default branch</td><td><code>on_default_branch</code> is set when the record is written,
+    with no fetch: the tree is clean and the commit is an ancestor of the ref that
+    <code>refs/remotes/origin/HEAD</code> names. With no such ref it is empty.</td><td>The notice
+    must not start a network call.</td></tr>
+    <tr><td>Processor time</td><td>The difference of <code>RUSAGE_CHILDREN</code> around the child.
+    It holds only the processes that the gate waited for. It is empty on Windows.</td><td>The
+    system gives no more.</td></tr>
+    <tr><td>The gate line</td><td>A gate line of a repository checks
+    <code>jacked tests run --help</code> and runs the bare gate command, with one printed line,
+    when it fails. The reference text holds the line and a test runs it.</td><td>A gate script
+    must not break on a machine that has an older jacked.</td></tr>
+    <tr><td>The sample projects</td><td>The repository holds the source files of each small
+    project and no dependency manifest of npm. <code>capture.py</code> holds the exact tool
+    versions, builds each project in a temporary folder, and installs there with scripts off.
+    </td><td>A manifest in the repository starts dependency alerts for packages that jacked does
+    not ship.</td></tr>
+    <tr><td>Codex policy file</td><td>For a skill: a real file <code>agents/openai.yaml</code> in the
+    skill directory, and a test that fails when a skill has the key and no file. For a command:
+    the generator writes the file into the skill that it makes from the command.</td><td>The
+    installer refuses a target file that the source does not have
+    (<code>install_manifest.py:238</code>), so a file that only the installer adds would send each
+    jacked skill to the backup folder.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="tasks">Tasks</h2>
+
+<h3>Task 1: fixtures, JUnit reader and test IDs</h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/__init__.py</code>, <code>model.py</code>,
+<code>junit.py</code>, <code>ids.py</code>, <code>tests/fixtures/testdiet/</code>,
+<code>tests/_testdiet.py</code>, <code>tests/unit/test_testdiet_junit.py</code>,
+<code>tests/unit/test_testdiet_ids.py</code>; modify <code>tests/conftest.py</code>,
+<code>pyproject.toml</code>.</p>
+<pre><code>@dataclass(frozen=True)
+class CaseResult:
+    id: str                    # normalized, see ids.normalize
+    file: str | None           # repo-relative POSIX path, always inside the root
+    seconds: float | None
+    state: str                 # "passed" | "failed" | "error" | "skipped" | "flaky"
+    failure_type: str | None   # the `type` attribute of the failure element; never its message
+    attempts: int
+
+@dataclass(frozen=True)
+class RunData:
+    runner: str                # "pytest" | "vitest" | "jest" | "playwright" | "go" | "nextest" | "unknown"
+    tests: tuple[CaseResult, ...]
+    seconds_reported: float | None
+
+class JUnitError(ValueError): ...
+class ListingError(ValueError): ...
+
+def read_junit(paths: Sequence[Path], *, root: Path, report_root: str | None = None,
+               runner: str | None = None) -> RunData
+def normalize(runner: str, classname: str, name: str, file: str | None, *, root: Path,
+              report_root: str | None = None) -> tuple[str, str | None]
+def ids_from_listing(runner: str, text: str, *, root: Path) -> list[str]   # raises ListingError on an error line
+def detect_runner(suite_attributes: Mapping[str, str], first_case: Mapping[str, str]) -> str
+
+# tests/_testdiet.py
+def private_hits(text: str, *, host: str, login: str, home: str) -> list[str]</code></pre>
+<p><strong>Rules of the reader.</strong> Open each path with <code>open_regular_fd</code>. Parse
+with <code>xml.etree.ElementTree.XMLParser(target=T)</code> and feed the file in blocks.
+<code>T.start</code> reads the attributes that the fields need. <code>T.data</code> does nothing,
+so the reader never holds the text of an element. <code>T.doctype</code> raises
+<code>JUnitError</code>. A <code>ParseError</code> becomes a <code>JUnitError</code>. No size limit.
+The message attribute of a failure element goes into no field.</p>
+<p><strong>Rule of <code>private_hits</code>.</strong> It returns each private value that the text
+holds. The home path matches as text, with either separator. The host name (the full name and its
+first part) and the login name match as a whole word: the character before and the character after
+are not a letter, a digit or an underscore. The match ignores case. The capture script calls it
+with the values of the machine that captures, and stops when it returns a hit.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 1.1 Write the source files of one small project for each
+  runner under <code>tests/fixtures/testdiet/projects/</code> (pytest, Vitest, Jest with
+  jest-junit, Playwright with tests that open no browser, Go with gotestsum, Rust with
+  cargo-nextest). Each project has: a passing test, a failing test, a skipped test, a parametrized
+  or table test, a test in a class or a nested suite, and a test named
+  <code>sleeps_half_a_second</code> that sleeps for 0.5 seconds. Add for pytest: a run with
+  pytest-rerunfailures in which one test fails and then passes, and a second project with a module
+  that cannot import (its JUnit file and its <code>--collect-only -q</code> output). Add for
+  Playwright: a second report of the same tests after one test moved down in its file.</li>
+  <li><input type="checkbox" disabled> 1.2 Write <code>capture.py</code>. It copies each project to
+  a temporary folder, writes the dependency manifest there with exact versions that are 14 days
+  old or more, installs there with install scripts off, and runs the project. It rewrites the
+  absolute root prefix to <code>/work</code>, sets each <code>hostname</code> attribute to
+  <code>gate.example</code>, calls <code>private_hits</code> on each output and stops on a hit. It
+  keeps the JUnit file, the listing and the console total in <code>reports/</code>, and writes
+  <code>PROVENANCE.json</code>: the tool versions, the commands, the date, and the two rewrites as
+  the only changes. Read each command in the runner's own documentation first. Use a release
+  binary of gotestsum and of cargo-nextest; do not compile a tool. Add the
+  <code>collect_ignore_glob</code> entry and the <code>extend-exclude</code> entry.</li>
+  <li><input type="checkbox" disabled> 1.3 Write the failing tests. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 1.4 Implement.</li>
+  <li><input type="checkbox" disabled> 1.5 Run the two test files. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 1.6 Commit: <code>feat(testdiet): read JUnit of six runners into one form</code>.</li>
+</ul>
+<pre><code>RUNNERS = ["pytest", "vitest", "jest", "playwright", "go", "nextest"]
+LISTED_BY_NAME = ("pytest", "vitest", "playwright", "nextest")    # this tuple is fixed by the plan
+
+@pytest.mark.parametrize("runner", RUNNERS)
+def test_real_report_gives_the_normalized_fields(runner): ...          # passed, failed and skipped are present
+@pytest.mark.parametrize("runner", RUNNERS)
+def test_a_test_that_sleeps_half_a_second_reads_as_half_a_second(runner):
+    data = read_junit(fixture_reports(runner), root=fixture_project(runner), report_root=REPORT_ROOT)
+    slept = [t for t in data.tests if "sleeps_half_a_second" in t.id]
+    assert len(slept) == 1 and 0.4 &lt;= slept[0].seconds &lt;= 5.0
+@pytest.mark.parametrize("runner", RUNNERS)
+def test_each_case_of_a_real_report_has_a_file_inside_the_project(runner): ...   # report_root maps /work to the folder
+def test_a_report_path_outside_the_report_root_gives_no_file(tmp_path): ...
+@pytest.mark.parametrize("runner", LISTED_BY_NAME)
+def test_ids_of_the_report_equal_ids_of_the_listing(runner): ...
+def test_jest_lists_files_only_and_each_report_file_is_listed(): ...
+def test_go_lists_top_level_tests_and_each_report_id_starts_with_a_listed_name(): ...
+def test_pytest_class_parametrized_and_nested_ids_have_the_file(): ...
+def test_a_playwright_id_has_no_line_or_column(): ...
+def test_a_playwright_test_that_moved_down_keeps_its_id(): ...            # the two real reports
+@pytest.mark.parametrize("runner", RUNNERS)
+def test_no_message_and_no_text_of_a_failure_is_kept(runner): ...         # take each message attribute and element text
+                                                                          # from the raw file; none is in repr(data)
+def test_the_failure_type_is_kept_as_a_class_name(): ...
+def test_a_test_that_failed_and_passed_on_a_rerun_is_flaky(): ...         # the real rerun report
+def test_a_passed_and_a_skipped_attempt_is_not_flaky(tmp_path): ...
+def test_a_testcase_with_failure_and_error_is_an_error(): ...
+def test_two_report_files_with_one_id_give_one_case(): ...
+def test_a_truncated_file_raises_junit_error(tmp_path): ...
+def test_a_file_with_a_doctype_raises_junit_error(tmp_path): ...
+def test_a_file_with_an_entity_declaration_raises_before_a_case_is_read(tmp_path): ...
+def test_a_class_name_that_leaves_the_root_gives_no_file(tmp_path): ...   # "..", an absolute value, an empty part
+def test_a_listing_of_a_module_that_cannot_import_raises_listing_error(): ...
+def test_the_report_of_a_collection_error_has_an_error_case_for_the_module(): ...
+def test_no_fixture_holds_a_host_name_or_a_home_path(): ...               # each hostname= is gate.example; no /Users/, /home/, \Users\
+def test_private_hits_finds_a_login_as_a_whole_word(): ...                # login "jack": "by jack." is a hit
+def test_private_hits_accepts_a_word_that_only_contains_the_login(): ...  # login "jack": "jacked" is no hit
+def test_private_hits_finds_the_home_path_with_either_separator(): ...
+def test_pytest_collects_nothing_under_the_fixture_projects(): ...        # a child pytest --collect-only on that folder
+def test_the_fixture_folder_has_no_npm_manifest(): ...                    # no package.json, no lock file</code></pre>
+
+<h3>Task 2: tree identity and the history store</h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/tree.py</code>, <code>history.py</code>;
+extend <code>model.py</code>; create <code>tests/unit/test_testdiet_tree_history.py</code>.</p>
+<pre><code>@dataclass(frozen=True)
+class TreeId:
+    commit: str; tree: str; clean: bool
+
+@dataclass(frozen=True)
+class RunMeta:
+    id: str; started: str; source: str               # "run" | "record"
+    wall_seconds: float | None; exit_code: int | None
+    verdict: str                                     # "passed" | "failed" | "conflict" | "no-data" | "unknown"
+    kind: str | None; label: str | None; runner: str | None
+    command_sha: str | None; inputs_sha: str | None
+    machine: str; machine_id: str | None
+    tree: TreeId | None; tree_changed: bool | None; on_default_branch: bool | None
+    counts: dict[str, int] | None; seconds_reported: float | None
+    load_start: float | None; load_end: float | None; child_cpu_seconds: float | None
+    failing: tuple[str, ...]; flaky: tuple[str, ...]; failing_sig: str | None
+
+def tree_id(cwd: Path) -> TreeId | None
+def changed_paths(cwd: Path, a: TreeId, b: TreeId) -> list[str]
+def inputs_fingerprint(cwd: Path, globs: Sequence[str]) -> str | None      # None when no glob is given
+def common_dir(cwd: Path) -> Path
+def store_dir(cwd: Path) -> Path                       # common_dir / "jacked-tests"
+def machine_id(home: Path | None = None) -> str | None # None when the file cannot be read or made
+def command_sha(argv: Sequence[str]) -> str
+def failing_signature(cases: Iterable[CaseResult]) -> str | None   # sha256 of the sorted (id, failure_type) pairs
+def verdict_of(exit_code: int | None, data: RunData | None) -> str
+def write_run(store: Path, meta: RunMeta, data: RunData | None) -> None
+def iter_runs(store: Path) -> Iterator[RunMeta]        # newest first; a damaged file is skipped with a warning
+def load_tests(store: Path, run_id: str) -> RunData | None
+def prune(store: Path, before: date) -> list[str]</code></pre>
+<p><strong>Rule.</strong> A meta file that holds a field that this version does not know is still
+read. A field that the file does not hold is empty. So a later version can add a field.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 2.1 Write the failing tests. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 2.2 Implement.</li>
+  <li><input type="checkbox" disabled> 2.3 Run the test file. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 2.4 Commit: <code>feat(testdiet): tree identity and a local history that no session can damage</code>.</li>
+</ul>
+<pre><code>def test_a_clean_tree_is_clean_and_has_the_head_tree(repo): ...
+def test_an_edit_that_is_not_committed_changes_the_tree_and_is_not_clean(repo): ...
+def test_a_new_file_that_git_does_not_ignore_changes_the_tree(repo): ...
+def test_an_ignored_file_does_not_change_the_tree(repo): ...
+def test_two_commits_with_the_same_content_have_one_tree(repo): ...
+def test_tree_id_does_not_change_the_real_index(repo): ...
+def test_tree_id_in_a_linked_worktree_does_not_change_its_index(repo): ...
+def test_tree_id_of_a_dirty_tree_writes_no_object_into_the_repository(repo): ...   # git count-objects before and after
+def test_each_git_call_of_tree_id_has_optional_locks_off(repo, monkeypatch): ...
+def test_a_repository_with_no_commit_has_no_tree(tmp_path): ...
+def test_changed_paths_names_the_file_that_differs(repo): ...
+def test_the_inputs_fingerprint_changes_when_an_ignored_input_changes(repo): ...
+def test_two_worktrees_of_one_clone_share_one_store(repo): ...
+def test_the_store_is_outside_the_work_tree(repo): ...
+def test_a_run_comes_back_the_same(tmp_path): ...
+def test_a_value_that_is_absent_comes_back_as_none_not_zero(tmp_path): ...
+def test_a_meta_file_with_a_field_of_a_later_version_is_read(tmp_path): ...
+def test_a_run_with_no_meta_file_does_not_exist(tmp_path): ...            # only the tests file was written
+def test_two_processes_write_runs_at_once_and_both_are_readable(tmp_path): ...
+def test_a_damaged_meta_file_is_skipped_and_the_others_are_listed(tmp_path): ...
+def test_prune_deletes_only_runs_before_the_date_and_names_them(tmp_path): ...
+@pytest.mark.parametrize("code,failed,expected", [(0, 0, "passed"), (1, 2, "failed"), (1, 0, "failed"),
+                         (0, 2, "conflict"), (0, None, "no-data"), (None, 0, "unknown"), (None, 2, "unknown")])
+def test_verdict_of(code, failed, expected): ...                           # failed None means no report
+def test_a_run_with_no_test_is_not_passed(): ...                           # exit 0, a report with zero cases
+def test_the_failing_signature_differs_when_the_failure_type_differs(): ...
+def test_the_command_sha_differs_when_one_argument_is_split_in_two(): ...  # ["a b"] and ["a", "b"]
+def test_the_machine_id_is_made_one_time_and_read_back(tmp_path): ...
+def test_the_machine_id_holds_no_part_of_the_host_name(tmp_path, monkeypatch): ...
+def test_the_machine_id_file_is_for_the_user_only(tmp_path): ...           # POSIX: mode 0600</code></pre>
+
+<h3>Task 3: <code>run</code>, <code>record</code>, <code>seen</code> and the command group</h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/record.py</code>,
+<code>tests/unit/test_testdiet_run.py</code>, <code>tests/unit/test_cli_tests_group.py</code>;
+modify <code>jacked/cli.py</code>.</p>
+<pre><code>JUNIT_PLACEHOLDER = "{junit}"
+
+def run_gate(argv: Sequence[str], *, cwd: Path, junit: Sequence[str] = (), inputs: Sequence[str] = (),
+             kind: str | None = None, label: str | None = None, runner: str | None = None,
+             strict: bool = False) -> int
+def record_files(junit: Sequence[Path], *, cwd: Path, kind: str | None, label: str | None, runner: str | None,
+                 commit: str | None, exit_code: int | None, wall_seconds: float | None,
+                 machine: str | None, report_root: str | None) -> RunMeta   # source "record"; tree is None
+                                                                            # when commit is None
+def seen(store: Path, tree: TreeId, command_sha: str, *, inputs_sha: str | None,
+         machine_id: str | None, any_machine: bool = False) -> RunMeta | None
+def repeat_notice(store: Path, meta: RunMeta) -> str | None
+
+# jacked tests run [--junit GLOB]... [--input GLOB]... [--kind full|targeted] [--label TEXT] [--runner NAME] [--strict] -- CMD...
+# jacked tests record --junit PATH... [--kind ..] [--exit-code N] [--wall SECONDS] [--commit SHA] [--machine LABEL]
+#                     [--report-root PATH]
+# jacked tests seen [--input GLOB]... [--any-machine] [--json] -- CMD...     exit 0: passed before. exit 1: not seen.</code></pre>
+<p><strong>Rules of <code>run</code>.</strong> The order is: read the tree; hash the typed command;
+make the report folder when an argument holds <code>{junit}</code>; start the child; wait; read the
+report; remove the report folder; read the tree a second time; write the record. The child inherits
+standard output and standard error. The record holds the tree identity from before the child. When
+the two identities differ, <code>tree_changed</code> is true and <code>run</code> prints the
+changed paths. After an interrupt of the parent, <code>run</code> waits for the child. A child
+that a signal stops gives 128 plus the signal number. A command that cannot start gives 127.
+Outside a git repository, <code>run</code> runs the command, prints one line, records nothing and
+returns the exit code. On a conflict it prints one line on standard error that says that the gate
+returned 0 and that the report holds failures; with <code>--strict</code> it returns 1.</p>
+<p><strong>Rule of <code>seen</code>.</strong> It returns a run only when all of these are true:
+<code>source</code> is <code>run</code>; <code>verdict</code> is <code>passed</code>;
+<code>tree_changed</code> is false (not empty); the tree hash, the command SHA and the inputs
+fingerprint are equal; the machine identity is equal and not empty, unless
+<code>--any-machine</code>.</p>
+<p><strong>Rule of the notice.</strong> It states facts: how many earlier records hold the same
+failing signature, the first and the last date, the number of trees, and how many of those records
+have <code>on_default_branch</code> true. It does not say whose defect it is.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 3.1 Write the failing tests. Each gate in a test is
+  <code>sys.executable -c</code> with a small script that writes a copy of a real fixture to the
+  path that it gets and exits with a chosen code. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 3.2 Implement <code>record.py</code> and the group. Exempt
+  <code>tests</code> in <code>_maybe_prompt_first_run</code> (<code>cli.py:179</code>).</li>
+  <li><input type="checkbox" disabled> 3.3 Run the two test files and
+  <code>tests/unit/test_cli_dcr.py</code>, <code>tests/unit/test_cli_first_run_and_tray.py</code>.
+  Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 3.4 Commit: <code>feat(testdiet): jacked tests run wraps a gate and keeps its exit code</code>.</li>
+</ul>
+<pre><code>@pytest.mark.parametrize("code", [0, 1, 2, 5])
+def test_run_returns_the_exit_code_of_the_gate(repo, code): ...
+def test_run_records_counts_failing_ids_the_tree_and_the_command_sha(repo): ...
+def test_the_store_holds_the_sha_of_the_command_and_not_its_text(repo): ...
+def test_run_puts_a_report_path_in_place_of_the_placeholder(repo): ...             # the child gets a real path
+def test_two_runs_with_different_junit_folders_have_one_command_sha(repo): ...     # focus 5
+def test_seen_is_true_for_the_same_command_with_a_new_junit_folder(repo): ...      # focus 5
+def test_the_placeholder_folder_is_outside_the_tree_and_is_removed(repo): ...
+def test_a_gate_that_writes_no_report_at_the_placeholder_is_no_data(repo): ...     # focus 1
+def test_run_without_junit_is_no_data_and_keeps_the_exit_code(repo): ...
+def test_run_reads_a_fixed_report_whose_content_changed(repo): ...                 # same size, mtime set back; focus 1
+def test_run_does_not_read_a_fixed_report_that_did_not_change_and_says_so(repo, capsys): ...   # focus 1
+def test_run_with_a_truncated_junit_keeps_the_exit_code_and_is_no_data(repo): ...  # focus 1
+def test_a_junit_path_that_is_a_fifo_does_not_block_the_run(repo): ...             # POSIX
+def test_exit_0_with_failures_in_the_report_is_a_conflict_and_is_printed(repo, capsys): ...   # focus 2
+def test_strict_returns_1_on_a_conflict_and_the_gate_code_in_each_other_case(repo): ...
+def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch): ...
+def test_a_command_that_cannot_start_returns_127(repo): ...
+def test_a_child_that_a_signal_stops_returns_128_plus_the_signal(repo): ...        # POSIX
+def test_run_outside_a_git_repository_records_nothing_and_keeps_the_exit_code(tmp_path): ...
+def test_a_gate_that_writes_a_file_into_the_tree_is_named_and_never_seen(repo, capsys): ...   # focus 3
+def test_seen_is_false_for_a_dirty_tree_whose_head_passed(repo): ...               # focus 3
+def test_seen_is_false_when_the_gate_command_differs(repo): ...
+def test_seen_is_false_for_a_conflict_and_for_no_data(repo): ...
+def test_seen_is_false_for_a_green_record_that_was_not_wrapped(repo): ...          # jacked tests record
+def test_record_without_an_exit_code_is_unknown(repo): ...
+def test_seen_is_false_when_a_declared_input_changed(repo): ...
+def test_seen_is_false_for_a_record_of_a_different_machine_without_the_flag(repo): ...
+def test_seen_is_false_when_this_machine_has_no_identity(repo, monkeypatch): ...
+def test_seen_is_true_for_a_second_commit_with_the_same_content(repo): ...
+def test_record_without_a_commit_has_no_tree(repo): ...
+def test_record_maps_a_report_of_a_different_root(repo): ...                       # --report-root
+def test_a_red_run_with_a_failing_set_in_two_earlier_records_prints_them(repo, capsys): ...
+def test_a_red_run_with_a_new_failing_set_prints_no_notice(repo, capsys): ...
+def test_the_notice_counts_default_branch_records_and_gives_no_cause(repo, capsys): ...
+def test_the_load_and_the_processor_time_are_recorded_or_empty_on_windows(repo): ...
+def test_record_writes_to_no_tracked_file(repo): ...
+def test_the_store_holds_no_failure_text(repo): ...                                # read the gzip file, then search
+def test_a_printed_id_has_no_escape_sequence(repo, capsys): ...
+def test_a_label_with_a_newline_at_its_end_is_refused(repo): ...
+def test_cli_run_passes_the_exit_code_through(repo): ...
+def test_cli_seen_exits_0_after_a_green_run_and_1_before_it(repo): ...
+def test_cli_tests_does_not_ask_to_install(repo): ...</code></pre>
+
+<h3>Task 4: <code>profile</code>, <code>history</code> and <code>prune</code></h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/views.py</code>,
+<code>tests/unit/test_testdiet_views.py</code>; modify <code>jacked/cli.py</code>.</p>
+<pre><code>def profile(store: Path, run_id: str | None = None, *, machine: str | None = None, top: int | None = 20) -> dict
+# keys: run, machine, total_test_seconds, files_for_half, file_count, files: [{file, seconds, tests}],
+#       tests: [{id, seconds}], hidden_rows, setup_share: None,
+#       repeats: [{tree, command_sha, runs, wall_min, wall_max, test_seconds_min, test_seconds_max}]
+def history(store: Path, *, machine: str | None = None, days: int | None = None) -> dict
+# keys: machine, labelled_full_runs, verdicts: {passed, failed, conflict, no-data, unknown}, failing_counts: [int],
+#       repeated_green: [{tree, command_sha, runs}], failing_sets: [{sig, runs, first, last, trees, on_default_branch, ids}],
+#       flaky: [{id, runs}], other_machines: [labels], size_bytes
+# jacked tests profile [--run ID] [--machine LABEL] [--top N] [--json]
+# jacked tests history [--machine LABEL] [--days N] [--json] [--size]
+# jacked tests prune --before YYYY-MM-DD</code></pre>
+<p><strong>Rules.</strong> With no <code>--machine</code>, a view uses the machine of the newest
+run with the label <code>full</code> and prints which machine it used. A group never mixes two
+machines (label and identity). <code>--json</code> prints every row; <code>--top</code> shortens
+the text output only, and the text says how many rows it hides. No output holds a
+<code>machine_id</code>.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 4.1 Write the failing tests on a store that
+  <code>fill_store</code> makes. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 4.2 Implement.</li>
+  <li><input type="checkbox" disabled> 4.3 Run the test file. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 4.4 Commit: <code>feat(testdiet): profile and history show where the gate time is</code>.</li>
+</ul>
+<pre><code>def test_files_for_half_counts_the_fewest_files_that_hold_half_the_seconds(store): ...   # 10,5,3,1,1 gives 1
+def test_profile_uses_the_machine_of_the_newest_full_run_and_prints_it(store): ...
+def test_profile_reads_a_record_of_a_different_machine_with_the_machine_flag(store): ...
+def test_a_group_never_mixes_two_machines_with_one_label(store): ...                 # same label, two identities
+def test_repeats_need_two_runs_of_one_tree_and_one_command(store): ...
+def test_setup_share_is_none_for_a_junit_record(store): ...
+def test_json_output_is_not_shortened_and_the_text_says_what_it_hides(store): ...
+def test_no_view_prints_a_machine_id(store, capsys): ...                             # text and --json
+def test_history_groups_red_runs_by_failing_set(store): ...
+def test_history_lists_a_tree_that_ran_green_two_times(store): ...
+def test_history_counts_each_verdict(store): ...
+def test_a_test_with_no_seconds_is_not_counted_as_zero_seconds(store): ...
+def test_cli_prune_prints_each_run_that_it_deletes(repo): ...
+@pytest.mark.parametrize("runner", RUNNERS)
+def test_a_real_report_goes_through_record_and_profile(repo, runner): ...             # record_files, then profile</code></pre>
+
+<h3>Task 5: the loss report</h3>
+<p><strong>Files.</strong> Create <code>jacked/testdiet/loss.py</code>,
+<code>tests/unit/test_testdiet_loss.py</code>; modify <code>jacked/cli.py</code>.</p>
+<pre><code>@dataclass(frozen=True)
+class LossReport:
+    base: str; added: tuple[str, ...]; removed: tuple[str, ...]; net: int      # names are "path::name"
+    fewer_assertions: tuple[str, ...]; skips_added: tuple[str, ...]
+
+def loss_report(cwd: Path, base: str | None = None) -> LossReport   # base default: merge-base with the default branch
+def declarations(path: str, text: str) -> list[str]
+# jacked tests loss [--base REF] [--json]      always exits 0</code></pre>
+<p><strong>Rules.</strong> A Python file is read with <code>ast</code> (functions and methods named
+<code>test*</code>); a file that does not parse uses the line pattern. TypeScript and JavaScript:
+the first string argument of <code>test(</code> and <code>it(</code>, with <code>.each</code>,
+<code>.skip</code> and <code>.only</code>. Go: <code>func TestXxx(</code>. Rust: the function after
+<code>#[test]</code>. A name that leaves one touched file and arrives in a different touched file
+is not in <code>removed</code>. The working tree counts, not only the commits.
+<code>fewer_assertions</code> names a test that is in both versions and has fewer assertion
+statements or calls now. <code>skips_added</code> names a test that has a skip mark now and had
+none. Both are report lines. They are not a verdict.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 5.1 Write the failing tests on small temporary repositories.
+  Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 5.2 Implement.</li>
+  <li><input type="checkbox" disabled> 5.3 Run the test file. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 5.4 Commit: <code>feat(testdiet): loss reports the tests that a change removes or weakens</code>.</li>
+</ul>
+<pre><code>def test_a_removed_test_is_named_and_net_is_minus_one(repo): ...
+def test_a_renamed_file_with_the_same_tests_reports_no_loss(repo): ...
+def test_a_test_moved_to_a_different_file_reports_no_loss(repo): ...
+def test_an_edited_parameter_value_reports_no_loss(repo): ...
+def test_added_tests_are_reported_as_growth(repo): ...
+def test_a_method_in_a_test_class_is_a_declaration(repo): ...
+def test_a_test_with_one_assertion_less_is_named(repo): ...
+def test_a_new_skip_mark_is_named(repo): ...
+def test_a_change_that_is_not_committed_counts(repo): ...
+@pytest.mark.parametrize("ext,body", TS_GO_RUST_CASES)
+def test_declarations_of_typescript_go_and_rust(ext, body): ...
+def test_cli_loss_exits_0_with_a_loss_and_with_none(repo): ...
+def test_a_python_file_with_a_syntax_error_still_gives_declarations(repo): ...</code></pre>
+
+<h3>Task 6: the Codex policy file</h3>
+<p><strong>Files.</strong> Create <code>jacked/data/skills/review-animations/agents/openai.yaml</code>,
+<code>tests/unit/test_codex_implicit_invocation.py</code>; modify
+<code>jacked/codex/_generate.py</code>, <code>_fsutil.py</code>, <code>installer.py</code>.</p>
+<pre><code># the file, exact content (Codex documentation, read 2026-11-26: with false, "Codex won't implicitly invoke the
+# skill based on user prompt; explicit $skill invocation still works")
+policy:
+  allow_implicit_invocation: false
+
+CODEX_NO_IMPLICIT = "policy:\n  allow_implicit_invocation: false\n"
+def _command_codex_policy(cmd: Path) -> str | None      # uses _split_command_frontmatter and skill_listing._truthy
+def _sha_solo_skill(content: str, extras: Mapping[str, str] | None = None) -> str
+def _write_solo_skill(skill_dir: Path, content: str, extras: Mapping[str, str] | None = None) -> None</code></pre>
+<p><strong>Rules.</strong> <code>_sha_solo_skill</code> must give the value that
+<code>_sha_dir</code> (<code>_fsutil.py:120</code>) gives for the written folder on each system:
+sort the same <code>Path</code> objects in the same way, because that order is different on
+Windows. Write <code>SKILL.md</code> and each extra file as bytes, so that Windows does not write
+a carriage return that the hash does not have. Each part of an extra path must pass
+<code>_is_safe_name</code>; an absolute path or a path with <code>..</code> is refused. The DCR
+reference tells a reviewer to invoke review-animations by name
+(<code>jacked/data/skills/dcr/references/conditional.md</code>). An invocation by name still works
+with the policy file; say that in the commit.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 6.1 Write the failing tests. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 6.2 Add the file to <code>review-animations</code>. Change
+  the generator, the two helpers and the call in <code>install_codex</code>.</li>
+  <li><input type="checkbox" disabled> 6.3 Run the new file, <code>tests/unit/test_codex_installer.py</code>
+  and <code>tests/unit/test_no_dual_shipped_names.py</code>, and each file that
+  <code>grep -rlE "_sha_solo_skill|_write_solo_skill|review-animations" tests</code> prints.
+  Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 6.4 Commit: <code>fix(codex): a skill that only the user starts stays that way in Codex</code>.</li>
+</ul>
+<pre><code>def test_each_skill_with_the_key_ships_the_policy_file_with_the_exact_content(): ...
+def test_install_gives_review_animations_the_policy_file(tmp_path): ...
+def test_install_gives_the_cleanup_command_skill_the_policy_file(tmp_path): ...
+def test_a_command_without_the_key_gets_no_policy_file(tmp_path): ...
+def test_sha_solo_skill_with_extras_equals_sha_dir_of_the_written_folder(tmp_path): ...     # runs on each system
+def test_write_solo_skill_refuses_an_extra_path_outside_the_skill_folder(tmp_path): ...
+def test_a_second_install_moves_nothing_aside(tmp_path): ...
+def test_the_claude_install_of_review_animations_still_passes_its_manifest_check(tmp_path): ...</code></pre>
+
+<h3>Task 7: the reference text and the README</h3>
+<p><strong>Files.</strong> Modify <code>jacked/data/rules/jacked-reference.md</code>,
+<code>README.md</code>; create <code>tests/unit/test_tests_reference.py</code>. The count of skills
+does not change in this plan.</p>
+<p><strong>The reference text</strong> gets one section, "Gate recorder (jacked tests)": what each
+command does; where the history is and how to delete it; the limits of <code>seen</code> (files
+that git ignores, submodules, <code>--input</code>, git-lfs); the placeholder
+<code>{junit}</code> and <code>--junit</code>; the rule for a red gate (a failure of the same tests
+on the base branch means: repair the checkout or the base, then run again; it never clears the
+branch); and the gate line. The gate line is an <code>sh</code> block that comes directly after
+the comment <code>&lt;!-- gate-line --&gt;</code>:</p>
+<pre><code>if jacked tests run --help >/dev/null 2>&amp;1; then
+  jacked tests run --kind full -- uv run python -m pytest -n auto --junitxml={junit}
+else
+  echo "jacked tests is not installed: the gate runs with no record" >&amp;2
+  uv run python -m pytest -n auto
+fi</code></pre>
+<p>Tried on 2026-11-26 with a stand-in <code>jacked</code> that has no <code>tests</code> group:
+the bare command ran and its exit code came back.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 7.1 Write the failing tests. Run them. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 7.2 Write the section of the reference text and one section
+  of the README: what the group does, the gate line, where the history is.</li>
+  <li><input type="checkbox" disabled> 7.3 Run the new file and each file that
+  <code>grep -rlE "README|jacked-reference" tests/unit</code> prints. Expected: PASS.</li>
+  <li><input type="checkbox" disabled> 7.4 Commit: <code>docs: jacked tests, the gate recorder</code>.</li>
+</ul>
+<pre><code>def test_the_gate_line_runs_the_bare_command_and_prints_one_line_with_an_older_jacked(tmp_path): ...
+    # Write the block as bytes. Put a stand-in `jacked` that exits 2 and a stand-in `uv` that exits 3 first on PATH.
+    # The exit code is 3 and standard error has one line. Skip where `sh` does not exist.
+def test_the_gate_line_uses_jacked_tests_run_when_it_exists(tmp_path): ...
+    # The stand-in `jacked` exits 0 for `tests run --help` and 7 for each other call. The exit code is 7 and
+    # the stand-in got the argument `--junitxml={junit}`.
+def test_each_jacked_tests_command_in_the_reference_exists_in_the_cli(): ...
+def test_each_command_of_the_group_is_in_the_reference(): ...
+def test_the_new_sections_have_no_em_dash_and_name_no_host(): ...</code></pre>
+
+<h3>Task 8: the shipped text about the cost of a test</h3>
+<p><strong>Waits on the owner:</strong> his read of the wording table in
+<a href="2026-11-26-test-diet.html#wording">the skill plan</a>. The owner approved the changes on
+2026-11-26 and has not read the wording. If the answer is not here when Task 11 starts, this task
+moves to the pull request of the skill, and this pull request ships without it.</p>
+<p>The last sentence of the new rule line names <code>/test-diet</code> ("To cut or speed up a
+suite that exists, the user runs /test-diet."). That sentence ships with the skill, not with this
+plan. The pin for it moves with it.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 8.1 Change the pin at
+  <code>tests/unit/test_command_whats_next_goal.py:217</code> to
+  <code>assert "with a test at the owning boundary for each contract of a done milestone" in s</code>.
+  Add <code>tests/unit/test_test_cost_guidance.py</code> (below). Run both. Expected: FAIL.</li>
+  <li><input type="checkbox" disabled> 8.2 Make each change of the wording table, exactly, without
+  the sentence that names <code>/test-diet</code>. The two files under <code>.claude/skills/</code>
+  are the wrappers of this repository; a test requires the shipped text word for word in them
+  (<code>test_command_whats_next_goal.py:371</code>).</li>
+  <li><input type="checkbox" disabled> 8.3 Run the two files and each file that
+  <code>grep -rlE "goal-maker|whats-next|bhag|jacked_behaviors|test-coverage|commands/dc|skills/dcr" tests/unit</code>
+  prints. Expected: PASS. A pin that fails on old wording gets the new wording. A pin that guards a
+  rule that this change did not touch stays.</li>
+  <li><input type="checkbox" disabled> 8.4 Commit: <code>feat(rules): a test has a cost, and a removed thing gets no test</code>.</li>
+</ul>
+<pre><code>FORGERS = ("commands/goal-maker.md", "skills/whats-next/SKILL.md", "commands/bhag.md")
+
+@pytest.mark.parametrize("relative", FORGERS)
+def test_no_brief_template_asks_for_new_tests_for_each_milestone(relative):
+    assert "NEW tests" not in _read(relative)
+
+def test_bhag_keeps_the_ban_on_a_weakened_test_and_names_the_one_exception():
+    text = _read("commands/bhag.md")
+    assert "NEVER delete, skip, weaken, or loosen an existing test or assertion to go green" in text
+    assert "removes behavior on purpose" in text
+
+def test_the_rules_block_has_the_test_cost_rule_between_its_markers():
+    text = _read("rules/jacked_behaviors.md")
+    assert "A test has a cost" in text.split("# end-jacked-behaviors")[0]
+
+def test_the_repository_wrappers_have_the_new_wording(): ...       # .claude/skills/whats-next and .claude/skills/dcr</code></pre>
+
+<h3>Task 9: the spec follows this plan</h3>
+<p>The main session does this task.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 9.1 Add one section to the spec, "Changes after the plan
+  review (the builder's calls)": the rule of <code>seen</code>, the five verdicts, the placeholder
+  <code>{junit}</code>, the machine identity, the setup share, the Codex policy file as a real
+  file, and the split into three plans. Say in the section that the owner has not read these
+  changes.</li>
+  <li><input type="checkbox" disabled> 9.2 Commit: <code>docs(spec): what the plan review changed in the recorder</code>.</li>
+</ul>
+
+<h3>Task 10: live proof in this repository</h3>
+<p>The main session does this task. Each command is <code>uv run jacked tests ...</code> in the
+feature worktree, so it is the build of this branch.</p>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 10.1 Install into a scratch home folder (not the real one)
+  and show the Codex copy of <code>review-animations</code> and of <code>cleanup</code> with
+  <code>agents/openai.yaml</code>, and a second install that moves nothing aside. Where the Codex
+  program is installed: a prompt that matches the description does not select the skill, and an
+  invocation by name does.</li>
+  <li><input type="checkbox" disabled> 10.2 The full gate of Task 11 is the first real record.
+  After it, show: <code>history</code>, <code>profile</code>, <code>seen</code> with exit 0 for
+  that command, exit 1 for a different command, and exit 1 after an edit that is not
+  committed.</li>
+  <li><input type="checkbox" disabled> 10.3 Run one real red gate (one test file with a planted
+  failure, in a scratch worktree) two times and show the notice on the third run.</li>
+  <li><input type="checkbox" disabled> 10.4 Show <code>loss</code> on a scratch branch that
+  removes one test, and <code>record</code> on a report with <code>--report-root</code>.</li>
+</ul>
+
+<h3>Task 11: one full gate, review, pull request</h3>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 11.1 One targeted run of each pin, sweep and help-copy test
+  and each <code>grep -rl</code> hit of the changed modules.</li>
+  <li><input type="checkbox" disabled> 11.2 Read <code>.github/workflows/*.yml</code> and run each
+  step in order. The full suite runs one time, wrapped by the build of this worktree:
+  <code>uv run jacked tests run --kind full -- uv run python -m pytest -n auto --junitxml={junit} &gt; log 2&gt;&amp;1; rc=$?</code>.
+  Quote the summary line of the log and show the record with
+  <code>uv run jacked tests history</code>.</li>
+  <li><input type="checkbox" disabled> 11.3 <code>/dcr</code> on the combined tree beside that
+  gate. A fix that changes code costs one more gate.</li>
+  <li><input type="checkbox" disabled> 11.4 <code>/pr</code>, after the owner's answer about the
+  push. The body says that the skill and the gate machine are in the two other plans, and links
+  the issue that tracks each one. Read the summary line of each operating system's job before the
+  word green. Stop at the pull request.</li>
+</ul>
+
+<h2 id="open-questions">Open questions</h2>
+<ul>
+  <li><strong>The push.</strong> The research document holds numbers of five private repositories,
+  with letters for names. This repository is public. Nothing is pushed before the owner says
+  yes.</li>
+  <li><strong>The wording of Task 8.</strong> The owner reads the wording table.</li>
+  <li><strong>The gate cadence rule.</strong> A proposal in
+  <a href="2026-11-26-test-diet.html#wording">the skill plan</a>, not approved: the rule tells a
+  session to run the one full suite through <code>jacked tests run</code> and to ask
+  <code>seen</code> first. Without it, only a repository whose gate script holds the gate line
+  makes records.</li>
+  <li><strong>The release.</strong> This plan stops at the pull request. The version belongs to
+  the release flow.</li>
+</ul>
+
+<hr>
+
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated with the <a href="https://github.com/jackneil/claude-jacked">jacked</a>
+  HTML artifact template. Edit freely.
+</p>
+
+</div>
+
+<!-- Mermaid: render diagrams, fail gracefully if CDN unreachable -->
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    // startOnLoad waits for the window "load" event, which has already fired by the time this
+    // dynamic import resolves, so it never renders. Render explicitly instead.
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+    await mermaid.run({ querySelector: ".diagram pre.mermaid" });
+  } catch (err) {
+    // Network unreachable or import failed — show source instead of broken diagrams.
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>

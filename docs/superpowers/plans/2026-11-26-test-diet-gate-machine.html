@@ -8,12 +8,12 @@
   Replace placeholders, keep what you need, delete sections you don't.
   Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
 -->
-<title>Test diet: implementation plan B (the gate machine)</title>
+<title>Test diet: the gate machine plan</title>
 
 <!-- Metadata block — adjust fields per artifact type -->
 <meta name="jacked:type" content="plan">
 <meta name="jacked:status" content="draft">
-<meta name="jacked:branch" content="on top of jack_20261125_test_diet">
+<meta name="jacked:branch" content="jack_20261125_test_diet">
 <meta name="jacked:date" content="2026-11-26">
 <meta name="jacked:project" content="claude-jacked">
 
@@ -258,10 +258,10 @@
 <body>
 <div class="wrap">
 
-<h1>Test diet: implementation plan B (the gate machine)</h1>
+<h1>Test diet: the gate machine plan</h1>
 
 <div class="meta">
-  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">written after the review of plan A, ready for a first read</span></span></div>
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge warn">on hold: the mechanism is not decided</span></span></div>
   <div class="kv"><span class="k">Date:</span><span class="v">2026-11-26</span></div>
   <div class="kv"><span class="k">Branch:</span><span class="v">a branch on top of jack_20261125_test_diet</span></div>
   <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
@@ -281,9 +281,79 @@
   own folder. Each rule below that has the word "never" has a test.
 </aside>
 
+<aside class="callout warn">
+  <strong>On hold. Do not build from this document.</strong> The review found nine open defects
+  in it, and there is a second mechanism that this plan did not compare. The section "State of this
+  plan" has both.
+</aside>
+
+<h2 id="state">State of this plan (2026-11-26)</h2>
+<p>The owner approved a gate on a different machine as a part of jacked. This plan builds it as a
+job runner over SSH. The second review read the plan and found that most of its open defects are
+in the parts that make it a job runner: the queue, the lock, the cancel, the run that a session
+leaves.</p>
+
+<h3>The open defects</h3>
+<ol>
+  <li><code>--detach</code> returns 0, and a failed fetch returns the exit code of the gate. Both
+  give a verdict that no record holds. Both must return 75.</li>
+  <li>"A member of the lock is alive" has no mechanism, and a run with no owner has no way
+  out.</li>
+  <li>The plan gives two different values for the heartbeat and for the retry, and has no state
+  for a run that its client left.</li>
+  <li><code>machines gc</code> and <code>machines forget-repo</code> have no driver verb, no rule
+  and no test.</li>
+  <li>A run verb is not tied to the repository of the caller. One session can cancel the run of a
+  different session.</li>
+  <li>The key of a shared run is too narrow, the first client cleans up for each client, and there
+  is no state for a cancelled run.</li>
+  <li>The address of the gate machine can still reach the terminal in the error text of
+  <code>ssh</code>.</li>
+  <li><code>collect_pending</code> records a run against the wrong tree, and it puts a network
+  call into <code>seen</code> and <code>history</code>.</li>
+  <li>Small defects: a pattern that accepts a newline at its end, the state folder of jacked, a
+  command line with backslashes, a repository with two root commits, processor time of children
+  that nobody waited for.</li>
+</ol>
+
+<h3>Two mechanisms</h3>
+<table>
+  <thead><tr><th>Subject</th><th>A self-hosted CI runner</th><th><code>run --on</code> over SSH
+  (this plan)</th></tr></thead>
+  <tbody>
+    <tr><td>Does it exist</td><td>Yes. The owner operates one today for a different private
+    repository, on the same second machine.</td><td>No. Eight tasks, 81 tests, nine open
+    defects.</td></tr>
+    <tr><td>How a gate gets there</td><td>A push. The CI workflow has a job for that
+    runner.</td><td>The client sends the commit over SSH.</td></tr>
+    <tr><td>Queue, cancel, logs, time limit</td><td>The CI service has them.</td><td>This plan
+    builds them.</td></tr>
+    <tr><td>Isolation on a machine that serves production</td><td>One new container for each
+    job, with no mount and a closed network.</td><td>The gate runs as the user of the gate
+    machine. The driver must hold each "never" rule.</td></tr>
+    <tr><td>A tree that is not pushed</td><td>No.</td><td>A commit only. Changes that are not
+    committed do not go.</td></tr>
+    <tr><td>A public repository</td><td>A risk: a pull request from a fork can run code on the
+    runner. It fits a private repository.</td><td>No such risk.</td></tr>
+    <tr><td>The record in the history</td><td><code>jacked tests record</code> reads the JUnit
+    artifact of the job. <code>seen</code> does not trust that source today.</td><td>The wrapper
+    writes it.</td></tr>
+    <tr><td>Work in jacked</td><td>Small: a rule for a record that a CI job made, and the
+    reference text.</td><td>This plan.</td></tr>
+  </tbody>
+</table>
+<p><strong>My recommendation:</strong> use the runner that exists. Copy its pattern to each
+private repository that needs a gate on the second machine, and give <code>seen</code> a rule for
+a record of a CI job. Do not build the SSH job runner. This is a change to what the owner
+approved, so it is his decision.</p>
+<p><strong>The capacity is a separate question.</strong> With each mechanism, the gate uses the
+share of the second machine that the owner gave to its Linux layer. A large suite needs more of
+that machine, or a rented machine in the owner's account. Only the owner can decide that.</p>
+
 <nav class="toc">
   <h2>Contents</h2>
   <ol>
+    <li><a href="#state">State of this plan</a></li>
     <li><a href="#goal">Goal</a></li>
     <li><a href="#architecture">Architecture</a></li>
     <li><a href="#constraints">Global constraints</a></li>

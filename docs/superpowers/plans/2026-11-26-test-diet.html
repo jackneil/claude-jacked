@@ -8,7 +8,7 @@
   Replace placeholders, keep what you need, delete sections you don't.
   Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
 -->
-<title>Test diet: implementation plan A</title>
+<title>Test diet: the skill plan</title>
 
 <!-- Metadata block — adjust fields per artifact type -->
 <meta name="jacked:type" content="plan">
@@ -258,10 +258,10 @@
 <body>
 <div class="wrap">
 
-<h1>Test diet: implementation plan A (recorder, ledger, skill)</h1>
+<h1>Test diet: the skill plan (ledger, ID check, skill)</h1>
 
 <div class="meta">
-  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">revised after review, ready for a second read</span></span></div>
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge warn">not ready to build: it needs a smaller design</span></span></div>
   <div class="kv"><span class="k">Date:</span><span class="v">2026-11-26</span></div>
   <div class="kv"><span class="k">Branch:</span><span class="v">jack_20261125_test_diet</span></div>
   <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
@@ -274,9 +274,104 @@
   plan does not make, stop and report. Do not invent architecture.
 </aside>
 
+<aside class="callout warn">
+  <strong>Do not build from this document.</strong> Two review cycles found defects in it. The
+  review limit is reached. The section "State of this plan" says what moved, what is open and what
+  the owner decides.
+</aside>
+
+<h2 id="state">State of this plan (2026-11-26)</h2>
+<p><strong>Moved to <a href="2026-11-26-test-diet-recorder.html">the recorder plan</a>,</strong>
+which is ready to build: Tasks 1 to 5 (the JUnit reader, the tree identity, the history,
+<code>run</code>, <code>record</code>, <code>seen</code>, <code>profile</code>,
+<code>history</code>, <code>loss</code>), Task 10 (the Codex policy file), the reference part of
+Task 13, and Task 12 (the shipped text, which waits on the owner's read of the
+<a href="#wording">wording table</a> below). The recorder plan is the source for those tasks. The
+text of those tasks in this document is the older version.</p>
+<p><strong>Still here, and not ready:</strong> Task 6 (the ledger), Task 7 (the ID check), Task 8
+(<code>prove</code>), Task 9 (the coverage comparison and the report), Task 11 (the skill) and
+Task 14 (the live proof of the skill).</p>
+
+<h3>What the second review found in these tasks</h3>
+<ol>
+  <li><code>prove</code> can prove nothing and still write a proof: a patch that breaks the build,
+  a subject command that always fails, a patch that changes nothing, an environment that is broken
+  before the patch, an exit code that is missing, or a proof record that a hand wrote.</li>
+  <li><code>prove</code> works in the present worktree. When it stops between the patch and the
+  reverse, the planted defect stays in the tree.</li>
+  <li>A wrong test selector (pytest exit code 5, no test ran) reads as "the test caught the
+  defect".</li>
+  <li>The baseline is not tied to the tree and the gate command of the ledger.</li>
+  <li>An approval is a plain field. The terminal check has a way around it. An approval and a
+  proof are not bound to the content of their row.</li>
+  <li>The detector for protected tests does not read the guardrails file and does not find a test
+  that a rule names by its function.</li>
+  <li>The ledger has no field for the tree before and after each batch.</li>
+  <li>The signals of <code>loss</code> are in no step of the skill and not in the report.</li>
+  <li>The control group for the saving can hold tests that the run made faster through a shared
+  fixture, and its formula is not defined.</li>
+  <li>A cut of kind duplicate or dead-target needs no mechanical check.</li>
+</ol>
+<p>Both reviewers said the same thing about the limit of this design: no local command can stop a
+record that a model writes by hand. So each check is worth the careless error that it catches, and
+no more. The first version of this plan added commands as if they could do more.</p>
+
+<h3>The base for the smaller design</h3>
+<p>The base is what the owner approved in the spec, and the method that the owner merged in his
+own prune on 2026-11-24:</p>
+<ul>
+  <li>the ledger with its marks and kinds, <code>jacked tests ledger</code> (it refuses a delete
+  row with a missing field) and <code>jacked tests ids</code> (the test IDs before and after a
+  batch against the ledger);</li>
+  <li>evidence for each cut, written by a read-only agent;</li>
+  <li>a second agent that argues against each cut;</li>
+  <li>a coverage comparison before and after;</li>
+  <li>a green gate at the end, recorded by <code>jacked tests run</code>.</li>
+</ul>
+
+<h3 id="proposals">Commands that the review added (the owner has not approved them)</h3>
+<p>The first review cycle added these commands to the design. They are my additions. The owner
+approved the spec, and the spec does not name them. Each row is a proposal with my
+recommendation.</p>
+<table>
+  <thead><tr><th>Command</th><th>What it does</th><th>The careless error that it catches</th>
+  <th>Cost and risk</th><th>My recommendation</th></tr></thead>
+  <tbody>
+    <tr><td><code>collect</code></td><td>Runs the listing command of the runner and keeps the
+    test IDs with the identity of the tree.</td><td>An ID check that compares the lists of the
+    wrong two trees.</td><td>Small. One more kind of record.</td><td>Yes.</td></tr>
+    <tr><td><code>covdiff</code></td><td>Compares two coverage files and prints the lines that
+    were covered before and are not covered now.</td><td>A cut that removes the only test of a
+    line.</td><td>Small. It prints numbers and gives no verdict. Line coverage does not prove an
+    assertion.</td><td>Yes. It is a step of the owner's own method.</td></tr>
+    <tr><td><code>report</code></td><td>Writes the HTML report from the ledger and the
+    history.</td><td>A number in the report that a model typed and no record holds.</td><td>Medium.
+    One template and its escapes.</td><td>Yes.</td></tr>
+    <tr><td><code>prove</code></td><td>Applies a patch that plants a defect, runs the subject test
+    and its keeper, reverses the patch, and writes the two results.</td><td>A "covered" claim that
+    is false. A faster test that does not catch the defect any more.</td><td>Large. Findings 1 to
+    3 above. It needs a recovery step, or it can leave a defect in the tree.</td><td>No command in
+    the first version. The planted-defect check stays in the skill text as a method, the ledger
+    holds its two results, and the second agent runs a sample of the checks again. Add the command
+    later only if the live proofs show checks that were skipped or wrong.</td></tr>
+    <tr><td><code>ledger protect</code></td><td>Marks the tests that a rule file names.</td><td>A
+    cut of a test that a rule protects.</td><td>Medium. Finding 6: it misses names, so its silence
+    reads as "not protected".</td><td>No command. The skill text names the protected classes, and
+    the agent that argues against a cut searches the rule files.</td></tr>
+    <tr><td><code>ledger approve</code></td><td>A person at a terminal approves a cut of a
+    protected test.</td><td>A model that approves its own cut.</td><td>Medium. Finding 5.</td>
+    <td>No command. A run never cuts a protected test. The pull request lists each such test as a
+    proposal, and the owner makes that cut by hand or names the rows in a later run.</td></tr>
+  </tbody>
+</table>
+<p>With these recommendations the skill plan has four commands (<code>ledger</code>,
+<code>ids</code> with <code>collect</code>, <code>covdiff</code>, <code>report</code>) and the
+skill. I write that plan after the owner's answer on the table.</p>
+
 <nav class="toc">
   <h2>Contents</h2>
   <ol>
+    <li><a href="#state">State of this plan</a></li>
     <li><a href="#goal">Goal</a></li>
     <li><a href="#review">What the review changed</a></li>
     <li><a href="#architecture">Architecture</a></li>
@@ -296,7 +391,7 @@ claude-jacked, for Claude Code and for Codex. The recorder measures each gate. T
 records to make a repository's test suite smaller and faster on a branch, with a proof for each
 cut, and opens a pull request.</p>
 <p>The gate machine (<code>jacked tests run --on</code>) is in
-<a href="2026-11-26-test-diet-gate-machine.html">plan B</a>. Plan B builds on this plan.</p>
+<a href="2026-11-26-test-diet-gate-machine.html">the gate machine plan</a>, which is on hold.</p>
 <p><strong>Spec:</strong>
 <a href="../specs/2026-11-25-test-diet-design.html">2026-11-25-test-diet-design.html</a> (approved by
 the owner on 2026-11-26). <strong>Research:</strong>
