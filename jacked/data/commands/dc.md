@@ -52,7 +52,7 @@ Check `$ARGUMENTS` and the conversation for these signals:
 | 5 | **Logic & Edge Cases** | Race conditions, empty states, nulls, boundaries, error handling, concurrent edits |
 | 6 | **UX & Flow** | User journey, error messages, loading states, mobile, surprising behavior |
 | 7 | **Performance** | N+1, unbounded queries/loops, indexes, caching, pagination |
-| 8 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality |
+| 8 | **Testing** | Unit test coverage, edge case tests, regression detection, test quality, test cost (a new test that repeats an existing proof, pins the implementation, asserts that a removed thing stays removed, or is slow for what it proves) |
 | 9 | **Maintainability** | Readability, coupling, magic numbers, implicit deps, code clarity |
 | 10 | **Simplicity & Reuse** | Redundant logic, reinvented utilities, over-engineering, premature abstraction |
 | 11 | **Observability & Debuggability** | Error context preservation, silent failure detection, structured logging, correlation/tracing, alertability |

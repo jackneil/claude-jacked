@@ -113,6 +113,12 @@ but treat coverage as a tool to *find what is untested* — pair it with **branc
 and a **mutation score**, and never write tests purely to move the percentage. Line coverage
 proves code is *exercised*, not that a test would *catch a bug*.
 
+**A test has a cost.** Each test runs in each gate from now on. Before you add one, name the
+defect that it catches and say why the present tests miss it, and put it at the boundary
+that owns the behavior. Do not add a second test for a contract that a present test proves.
+Do not add a test that asserts that removed code stays removed. Report the run time of the
+tests that you added.
+
 **Mutation Testing & Effectiveness Gate:**
 
 After coverage passes, run a mutation tool on critical modules (`mutmut` or `cosmic-ray` for
