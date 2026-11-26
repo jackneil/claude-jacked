@@ -77,6 +77,7 @@ def test_files_for_half_counts_the_fewest_files_that_hold_half_the_seconds(store
     assert views.files_for_half([10, 5, 3, 1, 1]) == 1
     assert views.files_for_half([1, 5, 10, 1, 3]) == 1
     assert views.files_for_half([5, 5, 5, 5]) == 2
+    assert views.files_for_half([0.0, 0.0, None]) is None  # no time to split
     result = views.profile(store)
     assert [r["seconds"] for r in result["files"]] == [10.0, 5.0, 3.0, 1.0, 1.0, None]
     assert result["files_for_half"] == 1
@@ -194,7 +195,10 @@ def test_history_groups_red_runs_by_failing_set(store):
     group = result["failing_sets"][0]
     assert (group["runs"], group["trees"], group["ids"]) == (3, 1, [FAILING_ID])
     assert (group["first"], group["last"]) == ("2026-11-22T08:00:00+00:00", "2026-11-23T08:00:00+00:00")
-    assert group["on_default_branch"] == 0
+    # The red runs hold no default-branch value: the count is empty, not 0.
+    assert (group["trees_unknown"], group["on_default_branch"], group["on_default_branch_unknown"]) == \
+        (0, None, 3)
+    assert "on the default branch  (3 unknown)" in views.render_history(result)
     assert FAILING_ID in views.render_history(result)
     # The ci record with the same set is a run of a different machine.
     ci = views.history(store, machine="ci")["failing_sets"]
@@ -269,6 +273,8 @@ def test_cli_views_outside_a_work_tree_and_with_no_run(repo, tmp_path, monkeypat
     # An empty history is not an error for history. It is for profile.
     empty = _invoke("tests", "history")
     assert (empty.exit_code, empty.output) == (0, "the history has no run.\n")
+    sized = _invoke("tests", "history", "--size")
+    assert (sized.exit_code, sized.output) == (0, "the history has no run.\nsize of the history: 0 bytes\n")
     data = json.loads(_invoke("tests", "history", "--json").output)
     assert (data["machine"], data["runs"], data["failing_sets"]) == (None, 0, [])
     assert set(data["verdicts"].values()) == {0}
@@ -322,3 +328,108 @@ def test_a_real_report_goes_through_record_and_profile(repo, runner):
     assert result["files_for_half"] is not None and 1 <= result["files_for_half"] <= result["file_count"]
     text = _invoke("tests", "profile")
     assert text.exit_code == 0 and "machine: local (the machine of the newest full run)" in text.output
+
+
+def _edit_meta(store: Path, run_id: str, **changes) -> None:
+    """Change fields of a stored meta file. A value of ``...`` removes the field."""
+    path = store / history.RUNS / f"{run_id}{history.META_SUFFIX}"
+    raw = json.loads(path.read_bytes())
+    for name, value in changes.items():
+        if value is ...:
+            raw.pop(name, None)
+        else:
+            raw[name] = value
+    path.write_bytes(json.dumps(raw).encode("utf-8"))
+
+
+def test_profile_of_a_run_with_no_tests_file_has_empty_counts(store):
+    no_report = next(m.id for m in history.iter_runs(store) if m.verdict == "no-data")
+    for run_id in (no_report, _damaged(store)):
+        result = views.profile(store, run_id)
+        data = json.loads(views.to_json(result))
+        assert (data["file_count"], data["tests_without_seconds"], data["files_for_half"],
+                data["total_test_seconds"]) == (None, None, None, None)
+        assert data["files"] == [] and data["tests"] == []
+        text = views.render_profile(result)
+        assert "the run has no tests file." in text
+        assert " of 0" not in text and "None" not in text
+
+
+def _damaged(store: Path) -> str:
+    run_id = store_run(store, "20261119T080000", exit_code=0, tests=[make_case("t::t", "t.py", 1.0)])
+    (store / history.RUNS / f"{run_id}{history.TESTS_SUFFIX}").write_bytes(b"not gzip")
+    return run_id
+
+
+def test_a_bad_machine_label_or_identity_reads_as_empty_and_the_run_stays(repo):
+    store = tree.store_dir(repo)
+    case = [make_case("t::t", "t.py", 1.0)]
+    no_label = store_run(store, "20261126T080000", exit_code=0, tests=case)
+    newline = store_run(store, "20261125T080000", exit_code=0, tests=case)
+    bad_id = store_run(store, "20261124T080000", exit_code=1, tests=case)
+    _edit_meta(store, no_label, machine=...)
+    _edit_meta(store, newline, machine="a\nb")
+    _edit_meta(store, bad_id, machine_id="NOT-HEX")
+    read = {m.id: (m.machine, m.machine_id) for m in history.iter_runs(store)}
+    assert read == {no_label: (None, LOCAL_ID), newline: (None, LOCAL_ID), bad_id: ("local", None)}
+    result = views.history(store)
+    assert (result["machine"], result["runs"], result["store_runs"]) == (None, 2, 3)
+    assert result["other_machines"] == ["local"]
+    out = _invoke("tests", "history")
+    assert out.exit_code == 0 and "the history has no run" not in out.output
+    assert "machine: (no label) (the machine of the newest full run)" in out.output
+    assert "a\nb" not in out.output and "\nb\n" not in out.output
+    # The run with no identity is its own machine; its other machines hold "(no label)".
+    other = views.history(store, machine="local")
+    assert other["runs"] == 1 and other["other_machines"] == ["(no label)"]
+    assert "(no label)" in views.render_history(other)
+    assert views.profile(store, no_label)["machine"] is None
+
+
+def test_a_line_break_in_a_test_id_cannot_add_a_line(store):
+    store_run(store, "20261126T080000", exit_code=1,
+              tests=[make_case("t::x\nmachine: ci (fake)", "t\nf.py", 1.0, "failed")])
+    for text in (views.render_profile(views.profile(store)), views.render_history(views.history(store))):
+        assert not any(line.startswith("machine: ci") for line in text.splitlines())
+        assert "t::x\\nmachine: ci (fake)" in text
+
+
+def test_profile_of_a_given_run_says_when_its_label_has_two_identities(store):
+    store_run(store, "20261126T080000", exit_code=0, machine_id=LOCAL_TWIN_ID,
+              tests=[make_case("t::t", "t.py", 1.0)])
+    old = _ids(store)[1]
+    notes = views.profile(store, old)["notes"]
+    assert notes[0] == "machine: local (the machine of the run that you gave)"
+    assert notes[1] == ("the label local has 2 machine identities. "
+                        "This view uses the identity of the run that you gave.")
+
+
+def test_a_failing_set_with_no_tree_has_no_tree_count(store):
+    red = [make_case("x::y", "x.py", 1.0, "failed")]
+    store_run(store, "20261126T080000", exit_code=1, tests=red, tree=None, on_default_branch=True)
+    store_run(store, "20261126T090000", exit_code=1, tests=red, tree=None)
+    group = next(s for s in views.history(store)["failing_sets"] if s["ids"] == ["x::y"])
+    assert (group["trees"], group["trees_unknown"]) == (None, 2)
+    assert (group["on_default_branch"], group["on_default_branch_unknown"]) == (1, 1)
+
+
+def test_no_command_prints_a_machine_id(store, repo):
+    store_run(store, "20261119T080000", exit_code=0, machine_id=LOCAL_TWIN_ID,
+              tests=[make_case("t::t", "t.py", 1.0)])
+    shutil.copytree(store / history.RUNS, tree.store_dir(repo) / history.RUNS)
+    ci_run = next(m.id for m in history.iter_runs(store) if m.machine == "ci")
+    real = tree.machine_id()
+    commands = [
+        ("profile",), ("profile", "--json"), ("profile", "--machine", "ci"),
+        ("profile", "--machine", "ci", "--json"), ("profile", "--run", ci_run, "--json"),
+        ("profile", "--run", ci_run, "--machine", "local"), ("profile", "--machine", "nobody"),
+        ("profile", "--run", "20200101T000000000000Z-00000000"), ("profile", "--run", "bad"),
+        ("history",), ("history", "--json", "--size"), ("history", "--machine", "ci"),
+        ("history", "--machine", "ci", "--json"), ("history", "--machine", "nobody"),
+        ("history", "--days", "1", "--json"), ("prune", "--before", "2000-01-01"),
+    ]
+    for command in commands:
+        out = _invoke("tests", *command).output
+        for value in (LOCAL_ID, LOCAL_TWIN_ID, real):
+            assert not value or value not in out, command
+        assert "machine_id" not in out, command

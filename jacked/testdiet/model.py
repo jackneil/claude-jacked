@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 STATES = ("passed", "failed", "error", "skipped", "flaky")
 RUNNERS = ("pytest", "vitest", "jest", "playwright", "go", "nextest", "unknown")
+#: The pattern of a label, a machine label and a runner name.
+LABEL_RE = re.compile(r"[A-Za-z0-9._-]+")
+#: The pattern of a machine identity: 32 lowercase hex characters.
+MACHINE_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
 @dataclass(frozen=True)
@@ -56,7 +61,8 @@ class RunMeta:
     ``failing`` and ``flaky``). It is never zero. ``source`` is "run" or
     "record". ``verdict`` is "passed", "failed", "conflict", "no-data" or
     "unknown". ``command_sha`` is the SHA-256 of the typed command, never
-    the command text.
+    the command text. ``machine`` is None when a stored record holds no
+    valid label.
     """
 
     id: str
@@ -70,7 +76,7 @@ class RunMeta:
     runner: str | None
     command_sha: str | None
     inputs_sha: str | None
-    machine: str
+    machine: str | None
     machine_id: str | None
     tree: TreeId | None
     tree_changed: bool | None

@@ -13,7 +13,6 @@ message before the print, because a test ID or a file name is free text.
 from __future__ import annotations
 
 import logging
-import re
 import sys
 import unicodedata
 from collections.abc import Callable, Sequence
@@ -22,13 +21,12 @@ from pathlib import Path
 from typing import TypeVar
 
 from jacked.testdiet import history, junit, tree
-from jacked.testdiet.model import RUNNERS, STATES, RunData, RunMeta, TreeId
+from jacked.testdiet.model import LABEL_RE, RUNNERS, STATES, RunData, RunMeta, TreeId
 
 logger = logging.getLogger(__name__)
 
 
-#: The pattern of a label, a machine label and a runner name.
-LABEL_RE = re.compile(r"[A-Za-z0-9._-]+")
+# LABEL_RE (the pattern of a label) is in jacked.testdiet.model and is read from here too.
 
 
 KINDS = ("full", "targeted")

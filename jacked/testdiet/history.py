@@ -28,7 +28,7 @@ from pathlib import Path
 
 from jacked.atomic_io import atomic_write_bytes
 from jacked.regular_file import open_regular_fd
-from jacked.testdiet.model import CaseResult, RunData, RunMeta, TreeId
+from jacked.testdiet.model import LABEL_RE, MACHINE_ID_RE, CaseResult, RunData, RunMeta, TreeId
 
 RUNS = "runs"
 META_SUFFIX = ".meta.json"
@@ -76,7 +76,12 @@ def _read(path: Path) -> bytes:
         return handle.read()
 
 
-def _id_time(run_id: str) -> datetime:
+def id_time(run_id: str) -> datetime:
+    """Return the UTC time of a run ID: the clock of the machine that wrote the run.
+
+    >>> id_time("20261126T090501000007Z-0a1b2c3d").isoformat()
+    '2026-11-26T09:05:01.000007+00:00'
+    """
     return datetime.strptime(run_id[:21], "%Y%m%dT%H%M%S%f").replace(tzinfo=timezone.utc)
 
 
@@ -156,7 +161,10 @@ def _meta_from(run_id: str, raw) -> RunMeta:
 
     A field that this version does not know is ignored. A field that the
     file does not hold is None (an empty tuple for ``failing`` and
-    ``flaky``). A field of the wrong type makes the file damaged.
+    ``flaky``). A machine label that does not match ``LABEL_RE`` and a
+    machine identity that is not 32 lowercase hex characters read as None,
+    and the record is still read. Another field of the wrong type makes the
+    file damaged.
     """
     if not isinstance(raw, dict):
         raise DamagedRecordError("the meta file is not an object")
@@ -170,6 +178,11 @@ def _meta_from(run_id: str, raw) -> RunMeta:
             if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
                 raise DamagedRecordError(f"{name} is not a list of IDs")
             value = tuple(value)
+        elif name == "machine":
+            # A label that is not valid reads as empty. The record is not damaged.
+            value = value if isinstance(value, str) and LABEL_RE.fullmatch(value) else None
+        elif name == "machine_id":
+            value = value if isinstance(value, str) and MACHINE_ID_RE.fullmatch(value) else None
         elif value is None:
             pass
         elif name == "tree":
@@ -287,7 +300,7 @@ def prune(store: Path, before: date, *, now: datetime | None = None) -> list[str
     failed: list[tuple[str, str]] = []
     for run_id in sorted(found):
         suffixes = found[run_id]
-        if META_SUFFIX not in suffixes and _id_time(run_id) >= orphan_limit:
+        if META_SUFFIX not in suffixes and id_time(run_id) >= orphan_limit:
             continue  # a write can still be in progress
         gone = False
         for suffix in (META_SUFFIX, TESTS_SUFFIX):

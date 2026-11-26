@@ -31,11 +31,29 @@ class ViewError(ValueError):
     """A view cannot be made (no run, or no run of the given machine or ID)."""
 
 
-def _key(meta: RunMeta) -> tuple[str, str | None]:
+#: The text of a machine whose record holds no valid label.
+NO_LABEL = "(no label)"
+
+
+def _key(meta: RunMeta) -> tuple[str | None, str | None]:
+    """The machine of a run: its label and its identity. Each part can be None."""
     return (meta.machine, meta.machine_id)
 
 
-def _select(runs: list[RunMeta], machine: str | None) -> tuple[tuple[str, str | None], list[str]]:
+def _show(label: str | None) -> str:
+    return NO_LABEL if label is None else label
+
+
+def _identity_note(runs: list[RunMeta], pick: RunMeta, which: str) -> list[str]:
+    """One line when the label of ``pick`` has two or more machine identities."""
+    identities = {m.machine_id for m in runs if m.machine == pick.machine}
+    if len(identities) < 2:
+        return []
+    return [f"the label {_show(pick.machine)} has {len(identities)} machine identities. "
+            f"This view uses the identity of {which}."]
+
+
+def _select(runs: list[RunMeta], machine: str | None) -> tuple[tuple[str | None, str | None], list[str]]:
     """Return the machine of a view and the lines that say why. ``runs`` is newest first."""
     if not runs:
         raise ViewError("the history has no run")
@@ -49,12 +67,8 @@ def _select(runs: list[RunMeta], machine: str | None) -> tuple[tuple[str, str | 
             "the machine of the newest run, because no run has the kind full"
     else:
         why = "the machine label that you gave"
-    notes = [f"machine: {pick.machine} ({why})"]
-    identities = {m.machine_id for m in runs if m.machine == pick.machine}
-    if len(identities) > 1:
-        which = "full run" if full else "run"
-        notes.append(f"the label {pick.machine} has {len(identities)} machine identities. "
-                     f"This view uses the identity of its newest {which}.")
+    notes = [f"machine: {_show(pick.machine)} ({why})"]
+    notes += _identity_note(runs, pick, "its newest full run" if full else "its newest run")
     return _key(pick), notes
 
 
@@ -92,7 +106,7 @@ def files_for_half(seconds: Iterable[float | None]) -> int | None:
     """Return the fewest files that hold half (or more) of the seconds of all files.
 
     A file with no seconds is not counted. The result is None when no file
-    has seconds.
+    has seconds, or when all the seconds are 0 (there is no time to split).
 
     >>> files_for_half([10, 5, 3, 1, 1])
     1
@@ -100,9 +114,11 @@ def files_for_half(seconds: Iterable[float | None]) -> int | None:
     2
     >>> files_for_half([None]) is None
     True
+    >>> files_for_half([0.0, 0.0]) is None
+    True
     """
     known = sorted((s for s in seconds if s is not None), reverse=True)
-    if not known:
+    if not known or sum(known) <= 0:
         return None
     half, total, count = sum(known) / 2, 0.0, 0
     while total < half:
@@ -131,6 +147,8 @@ def profile(store: Path, run_id: str | None = None, *, machine: str | None = Non
     that the text output does not show. ``repeats`` compares runs of the
     same machine only: one group for each tree and command with two runs or
     more. ``setup_share`` is None, because a JUnit record holds no setup time.
+    A run with no tests file (no report, or a damaged file) has no rows, and
+    ``file_count``, ``tests_without_seconds`` and ``files_for_half`` are None.
     """
     store = Path(store)
     runs = list(_history.iter_runs(store))
@@ -141,14 +159,18 @@ def profile(store: Path, run_id: str | None = None, *, machine: str | None = Non
         if meta is None:
             raise ViewError(f"the history has no run {run_id}")
         if machine is not None and meta.machine != machine:
-            raise ViewError(f"the run {run_id} is a run of the machine {meta.machine}, not {machine}")
-        key, notes = _key(meta), [f"machine: {meta.machine} (the machine of the run that you gave)"]
+            raise ViewError(f"the run {run_id} is a run of the machine {_show(meta.machine)}, not {machine}")
+        key = _key(meta)
+        notes = [f"machine: {_show(meta.machine)} (the machine of the run that you gave)"]
+        notes += _identity_note(runs, meta, "the run that you gave")
     else:
         key, notes = _select(runs, machine)
         mine = [m for m in runs if _key(m) == key]
         meta = next((m for m in mine if m.kind == "full"), mine[0])
     data = _history.load_tests(store, meta.id)
     tests = data.tests if data is not None else ()
+    if data is None:
+        notes = notes + ["the run has no tests file."]
     files = _file_rows(tests)
     test_rows = sorted(({"id": c.id, "seconds": c.seconds} for c in tests),
                        key=lambda r: _seconds_order(r["seconds"], r["id"]))
@@ -169,9 +191,9 @@ def profile(store: Path, run_id: str | None = None, *, machine: str | None = Non
         "run": meta.id, "started": meta.started, "verdict": meta.verdict, "kind": meta.kind,
         "machine": meta.machine, "notes": notes,
         "total_test_seconds": _sum(c.seconds for c in tests),
-        "tests_without_seconds": sum(1 for c in tests if c.seconds is None),
+        "tests_without_seconds": None if data is None else sum(1 for c in tests if c.seconds is None),
         "files_for_half": files_for_half(r["seconds"] for r in files),
-        "file_count": len(files), "files": files, "tests": test_rows,
+        "file_count": None if data is None else len(files), "files": files, "tests": test_rows,
         "hidden_rows": {"files": max(0, len(files) - shown), "tests": max(0, len(test_rows) - shown_tests)},
         "setup_share": None, "repeats": repeats,
     }
@@ -215,7 +237,7 @@ def history(store: Path, *, machine: str | None = None, days: int | None = None,
     mine = [m for m in runs if _key(m) == key]
     if days is not None:
         limit = (now or datetime.now(timezone.utc)) - timedelta(days=days)
-        mine = [m for m in mine if _history._id_time(m.id) >= limit]
+        mine = [m for m in mine if _history.id_time(m.id) >= limit]
     verdicts = dict.fromkeys(VERDICTS, 0)
     for meta in mine:
         verdicts[meta.verdict if meta.verdict in verdicts else "unknown"] += 1
@@ -228,10 +250,15 @@ def history(store: Path, *, machine: str | None = None, days: int | None = None,
             by_sig.setdefault(meta.failing_sig, []).append(meta)
     failing_sets = []
     for sig, group in by_sig.items():  # each group is newest first
+        trees = {m.tree.tree for m in group if m.tree is not None}
+        known_branch = [m.on_default_branch for m in group if m.on_default_branch is not None]
         failing_sets.append({
             "sig": sig, "runs": len(group), "first": group[-1].started, "last": group[0].started,
-            "trees": len({m.tree.tree for m in group if m.tree is not None}),
-            "on_default_branch": sum(1 for m in group if m.on_default_branch is True),
+            # None when no run of the set holds the value; *_unknown counts the runs with no value.
+            "trees": len(trees) if trees else None,
+            "trees_unknown": sum(1 for m in group if m.tree is None),
+            "on_default_branch": sum(known_branch) if known_branch else None,
+            "on_default_branch_unknown": len(group) - len(known_branch),
             "ids": list(group[0].failing),
         })
     failing_sets.sort(key=lambda s: (-s["runs"], s["sig"]))
@@ -242,11 +269,13 @@ def history(store: Path, *, machine: str | None = None, days: int | None = None,
     others: list[str] = []
     for meta in runs:
         if _key(meta) != key:
-            label = meta.machine if meta.machine != key[0] else f"{meta.machine} (another identity)"
+            label = _show(meta.machine)
+            if meta.machine == key[0]:
+                label += " (another identity)"
             if label not in others:
                 others.append(label)
     return {
-        "machine": key[0], "notes": notes, "days": days, "runs": len(mine),
+        "machine": key[0], "notes": notes, "days": days, "runs": len(mine), "store_runs": len(runs),
         "labelled_full_runs": sum(1 for m in mine if m.kind == "full"),
         "verdicts": verdicts,
         "failing_counts": [len(m.failing) for m in mine if m.counts is not None],
@@ -263,7 +292,8 @@ NO_RUN = "the history has no run."
 def _empty_history(store: Path, days: int | None) -> dict:
     """The result of ``history`` on a store with no run: no machine, no rows, zero runs."""
     return {
-        "machine": None, "notes": [NO_RUN], "days": days, "runs": 0, "labelled_full_runs": 0,
+        "machine": None, "notes": [NO_RUN], "days": days, "runs": 0, "store_runs": 0,
+        "labelled_full_runs": 0,
         "verdicts": dict.fromkeys(VERDICTS, 0), "failing_counts": [], "repeated_green": [],
         "failing_sets": [], "flaky": [], "other_machines": [], "size_bytes": _store_size(store),
     }
@@ -276,35 +306,50 @@ def _num(value) -> str:
     return f"{value:.3f}".rstrip("0").rstrip(".") if isinstance(value, float) else str(value)
 
 
+def _text(value) -> str:
+    """Free text (a test ID, a file, a time) on one line. None is empty.
+
+    A line break shows as ``\\n``, so a value cannot add a line to the output.
+
+    >>> _text("a\\nb")
+    'a\\\\nb'
+    """
+    if value is None:
+        return ""
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")
+
+
 def _hidden(count: int, what: str) -> list[str]:
-    return [f"  {count} more {what} are not shown. --json shows all rows."] if count else []
+    return [f"  {_num(count)} more {what} are not shown. --json shows all rows."] if count else []
 
 
 def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
     """The text output of ``profile``. ``top`` is the number of rows of each table."""
     lines = list(result["notes"])
-    lines.append(f"run: {result['run']} started {result['started']}, kind {_num(result['kind'])}, "
-                 f"verdict {result['verdict']}")
+    lines.append(f"run: {_text(result['run'])} started {_text(result['started'])}, "
+                 f"kind {_text(result['kind'])}, verdict {_text(result['verdict'])}")
     lines.append(f"test seconds: {_num(result['total_test_seconds'])}")
     if result["tests_without_seconds"]:
-        lines.append(f"tests with no seconds in the report: {result['tests_without_seconds']}")
-    lines.append(f"files that hold half the seconds: {_num(result['files_for_half'])} "
-                 f"of {result['file_count']}")
+        lines.append(f"tests with no seconds in the report: {_num(result['tests_without_seconds'])}")
+    if result["file_count"] is not None:
+        lines.append(f"files that hold half the seconds: {_num(result['files_for_half'])} "
+                     f"of {_num(result['file_count'])}")
     if result["setup_share"] is not None:
         lines.append(f"setup share: {_num(result['setup_share'])}")
     lines.append("files (seconds, tests, file):")
     rows = result["files"] if top is None else result["files"][:top]
-    lines += [f"  {_num(r['seconds']):>10} {r['tests']:>6} {r['file'] or '(no file)'}" for r in rows]
+    lines += [f"  {_num(r['seconds']):>10} {_num(r['tests']):>6} {_text(r['file']) or '(no file)'}"
+              for r in rows]
     lines += _hidden(result["hidden_rows"]["files"], "files")
     lines.append("tests (seconds, test ID):")
     rows = result["tests"] if top is None else result["tests"][:top]
-    lines += [f"  {_num(r['seconds']):>10} {r['id']}" for r in rows]
+    lines += [f"  {_num(r['seconds']):>10} {_text(r['id'])}" for r in rows]
     lines += _hidden(result["hidden_rows"]["tests"], "tests")
     if result["repeats"]:
         lines.append("repeat runs of one tree and one command on this machine "
                      "(runs, wall min-max, test seconds min-max, tree, command):")
         for r in result["repeats"]:
-            lines.append(f"  {r['runs']} runs, wall {_num(r['wall_min'])}-{_num(r['wall_max'])}, "
+            lines.append(f"  {_num(r['runs'])} runs, wall {_num(r['wall_min'])}-{_num(r['wall_max'])}, "
                          f"test seconds {_num(r['test_seconds_min'])}-{_num(r['test_seconds_max'])}, "
                          f"{r['tree'][:12]} {r['command_sha'][:12]}")
     else:
@@ -315,34 +360,37 @@ def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
 def render_history(result: dict, *, size: bool = False) -> str:
     """The text output of ``history``. ``size`` adds the size of the store.
 
-    A store with no run gives one line.
+    A store with no run gives one line (and the size line with ``size``).
     """
-    if result["machine"] is None:
-        return NO_RUN
+    size_line = [f"size of the history: {_num(result['size_bytes'])} bytes"] if size else []
+    if result["store_runs"] == 0:
+        return clean_text("\n".join([NO_RUN, *size_line]))
     lines = list(result["notes"])
-    span = "all runs" if result["days"] is None else f"the runs of the last {result['days']} days"
-    lines.append(f"{span}: {result['runs']}, with the kind full: {result['labelled_full_runs']}")
-    lines.append("verdicts: " + ", ".join(f"{k} {v}" for k, v in result["verdicts"].items()))
+    span = "all runs" if result["days"] is None else f"the runs of the last {_num(result['days'])} days"
+    lines.append(f"{span}: {_num(result['runs'])}, with the kind full: {_num(result['labelled_full_runs'])}")
+    lines.append("verdicts: " + ", ".join(f"{k} {_num(v)}" for k, v in result["verdicts"].items()))
     counts = result["failing_counts"]
     lines.append("failing tests in each run with a report, newest first: "
-                 + (" ".join(str(n) for n in counts) or "no run with a report"))
+                 + (" ".join(_num(n) for n in counts) or "no run with a report"))
     lines.append("trees that passed one command two times or more:")
-    lines += [f"  {r['runs']} runs, tree {r['tree'][:12]}, command {r['command_sha'][:12]}"
+    lines += [f"  {_num(r['runs'])} runs, tree {r['tree'][:12]}, command {r['command_sha'][:12]}"
               for r in result["repeated_green"]] or ["  none"]
     lines.append("failing sets:")
     for s in result["failing_sets"]:
-        lines.append(f"  {s['runs']} runs, {s['trees']} trees, {s['on_default_branch']} on the default "
-                     f"branch, first {s['first']}, last {s['last']}, set {s['sig'][:12]}:")
-        lines += [f"    {test_id}" for test_id in s["ids"]]
+        trees = _num(s["trees"]) + (f" ({s['trees_unknown']} unknown)" if s["trees_unknown"] else "")
+        branch = _num(s["on_default_branch"]) + (
+            f" ({s['on_default_branch_unknown']} unknown)" if s["on_default_branch_unknown"] else "")
+        lines.append(f"  {_num(s['runs'])} runs, trees {trees}, on the default branch {branch}, "
+                     f"first {_text(s['first'])}, last {_text(s['last'])}, set {s['sig'][:12]}:")
+        lines += [f"    {_text(test_id)}" for test_id in s["ids"]]
     if not result["failing_sets"]:
         lines.append("  none")
     lines.append("flaky tests (runs, test ID):")
-    lines += [f"  {r['runs']:>4} {r['id']}" for r in result["flaky"]] or ["  none"]
+    lines += [f"  {_num(r['runs']):>4} {_text(r['id'])}" for r in result["flaky"]] or ["  none"]
     if result["other_machines"]:
         lines.append("other machines in the history (use --machine LABEL): "
                      + ", ".join(result["other_machines"]))
-    if size:
-        lines.append(f"size of the history: {_num(result['size_bytes'])} bytes")
+    lines += size_line
     return clean_text("\n".join(lines))
 
 
