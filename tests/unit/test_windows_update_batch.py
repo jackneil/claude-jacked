@@ -70,7 +70,9 @@ def _capture_batch(spawn) -> dict:
 TRAY_CREATION_ID = "windows-filetime:133000000000000000"
 
 # The programs that the batch builders' find_bin knows. A test may add one.
-_BINS = {"uv": r"C:\uv\uv.exe"}
+_BINS = {"uv": r"C:\uv\uv.exe", "pipx": r"C:\pipx\pipx.exe"}
+# The install method that the builders report. A test may change it.
+_VARIANT = {"method": "uv"}
 
 
 def _tray_identity(pid):
@@ -90,7 +92,7 @@ def _tray_batch(identity=_tray_identity, port=8321):
         with patch.object(updater.subprocess, "Popen", fake_popen), patch(
             "jacked.install_method.can_auto_upgrade", return_value=(True, "")
         ), patch(
-            "jacked.install_method.detect_install_method", return_value="uv"
+            "jacked.install_method.detect_install_method", side_effect=lambda: _VARIANT["method"]
         ), patch(
             "jacked.findbin.find_bin",
             side_effect=lambda n: _BINS.get(n),
@@ -117,7 +119,7 @@ def _cli_batch(extra_args=(), precheck=None):
         from jacked.cli import main
 
         with patch("sys.platform", "win32"), patch(
-            "jacked.install_method.detect_install_method", return_value="uv"
+            "jacked.install_method.detect_install_method", side_effect=lambda: _VARIANT["method"]
         ), patch(
             "jacked.findbin.find_bin",
             side_effect=lambda n: _BINS.get(n),
@@ -1383,6 +1385,30 @@ class TestEveryProgramIsAbsolute:
         assert f'set JACKED="{jacked}"' in seen["raw"].split("\r\n")[:3]
         # The checker is not vacuous: the same batch with bare names fails it.
         assert len(bare_commands(seen["body"])) > 5
+
+    @pytest.mark.parametrize("method", ["uv", "pipx"])
+    @pytest.mark.parametrize("rollback", [True, False])
+    @pytest.mark.parametrize(
+        ("which", "extra"), [("tray", ()), ("cli", ()), ("cli", ("--skip-service",))]
+    )
+    def test_every_batch_variant_names_each_program_by_an_absolute_path(
+        self, which, extra, method, rollback, monkeypatch
+    ):
+        from jacked.service.batch_programs import bare_commands
+
+        monkeypatch.setitem(_VARIANT, "method", method)
+        monkeypatch.setitem(_BINS, "jacked", r"C:\jk\jacked.exe")
+        if not rollback:
+            monkeypatch.setattr(
+                "jacked.install_method.rollback_command",
+                lambda *a, **k: (_ for _ in ()).throw(ValueError("no rollback")),
+            )
+        seen = _tray_batch() if which == "tray" else _cli_batch(extra)
+        raw = seen["raw"]
+        assert raw.count("\r\n") > 20, "the builder made no batch"
+        if method == "pipx":
+            assert r"C:\pipx\pipx.exe" in raw
+        assert bare_commands(raw) == []
 
     def test_the_cmd_builtin_list_is_explicit(self):
         from jacked.service.batch_programs import CMD_BUILTINS

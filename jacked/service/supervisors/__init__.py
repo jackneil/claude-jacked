@@ -190,7 +190,8 @@ def _append_task_settings(root) -> None:
 def _append_task_action(root, spec, environment, arguments) -> None:
     actions = ElementTree.SubElement(root, "Actions", {"Context": "CurrentUser"})
     execute = ElementTree.SubElement(actions, "Exec")
-    ElementTree.SubElement(execute, "Command").text = "powershell.exe"
+    # An absolute path, as every program that jacked writes into a script.
+    ElementTree.SubElement(execute, "Command").text = system_program("powershell")
     ElementTree.SubElement(execute, "Arguments").text = arguments
     if environment:
         ElementTree.SubElement(execute, "WorkingDirectory").text = environment.get(

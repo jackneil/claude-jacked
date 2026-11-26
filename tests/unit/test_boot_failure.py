@@ -59,3 +59,14 @@ def test_service_status_prints_the_newest_entry(tmp_path, capsys):
     out = " ".join(capsys.readouterr().out.split())
     assert "Last boot failure: OSError: [WinError 10106] provider" in out
     assert "1970-01-01T00:00:00Z" in out
+
+
+def test_an_entry_older_than_the_live_service_start_is_not_shown(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    os.utime(manifest, (1000, 1000))
+    record("Traceback\nImportError: old\n", now=500)
+    assert boot_failure.describe_latest(after_file=manifest) is None
+    record("Traceback\nImportError: new\n", now=2000)
+    assert "ImportError: new" in boot_failure.describe_latest(after_file=manifest)
+    assert "ImportError: new" in boot_failure.describe_latest(after_file=tmp_path / "none")

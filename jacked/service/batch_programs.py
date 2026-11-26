@@ -60,7 +60,9 @@ def resolve_jacked() -> str:
         console = interpreter.with_name("python.exe")
         found = str(console if console.is_file() else interpreter)
         suffix = " -m jacked"
-    if any(char in found for char in '"\r\n') or not ntpath.isabs(found):
+    # A drive path is absolute for cmd.exe; os.path covers the host (POSIX in tests).
+    windows_absolute = bool(ntpath.splitdrive(found)[0]) and ntpath.isabs(found)
+    if any(char in found for char in '"\r\n') or not (windows_absolute or os.path.isabs(found)):
         raise ValueError("the jacked program path cannot go into a batch file")
     return f'"{found}"{suffix}'
 

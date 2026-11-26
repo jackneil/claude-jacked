@@ -12,14 +12,15 @@ stays under ``MAX_BYTES``: the oldest entries go first, and one line says
 that older entries were dropped. ``jacked service status`` prints the time
 and the last line of the newest entry.
 
-This module uses the standard library only, because it must work when the
-rest of jacked cannot import.
+This module uses the standard library and ``jacked.atomic_io`` (which also
+uses the standard library only), because it must work when the rest of
+jacked cannot import.
 """
 
 from __future__ import annotations
 
+import calendar
 import os
-import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -47,16 +48,10 @@ def _entries(text: str) -> list[str]:
 
 
 def _write_private(path: Path, text: str) -> None:
+    from jacked.atomic_io import atomic_write_text  # standard library only
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{LOG_NAME}.", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", errors="replace") as handle:
-            handle.write(text)
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-    except BaseException:
-        Path(temporary).unlink(missing_ok=True)
-        raise
+    atomic_write_text(path, text, mode=0o600, mode_strict=False)
 
 
 def record(trace: str, *, path: Path | None = None, now: float | None = None) -> None:
@@ -104,10 +99,23 @@ def latest(*, path: Path | None = None) -> tuple[str, str] | None:
     return stamp, lines[-1] if len(lines) > 1 else ""
 
 
-def describe_latest(*, path: Path | None = None) -> str | None:
-    """Return one status line for the newest entry, or None."""
+def describe_latest(*, path: Path | None = None, after_file: Path | None = None) -> str | None:
+    """Return one status line for the newest entry, or None.
+
+    ``after_file`` is the service manifest: a live service writes it when it
+    starts. An entry older than that file is history, not the current state,
+    so it gives None.
+    """
     found = latest(path=path)
     if found is None:
         return None
     stamp, last = found
+    if after_file is not None:
+        try:
+            started = after_file.stat().st_mtime
+            failed = calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+        except (OSError, ValueError):
+            started = failed = None
+        if started is not None and failed < started:
+            return None
     return f"{last} (at {stamp}, see {path or log_path()})"

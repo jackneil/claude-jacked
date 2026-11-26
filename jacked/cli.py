@@ -473,7 +473,7 @@ def _print_start_failure_breaker(paths) -> None:
     from jacked.service import START_FAILURE_FILENAME, START_FAILURE_LIMIT
     from jacked.service.start_failures import read_start_failures
 
-    if (boot := describe_latest()) is not None:
+    if (boot := describe_latest(after_file=paths.manifest)) is not None:
         console.print(f"  [yellow]Last boot failure: {escape(boot)}[/yellow]", soft_wrap=True)
     now = _t.time()
     # A missing or corrupt breaker file reads as no failures.
@@ -844,13 +844,13 @@ def upgrade(extras: str, skip_service: bool, no_rollback: bool):
     cmd = upgrade_guard.guarded_upgrade_command(extras, installed)
     label = upgrade_guard.guarded_upgrade_command_label(extras, installed)
 
-    # uv-based flow requires `uv` on PATH; pip/pipx flows don't.
-    if method == "uv":
-        uv = find_bin("uv")
+    # uv and pipx flows run the tool by its resolved absolute path.
+    if method in ("uv", "pipx"):
+        uv = find_bin(method)
         if not uv:
             console.print(
-                "[red]Error:[/red] jacked was installed via `uv tool install` "
-                "but `uv` isn't on PATH. Install it from https://docs.astral.sh/uv/"
+                f"[red]Error:[/red] jacked was installed via `{method}` but `{method}` "
+                "isn't on PATH. Install it (uv: https://docs.astral.sh/uv/)."
             )
             sys.exit(1)
         cmd[0] = uv  # use resolved absolute path
@@ -1024,8 +1024,8 @@ def _run_rollback_steps(
     from jacked.findbin import find_bin
 
     cmd = list(rollback_cmd)
-    if cmd and cmd[0] == "uv":
-        resolved_uv = find_bin("uv")
+    if cmd and cmd[0] in ("uv", "pipx"):
+        resolved_uv = find_bin(cmd[0])
         if resolved_uv:
             cmd[0] = resolved_uv
 
@@ -2101,8 +2101,8 @@ def _spawn_windows_upgrade_helper(
             rb_cmd = []
             rollback_label = ""
         if rb_cmd:
-            if rb_cmd[0] == "uv":
-                _resolved_uv = find_bin("uv")
+            if rb_cmd[0] in ("uv", "pipx"):
+                _resolved_uv = find_bin(rb_cmd[0])
                 if _resolved_uv:
                     rb_cmd[0] = _resolved_uv
             rollback_line = " ".join(f'"{arg}"' for arg in rb_cmd)

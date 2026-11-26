@@ -16,6 +16,7 @@ from jacked.service.preflight_probe import (
     PREFLIGHT_TIMEOUT_SECONDS,
     PROBE_CODE,
     PROBE_EXIT_BASE,
+    PROBE_REPORT_NAME,
     PROBE_STDERR_NAME,
     PROBE_STEPS,
     STEP_MARK,
@@ -101,10 +102,24 @@ def test_a_refused_start_check_names_its_token(contract):
     assert (result.step, result.detail) == ("tray_backend", "ProbeRefusal uvicorn_missing")
 
 
-def test_the_exit_code_is_the_verdict_when_stdout_is_lost(contract):
+def test_the_report_file_carries_the_detail_when_stdout_is_lost(contract):
+    """On Windows the launcher child writes to a new hidden console, so the
+    probe's stdout never reaches the caller. The report file still does."""
     code = "import sys\nsys.stdout = None\n" + _seam(
+        "    ssl.create_default_context()", "    raise OSError(10106, 'x')"
+    )
+    result = _probe(contract, code=code)
+    assert (result.step, result.detail) == ("ssl", "OSError errno 10106")
+    assert "Traceback" in Path(result.stderr_file).read_text(encoding="utf-8")
+    assert not (contract[2].root / PROBE_REPORT_NAME).exists()
+
+
+def test_the_exit_code_is_the_verdict_when_every_channel_is_lost(contract):
+    code = "import sys\nsys.stdout = None\nsys.argv[1:] = []\n" + _seam(
         "    ssl.create_default_context()", "    raise ImportError('x')"
     )
+    code = code.replace('REPORT = sys.argv[1] if len(sys.argv) > 1 else None', "REPORT = None")
+    assert "REPORT = None" in code
     result = _probe(contract, code=code)
     assert (result.step, result.detail) == ("ssl", f"exit {PROBE_EXIT_BASE + 2}")
 
@@ -151,7 +166,9 @@ def test_a_failed_probe_keeps_its_stderr_in_a_private_file(contract):
     result = _probe(contract, code=code)
     path = Path(result.stderr_file)
     assert path == contract[2].root / PROBE_STDERR_NAME
-    assert "stderr-canary" in path.read_text(encoding="utf-8")
+    saved = path.read_text(encoding="utf-8")
+    assert "stderr-canary" in saved
+    assert "Traceback" in saved and "OSError" in saved
     if os.name == "posix":
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
     message = str(ServiceProbeError(result))

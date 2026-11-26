@@ -85,6 +85,8 @@ PROBE_STEPS = (
 PROBE_EXIT_BASE = 40
 #: The name of the file that holds the stderr of the last failed probe.
 PROBE_STDERR_NAME = "preflight-probe-stderr.log"
+#: The name of the file that the probe writes its markers and traceback to.
+PROBE_REPORT_NAME = "preflight-probe-report.log"
 
 STEP_MARK = "jacked-probe-step:"
 FAIL_MARK = "jacked-probe-fail:"
@@ -95,13 +97,29 @@ import os
 import sys
 
 
+# The report file (argv[1]) carries the marker lines and the traceback. On
+# Windows the launcher starts Python with CreateNoWindow and no redirection,
+# so the child writes to a new hidden console, not to the caller's pipes.
+REPORT = sys.argv[1] if len(sys.argv) > 1 else None
+
+
 class ProbeRefusal(Exception):
     """A check of the real start failed. args[0] is a fixed token."""
+
+
+def _report(text):
+    if REPORT:
+        try:
+            with open(REPORT, "a", encoding="utf-8") as handle:
+                handle.write(text)
+        except Exception:
+            pass
 
 
 def _say(line):
     # pythonw.exe can start with no usable stdout. The exit code carries
     # the verdict, so a lost marker line never changes the result.
+    _report(line + "\n")
     try:
         print(line, flush=True)
     except Exception:
@@ -128,7 +146,10 @@ def _step(code, name, action):
     try:
         action()
     except BaseException as exc:
+        import traceback
+
         _say(FAIL_MARK + name + ":" + _detail(exc))
+        _report(traceback.format_exc())
         sys.exit(code)
 
 
@@ -293,11 +314,22 @@ def _os_error_detail(exc: OSError) -> str:
     return detail
 
 
+def _secure(path: Path) -> None:
+    """Give ``path`` owner-only access: mode 0600, or the private ACL on Windows."""
+    if os.name == "nt":
+        from jacked.service.instance_storage import _secure_windows_path
+
+        _secure_windows_path(path)
+    else:
+        os.chmod(path, 0o600)
+
+
 def _write_private(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` with owner-only access (mode 0600)."""
+    """Write ``text`` to ``path`` with owner-only access."""
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8", errors="replace") as handle:
         handle.write(text)
+    _secure(path)
 
 
 def _run(argv: list[str], cwd: Path, options: ProbeOptions):
@@ -308,15 +340,16 @@ def _run(argv: list[str], cwd: Path, options: ProbeOptions):
     return run_tree(argv, timeout=options.timeout, capture=True, cwd=str(cwd))
 
 
-def _windows_argv(spec, environment, cwd: Path, code: str) -> tuple[list[str], Path]:
+def _windows_argv(spec, environment, cwd: Path, argv: tuple[str, ...]):
     from jacked.winproc import system_program
 
     script = render_windows_launcher(
-        runtime=spec.runtime_path, argv=("-I", "-c", code), environment=environment
+        runtime=spec.runtime_path, argv=argv, environment=environment
     )
     descriptor, name = tempfile.mkstemp(prefix="jacked-probe-", suffix=".ps1", dir=cwd)
     with os.fdopen(descriptor, "wb") as handle:
         handle.write(script.encode("ascii"))
+    _secure(Path(name))
     argv = [
         system_program("powershell"),
         "-NoProfile",
@@ -331,17 +364,21 @@ def _windows_argv(spec, environment, cwd: Path, code: str) -> tuple[list[str], P
     return argv, Path(name)
 
 
-def probe_argv(spec, environment: dict[str, str], cwd: Path, code: str):
+def probe_argv(
+    spec, environment: dict[str, str], cwd: Path, code: str, report: Path | None = None
+):
     """Return ``(argv, temporary_file)`` for the delivered launch shape.
 
+    ``report`` is the file that the probe writes its markers to (its argv[1]).
     ``temporary_file`` is the Windows probe launcher (the caller removes it),
     or None on POSIX.
     """
+    python_argv = ("-I", "-c", code, *((str(report),) if report else ()))
     if sys.platform == "win32":
-        return _windows_argv(spec, environment, cwd, code)
+        return _windows_argv(spec, environment, cwd, python_argv)
     command = posix_preinterpreter_command(
         runtime=spec.runtime_path,
-        argv=("-I", "-c", code),
+        argv=python_argv,
         environment={**environment, "JACKED_SERVICE_GENERATION": spec.generation},
         launcher=spec.launcher_path,
         runtime_target=spec.runtime_target_path,
@@ -360,27 +397,44 @@ def run_service_probe(
     file ``cwd / PROBE_STDERR_NAME``.
     """
     stderr_path = Path(cwd) / PROBE_STDERR_NAME
+    report = Path(cwd) / PROBE_REPORT_NAME
     temporary = None
     try:
-        argv, temporary = probe_argv(spec, environment, Path(cwd), options.code)
+        _write_private(report, "")
+        argv, temporary = probe_argv(spec, environment, Path(cwd), options.code, report)
         completed = _run(argv, Path(cwd), options)
     except subprocess.TimeoutExpired as exc:
-        stdout = _text(exc.stdout)
-        step = "interpreter_exit" if OK_MARK in stdout.splitlines() else (
-            _last_step(stdout) or "interpreter_start"
+        output = _report_text(report) + _text(exc.stdout)
+        step = "interpreter_exit" if OK_MARK in output.splitlines() else (
+            _last_step(output) or "interpreter_start"
         )
         result = ProbeResult(False, step, f"timeout after {options.timeout:g}s")
-        return _with_stderr(result, _text(exc.stderr), stderr_path)
+        return _with_stderr(result, _trace(output) + _text(exc.stderr), stderr_path)
     except OSError as exc:
         return ProbeResult(False, "interpreter_start", _os_error_detail(exc))
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    result = parse_probe_output(completed.returncode, _text(completed.stdout))
+    output = _report_text(report) + _text(completed.stdout)
+    report.unlink(missing_ok=True)
+    result = parse_probe_output(completed.returncode, output)
     if result.ok:
         stderr_path.unlink(missing_ok=True)
         return result
-    return _with_stderr(result, _text(completed.stderr), stderr_path)
+    return _with_stderr(result, _trace(output) + _text(completed.stderr), stderr_path)
+
+
+def _report_text(report: Path) -> str:
+    try:
+        return report.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _trace(output: str) -> str:
+    """The lines of the probe report that are not marker lines (the traceback)."""
+    marks = (STEP_MARK, FAIL_MARK, OK_MARK)
+    return "".join(line for line in output.splitlines(True) if not line.startswith(marks))
 
 
 def _with_stderr(result: ProbeResult, stderr: str, path: Path) -> ProbeResult:
@@ -399,6 +453,7 @@ __all__ = [
     "OK_MARK",
     "PROBE_CODE",
     "PROBE_EXIT_BASE",
+    "PROBE_REPORT_NAME",
     "PROBE_STDERR_NAME",
     "PROBE_STEPS",
     "STEP_MARK",
