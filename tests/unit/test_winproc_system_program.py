@@ -59,10 +59,16 @@ def test_the_launch_junction_runs_the_resolved_cmd(tmp_path, monkeypatch):
         raise OSError(1314, "a required privilege is not held")
 
     monkeypatch.setattr(Path, "home", lambda: home)
-    # With no env argument, cmd comes from the Windows directory, never from a
-    # caller's ComSpec (off Windows the directory falls back to SystemRoot).
+    # With no env argument, cmd comes from the Windows directory that the OS
+    # reports (the resolver seam), never from the caller's ComSpec/SystemRoot.
+    import jacked.service.environment as environment
+    import jacked.winproc as winproc
+    from tests.unit.service.service_contract_support import fixed_windows
+
+    monkeypatch.setattr(winproc.sys, "platform", "win32")
+    monkeypatch.setattr(environment, "default_windows_resolvers", lambda: fixed_windows(SystemRoot=r"Z:\Sys"))
     monkeypatch.setenv("ComSpec", r"Y:\Evil\cmd.exe")
-    monkeypatch.setenv("SystemRoot", r"Z:\Sys")
+    monkeypatch.setenv("SystemRoot", r"D:\Other")
     monkeypatch.setattr(launch.os, "name", "nt")
     monkeypatch.setattr(launch.os, "symlink", no_symlink)
     monkeypatch.setattr(launch.subprocess, "run", lambda argv, **k: calls.append(list(argv)))
