@@ -10,10 +10,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from jacked.service.lifecycle import (
-    default_environment,
-    inherited_allowlisted_environment,
-)
+from jacked.service.environment import inherited_allowlisted_environment
+from jacked.service.lifecycle import default_environment
 from jacked.service.preflight_probe import (
     PROBE_CODE,
     PROBE_EXIT_BASE,

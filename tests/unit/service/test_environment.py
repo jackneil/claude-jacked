@@ -1,16 +1,23 @@
+import base64
 import os
+import re
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
 from jacked.service.environment import (
-    WINDOWS_DEFAULT_PATHEXT,
     EnvironmentInputs,
     build_service_environment,
+    inherited_allowlisted_environment,
     posix_preinterpreter_command,
     render_windows_launcher,
+)
+from jacked.service.windows_env import WINDOWS_DEFAULT_PATHEXT, WindowsResolvers
+from tests.unit.service.service_contract_support import (
+    WINDOWS_VALUES,
+    fixed_windows,
+    provision_contract,
 )
 
 
@@ -98,6 +105,17 @@ def test_windows_launcher_clears_environment_and_never_embeds_inherited_secret()
     assert os.linesep not in "unused"  # keep this test platform-neutral
 
 
+def _decoded(script: str) -> dict[str, str]:
+    """Map each launcher target ('FileName', 'Arguments', or an env name) to
+    the value that its base64 expression decodes to."""
+    found = {}
+    pattern = r"\$psi\.(FileName|Arguments|Environment\['([^']+)'\]) = \(Decode '([^']*)'\)"
+    for match in re.finditer(pattern, script):
+        name = match.group(2) or match.group(1)
+        found[name] = base64.b64decode(match.group(3)).decode("utf-8")
+    return found
+
+
 def test_windows_process_arguments_use_commandlinetoargvw_quoting():
     arguments = ("-I", "-m", "jacked", "value with spaces", 'quote"inside')
     script = render_windows_launcher(
@@ -105,8 +123,68 @@ def test_windows_process_arguments_use_commandlinetoargvw_quoting():
         argv=arguments,
         environment={"USERPROFILE": r"C:\Users\Alice Example"},
     )
-    expected = subprocess.list2cmdline(list(arguments)).replace("'", "''")
-    assert f"$psi.Arguments = '{expected}'" in script
+    decoded = _decoded(script)
+    assert decoded["Arguments"] == subprocess.list2cmdline(list(arguments))
+    assert decoded["FileName"] == r"C:\Program Files\Jacked\python.exe"
+    assert decoded["USERPROFILE"] == r"C:\Users\Alice Example"
+
+
+@pytest.mark.parametrize("name", ["Владимир", "NUÑEZ", "Òscar", "O’Neil‘‛"])
+def test_windows_launcher_is_ascii_and_round_trips_non_ascii_values(name):
+    """PowerShell 5.1 reads a BOM-less .ps1 in the ANSI code page and ends a
+    single-quoted string at U+0027 and U+2018-U+201B. The UTF-8 bytes of В
+    and Ñ hold 0x92/0x91, which cp1252 decodes to those quotes."""
+    home = rf"C:\Users\{name}"
+    script = render_windows_launcher(
+        runtime=rf"C:\Users\{name}\jacked\python.exe",
+        argv=("-I", "-m", "jacked", "service", "start", name),
+        environment={"USERPROFILE": home, "USERNAME": name, "TEMP": home + r"\Temp"},
+    )
+    raw = script.encode("ascii")  # raises on any non-ASCII byte
+    for codec in ("cp1252", "cp1251"):
+        text = raw.decode(codec)
+        assert not any(char in text for char in "\u2018\u2019\u201a\u201b")
+    decoded = _decoded(script)
+    assert decoded["USERPROFILE"] == home
+    assert decoded["USERNAME"] == name
+    assert decoded["FileName"] == rf"C:\Users\{name}\jacked\python.exe"
+    assert name in decoded["Arguments"]
+
+
+@pytest.mark.parametrize("key", ["BAD'KEY", "A B", "X=Y", "ключ", ""])
+def test_windows_launcher_refuses_an_environment_name_outside_the_safe_set(key):
+    with pytest.raises(ValueError, match="environment name"):
+        render_windows_launcher(
+            runtime=r"C:\py\python.exe", argv=("-I",), environment={key: "v"}
+        )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the PowerShell parser is Windows only")
+@pytest.mark.real_process  # runs the real powershell.exe parser, no Task Scheduler
+def test_windows_launcher_parses_with_zero_errors_in_windows_powershell(tmp_path):
+    from jacked.winproc import system_root
+
+    script = render_windows_launcher(
+        runtime=r"C:\Users\Владимир\python.exe",
+        argv=("-I", "-m", "jacked", "service", "start"),
+        environment={"USERPROFILE": r"C:\Users\NUÑEZ", "USERNAME": "Òscar"},
+    )
+    launcher = tmp_path / "launcher.ps1"
+    launcher.write_bytes(script.encode("ascii"))
+    powershell = os.path.join(
+        system_root(), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+    )
+    check = (
+        "$errors = $null; "
+        "[void][System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{launcher}', [ref]$null, [ref]$errors); "
+        "exit $errors.Count"
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", check],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 _WINDOWS_INPUTS = EnvironmentInputs(
@@ -114,298 +192,198 @@ _WINDOWS_INPUTS = EnvironmentInputs(
 )
 
 
-def test_windows_environment_keeps_the_os_variables_from_the_inherited_mapping():
-    inherited = {
-        "SystemRoot": r"C:\Windows",
-        "windir": r"C:\Windows",
-        "ComSpec": r"C:\Windows\System32\cmd.exe",
-        "ProgramFiles(x86)": r"C:\Program Files (x86)",
-        "LOCALAPPDATA": r"C:\Users\alice\AppData\Local",
-    }
-    env = build_service_environment(_WINDOWS_INPUTS, inherited=inherited)
-    for key, value in inherited.items():
-        assert env[key] == value
-    assert env["TEMP"] == env["TMP"] == r"C:\Users\alice\AppData\Local\Temp"
-    assert env["PATHEXT"] == WINDOWS_DEFAULT_PATHEXT
+def _windows_env(inherited=None, **changes):
+    return build_service_environment(
+        _WINDOWS_INPUTS, inherited=inherited or {}, windows=fixed_windows(**changes)
+    )
+
+
+def test_windows_environment_comes_from_the_resolvers_only():
+    env = _windows_env()
+    for name in (
+        "SystemRoot", "APPDATA", "LOCALAPPDATA", "ProgramData", "ProgramFiles",
+        "ProgramFiles(x86)", "ProgramW6432", "CommonProgramFiles",
+        "CommonProgramFiles(x86)", "CommonProgramW6432", "PUBLIC", "USERNAME",
+        "COMPUTERNAME",
+    ):
+        assert env[name] == WINDOWS_VALUES[name], name
+    assert env["windir"] == env["SystemRoot"] == r"C:\Windows"
+    assert env["SystemDrive"] == "C:"
     assert env["PATH"] == r"C:\Windows\System32;C:\Windows"
+    assert env["PATHEXT"] == WINDOWS_DEFAULT_PATHEXT
+    assert env["OS"] == "Windows_NT"
+    assert env["PROCESSOR_ARCHITECTURE"] == "AMD64"
+    assert env["TEMP"] == env["TMP"] == r"C:\Users\alice\AppData\Local\Temp"
+    assert (env["HOMEDRIVE"], env["HOMEPATH"]) == ("C:", r"\Users\alice")
     assert env["USERPROFILE"] == r"C:\Users\alice"
+    for dropped in ("USERDOMAIN", "ComSpec", "NUMBER_OF_PROCESSORS", "LANG", "LC_ALL"):
+        assert dropped not in env
 
 
-def test_windows_environment_matches_names_without_case_and_writes_canonical_names():
+def test_windows_environment_ignores_every_inherited_value():
     inherited = {
-        "SYSTEMROOT": r"D:\Win",
-        "WINDIR": r"D:\Win",
-        "programfiles(x86)": r"D:\PF86",
-        "LocalAppData": r"D:\Users\alice\Local",
+        "SystemRoot": r"D:\Other", "SYSTEMROOT": r"D:\Other", "ComSpec": r"D:\cmd.exe",
+        "USERDOMAIN": "WORKGROUP", "LANG": "en_US.UTF-8", "TEMP": r"C:\T\2",
+        "PATHEXT": ".COM;.CPL", "HOMEPATH": r"\Other", "NUMBER_OF_PROCESSORS": "16",
+        "OPENAI_API_KEY": "secret-canary", "PYTHONPATH": r"C:\evil",
+        "PYTHONSTARTUP": r"C:\evil.py", "HTTPS_PROXY": "https://u:secret-canary@p",
     }
-    env = build_service_environment(_WINDOWS_INPUTS, inherited=inherited)
-    assert env["SystemRoot"] == r"D:\Win"
-    assert env["windir"] == r"D:\Win"
-    assert env["ProgramFiles(x86)"] == r"D:\PF86"
-    assert env["LOCALAPPDATA"] == r"D:\Users\alice\Local"
-    assert not ({"SYSTEMROOT", "WINDIR", "programfiles(x86)", "LocalAppData"} & env.keys())
-    assert env["PATH"] == r"D:\Win\System32;D:\Win"
+    assert _windows_env(inherited) == _windows_env()
+    assert "secret-canary" not in repr(_windows_env(inherited))
 
 
-def test_windows_environment_sets_systemroot_through_the_winproc_resolver():
-    # Nothing inherited: the resolver default.
-    env = build_service_environment(_WINDOWS_INPUTS, inherited={})
-    assert env["SystemRoot"] == env["windir"] == r"C:\Windows"
-    # Only windir inherited: the resolver takes windir for both names.
-    env = build_service_environment(_WINDOWS_INPUTS, inherited={"windir": r"E:\Windows"})
-    assert env["SystemRoot"] == env["windir"] == r"E:\Windows"
-    # A relative SystemRoot is not a root.
-    env = build_service_environment(_WINDOWS_INPUTS, inherited={"SystemRoot": "Windows"})
-    assert env["SystemRoot"] == env["windir"] == r"C:\Windows"
+def test_windows_architecture_follows_the_interpreter_platform():
+    assert _windows_env(platform="win-arm64")["PROCESSOR_ARCHITECTURE"] == "ARM64"
+    assert _windows_env(platform="win32")["PROCESSOR_ARCHITECTURE"] == "x86"
+    assert "PROCESSOR_ARCHITECTURE" not in _windows_env(platform="mingw")
 
 
-def test_windows_temp_is_localappdata_temp_and_never_the_inherited_temp():
-    def temp(inherited):
-        env = build_service_environment(_WINDOWS_INPUTS, inherited=inherited)
-        assert env["TMP"] == env["TEMP"]
-        return env["TEMP"]
-
-    local = r"D:\Profiles\alice\Local"
-    # Remote Desktop gives each session its own TEMP subfolder: never used.
-    assert temp({"LOCALAPPDATA": local, "TEMP": r"C:\T1\2", "TMP": r"C:\T2"}) == (
-        local + r"\Temp"
-    )
-    assert temp({"LOCALAPPDATA": "relative", "TEMP": r"C:\T1"}) == (
-        r"C:\Users\alice\AppData\Local\Temp"
-    )
-    assert temp({"TEMP": r"C:\T1"}) == r"C:\Users\alice\AppData\Local\Temp"
-    assert temp({}) == r"C:\Users\alice\AppData\Local\Temp"
-
-
-def test_windows_pathext_is_the_default_and_number_of_processors_is_dropped():
+def test_windows_folders_that_the_os_does_not_have_are_left_out():
+    values = {k: v for k, v in WINDOWS_VALUES.items() if not k.endswith("W6432")}
     env = build_service_environment(
-        _WINDOWS_INPUTS,
-        inherited={
-            "PATHEXT": ".COM;.EXE;.BAT;.CMD;.CPL",
-            "NUMBER_OF_PROCESSORS": "16",
-        },
+        _WINDOWS_INPUTS, windows=WindowsResolvers.fixed(values)
     )
-    assert env["PATHEXT"] == ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC"
-    assert "NUMBER_OF_PROCESSORS" not in env
+    assert "ProgramW6432" not in env
+    assert "CommonProgramW6432" not in env
+
+
+def test_windows_temp_falls_back_to_the_home_profile():
+    values = {k: v for k, v in WINDOWS_VALUES.items() if k != "LOCALAPPDATA"}
+    env = build_service_environment(
+        _WINDOWS_INPUTS, windows=WindowsResolvers.fixed(values)
+    )
+    assert env["TEMP"] == env["TMP"] == r"C:\Users\alice\AppData\Local\Temp"
 
 
 def test_windows_explicit_temp_dir_wins():
     inputs = EnvironmentInputs(
-        home=r"C:\Users\alice",
-        user_id="sid:S-1-5-21-1",
-        platform="win32",
+        home=r"C:\Users\alice", user_id="sid:S-1-5-21-1", platform="win32",
         temp_dir=r"C:\jacked\tmp",
     )
-    env = build_service_environment(inputs, inherited={"TEMP": r"C:\T1"})
+    env = build_service_environment(inputs, windows=fixed_windows())
     assert env["TEMP"] == env["TMP"] == r"C:\jacked\tmp"
 
 
-def test_windows_environment_still_drops_secrets_proxy_and_python_injection():
-    hostile = {
-        "SystemRoot": r"C:\Windows",
-        "OPENAI_API_KEY": "secret-canary",
-        "ANTHROPIC_API_KEY": "secret-canary",
-        "GITHUB_TOKEN": "secret-canary",
-        "HTTPS_PROXY": "https://user:secret-canary@proxy.example",
-        "PYTHONPATH": r"C:\evil",
-        "PYTHONHOME": r"C:\evil",
-        "PYTHONSTARTUP": r"C:\evil.py",
-        "pythonpath": r"C:\evil",
-        "PSModulePath": r"C:\evil",
-    }
-    env = build_service_environment(_WINDOWS_INPUTS, inherited=hostile)
-    assert "secret-canary" not in repr(env)
-    assert not any(key.upper().startswith("PYTHON") for key in env)
-    assert not ({"HTTPS_PROXY", "PSModulePath"} & env.keys())
+def test_windows_relative_windows_directory_is_refused():
+    with pytest.raises(ValueError, match="Windows directory"):
+        _windows_env(SystemRoot="Windows")
 
 
-def test_windows_allowlisted_inherited_names_carry_the_os_variables_only():
-    from jacked.service.environment import WINDOWS_OS_KEYS
-    from jacked.service.lifecycle import inherited_allowlisted_environment
+def test_windows_value_with_a_newline_is_refused():
+    with pytest.raises(ValueError, match="USERNAME"):
+        _windows_env(USERNAME="alice\nPYTHONPATH=x")
 
+
+def test_the_inherited_allowlist_is_empty_on_windows_and_locale_gui_elsewhere():
     source = {
-        "SYSTEMROOT": r"C:\Windows",
-        "TEMP": r"C:\T",
-        "PATHEXT": ".COM;.CPL",
-        "NUMBER_OF_PROCESSORS": "16",
-        "OPENAI_API_KEY": "secret-canary",
-        "PYTHONPATH": r"C:\evil",
-        "LANG": "en_US.UTF-8",
+        "SYSTEMROOT": r"C:\Windows", "TEMP": r"C:\T", "LANG": "en_US.UTF-8",
+        "DISPLAY": ":0", "OPENAI_API_KEY": "secret-canary", "PYTHONPATH": "/evil",
     }
-    inherited = inherited_allowlisted_environment("win32", source)
-    # Session values (TEMP, PATHEXT, NUMBER_OF_PROCESSORS) are not carried.
-    assert inherited == {
-        "SystemRoot": r"C:\Windows",
-        "LANG": "en_US.UTF-8",
+    assert inherited_allowlisted_environment("win32", source) == {}
+    assert inherited_allowlisted_environment("linux", source) == {
+        "DISPLAY": ":0", "LANG": "en_US.UTF-8",
     }
-    # No allowlisted name may carry a secret or change the interpreter.
-    for name in WINDOWS_OS_KEYS:
-        upper = name.upper()
-        assert not upper.startswith("PYTHON")
-        assert not any(part in upper for part in ("TOKEN", "KEY", "SECRET", "PROXY"))
-    # POSIX hosts keep the old allowlist: no Windows names.
-    assert inherited_allowlisted_environment("linux", source) == {"LANG": "en_US.UTF-8"}
 
 
 def test_windows_launcher_sets_systemroot_from_the_service_environment():
-    env = build_service_environment(
-        _WINDOWS_INPUTS, inherited={"SystemRoot": r"C:\Windows"}
-    )
     script = render_windows_launcher(
         runtime=r"C:\jacked\python.exe",
         argv=("-I", "-m", "jacked", "service", "start"),
-        environment=env,
+        environment=_windows_env(),
     )
     clear = script.index(".Environment.Clear()")
-    for key in ("SystemRoot", "windir", "TEMP", "TMP"):
-        line = f"$psi.Environment['{key}'] = "
-        assert script.index(line) > clear
-    assert r"$psi.Environment['SystemRoot'] = 'C:\Windows'" in script
+    for key in ("SystemRoot", "windir", "TEMP", "TMP", "PATHEXT"):
+        assert script.index(f"$psi.Environment['{key}'] = ") > clear
+    assert _decoded(script)["SystemRoot"] == r"C:\Windows"
 
 
-@pytest.mark.skipif(
-    sys.platform != "win32",
-    reason="proves the Windows runtime starts under the service environment; Windows only",
-)
-def test_windows_runtime_starts_under_the_exact_service_environment(tmp_path):
-    from jacked.service.lifecycle import (
-        default_environment,
-        inherited_allowlisted_environment,
-    )
-
-    # Build the environment exactly as provision_service_contract does.
-    env = default_environment(
-        home=str(Path.home()),
-        user_id="sid:test",
-        inherited_allowlisted=inherited_allowlisted_environment(sys.platform),
-        platform=sys.platform,
-    )
-    probe = (
-        "import asyncio, socket, ssl, tempfile; "
-        "socket.socket().close(); "
-        "asyncio.new_event_loop().close(); "
-        "print(tempfile.gettempdir())"
-    )
-    result = subprocess.run(
-        [sys.executable, "-I", "-c", probe],
-        env=env,
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    temp_dir = result.stdout.strip()
-    assert temp_dir
-    assert os.path.normcase(os.path.abspath(temp_dir)) != os.path.normcase(str(tmp_path))
-    assert os.path.normcase(os.path.abspath(temp_dir)) != os.path.normcase(os.getcwd())
-
-
-def test_windows_service_environment_is_a_fixed_point_of_its_own_rebuild():
-    """The service re-provisions its contract at boot (tray.py) from the
-    environment that the launcher gave it. That rebuild must give the same
-    environment, so the same launcher digest and the same generation."""
-    from jacked.service.lifecycle import (
-        default_environment,
-        inherited_allowlisted_environment,
-    )
-
-    messy = {
-        "SYSTEMROOT": r"C:\Windows",
-        "ComSpec": r"C:\Windows\System32\cmd.exe",
-        "PATHEXT": ".COM;.EXE;.BAT;.CMD;.CPL",
-        "LocalAppData": r"C:\Users\alice\AppData\Local",
-        "TMP": r"C:\Users\alice\AppData\Local\Temp\2",
-        "USERNAME": "alice",
-        "LANG": "en_US.UTF-8",
-        "OPENAI_API_KEY": "secret-canary",
-        "PYTHONPATH": r"C:\evil",
-        "Path": r"C:\tools;C:\Windows\System32",
-    }
-
-    def build(source):
-        return default_environment(
-            home=r"C:\Users\alice",
-            user_id="sid:S-1-5-21-1",
-            inherited_allowlisted=inherited_allowlisted_environment("win32", source),
-            platform="win32",
-        )
-
-    first = build(messy)
-    service_view = {**first, "JACKED_SERVICE_GENERATION": "a" * 64}
-    assert build(service_view) == first
-    assert "secret-canary" not in repr(first)
-
-
-_WINDOWS_CALLER = {
-    "SystemRoot": r"C:\Windows",
-    "windir": r"C:\Windows",
-    "ComSpec": r"C:\Windows\System32\cmd.exe",
-    "ProgramFiles": r"C:\Program Files",
-    "APPDATA": r"C:\Users\alice\AppData\Roaming",
-    "LOCALAPPDATA": r"C:\Users\alice\AppData\Local",
-    "USERNAME": "alice",
-    "COMPUTERNAME": "DESK",
-    "PATHEXT": ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC",
-    "TEMP": r"C:\Users\alice\AppData\Local\Temp",
-    "TMP": r"C:\Users\alice\AppData\Local\Temp",
-    "NUMBER_OF_PROCESSORS": "8",
+# Two callers whose environments differ in ANY variable. On win32 nothing
+# comes from the caller, so each row must give the same contract.
+_CALLER = {
+    "SystemRoot": r"C:\Windows", "ComSpec": r"C:\Windows\System32\cmd.exe",
+    "USERDOMAIN": "CORP", "LANG": "en_US.UTF-8",
+    "TEMP": r"C:\Users\alice\AppData\Local\Temp", "HOMEPATH": r"\Users\alice",
+    "PATHEXT": WINDOWS_DEFAULT_PATHEXT, "NUMBER_OF_PROCESSORS": "8",
 }
 
 
-def _windows_contract(tmp_path, monkeypatch, caller):
-    """Provision the win32 contract exactly as a caller with ``caller`` does.
-
-    Both callers in a test share one state directory, as two shells of one
-    user do, so the launcher path differs only when its content does."""
-    import jacked.service.lifecycle as lifecycle
-    from jacked.service.instance_models import ServicePaths
-    from jacked.service.spec import SupervisorKind
-
-    monkeypatch.setattr(lifecycle.os, "environ", dict(caller))
-    monkeypatch.setattr(lifecycle.Path, "home", lambda: Path(r"C:\Users\alice"))
-    monkeypatch.setattr(
-        "jacked.service.instance.current_user_identity", lambda: "sid:S-1-5-21-1"
-    )
-    paths = ServicePaths.in_directory(tmp_path / "state")
-    spec, environment = lifecycle.provision_service_contract(
-        paths=paths, platform="win32", supervisor=SupervisorKind.MANUAL
-    )
-    return spec.launcher_sha256, spec.generation, environment
-
-
 @pytest.mark.parametrize(
-    "session_change",
+    "change",
     [
+        pytest.param({"SystemRoot": None, "SYSTEMROOT": r"C:\WINDOWS"}, id="systemroot-case"),
+        pytest.param({"ComSpec": None, "COMSPEC": r"D:\cmd.exe"}, id="comspec"),
+        pytest.param({"USERDOMAIN": "WORKGROUP"}, id="openssh-userdomain"),
+        pytest.param({"LANG": "C.UTF-8"}, id="git-bash-lang"),
         pytest.param({"TEMP": r"C:\Users\alice\AppData\Local\Temp\2",
                       "TMP": r"C:\Users\alice\AppData\Local\Temp\2"}, id="rdp-temp"),
-        pytest.param({"PATHEXT": ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"},
-                     id="pwsh-pathext"),
+        pytest.param({"HOMEPATH": r"\\server\home\alice"}, id="domain-homepath"),
+        pytest.param({"PATHEXT": WINDOWS_DEFAULT_PATHEXT + ";.CPL"}, id="pwsh-pathext"),
         pytest.param({"NUMBER_OF_PROCESSORS": "16"}, id="vm-resize"),
         pytest.param({"TERM_PROGRAM": "vscode", "SESSIONNAME": "RDP-Tcp#3"}, id="extra"),
-        pytest.param({"SystemRoot": None, "SYSTEMROOT": r"C:\Windows"}, id="key-case"),
     ],
 )
-def test_windows_generation_does_not_depend_on_the_caller_session(
-    tmp_path, monkeypatch, session_change
-):
-    base = _windows_contract(tmp_path, monkeypatch, _WINDOWS_CALLER)
-    other = dict(_WINDOWS_CALLER)
-    for key, value in session_change.items():
+def test_windows_generation_does_not_depend_on_the_caller(tmp_path, monkeypatch, change):
+    import jacked.service.lifecycle as lifecycle
+
+    def contract(caller, state):
+        monkeypatch.setattr(lifecycle.os, "environ", dict(caller))
+        monkeypatch.setattr(lifecycle.Path, "home", lambda: lifecycle.Path(r"C:\Users\alice"))
+        monkeypatch.setattr(
+            "jacked.service.instance.current_user_identity", lambda: "sid:S-1-5-21-1"
+        )
+        spec, environment, _paths = provision_contract(
+            tmp_path, monkeypatch, platform="win32", state=state,
+            runtime=runtime, windows=fixed_windows(),
+        )
+        return spec.launcher_sha256, spec.generation, environment
+
+    from tests.unit.service.service_contract_support import trusted_runtime
+
+    runtime = trusted_runtime(tmp_path / "rt")
+    other = dict(_CALLER)
+    for key, value in change.items():
         if value is None:
             other.pop(key)
         else:
             other[key] = value
-    changed = _windows_contract(tmp_path, monkeypatch, other)
-    assert changed[0] == base[0], "launcher digest changed"
-    assert changed[1] == base[1], "generation changed"
-    assert changed[2] == base[2]
+    # Both callers share one state directory, as two shells of one user do.
+    state = tmp_path / "state"
+    assert contract(other, state) == contract(_CALLER, state)
 
 
-def test_windows_generation_follows_a_stable_value(tmp_path, monkeypatch):
-    base = _windows_contract(tmp_path, monkeypatch, _WINDOWS_CALLER)
-    other = {**_WINDOWS_CALLER, "LOCALAPPDATA": r"D:\Profiles\alice\Local"}
-    changed = _windows_contract(tmp_path, monkeypatch, other)
-    assert changed[0] != base[0]
-    assert changed[1] != base[1]
+def test_windows_generation_follows_a_resolved_value(tmp_path, monkeypatch):
+    from tests.unit.service.service_contract_support import trusted_runtime
+
+    runtime = trusted_runtime(tmp_path / "rt")
+    state = tmp_path / "state"
+    base = provision_contract(
+        tmp_path, monkeypatch, platform="win32", runtime=runtime, state=state,
+        windows=fixed_windows(),
+    )[0]
+    moved = provision_contract(
+        tmp_path, monkeypatch, platform="win32", runtime=runtime, state=state,
+        windows=fixed_windows(LOCALAPPDATA=r"D:\Profiles\alice\Local"),
+    )[0]
+    assert moved.launcher_sha256 != base.launcher_sha256
+    assert moved.generation != base.generation
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="asks the real Windows APIs")
+def test_windows_resolvers_agree_with_the_os(monkeypatch):
+    """Each resolved value is absolute (for a folder) and equals the value
+    that Windows gave this runner's own process environment."""
+    from jacked.service.windows_env import KNOWN_FOLDERS, real_windows_resolvers
+    from jacked.winproc import is_absolute_windows_path
+
+    env = build_service_environment(_WINDOWS_INPUTS, windows=real_windows_resolvers())
+    real = {key.upper(): value for key, value in os.environ.items()}
+    for name in ("SystemRoot", "windir", "SystemDrive", *KNOWN_FOLDERS):
+        if name not in env:
+            continue
+        if name != "SystemDrive":
+            assert is_absolute_windows_path(env[name]), name
+        if name.upper() in real:
+            assert os.path.normcase(env[name]) == os.path.normcase(real[name.upper()]), name
+    assert env["USERNAME"].casefold() == real["USERNAME"].casefold()
+    assert env["COMPUTERNAME"].casefold() == real["COMPUTERNAME"].casefold()
+    assert env["PROCESSOR_ARCHITECTURE"] in {"AMD64", "ARM64", "x86"}

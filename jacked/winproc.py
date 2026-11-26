@@ -51,6 +51,17 @@ def _absolute(value: str | None) -> bool:
     return bool(value) and bool(ntpath.splitdrive(value)[0]) and ntpath.isabs(value)
 
 
+def is_absolute_windows_path(value: str | None) -> bool:
+    """True for a Windows path with a drive (or a UNC share) and a root.
+
+    This is the public name of the rule that ``system_root`` uses.
+
+    >>> is_absolute_windows_path(r"D:\\Temp"), is_absolute_windows_path("Temp")
+    (True, False)
+    """
+    return _absolute(value)
+
+
 def system_root(env: Mapping[str, str] | None = None) -> str:
     """Return ``%SystemRoot%`` (else ``%windir%``) when it is absolute, else ``C:\\Windows``."""
     env = os.environ if env is None else env

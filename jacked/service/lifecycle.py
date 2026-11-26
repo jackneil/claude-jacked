@@ -8,15 +8,11 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable
 
 from jacked import __version__
 from jacked.service import CLAUDE_DIR, DEFAULT_HOST, DEFAULT_PORT, LAUNCHD_LABEL
-from jacked.service.environment import (
-    WINDOWS_OS_KEYS,
-    EnvironmentInputs,
-    build_service_environment,
-)
+from jacked.service.environment import EnvironmentInputs, build_service_environment
 from jacked.service.environment import render_windows_launcher
 from jacked.service.handoff import handoff_owned_service
 from jacked.service.instance import (
@@ -188,39 +184,6 @@ def _launcher_install(
     )
 
 
-_INHERITED_NAMES = (
-    "LANG",
-    "LANGUAGE",
-    "LC_ALL",
-    "LC_CTYPE",
-    "LC_MESSAGES",
-    "DISPLAY",
-    "WAYLAND_DISPLAY",
-    "XDG_RUNTIME_DIR",
-    "DBUS_SESSION_BUS_ADDRESS",
-)
-
-
-def inherited_allowlisted_environment(
-    platform: str, source: Mapping[str, str] | None = None
-) -> dict[str, str]:
-    """Return the allowlisted variables of ``source`` (default ``os.environ``).
-
-    On win32 the allowlist also holds the stable Windows OS variables.
-    Windows variable names are not case-sensitive, so the match ignores case
-    on win32. ``build_service_environment`` validates each value.
-    """
-
-    source = os.environ if source is None else source
-    names = list(_INHERITED_NAMES)
-    if platform == "win32":
-        names.extend(WINDOWS_OS_KEYS)
-    folded = {key.casefold(): value for key, value in source.items()}
-    if platform == "win32":
-        return {name: folded[name.casefold()] for name in names if name.casefold() in folded}
-    return {name: source[name] for name in names if name in source}
-
-
 def provision_service_contract(
     *,
     paths: ServicePaths | None = None,
@@ -233,6 +196,14 @@ def provision_service_contract(
 
     selected_platform = sys.platform if platform is None else platform
     selected_paths = paths or default_service_paths()
+    # This release added the name to jacked.service.environment. An
+    # interpreter mid-upgrade can hold the older module (see
+    # jacked.mixed_generation), so the import reloads a held copy that lacks it.
+    from jacked.mixed_generation import names_from
+
+    (inherited_allowlisted_environment,) = names_from(
+        "jacked.service.environment", "inherited_allowlisted_environment"
+    )
     inherited = inherited_allowlisted_environment(selected_platform)
     environment = default_environment(
         home=str(Path.home()),
@@ -447,7 +418,6 @@ __all__ = [
     "quarantine_invalid_ownership",
     "install_native_owned",
     "native_artifact_path",
-    "inherited_allowlisted_environment",
     "provision_service_contract",
     "inspect_native_artifact",
     "reconcile_native_artifact",
