@@ -937,3 +937,28 @@ def test_a_failed_work_tree_read_raises_with_the_first_error_line_of_git(repo):
         locked.chmod(0o600)
     assert "git add exited with" in str(caught.value)
     assert "locked.txt" in caught.value.detail
+
+
+def test_a_same_size_edit_that_git_status_sees_is_never_a_clean_tree(repo):
+    # The edit keeps the size, the inode and the old modification time, and
+    # git does not check ctime. The real index has the time of its entries,
+    # so git sees the entry as racy and reads the content. A copy of the
+    # index with a new time would trust the stat data and see no change.
+    old = 1_000_000_000 * 10**9
+    path = repo / "same.py"
+    path.write_bytes(b"[1, 2]\n")
+    os.utime(path, ns=(old, old))
+    _git(repo, "config", "core.trustctime", "false")
+    _git(repo, "add", "same.py")
+    _git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "same size")
+    path.write_bytes(b"VALUES\n")
+    os.utime(path, ns=(old, old))
+    index = repo / ".git" / "index"
+    os.utime(index, ns=(old, old))
+    # Real git sees the change (with no index write, so the test state stays).
+    status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True,
+                            text=True, stdin=subprocess.DEVNULL, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    assert status.stdout == " M same.py\n"
+    assert os.stat(index).st_mtime_ns == old
+    tid = tree.tree_id(repo)
+    assert tid is not None and tid.clean is False

@@ -186,7 +186,10 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
     try:
         index_copy = work / "index"
         if real_index.is_file():
-            shutil.copyfile(real_index, index_copy)
+            # copy2 keeps the modification time of the index. Git trusts the stat
+            # data of an entry that is older than the index file; a new time on
+            # the copy would hide a change of the same size in the same second.
+            shutil.copy2(real_index, index_copy)
         object_dir = Path(objects) if objects is not None else work / "objects"
         object_dir.mkdir(parents=True, exist_ok=True)
         env = {
