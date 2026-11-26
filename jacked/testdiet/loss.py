@@ -45,6 +45,8 @@ from jacked.testdiet.model import one_line
 
 #: The ref of the default branch. There is no fetch and no network call.
 DEFAULT_REF = "refs/remotes/origin/HEAD"
+#: The name of the default base in the output.
+DEFAULT_NAME = "origin/HEAD"
 _ZERO = re.compile(r"0+")
 _NOT_READ_MODES = ("160000", "120000")  # a submodule and a symbolic link
 _SCRIPT = re.compile(r"\.[cm]?[jt]sx?$")
@@ -59,11 +61,14 @@ class LossError(RuntimeError):
 class LossReport:
     """The loss report. Each name has the form ``path::name``.
 
-    ``base`` is the base commit. ``net`` is the number of declarations now,
+    ``base`` is the base commit: the merge base of HEAD and ``base_ref``.
+    ``base_ref`` is the ref that the user gave, or ``origin/HEAD``. ``net``
+    is the number of declarations now,
     minus the number at the base, over the touched files.
     """
 
     base: str
+    base_ref: str
     added: tuple[str, ...]
     removed: tuple[str, ...]
     net: int
@@ -316,18 +321,26 @@ def _rev(top: Path, spec: str) -> str | None:
 
 
 def _base_commit(top: Path, base: str | None) -> str:
+    """Return the merge base of HEAD and ``base`` (the default branch when ``base`` is None).
+
+    A ref that is an ancestor of HEAD is its own merge base. A branch that
+    moved ahead after the fork gives the fork point, so its new tests are
+    not read as removed.
+    """
     if base is not None:
-        commit = _rev(top, f"{base}^{{commit}}")
-        if commit is None:
+        tip = _rev(top, f"{base}^{{commit}}")
+        if tip is None:
             raise LossError(f"the base {base!r} is not a commit of this repository")
-        return commit
-    default = _rev(top, f"{DEFAULT_REF}^{{commit}}")
-    if default is None:
-        raise LossError(f"{DEFAULT_REF} does not exist, so there is no default branch. Give --base REF.")
-    code, out = tree._git(top, "merge-base", "--end-of-options", "HEAD", default)
+    else:
+        tip = _rev(top, f"{DEFAULT_REF}^{{commit}}")
+        if tip is None:
+            raise LossError(f"{DEFAULT_REF} does not exist. Give --base <branch>, "
+                            "or run: git remote set-head origin --auto")
+    code, out = tree._git(top, "merge-base", "--end-of-options", "HEAD", tip)
     lines = tree._lines(out)
     if code != 0 or len(lines) != 1:
-        raise LossError("HEAD and the default branch have no merge base. Give --base REF.")
+        name = DEFAULT_NAME if base is None else repr(base)
+        raise LossError(f"HEAD and {name} have no merge base. Give a --base that shares history with HEAD.")
     return lines[0]
 
 
@@ -367,8 +380,9 @@ def _read(top: Path, blob: str, env: dict[str, str]) -> bytes | None:
 def loss_report(cwd: Path, base: str | None = None) -> LossReport:
     """Compare the test declarations of the touched files at ``base`` and in the work tree.
 
-    ``base`` is a ref or a commit. With no ``base``, the base is the merge
-    base of HEAD and the default branch (``refs/remotes/origin/HEAD``). An
+    ``base`` is a ref or a commit. The compared commit is the merge base of
+    HEAD and ``base``. With no ``base``, it is the merge base of HEAD and the
+    default branch (``refs/remotes/origin/HEAD``). An
     input that cannot be read raises ``LossError`` (or ``tree.TreeError``
     outside a git work tree).
     """
@@ -394,11 +408,11 @@ def loss_report(cwd: Path, base: str | None = None) -> LossReport:
                     side[path] = scan(path, data.decode("utf-8", "replace"))
     finally:
         tree.remove_tree(objects)
-    return _compare(commit, *sides)
+    return _compare(commit, *sides, base_ref=DEFAULT_NAME if base is None else base)
 
 
 def _compare(base: str, before: dict[str, list[Declaration]],
-             after: dict[str, list[Declaration]]) -> LossReport:
+             after: dict[str, list[Declaration]], *, base_ref: str = DEFAULT_NAME) -> LossReport:
     old = Counter(d.name for found in before.values() for d in found)
     new = Counter(d.name for found in after.values() for d in found)
     removed = _surplus(before, after, old - new)
@@ -409,7 +423,7 @@ def _compare(base: str, before: dict[str, list[Declaration]],
             weaker.append(f"{path}::{now.name}")
         if now.skipped is True and then.skipped is False:
             skips.append(f"{path}::{now.name}")
-    return LossReport(base=base, added=added, removed=removed, net=sum(new.values()) - sum(old.values()),
+    return LossReport(base=base, base_ref=base_ref, added=added, removed=removed, net=sum(new.values()) - sum(old.values()),
                       fewer_assertions=tuple(sorted(weaker)), skips_added=tuple(sorted(skips)))
 
 
@@ -453,7 +467,7 @@ def render(report: LossReport) -> str:
     """Return the report as text lines. Each name is on one line, with no control character."""
     from jacked.testdiet.record import clean_text
 
-    lines = [f"base {report.base}", f"net {report.net:+d}" if report.net else "net 0",
+    lines = [f"base {report.base[:12]} ({one_line(report.base_ref)})", f"net {report.net:+d}" if report.net else "net 0",
              f"added {len(report.added)}, removed {len(report.removed)}"]
     for title, names in (("removed", report.removed), ("added", report.added),
                          ("fewer assertions", report.fewer_assertions),

@@ -244,7 +244,7 @@ def prune_command(before):
 
 @recorder_group.command(name="loss")
 @click.option("--base", default=None, metavar="REF",
-              help="The base commit. Default: the merge base of HEAD and refs/remotes/origin/HEAD.")
+              help="Compare with the merge base of HEAD and REF. Default REF: refs/remotes/origin/HEAD.")
 @click.option("--json", "as_json", is_flag=True, help="Print the report as JSON.")
 def loss_command(base, as_json):
     """Show the tests that the change removes or weakens. This is a report: it exits 0.

@@ -101,6 +101,7 @@ def test_a_removed_test_is_named_and_net_is_minus_one(repo):
     assert report.removed == ("tests/test_calc.py::test_adds",)
     assert (report.added, report.net) == ((), -1)
     assert report.base == git(repo, "rev-parse", "main").strip()
+    assert report.base_ref == "origin/HEAD"
 
 
 def test_a_renamed_file_with_the_same_tests_reports_no_loss(repo):
@@ -269,6 +270,8 @@ def test_cli_loss_exits_0_with_a_loss_and_with_none(repo):
     assert "removed tests/test_calc.py::test_adds" in lost.output
     data = json.loads(_invoke("tests", "loss", "--json").output)
     assert data["removed"] == ["tests/test_calc.py::test_adds"] and data["net"] == -1
+    assert (data["base"], data["base_ref"]) == (git(repo, "rev-parse", "main").strip(), "origin/HEAD")
+    assert lost.output.startswith(f"base {data['base'][:12]} (origin/HEAD)\n")
     explicit = _invoke("tests", "loss", "--base", "main")
     assert explicit.exit_code == 0 and "net -1" in explicit.output
 
@@ -281,6 +284,7 @@ def test_cli_loss_gives_one_line_and_exit_1_for_an_input_it_cannot_read(repo, tm
     nodefault = _invoke("tests", "loss")
     assert nodefault.exit_code == 1
     assert nodefault.output.count("\n") == 1 and "--base" in nodefault.output
+    assert "git remote set-head origin --auto" in nodefault.output
     outside = tmp_path / "outside"
     outside.mkdir()
     monkeypatch.chdir(outside)
@@ -353,3 +357,27 @@ def test_a_test_name_with_a_real_line_break_prints_on_one_line(repo):
     write(repo, "tests/test_lines.ts", b"\n")
     out = _invoke("tests", "loss", "--base", "HEAD").output
     assert "removed tests/test_lines.ts::first\\nsecond" in out.splitlines()
+
+
+def test_a_base_branch_that_moved_ahead_reports_no_loss_for_its_new_tests(repo):
+    git(repo, "checkout", "-q", "main")
+    write(repo, "tests/test_calc.py", CALC + b"\n\ndef test_on_main_only():\n    assert True\n")
+    commit(repo, "main moves ahead")
+    fork = git(repo, "merge-base", "main", "work").strip()
+    git(repo, "checkout", "-q", "work")
+    write(repo, "tests/test_calc.py", CALC + b"\n\ndef test_on_work():\n    assert True\n")
+    report = loss.loss_report(repo, "main")
+    assert (report.base, report.base_ref) == (fork, "main")
+    assert (report.removed, report.added, report.net) == ((), ("tests/test_calc.py::test_on_work",), 1)
+    out = _invoke("tests", "loss", "--base", "main")
+    assert out.exit_code == 0 and f"base {fork[:12]} (main)" in out.output
+
+
+def test_a_base_with_no_shared_history_exits_1_with_one_line(repo):
+    git(repo, "checkout", "-q", "--orphan", "other")
+    git(repo, "rm", "-rq", "--cached", ".")
+    commit(repo, "unrelated")
+    git(repo, "checkout", "-q", "-f", "work")
+    out = _invoke("tests", "loss", "--base", "other")
+    assert out.exit_code == 1
+    assert out.output.count("\n") == 1 and "no merge base" in out.output
