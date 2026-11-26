@@ -71,7 +71,8 @@ def relative_path(text: str, *, root: Path, report_root: str | None = None) -> s
     An absolute path that starts with ``report_root`` (or with the root
     itself) becomes relative to it. The match is on text with ``/``
     separators. A path that is absolute in a different way, or that holds
-    ``..``, ``.`` or an empty part, gives None.
+    ``..``, ``.``, an empty part or a part with ``:`` (a Windows drive),
+    gives None.
 
     >>> relative_path("/work/src/a.js", root=Path("/x"), report_root="/work")
     'src/a.js'
@@ -92,7 +93,9 @@ def relative_path(text: str, *, root: Path, report_root: str | None = None) -> s
     if value.startswith("./"):
         value = value[2:]
     parts = value.split("/")
-    if not value or any(part in ("", ".", "..") for part in parts):
+    # A part with ":" can be a Windows drive ("C:a.js" is relative to the
+    # current folder of drive C, not to the root) or an alternate data stream.
+    if not value or any(part in ("", ".", "..") or ":" in part for part in parts):
         return None
     return value
 

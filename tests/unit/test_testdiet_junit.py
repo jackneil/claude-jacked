@@ -236,6 +236,12 @@ def _fixture_files() -> list[Path]:
 
 
 def test_no_fixture_holds_a_host_name_or_a_home_path():
+    """No fixture holds a host name or a home path.
+
+    This test cannot know the login of the machine that captured the reports
+    (on CI the login is the one of the runner), so capture.py checks the
+    login with private_hits at capture time.
+    """
     import re
 
     files = _fixture_files()
@@ -259,9 +265,8 @@ def test_provenance_names_the_two_rewrites_as_the_only_changes():
     ]
     names = {run["name"] for run in data["runs"]}
     assert set(RUNNERS) | {"pytest_rerun", "pytest_import_error", "playwright_moved", "go_rerun"} == names
-    for run in data["runs"]:
-        for name in run["files"]:
-            assert (FIXTURES / "reports" / name).is_file()
+    listed = {name for run in data["runs"] for name in run["files"]}
+    assert listed == {path.name for path in (FIXTURES / "reports").iterdir()}
 
 
 def test_pytest_collects_nothing_under_the_fixture_projects():
