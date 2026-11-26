@@ -201,3 +201,36 @@ def test_the_claude_install_of_review_animations_still_passes_its_manifest_check
     assert second.error is None and second.backup is None
     assert not (tmp_path / ".claude" / "jacked-backups").exists()
     assert (dest / POLICY).read_bytes() == EXACT
+
+
+def test_each_shipped_command_gets_the_policy_exactly_when_it_has_the_key():
+    from jacked.codex._generate import (
+        CODEX_NO_IMPLICIT,
+        _command_codex_policy,
+        _split_command_frontmatter,
+    )
+    from jacked.skill_listing import _truthy
+
+    with_key, without_key = [], []
+    for cmd in sorted((DATA / "commands").glob("*.md")):
+        meta, _ = _split_command_frontmatter(cmd.read_text(encoding="utf-8"))
+        if _truthy(meta.get("disable-model-invocation")):
+            with_key.append(cmd.stem)
+            assert _command_codex_policy(cmd) == CODEX_NO_IMPLICIT, cmd.name
+        else:
+            without_key.append(cmd.stem)
+            assert _command_codex_policy(cmd) is None, cmd.name
+    assert "cleanup" in with_key
+    assert without_key, "the walk found no command without the key"
+
+
+def test_each_shipped_policy_file_belongs_to_a_skill_with_the_key():
+    policies = [p for p in sorted((DATA / "skills").glob("*/" + POLICY))
+                if b"allow_implicit_invocation" in p.read_bytes()]
+    assert DATA / "skills" / "review-animations" / POLICY in policies
+    for policy in policies:
+        skill_md = policy.parent.parent / "SKILL.md"
+        assert _has_the_key(skill_md), (
+            f"{policy.parent.parent.name} ships a Codex policy file, "
+            "but its SKILL.md does not set disable-model-invocation"
+        )
