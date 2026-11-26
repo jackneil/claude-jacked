@@ -81,6 +81,9 @@ from ._generate import (
     _CODEX_ADAPTER as _CODEX_ADAPTER,
     _agent_toml as _agent_toml,
     _codex_rules_body as _codex_rules_body,
+    CODEX_NO_IMPLICIT as CODEX_NO_IMPLICIT,
+    CODEX_POLICY_PATH as CODEX_POLICY_PATH,
+    _command_codex_policy as _command_codex_policy,
     _command_skill_md as _command_skill_md,
     _first_nonempty_line as _first_nonempty_line,
     _is_jacked_owned as _is_jacked_owned,
@@ -364,10 +367,17 @@ def install_codex(
             # user's own, moved back after a failed write.
             # src None: this skill's content is GENERATED from the command, so
             # the expected-hash identity check is the only source test.
+            # A command that only the user may start gets the Codex policy
+            # file in its skill. The hash and the write take the same extras,
+            # so the manifest of the next install matches the dir.
+            policy = _command_codex_policy(cmd)
+            extras = {CODEX_POLICY_PATH: policy} if policy is not None else None
             outcome = _install_codex_skill_dir(
                 None, skill_dir, cmd.stem, prior, preserved,
-                expected=_sha_solo_skill(content),
-                copy=lambda _src, dst, body=content: _write_solo_skill(dst, body),
+                expected=_sha_solo_skill(content, extras),
+                copy=lambda _src, dst, body=content, more=extras: _write_solo_skill(
+                    dst, body, more,
+                ),
                 this_run=written_this_run,
             )
             if outcome.error is not None:

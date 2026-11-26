@@ -185,6 +185,28 @@ def _command_skill_md(cmd: Path) -> str:
     return "---\n" + "\n".join(lines) + "\n---\n" + body
 
 
+# The Codex policy file of a skill that only the user may start. Codex
+# documentation (read 2026-11-26): with false, "Codex won't implicitly invoke
+# the skill based on user prompt; explicit $skill invocation still works".
+CODEX_POLICY_PATH = "agents/openai.yaml"
+CODEX_NO_IMPLICIT = "policy:\n  allow_implicit_invocation: false\n"
+
+
+def _command_codex_policy(cmd: Path) -> Optional[str]:
+    """The Codex policy file text for the skill made from command `cmd`.
+
+    Returns `CODEX_NO_IMPLICIT` when the frontmatter of the command sets
+    ``disable-model-invocation`` to a true value, else None. Claude Code does
+    not start such a command by itself, and with this file Codex does not
+    start the generated skill by itself. An invocation by name still works."""
+    from jacked.skill_listing import _truthy
+
+    meta, _ = _split_command_frontmatter(cmd.read_text(encoding="utf-8"))
+    if _truthy(meta.get("disable-model-invocation")):
+        return CODEX_NO_IMPLICIT
+    return None
+
+
 # A skill whose SKILL.md carries this as a whole line absorbed the body of a
 # former data/commands/<name>.md: everything after it is the engine that used to
 # be the command file, everything before it is Claude-side repo-dispatch prose.

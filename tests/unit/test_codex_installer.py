@@ -1878,11 +1878,11 @@ def test_failed_command_skill_write_restores_the_users_own_dir(data_root, homes,
     real = ins._write_solo_skill
     calls: list = []
 
-    def half_write(skill_dir, content):
+    def half_write(skill_dir, content, extras=None):
         # The write goes into the private staging dir for dcr, never into
         # ~/.agents/skills/dcr itself.
         if _staged_name(skill_dir) != "dcr":
-            return real(skill_dir, content)
+            return real(skill_dir, content, extras)
         calls.append(skill_dir)
         Path(skill_dir).mkdir(parents=True)
         (Path(skill_dir) / "SKILL.md").write_text(content[:10])
