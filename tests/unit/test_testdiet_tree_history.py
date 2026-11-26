@@ -9,6 +9,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -323,6 +324,23 @@ def test_a_meta_file_with_a_field_of_a_later_version_is_read(tmp_path):
     assert back.tree == meta.tree and back.label == "gate"
 
 
+@pytest.mark.parametrize("damage", ["middle", "truncated"])
+def test_a_damaged_tests_file_reads_as_none_with_one_warning(tmp_path, capsys, damage):
+    meta = _meta(history.new_run_id())
+    history.write_run(tmp_path, meta, _data())
+    path = tmp_path / "runs" / f"{meta.id}.tests.json.gz"
+    raw = bytearray(path.read_bytes())
+    if damage == "middle":
+        for n in range(12, len(raw) - 8):
+            raw[n] ^= 0xFF
+    else:
+        del raw[len(raw) // 2:]
+    path.write_bytes(bytes(raw))
+    assert history.load_tests(tmp_path, meta.id) is None
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and meta.id in err
+
+
 def test_a_run_with_no_meta_file_does_not_exist(tmp_path):
     meta = _meta(history.new_run_id())
     history.write_run(tmp_path, meta, _data())
@@ -559,12 +577,24 @@ def test_the_machine_id_uses_the_jacked_home_by_default(tmp_path, monkeypatch):
 
 
 def test_the_machine_id_holds_no_part_of_the_host_name(tmp_path, monkeypatch):
-    monkeypatch.setattr(socket, "gethostname", lambda: "abc123def")
+    # The fake name has letters outside 0-9a-f, so random hex cannot hold it by chance.
+    calls: list[str] = []
+
+    def recorder(name):
+        def fake(*args, **kwargs):
+            calls.append(name)
+            return "zqxhost.lan"
+        return fake
+
+    monkeypatch.setattr(socket, "gethostname", recorder("gethostname"))
+    monkeypatch.setattr(socket, "getfqdn", recorder("getfqdn"))
+    monkeypatch.setattr(platform, "node", recorder("node"))
     made = tree.machine_id(tmp_path)
     text = (tmp_path / ".claude" / "jacked-tests-machine-id").read_bytes().decode("ascii")
-    for part in ("abc123def", "abc", "123", "def", socket.gethostname()):
+    assert calls == []
+    for part in ("zqxhost.lan", "zqxhost"):
         assert part not in text
-    assert re.fullmatch(r"[0-9a-f]{32}\n?", text) and made == text.strip()
+    assert re.fullmatch(r"[0-9a-f]{32}\n", text) and made == text.strip()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows has no POSIX mode bits")

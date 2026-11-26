@@ -20,6 +20,7 @@ import json
 import re
 import secrets
 import sys
+import zlib
 from collections.abc import Iterable, Iterator
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -199,7 +200,7 @@ def load_tests(store: Path, run_id: str) -> RunData | None:
         raw = json.loads(gzip.decompress((Path(store) / RUNS / name).read_bytes()))
     except FileNotFoundError:
         return None
-    except (OSError, ValueError, EOFError) as exc:
+    except (OSError, ValueError, EOFError, zlib.error) as exc:
         _warn(name, exc)
         return None
     try:
