@@ -1491,11 +1491,22 @@ class TestEveryBatchSurvivesAnyProfilePath:
         monkeypatch.setattr(batch_programs.tempfile, "tempdir", str(folder))
         monkeypatch.setitem(_BINS, "jacked", str(folder / "jacked.exe"))
         monkeypatch.setattr("jacked.findbin.find_bin", lambda name, **kw: _BINS.get(name))
+        # After the non-ASCII lines: a label, a goto, an `if errorlevel`
+        # branch and a chcp check. cmd.exe reads each later line again by
+        # its byte offset, so a wrong code page breaks these first.
         body = (
             "@echo off\r\n"
-            'echo ok> "%~dp0marker.txt"\r\n'
             'set "NAME=Владимир NUÑEZ"\r\n'
             'echo %NAME%> "%~dp0name.txt"\r\n'
+            "goto :after\r\n"
+            'echo skipped> "%~dp0skipped.txt"\r\n'
+            ":after\r\n"
+            '"%SystemRoot%\\System32\\cmd.exe" /c exit 3\r\n'
+            "if errorlevel 3 goto :branch\r\n"
+            'echo wrong> "%~dp0wrong.txt"\r\n'
+            ":branch\r\n"
+            'for /f "delims=" %%c in (\'"%SystemRoot%\\System32\\chcp.com"\') do echo %%c> "%~dp0cp.txt"\r\n'
+            'echo ok> "%~dp0marker.txt"\r\n'
         )
         path = batch_programs.write_batch(body, "jacked-test-")
         assert str(folder) in path
@@ -1503,5 +1514,8 @@ class TestEveryBatchSurvivesAnyProfilePath:
             [system_program("cmd"), "/c", path], capture_output=True, timeout=60, check=False
         )
         assert result.returncode == 0, result
-        assert (folder / "marker.txt").read_text().strip() == "ok"
         assert (folder / "name.txt").read_bytes().strip() == "Владимир NUÑEZ".encode("utf-8")
+        assert not (folder / "skipped.txt").exists()
+        assert not (folder / "wrong.txt").exists()
+        assert "65001" in (folder / "cp.txt").read_text(encoding="utf-8", errors="replace")
+        assert (folder / "marker.txt").read_text().strip() == "ok"

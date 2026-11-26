@@ -144,6 +144,27 @@ class TestNamesThisReleaseAddedToHeldModules:
         assert env["JACKED_SERVICE_USER"]
         assert len(spec.generation) == 64
 
+    def test_the_builder_comes_from_the_same_load_as_the_allowlist(
+        self, monkeypatch, tmp_path
+    ):
+        """An old held builder must not run with the new allowlist names."""
+        import jacked.service.environment as environment
+        from tests.unit.service.service_contract_support import provision_contract
+
+        def old_builder(*args, **kwargs):
+            raise AssertionError("the held builder of the older module ran")
+
+        import jacked.service.lifecycle as lifecycle
+
+        # The held older module: no allowlist name, an older builder, which
+        # lifecycle bound at its own import.
+        monkeypatch.delattr(environment, "inherited_allowlisted_environment")
+        monkeypatch.setattr(environment, "build_service_environment", old_builder)
+        monkeypatch.setattr(lifecycle, "build_service_environment", old_builder)
+        _spec, env, _paths = provision_contract(tmp_path, monkeypatch)
+        assert environment.build_service_environment is not old_builder
+        assert env["JACKED_SERVICE_USER"]
+
 
 class TestPreloadUpgradeModules:
     def test_the_roots_and_the_supervisor_submodules_are_loaded(self, monkeypatch):

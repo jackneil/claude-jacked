@@ -386,14 +386,19 @@ def test_one_number_ties_the_budget_the_callers_and_the_batches():
     from jacked.cli import main
     from jacked.preflight_cli import preflight_budget
 
-    assert preflight_budget(None) == PREFLIGHT_TIMEOUT_SECONDS == updater.PREFLIGHT_TIMEOUT_SECONDS
+    assert PREFLIGHT_TIMEOUT_SECONDS == updater.PREFLIGHT_TIMEOUT_SECONDS
+    # A 0.111.x caller passes no --timeout and stops the command after 120 s
+    # (its own PREFLIGHT_TIMEOUT_SECONDS). The default must end first.
+    old_caller_limit = 120
+    assert preflight_budget(None) == PREFLIGHT_TIMEOUT_SECONDS - 10
+    assert preflight_budget(None) < old_caller_limit
     assert updater.preflight_argv("j")[-2:] == ["--timeout", str(PREFLIGHT_TIMEOUT_SECONDS)]
     literal = f"jacked service preflight --timeout {PREFLIGHT_TIMEOUT_SECONDS} 2>&1"
     root = Path(__file__).resolve().parents[3]
     assert literal in (root / "jacked/cli.py").read_text(encoding="utf-8")
     assert literal in (root / "jacked/service/updater.py").read_text(encoding="utf-8")
     help_text = CliRunner().invoke(main, ["service", "preflight", "--help"]).output
-    assert f"default {PREFLIGHT_TIMEOUT_SECONDS}" in " ".join(help_text.split())
+    assert f"default {PREFLIGHT_TIMEOUT_SECONDS - 10}" in " ".join(help_text.split())
 
 
 def test_preflight_end_to_end_through_the_real_launcher(tmp_path, monkeypatch):

@@ -473,7 +473,7 @@ def _print_start_failure_breaker(paths) -> None:
     from jacked.service import START_FAILURE_FILENAME, START_FAILURE_LIMIT
     from jacked.service.start_failures import read_start_failures
 
-    if (boot := describe_latest(after_file=paths.manifest)) is not None:
+    if (boot := describe_latest()) is not None:
         console.print(f"  [yellow]Last boot failure: {escape(boot)}[/yellow]", soft_wrap=True)
     now = _t.time()
     # A missing or corrupt breaker file reads as no failures.
@@ -7873,8 +7873,8 @@ def _exit_hard(code: int) -> None:
     default=None,
     type=float,
     help=(
-        "The time budget of the whole command, in seconds (default 120, the "
-        "upgrade helper's timeout). Provisioning and the boot probe share it. "
+        "The time budget of the whole command, in seconds (default 110, under an "
+        "old upgrade helper's 120 s timeout). Provisioning and the probe share it. "
         "When it ends, the command fails with exit code 1."
     ),
 )

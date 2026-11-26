@@ -8,6 +8,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from typing import Callable
 
 from jacked import __version__
@@ -146,9 +147,17 @@ def default_environment(
     user_id: str,
     inherited_allowlisted: dict[str, str] | None = None,
     platform: str | None = None,
+    environment_module: tuple[Any, Any] | None = None,
 ) -> dict[str, str]:
-    return build_service_environment(
-        EnvironmentInputs(
+    """Return the service environment.
+
+    ``environment_module`` is ``(EnvironmentInputs, build_service_environment)``
+    from one load of ``jacked.service.environment``, so the caller can take
+    them in the same ``names_from`` call as the allowlist names.
+    """
+    inputs_type, build = environment_module or (EnvironmentInputs, build_service_environment)
+    return build(
+        inputs_type(
             home=home,
             user_id=user_id,
             platform=sys.platform if platform is None else platform,
@@ -201,8 +210,12 @@ def provision_service_contract(
     # jacked.mixed_generation), so the import reloads a held copy that lacks it.
     from jacked.mixed_generation import names_from
 
-    (inherited_allowlisted_environment,) = names_from(
-        "jacked.service.environment", "inherited_allowlisted_environment"
+    # One call, so the allowlist and the builder come from the same module load.
+    inputs_type, build, inherited_allowlisted_environment = names_from(
+        "jacked.service.environment",
+        "EnvironmentInputs",
+        "build_service_environment",
+        "inherited_allowlisted_environment",
     )
     inherited = inherited_allowlisted_environment(selected_platform)
     environment = default_environment(
@@ -210,6 +223,7 @@ def provision_service_contract(
         user_id=current_user_identity(),
         inherited_allowlisted=inherited,
         platform=selected_platform,
+        environment_module=(inputs_type, build),
     )
     # Preserve the virtualenv entrypoint. Resolving this symlink selects the
     # base interpreter, which cannot import the tool environment under -I.

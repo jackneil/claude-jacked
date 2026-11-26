@@ -61,18 +61,50 @@ def test_service_status_prints_the_newest_entry(tmp_path, capsys):
     assert "1970-01-01T00:00:00Z" in out
 
 
-def test_an_entry_older_than_the_live_service_start_is_not_shown(tmp_path):
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text("{}", encoding="utf-8")
-    os.utime(manifest, (1000, 1000))
+def test_a_failure_then_an_ok_start_then_a_stop_shows_nothing(tmp_path):
+    """A clean stop deletes the manifest; the OK line still hides the failure."""
     record("Traceback\nImportError: old\n", now=500)
-    assert boot_failure.describe_latest(after_file=manifest) is None
+    assert "ImportError: old" in boot_failure.describe_latest()
+    boot_failure.record_started(now=600)
+    # The service stops cleanly: nothing else changes in the log.
+    assert boot_failure.describe_latest() is None
     record("Traceback\nImportError: new\n", now=2000)
-    assert "ImportError: new" in boot_failure.describe_latest(after_file=manifest)
-    assert "ImportError: new" in boot_failure.describe_latest(after_file=tmp_path / "none")
+    assert "ImportError: new" in boot_failure.describe_latest()
 
 
-def test_on_windows_the_log_gets_the_private_acl_best_effort(tmp_path, monkeypatch):
+def test_an_ok_start_adds_a_line_only_after_a_failure(tmp_path):
+    log = tmp_path / "boot.log"
+    boot_failure.record_started(path=log, now=1)
+    assert not log.exists()
+    record("Traceback\nImportError: x\n", path=log, now=2)
+    boot_failure.record_started(path=log, now=3)
+    boot_failure.record_started(path=log, now=4)
+    assert log.read_text(encoding="utf-8").count(boot_failure.OK_MARK) == 1
+
+
+def test_the_limit_counts_utf8_bytes(tmp_path):
+    log = tmp_path / "boot.log"
+    chunk = "Ж" * (MAX_BYTES // 6)  # two bytes each
+    for index in range(4):
+        record(chunk, path=log, now=index)
+    assert len(log.read_bytes()) <= MAX_BYTES
+    record("Ж" * MAX_BYTES, path=log, now=9)
+    data = log.read_bytes()
+    assert len(data) <= MAX_BYTES
+    data.decode("utf-8")  # the cut never splits a character
+
+
+def test_a_failed_write_says_so_on_stderr_and_raises(tmp_path, monkeypatch, capsys):
+    def refuse(*args, **kwargs):
+        raise PermissionError("refused")
+
+    monkeypatch.setattr("jacked.atomic_io.atomic_write_text", refuse)
+    with pytest.raises(PermissionError):
+        record("Traceback\nImportError: x\n", path=tmp_path / "boot.log", now=0)
+    assert "could not write the boot-failure log" in capsys.readouterr().err
+
+
+def test_on_windows_the_log_gets_the_private_acl_best_effort(tmp_path, monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(boot_failure, "_IS_WINDOWS", True)
     monkeypatch.setattr(
@@ -87,3 +119,4 @@ def test_on_windows_the_log_gets_the_private_acl_best_effort(tmp_path, monkeypat
     monkeypatch.setattr("jacked.service.windows_security.secure_windows_path", fail)
     record("Traceback\nImportError: y\n", path=tmp_path / "boot.log", now=1)
     assert latest(path=tmp_path / "boot.log")[1] == "ImportError: y"
+    assert "could not set the private ACL" in capsys.readouterr().err

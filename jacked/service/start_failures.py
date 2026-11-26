@@ -94,3 +94,16 @@ def clear_start_failures(path: Path) -> None:
         path.unlink()
     except FileNotFoundError:
         return
+
+
+def record_ready_start(path: Path) -> None:
+    """Record a start that reached "Service ready".
+
+    It adds a "started OK" line to the boot-failure log, which hides an
+    older boot failure in ``jacked service status``. Then it clears the
+    start-failure memory at ``path``. Only the log line never raises.
+    """
+    from jacked.boot_failure import record_started
+
+    record_started()
+    clear_start_failures(path)

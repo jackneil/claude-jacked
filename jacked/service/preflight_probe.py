@@ -70,6 +70,12 @@ PREFLIGHT_TIMEOUT_SECONDS = 120
 #: The caller waits this much longer than the budget, so the command reports
 #: its own named failure before the caller's timeout stops it.
 PREFLIGHT_EXIT_GRACE_SECONDS = 30
+#: The budget of ``jacked service preflight`` with no ``--timeout``. A 0.111.x
+#: upgrade path runs the command with no ``--timeout`` and stops it after its
+#: own 120 seconds. The default ends 10 seconds before that, so the command
+#: stops its probe and reports before the old caller kills it (which would
+#: leave the probe process behind). The new callers pass ``--timeout``.
+PREFLIGHT_DEFAULT_BUDGET_SECONDS = PREFLIGHT_TIMEOUT_SECONDS - 10
 
 
 def preflight_argv(jacked: str) -> list[str]:
@@ -341,6 +347,7 @@ def _with_stderr(result: ProbeResult, stderr: str, path: Path) -> ProbeResult:
 
 
 __all__ = [
+    "PREFLIGHT_DEFAULT_BUDGET_SECONDS",
     "PREFLIGHT_EXIT_GRACE_SECONDS",
     "PREFLIGHT_TIMEOUT_SECONDS",
     "preflight_argv",
