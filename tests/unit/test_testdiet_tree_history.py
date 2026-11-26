@@ -8,16 +8,19 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import os
 import platform
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -178,6 +181,91 @@ def test_each_git_call_of_tree_id_has_optional_locks_off(repo, monkeypatch):
     assert tree.tree_id(repo).clean is False
     assert len(envs) >= 3
     assert all(env.get("GIT_OPTIONAL_LOCKS") == "0" for env in envs)
+
+
+def test_tree_id_leaves_no_temporary_folder(repo, tmp_path, monkeypatch):
+    temp_root = tmp_path / "temp-root"
+    temp_root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+    (repo / "README.md").write_bytes(b"dirty, so git writes loose objects\n")
+    (repo / "new.txt").write_bytes(b"new\n")
+    assert tree.tree_id(repo).clean is False
+    assert list(temp_root.iterdir()) == []
+
+
+def test_a_caller_folder_of_objects_stays_after_tree_id(repo, tmp_path):
+    objects = tmp_path / "kept-objects"
+    (repo / "README.md").write_bytes(b"dirty\n")
+    tid = tree.tree_id(repo, objects=objects)
+    assert any(p.is_file() for p in objects.rglob("*"))
+    tree.remove_tree(objects)
+    assert not objects.exists()
+    assert tid.clean is False
+
+
+def test_remove_tree_removes_a_read_only_file(tmp_path):
+    folder = tmp_path / "objects"
+    (folder / "ab").mkdir(parents=True)
+    loose = folder / "ab" / "cdef"
+    loose.write_bytes(b"object")
+    os.chmod(loose, stat.S_IREAD)
+    if os.name != "nt":
+        os.chmod(folder / "ab", stat.S_IREAD | stat.S_IEXEC)
+    tree.remove_tree(folder)
+    assert not folder.exists()
+    tree.remove_tree(folder)  # a missing folder is not an error
+
+
+def test_remove_tree_logs_a_path_that_it_cannot_remove(tmp_path, monkeypatch, caplog):
+    folder = tmp_path / "stuck"
+    folder.mkdir()
+    (folder / "file").write_bytes(b"x")
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "refused")
+
+    monkeypatch.setattr(os, "unlink", refuse)
+    with caplog.at_level(logging.WARNING, logger="jacked.testdiet.tree"):
+        tree.remove_tree(folder)
+    assert any("cannot remove" in r.getMessage() and "file" in r.getMessage() for r in caplog.records)
+
+
+def test_tree_id_is_empty_when_the_temporary_folder_cannot_be_made(repo, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "refused")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", refuse)
+    assert tree.tree_id(repo) is None
+
+
+def _sparse_repo(repo: Path) -> Path:
+    (repo / "in").mkdir()
+    (repo / "out").mkdir()
+    (repo / "in" / "a.txt").write_bytes(b"a\n")
+    (repo / "out" / "b.txt").write_bytes(b"b\n")
+    _commit_all(repo, "two folders")
+    _git(repo, "sparse-checkout", "set", "in")
+    assert not (repo / "out" / "b.txt").exists()
+    return repo
+
+
+def test_a_clean_sparse_checkout_has_the_head_tree(repo):
+    _sparse_repo(repo)
+    tid = tree.tree_id(repo)
+    assert tid == TreeId(commit=_git(repo, "rev-parse", "HEAD"),
+                         tree=_git(repo, "rev-parse", "HEAD^{tree}"), clean=True)
+
+
+def test_an_untracked_file_outside_the_sparse_cone_is_in_the_tree(repo, tmp_path):
+    _sparse_repo(repo)
+    objects = tmp_path / "objects"
+    clean = tree.tree_id(repo, objects=objects)
+    (repo / "out").mkdir(exist_ok=True)
+    (repo / "out" / "new.txt").write_bytes(b"new\n")
+    dirty = tree.tree_id(repo, objects=objects)
+    assert dirty is not None and dirty.clean is False
+    # The tracked file that the cone leaves out is not staged as deleted.
+    assert tree.changed_paths(repo, clean, dirty, objects=objects) == ["out/new.txt"]
 
 
 def test_a_repository_with_no_commit_has_no_tree(tmp_path, hermetic_git):
@@ -363,6 +451,11 @@ def test_the_tests_file_is_written_before_the_meta_file(tmp_path, monkeypatch):
 
 
 def test_two_processes_write_runs_at_once_and_both_are_readable(tmp_path):
+    """Two real processes write 25 runs each into one store, behind a start barrier.
+
+    It proves that the run IDs are unique and that no run holds the data of
+    another run (no cross-talk). It does not prove each order of the writes.
+    """
     script = textwrap.dedent("""
         import sys
         import time
@@ -394,7 +487,8 @@ def test_two_processes_write_runs_at_once_and_both_are_readable(tmp_path):
             [sys.executable, "-c", script, str(REPO_ROOT), str(tmp_path / "store"), label, str(ready),
              str(go)], stdin=subprocess.DEVNULL)))
     try:
-        while not all(ready.exists() for ready, _ in procs):
+        deadline = time.monotonic() + 120
+        while not all(ready.exists() for ready, _ in procs) and time.monotonic() < deadline:
             if any(proc.poll() is not None for _, proc in procs):
                 break
             time.sleep(0.005)
@@ -458,6 +552,77 @@ def test_prune_deletes_only_runs_before_the_date_and_names_them(tmp_path):
     assert history.prune(tmp_path, date(2026, 11, 25)) == []
 
 
+def test_prune_spares_a_tests_file_with_no_meta_file_that_is_younger_than_a_day(tmp_path):
+    writing = history.new_run_id()
+    history.write_run(tmp_path, _meta(writing), _data())
+    (tmp_path / "runs" / f"{writing}.meta.json").unlink()  # the writer has not written it yet
+    complete = history.new_run_id()
+    history.write_run(tmp_path, _meta(complete), _data())
+    assert history.prune(tmp_path, date(2100, 1, 1)) == [complete]
+    assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == [f"{writing}.tests.json.gz"]
+
+
+def test_prune_deletes_a_tests_file_with_no_meta_file_that_is_older_than_a_day(tmp_path):
+    stopped = "20261120T100000000000Z-0000000f"
+    history.write_run(tmp_path, _meta(stopped), _data())
+    (tmp_path / "runs" / f"{stopped}.meta.json").unlink()
+    now = datetime(2026, 11, 21, 10, 0, 1, tzinfo=timezone.utc)
+    assert history.prune(tmp_path, date(2026, 11, 25), now=now) == [stopped]
+    assert list((tmp_path / "runs").iterdir()) == []
+    history.write_run(tmp_path, _meta(stopped), _data())
+    (tmp_path / "runs" / f"{stopped}.meta.json").unlink()
+    young = datetime(2026, 11, 21, 9, 59, 59, tzinfo=timezone.utc)
+    assert history.prune(tmp_path, date(2026, 11, 25), now=young) == []
+
+
+def test_a_prune_failure_names_the_file_and_keeps_the_deleted_ids(tmp_path, monkeypatch):
+    ids = ["20261120T100000000000Z-00000001", "20261121T100000000000Z-00000002",
+           "20261122T100000000000Z-00000003"]
+    for run_id in ids:
+        history.write_run(tmp_path, _meta(run_id), _data())
+    real_unlink = Path.unlink
+
+    def unlink(self, *args, **kwargs):
+        if self.name == f"{ids[1]}.meta.json":
+            raise PermissionError(13, "refused")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(history.PruneError) as caught:
+        history.prune(tmp_path, date(2026, 11, 25))
+    assert caught.value.deleted == [ids[0], ids[2]]
+    assert caught.value.failed == [(f"{ids[1]}.meta.json", "PermissionError")]
+    assert f"{ids[1]}.meta.json" in str(caught.value)
+    assert [r.id for r in history.iter_runs(tmp_path)] == [ids[1]]
+    assert history.load_tests(tmp_path, ids[1]) == _data()
+
+
+def test_a_tree_with_a_wrong_sub_field_reads_as_no_tree(tmp_path):
+    for bad in ({"commit": "c" * 40, "tree": "d" * 40}, {"commit": "c" * 40, "tree": 5, "clean": True},
+                {"commit": "not hex", "tree": "d" * 40, "clean": True},
+                {"commit": "c" * 40, "tree": "d" * 40, "clean": "yes"}, "a text"):
+        store = tmp_path / str(abs(hash(str(bad))))
+        meta = _meta(history.new_run_id())
+        history.write_run(store, meta, None)
+        path = store / "runs" / f"{meta.id}.meta.json"
+        raw = json.loads(path.read_bytes())
+        raw["tree"] = bad
+        path.write_bytes(json.dumps(raw).encode("utf-8"))
+        [back] = history.iter_runs(store)
+        assert back.tree is None and back.label == "gate"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a symbolic link needs a privilege on Windows")
+def test_a_meta_file_that_is_not_a_regular_file_is_skipped(tmp_path, capsys):
+    meta = _meta(history.new_run_id())
+    history.write_run(tmp_path, meta, None)
+    path = tmp_path / "runs" / f"{meta.id}.meta.json"
+    path.unlink()
+    path.mkdir()
+    assert list(history.iter_runs(tmp_path)) == []
+    assert meta.id in capsys.readouterr().err
+
+
 def test_the_tests_file_holds_no_failure_message(tmp_path):
     history.write_run(tmp_path, _meta(history.new_run_id()), _data())
     raw = gzip.decompress(next((tmp_path / "runs").glob("*.tests.json.gz")).read_bytes())
@@ -468,9 +633,13 @@ def test_the_tests_file_holds_no_failure_message(tmp_path):
 # --------------------------------------------------------------------------- verdicts and hashes
 
 
-def _run_data(failed: int | None, passed: int = 3) -> RunData | None:
+def _run_data(failed: int | str | None, passed: int = 3) -> RunData | None:
     if failed is None:
         return None
+    if failed == "all-skipped":
+        return RunData(runner="pytest", seconds_reported=None, tests=tuple(
+            CaseResult(id=f"s{n}", file=None, seconds=None, state="skipped", failure_type=None,
+                       attempts=1) for n in range(3)))
     tests = [CaseResult(id=f"p{n}", file=None, seconds=None, state="passed", failure_type=None,
                         attempts=1) for n in range(passed)]
     tests += [CaseResult(id=f"f{n}", file=None, seconds=None, state="failed",
@@ -479,7 +648,8 @@ def _run_data(failed: int | None, passed: int = 3) -> RunData | None:
 
 
 @pytest.mark.parametrize("code,failed,expected", [(0, 0, "passed"), (1, 2, "failed"), (1, 0, "failed"),
-                         (0, 2, "conflict"), (0, None, "no-data"), (None, 0, "unknown"), (None, 2, "unknown")])
+                         (0, 2, "conflict"), (0, None, "no-data"), (None, 0, "unknown"), (None, 2, "unknown"),
+                         (0, "all-skipped", "no-data")])
 def test_verdict_of(code, failed, expected):  # failed None means no report
     assert history.verdict_of(code, _run_data(failed)) == expected
 
@@ -505,6 +675,11 @@ def test_the_failing_signature_differs_when_the_failure_type_differs():
     assert a != history.failing_signature([case("t1", "TypeError"), case("t2", "KeyError")])
     assert history.failing_signature([case("t1", "x", state="passed")]) is None
     assert history.failing_signature([]) is None
+
+
+def test_the_command_sha_of_a_lone_surrogate_is_a_hash_not_an_error():
+    assert re.fullmatch(r"[0-9a-f]{64}", tree.command_sha(["\ud800"]))
+    assert tree.command_sha(["\ud800"]) != tree.command_sha(["\ud801"])
 
 
 def test_the_command_sha_differs_when_one_argument_is_split_in_two():
@@ -558,6 +733,41 @@ def test_the_machine_id_is_made_one_time_and_read_back(tmp_path):
     assert path.read_bytes().decode("ascii").strip() == first
     assert tree.machine_id(tmp_path) == first
     assert tree.machine_id(tmp_path / "other") != first
+
+
+def test_two_processes_that_make_the_machine_id_at_once_get_one_id(tmp_path):
+    script = textwrap.dedent("""
+        import sys, time
+        sys.path.insert(0, sys.argv[1])
+        from pathlib import Path
+        from jacked.testdiet import tree
+        Path(sys.argv[3]).touch()
+        while not Path(sys.argv[4]).exists():
+            time.sleep(0.001)
+        print(tree.machine_id(Path(sys.argv[2])))
+    """)
+    go = tmp_path / "go"
+    procs = []
+    for n in range(4):
+        ready = tmp_path / f"ready-{n}"
+        procs.append((ready, subprocess.Popen(
+            [sys.executable, "-c", script, str(REPO_ROOT), str(tmp_path / "home"), str(ready), str(go)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)))
+    try:
+        deadline = time.monotonic() + 120
+        while not all(ready.exists() for ready, _ in procs) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        go.touch()
+        outs = [proc.communicate(timeout=120)[0].strip() for _, proc in procs]
+    finally:
+        for _, proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    assert [proc.returncode for _, proc in procs] == [0, 0, 0, 0]
+    assert len(set(outs)) == 1 and re.fullmatch(r"[0-9a-f]{32}", outs[0])
+    folder = tmp_path / "home" / ".claude"
+    assert sorted(p.name for p in folder.iterdir()) == ["jacked-tests-machine-id"]
 
 
 def test_the_machine_id_is_empty_when_the_file_cannot_be_read_or_made(tmp_path):

@@ -17,15 +17,17 @@ import dataclasses
 import gzip
 import hashlib
 import json
+import os
 import re
 import secrets
 import sys
 import zlib
 from collections.abc import Iterable, Iterator
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from jacked.atomic_io import atomic_write_bytes
+from jacked.regular_file import open_regular_fd
 from jacked.testdiet.model import CaseResult, RunData, RunMeta, TreeId
 
 RUNS = "runs"
@@ -35,9 +37,15 @@ TESTS_SUFFIX = ".tests.json.gz"
 RUN_ID_RE = re.compile(r"(\d{8})T\d{12}Z-[0-9a-f]{8}")
 
 _FAILING_STATES = ("failed", "error")
+_RAN_STATES = ("passed", "flaky")
+#: A tests file with no meta file is a write that is in progress or that
+#: stopped. A write takes milliseconds, so ``prune`` deletes such a file only
+#: when its run ID is older than this margin. It is a margin for a live
+#: writer, not a limit on data.
+ORPHAN_AGE = timedelta(hours=24)
+_HEX_ID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _META_FIELDS = tuple(f.name for f in dataclasses.fields(RunMeta))
 _CASE_FIELDS = tuple(f.name for f in dataclasses.fields(CaseResult))
-_TREE_FIELDS = tuple(f.name for f in dataclasses.fields(TreeId))
 _TUPLE_FIELDS = ("failing", "flaky")
 _INT_FIELDS = ("exit_code",)
 _NUMBER_FIELDS = ("wall_seconds", "seconds_reported", "load_start", "load_end", "child_cpu_seconds")
@@ -46,6 +54,30 @@ _BOOL_FIELDS = ("tree_changed", "on_default_branch")
 
 class DamagedRecordError(ValueError):
     """A file of the store cannot be read as a record."""
+
+
+class PruneError(OSError):
+    """``prune`` could not delete some files.
+
+    ``deleted`` holds the run IDs that are gone. ``failed`` holds each file
+    name that stays, with the class name of its error.
+    """
+
+    def __init__(self, deleted: list[str], failed: list[tuple[str, str]]):
+        names = ", ".join(f"{name} ({error})" for name, error in failed)
+        super().__init__(f"prune could not delete {len(failed)} file(s): {names}")
+        self.deleted = deleted
+        self.failed = failed
+
+
+def _read(path: Path) -> bytes:
+    """Read a store file. A path that is not a regular file raises ``NotRegularFileError``."""
+    with os.fdopen(open_regular_fd(path), "rb") as handle:
+        return handle.read()
+
+
+def _id_time(run_id: str) -> datetime:
+    return datetime.strptime(run_id[:21], "%Y%m%dT%H%M%S%f").replace(tzinfo=timezone.utc)
 
 
 def new_run_id(now: datetime | None = None) -> str:
@@ -80,9 +112,10 @@ def verdict_of(exit_code: int | None, data: RunData | None) -> str:
     """Return the verdict of a run.
 
     "unknown": no exit code. "failed": an exit code that is not 0.
-    "no-data": exit code 0 and no report, or a report with no test.
-    "conflict": exit code 0 and a failed or an error test. "passed": all
-    other runs.
+    "no-data": exit code 0 and no report, or a report in which no test
+    ran (no test, or only skipped tests). "conflict": exit code 0 and a
+    failed or an error test. "passed": exit code 0, no failed and no error
+    test, and at least one test that passed (a flaky test passed too).
     """
     if exit_code is None:
         return "unknown"
@@ -92,6 +125,8 @@ def verdict_of(exit_code: int | None, data: RunData | None) -> str:
         return "no-data"
     if any(case.state in _FAILING_STATES for case in data.tests):
         return "conflict"
+    if not any(case.state in _RAN_STATES for case in data.tests):
+        return "no-data"
     return "passed"
 
 
@@ -138,9 +173,7 @@ def _meta_from(run_id: str, raw) -> RunMeta:
         elif value is None:
             pass
         elif name == "tree":
-            if not isinstance(value, dict) or not all(k in value for k in _TREE_FIELDS):
-                raise DamagedRecordError("tree is not a tree identity")
-            value = TreeId(**{k: value[k] for k in _TREE_FIELDS})
+            value = _tree_from(value)
         elif name == "counts":
             if not isinstance(value, dict) or not all(_is(v, int) for v in value.values()):
                 raise DamagedRecordError("counts is not a map of numbers")
@@ -157,6 +190,18 @@ def _meta_from(run_id: str, raw) -> RunMeta:
             raise DamagedRecordError(f"{name} is not text")
         values[name] = value
     return RunMeta(**values)
+
+
+def _tree_from(value) -> TreeId | None:
+    """A tree identity, or None when a sub-field is missing or has the wrong type."""
+    if not isinstance(value, dict):
+        return None
+    commit, tree_hash, clean = value.get("commit"), value.get("tree"), value.get("clean")
+    if not (isinstance(commit, str) and _HEX_ID_RE.fullmatch(commit)
+            and isinstance(tree_hash, str) and _HEX_ID_RE.fullmatch(tree_hash)
+            and isinstance(clean, bool)):
+        return None
+    return TreeId(commit=commit, tree=tree_hash, clean=clean)
 
 
 def _warn(name: str, exc: Exception) -> None:
@@ -181,7 +226,7 @@ def iter_runs(store: Path) -> Iterator[RunMeta]:
             continue
         name = f"{run_id}{META_SUFFIX}"
         try:
-            meta = _meta_from(run_id, json.loads((runs / name).read_bytes()))
+            meta = _meta_from(run_id, json.loads(_read(runs / name)))
         except FileNotFoundError:
             continue  # pruned while the list was read
         except (OSError, ValueError, TypeError) as exc:
@@ -197,7 +242,7 @@ def load_tests(store: Path, run_id: str) -> RunData | None:
     """
     name = f"{_check_id(run_id)}{TESTS_SUFFIX}"
     try:
-        raw = json.loads(gzip.decompress((Path(store) / RUNS / name).read_bytes()))
+        raw = json.loads(gzip.decompress(_read(Path(store) / RUNS / name)))
     except FileNotFoundError:
         return None
     except (OSError, ValueError, EOFError, zlib.error) as exc:
@@ -211,28 +256,51 @@ def load_tests(store: Path, run_id: str) -> RunData | None:
         return None
 
 
-def prune(store: Path, before: date) -> list[str]:
+def prune(store: Path, before: date, *, now: datetime | None = None) -> list[str]:
     """Delete each run whose UTC date is before ``before``. Return the deleted run IDs, sorted.
 
-    The meta file goes first, so a run never shows with no tests. A tests
-    file with no meta file (a write that stopped) goes too. A file that is
-    not a run file stays.
+    For a complete run, the meta file goes first, so the run is gone in one
+    step, and then its tests file. A tests file with no meta file is a write
+    that is in progress or that stopped: it goes only when its run ID is
+    also more than 24 hours (``ORPHAN_AGE``) before ``now``. A file that is
+    not a run file stays. When a file cannot be deleted, the other files
+    still go, and then ``PruneError`` names each file that stays and holds
+    the deleted IDs.
     """
     runs = Path(store) / RUNS
     try:
-        names = [p.name for p in runs.iterdir()]
+        names = set(os.listdir(runs))
     except FileNotFoundError:
         return []
     limit = f"{before:%Y%m%d}"
-    doomed: dict[str, list[str]] = {}
+    orphan_limit = (now or datetime.now(timezone.utc)) - ORPHAN_AGE
+    found: dict[str, set[str]] = {}
     for name in names:
         for suffix in (META_SUFFIX, TESTS_SUFFIX):
-            if name.endswith(suffix):
-                match = RUN_ID_RE.fullmatch(name[: -len(suffix)])
-                if match and match.group(1) < limit:
-                    doomed.setdefault(name[: -len(suffix)], []).append(suffix)
-    for run_id, suffixes in doomed.items():
+            run_id = name[: -len(suffix)]
+            if name.endswith(suffix) and (match := RUN_ID_RE.fullmatch(run_id)):
+                if match.group(1) < limit:
+                    found.setdefault(run_id, set()).add(suffix)
+    deleted: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for run_id in sorted(found):
+        suffixes = found[run_id]
+        if META_SUFFIX not in suffixes and _id_time(run_id) >= orphan_limit:
+            continue  # a write can still be in progress
+        gone = False
         for suffix in (META_SUFFIX, TESTS_SUFFIX):
-            if suffix in suffixes:
+            if suffix not in suffixes:
+                continue
+            try:
                 (runs / f"{run_id}{suffix}").unlink(missing_ok=True)
-    return sorted(doomed)
+            except OSError as exc:
+                failed.append((f"{run_id}{suffix}", type(exc).__name__))
+                if suffix == META_SUFFIX:
+                    break  # the run still exists; keep its tests file
+            else:
+                gone = True
+        if gone:
+            deleted.append(run_id)
+    if failed:
+        raise PruneError(deleted, failed)
+    return deleted

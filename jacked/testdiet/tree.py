@@ -9,7 +9,10 @@ Limits of the identity: it does not hold a file that git ignores, and it does
 not hold a change inside the work tree of a submodule. ``inputs_fingerprint``
 adds named files to a record. The clean and smudge filters stay on, so the
 hash is equal to the tree of a commit. With git-lfs, the clean filter can
-write a copy of a new large file into the lfs folder of the clone.
+write a copy of a new large file into the lfs folder of the clone. In a
+sparse checkout, ``git add -A --sparse`` adds a file outside the sparse cone
+too, and a tracked file that the cone leaves out of the work tree stays as
+HEAD has it, so the hash is the tree of a full commit of the work tree.
 """
 
 from __future__ import annotations
@@ -21,7 +24,9 @@ import logging
 import os
 import secrets
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -48,6 +53,8 @@ _GIT_TIMEOUT_S = 600.0
 # split index keeps part of the index in a second file of the git directory;
 # with this value git writes the copy as one file and never touches that one.
 _INDEX_COPY_ARGS = ("-c", "core.splitIndex=false")
+# A failure of the work-tree read is logged at WARNING one time in each process.
+_warned_add = False
 # The size of the machine identity, in random bytes (32 hex characters).
 _MACHINE_ID_BYTES = 16
 
@@ -108,9 +115,20 @@ def tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
     """
     try:
         return _tree_id(Path(cwd), objects)
-    except TreeError as exc:
-        logger.debug("tree_id: no tree identity (%s)", exc)
+    except _AddError as exc:
+        global _warned_add
+        level = logging.DEBUG if _warned_add else logging.WARNING
+        _warned_add = True
+        logger.log(level, "tree_id: no tree identity, the work tree read failed (%s)", exc)
         return None
+    except (TreeError, OSError) as exc:
+        logger.debug("tree_id: no tree identity (%s)", type(exc).__name__ if isinstance(exc, OSError)
+                     else exc)
+        return None
+
+
+class _AddError(TreeError):
+    """``git add`` or ``git write-tree`` on the copy of the index failed."""
 
 
 def _tree_id(cwd: Path, objects: Path | None) -> TreeId | None:
@@ -143,16 +161,51 @@ def _tree_id(cwd: Path, objects: Path | None) -> TreeId | None:
             "GIT_OBJECT_DIRECTORY": str(object_dir),
             "GIT_ALTERNATE_OBJECT_DIRECTORIES": _alternates(real_objects),
         }
-        code, _ = _git(cwd, *_INDEX_COPY_ARGS, "add", "-A", env=env)
+        code, _ = _git(cwd, *_INDEX_COPY_ARGS, "add", "-A", "--sparse", env=env)
         if code != 0:
-            raise TreeError(f"git add exited with {code}")
+            raise _AddError(f"git add exited with {code}")
         code, out = _git(cwd, *_INDEX_COPY_ARGS, "write-tree", env=env)
         lines = _lines(out)
         if code != 0 or len(lines) != 1:
-            raise TreeError(f"git write-tree exited with {code}")
+            raise _AddError(f"git write-tree exited with {code}")
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        remove_tree(work)
     return TreeId(commit=commit, tree=lines[0], clean=lines[0] == head_tree)
+
+
+def remove_tree(path: Path) -> None:
+    """Remove the folder ``path`` and all that it holds.
+
+    Git makes its loose objects read-only, and Windows does not delete a
+    read-only file. So a path that cannot be removed gets write permission
+    (and its folder too), and the removal tries again. A path that still
+    cannot be removed is logged at WARNING. A missing folder is not an error.
+    """
+
+    root = os.path.abspath(path)
+
+    def retry(func, failed, exc) -> None:
+        if isinstance(exc, FileNotFoundError):
+            return
+        try:
+            parent = os.path.dirname(os.path.abspath(failed))
+            # Only a folder inside ``path`` gets a new mode, never the folder that holds it.
+            if parent == root or parent.startswith(root + os.sep):
+                os.chmod(parent, stat.S_IRWXU)
+            if os.path.lexists(failed) and not os.path.isdir(failed):
+                os.chmod(failed, stat.S_IREAD | stat.S_IWRITE)
+            elif os.path.isdir(failed):
+                os.chmod(failed, stat.S_IRWXU)
+            func(failed)
+        except FileNotFoundError:
+            return
+        except OSError as again:
+            logger.warning("remove_tree: cannot remove %s (%s)", failed, type(again).__name__)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:
+        shutil.rmtree(path, onerror=lambda func, failed, info: retry(func, failed, info[1]))
 
 
 def _alternates(real_objects: str) -> str:
@@ -176,8 +229,8 @@ def changed_paths(cwd: Path, a: TreeId, b: TreeId, *, objects: Path | None = Non
             raise TreeError("git did not give the object path")
         env = {"GIT_OBJECT_DIRECTORY": str(objects),
                "GIT_ALTERNATE_OBJECT_DIRECTORIES": _alternates(_lines(out)[0])}
-    code, out = _git(cwd, "diff-tree", "-r", "-z", "--name-only", "--no-renames", a.tree, b.tree,
-                     env=env)
+    code, out = _git(cwd, "diff-tree", "-r", "-z", "--name-only", "--no-renames", "--end-of-options",
+                     a.tree, b.tree, env=env)
     if code != 0:
         raise TreeError(f"git diff-tree exited with {code}; a tree object can be missing")
     return sorted(os.fsdecode(name) for name in out.split(b"\0") if name)
@@ -247,7 +300,8 @@ def on_default_branch(cwd: Path, tree: TreeId) -> bool | None:
             return None
         if not tree.clean:
             return False
-        code, _ = _git(cwd, "merge-base", "--is-ancestor", tree.commit, lines[0])
+        code, _ = _git(cwd, "merge-base", "--is-ancestor", "--end-of-options", tree.commit,
+                       lines[0])
     except TreeError as exc:
         logger.debug("on_default_branch: no answer (%s)", exc)
         return None
@@ -261,15 +315,15 @@ def on_default_branch(cwd: Path, tree: TreeId) -> bool | None:
 def command_sha(argv: Sequence[str]) -> str:
     """Return the SHA-256 of the arguments as the caller typed them, joined by a NUL.
 
+    The join is not ambiguous, because an argument of a real command line
+    cannot hold a NUL. The text is UTF-8 with "surrogatepass", so a lone
+    surrogate (from a Windows command line) gives a hash and never an error.
+
     >>> command_sha(["a b"]) == command_sha(["a", "b"])
     False
     """
     text = "\0".join(argv)
-    return hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()
-
-
-class _IdExists(Exception):
-    """The machine identity file exists. The write stops."""
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def machine_id(home: Path | None = None) -> str | None:
@@ -278,8 +332,9 @@ def machine_id(home: Path | None = None) -> str | None:
     The identity is 32 random hex characters in
     ``<home>/.claude/jacked-tests-machine-id``. ``home`` is the jacked home
     when it is not given. The file has mode 0600 where the system has
-    modes. The identity holds no part of the host name. The result is None
-    when the file cannot be read or made, or holds no valid identity.
+    modes. The identity holds no part of the host name. Two processes that
+    make it at the same time get the same identity. The result is None when
+    the file cannot be read or made, or holds no valid identity.
     """
     path = Path(home if home is not None else jacked_home()) / ".claude" / MACHINE_ID_NAME
     try:
@@ -292,18 +347,21 @@ def machine_id(home: Path | None = None) -> str | None:
 
 
 def _make_machine_id(path: Path) -> None:
+    """Make the file with a complete content, or keep the file that another process made.
+
+    The value goes into a private temporary file first. A hard link then puts
+    it at ``path``; the link fails when ``path`` exists, so the first process
+    wins and no reader sees a partial file.
+    """
     value = secrets.token_hex(_MACHINE_ID_BYTES)
-
-    def refuse_when_made() -> None:
-        # A second session can make the file first. Then its value stays.
-        if os.path.lexists(path):
-            raise _IdExists
-
+    temp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    atomic_write_bytes(temp, (value + "\n").encode("ascii"), mode=0o600)
     try:
-        atomic_write_bytes(path, (value + "\n").encode("ascii"), mode=0o600,
-                           before_replace=refuse_when_made)
-    except _IdExists:
+        os.link(temp, path)
+    except FileExistsError:
         pass
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def _read_machine_id(path: Path) -> str | None:
