@@ -61,6 +61,9 @@ def _gate_env(tmp_path: Path, standins: dict[str, bytes]) -> tuple[Path, dict[st
 
     The PATH holds only the stand-in folder and the folder of ``sh``. So a
     stand-in that is not found can never start the real ``jacked`` or ``uv``.
+    The Git for Windows ``sh`` wrapper can put ``/usr/bin`` ahead of this
+    PATH. That folder has no ``jacked`` and no ``uv``, and the exit codes 3
+    and 7 (which only the stand-ins give) prove that the stand-ins ran.
     """
     sh = shutil.which("sh")
     if sh is None:
@@ -159,6 +162,76 @@ def test_each_jacked_tests_command_in_the_reference_exists_in_the_cli(path):
                 if option.startswith("--"):
                     assert option in _options(commands[sub]), f"{path.name}: jacked tests {sub} {option}"
     assert found, f"{path.name} names no jacked tests command"
+
+
+def _usage_lines() -> dict[str, set[str]]:
+    """Return the options of each usage line in the Commands block of the reference."""
+    section = _section("reference")
+    match = re.search(r"\n### Commands\n\n```\n(.*?)```\n", section, re.S)
+    assert match, "the reference needs a usage block directly after ### Commands"
+    usage: dict[str, set[str]] = {}
+    for line in match.group(1).splitlines():
+        found = COMMAND_RE.match(line)
+        assert found, f"not a usage line: {line!r}"
+        sub, tokens = found.group(1), found.group(2).split()
+        assert sub not in usage, f"two usage lines for {sub}"
+        if "--" in tokens:
+            tokens = tokens[:tokens.index("--")]
+        usage[sub] = {tok.strip("[]|").split("=", 1)[0] for tok in tokens if tok.strip("[]|").startswith("--")}
+    return usage
+
+
+def test_each_usage_line_has_exactly_the_options_of_its_command():
+    _, commands = _group()
+    usage = _usage_lines()
+    assert set(usage) == set(commands)
+    for sub, command in commands.items():
+        assert usage[sub] == _options(command) - {"--help"}, sub
+
+
+def _spans_with_context(section: str):
+    """Yield (subcommand or None, inline code span) for each span outside a fenced block.
+
+    A bullet that starts with `jacked tests X` sets the subcommand for itself
+    and for its sub-bullets. A heading or another top-level bullet clears it.
+    """
+    context = None
+    for line in FENCE_RE.sub("", section).splitlines():
+        lead = re.match(r"- `jacked tests ([a-z-]+)", line)
+        if lead:
+            context = lead.group(1)
+        elif line.startswith(("- ", "#")) or (line and not line.startswith(" ")):
+            context = None
+        for span in INLINE_RE.findall(line):
+            yield context, span.strip("`")
+
+
+@pytest.mark.parametrize("name", sorted(DOCS))
+def test_each_option_in_the_prose_is_an_option_of_its_command(name):
+    _, commands = _group()
+    every = set().union(*(_options(c) for c in commands.values()))
+    section = _section(name)
+    runner_flags = section.split("### Runner settings", 1)[1] if "### Runner settings" in section else ""
+    checked = 0
+    for context, span in _spans_with_context(section):
+        tokens = span.split()
+        if tokens[:2] == ["jacked", "tests"]:
+            tokens = tokens[2:]
+        sub = context
+        if tokens and tokens[0] in commands:
+            sub, tokens = tokens[0], tokens[1:]
+        elif not tokens or not tokens[0].startswith("--") or tokens[0] == "--":
+            continue
+        if "{junit}" in span and span in runner_flags:
+            continue  # a flag of the test runner, not of jacked
+        for token in tokens:
+            option = token.strip("[]|").split("=", 1)[0]
+            if not option.startswith("--") or option == "--":
+                continue
+            checked += 1
+            allowed = _options(commands[sub]) if sub else every
+            assert option in allowed, f"{name}: `{span}` ({sub or 'no command'})"
+    assert checked, f"{name}: no option span was checked"
 
 
 @pytest.mark.parametrize("name", sorted(DOCS))

@@ -738,14 +738,14 @@ The dashboard toggle lives at Settings > Features > Statusline.
 
 ### Gate recorder (jacked tests)
 
-A full test gate can take many minutes, and a session often runs it again on a tree that already passed. `jacked tests` records each gate run and answers three questions: did this tree already pass this gate command on this machine, where does the time of the gate go, and which tests does this change remove or weaken. It reads the JUnit XML report of pytest, vitest, jest, Playwright, Go (gotestsum) or cargo-nextest.
+A full test gate can take many minutes. A session often runs it again on a tree that already passed. `jacked tests` records each gate run and answers three questions. Did this tree already pass this gate command on this machine? Where does the time of the gate go? Which tests does this change remove or weaken? It reads the JUnit XML report of pytest, vitest, jest, Playwright, Go (gotestsum) or cargo-nextest.
 
 ```bash
 jacked tests run --kind full -- uv run python -m pytest -n auto --junitxml={junit}
 jacked tests seen -- uv run python -m pytest -n auto --junitxml={junit}   # exit 0: this tree passed
 jacked tests profile               # the slowest files and tests of the newest full run
 jacked tests history --size        # verdicts, failing sets, flaky tests, repeat green runs
-jacked tests loss                  # tests that the change removes or weakens, against origin/HEAD
+jacked tests loss                  # tests that the change removes or weakens, against the merge base with origin/HEAD
 jacked tests record --junit report.xml --exit-code 0 --machine ci   # a run that run did not wrap
 jacked tests prune --before 2026-01-01
 ```
@@ -764,9 +764,9 @@ else
 fi
 ```
 
-**Where the history is.** The runs are in the `jacked-tests` folder of the common git directory of the clone (run `git rev-parse --git-common-dir` to find it). All linked worktrees share it, and git never commits it. A run holds test IDs, times, states and the SHA-256 of the command, never a failure message, test output or the command text. Nothing is deleted automatically: run `jacked tests prune --before YYYY-MM-DD`, or delete the `jacked-tests` folder.
+**Where the history is.** The runs are in the `jacked-tests` folder of the common git directory of the clone (run `git rev-parse --git-common-dir` to find it). All linked worktrees share it, and git never commits it. A run holds test IDs, times, states and the SHA-256 of the command, never a failure message, test output or the command text. jacked deletes nothing automatically. To delete runs, run `jacked tests prune --before YYYY-MM-DD`, or delete the `jacked-tests` folder.
 
-**Limits.** `seen` does not see a change to a file that git ignores (give such files with `--input GLOB` to `run` and to `seen`), or a change inside a submodule. A gate that writes a file that git sees cannot prove a tree, so add its cache folders to `.gitignore`. See the "Gate recorder" section of `jacked/data/rules/jacked-reference.md` for each command, the jest-junit settings and the rule for a red gate.
+**Limits.** `seen` does not see a change to a file that git ignores. Give such files with `--input GLOB` to `run` and to `seen`. `seen` also does not see a change inside a submodule. A gate that writes a file that git sees cannot prove a tree. Add the cache folders of the gate to `.gitignore`. See the "Gate recorder" section of `jacked/data/rules/jacked-reference.md` for each command, the jest-junit settings and the rule for a red gate.
 
 ### QA Browser Testing
 
