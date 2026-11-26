@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<testsuites name="vitest tests" tests="8" failures="1" errors="0" time="0.509697125">
+    <testsuite name="src/sample.test.js" timestamp="2026-11-26T13:33:55.287Z" hostname="gate.example" tests="8" failures="1" errors="0" skipped="1" time="0.509697125">
+        <testcase classname="src/sample.test.js" name="passes" time="0.001722875">
+        </testcase>
+        <testcase classname="src/sample.test.js" name="fails" time="0.005125375">
+            <failure message="expected &apos;sample-failure-message&apos; to be &apos;a different value&apos; // Object.is equality" type="AssertionError">
+AssertionError: expected &apos;sample-failure-message&apos; to be &apos;a different value&apos; // Object.is equality
+
+Expected: &quot;a different value&quot;
+Received: &quot;sample-failure-message&quot;
+
+ ❯ src/sample.test.js:8:36
+            </failure>
+        </testcase>
+        <testcase classname="src/sample.test.js" name="skipped" time="0">
+            <skipped/>
+        </testcase>
+        <testcase classname="src/sample.test.js" name="parametrized 1" time="0.00026875">
+        </testcase>
+        <testcase classname="src/sample.test.js" name="parametrized 2" time="0.00009325">
+        </testcase>
+        <testcase classname="src/sample.test.js" name="group &gt; in group" time="0.000244291">
+        </testcase>
+        <testcase classname="src/sample.test.js" name="group &gt; nested &gt; in nested group" time="0.000107166">
+        </testcase>
+        <testcase classname="src/sample.test.js" name="sleeps_half_a_second" time="0.500754709">
+        </testcase>
+    </testsuite>
+</testsuites>

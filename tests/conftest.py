@@ -92,6 +92,12 @@ assert (
 
 
 
+# The sample projects of the test-diet recorder hold real test files of other
+# runners (tests/fixtures/testdiet/projects). They are data, not tests of this
+# suite: tests/fixtures/testdiet/capture.py runs them in a temporary folder.
+collect_ignore_glob = ["fixtures/testdiet/projects/*"]
+
+
 # --------------------------------------------------------------------------- #
 # Tripwire: nothing may replace the pytest process.
 #

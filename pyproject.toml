@@ -124,6 +124,11 @@ markers = [
     "real_process_tree: the test needs the real jacked.service.updater.run_process_tree (opts out of the subprocess.run seam in tests/conftest.py)",
 ]
 
+[tool.ruff]
+# The sample projects of the test-diet recorder are inputs of other runners,
+# kept as a real run wrote them (tests/fixtures/testdiet/capture.py).
+extend-exclude = ["tests/fixtures/testdiet/projects"]
+
 [tool.ruff.lint]
 # Ruff's default rule set before 0.16, pinned so a ruff upgrade never
 # changes what the pre-push hook enforces. Widening it is a deliberate

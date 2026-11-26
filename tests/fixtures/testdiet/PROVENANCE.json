@@ -1,0 +1,466 @@
+{
+  "date": "2026-11-26",
+  "script": "tests/fixtures/testdiet/capture.py",
+  "system": "Darwin arm64",
+  "tools": {
+    "gotestsum": {
+      "version": "1.13.0",
+      "published": "2025-09-11",
+      "asset": "gotestsum_1.13.0_darwin_arm64.tar.gz",
+      "sha256": "509cb27aef747f48faf9bce424f59dcf79572c905204b990ee935bbfcc7fa0e9"
+    },
+    "cargo-nextest": {
+      "version": "0.9.151",
+      "published": "2026-11-03",
+      "asset": "cargo-nextest-0.9.151-universal-apple-darwin.tar.gz",
+      "sha256": "d1d7d025d4bfc9fb154cd76aea3949bd78534829a0589abefa6e5dd4edb135dd"
+    },
+    "python": "3.12.12",
+    "node": "v26.3.0",
+    "npm": "11.16.0",
+    "go": "go version go1.26.4 darwin/arm64",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "uv": "uv 0.10.2 (Homebrew 2026-02-10)"
+  },
+  "python_packages": {
+    "pytest": {
+      "version": "9.2.0",
+      "published": "2026-10-27"
+    },
+    "pytest-rerunfailures": {
+      "version": "16.7",
+      "published": "2026-09-17"
+    }
+  },
+  "npm_packages": {
+    "vitest": {
+      "version": "5.1.0",
+      "published": "2026-11-02"
+    },
+    "jest": {
+      "version": "30.5.2",
+      "published": "2026-09-18"
+    },
+    "jest-junit": {
+      "version": "17.0.0",
+      "published": "2026-04-24"
+    },
+    "@playwright/test": {
+      "version": "1.65.0",
+      "published": "2026-11-05"
+    }
+  },
+  "docs": {
+    "pytest": "https://docs.pytest.org/en/stable/how-to/output.html#creating-junitxml-format-files",
+    "pytest-rerunfailures": "https://github.com/pytest-dev/pytest-rerunfailures#readme",
+    "vitest": "https://vitest.dev/guide/reporters#junit-reporter",
+    "jest-junit": "https://github.com/jest-community/jest-junit#configuration",
+    "playwright": "https://playwright.dev/docs/test-reporters#junit-reporter",
+    "gotestsum": "https://github.com/gotestyourself/gotestsum#junit-xml-output",
+    "nextest": "https://nexte.st/docs/machine-readable/junit/"
+  },
+  "environment": {
+    "CI": "1",
+    "NO_COLOR": "1",
+    "FORCE_COLOR": "0",
+    "TERM": "dumb"
+  },
+  "changes": [
+    "The absolute root of the temporary project is replaced by /work.",
+    "Each hostname attribute is replaced by gate.example."
+  ],
+  "runs": [
+    {
+      "project": "projects/pytest",
+      "commands": [
+        {
+          "kind": "run",
+          "argv": [
+            "python",
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "--rootdir",
+            ".",
+            "--junitxml",
+            "junit.xml",
+            "tests"
+          ],
+          "env": {},
+          "exit_code": 1
+        },
+        {
+          "kind": "list",
+          "argv": [
+            "python",
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "--rootdir",
+            ".",
+            "--collect-only",
+            "-q",
+            "tests"
+          ],
+          "env": {},
+          "exit_code": 0
+        }
+      ],
+      "name": "pytest",
+      "files": [
+        "pytest.list.txt",
+        "pytest.total.txt",
+        "pytest.xml"
+      ]
+    },
+    {
+      "project": "projects/pytest_rerun",
+      "commands": [
+        {
+          "kind": "run",
+          "argv": [
+            "python",
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "--rootdir",
+            ".",
+            "--junitxml",
+            "junit.xml",
+            "--reruns",
+            "1",
+            "tests"
+          ],
+          "env": {},
+          "exit_code": 0
+        }
+      ],
+      "name": "pytest_rerun",
+      "files": [
+        "pytest_rerun.total.txt",
+        "pytest_rerun.xml"
+      ]
+    },
+    {
+      "project": "projects/pytest_import_error",
+      "commands": [
+        {
+          "kind": "run",
+          "argv": [
+            "python",
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "--rootdir",
+            ".",
+            "--junitxml",
+            "junit.xml",
+            "tests"
+          ],
+          "env": {},
+          "exit_code": 2
+        },
+        {
+          "kind": "list",
+          "argv": [
+            "python",
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "--rootdir",
+            ".",
+            "--collect-only",
+            "-q",
+            "tests"
+          ],
+          "env": {},
+          "exit_code": 2
+        }
+      ],
+      "name": "pytest_import_error",
+      "files": [
+        "pytest_import_error.list.txt",
+        "pytest_import_error.total.txt",
+        "pytest_import_error.xml"
+      ]
+    },
+    {
+      "project": "projects/vitest",
+      "commands": [
+        {
+          "kind": "run",
+          "argv": [
+            "npx",
+            "--no-install",
+            "vitest",
+            "run",
+            "--reporter=default",
+            "--reporter=junit",
+            "--outputFile.junit=junit.xml"
+          ],
+          "env": {},
+          "exit_code": 1
+        },
+        {
+          "kind": "list",
+          "argv": [
+            "npx",
+            "--no-install",
+            "vitest",
+            "list",
+            "--no-staticParse"
+          ],
+          "env": {},
+          "exit_code": 0
+        }
+      ],
+      "setup": [
+        "npm install --ignore-scripts --no-audit --no-fund --save-exact",
+        "package.json: vitest@5.1.0"
+      ],
+      "name": "vitest",
+      "files": [
+        "vitest.list.txt",
+        "vitest.total.txt",
+        "vitest.xml"
+      ]
+    },
+    {
+      "project": "projects/jest",
+      "commands": [
+        {
+          "kind": "run",
+          "argv": [
+            "npx",
+            "--no-install",
+            "jest",
+            "--ci",
+            "--reporters=default",
+            "--reporters=jest-junit"
+          ],
+          "env": {
+            "JEST_JUNIT_OUTPUT_DIR": ".",
+            "JEST_JUNIT_OUTPUT_NAME": "junit.xml",
+            "JEST_JUNIT_ADD_FILE_ATTRIBUTE": "true",
+            "JEST_JUNIT_CLASSNAME": "{classname}",
+            "JEST_JUNIT_TITLE": "{title}",
+            "JEST_JUNIT_ANCESTOR_SEPARATOR": " > ",
+            "JEST_JUNIT_REPORT_TEST_SUITE_ERRORS": "true"
+          },
+          "exit_code": 1
+        },
+        {
+          "kind": "list",
+          "argv": [
+            "npx",
+            "--no-install",
+            "jest",
+            "--listTests"
+          ],
+          "env": {},
+          "exit_code": 0
+        }
+      ],
+      "setup": [
+        "npm install --ignore-scripts --no-audit --no-fund --save-exact",
+        "package.json: jest@30.5.2, jest-junit@17.0.0"
+      ],
+      "name": "jest",
+      "files": [
+        "jest.list.txt",
+        "jest.total.txt",
+        "jest.xml"
+      ]
+    },
+    {
+      "project": "projects/playwright",
+      "commands": [
+        {
+          "kind": "run",
+          "argv": [
+            "npx",
+            "--no-install",
+            "playwright",
+            "test",
+            "--reporter=list,junit",
+            "--workers=1"
+          ],
+          "env": {
+            "PLAYWRIGHT_JUNIT_OUTPUT_FILE": "junit.xml"
+          },
+          "exit_code": 1
+        },
+        {
+          "kind": "list",
+          "argv": [
+            "npx",
+            "--no-install",
+            "playwright",
+            "test",
+            "--list"
+          ],
+          "env": {},
+          "exit_code": 0
+        }
+      ],
+      "setup": [
+        "npm install --ignore-scripts --no-audit --no-fund --save-exact",
+        "package.json: @playwright/test@1.65.0"
+      ],
+      "name": "playwright",
+      "files": [
+        "playwright.list.txt",
+        "playwright.total.txt",
+        "playwright.xml"
+      ]
+    },
+    {
+      "project": "projects/playwright_moved",
+      "commands": [
+        {
+          "kind": "run",
+          "argv": [
+            "npx",
+            "--no-install",
+            "playwright",
+            "test",
+            "--reporter=list,junit",
+            "--workers=1"
+          ],
+          "env": {
+            "PLAYWRIGHT_JUNIT_OUTPUT_FILE": "junit.xml"
+          },
+          "exit_code": 1
+        },
+        {
+          "kind": "list",
+          "argv": [
+            "npx",
+            "--no-install",
+            "playwright",
+            "test",
+            "--list"
+          ],
+          "env": {},
+          "exit_code": 0
+        }
+      ],
+      "setup": [
+        "npm install --ignore-scripts --no-audit --no-fund --save-exact",
+        "package.json: @playwright/test@1.65.0"
+      ],
+      "name": "playwright_moved",
+      "files": [
+        "playwright_moved.list.txt",
+        "playwright_moved.total.txt",
+        "playwright_moved.xml"
+      ]
+    },
+    {
+      "project": "projects/go",
+      "commands": [
+        {
+          "kind": "run",
+          "argv": [
+            "gotestsum",
+            "--junitfile",
+            "junit.xml",
+            "--format",
+            "standard-verbose",
+            "--",
+            "-count=1",
+            "./..."
+          ],
+          "env": {},
+          "exit_code": 1
+        },
+        {
+          "kind": "list",
+          "argv": [
+            "go",
+            "test",
+            "-list",
+            ".",
+            "./..."
+          ],
+          "env": {},
+          "exit_code": 0
+        }
+      ],
+      "name": "go",
+      "files": [
+        "go.list.txt",
+        "go.total.txt",
+        "go.xml"
+      ]
+    },
+    {
+      "project": "projects/go_rerun",
+      "commands": [
+        {
+          "kind": "run",
+          "argv": [
+            "gotestsum",
+            "--junitfile",
+            "junit.xml",
+            "--rerun-fails=1",
+            "--packages",
+            "./...",
+            "--format",
+            "standard-verbose",
+            "--",
+            "-count=1"
+          ],
+          "env": {},
+          "exit_code": 0
+        }
+      ],
+      "name": "go_rerun",
+      "files": [
+        "go_rerun.total.txt",
+        "go_rerun.xml"
+      ]
+    },
+    {
+      "project": "projects/nextest",
+      "commands": [
+        {
+          "kind": "run",
+          "argv": [
+            "cargo",
+            "nextest",
+            "run",
+            "--no-fail-fast"
+          ],
+          "env": {},
+          "exit_code": 100
+        },
+        {
+          "kind": "list",
+          "argv": [
+            "cargo",
+            "nextest",
+            "list"
+          ],
+          "env": {},
+          "exit_code": 0
+        }
+      ],
+      "setup": [
+        ".config/nextest.toml: [profile.default.junit] path = \"junit.xml\""
+      ],
+      "name": "nextest",
+      "files": [
+        "nextest.list.txt",
+        "nextest.total.txt",
+        "nextest.xml"
+      ]
+    }
+  ]
+}

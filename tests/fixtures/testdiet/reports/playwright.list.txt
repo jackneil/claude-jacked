@@ -1,0 +1,10 @@
+Listing tests:
+  tests/sample.spec.js:4:1 › passes
+  tests/sample.spec.js:8:1 › fails
+  tests/sample.spec.js:12:6 › skipped
+  tests/sample.spec.js:15:3 › parametrized 1
+  tests/sample.spec.js:15:3 › parametrized 2
+  tests/sample.spec.js:21:3 › group › in group
+  tests/sample.spec.js:26:5 › group › nested › in nested group
+  tests/sample.spec.js:32:1 › sleeps_half_a_second
+Total: 8 tests in 1 file
