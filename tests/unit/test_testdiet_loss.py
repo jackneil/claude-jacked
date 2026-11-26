@@ -759,3 +759,16 @@ def test_a_go_loop_over_a_struct_table_in_the_header_counts_its_rows():
             '\t\t{1},\n\t\t{2},\n\t} {\n\t\tt.Run("x", func(t *testing.T) {})\n\t}\n'
             '\tfor i := 0; i < 3; i++ {\n\t\t_ = i\n\t}\n\tt.Run("after", func(t *testing.T) {})\n}\n')
     assert by_name("calc_test.go", body)["TestStruct"].cases == 3
+
+
+def test_a_go_function_literal_in_a_for_header_is_not_the_loop_body():
+    from jacked.testdiet import loss_braces
+    body = ('package calc\n\nfunc TestFuncRange(t *testing.T) {\n'
+            '\tfor _, n := range func() []int { return []int{1, 2} }() {\n'
+            '\t\tt.Run("n", func(t *testing.T) { _ = n })\n\t}\n}\n')
+    found = by_name("calc_test.go", body)["TestFuncRange"]
+    assert (found.cases, found.unread) == (None, (loss_scan.COMPUTED_CASES,))
+    index = loss_braces._Index(body, "\"`", "`", chars=True)
+    brace = body.index("{", body.index("TestFuncRange"))
+    (loop,) = loss_braces._go_loops(body, index, brace, index.body(brace))
+    assert loop[1] == body.index("{\n\t\tt.Run")

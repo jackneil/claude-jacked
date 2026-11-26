@@ -232,6 +232,9 @@ def _go_table(text: str, index: _Index, brace: int, loop: int, name: str) -> int
     return _elements(text, index, *literal)
 
 
+_GO_FUNC = re.compile(r"func\b")
+
+
 def _go_body_brace(text: str, index: _Index, start: int, end: int) -> int:
     """Return the body brace of the for header that starts at ``start``, or -1 when there is none.
 
@@ -241,16 +244,24 @@ def _go_body_brace(text: str, index: _Index, start: int, end: int) -> int:
     the scan goes on after its close. gofmt writes ``X {`` for a body and
     ``T{`` for a literal. Go also requires parentheses around a bare type
     literal in a for header. So this rule reads gofmt'ed code exactly.
+    A ``func`` keyword at depth 0 makes the next spaced ``{`` the body of a
+    function literal (``range func() []int { ... }()``). The scan skips that
+    body and the call after it, and goes on.
     """
-    j = start
+    j, in_func = start, False
     while j < end:
         if j in index.spans:
             j = index.spans[j]
             continue
         ch = text[j]
+        if _GO_FUNC.match(text, j) and (j == 0 or not (text[j - 1].isalnum() or text[j - 1] in "_.")):
+            j, in_func = j + 4, True
+            continue
         if ch in "([{":
             if ch == "{" and (text[j - 1].isspace() or text[j - 1] == ")"):
-                return j
+                if not in_func:
+                    return j
+                in_func = False
             close = index.closes.get(j, -1)
             if close < 0:
                 return -1
