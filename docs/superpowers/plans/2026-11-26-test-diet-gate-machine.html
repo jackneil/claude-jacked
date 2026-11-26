@@ -425,7 +425,8 @@ local: read the JUnit files with the recorder's reader, write the record with th
     <tr><td>Machine list</td><td><code>jacked_home()/.claude/jacked-gate-machines.json</code>,
     written only by the <code>machines</code> commands through <code>atomic_write_bytes</code> with
     mode 0600: <code>{"version": 1, "machines": {"&lt;label&gt;": {"ssh": "&lt;alias&gt;",
-    "python": "python3", "workers": N, "machine_id": "&lt;32 hex&gt;"}}}</code>. A load refuses
+    "python": "python3", "workers": N, "priority": "low" | "normal", "min_free_mb": N | null,
+    "machine_id": "&lt;32 hex&gt;"}}}</code>. The default priority is <code>low</code>. A load refuses
     a file that group or others can read (POSIX), an <code>ssh</code> value that starts with
     <code>-</code> or holds white space, and a <code>python</code> value outside
     <code>[A-Za-z0-9._/\\:-]+</code>. The documentation tells the user to put an alias of the SSH
@@ -477,6 +478,15 @@ local: read the JUnit files with the recorder's reader, write the record with th
     <code>runs/&lt;RUN&gt;/tree</code>, made with <code>git worktree add --detach</code>; the driver
     checks that its <code>HEAD</code> is the sent SHA.</td><td>Nothing of a repository runs on a
     fetch or a worktree add.</td></tr>
+    <tr><td>Priority and the RAM floor</td><td>With priority <code>low</code>, the driver starts the
+    setup and the gate as <code>nice -n 10 /bin/sh -c ...</code> on POSIX, and with
+    <code>BELOW_NORMAL_PRIORITY_CLASS</code> on Windows (children inherit it). <code>probe</code>
+    gives the free physical memory. When the entry has <code>min_free_mb</code> and the machine has
+    less free memory at the start of a gate, the driver gives no gate, exit 75, and one line with
+    the two numbers. The user sets the floor; jacked has no default.</td><td>The owner's answer of
+    2026-11-26: his Windows machine is a gate machine "at low priority", and it also runs a
+    production VM, so RAM is the hard limit. A floor that the user sets is not an arbitrary
+    cap.</td></tr>
     <tr><td>The gate command</td><td>The driver runs the setup (when given) and then the gate with
     <code>/bin/sh -c</code> on POSIX and <code>cmd.exe /d /s /c</code> on Windows, in the worktree,
     with the null device as standard input. Each <code>{junit}</code> in the command becomes a path
@@ -573,7 +583,9 @@ def test_a_gate_that_writes_into_its_worktree_reports_clean_after_false(tmp_path
 def test_the_run_folder_is_removed_after_the_result(tmp_path): ...
 def test_gc_removes_a_folder_whose_lock_is_free_and_keeps_a_live_one(tmp_path): ...   # focus 4
 def test_gc_never_removes_a_folder_without_the_marker_or_a_link(tmp_path): ...
-def test_no_local_variable_reaches_the_gate_unless_named(tmp_path): ...</code></pre>
+def test_no_local_variable_reaches_the_gate_unless_named(tmp_path): ...
+def test_a_low_priority_gate_runs_niced_and_its_child_inherits_it(tmp_path): ...       # POSIX: os.getpriority
+def test_a_gate_below_the_free_memory_floor_does_not_start(tmp_path, monkeypatch): ...</code></pre>
 
 <h3>Task 3: the local side: machine list, transport, <code>run --on</code>, <code>seen --on</code></h3>
 <p><strong>Files.</strong> Create <code>jacked/testdiet/remote.py</code>,
@@ -621,14 +633,15 @@ def test_the_ssh_command_line_has_the_fixed_options_and_no_value_outside_the_gra
 
 <h3>Task 5: live proof, one full gate, review, pull request</h3>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 5.1 POSIX gate machine: the rented box of the second lane,
-  over its Tailscale name. Show: <code>machines add</code>; a green and a red gate of this
+  <li><input type="checkbox" disabled> 5.1 POSIX gate machine: a Linux host over its Tailscale
+  name. <strong>Waits on the owner:</strong> which Linux host (a VM of the runner service, or a
+  different one). Show: <code>machines add</code>; a green and a red gate of this
   repository; the record with the label; <code>seen --on</code> exit 0 and 1; a gate whose local
   command is stopped by PID, with exit 75, no record, and no process of that gate left on the box
   after it (read the process list of the box); <code>gc</code>.</li>
   <li><input type="checkbox" disabled> 5.2 Windows gate machine: the same checks on a Windows host,
-  with a gate of about 30 seconds. <strong>Waits on the owner:</strong> his consent for that small
-  load on the Windows host, or a different Windows host.</li>
+  at priority <code>low</code> with a free-memory floor. The owner chose his Windows machine for
+  his gates on 2026-11-26. Also show a gate that the floor refuses.</li>
   <li><input type="checkbox" disabled> 5.3 The full gate of this branch runs on the POSIX gate
   machine through <code>run --on</code>, then <code>/dcr</code>, then <code>/pr</code>. Stop at the
   pull request.</li>
@@ -651,8 +664,7 @@ to the box is named before it runs.</p>
 <h2 id="open-questions">Open questions</h2>
 <ul>
   <li><strong>The provider of the box.</strong> The owner picks from the research report.</li>
-  <li><strong>The Windows leg of the live proof.</strong> The owner's consent for a gate of about
-  30 seconds on a Windows host.</li>
+  <li><strong>The Linux leg of the live proof.</strong> Which Linux host.</li>
 </ul>
 
 <hr>
