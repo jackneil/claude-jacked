@@ -33,12 +33,34 @@ _PROXY_KEYS = {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}
 #: The Windows runtime needs them: without SystemRoot, ``import asyncio``
 #: fails with WinError 10106 when Winsock loads its providers. No value here
 #: holds a secret. The names use the canonical Windows spelling.
+#:
+#: The Windows launcher holds this environment, and its digest is part of the
+#: service generation. So each value here must be the same for one user on
+#: one machine in every logon session and every shell:
+#:
+#: - SystemRoot, windir, SystemDrive, ComSpec: the Windows installation.
+#: - ProgramData, ProgramFiles, ProgramFiles(x86), ProgramW6432,
+#:   CommonProgramFiles, CommonProgramFiles(x86), CommonProgramW6432, PUBLIC:
+#:   machine folders that Windows sets at installation.
+#: - APPDATA, LOCALAPPDATA: the folders of the user profile.
+#: - USERNAME, USERDOMAIN, COMPUTERNAME: the account and the machine name.
+#: - PROCESSOR_ARCHITECTURE, OS: the machine type and the OS family.
+#: - HOMEDRIVE, HOMEPATH: the home folder of the user account.
+#:
+#: These variables are NOT copied, because they change between sessions or
+#: shells:
+#:
+#: - TEMP and TMP: Remote Desktop gives each session its own subfolder. The
+#:   service uses ``LOCALAPPDATA\Temp`` instead.
+#: - PATHEXT: PowerShell adds ``.CPL``. The service uses
+#:   ``WINDOWS_DEFAULT_PATHEXT`` instead.
+#: - NUMBER_OF_PROCESSORS: a virtual machine resize changes it, and Python
+#:   does not need it.
 WINDOWS_OS_KEYS = (
     "SystemRoot",
     "windir",
     "SystemDrive",
     "ComSpec",
-    "PATHEXT",
     "ProgramData",
     "ProgramFiles",
     "ProgramFiles(x86)",
@@ -51,15 +73,14 @@ WINDOWS_OS_KEYS = (
     "USERNAME",
     "USERDOMAIN",
     "COMPUTERNAME",
-    "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE",
     "OS",
     "PUBLIC",
     "HOMEDRIVE",
     "HOMEPATH",
 )
-#: Windows temporary directory variables, in the order that Windows reads them.
-WINDOWS_TEMP_KEYS = ("TEMP", "TMP")
+#: The Windows default PATHEXT. The service always gets this value.
+WINDOWS_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC"
 
 
 @dataclass(frozen=True)
@@ -81,11 +102,15 @@ def _windows_os_environment(source: dict[str, str], home: str) -> dict[str, str]
     """Return the Windows OS variables for a service environment.
 
     Windows variable names are not case-sensitive. This function matches the
-    inherited names without case and writes the canonical spelling. It always
-    sets SystemRoot and windir. When the inherited mapping has no absolute
-    value, ``jacked.winproc.system_root`` gives the fallback. It always sets
-    TEMP and TMP to one absolute directory, so that Python ``tempfile`` never
-    uses the current directory.
+    inherited names without case and writes the canonical spelling. Only the
+    stable values in ``WINDOWS_OS_KEYS`` come from ``source``.
+
+    - SystemRoot and windir are always set. When the inherited mapping has
+      no absolute value, ``jacked.winproc.system_root`` gives the fallback.
+    - TEMP and TMP are always ``LOCALAPPDATA\\Temp``, else
+      ``USERPROFILE\\AppData\\Local\\Temp``. They never come from the inherited
+      TEMP or TMP. Python ``tempfile`` thus never uses the current directory.
+    - PATHEXT is always ``WINDOWS_DEFAULT_PATHEXT``.
 
     >>> env = _windows_os_environment({"SYSTEMROOT": r"D:\\Win"}, r"C:\\Users\\a")
     >>> env["SystemRoot"], env["windir"], env["TEMP"]
@@ -102,20 +127,11 @@ def _windows_os_environment(source: dict[str, str], home: str) -> dict[str, str]
     root = system_root(env)
     env["SystemRoot"] = root
     env["windir"] = root
-    temp = next(
-        (
-            folded[key.casefold()]
-            for key in WINDOWS_TEMP_KEYS
-            if _windows_absolute(folded.get(key.casefold()))
-        ),
-        None,
-    )
-    if temp is None:
-        local = env.get("LOCALAPPDATA")
-        if not _windows_absolute(local):
-            local = ntpath.join(home, "AppData", "Local")
-        temp = ntpath.join(local, "Temp")
-    env["TEMP"] = _validate_plain(temp, "temp directory")
+    env["PATHEXT"] = WINDOWS_DEFAULT_PATHEXT
+    local = env.get("LOCALAPPDATA")
+    if not _windows_absolute(local):
+        local = ntpath.join(home, "AppData", "Local")
+    env["TEMP"] = _validate_plain(ntpath.join(local, "Temp"), "temp directory")
     env["TMP"] = env["TEMP"]
     return env
 
@@ -131,9 +147,10 @@ def build_service_environment(
     Callers must pass the inherited mapping explicitly.  Nothing in this
     function implicitly copies ``os.environ``.
 
-    On win32 the environment also holds the Windows OS variables in
-    ``WINDOWS_OS_KEYS`` and one TEMP and TMP directory. PATH starts from the
-    resolved SystemRoot.
+    On win32 the environment also holds the stable Windows OS variables in
+    ``WINDOWS_OS_KEYS``, the default PATHEXT, and one TEMP and TMP directory.
+    PATH starts from the resolved SystemRoot. No win32 value depends on the
+    logon session or the shell of the caller.
     """
 
     source = inherited or {}

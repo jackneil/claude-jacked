@@ -14,7 +14,6 @@ from jacked import __version__
 from jacked.service import CLAUDE_DIR, DEFAULT_HOST, DEFAULT_PORT, LAUNCHD_LABEL
 from jacked.service.environment import (
     WINDOWS_OS_KEYS,
-    WINDOWS_TEMP_KEYS,
     EnvironmentInputs,
     build_service_environment,
 )
@@ -207,16 +206,15 @@ def inherited_allowlisted_environment(
 ) -> dict[str, str]:
     """Return the allowlisted variables of ``source`` (default ``os.environ``).
 
-    On win32 the allowlist also holds the Windows OS variables and TEMP and
-    TMP. Windows variable names are not case-sensitive, so the match ignores
-    case on win32. ``build_service_environment`` validates each value.
+    On win32 the allowlist also holds the stable Windows OS variables.
+    Windows variable names are not case-sensitive, so the match ignores case
+    on win32. ``build_service_environment`` validates each value.
     """
 
     source = os.environ if source is None else source
     names = list(_INHERITED_NAMES)
     if platform == "win32":
         names.extend(WINDOWS_OS_KEYS)
-        names.extend(WINDOWS_TEMP_KEYS)
     folded = {key.casefold(): value for key, value in source.items()}
     if platform == "win32":
         return {name: folded[name.casefold()] for name in names if name.casefold() in folded}

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from jacked.service.environment import (
+    WINDOWS_DEFAULT_PATHEXT,
     EnvironmentInputs,
     build_service_environment,
     posix_preinterpreter_command,
@@ -118,15 +119,14 @@ def test_windows_environment_keeps_the_os_variables_from_the_inherited_mapping()
         "SystemRoot": r"C:\Windows",
         "windir": r"C:\Windows",
         "ComSpec": r"C:\Windows\System32\cmd.exe",
-        "PATHEXT": ".COM;.EXE;.BAT;.CMD",
         "ProgramFiles(x86)": r"C:\Program Files (x86)",
         "LOCALAPPDATA": r"C:\Users\alice\AppData\Local",
-        "TEMP": r"C:\Users\alice\AppData\Local\Temp",
     }
     env = build_service_environment(_WINDOWS_INPUTS, inherited=inherited)
     for key, value in inherited.items():
         assert env[key] == value
-    assert env["TMP"] == env["TEMP"]
+    assert env["TEMP"] == env["TMP"] == r"C:\Users\alice\AppData\Local\Temp"
+    assert env["PATHEXT"] == WINDOWS_DEFAULT_PATHEXT
     assert env["PATH"] == r"C:\Windows\System32;C:\Windows"
     assert env["USERPROFILE"] == r"C:\Users\alice"
 
@@ -159,19 +159,34 @@ def test_windows_environment_sets_systemroot_through_the_winproc_resolver():
     assert env["SystemRoot"] == env["windir"] == r"C:\Windows"
 
 
-def test_windows_temp_comes_from_temp_then_tmp_then_localappdata_then_home():
+def test_windows_temp_is_localappdata_temp_and_never_the_inherited_temp():
     def temp(inherited):
         env = build_service_environment(_WINDOWS_INPUTS, inherited=inherited)
         assert env["TMP"] == env["TEMP"]
         return env["TEMP"]
 
-    assert temp({"TEMP": r"C:\T1", "TMP": r"C:\T2"}) == r"C:\T1"
-    assert temp({"TMP": r"C:\T2"}) == r"C:\T2"
-    assert temp({"TEMP": "relative", "TMP": r"C:\T2"}) == r"C:\T2"
-    assert temp({"LOCALAPPDATA": r"C:\Users\alice\AppData\Local"}) == (
+    local = r"D:\Profiles\alice\Local"
+    # Remote Desktop gives each session its own TEMP subfolder: never used.
+    assert temp({"LOCALAPPDATA": local, "TEMP": r"C:\T1\2", "TMP": r"C:\T2"}) == (
+        local + r"\Temp"
+    )
+    assert temp({"LOCALAPPDATA": "relative", "TEMP": r"C:\T1"}) == (
         r"C:\Users\alice\AppData\Local\Temp"
     )
+    assert temp({"TEMP": r"C:\T1"}) == r"C:\Users\alice\AppData\Local\Temp"
     assert temp({}) == r"C:\Users\alice\AppData\Local\Temp"
+
+
+def test_windows_pathext_is_the_default_and_number_of_processors_is_dropped():
+    env = build_service_environment(
+        _WINDOWS_INPUTS,
+        inherited={
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD;.CPL",
+            "NUMBER_OF_PROCESSORS": "16",
+        },
+    )
+    assert env["PATHEXT"] == ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC"
+    assert "NUMBER_OF_PROCESSORS" not in env
 
 
 def test_windows_explicit_temp_dir_wins():
@@ -205,24 +220,26 @@ def test_windows_environment_still_drops_secrets_proxy_and_python_injection():
 
 
 def test_windows_allowlisted_inherited_names_carry_the_os_variables_only():
-    from jacked.service.environment import WINDOWS_OS_KEYS, WINDOWS_TEMP_KEYS
+    from jacked.service.environment import WINDOWS_OS_KEYS
     from jacked.service.lifecycle import inherited_allowlisted_environment
 
     source = {
         "SYSTEMROOT": r"C:\Windows",
         "TEMP": r"C:\T",
+        "PATHEXT": ".COM;.CPL",
+        "NUMBER_OF_PROCESSORS": "16",
         "OPENAI_API_KEY": "secret-canary",
         "PYTHONPATH": r"C:\evil",
         "LANG": "en_US.UTF-8",
     }
     inherited = inherited_allowlisted_environment("win32", source)
+    # Session values (TEMP, PATHEXT, NUMBER_OF_PROCESSORS) are not carried.
     assert inherited == {
         "SystemRoot": r"C:\Windows",
-        "TEMP": r"C:\T",
         "LANG": "en_US.UTF-8",
     }
     # No allowlisted name may carry a secret or change the interpreter.
-    for name in (*WINDOWS_OS_KEYS, *WINDOWS_TEMP_KEYS):
+    for name in WINDOWS_OS_KEYS:
         upper = name.upper()
         assert not upper.startswith("PYTHON")
         assert not any(part in upper for part in ("TOKEN", "KEY", "SECRET", "PROXY"))
@@ -319,3 +336,76 @@ def test_windows_service_environment_is_a_fixed_point_of_its_own_rebuild():
     service_view = {**first, "JACKED_SERVICE_GENERATION": "a" * 64}
     assert build(service_view) == first
     assert "secret-canary" not in repr(first)
+
+
+_WINDOWS_CALLER = {
+    "SystemRoot": r"C:\Windows",
+    "windir": r"C:\Windows",
+    "ComSpec": r"C:\Windows\System32\cmd.exe",
+    "ProgramFiles": r"C:\Program Files",
+    "APPDATA": r"C:\Users\alice\AppData\Roaming",
+    "LOCALAPPDATA": r"C:\Users\alice\AppData\Local",
+    "USERNAME": "alice",
+    "COMPUTERNAME": "DESK",
+    "PATHEXT": ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC",
+    "TEMP": r"C:\Users\alice\AppData\Local\Temp",
+    "TMP": r"C:\Users\alice\AppData\Local\Temp",
+    "NUMBER_OF_PROCESSORS": "8",
+}
+
+
+def _windows_contract(tmp_path, monkeypatch, caller):
+    """Provision the win32 contract exactly as a caller with ``caller`` does.
+
+    Both callers in a test share one state directory, as two shells of one
+    user do, so the launcher path differs only when its content does."""
+    import jacked.service.lifecycle as lifecycle
+    from jacked.service.instance_models import ServicePaths
+    from jacked.service.spec import SupervisorKind
+
+    monkeypatch.setattr(lifecycle.os, "environ", dict(caller))
+    monkeypatch.setattr(lifecycle.Path, "home", lambda: Path(r"C:\Users\alice"))
+    monkeypatch.setattr(
+        "jacked.service.instance.current_user_identity", lambda: "sid:S-1-5-21-1"
+    )
+    paths = ServicePaths.in_directory(tmp_path / "state")
+    spec, environment = lifecycle.provision_service_contract(
+        paths=paths, platform="win32", supervisor=SupervisorKind.MANUAL
+    )
+    return spec.launcher_sha256, spec.generation, environment
+
+
+@pytest.mark.parametrize(
+    "session_change",
+    [
+        pytest.param({"TEMP": r"C:\Users\alice\AppData\Local\Temp\2",
+                      "TMP": r"C:\Users\alice\AppData\Local\Temp\2"}, id="rdp-temp"),
+        pytest.param({"PATHEXT": ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL"},
+                     id="pwsh-pathext"),
+        pytest.param({"NUMBER_OF_PROCESSORS": "16"}, id="vm-resize"),
+        pytest.param({"TERM_PROGRAM": "vscode", "SESSIONNAME": "RDP-Tcp#3"}, id="extra"),
+        pytest.param({"SystemRoot": None, "SYSTEMROOT": r"C:\Windows"}, id="key-case"),
+    ],
+)
+def test_windows_generation_does_not_depend_on_the_caller_session(
+    tmp_path, monkeypatch, session_change
+):
+    base = _windows_contract(tmp_path, monkeypatch, _WINDOWS_CALLER)
+    other = dict(_WINDOWS_CALLER)
+    for key, value in session_change.items():
+        if value is None:
+            other.pop(key)
+        else:
+            other[key] = value
+    changed = _windows_contract(tmp_path, monkeypatch, other)
+    assert changed[0] == base[0], "launcher digest changed"
+    assert changed[1] == base[1], "generation changed"
+    assert changed[2] == base[2]
+
+
+def test_windows_generation_follows_a_stable_value(tmp_path, monkeypatch):
+    base = _windows_contract(tmp_path, monkeypatch, _WINDOWS_CALLER)
+    other = {**_WINDOWS_CALLER, "LOCALAPPDATA": r"D:\Profiles\alice\Local"}
+    changed = _windows_contract(tmp_path, monkeypatch, other)
+    assert changed[0] != base[0]
+    assert changed[1] != base[1]
