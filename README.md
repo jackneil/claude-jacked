@@ -291,7 +291,7 @@ jacked service restart     # stop + detached start (returns immediately)
 jacked service restart --foreground   # same but runs in foreground like service start
 jacked service status      # show evidence-qualified state, build, protocol, port, autostart
 jacked service recover     # safely reconcile a provably owned native definition
-jacked service preflight   # prove this build can provision its service contract
+jacked service preflight   # prove this build can provision and boot its service contract
 ```
 
 ### Troubleshooting
@@ -481,7 +481,7 @@ jacked service preflight          # exit 0: this build can start its service
 jacked service preflight --json   # one JSON object, for scripts
 ```
 
-The command provisions the service contract and prints the runtime path, the runtime target, the supervisor, and the generation. It starts no process and it changes no supervisor, so it is safe to run while the service is live. On a refusal it prints `[FAIL] <error type>: <reason>` and exits 1.
+The command provisions the service contract. Then it runs one short probe process: the service runtime, with the exact service environment, does the imports that the service does at start (an asyncio event loop, a socket, a TLS context, the temporary directory, and the tray module). The command prints the runtime path, the runtime target, the supervisor, and the generation. It starts no service and it changes no supervisor, so it is safe to run while the service is live. On a refusal it prints `[FAIL] <error type>: <reason>` and exits 1. A probe failure names the step, for example `ServiceProbeError: the service runtime failed its start probe at asyncio_event_loop: OSError 10106`. The `--json` object has a `probe_step` field.
 
 ### Options
 

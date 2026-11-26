@@ -1804,7 +1804,7 @@ def _run_upgrade_inline_locked(request: "_UpgradeRequest") -> None:
 
 
 def _upgrade_preflight_or_rollback(plan, new_version: str, no_rollback: bool) -> None:
-    """Prove the NEW build can provision its service contract, or roll back.
+    """Prove the NEW build can provision and boot its service contract, or roll back.
 
     This runs before the old service is replaced, and with --skip-service too:
     it is cheap, and it is the whole point of the transaction.
@@ -1813,7 +1813,7 @@ def _upgrade_preflight_or_rollback(plan, new_version: str, no_rollback: bool) ->
     if preflight_code == 0:
         _upgrade_phase("preflight", "ok")
         return
-    reason = "the new build cannot provision its service contract"
+    reason = "the new build cannot provision or boot its service contract"
     _upgrade_phase(
         "preflight", "failed", error=reason, recovery="jacked service preflight"
     )
@@ -7871,6 +7871,12 @@ def _exit_hard(code: int) -> None:
     os._exit(code)
 
 
+from jacked.preflight_cli import (  # noqa: E402 - re-exported for callers
+    print_preflight_failure as _print_preflight_failure,
+    print_preflight_ok as _print_preflight_ok,
+)
+
+
 @service.command(name="preflight")
 @click.option(
     "--json",
@@ -7883,13 +7889,18 @@ def _exit_hard(code: int) -> None:
     "timeout_seconds",
     default=None,
     type=float,
-    help="Fail with exit code 1 if provisioning takes longer than this many seconds.",
+    help=(
+        "Fail with exit code 1 if provisioning takes longer than this many "
+        "seconds. The boot probe also stops at this limit."
+    ),
 )
 def service_preflight(as_json: bool, timeout_seconds: float | None):
-    """Prove this build can provision its service contract.
+    """Prove this build can provision and boot its service contract.
 
-    The command provisions the contract only. It starts no process and it
-    changes no supervisor. Provisioning writes the immutable
+    The command provisions the contract. Then it runs one short probe
+    process: the service runtime, with the exact service environment, does
+    the imports that the service does at start. The command starts no
+    service and changes no supervisor. Provisioning writes the immutable
     content-addressed launcher file, which is safe to repeat.
 
     Exit code 0 means this build can boot its service. Exit code 1 means it
@@ -7899,10 +7910,12 @@ def service_preflight(as_json: bool, timeout_seconds: float | None):
         default_service_paths,
         provision_service_contract,
     )
+    from jacked.preflight_cli import print_probe_failure, run_boot_probe
 
+    paths = default_service_paths()
     try:
-        spec, _environment = _provision_with_timeout(
-            provision_service_contract, default_service_paths(), timeout_seconds
+        spec, environment = _provision_with_timeout(
+            provision_service_contract, paths, timeout_seconds
         )
     except (OSError, ValueError, TimeoutError) as exc:
         _print_preflight_failure(exc, as_json)
@@ -7911,53 +7924,13 @@ def service_preflight(as_json: bool, timeout_seconds: float | None):
             # wait for it. The batches depend on this command returning.
             _exit_hard(1)
         sys.exit(1)
+    # Provisioning alone passed a build whose service died at `import
+    # asyncio` on Windows (WinError 10106). The probe boots the runtime.
+    probe = run_boot_probe(spec, environment, paths, timeout_seconds)
+    if not probe.ok:
+        print_probe_failure(probe, as_json)
+        sys.exit(1)
     _print_preflight_ok(spec, as_json)
-
-
-def _print_preflight_failure(exc: BaseException, as_json: bool) -> None:
-    import json as _json
-
-    if as_json:
-        click.echo(
-            _json.dumps(
-                {
-                    "ok": False,
-                    "runtime_path": None,
-                    "runtime_target_path": None,
-                    "supervisor": None,
-                    "generation": None,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
-        )
-        return
-    console.print(f"[red][FAIL][/red] {type(exc).__name__}: {exc}")
-    console.print("[dim]Run 'jacked service status' for details.[/dim]")
-
-
-def _print_preflight_ok(spec, as_json: bool) -> None:
-    import json as _json
-
-    supervisor = getattr(spec.supervisor, "value", str(spec.supervisor))
-    if as_json:
-        click.echo(
-            _json.dumps(
-                {
-                    "ok": True,
-                    "runtime_path": spec.runtime_path,
-                    "runtime_target_path": spec.runtime_target_path,
-                    "supervisor": supervisor,
-                    "generation": spec.generation,
-                    "error": None,
-                }
-            )
-        )
-        return
-    console.print("[green][OK][/green] Service contract OK")
-    console.print(f"[dim]runtime:[/dim] {spec.runtime_path}")
-    console.print(f"[dim]target:[/dim] {spec.runtime_target_path}")
-    console.print(f"[dim]supervisor:[/dim] {supervisor}")
-    console.print(f"[dim]generation:[/dim] {spec.generation[:12]}")
 
 
 @service.command(name="stop")

@@ -1282,7 +1282,7 @@ def run_update(
             log(f"UPDATE FAILED: {error}")
 
         # Phase: preflight - the transaction gate. The new build must prove it
-        # can provision its service contract before the old service is gone.
+        # can provision and boot its contract before the old service is gone.
         _begin("preflight")
         log(f"Running: {jacked} service preflight")
         # A hung or unlaunchable preflight is a REFUSAL, not a crash: the old
@@ -1322,7 +1322,7 @@ def run_update(
             _end(
                 "preflight",
                 "failed",
-                error=f"new build refused to provision its service contract: {first_line}",
+                error=f"new build failed its service preflight: {first_line}",
                 recovery=f'uv tool install "claude-jacked[{extras}]=={_current_version}" --force --refresh',
             )
             rollback = _rollback("preflight refused")
@@ -2063,7 +2063,7 @@ def _spawn_windows_tray_updater(
         + DRIFT_GUARD
         +
         # Phase: preflight - the transaction gate. The new build must prove it
-        # can provision its service contract before the old service is gone.
+        # can provision and boot its contract before the old service is gone.
         "jacked _update_status preflight in_progress\r\n"
         + DRIFT_GUARD
         + "jacked service preflight --timeout 120 2>&1\r\n"

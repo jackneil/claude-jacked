@@ -283,3 +283,39 @@ def test_windows_runtime_starts_under_the_exact_service_environment(tmp_path):
     assert temp_dir
     assert os.path.normcase(os.path.abspath(temp_dir)) != os.path.normcase(str(tmp_path))
     assert os.path.normcase(os.path.abspath(temp_dir)) != os.path.normcase(os.getcwd())
+
+
+def test_windows_service_environment_is_a_fixed_point_of_its_own_rebuild():
+    """The service re-provisions its contract at boot (tray.py) from the
+    environment that the launcher gave it. That rebuild must give the same
+    environment, so the same launcher digest and the same generation."""
+    from jacked.service.lifecycle import (
+        default_environment,
+        inherited_allowlisted_environment,
+    )
+
+    messy = {
+        "SYSTEMROOT": r"C:\Windows",
+        "ComSpec": r"C:\Windows\System32\cmd.exe",
+        "PATHEXT": ".COM;.EXE;.BAT;.CMD;.CPL",
+        "LocalAppData": r"C:\Users\alice\AppData\Local",
+        "TMP": r"C:\Users\alice\AppData\Local\Temp\2",
+        "USERNAME": "alice",
+        "LANG": "en_US.UTF-8",
+        "OPENAI_API_KEY": "secret-canary",
+        "PYTHONPATH": r"C:\evil",
+        "Path": r"C:\tools;C:\Windows\System32",
+    }
+
+    def build(source):
+        return default_environment(
+            home=r"C:\Users\alice",
+            user_id="sid:S-1-5-21-1",
+            inherited_allowlisted=inherited_allowlisted_environment("win32", source),
+            platform="win32",
+        )
+
+    first = build(messy)
+    service_view = {**first, "JACKED_SERVICE_GENERATION": "a" * 64}
+    assert build(service_view) == first
+    assert "secret-canary" not in repr(first)
