@@ -72,6 +72,8 @@ from jacked.testdiet.model import (  # noqa: F401 -- loss and the tests read the
 )
 
 _PY_SKIPS = {"skip", "skipif", "skipIf", "skipUnless"}
+#: The default test file name of jest, vitest and Playwright: "<name>.test.ts", "<name>.spec.mjs".
+_SCRIPT_TEST_NAME = re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$")
 
 
 def declarations(path: str, text: str) -> list[str]:
@@ -88,15 +90,19 @@ def scan_kind(path: str) -> bool:
 
     A Python file is a test file only by the default file names of pytest
     (``test_*.py``, ``*_test.py``), so a helper ``def test_x`` in
-    ``src/db.py`` is not a test.
+    ``src/db.py`` is not a test. A TypeScript or JavaScript file is a test
+    file only by the default names of jest, vitest and Playwright
+    (``*.test.*``, ``*.spec.*``, or a file in a ``__tests__`` folder).
 
     >>> scan_kind("tests/test_a.py"), scan_kind("src/db.py"), scan_kind("web/a.test.ts")
     (True, False, True)
     """
+    name = path.rsplit("/", 1)[-1]
     if path.endswith(".py"):
-        name = path.rsplit("/", 1)[-1]
         return name.startswith("test_") or name.endswith("_test.py")
-    return path.endswith(("_test.go", ".rs")) or bool(SCRIPT_FILE_RE.search(path))
+    if SCRIPT_FILE_RE.search(path):
+        return bool(_SCRIPT_TEST_NAME.search(name)) or f"/{path}".count("/__tests__/") > 0
+    return path.endswith(("_test.go", ".rs"))
 
 
 def scan(path: str, text: str) -> list[Declaration]:

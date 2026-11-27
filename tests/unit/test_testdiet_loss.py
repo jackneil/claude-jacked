@@ -281,13 +281,13 @@ def test_cli_loss_gives_one_line_and_exit_1_for_an_input_it_cannot_read(repo, tm
 
 
 def test_a_test_name_with_a_control_character_prints_on_one_line(repo):
-    write(repo, "tests/test_names.ts", b'test("bad\x1b[31m na\\nme", () => {});\n')
+    write(repo, "tests/names.test.ts", b'test("bad\x1b[31m na\\nme", () => {});\n')
     commit(repo, "names")
-    write(repo, "tests/test_names.ts", b"\n")
+    write(repo, "tests/names.test.ts", b"\n")
     out = _invoke("tests", "loss", "--base", "HEAD").output
     line = next(line for line in out.splitlines() if line.startswith("removed "))
     assert "\x1b" not in out
-    assert line.startswith("removed tests/test_names.ts::bad")
+    assert line.startswith("removed tests/names.test.ts::bad")
 
 
 def test_a_python_file_with_a_syntax_error_still_gives_declarations(repo):
@@ -360,11 +360,11 @@ def test_a_rust_char_literal_with_a_brace_does_not_move_the_end_of_a_body():
 
 
 def test_a_test_name_with_a_real_line_break_prints_on_one_line(repo):
-    write(repo, "tests/test_lines.ts", b"test(`first\nsecond`, () => {});\n")
+    write(repo, "tests/lines.test.ts", b"test(`first\nsecond`, () => {});\n")
     commit(repo, "names")
-    write(repo, "tests/test_lines.ts", b"\n")
+    write(repo, "tests/lines.test.ts", b"\n")
     out = _invoke("tests", "loss", "--base", "HEAD").output
-    assert "removed tests/test_lines.ts::first\\nsecond" in out.splitlines()
+    assert "removed tests/lines.test.ts::first\\nsecond" in out.splitlines()
 
 
 def test_a_base_branch_that_moved_ahead_reports_no_loss_for_its_new_tests(repo):
@@ -849,3 +849,27 @@ def test_a_removed_test_and_an_added_test_with_the_same_last_name_pair_only_with
     report = loss.loss_report(repo, "HEAD")
     assert report.moved == (("tests/a/test_x.py::TestA::test_ok", "tests/b/test_y.py::test_ok"),)
     assert report.removed == ()
+
+
+def test_loss_reads_every_blob_with_one_git_process(repo, monkeypatch):
+    for n in range(3):
+        write(repo, f"tests/test_m{n}.py", f"def test_{n}():\n    assert {n} == {n}\n".encode())
+    commit(repo, "three files")
+    for n in range(3):
+        write(repo, f"tests/test_m{n}.py", f"def test_{n}():\n    pass\n".encode())
+    calls = []
+    real = loss.tree.git
+    monkeypatch.setattr(loss.tree, "git", lambda *a, **k: calls.append(a[1:3]) or real(*a, **k))
+    report = loss.loss_report(repo, "HEAD")
+    assert len(report.fewer_assertions) == 3
+    assert sum(1 for args in calls if args[0] == "cat-file") == 1
+
+
+def test_a_script_file_that_is_not_a_test_file_name_is_not_read(repo):
+    write(repo, "src/util.ts", b'test("helper", () => {});\n')
+    write(repo, "src/__tests__/util.ts", b'test("in tests", () => {});\n')
+    commit(repo, "scripts")
+    write(repo, "src/util.ts", b"\n")
+    write(repo, "src/__tests__/util.ts", b"\n")
+    assert loss.loss_report(repo, "HEAD").removed == ("src/__tests__/util.ts::in tests",)
+    assert loss.scan_kind("web/a.spec.mjs") and loss.scan_kind("a.test.tsx") and not loss.scan_kind("src/util.ts")

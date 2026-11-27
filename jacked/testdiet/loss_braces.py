@@ -207,6 +207,10 @@ def _array_rows(text: str, index: _Index, start: int, end: int) -> int | None:
     return _elements(text, index, k, close)
 
 
+_GO_FOR = re.compile(r"\bfor\b")
+_RUST_IGNORE = re.compile(r"#\[\s*ignore\b")
+
+
 def _print(text: str, start: int, end: int) -> str | None:
     """The ``body_print`` of ``text[start:end]``, or None when the body is not read."""
     return body_print(text[start:end]) if 0 <= start < end else None
@@ -284,8 +288,9 @@ def _go_table(text: str, index: _Index, brace: int, loop: int, name: str) -> int
     A name that is assigned again between its literal and the loop gives None.
     """
     word = re.escape(name)
-    found = [m for m in re.finditer(rf"(?<![\w.]){word}\s*:?=\s*\[\]", text[:loop])
-             if m.start() > brace and index.in_code(m.start())]
+    # pos and endpos, not a slice: a slice for each loop costs the size of the file each time.
+    found = [m for m in re.compile(rf"(?<![\w.]){word}\s*:?=\s*\[\]").finditer(text, brace + 1, loop)
+             if index.in_code(m.start())]
     literal = _go_literal(text, index, found[-1].end(), loop) if found else None
     if literal is None:
         return None
@@ -343,8 +348,8 @@ def _go_loops(text: str, index: _Index, brace: int, end: int) -> list[tuple[int,
     text from its head to ``end``. Its cases are not counted.
     """
     loops = []
-    for loop in re.finditer(r"\bfor\b", text[:end]):
-        if loop.start() <= brace or not index.in_code(loop.start()):
+    for loop in _GO_FOR.finditer(text, brace + 1, max(end, 0)):
+        if not index.in_code(loop.start()):
             continue
         open_ = _go_body_brace(text, index, loop.end(), end)
         close = index.closes.get(open_, -1) if open_ >= 0 else -1
@@ -419,7 +424,7 @@ def rust(text: str) -> tuple[list[Declaration], str | None]:
                 close = text.find("*/", k + 2)
                 j = len(text) if close < 0 else close + 2
             elif text.startswith("#[", k) and index.closes.get(k + 1, -1) > 0:
-                ignored = ignored or bool(re.match(r"#\[\s*ignore\b", text[k:]))
+                ignored = ignored or bool(_RUST_IGNORE.match(text, k))
                 j = index.closes[k + 1]
             else:
                 break

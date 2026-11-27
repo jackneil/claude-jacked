@@ -147,13 +147,28 @@ def _touched(top: Path, base: str, head_tree: str, env: dict[str, str]):
     return touched, skipped
 
 
-def _read(top: Path, blob: str, env: dict[str, str]) -> bytes | None:
-    if not blob:
-        return None
-    code, out = tree.git(top, "cat-file", "blob", blob, env=env)
+def _read_blobs(top: Path, blobs: list[str], env: dict[str, str]) -> dict[str, bytes]:
+    """Read each blob with one ``git cat-file --batch`` process. An empty name is an absent side."""
+    wanted = sorted({blob for blob in blobs if blob})
+    if not wanted:
+        return {}
+    with tempfile.TemporaryFile() as names:
+        names.write("".join(f"{blob}\n" for blob in wanted).encode("ascii"))
+        names.seek(0)
+        code, out = tree.git(top, "cat-file", "--batch", env=env, stdin=names)
     if code != 0:
-        raise LossError(f"git cannot read the object {blob}")
-    return out
+        raise LossError(f"git cat-file --batch exited with {code}")
+    found: dict[str, bytes] = {}
+    pos = 0
+    for blob in wanted:
+        newline = out.find(b"\n", pos)
+        header = out[pos:newline].split() if newline >= 0 else []
+        if len(header) != 3 or header[0] != blob.encode("ascii") or header[1] != b"blob":
+            raise LossError(f"git cannot read the object {blob}")
+        start = newline + 1
+        found[blob] = out[start:start + int(header[2])]
+        pos = start + int(header[2]) + 1  # the content ends with one newline
+    return found
 
 
 def loss_report(cwd: Path, base: str | None = None) -> LossReport:
@@ -186,9 +201,10 @@ def loss_report(cwd: Path, base: str | None = None) -> LossReport:
         env = tree.object_env(top, objects)
         sides: tuple[Sides, Sides] = ({}, {})
         touched, skipped = _touched(top, commit, head.tree, env)
+        contents = _read_blobs(top, [blob for _, *blobs in touched for blob in blobs], env)
         for path, *blobs in touched:
             for side, blob in zip(sides, blobs):
-                data = _read(top, blob, env)
+                data = contents.get(blob) if blob else None
                 if data is not None:
                     side[path], reason = scan_file(path, data.decode("utf-8", "replace"))
                     if reason is not None and (path, reason) not in skipped:

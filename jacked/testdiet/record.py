@@ -54,17 +54,20 @@ INPUTS_UNAVAILABLE = history.INPUTS_UNAVAILABLE
 T = TypeVar("T")
 
 
-def guard(step: str, func: Callable[[], T], default: T) -> T:
+def guard(step: str, func: Callable[[], T], default: T, then: str = "") -> T:
     """Run one recorder step. An error is logged and printed, and ``default`` is the result.
 
     The WARNING log line has no traceback; the traceback goes to DEBUG (``jacked -v``).
+    ``then`` ends the printed line with what the failure costs, for example
+    "The run is not recorded."
     """
     try:
         return func()
     except Exception as exc:  # noqa: BLE001 -- a recorder error never stops or changes the gate
         logger.warning("recorder step %s failed: %s", step, describe(exc))
         logger.debug("recorder step %s failed", step, exc_info=True)
-        emit(f"the recorder step '{step}' failed ({type(exc).__name__}). The gate result is not changed.")
+        emit(f"the recorder step '{step}' failed ({type(exc).__name__}). The gate result is not changed."
+             + (f" {then}" if then else ""))
         return default
 
 
@@ -181,7 +184,9 @@ def _same_identity(meta: RunMeta, tree_value: TreeId, command_sha: str, folder: 
 
 
 def _proves(meta: RunMeta) -> bool:
-    return meta.verdict == "passed" and meta.tree_changed is False and meta.inputs_changed is not True
+    # With --input, the files after the gate must be known to be the same (fail closed).
+    return (meta.verdict == "passed" and meta.tree_changed is False
+            and (meta.inputs_sha is None or meta.inputs_changed is False))
 
 
 def _not_proved(meta: RunMeta) -> str:
@@ -191,6 +196,8 @@ def _not_proved(meta: RunMeta) -> str:
         cause = "the gate changed the tree"
     elif meta.inputs_changed is True:
         cause = "the gate changed the --input files"
+    elif meta.inputs_sha is not None and meta.inputs_changed is None:
+        cause = "the --input files after the gate are not known"
     else:
         cause = "the tree after the gate is not known"
     return (f"the newest run of this tree and this command is {meta.id}, and it does not prove the tree: "

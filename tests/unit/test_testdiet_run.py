@@ -228,8 +228,9 @@ def test_run_without_junit_is_no_data_and_keeps_the_exit_code(repo, capsys):
     warning = [line for line in err if "has no report" in line]
     assert len(warning) == 1 and "cannot prove a tree" in warning[0]
     assert "{junit}" in warning[0] and "--junit GLOB" in warning[0]
-    assert [line for line in err if line.startswith("jacked tests: recorded ")] == [
-        f"jacked tests: recorded {meta.id}, verdict no-data."]
+    [closing] = [line for line in err if line.startswith("jacked tests: recorded ")]
+    assert closing.startswith(f"jacked tests: recorded {meta.id}, verdict no-data, recorder ")
+    assert closing.endswith(" s.")
     assert run.run_gate(gate(4), cwd=repo) == 4
     assert _last(repo).verdict == "failed"
 
@@ -250,7 +251,8 @@ def test_each_recorded_run_prints_one_closing_line_with_its_id_and_verdict(repo,
         meta = _last(repo)
         lines = [line for line in capsys.readouterr().err.splitlines()
                  if line.startswith("jacked tests: recorded ")]
-        assert lines == [f"jacked tests: recorded {meta.id}, verdict {verdict}."]
+        assert len(lines) == 1 and re.fullmatch(
+            rf"jacked tests: recorded {meta.id}, verdict {verdict}, recorder \d+\.\d s\.", lines[0]), lines
 
 
 def test_run_reads_a_fixed_report_whose_content_changed(repo, side):
@@ -1283,3 +1285,34 @@ def test_a_gate_that_changes_an_input_file_cannot_prove_a_tree(repo, capsys):
                               inputs_sha=meta.inputs_sha, machine_id=meta.machine_id).hit is None
     run.run_gate(junit_gate(0, GREEN), cwd=repo, inputs=["data/*.txt"])
     assert _last(repo).inputs_changed is False
+
+
+@pytest.mark.parametrize("owner, name, consequence", [
+    (history, "write_run", "The run is not recorded."),
+    (junit, "read_junit", "The run has no test data."),
+], ids=["write_run", "read_junit"])
+def test_a_failed_recorder_step_says_what_it_costs_and_prints_no_traceback(repo, monkeypatch, capsys,
+                                                                            owner, name, consequence):
+    monkeypatch.setattr(owner, name, _boom)
+    assert run.run_gate(junit_gate(0, GREEN), cwd=repo) == 0
+    err = capsys.readouterr().err
+    [line] = [line for line in err.splitlines() if "failed (RuntimeError)" in line]
+    assert line.endswith(consequence) and "Traceback" not in err
+
+
+def test_the_closing_line_gives_the_time_of_the_recorder(repo, capsys):
+    import re as _re
+
+    run.run_gate(junit_gate(0, GREEN), cwd=repo)
+    [line] = [line for line in capsys.readouterr().err.splitlines() if line.startswith("jacked tests: recorded ")]
+    assert _re.fullmatch(r"jacked tests: recorded \S+, verdict passed, recorder \d+\.\d s\.", line), line
+
+
+def test_the_fixed_reports_are_listed_one_time_after_the_gate(repo, monkeypatch):
+    from jacked.testdiet import globs as _globs
+
+    calls = []
+    real = _globs.matches
+    monkeypatch.setattr(_globs, "matches", lambda top, pattern: calls.append(pattern) or real(top, pattern))
+    reports.read_reports(repo, None, ["a/*.xml", "b/*.xml"], {}, None)
+    assert calls == ["a/*.xml", "b/*.xml"]

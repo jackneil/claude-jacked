@@ -38,10 +38,13 @@ def sha_of(path: Path) -> str | None:
 
 def matches(top: Path, patterns: Sequence[str]) -> list[Path]:
     """The paths that the globs match. A relative glob starts at ``top``. No path is listed two times."""
+    return _unique([globs.full_path(top, name) for name in globs.matches(top, pattern)] for pattern in patterns)
+
+
+def _unique(lists) -> list[Path]:
     found: dict[str, Path] = {}
-    for pattern in patterns:
-        for name in globs.matches(top, pattern):
-            path = globs.full_path(top, name)
+    for paths in lists:
+        for path in paths:
             found.setdefault(os.path.normpath(path), path)
     return list(found.values())
 
@@ -90,7 +93,9 @@ def read_reports(top: Path, report: Path | None, patterns: Sequence[str],
     if fixed_before is None:
         emit("did not read the --junit reports: they were not hashed before the run.")
         patterns = ()
-    for path in matches(top, patterns):
+    # One walk for each glob after the gate; the "no file matches" check uses the same lists.
+    each = [[globs.full_path(top, name) for name in globs.matches(top, pattern)] for pattern in patterns]
+    for path in _unique(found for found in each):
         key = os.path.normpath(path)
         now = sha_of(path)
         if now is None:
@@ -99,7 +104,7 @@ def read_reports(top: Path, report: Path | None, patterns: Sequence[str],
             emit(f"did not read {path}: its content did not change during the run.")
         else:
             paths.append(path)
-    if patterns and not any(matches(top, [g]) for g in patterns):
+    if patterns and not any(each):
         emit("no file matches the --junit pattern(s).")
     if not paths:
         return None
