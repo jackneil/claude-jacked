@@ -117,7 +117,7 @@ class Capture:
 
 def run_git(
     argv: list[str], *, name: str, env: Mapping[str, str], timeout: float,
-    consumer: Consumer, cwd: str | None = None, stderr=None,
+    consumer: Consumer, cwd: str | None = None, stderr=None, stdin=None,
 ) -> int:
     """Run git and give its stdout to ``consumer`` in chunks. Return the exit code.
 
@@ -126,14 +126,16 @@ def run_git(
     exit code is then the code of the ended process, and the consumer says
     why it stopped. stderr goes to ``os.devnull``, or to the binary file
     ``stderr`` when the caller gives one (a file, not a pipe, so git cannot
-    block on a full pipe). The whole call ends within ``timeout`` seconds: a slow git is ended
+    block on a full pipe). stdin is ``os.devnull``, or the binary file ``stdin``
+    when the caller gives one. The whole call ends within ``timeout`` seconds: a slow git is ended
     and ``subprocess.TimeoutExpired`` is raised. ``name`` is the fixed
     subcommand name for the DEBUG log, which never holds the argv, a path
     or the output. An ``OSError`` from the start of git goes up.
     """
     deadline = time.monotonic() + timeout
     proc = subprocess.Popen(
-        argv, cwd=cwd, env=dict(env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        argv, cwd=cwd, env=dict(env), stdin=subprocess.DEVNULL if stdin is None else stdin,
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL if stderr is None else stderr, creationflags=NO_WINDOW,
     )
     state: dict = {"stopped": False, "read": 0, "error": None}

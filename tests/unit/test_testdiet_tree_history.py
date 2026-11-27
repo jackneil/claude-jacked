@@ -1076,3 +1076,69 @@ def test_an_index_copy_that_cannot_get_an_early_time_raises_tree_error(tmp_path,
     source, copy = _index_with_rounding_utime(tmp_path, monkeypatch, refuse={(0, 0), floor})
     with pytest.raises(tree.TreeError, match="index copy"):
         tree._copy_index(source, copy)
+
+
+# --------------------------------------------------------------------------- index bits that hide an edit
+
+
+def _bits(repo: Path) -> str:
+    return _git(repo, "ls-files", "-v")
+
+
+def test_core_ignorestat_does_not_hide_an_edit_from_the_tree(repo):
+    _git(repo, "config", "core.ignoreStat", "true")
+    (repo / "c.txt").write_bytes(b"one\n")
+    _commit_all(repo, "c")
+    assert "h c.txt" in _bits(repo)  # git set the assume-unchanged bit
+    clean = tree.tree_id(repo)
+    assert clean.clean is True
+    (repo / "c.txt").write_bytes(b"a longer edit\n")
+    changed = tree.tree_id(repo)
+    assert changed.tree != clean.tree and changed.clean is False
+    assert "h c.txt" in _bits(repo)  # the real index keeps its bit
+
+
+def test_an_assume_unchanged_bit_does_not_hide_an_edit_from_the_tree(repo):
+    clean = tree.tree_id(repo)
+    _git(repo, "update-index", "--assume-unchanged", "README.md")
+    (repo / "README.md").write_bytes(b"hidden edit\n")
+    changed = tree.tree_id(repo)
+    assert changed.tree != clean.tree and changed.clean is False
+    assert "h README.md" in _bits(repo)
+
+
+def test_a_skip_worktree_bit_outside_a_sparse_checkout_does_not_hide_an_edit(repo):
+    (repo / "sub").mkdir()
+    (repo / "sub" / "a.txt").write_bytes(b"a\n")
+    _commit_all(repo, "sub")
+    clean = tree.tree_id(repo)
+    _git(repo, "update-index", "--skip-worktree", "sub/a.txt")
+    (repo / "sub" / "a.txt").write_bytes(b"hidden edit\n")
+    changed = tree.tree_id(repo)
+    assert changed.tree != clean.tree and changed.clean is False
+    assert "S sub/a.txt" in _bits(repo)
+
+
+def test_clearing_the_bits_keeps_the_early_time_of_the_index_copy(repo, monkeypatch):
+    # A same-size edit in the same second: the copy must stay as old as the real index.
+    _git(repo, "update-index", "--assume-unchanged", "README.md")
+    times = []
+    real = tree._copy_index
+
+    def spy(source, target):
+        info = real(source, target)
+        times.append(info.st_mtime_ns)
+        return info
+
+    monkeypatch.setattr(tree, "_copy_index", spy)
+    seen: list[int] = []
+    real_git = tree.git
+
+    def watch(cwd, *args, env=None, stderr=None, stdin=None):
+        if "add" in args and env and "GIT_INDEX_FILE" in env:
+            seen.append(os.stat(env["GIT_INDEX_FILE"]).st_mtime_ns)
+        return real_git(cwd, *args, env=env, stderr=stderr, stdin=stdin)
+
+    monkeypatch.setattr(tree, "git", watch)
+    assert tree.tree_id(repo) is not None
+    assert seen and times and all(ns <= times[0] for ns in seen)

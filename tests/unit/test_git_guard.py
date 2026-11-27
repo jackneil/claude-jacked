@@ -311,3 +311,13 @@ def test_a_config_over_the_limit_gives_none(monkeypatch, caplog):
     caplog.set_level(logging.DEBUG, logger="jacked.git_guard")
     assert git_guard.guarded_git_env("git", "/repo", {}) is None
     assert any("more than 8 bytes" in r.getMessage() for r in caplog.records)
+
+
+def test_run_git_reads_stdin_from_a_file_that_the_caller_gives(tmp_path):
+    source = tmp_path / "in.bin"
+    source.write_bytes(b"from the file")
+    out = git_guard.Capture()
+    with open(source, "rb") as handle:
+        code = git_guard.run_git(_python("import sys; sys.stdout.write(sys.stdin.read())"), name="x",
+                                 env=dict(os.environ), timeout=30, consumer=out, stdin=handle)
+    assert code == 0 and bytes(out.data) == b"from the file"

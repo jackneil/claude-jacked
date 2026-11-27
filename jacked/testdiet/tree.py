@@ -55,10 +55,12 @@ _GIT_TIMEOUT_S = 600.0
 # split index keeps part of the index in a second file of the git directory;
 # with this value git writes the copy as one file and never touches that one.
 #: The stat checks stay at full strength whatever the repository config says,
-#: so a config such as core.trustctime=false cannot hide an edit from the tree
-#: identity that ``seen`` trusts.
+#: so core.trustctime=false or core.ignoreStat=true cannot hide an edit from the
+#: tree identity that ``seen`` trusts. The assume-unchanged bits (and, outside a
+#: sparse checkout, the skip-worktree bits) that the real index holds are
+#: cleared in the copy before the add (``_clear_hiding_bits``).
 _INDEX_COPY_ARGS = ("-c", "core.splitIndex=false", "-c", "core.checkStat=default",
-                    "-c", "core.trustctime=true")
+                    "-c", "core.trustctime=true", "-c", "core.ignoreStat=false")
 # The exit code of git for an option that it does not know.
 _GIT_USAGE_ERROR = 129
 # 1980-01-01 UTC, the first time that a FAT file system can store.
@@ -86,12 +88,13 @@ class _All:
 
 
 def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
-        stderr=None) -> tuple[int, bytes]:
+        stderr=None, stdin=None) -> tuple[int, bytes]:
     """Run git in ``cwd`` and return the exit code and the output.
 
     Each call has ``GIT_OPTIONAL_LOCKS=0``, so a read never writes the real
     index. A git that cannot start raises ``TreeError``. ``stderr`` is a
     binary file for the error text of git; with no value it is discarded.
+    ``stdin`` is a binary file that git reads; with no value it is empty.
     """
     binary = find_bin("git")
     if binary is None:
@@ -106,7 +109,8 @@ def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
         while rest[:1] == ["-c"]:
             rest = rest[2:]
         code = git_guard.run_git(argv, name=rest[0] if rest else "git",
-                                 env=full_env, timeout=_GIT_TIMEOUT_S, consumer=out, stderr=stderr)
+                                 env=full_env, timeout=_GIT_TIMEOUT_S, consumer=out, stderr=stderr,
+                                 stdin=stdin)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise TreeError(f"git did not run: {type(exc).__name__}") from exc
     return code, bytes(out.data)
@@ -188,8 +192,6 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
     work = Path(tempfile.mkdtemp(prefix="jacked-tree-"))
     try:
         index_copy = work / "index"
-        if real_index.is_file():
-            _copy_index(real_index, index_copy)
         object_dir = Path(objects) if objects is not None else work / "objects"
         object_dir.mkdir(parents=True, exist_ok=True)
         env = {
@@ -197,6 +199,10 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
             "GIT_OBJECT_DIRECTORY": str(object_dir),
             "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates(real_objects),
         }
+        if real_index.is_file():
+            source_times = _copy_index(real_index, index_copy)
+            if _clear_hiding_bits(cwd, env, work):
+                _set_index_times(index_copy, source_times)
         with tempfile.TemporaryFile(dir=work) as errors:
             code, _ = git(cwd, *_INDEX_COPY_ARGS, "add", "-A", "--sparse", env=env, stderr=errors)
             if code == _GIT_USAGE_ERROR:
@@ -215,22 +221,31 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
     return TreeId(commit=commit, tree=lines[0], clean=lines[0] == head_tree)
 
 
-def _copy_index(source: Path, target: Path) -> None:
-    """Copy the index file, and give the copy the times of the source.
+def _copy_index(source: Path, target: Path) -> os.stat_result:
+    """Copy the index file, give the copy the times of the source, and return the source stat.
 
     Git trusts the stat data of an entry that is older than the index file.
     A copy with a new time would hide a change of the same size in the same
     second. The content and the times come from one open file, so a write of
-    the index between them cannot mix two versions. When the file system
-    rounds the time of the copy up, the copy gets the whole second of the
-    source; when that is still later, it gets time zero. A file system that
-    cannot store time zero (FAT starts in 1980) gets 1980-01-01 UTC. When that
-    also fails, this function raises ``TreeError``. So the copy is never
-    later than the source.
+    the index between them cannot mix two versions. ``_set_index_times``
+    makes sure that the copy is never later than the source.
     """
     with open(source, "rb") as src, open(target, "wb") as dst:
         info = os.fstat(src.fileno())
         shutil.copyfileobj(src, dst)
+    _set_index_times(target, info)
+    return info
+
+
+def _set_index_times(target: Path, info: os.stat_result) -> None:
+    """Give the index copy the times of the source, and never a later time.
+
+    When the file system rounds the time of the copy up, the copy gets the
+    whole second of the source; when that is still later, it gets time
+    zero. A file system that cannot store time zero (FAT starts in 1980)
+    gets 1980-01-01 UTC. When that also fails, this function raises
+    ``TreeError``.
+    """
     os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
     if os.stat(target).st_mtime_ns > info.st_mtime_ns:
         floor = info.st_mtime_ns // 10**9 * 10**9
@@ -245,6 +260,46 @@ def _copy_index(source: Path, target: Path) -> None:
                     os.utime(target, ns=(_FAT_FLOOR_NS, _FAT_FLOOR_NS))
                 except OSError as exc:
                     raise TreeError(f"cannot set an early time on the index copy: {type(exc).__name__}") from exc
+
+
+def _clear_hiding_bits(cwd: Path, env: Mapping[str, str], work: Path) -> bool:
+    """Clear the index bits that make ``git add`` skip an edit, in the index copy only.
+
+    The bits are assume-unchanged (a lowercase tag of ``git ls-files -v``,
+    set by ``update-index --assume-unchanged`` or by ``core.ignoreStat``)
+    and, when ``core.sparseCheckout`` is not true, skip-worktree (tag ``S``
+    or ``s``). In a sparse checkout the skip-worktree bits stay, as the
+    module docstring says. The real index is never written: ``env`` names
+    the copy. Return True when the copy changed. A git error raises
+    ``TreeError``.
+    """
+    code, out = git(cwd, "ls-files", "-v", "-z", env=env)
+    if code != 0:
+        raise TreeError(f"git ls-files exited with {code}")
+    code, sparse = git(cwd, "config", "--type=bool", "--get", "core.sparseCheckout")
+    clear_skip = sparse.strip() != b"true"
+    assumed, skipped = [], []
+    for entry in out.split(b"\0"):
+        if len(entry) < 3 or entry[1:2] != b" ":
+            continue
+        tag, path = entry[:1], entry[2:]
+        if tag.islower():
+            assumed.append(path)
+        if clear_skip and tag in (b"S", b"s"):
+            skipped.append(path)
+    for option, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", skipped)):
+        if paths:
+            _update_index(cwd, env, work, option, paths)
+    return bool(assumed or skipped)
+
+
+def _update_index(cwd: Path, env: Mapping[str, str], work: Path, option: str, paths: list[bytes]) -> None:
+    with tempfile.TemporaryFile(dir=work) as names:
+        names.write(b"\0".join(paths) + b"\0")
+        names.seek(0)
+        code, _ = git(cwd, *_INDEX_COPY_ARGS, "update-index", "-z", option, "--stdin", env=env, stdin=names)
+    if code != 0:
+        raise TreeError(f"git update-index {option} exited with {code}")
 
 
 def alternates(real_objects: str) -> str:

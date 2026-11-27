@@ -243,6 +243,7 @@ A machine has a label: `local` for a run of `run`, or the value of `record --mac
 - The tree identity does not hold a file that git ignores. When the gate reads such a file, give it with `run --input GLOB`. Then give the same globs with `seen --input GLOB`.
 - The `--input` fingerprint holds the path, the size and the modification time in nanoseconds of each file. It does not hold the content.
 - The tree identity does not hold a change inside the work tree of a submodule.
+- An assume-unchanged bit, `core.ignoreStat` and a skip-worktree bit do not hide an edit from the tree identity. jacked clears these bits in its own copy of the index, and never in the real index. In a sparse checkout, the skip-worktree bits stay: a tracked file that the cone leaves out stays as HEAD has it.
 - With git-lfs, the clean filter can write a copy of a new large file into `.git/lfs/objects` of the clone. The copy uses disk space, and no commit uses it. To remove such copies, run `git lfs prune`.
 - On Windows, an edit that keeps the size and puts back the old modification time is not seen. `git status` does not see it either.
 
