@@ -949,3 +949,43 @@ def test_the_script_scan_reads_each_character_a_bounded_number_of_times(line):
     _CountingText.reads = 0
     loss_braces._Index(text, loss_braces._JS_QUOTES, "`", chars=False, script=True)
     assert _CountingText.reads < 20 * len(text), _CountingText.reads
+
+
+# --------------------------------------------------------------------------- g-L1: literals stay exact in the body print
+
+_PY_OLD = b"from m import normalize\n\n\nclass TestA:\n    def test_ok(self):\n        assert normalize('a b') == 'ab'\n"
+
+
+@pytest.mark.parametrize("old_path, old, new_path, new, moved", [
+    # The reviewer's pair: the bodies differ only inside a string literal, so it is a removal and an addition.
+    # (Only Python names have a class part, so only Python reaches the body key of the pairing.)
+    ("tests/test_a.py", _PY_OLD, "tests/test_b.py",
+     b"from m import normalize\n\n\ndef test_ok():\n    assert normalize('ab') == 'ab'\n", False),
+    # Controls: a new indent, or space between tokens, is still a move.
+    ("tests/test_a.py", _PY_OLD, "tests/test_b.py",
+     b"from m import normalize\n\n\ndef test_ok():\n  assert normalize( 'a b' )  ==  'ab'\n", True),
+])
+def test_a_body_that_differs_only_inside_a_string_is_not_a_move(repo, old_path, old, new_path, new, moved):
+    write(repo, old_path, old)
+    commit(repo, "the old test")
+    (repo / old_path).unlink()
+    write(repo, new_path, new)
+    report = loss.loss_report(repo, "HEAD")
+    if moved:
+        assert len(report.moved) == 1 and report.removed == () and report.added == (), report
+    else:
+        assert report.moved == () and len(report.removed) == 1 and len(report.added) == 1, report
+
+
+@pytest.mark.parametrize("path, template", [
+    ("src/a.test.js", 'test("ok", () => {{\n{indent}expect(f({arg})).toBe("ab");\n}});\n'),
+    ("pkg/a_test.go", 'func TestOk(t *testing.T) {{\n{indent}if f({arg}) != "ab" {{\n{indent}{indent}t.Fail()\n{indent}}}\n}}\n'),
+    ("src/lib.rs", '#[test]\nfn ok() {{\n{indent}assert_eq!(f({arg}), "ab");\n}}\n'),
+])
+def test_a_brace_body_print_keeps_string_contents_and_ignores_layout(path, template):
+    def body(arg, indent="  "):
+        [found] = loss_scan.scan_file(path, template.format(arg=arg, indent=indent))[0]
+        return found.body
+
+    assert body('"a b"') != body('"ab"')  # failed before: white space inside a string was dropped
+    assert body('"a b"') == body('"a b"', indent="        ") == body(' "a b" ')

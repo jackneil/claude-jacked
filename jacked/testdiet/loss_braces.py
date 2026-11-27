@@ -12,7 +12,7 @@ import bisect
 import functools
 import re
 
-from jacked.testdiet.model import BODY_NOT_READ, COMPUTED_CASES, Declaration, body_print
+from jacked.testdiet.model import BODY_NOT_READ, COMPUTED_CASES, Declaration, code_print
 
 # A scanner for the languages with braces --------------------------------
 
@@ -254,9 +254,17 @@ _GO_FOR = re.compile(r"\bfor\b")
 _RUST_IGNORE = re.compile(r"#\[\s*ignore\b")
 
 
-def _print(text: str, start: int, end: int) -> str | None:
-    """The ``body_print`` of ``text[start:end]``, or None when the body is not read."""
-    return body_print(text[start:end]) if 0 <= start < end else None
+def _print(text: str, index: _Index, start: int, end: int) -> str | None:
+    """The ``code_print`` of ``text[start:end]`` with the strings and comments of ``index``, or None."""
+    if not 0 <= start < end:
+        return None
+    spans = []
+    for first in index._starts[max(bisect.bisect_right(index._starts, start) - 1, 0):]:
+        if first >= end:
+            break
+        if index.spans[first] > start:
+            spans.append((max(first, start) - start, min(index.spans[first], end) - start))
+    return code_print(text[start:end], spans)
 
 
 def script(text: str) -> tuple[list[Declaration], str | None]:
@@ -291,7 +299,7 @@ def script(text: str) -> tuple[list[Declaration], str | None]:
         end = index.body(i)
         skipped = head["fn"].startswith("x") or bool(_JS_SKIPS & set(mods))
         found.append(Declaration(text[start + 1:name_end - 1], _count(_JS_ASSERT, text, name_end, end),
-                                 skipped, cases, _unread(end, cases), _print(text, name_end, end)))
+                                 skipped, cases, _unread(end, cases), _print(text, index, name_end, end)))
     return found, index.damage_reason(text)
 
 
@@ -446,7 +454,7 @@ def go(text: str) -> tuple[list[Declaration], str | None]:
         cases = None if end < 0 else _go_cases(text, index, brace, end, runs)
         found.append(Declaration(head["name"], _count(asserts, text, brace, end), skipped, cases,
                                  _unread(end, cases) if end >= 0 else (BODY_NOT_READ,),
-                                 _print(text, brace, end)))
+                                 _print(text, index, brace, end)))
     return found, index.damage_reason(text)
 
 
@@ -478,5 +486,5 @@ def rust(text: str) -> tuple[list[Declaration], str | None]:
         brace = text.find("{", fn.end())
         end = -1 if brace < 0 else index.body(brace)
         found.append(Declaration(fn["name"], _count(_RUST_ASSERT, text, brace, end), ignored, 1, _unread(end, 1),
-                                 _print(text, brace, end)))
+                                 _print(text, index, brace, end)))
     return found, index.damage_reason(text)

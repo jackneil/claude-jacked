@@ -6,6 +6,7 @@ import logging
 import re
 import sys
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -293,11 +294,47 @@ class Declaration:
 
 
 def body_print(text: str) -> str:
-    """A short SHA-256 of a test body with no white space, so a new indent gives the same value.
+    """A short SHA-256 of a normalized test body. The text is hashed as it is.
 
-    >>> body_print("assert 1") == body_print("  assert   1\\n")
-    True
+    The caller normalizes: Python gives the AST dump of the body (no indent,
+    literals exact), and the brace languages give the code with each string
+    and comment exact (``loss_braces._print``). So two bodies that differ
+    only inside a string literal get two values.
+
+    >>> body_print("f('a b')") == body_print("f('ab')")
+    False
     """
     import hashlib
 
-    return hashlib.sha256("".join(text.split()).encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def code_print(body: str, spans: Sequence[tuple[int, int]]) -> str:
+    """The ``body_print`` of brace-language code. Each span (a string or a comment) stays exact.
+
+    Outside the spans, white space counts only between two word characters
+    (a token boundary), so a new indent or a space inside brackets gives the
+    same print, and ``f("a b")`` and ``f("ab")`` give two prints.
+
+    >>> code_print('f( "a b" )', [(3, 8)]) == code_print('f("a b")', [(2, 7)])
+    True
+    >>> code_print('f("a b")', [(2, 7)]) == code_print('f("ab")', [(2, 6)])
+    False
+    """
+    parts: list[str] = []
+    j = 0
+    for start, end in [*spans, (len(body), len(body))]:
+        segment = body[j:start]
+        parts.append(_SPACE_RUN.sub(lambda m: _boundary(segment, m.start(), m.end()), segment))
+        parts.append(body[start:end])
+        j = end
+    return body_print("".join(parts))
+
+
+def _boundary(code: str, start: int, end: int) -> str:
+    """One space when the white space ``code[start:end]`` is between two word characters, else nothing."""
+    before, after = code[start - 1:start] if start else "", code[end:end + 1]
+    return " " if all(ch and (ch.isalnum() or ch in "_$") for ch in (before, after)) else ""
