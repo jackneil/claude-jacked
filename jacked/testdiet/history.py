@@ -1,0 +1,499 @@
+"""The local store of test runs.
+
+Each run is two files in ``<store>/runs/``: ``<id>.tests.json.gz`` (the
+tests) and then ``<id>.meta.json`` (the record). The meta file is the commit
+marker: a run with no meta file does not exist. No file is shared between
+runs, so two sessions that write at the same time cannot damage a record.
+Each file is written atomically.
+
+The store holds IDs, numbers, states and the class name of a failure. It
+holds no failure message, no test output and no command text. Nothing is
+deleted automatically: ``prune`` deletes on request.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import gzip
+import hashlib
+import json
+import os
+import re
+import secrets
+import zlib
+from collections.abc import Iterable, Iterator
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+from jacked.atomic_io import atomic_write_bytes
+from jacked.regular_file import open_regular_fd
+from jacked.testdiet.model import (
+    FAILING_STATES,
+    LABEL_RE,
+    MACHINE_ID_RE,
+    STATES,
+    CaseResult,
+    RunData,
+    RunMeta,
+    TreeId,
+    emit,
+    error_text,
+)
+
+RUNS = "runs"
+META_SUFFIX = ".meta.json"
+TESTS_SUFFIX = ".tests.json.gz"
+#: A run ID: the UTC time to the microsecond, then 8 random hex characters.
+# Explicit ASCII classes, not \d: \d also matches digits such as U+0660, and a
+# pattern that embeds this one (``_TEMP_RE``) does not get the flag of this one.
+RUN_ID_RE = re.compile(r"([0-9]{8})T[0-9]{12}Z-[0-9a-f]{8}", re.ASCII)
+
+_RAN_STATES = ("passed", "flaky")
+#: A tests file with no meta file is a write that is in progress or that
+#: stopped. A write takes milliseconds, so ``prune`` deletes such a file only
+#: when its run ID is older than this margin. It is a margin for a live
+#: writer, not a limit on data.
+ORPHAN_AGE = timedelta(hours=24)
+_HEX_ID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_HASH_FIELDS = ("command_sha", "inputs_sha", "failing_sig")
+#: The ``inputs_sha`` of a run whose ``--input`` files could not be hashed.
+#: ``seen`` never matches it. It is not None, because None means "no --input".
+INPUTS_UNAVAILABLE = "unavailable"
+#: The ``inputs_sha`` of a stored record whose value is not valid (damaged, or forged).
+#: It never equals a request value and never proves a tree. None stays reserved
+#: for a record of a run with no ``--input``.
+INPUTS_INVALID = "invalid"
+_META_FIELDS = tuple(f.name for f in dataclasses.fields(RunMeta))
+_CASE_FIELDS = tuple(f.name for f in dataclasses.fields(CaseResult))
+_TUPLE_FIELDS = ("failing", "flaky")
+_INT_FIELDS = ("exit_code",)
+_NUMBER_FIELDS = ("wall_seconds", "seconds_reported", "load_start", "load_end", "child_cpu_seconds",
+                  "test_seconds")
+_BOOL_FIELDS = ("tree_changed", "on_default_branch", "interrupted", "inputs_changed")
+
+
+class DamagedRecordError(ValueError):
+    """A file of the store cannot be read as a record."""
+
+
+class PruneError(OSError):
+    """``prune`` could not delete some files.
+
+    ``deleted`` holds the run IDs that are gone. ``failed`` holds each file
+    name that stays, with the class name of its error.
+    """
+
+    def __init__(self, deleted: list[str], failed: list[tuple[str, str]]):
+        names = ", ".join(f"{name} ({error})" for name, error in failed)
+        super().__init__(f"prune could not delete {len(failed)} file(s): {names}")
+        self.deleted = deleted
+        self.failed = failed
+
+
+def _read(path: Path) -> bytes:
+    """Read a store file. A path that is not a regular file raises ``NotRegularFileError``."""
+    with os.fdopen(open_regular_fd(path), "rb") as handle:
+        return handle.read()
+
+
+def id_time(run_id: str) -> datetime:
+    """Return the UTC time of a run ID: the clock of the machine that wrote the run.
+
+    >>> id_time("20261126T090501000007Z-0a1b2c3d").isoformat()
+    '2026-11-26T09:05:01.000007+00:00'
+    """
+    return datetime.strptime(run_id[:21], "%Y%m%dT%H%M%S%f").replace(tzinfo=timezone.utc)
+
+
+def new_run_id(now: datetime | None = None) -> str:
+    """Return a new run ID. IDs sort in the order of their UTC time.
+
+    >>> new_run_id(datetime(2026, 11, 26, 9, 5, 1, 7, tzinfo=timezone.utc))[:23]
+    '20261126T090501000007Z-'
+    """
+    moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return f"{moment:%Y%m%dT%H%M%S%f}Z-{secrets.token_hex(4)}"
+
+
+def is_run_id(name) -> bool:
+    """True when ``name`` matches ``RUN_ID_RE`` and its time is real. A month 13 is not a run file, so it stays."""
+    if not isinstance(name, str) or not RUN_ID_RE.fullmatch(name):
+        return False
+    try:
+        id_time(name)
+    except ValueError:
+        return False
+    return True
+
+
+def check_id(run_id: str) -> str:
+    """Return ``run_id`` when it is a valid run ID. Else raise ``ValueError``."""
+    if not is_run_id(run_id):
+        raise ValueError("a run ID must be <UTC time>Z-<8 hex characters>")
+    return run_id
+
+
+def failing_signature(cases: Iterable[CaseResult]) -> str | None:
+    """Return the SHA-256 of the sorted (id, failure_type) pairs of the failed and error tests.
+
+    A flaky test is not in the failing set. The result is None when no test failed.
+    """
+    pairs = sorted({(c.id, c.failure_type or "") for c in cases if c.state in FAILING_STATES})
+    if not pairs:
+        return None
+    text = json.dumps(pairs, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+def counts_of(data: RunData | None) -> dict[str, int] | None:
+    """Return the number of tests in each state, or None for a run with no report.
+
+    >>> counts_of(None) is None
+    True
+    """
+    if data is None:
+        return None
+    return {state: sum(1 for case in data.tests if case.state == state) for state in STATES}
+
+
+def failing_of(data: RunData | None) -> tuple[str, ...]:
+    """Return the sorted IDs of the failed and the error tests."""
+    if data is None:
+        return ()
+    return tuple(sorted(case.id for case in data.tests if case.state in FAILING_STATES))
+
+
+def flaky_of(data: RunData | None) -> tuple[str, ...]:
+    """Return the sorted IDs of the flaky tests."""
+    if data is None:
+        return ()
+    return tuple(sorted(case.id for case in data.tests if case.state == "flaky"))
+
+
+def sum_test_seconds(data: RunData | None) -> float | None:
+    """Return the sum of the test seconds that the report holds, or None when no test has a time.
+
+    >>> sum_test_seconds(None) is None
+    True
+    """
+    if data is None:
+        return None
+    known = [case.seconds for case in data.tests if case.seconds is not None]
+    return sum(known) if known else None
+
+
+def failing_set_summary(records: Iterable[RunMeta]) -> dict[str, int | None]:
+    """Return the tree and default-branch counts of the records of one failing set.
+
+    ``trees`` is the number of distinct trees, or None when no record holds
+    a tree; ``trees_unknown`` counts the records with no tree.
+    ``on_default_branch`` is the number of records on the default branch, or
+    None when no record holds that value; ``on_default_branch_unknown``
+    counts the records with no value. An unknown value is never 0.
+    """
+    records = list(records)
+    trees = {m.tree.tree for m in records if m.tree is not None}
+    known_branch = [m.on_default_branch for m in records if m.on_default_branch is not None]
+    return {
+        "runs": len(records),
+        "trees": len(trees) if trees else None,
+        "trees_unknown": sum(1 for m in records if m.tree is None),
+        "on_default_branch": sum(known_branch) if known_branch else None,
+        "on_default_branch_unknown": len(records) - len(known_branch),
+    }
+
+
+def verdict_of(exit_code: int | None, data: RunData | None) -> str:
+    """Return the verdict of a run.
+
+    "unknown": no exit code. "failed": an exit code that is not 0.
+    "no-data": exit code 0 and no report, or a report in which no test
+    ran (no test, or only skipped tests). "conflict": exit code 0 and a
+    failed or an error test, or a failure that only a suite counts. "passed": exit code 0, no failed and no error
+    test, and at least one test that passed (a flaky test passed too).
+    """
+    if exit_code is None:
+        return "unknown"
+    if exit_code != 0:
+        return "failed"
+    if data is not None and data.suite_failures:
+        return "conflict"  # a failure that only a suite counts is still a failure
+    if data is None or not data.tests:
+        return "no-data"
+    if any(case.state in FAILING_STATES for case in data.tests):
+        return "conflict"
+    if not any(case.state in _RAN_STATES for case in data.tests):
+        return "no-data"
+    return "passed"
+
+
+def write_run(store: Path, meta: RunMeta, data: RunData | None) -> None:
+    """Write one run into ``store``: the tests file first, then the meta file.
+
+    With no ``data``, only the meta file is written.
+    """
+    run_id = check_id(meta.id)
+    runs = Path(store) / RUNS
+    if data is not None:
+        payload = {"runner": data.runner, "seconds_reported": data.seconds_reported,
+                   "tests": [dataclasses.asdict(case) for case in data.tests]}
+        # ASCII JSON: a file name that is not UTF-8 (a lone surrogate) is kept as an escape.
+        raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        atomic_write_bytes(runs / f"{run_id}{TESTS_SUFFIX}", gzip.compress(raw, mtime=0), fsync=True)
+    text = json.dumps(dataclasses.asdict(meta), ensure_ascii=True, indent=1, sort_keys=True)
+    # fsync: after a power loss, a meta file (the mark of a complete run) is never empty.
+    atomic_write_bytes(runs / f"{run_id}{META_SUFFIX}", (text + "\n").encode("ascii"), fsync=True)
+
+
+def _is(value, kinds) -> bool:
+    # bool is an int in Python; a number field never takes a bool.
+    return isinstance(value, kinds) and not isinstance(value, bool)
+
+
+def _meta_from(run_id: str, raw) -> RunMeta:
+    """Build a RunMeta from the JSON of a meta file.
+
+    A field that this version does not know is ignored. A field that the
+    file does not hold is None (an empty tuple for ``failing`` and
+    ``flaky``). A machine label that does not match ``LABEL_RE``, a
+    machine identity that does not match ``MACHINE_ID_RE`` and a schema
+    that is not an integer read as None, and the record is still read.
+    Another field of the wrong type makes the file damaged.
+    """
+    if not isinstance(raw, dict):
+        raise DamagedRecordError("the meta file is not an object")
+    values: dict = {}
+    for name in _META_FIELDS:
+        value = raw.get(name)
+        if name == "id":
+            value = run_id
+        elif name in _TUPLE_FIELDS:
+            value = () if value is None else value
+            if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
+                raise DamagedRecordError(f"{name} is not a list of IDs")
+            value = tuple(value)
+        elif name == "machine":
+            # A label that is not valid reads as empty. The record is not damaged.
+            value = value if isinstance(value, str) and LABEL_RE.fullmatch(value) else None
+        elif name == "machine_id":
+            value = value if isinstance(value, str) and MACHINE_ID_RE.fullmatch(value) else None
+        elif name in _HASH_FIELDS:
+            value = _hash_value(name, value)
+        elif name == "schema":
+            # A version that is not an integer reads as no version: seen never uses the record.
+            value = value if _is(value, int) else None
+        elif value is None:
+            pass
+        elif name == "tree":
+            value = _tree_from(value)
+        elif name == "counts":
+            if not isinstance(value, dict) or not all(_is(v, int) for v in value.values()):
+                raise DamagedRecordError("counts is not a map of numbers")
+        elif name in _INT_FIELDS:
+            if not _is(value, int):
+                raise DamagedRecordError(f"{name} is not an integer")
+        elif name in _NUMBER_FIELDS:
+            if not _is(value, (int, float)):
+                raise DamagedRecordError(f"{name} is not a number")
+        elif name in _BOOL_FIELDS:
+            if not isinstance(value, bool):
+                raise DamagedRecordError(f"{name} is not true or false")
+        elif not isinstance(value, str):
+            raise DamagedRecordError(f"{name} is not text")
+        values[name] = value
+    return RunMeta(**values)
+
+
+def _tree_from(value) -> TreeId | None:
+    """A tree identity, or None when a sub-field is missing or has the wrong type."""
+    if not isinstance(value, dict):
+        return None
+    commit, tree_hash, clean = value.get("commit"), value.get("tree"), value.get("clean")
+    if not (isinstance(commit, str) and _HEX_ID_RE.fullmatch(commit)
+            and isinstance(tree_hash, str) and _HEX_ID_RE.fullmatch(tree_hash)
+            and isinstance(clean, bool)):
+        return None
+    return TreeId(commit=commit, tree=tree_hash, clean=clean)
+
+
+def _warn(name: str, exc: Exception) -> None:
+    emit(f"skipped the damaged record {name} ({error_text(exc)})")
+
+
+def iter_runs(store: Path) -> Iterator[RunMeta]:
+    """Yield each run of ``store``, newest first by the run ID.
+
+    A run with no meta file does not exist. A damaged meta file is skipped,
+    with one warning on standard error for each file.
+    """
+    runs = Path(store) / RUNS
+    try:
+        names = [p.name for p in runs.iterdir()]
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        emit(f"the history folder {RUNS} cannot be read ({error_text(exc)}). No run is read.")
+        return
+    ids = sorted((n[: -len(META_SUFFIX)] for n in names if n.endswith(META_SUFFIX)), reverse=True)
+    for run_id in ids:
+        if not is_run_id(run_id):
+            continue
+        name = f"{run_id}{META_SUFFIX}"
+        try:
+            meta = _meta_from(run_id, json.loads(_read(runs / name)))
+        except FileNotFoundError:
+            continue  # pruned while the list was read
+        except (OSError, ValueError, TypeError) as exc:
+            _warn(name, exc)
+            continue
+        yield meta
+
+
+def load_tests(store: Path, run_id: str) -> RunData | None:
+    """Return the tests of the run ``run_id``, or None when the run has no tests file.
+
+    A damaged tests file gives None, with one warning on standard error.
+    """
+    name = f"{check_id(run_id)}{TESTS_SUFFIX}"
+    try:
+        raw = json.loads(gzip.decompress(_read(Path(store) / RUNS / name)))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, EOFError, zlib.error) as exc:
+        _warn(name, exc)
+        return None
+    try:
+        tests = tuple(_case_from(case) for case in raw["tests"])
+        seconds = raw.get("seconds_reported")
+        if not isinstance(raw["runner"], str) or not (seconds is None or _is_number(seconds)):
+            raise DamagedRecordError("the runner or the reported seconds have the wrong type")
+        return RunData(runner=raw["runner"], tests=tests, seconds_reported=seconds)
+    except (KeyError, TypeError, AttributeError, DamagedRecordError) as exc:
+        _warn(name, exc)
+        return None
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _hash_value(name: str, value):
+    """A hash that is not 64 hex characters reads as None, so seen never matches it. For ``inputs_sha``
+    it reads as ``INPUTS_INVALID``: there None means "no --input", and "unavailable" stays."""
+    if isinstance(value, str) and _SHA256_RE.fullmatch(value) or name == "inputs_sha" and value in (
+            None, INPUTS_UNAVAILABLE):
+        return value
+    return INPUTS_INVALID if name == "inputs_sha" else None
+
+
+def _case_from(case: dict) -> CaseResult:
+    """One test of a tests file. A field of the wrong type makes the file damaged."""
+    values = {k: case.get(k) for k in _CASE_FIELDS}
+    ok = (isinstance(values["id"], str)
+          and (values["file"] is None or isinstance(values["file"], str))
+          and (values["seconds"] is None or _is_number(values["seconds"]))
+          and values["state"] in STATES
+          and (values["failure_type"] is None or isinstance(values["failure_type"], str))
+          and isinstance(values["attempts"], int) and not isinstance(values["attempts"], bool))
+    if not ok:
+        raise DamagedRecordError("a test has a field of the wrong type")
+    return CaseResult(**values)
+
+
+def run_ids(store: Path) -> set[str]:
+    """Return the ID of each run that has a meta file in ``store``."""
+    try:
+        names = os.listdir(Path(store) / RUNS)
+    except FileNotFoundError:
+        return set()
+    return {name[: -len(META_SUFFIX)] for name in names
+            if name.endswith(META_SUFFIX) and is_run_id(name[: -len(META_SUFFIX)])}
+
+
+#: The temporary file of an atomic write: ".<run file>.<random>.tmp".
+_TEMP_RE = re.compile(rf"\.(?P<id>{RUN_ID_RE.pattern})(?:{re.escape(META_SUFFIX)}|{re.escape(TESTS_SUFFIX)})"
+                      r"\.[A-Za-z0-9_]+\.tmp", re.ASCII)
+
+
+def _prune_temp_files(runs: Path, names: set[str], orphan_limit: datetime, dry_run: bool) -> None:
+    """Delete each temporary file of a write that stopped more than ``ORPHAN_AGE`` ago. One line gives the count.
+
+    Such a file is never a run: a write that a hard stop or a power loss cut.
+    A young one can still be in progress, so it stays.
+    """
+    stale = sorted(name for name in names if (match := _TEMP_RE.fullmatch(name))
+                   and is_run_id(match.group("id")) and id_time(match.group("id")) < orphan_limit)
+    gone = 0
+    for name in stale:
+        if dry_run:
+            gone += 1
+            continue
+        try:
+            (runs / name).unlink(missing_ok=True)
+            gone += 1
+        except OSError as exc:
+            emit(f"cannot delete the temporary file {name} ({error_text(exc)})")
+    if gone:
+        what = "1 temporary file" if gone == 1 else f"{gone} temporary files"
+        emit(f"{'would delete' if dry_run else 'deleted'} {what} of a write that stopped.")
+
+
+def prune(store: Path, before: date, *, now: datetime | None = None, dry_run: bool = False) -> list[str]:
+    """Delete each run whose UTC date is before ``before``. Return the deleted run IDs, sorted.
+
+    With ``dry_run``, delete nothing, and return the IDs that a prune deletes.
+    A temporary file of a write that stopped more than ``ORPHAN_AGE`` ago
+    also goes (``_prune_temp_files``), at any date.
+
+    For a complete run, the meta file goes first, so the run is gone in one
+    step, and then its tests file. A tests file with no meta file is a write
+    that is in progress or that stopped: it goes only when its run ID is
+    also more than 24 hours (``ORPHAN_AGE``) before ``now``. A file that is
+    not a run file stays. ``now`` must be an aware datetime. When a file
+    cannot be deleted, the other files still go, and then ``PruneError``
+    names each file that stays and holds the deleted IDs.
+    """
+    if now is not None and now.tzinfo is None:
+        raise ValueError("now must be an aware datetime (UTC)")
+    runs = Path(store) / RUNS
+    try:
+        names = set(os.listdir(runs))
+    except FileNotFoundError:
+        return []
+    limit = f"{before:%Y%m%d}"
+    orphan_limit = (now or datetime.now(timezone.utc)) - ORPHAN_AGE
+    _prune_temp_files(runs, names, orphan_limit, dry_run)
+    found: dict[str, set[str]] = {}
+    for name in names:
+        for suffix in (META_SUFFIX, TESTS_SUFFIX):
+            run_id = name[: -len(suffix)]
+            if name.endswith(suffix) and is_run_id(run_id):
+                if run_id[:8] < limit:
+                    found.setdefault(run_id, set()).add(suffix)
+    deleted: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for run_id in sorted(found):
+        suffixes = found[run_id]
+        if META_SUFFIX not in suffixes and id_time(run_id) >= orphan_limit:
+            continue  # a write can still be in progress
+        if dry_run:
+            deleted.append(run_id)
+            continue
+        gone = False
+        for suffix in (META_SUFFIX, TESTS_SUFFIX):
+            if suffix not in suffixes:
+                continue
+            try:
+                (runs / f"{run_id}{suffix}").unlink(missing_ok=True)
+            except OSError as exc:
+                failed.append((f"{run_id}{suffix}", type(exc).__name__))
+                if suffix == META_SUFFIX:
+                    break  # the run still exists; keep its tests file
+            else:
+                gone = True
+        if gone:
+            deleted.append(run_id)
+    if failed:
+        raise PruneError(deleted, failed)
+    return deleted

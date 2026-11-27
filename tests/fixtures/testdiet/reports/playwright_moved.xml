@@ -1,0 +1,51 @@
+<testsuites id="" name="" tests="8" failures="1" skipped="1" errors="0" time="6.225863000000001">
+<testsuite name="tests/sample.spec.js" timestamp="2026-11-26T14:26:14.143Z" hostname="gate.example" tests="8" failures="1" skipped="1" time="0.685" errors="0">
+<testcase name="fails" classname="tests/sample.spec.js" time="0.004">
+<system-out>
+<![CDATA[
+[[ATTACHMENT|test-results/tests-sample-fails/error-context.md]]
+]]>
+</system-out>
+<failure message="expect(received).toBe(expected) // Object.is equality" type="expect.toBe">
+<![CDATA[  tests/sample.spec.js:4:1 › fails ─────────────────────────────────────────────────────────────────
+
+    Error: expect(received).toBe(expected) // Object.is equality
+
+    Expected: "a different value"
+    Received: "sample-failure-message"
+
+      3 |
+      4 | test("fails", async () => {
+    > 5 |   expect("sample-failure-message").toBe("a different value");
+        |                                    ^
+      6 | });
+      7 |
+      8 | test.skip("skipped", async () => {});
+        at /work/tests/sample.spec.js:5:36
+
+    Error Context: test-results/tests-sample-fails/error-context.md
+]]>
+</failure>
+</testcase>
+<testcase name="skipped" classname="tests/sample.spec.js">
+<properties>
+<property name="skip" value="">
+</property>
+</properties>
+<skipped>
+</skipped>
+</testcase>
+<testcase name="parametrized 1" classname="tests/sample.spec.js" time="0.082">
+</testcase>
+<testcase name="parametrized 2" classname="tests/sample.spec.js" time="0.001">
+</testcase>
+<testcase name="group › in group" classname="tests/sample.spec.js" time="0.094">
+</testcase>
+<testcase name="group › nested › in nested group" classname="tests/sample.spec.js" time="0.001">
+</testcase>
+<testcase name="sleeps_half_a_second" classname="tests/sample.spec.js" time="0.503">
+</testcase>
+<testcase name="passes" classname="tests/sample.spec.js" time="0">
+</testcase>
+</testsuite>
+</testsuites>

@@ -1,0 +1,2 @@
+/work/src/sample.test.js
+/work/src/other.test.js

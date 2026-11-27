@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="1" tests="8" time="0.545" timestamp="2026-11-26T09:25:01.272572-05:00" hostname="gate.example"><testcase classname="tests.test_sample" name="test_passes" time="0.000" /><testcase classname="tests.test_sample" name="test_fails" time="0.000"><failure message="AssertionError: sample-failure-message&#10;assert 'sample-failure-message' == 'a different value'&#10;  &#10;  - a different value&#10;  + sample-failure-message">def test_fails():
+&gt;       assert "sample-failure-message" == "a different value", "sample-failure-message"
+E       AssertionError: sample-failure-message
+E       assert 'sample-failure-message' == 'a different value'
+E         
+E         - a different value
+E         + sample-failure-message
+
+tests/test_sample.py:13: AssertionError</failure></testcase><testcase classname="tests.test_sample" name="test_skipped" time="0.000"><skipped type="pytest.skip" message="sample-skip-reason">/work/tests/test_sample.py:16: sample-skip-reason</skipped></testcase><testcase classname="tests.test_sample" name="test_parametrized[1]" time="0.000" /><testcase classname="tests.test_sample" name="test_parametrized[2]" time="0.000" /><testcase classname="tests.test_sample.TestGroup" name="test_in_class" time="0.000" /><testcase classname="tests.test_sample.TestGroup.TestNested" name="test_in_nested_class" time="0.000" /><testcase classname="tests.test_sample" name="test_sleeps_half_a_second" time="0.505" /></testsuite></testsuites>

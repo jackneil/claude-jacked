@@ -28,6 +28,7 @@ from jacked.dcr_settings import EFFORT_CHOICES as _DCR_EFFORT_CHOICES
 from jacked.dcr_settings import ENGINE_CHOICES as _DCR_ENGINE_CHOICES
 from jacked.integrity_cli import integrity_group, print_doctor_lines
 from jacked.issues_cli import issues_group
+from jacked.testdiet.commands import recorder_group
 from jacked.provider_cli import grok_group, provider_db as _codex_db
 from jacked.memory.settings_io import SettingsUnreadableError as _SettingsUnreadable
 from jacked.memory.settings_io import read_settings as _read_settings_strict
@@ -181,11 +182,11 @@ def _maybe_prompt_first_run(ctx) -> None:
     banner and (interactively) offer to run it now.
 
     Fires only for a human at an interactive terminal — never for the hook /
-    update-status shims (names starting with ``_``), for ``install`` itself, or
+    update-status shims (names starting with ``_``), for ``install``, ``tests``, or
     for any non-TTY caller (scripts, CI, Claude Code hooks, the test runner), so
     it can't corrupt automated stdout/stderr."""
     sub = ctx.invoked_subcommand
-    if sub and (sub.startswith("_") or sub == "install"):
+    if sub and (sub.startswith("_") or sub in ("install", "tests")):
         return
     if not _is_interactive_tty():
         return
@@ -7012,9 +7013,8 @@ def dcr_engine_clear():
         console.print("[dim](No config file was present.)[/dim]")
 
 
-main.add_command(issues_group)
-main.add_command(integrity_group)
-main.add_command(grok_group)
+for _group in (issues_group, integrity_group, grok_group, recorder_group):
+    main.add_command(_group)
 
 
 @main.group(name="memory")

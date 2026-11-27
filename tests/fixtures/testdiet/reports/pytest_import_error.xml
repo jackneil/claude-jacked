@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="1" failures="0" skipped="0" tests="1" time="0.217" timestamp="2026-11-26T09:25:02.672074-05:00" hostname="gate.example"><testcase classname="" name="tests.test_broken" time="0.000"><error message="collection failure">ImportError while importing test module '/work/tests/test_broken.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/opt/homebrew/Caskroom/miniconda/base/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_broken.py:3: in &lt;module&gt;
+    import sample_module_that_does_not_exist  # noqa: F401
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   ModuleNotFoundError: No module named 'sample_module_that_does_not_exist'</error></testcase></testsuite></testsuites>

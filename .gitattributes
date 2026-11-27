@@ -1,3 +1,11 @@
 # Vendored browser scripts are pinned by SHA-256
 # (tests/unit/test_web_vendor_scripts.py): never convert their line endings.
 jacked/data/web/js/vendor/*.js -text
+
+# The sample reports of the test-diet recorder keep the bytes of the real
+# run (tests/fixtures/testdiet/capture.py): never convert their line endings.
+tests/fixtures/testdiet/reports/** -text
+
+# The Codex policy files are pinned by their exact bytes
+# (tests/unit/test_codex_implicit_invocation.py): keep LF on every checkout.
+jacked/data/skills/**/agents/openai.yaml text eol=lf

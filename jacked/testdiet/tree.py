@@ -1,0 +1,499 @@
+"""The identity of a git tree and the fingerprint of input files.
+
+``tree_state`` gives the hash of the tree that a commit of the work tree would
+have. Changes that are not committed are part of it. It never changes the
+real index or the real object store: it adds the work tree to a copy of the
+index, and git writes the new objects into a temporary folder.
+
+Limits of the identity: it does not hold a file that git ignores, and it does
+not hold a change inside the work tree of a submodule. On Windows, Git reads the
+creation time as the change time, so an edit that keeps the size and puts
+back the old modification time is not seen (git status does not see it
+either). ``jacked.testdiet.globs.inputs_fingerprint``
+adds named files to a record. The clean and smudge filters stay on, so the
+hash is equal to the tree of a commit. With git-lfs, the clean filter can
+write a copy of a new large file into the lfs folder of the clone. In a
+sparse checkout, ``git add -A --sparse`` adds a file outside the sparse cone
+too, and a tracked file that the cone leaves out of the work tree stays as
+HEAD has it, so the hash is the tree of a full commit of the work tree.
+
+The minimum git is 2.31 (``rev-parse --path-format``). ``--sparse`` needs
+git 2.34. An older git rejects it with exit code 129, and then the add runs
+again with no ``--sparse``: a sparse checkout with an untracked file outside
+the cone then has no tree.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
+from jacked import git_guard
+from jacked.findbin import find_bin
+from jacked.public_errors import describe, os_error_reason
+from jacked.testdiet.cleanup import remove_tree_quietly
+from jacked.testdiet.model import DEFAULT_BRANCH_REF, TreeId, git_name, git_os_path
+
+logger = logging.getLogger(__name__)
+
+#: The name of the store folder in the common git directory of a clone.
+STORE_NAME = "jacked-tests"
+
+# The time that one git call can take. ``git add -A`` hashes each changed file
+# of the work tree, so a large checkout needs minutes, not seconds. The limit
+# only stops a git that hangs; no data is dropped.
+_GIT_TIMEOUT_S = 600.0
+# The configuration of the calls that write into the copy of the index. A
+# split index keeps part of the index in a second file of the git directory;
+# with this value git writes the copy as one file and never touches that one.
+#: The stat checks stay at full strength whatever the repository config says,
+#: so core.trustctime=false or core.ignoreStat=true cannot hide an edit from the
+#: tree identity that ``seen`` trusts. The assume-unchanged bits (and, outside a
+#: sparse checkout, the skip-worktree bits) that the real index holds are
+#: cleared in the copy before the add (``_clear_hiding_bits``).
+_INDEX_COPY_ARGS = ("-c", "core.splitIndex=false", "-c", "core.checkStat=default",
+                    "-c", "core.trustctime=true", "-c", "core.ignoreStat=false")
+# The longest git error text that a printed line holds (a message, not data).
+DETAIL_CHARS = 300
+# The exit code of git for an option that it does not know.
+_GIT_USAGE_ERROR = 129
+# 1980-01-01 UTC, the first time that a FAT file system can store.
+_FAT_FLOOR_NS = 315_532_800 * 10**9
+
+
+class TreeError(RuntimeError):
+    """Git cannot give the answer (for example, a tree object is not in the repository)."""
+
+
+class GitMissing(TreeError):
+    """No git program is on PATH."""
+
+
+class GitTimeout(TreeError):
+    """A git call did not end within its time limit."""
+
+
+class GitRefused(TreeError):
+    """git refuses the repository because another user owns it (``safe.directory``)."""
+
+
+class NotAWorkTree(TreeError):
+    """The folder is not in the work tree of a git repository."""
+
+
+#: The one text for a folder that is not in a work tree.
+NOT_IN_WORK_TREE = "this folder is not in the work tree of a git repository"
+
+
+class _All:
+    """A git_guard consumer that keeps the whole output."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+
+    def feed(self, chunk: bytes) -> bool:
+        self.data += chunk
+        return True
+
+    def close(self) -> None:
+        return None
+
+
+def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
+        stderr=None, stdin=None) -> tuple[int, bytes]:
+    """Run git in ``cwd`` and return the exit code and the output.
+
+    Each call has ``GIT_OPTIONAL_LOCKS=0``, so a read never writes the real
+    index. A git that cannot start raises ``TreeError``. ``stderr`` is a
+    binary file for the error text of git; with no value it is discarded.
+    ``stdin`` is a binary file that git reads; with no value it is empty.
+    """
+    code, data = git_buffer(cwd, *args, env=env, stderr=stderr, stdin=stdin)
+    return code, bytes(data)
+
+
+def git_buffer(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
+               stderr=None, stdin=None) -> tuple[int, bytearray]:
+    """``git``, with the output as the one buffer that holds it: no copy, for a large output."""
+    binary = find_bin("git")
+    if binary is None:
+        raise GitMissing("git is not installed: no git program is on PATH")
+    full_env = dict(os.environ)
+    full_env.update(env or {})
+    full_env["GIT_OPTIONAL_LOCKS"] = "0"
+    out = _All()
+    argv = [binary, "-C", str(cwd), *git_guard.GIT_CONFIG_OVERRIDE_ARGS, *args]
+    try:
+        rest = list(args)
+        while rest[:1] == ["-c"]:
+            rest = rest[2:]
+        code = git_guard.run_git(argv, name=rest[0] if rest else "git",
+                                 env=full_env, timeout=_GIT_TIMEOUT_S, consumer=out, stderr=stderr,
+                                 stdin=stdin)
+    except subprocess.TimeoutExpired as exc:
+        raise GitTimeout(f"git did not answer in {int(_GIT_TIMEOUT_S)} seconds") from exc
+    except OSError as exc:
+        raise TreeError(f"git did not run: {describe(exc)}") from exc
+    return code, out.data
+
+
+def work_tree_top(cwd: Path) -> Path:
+    """Return the top folder of the work tree that holds ``cwd``.
+
+    A folder outside a work tree raises ``NotAWorkTree``, and a repository
+    that another user owns raises ``GitRefused``. Each message holds the
+    first error line of git. ``git`` raises ``GitMissing`` and ``GitTimeout``.
+    The call runs with ``LC_ALL=C``, so the error text is not translated.
+    """
+    with tempfile.TemporaryFile() as errors:
+        code, out = git(Path(cwd), "rev-parse", "--show-toplevel", env={"LC_ALL": "C"}, stderr=errors)
+        errors.seek(0)
+        # All of it: a trace (GIT_TRACE, GIT_TRACE2_PERF) can come before the refusal.
+        text = errors.read().decode("utf-8", "replace")
+    lines = output_lines(out, git_os_path)
+    if code == 0 and len(lines) == 1:
+        return Path(lines[0])
+    first = git_detail(text)
+    if "safe.directory" in text:
+        raise GitRefused(f"git refuses this repository because another user owns it ({first}). "
+                         "Trust it only when you trust its owner: git and jacked tests then run "
+                         "the repository config of that owner, for example its filter drivers. "
+                         "Only then run: git config --global --add safe.directory <path>")
+    raise NotAWorkTree(NOT_IN_WORK_TREE + (f" ({first})" if first else ""))
+
+
+def git_detail(text: str) -> str:
+    """The one line of git's error text that a message prints, cut at ``DETAIL_CHARS``: the first
+    ``error:`` line, else ``fatal:``, else ``warning:``, else the first line that is not empty. git's
+    error() names the cause (``error: open("a.txt"): Permission denied``), and die() then sums up
+    (``fatal: adding files failed``); a CRLF ``warning:`` notice can come before both."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for tag in ("error:", "fatal:", "warning:"):
+        found = next((line for line in lines if line.startswith(tag)), None)
+        if found is not None:
+            return found[:DETAIL_CHARS]
+    return lines[0][:DETAIL_CHARS] if lines else ""
+
+
+def no_tree_line(problem: str) -> str:
+    """The one line of ``run`` and ``seen`` when the work tree has no identity: ``problem``, then what to do."""
+    return f"{problem}, so jacked tests cannot prove this tree. Run git status to see the cause."
+
+
+def output_lines(data: bytes, decode=git_name) -> list[str]:
+    """The lines of git output that are not empty, as text (``git_os_path`` for a path that goes to the OS)."""
+    return [decode(line) for line in data.splitlines() if line]
+
+
+def rev(cwd: Path, spec: str) -> str | None:
+    """Return the object name that ``spec`` names, or None when it names no object.
+
+    A spec that starts with "-" (one that a user typed) comes after
+    ``--end-of-options``, so git never reads it as an option.
+    """
+    end = ("--end-of-options",) if spec.startswith("-") else ()
+    code, out = git(cwd, "rev-parse", "--verify", "-q", *end, spec)
+    lines = output_lines(out)
+    return lines[0] if code == 0 and len(lines) == 1 else None
+
+
+def tree_state(cwd: Path, *, objects: Path | None = None) -> tuple[TreeId | None, str]:
+    """Return the identity of the work tree that holds ``cwd`` and, when it is None, the reason as text.
+
+    The identity is None for a folder that is not in a git repository, for a
+    bare repository, for a repository with no commit, and when git fails.
+    ``objects`` is a folder that the caller owns: when it is given, the
+    objects of a tree with changes stay there, so ``changed_paths`` can read
+    them later. When it is not given, they go into a temporary folder that
+    is removed. The reason holds the exit code and the git line of
+    ``git_detail``, for a caller that prints it; the log is at DEBUG.
+    """
+    try:
+        found = read_tree_id(cwd, objects=objects)
+    except _AddError as exc:
+        logger.debug("tree_state: no tree identity, the work tree read failed (%s)", exc)
+        detail = exc.detail[:DETAIL_CHARS]
+        return None, f"git cannot read the work tree ({exc}{': ' + detail if detail else ''})"
+    except TreeError as exc:
+        logger.debug("tree_state: no tree identity (%s)", describe(exc))
+        return None, f"git cannot read the work tree ({exc})"
+    except OSError as exc:
+        logger.debug("tree_state: no tree identity (%s)", describe(exc))
+        return None, f"the work tree cannot be read ({os_error_reason(exc)})"
+    if found is None:
+        return None, "the repository has no commit, or it is a bare repository"
+    return found, ""
+
+
+class _AddError(TreeError):
+    """``git add`` or ``git write-tree`` on the copy of the index failed.
+
+    The message holds the exit code only. ``detail`` is the first line of the
+    error text of git, for a caller that prints it.
+    """
+
+    def __init__(self, message: str, detail: str = "") -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
+def _first_line(handle) -> str:
+    handle.seek(0)
+    return git_detail(handle.read().decode("utf-8", "replace"))
+
+
+def read_tree_id(cwd: Path, *, objects: Path | None = None,
+                 base_env: Mapping[str, str] | None = None) -> TreeId | None:
+    """Return the identity of the work tree, as ``tree_state`` does, but raise when git fails.
+
+    The result is None for a bare repository and for a repository with no
+    commit. A failed read of the work tree raises ``TreeError``; its
+    ``detail`` holds the first line of the error text of git. ``base_env``
+    goes under the environment of the index-copy calls (``loss`` gives the
+    guarded environment, so no filter driver of the repository runs).
+    """
+    cwd = Path(cwd)
+    code, out = git(cwd, "rev-parse", "--is-bare-repository")
+    if code != 0 or out.strip() != b"false":
+        return None
+    commit, head_tree = rev(cwd, "HEAD^{commit}"), rev(cwd, "HEAD^{tree}")
+    if commit is None or head_tree is None:
+        return None
+    code, out = git(cwd, "rev-parse", "--path-format=absolute", "--git-path", "index",
+                     "--git-path", "objects", "--show-toplevel")
+    paths = output_lines(out, git_os_path)
+    if code != 0 or len(paths) != 3:
+        raise TreeError("git did not give the index path, the object path and the top folder")
+    real_index, real_objects, top = Path(paths[0]), paths[1], Path(paths[2])
+
+    work = Path(tempfile.mkdtemp(prefix="jacked-tree-"))
+    try:
+        index_copy = work / "index"
+        object_dir = Path(objects) if objects is not None else work / "objects"
+        object_dir.mkdir(parents=True, exist_ok=True)
+        env = {
+            **(base_env or {}),
+            "GIT_INDEX_FILE": str(index_copy),
+            "GIT_OBJECT_DIRECTORY": str(object_dir),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates(real_objects),
+        }
+        if real_index.is_file():
+            source_times = _copy_index(real_index, index_copy)
+            if _clear_hiding_bits(top, env, work):  # from the top: ls-files in a subfolder lists only it
+                _set_index_times(index_copy, source_times)
+        with tempfile.TemporaryFile(dir=work) as errors:
+            code, _ = git(cwd, *_INDEX_COPY_ARGS, "add", "-A", "--sparse", env=env, stderr=errors)
+            if code == _GIT_USAGE_ERROR:
+                # A git before 2.34 does not know --sparse.
+                errors.seek(0)
+                errors.truncate()
+                code, _ = git(cwd, *_INDEX_COPY_ARGS, "add", "-A", env=env, stderr=errors)
+            if code != 0:
+                raise _AddError(f"git add exited with {code}", _first_line(errors))
+            code, out = git(cwd, *_INDEX_COPY_ARGS, "write-tree", env=env, stderr=errors)
+            lines = output_lines(out)
+            if code != 0 or len(lines) != 1:
+                raise _AddError(f"git write-tree exited with {code}", _first_line(errors))
+    finally:
+        remove_tree_quietly(work)
+    return TreeId(commit=commit, tree=lines[0], clean=lines[0] == head_tree)
+
+
+def _copy_index(source: Path, target: Path) -> os.stat_result:
+    """Copy the index file, give the copy the times of the source, and return the source stat.
+
+    Git trusts the stat data of an entry that is older than the index file.
+    A copy with a new time would hide a change of the same size in the same
+    second. The content and the times come from one open file, so a write of
+    the index between them cannot mix two versions. ``_set_index_times``
+    makes sure that the copy is never later than the source.
+    """
+    with open(source, "rb") as src, open(target, "wb") as dst:
+        info = os.fstat(src.fileno())
+        shutil.copyfileobj(src, dst)
+    _set_index_times(target, info)
+    return info
+
+
+def _set_index_times(target: Path, info: os.stat_result) -> None:
+    """Give the index copy the times of the source, and never a later time.
+
+    When the file system rounds the time of the copy up, the copy gets the
+    whole second of the source; when that is still later, it gets time
+    zero. A file system that cannot store time zero (FAT starts in 1980)
+    gets 1980-01-01 UTC. When that also fails, this function raises
+    ``TreeError``.
+    """
+    os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+    if os.stat(target).st_mtime_ns > info.st_mtime_ns:
+        floor = info.st_mtime_ns // 10**9 * 10**9
+        os.utime(target, ns=(floor, floor))
+        if os.stat(target).st_mtime_ns > info.st_mtime_ns:
+            # Time zero makes each entry racy: git then checks content only,
+            # which is slower and always correct.
+            try:
+                os.utime(target, ns=(0, 0))
+            except OSError:
+                try:
+                    os.utime(target, ns=(_FAT_FLOOR_NS, _FAT_FLOOR_NS))
+                except OSError as exc:
+                    raise TreeError(f"cannot set an early time on the index copy: {type(exc).__name__}") from exc
+
+
+def _clear_hiding_bits(cwd: Path, env: Mapping[str, str], work: Path) -> bool:
+    """Clear the index bits that make ``git add`` skip an edit, in the index copy only.
+
+    The bits are assume-unchanged (a lowercase tag of ``git ls-files -v``,
+    set by ``update-index --assume-unchanged`` or by ``core.ignoreStat``)
+    and, when ``core.sparseCheckout`` is not true, skip-worktree (tag ``S``
+    or ``s``). In a sparse checkout the skip-worktree bits stay, as the
+    module docstring says. The real index is never written: ``env`` names
+    the copy. ``cwd`` is the top of the work tree, so the list holds every
+    path, not only the paths below a gate folder. Return True when the copy
+    changed. A git error raises ``TreeError``.
+    """
+    code, out = git(cwd, "ls-files", "-v", "-z", env=env)
+    if code != 0:
+        raise TreeError(f"git ls-files exited with {code}")
+    code, sparse = git(cwd, "config", "--type=bool", "--get", "core.sparseCheckout")
+    clear_skip = sparse.strip() != b"true"
+    assumed, skipped = [], []
+    for entry in out.split(b"\0"):
+        if len(entry) < 3 or entry[1:2] != b" ":
+            continue
+        tag, path = entry[:1], entry[2:]
+        if tag.islower():
+            assumed.append(path)
+        if clear_skip and tag in (b"S", b"s"):
+            skipped.append(path)
+    for option, paths in (("--no-assume-unchanged", assumed), ("--no-skip-worktree", skipped)):
+        if paths:
+            _update_index(cwd, env, work, option, paths)
+    return bool(assumed or skipped)
+
+
+def _update_index(cwd: Path, env: Mapping[str, str], work: Path, option: str, paths: list[bytes]) -> None:
+    with tempfile.TemporaryFile(dir=work) as names:
+        names.write(b"\0".join(paths) + b"\0")
+        names.seek(0)
+        code, _ = git(cwd, *_INDEX_COPY_ARGS, "update-index", "-z", option, "--stdin", env=env, stdin=names)
+    if code != 0:
+        raise TreeError(f"git update-index {option} exited with {code}")
+
+
+def alternates(real_objects: str) -> str:
+    """The real object folder, plus the alternates that the environment already names."""
+    present = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+    return os.pathsep.join([real_objects, present] if present else [real_objects])
+
+
+def object_env(cwd: Path, objects: Path) -> dict[str, str]:
+    """Return the environment that lets git read the objects in ``objects`` and the real objects.
+
+    Raise ``TreeError`` when git does not give the real object folder.
+    """
+    code, out = git(Path(cwd), "rev-parse", "--path-format=absolute", "--git-path", "objects")
+    lines = output_lines(out, git_os_path)
+    if code != 0 or len(lines) != 1:
+        raise TreeError("git did not give the object path")
+    return {"GIT_OBJECT_DIRECTORY": str(objects), "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates(lines[0])}
+
+
+def changed_paths(cwd: Path, a: TreeId, b: TreeId, *, objects: Path | None = None) -> list[str]:
+    """Return the sorted paths whose content or mode differs between the trees ``a`` and ``b``.
+
+    The tree of a work tree with changes is only in the folder ``objects``
+    that ``tree_state`` got. A tree object that git cannot find raises
+    ``TreeError``: an empty list always means that no path differs.
+    """
+    cwd = Path(cwd)
+    env = {} if objects is None else object_env(cwd, objects)
+    code, out = git(cwd, "diff-tree", "-r", "-z", "--name-only", "--no-renames", "--end-of-options",
+                     a.tree, b.tree, env=env)
+    if code != 0:
+        raise TreeError(f"git diff-tree exited with {code}; a tree object can be missing")
+    return sorted(git_name(name) for name in out.split(b"\0") if name)
+
+
+def common_dir(cwd: Path) -> Path:
+    """Return the common git directory of the clone that holds ``cwd``.
+
+    All worktrees of one clone have the same common directory. A folder that
+    is not in a git repository raises ``TreeError``.
+    """
+    code, out = git(Path(cwd), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    lines = output_lines(out, git_os_path)
+    if code != 0 or len(lines) != 1:
+        raise TreeError("the folder is not in a git repository")
+    return Path(lines[0])
+
+
+def store_dir(cwd: Path) -> Path:
+    """Return the history store of the clone that holds ``cwd``: ``<common dir>/jacked-tests``.
+
+    Git never commits a file in its own directory.
+    """
+    return common_dir(cwd) / STORE_NAME
+
+
+def on_default_branch(cwd: Path, tree: TreeId) -> bool | None:
+    """Return True when ``tree`` is clean and its commit is an ancestor of the remote default branch.
+
+    The default branch is the commit that ``DEFAULT_BRANCH_REF``
+    (``refs/remotes/origin/HEAD``) names. There is no fetch and no network call. The result is None when
+    that ref does not exist or when git fails, and False for a tree with
+    changes.
+    """
+    cwd = Path(cwd)
+    try:
+        tip = rev(cwd, f"{DEFAULT_BRANCH_REF}^{{commit}}")
+        if tip is None:
+            return None
+        if not tree.clean:
+            return False
+        code, _ = git(cwd, "merge-base", "--is-ancestor", "--end-of-options", tree.commit, tip)
+    except TreeError as exc:
+        logger.debug("on_default_branch: no answer (%s)", exc)
+        return None
+    if code == 0:
+        return True
+    if code == 1:
+        return False
+    return None
+
+
+def command_sha(argv: Sequence[str], *, folder: str) -> str:
+    """Return the SHA-256 of the gate folder and the arguments as the caller typed them.
+
+    The text is ``folder\\0<folder>\\0argv\\0`` and then the arguments
+    joined by a NUL. The join is not ambiguous, because an argument of a
+    real command line cannot hold a NUL. So the same command in a different
+    folder has a different identity. The text is UTF-8 with
+    "surrogatepass", so a lone surrogate (from a Windows command line)
+    gives a hash and never an error.
+
+    >>> command_sha(["a b"], folder=".") == command_sha(["a", "b"], folder=".")
+    False
+    >>> command_sha(["pytest"], folder=".") == command_sha(["pytest"], folder="sub")
+    False
+    """
+    text = "folder\0" + folder + "\0argv\0" + "\0".join(argv)
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def work_folder(cwd: Path) -> str:
+    """Return the folder ``cwd`` relative to the top of its work tree, as a POSIX path.
+
+    The top itself is ".". Outside a work tree this raises ``TreeError``.
+    """
+    code, out = git(Path(cwd), "rev-parse", "--show-prefix")
+    if code != 0:
+        raise NotAWorkTree(NOT_IN_WORK_TREE)
+    prefix = git_os_path(out[:-1] if out.endswith(b"\n") else out).rstrip("/")
+    return prefix or "."

@@ -736,6 +736,38 @@ jacked statusline status           # registration state and the active command
 
 The dashboard toggle lives at Settings > Features > Statusline.
 
+### Gate recorder (jacked tests)
+
+A full test gate can take many minutes. A session often runs it again on a tree that already passed. `jacked tests` records each gate run and answers three questions. Did this tree already pass this gate command on this machine? Where does the time of the gate go? Which tests does this change remove or weaken? It reads the JUnit XML report of pytest, vitest, jest, Playwright, Go (gotestsum) or cargo-nextest.
+
+```bash
+jacked tests run --kind full -- uv run python -m pytest -n auto --junitxml={junit}
+jacked tests seen -- uv run python -m pytest -n auto --junitxml={junit}   # exit 0: this tree passed
+jacked tests profile               # the slowest files and tests of the newest full run
+jacked tests history               # verdicts, failing sets, flaky tests, repeat green runs, size
+jacked tests loss                  # tests that the change removes or weakens, against the merge base with origin/HEAD
+jacked tests record --junit report.xml --exit-code 0 --machine ci   # a run that run did not wrap
+jacked tests prune --dry-run --before 2026-01-01   # prints the runs that it would delete
+```
+
+`jacked tests run` returns the exit code of the gate command. A recorder error never changes it. An argument that holds `{junit}` gets the path of a private report file. For a runner that writes its report at a fixed path, give that path with `run --junit GLOB`. A run with no report cannot prove a tree, and `run` says so before the gate starts. After each record, `run` prints the run ID, the verdict and the time of the recorder itself. `seen` matches the tree hash (with the changes that are not committed), the command as you typed it, the folder that the gate ran in and the machine. Run `seen` in the folder where the gate runs. It never compares the times of two machines. When no run proves the tree, `seen` names the nearest record and what to do. Ctrl-C before the gate starts gives exit 130, and jacked records nothing. A run that Ctrl-C stopped during or after the gate never proves a tree.
+
+To use the recorder in a gate script and keep the script working with an older jacked, use this gate line. When the `tests` group is not there, it runs the bare command and prints one line:
+
+<!-- gate-line -->
+```sh
+if jacked tests run --help >/dev/null 2>&1; then
+  jacked tests run --kind full -- uv run python -m pytest -n auto --junitxml={junit}
+else
+  echo "jacked tests is not installed: the gate runs with no record" >&2
+  uv run python -m pytest -n auto
+fi
+```
+
+**Where the history is.** The runs are in the `jacked-tests` folder of the common git directory of the clone (run `git rev-parse --git-common-dir` to find it). All linked worktrees share it, and git never commits it. A run holds test IDs, times, states and the SHA-256 of the command, never a failure message, test output or the command text. jacked deletes nothing automatically. To delete runs, run `jacked tests prune --before YYYY-MM-DD`, or delete the `jacked-tests` folder. To see which runs a prune deletes, run `jacked tests prune --dry-run --before YYYY-MM-DD`.
+
+**Limits.** `seen` does not see a change to a file that git ignores. Give such files with `run --input GLOB`. A glob that matches a folder adds each file below it. Then give the same globs with `seen --input GLOB`. `seen` also does not see a change inside a submodule, or an environment variable that selects tests (for example `PYTEST_ADDOPTS`). A gate that writes a file that git sees cannot prove a tree. Add the cache folders of the gate to `.gitignore`. `loss` reads the test files that the runners find by their default names, so a test file that only a custom `testMatch`, `include` or `python_files` setting adds gives no line. See the "Gate recorder" section of `jacked/data/rules/jacked-reference.md` for each command, the jest-junit settings and the rule for a red gate.
+
 ### QA Browser Testing
 
 The `/qa` command runs browser-based QA on UI changes from the current session. It detects modified UI files (JS, CSS, HTML, Vue, Svelte, etc.), opens the app in a browser, and runs visual checks, interactive tests, and console error scans. Auto-suggested via a Stop hook when UI files are modified. Requires Playwright MCP or Claude-in-Chrome.
@@ -781,7 +813,7 @@ Three places: the statusline inside every Claude Code session, the tray or menu-
 
 ### Does jacked work with Codex?
 
-Yes. Codex accounts sit side by side with Claude accounts in the same pool. When Codex is installed, `jacked install` also deploys the suite into Codex's native formats (`~/.agents/skills`, `~/.codex/AGENTS.md`, Codex custom-agent TOMLs).
+Yes. Codex accounts sit side by side with Claude accounts in the same pool. When Codex is installed, `jacked install` also deploys the suite into Codex's native formats (`~/.agents/skills`, `~/.codex/AGENTS.md`, Codex custom-agent TOMLs). Codex does not start the `cleanup` command or the `review-animations` skill by itself. To start one in Codex, type `$cleanup` or `$review-animations`.
 
 jacked switches a Codex account only when Codex keeps the credential in the `auth.json` file. If `config.toml` sets `cli_auth_credentials_store` to `"keyring"`, or the store mode is `"auto"` and `auth.json` has no usable credential, jacked does not switch the account and does not change `config.toml`. To switch Codex accounts with jacked, set `cli_auth_credentials_store = "file"` in `config.toml`, then sign in to Codex again. jacked does all of its checks before it writes a file: if a check stops the switch, `config.toml` and each `auth.json` stay the same. jacked never writes an older stored copy of an account over the live credential of the same account, and it stops a switch when the stored copy has a different refresh token and a last-refresh time that is not later than the live time. If jacked stops a switch for one of these reasons, run `codex login` to capture the account again.
 

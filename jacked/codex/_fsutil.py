@@ -126,13 +126,43 @@ def _sha_dir(d: Path) -> str:
     return "sha256:" + h.hexdigest()
 
 
-def _sha_solo_skill(content: str) -> str:
-    """The `_sha_dir` value a solo skill dir (only ``SKILL.md`` holding `content`)
-    will hash to once written, computed without touching disk. Mirrors `_sha_dir`
-    for a single UTF-8 ``SKILL.md`` so a pre-write byte-identity check is exact."""
+def _solo_skill_files(
+    content: str, extras: Optional[Mapping[str, str]] = None,
+) -> list[tuple[Path, bytes]]:
+    """The files of a generated skill dir, in the order that `_sha_dir` reads them.
+
+    Each item is ``(relative path, bytes)``. ``SKILL.md`` holds `content`. Each
+    key of `extras` is a relative POSIX path, for example
+    ``agents/openai.yaml``, and its value is the text of that file.
+
+    Each part of an extra path must pass `_is_safe_name`. An absolute path, an
+    empty part, ``.``, ``..``, a backslash or a second ``SKILL.md`` raises
+    ValueError. The sort uses `Path` objects, as `_sha_dir` does, because that
+    order is different on Windows (it ignores case there)."""
+    files = {Path("SKILL.md"): content.encode("utf-8")}
+    for rel, text in (extras or {}).items():
+        parts = rel.split("/") if isinstance(rel, str) else []
+        if not parts or not all(_is_safe_name(part) for part in parts):
+            raise ValueError(f"unsafe extra path in a generated skill: {rel!r}")
+        path = Path(*parts)
+        if path in files:
+            raise ValueError(f"duplicate path in a generated skill: {rel!r}")
+        files[path] = text.encode("utf-8")
+    return sorted(files.items())
+
+
+def _sha_solo_skill(content: str, extras: Optional[Mapping[str, str]] = None) -> str:
+    """The `_sha_dir` value of a generated skill dir once it is written,
+    computed without a disk access.
+
+    The dir holds ``SKILL.md`` with `content` and each file of `extras`
+    (see `_solo_skill_files`). With no extras the value is the same as for a
+    dir that holds only ``SKILL.md``, so the hashes that a present install
+    recorded do not change."""
     h = hashlib.sha256()
-    h.update(b"SKILL.md")
-    h.update(content.encode("utf-8"))
+    for rel, data in _solo_skill_files(content, extras):
+        h.update(rel.as_posix().encode())
+        h.update(data)
     return "sha256:" + h.hexdigest()
 
 
@@ -147,12 +177,22 @@ def _copy_tree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst)
 
 
-def _write_solo_skill(skill_dir: Path, content: str) -> None:
-    """Write a single-file skill (only SKILL.md) into the NEW dir skill_dir.
+def _write_solo_skill(
+    skill_dir: Path, content: str, extras: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Write a generated skill (SKILL.md and each file of `extras`) into the
+    NEW dir skill_dir.
 
     Like `_copy_tree`, this is a copy step of the shared skill transaction:
     the publish rename replaces a prior pointer-wrapper dir as a whole, so
     none of its sidecars is left. A skill_dir that exists raises
-    FileExistsError and stays as it is."""
+    FileExistsError and stays as it is. An unsafe extra path raises
+    ValueError before the dir is made (see `_solo_skill_files`). Each file is
+    written as bytes, so Windows does not add a carriage return that
+    `_sha_solo_skill` does not have."""
+    files = _solo_skill_files(content, extras)
     skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+    for rel, data in files:
+        dest = skill_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)

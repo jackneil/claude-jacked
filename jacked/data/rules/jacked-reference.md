@@ -86,6 +86,9 @@ jacked lint-hook init [--repo PATH] [--force]        # Install pre-push lint hoo
 jacked dcr engine [--json]                          # Show the /dcr review engine config + Codex readiness
 jacked dcr engine set codex --model M --effort E    # Route /dcr volume reviewers to the Codex CLI
 jacked dcr engine clear                             # Back to Claude reviewers (the default)
+jacked tests run [--kind full|targeted] -- CMD...   # Run a test gate, record the run, return its exit code
+jacked tests seen -- CMD...                         # Exit 0 when this tree passed this gate command here
+jacked tests profile / history / loss               # Gate time, run history, tests a change removes
 python -m jacked                                    # Alternative invocation
 ```
 
@@ -154,6 +157,126 @@ Claude Code's native auto permission mode) and Qdrant session search
 (`jacked search/backfill/status/configure`, the `/jacked` skill, the `[search]`
 extra). `jacked install` prunes their hooks from settings.json automatically.
 
+## Gate recorder (jacked tests)
+
+The `jacked tests` group records each run of a test gate. It reads the JUnit XML report of the runner: pytest, vitest, jest, Playwright, Go (gotestsum) or cargo-nextest. Then it tells you if a tree passed a gate command, where the time of a gate goes, and which tests a change removes or weakens.
+
+### The gate line
+
+Put this block in the gate script of a repository. When the installed jacked has no `tests` group, the block runs the bare gate command and prints one line on standard error. The exit code is always the exit code of the gate command.
+
+<!-- gate-line -->
+```sh
+if jacked tests run --help >/dev/null 2>&1; then
+  jacked tests run --kind full -- uv run python -m pytest -n auto --junitxml={junit}
+else
+  echo "jacked tests is not installed: the gate runs with no record" >&2
+  uv run python -m pytest -n auto
+fi
+```
+
+### Commands
+
+```
+jacked tests run [--kind full|targeted] [--junit GLOB] [--input GLOB] [--label TEXT] [--runner NAME] [--strict] -- CMD...
+jacked tests record --junit PATH [--exit-code N] [--wall SECONDS] [--commit SHA] [--machine LABEL] [--report-root PATH] [--started ISO] [--kind full|targeted] [--label TEXT] [--runner NAME]
+jacked tests seen [--input GLOB] [--any-machine] [--json] -- CMD...
+jacked tests profile [--run ID] [--machine LABEL] [--top N] [--json]
+jacked tests history [--machine LABEL] [--days N] [--json]
+jacked tests prune --before YYYY-MM-DD [--dry-run]
+jacked tests loss [--base REF] [--json]
+```
+
+- `jacked tests run` runs CMD, records the run, and returns the exit code of CMD. A recorder error never changes that code. The one exception is `--strict`: it gives exit 1 when the gate returns 0 and the report holds failures. `--strict` needs a git work tree: outside one, `run` reads no report and records nothing, so the exit code is the code of the gate. When CMD cannot start, the exit code is 127. When signal N stops CMD, the exit code is 128 plus N. A SIGTERM or a SIGHUP to `run` goes on to CMD. Under `nohup`, SIGHUP stays ignored for CMD, as with `nohup CMD`. Put the options before CMD. Put `--` between the options and CMD.
+  - Ctrl-C before the gate starts gives exit 130, and jacked records nothing. Ctrl-C while the gate runs goes to the gate too. Then the exit code is the code of the gate, and the record says that the user stopped the run. `seen` does not accept such a run, because the report can be partial, and `profile` does not use it as the newest full run. Ctrl-C after the gate stops makes `run` write the record without the tree after the gate, so that run cannot prove a tree.
+  - The placeholder `{junit}`: an argument that holds the text `{junit}` gets the path of a private report file. `run` makes a private temporary folder for it, reads the report after the gate, and then removes the folder. The record holds the SHA-256 of the arguments as you typed them, so the path does not change the identity of the command.
+  - A command with no `{junit}` and a run with no `--junit` have no report. Then `run` prints one line before the gate: the run cannot prove a tree.
+  - After each record, `run` prints one line: `recorded <run id>, verdict <verdict>, recorder <seconds> s.` The seconds are the time of the recorder itself, without the gate.
+  - When a recorder step fails, `run` prints one line that names the step and what the failure costs, for example `The run is not recorded.` The traceback goes to the debug log (`jacked -v`).
+  - When `run` cannot write the history store, it prints one line that names the store folder, and it does not record the run. The exit code is still the exit code of the gate. A sandbox that makes the `.git` folder read-only gives this result, for example the default sandbox of Codex.
+  - `--junit GLOB`: use it for a runner that writes its report at a fixed path. Before the gate, `run` takes the SHA-256 of each file that matches. After the gate, it reads each match that is new or that has new content. It prints one line for each match that it did not read, so an old report never becomes this run. Two runs at the same time with one fixed `--junit` path can read the report of the other run. When two gates can run at the same time, use `{junit}`: each run gets its own private path.
+  - `--kind full|targeted` is a label for `profile` and `history` only.
+  - The verdict of a run is one of five values. `passed`: exit code 0, a report with at least one test, and no failed or error test. `failed`: an exit code that is not 0. `conflict`: exit code 0 and a failed or an error test in the report, or a failure that only a suite counts (a `failures` or `errors` count of a suite that is more than its failed test cases, or a failure element of the suite itself). `no-data`: exit code 0 and no test data. `unknown`: no exit code. A pipe can turn a red gate into exit code 0, and then the verdict is `conflict`.
+  - Two test cases with one ID in one report are two tests with one name: the ID fails when one of them failed. A test is flaky only through the rerun marks of its runner. The exception is go: when gotestsum runs the failed tests again, it writes each attempt as its own test case, so the last one decides, and a pass after a failure is flaky.
+  - A conflict prints one line. Without `--strict`, the line says that `seen` does not accept the run, and that `--strict` gives exit 1.
+  - When git cannot read the work tree (for example, a file that you cannot read, or a clean filter that git cannot start), `run` and `seen` print the same line: the git line, then "so jacked tests cannot prove this tree. Run git status to see the cause." A repository with no commit gives a line too.
+  - A gate can change a path that git sees, for example a cache file that git does not ignore. Then `run` prints each changed path, and the run cannot prove a tree. Add these paths to `.gitignore`.
+  - `run` hashes the `--input` files again after the gate. When the gate changed them, `run` prints one line, and the run cannot prove a tree.
+  - A red run whose failing set is in an earlier record prints a notice. The notice gives the number of earlier records, the number of trees, and how many of the records are on the default branch. A count that some records do not hold prints as in `history`: `K (M not recorded)`, or `not recorded (N runs)`. Then it gives the failing test IDs and one line for each earlier record, by machine. Each list shows at most 20 rows, and then one line with the count of the rest. The record keeps each ID. It does not say whose defect it is. The last line points to "A red gate" in this reference.
+  - Outside a git repository, the gate runs and jacked records nothing. The line says which git failure it is: no git program, a git call that does not answer, a repository that another user owns (git names `safe.directory`), or a folder outside a work tree. The line holds one line of git, at most 300 characters: the first `error:` line (git names the cause there), else the first `fatal:` line, else the first `warning:` line, else the first line. For a repository that another user owns, the line gives the caution first: trust the repository only when you trust its owner, because git and `jacked tests` then run the repository config of that owner. The other commands print the same line and give exit 1.
+  - Each output line of `jacked tests` is one line. A line break or a format character (a bidi control, a zero-width character, U+FEFF or a tag character) in a stored value (a test ID, a file name, the text of an error) prints as an escape, for example `\n`, `\u2028` or `\u200b`.
+- `jacked tests record` records the JUnit files of a gate run that `run` did not wrap, for example a run on hosted CI. Without `--exit-code`, the verdict is `unknown`. `--machine LABEL` names the machine that ran the gate. `--report-root PATH` gives the root folder of the machine that wrote the report, so the reader can make the paths relative. `--started ISO` needs a time zone. The command prints `<run id> <verdict>`. With no `--machine`, it also prints one line that says that the record is filed under this machine (`local`).
+- `jacked tests seen` looks for a wrapped run on this machine that proves that this tree passed this command. When it finds one, it prints one line that starts with `passed before:` and gives exit 0. When not, it prints one line and gives exit 1. That line names the nearest record and what to do: a run on another machine, a run with other `--input` files, a run of another command or in another folder, or only records of `record`.
+  - A run proves it when all of these are true: `run` made it, its verdict is `passed`, and the gate did not change the tree. The tree hash, the command SHA-256 and the `--input` fingerprint must also be equal.
+  - The newest run of the same tree, command, folder, inputs and machine decides. When that run did not pass, `seen` gives exit 1, and its line names that run and the cause, then says: Run the gate with jacked tests run. For a run with no test data, the line also says to put `{junit}` in the command, or give `run --junit GLOB`. An older pass never hides a newer failure. With `--json`, a miss prints `null` on standard output and the line on standard error.
+  - The command identity holds the folder that the gate ran in, relative to the top of the work tree. A run in `sub` never proves the same command at the top, because the same command can collect a different set of tests in a different folder. Run `seen` in the folder where the gate runs. The hit line names that folder.
+  - A record of an older or newer record format never proves a tree. `history` and `profile` still show it.
+  - The commit is not compared, so two commits with the same content are one tree. A run of `record` never proves a tree.
+  - When this machine has no identity (the file cannot be read or made, or holds no valid identity), `seen` prints one line that names the file and the cause.
+  - `--any-machine` also accepts a run of a different machine. The newest run of each machine decides for that machine. When no machine has a newest run that proves the tree, the line names the newest run of each machine (at most 20) and its cause. `seen` never compares the times of two machines. `--json` prints the record, or `null`.
+- `jacked tests profile` shows where the time of a run goes, by file and by test.
+  - By default, it shows the newest run with the kind full. When no run has the kind full, it shows the newest run. The default machine is the machine of the newest full run.
+  - It prints the number of files that hold half of the test seconds. When each file took 0 seconds, it prints `every file took 0 seconds`. When some files have no time and each other file took 0 seconds, it prints `every file with a time took 0 seconds`.
+  - A value that the record does not hold prints as text (`no time recorded`, `no time`, `kind not given`), never as 0 or as an empty space. The JSON gives `null`.
+  - `--top N` sets the rows of each text table, and `--json` prints all rows. It prints a setup share only when the record holds one, and a JUnit report never holds one.
+  - With no run in the history, `profile` gives exit 1, and its line says to run the gate with `jacked tests run` first. An unknown `--run` or `--machine` also gives exit 1. The line for an unknown `--machine` gives the machine labels in the history.
+- `jacked tests history` shows the runs of one machine.
+  - It shows the verdict counts, the failing sets and the flaky tests. It also shows the trees that passed one command two times or more, and the labels of the other machines.
+  - `--days N` shows only the last N days. The last line gives the size of the history in bytes, because jacked deletes nothing automatically.
+  - A value that the record does not hold prints as text, never as 0. A count of a failing set that no run holds prints `not recorded (N runs)`. A count that only some runs hold prints `K (M not recorded)`. A size that jacked cannot read prints `the folder cannot be read`.
+  - With no run in the history, `history` prints one line and gives exit 0. An unknown `--machine` gives exit 1.
+- `jacked tests prune --before YYYY-MM-DD` deletes each run whose UTC date is before that date. It prints `deleted <run id>` for each deleted run. Then it prints the number of runs that stay. It also deletes each temporary file of a write that stopped more than 24 hours before (at any date), and prints the count of those files. With `--dry-run`, it prints `would delete <run id>` for each run, and it deletes nothing. jacked deletes nothing automatically.
+- `jacked tests loss` compares the work tree with the merge base of HEAD and `--base REF`. The work tree includes the commits, the changes that are not committed, and the untracked files that git does not ignore. With no `--base`, REF is `refs/remotes/origin/HEAD`. `loss` does no fetch. It is a report: it gives exit 0 when it makes a report, also a report with a loss.
+  - The output lines are `base <commit> (<ref>)`, `net <+N|-N|0>` and `added N, removed N`. Then come the lines `removed <test>`, `added <test>`, `moved <old> -> <new>`, `fewer assertions <test>`, `fewer cases <test> <before> -> <after>`, `skip mark added <test>`, `not read <test> (<reason>)` and `not read file <path> (<kind>)`.
+  - A renamed file, a test that moves to a different file, and an edited parameter value give no loss. A test that gets a new name inside one file shows as one removed test and one added test. A test that moves into a class or out of one pairs only when its body stays the same: a new indent does not count, but a change inside a string does. Otherwise it shows as one removed test and one added test.
+  - `loss` reads a Python file only when its name is `test_*.py` or `*_test.py`, the default names of pytest. A function named `test_x` in another Python file is not a test.
+  - `loss` reads a TypeScript or JavaScript file only when its name is `*.test.*` or `*.spec.*`, a bare `test.js` or `spec.ts`, or when it is in a `__tests__` folder. These are the default names of jest, vitest and Playwright.
+  - `loss` counts these cases: the literal lists of Python parametrize marks, the rows of a literal `.each` table (TypeScript and JavaScript), and the `t.Run` calls of a Go test.
+  - A `t.Run` in a for-range loop over a slice literal counts each element of that literal. The literal must be inline, or assigned in the same function and not assigned again. This Go rule reads gofmt spacing.
+  - `loss` does not count a computed case list. It also does not count a `t.Run` in a loop over any other value, or a fixture parameter.
+  - When a paired test has a computed case list, or a body that `loss` cannot read, `loss` prints a `not read` line.
+  - A TypeScript, JavaScript, Go or Rust file with a comment or a string that does not close gives a `not read file` line with the line number, because `loss` cannot be sure of the rest of that file. A regex literal (for example `/\/*$/`) is not a comment. In a TypeScript or JavaScript file, only a block comment or a template string that does not close gives this line: a quote that does not close on its line is text, for example the apostrophe of JSX text `<p>Don't panic</p>`.
+  - When `loss` cannot make a report, it prints one line and gives exit 1. With no `refs/remotes/origin/HEAD`, give `--base`, or run `git remote set-head origin --auto`. In a shallow clone with no merge base, run `git fetch --unshallow`. On a branch with no commit, make a commit first.
+
+### Where the history is
+
+The history is in `<git common dir>/jacked-tests/runs/`. To find the common git directory, run `git rev-parse --git-common-dir`. All linked worktrees of one clone use the same history. The history is inside the git directory, so git never commits it.
+
+Each run has two files: `<id>.tests.json.gz` and `<id>.meta.json`. The files hold test IDs, numbers, states, the class name of a failure, and the SHA-256 of the command. They hold no failure message, no test output and no command text.
+
+To delete runs, run `jacked tests prune --before YYYY-MM-DD`. To delete all of the history, delete the `jacked-tests` folder in the common git directory.
+
+A machine has a label: `local` for a run of `run`, or the value of `record --machine`. A machine also has a private random identity in `~/.claude/jacked-tests-machine-id` (under `JACKED_HOME` when it is set). No command prints the identity. When the file holds no valid identity (for example after a power loss), jacked makes a new identity and prints one line. A run of the old identity then does not prove a tree. Two processes that repair the file at one time get one identity: the repair holds the lock file `jacked-tests-machine-id.lock` beside it. Each record in the store holds it, so the identity leaves the machine when a copy of the `.git` folder leaves. It has no meaning on another machine. One label can have two identities, for example a host and a container that open one clone. Then `history` and `profile` say so.
+
+### Limits of seen
+
+- The identity does not hold the environment. A variable that selects tests (for example `PYTEST_ADDOPTS="-k smoke"`, `CI=1`, or a jest or vitest selector) can make the same command run fewer tests. Then a run of fewer tests can prove the tree. Do not set such a variable for a gate whose run `seen` must prove.
+- The identity does not hold ignored state that changes what the command runs. `pytest --lf` reads its last failures from the ignored `.pytest_cache`, a cache can skip work, and a second linked worktree can have its own ignored `.venv` (all linked worktrees use one history). Give such paths with `--input`, or do not use `seen` for such a gate.
+- The tree identity does not hold a file that git ignores. When the gate reads such a file, give it with `run --input GLOB`. Then give the same globs with `seen --input GLOB`.
+- The `--input` fingerprint holds the path, the size and the modification time in nanoseconds of each file. It does not hold the content. A glob that matches a folder adds each regular file below that folder, hidden files too. It does not follow a symbolic link. A glob that matches no regular file gives one line in `run` and in `seen`.
+- The tree identity does not hold a change inside the work tree of a submodule.
+- An assume-unchanged bit, `core.ignoreStat` and a skip-worktree bit do not hide an edit from the tree identity. jacked clears these bits in its own copy of the index, and never in the real index. In a sparse checkout, the skip-worktree bits stay: a tracked file that the cone leaves out stays as HEAD has it.
+- With git-lfs, the clean filter can write a copy of a new large file into `.git/lfs/objects` of the clone. The copy uses disk space, and no commit uses it. To remove such copies, run `git lfs prune`.
+- On Windows, an edit that keeps the size and puts back the old modification time is not seen. `git status` does not see it either.
+- `run` and `seen` run the clean filters of the repository when they read the work tree, as `git status` does, so the hash is the tree of a commit. `loss` is a report, and it turns the filter drivers off.
+
+### Limits of loss
+
+- `loss` does not read a test file that only a custom `testMatch` or `include` setting adds, or a Python file that only a custom `python_files` setting of pytest adds. A removed test in such a file gives no line.
+
+### A red gate
+
+When the gate is red, read the failing tests. When the same tests fail on the base branch, repair the checkout or the base. Then run the gate again. A failure on the base branch never clears the branch.
+
+### Runner settings
+
+- pytest: give `--junitxml={junit}`.
+- vitest: give `--reporter=junit --outputFile.junit={junit}`.
+- gotestsum: give `--junitfile {junit}`.
+- PowerShell: quote the placeholder, for example `--junitfile '{junit}'`. Without quotes, PowerShell reads `{junit}` as a script block, and the command does not get the text `{junit}`.
+- Playwright, cargo-nextest and jest write the report at the path that their configuration gives. Give that path with `run --junit GLOB`.
+- jest: the reader needs four jest-junit settings. In the environment, set `JEST_JUNIT_ADD_FILE_ATTRIBUTE="true"`, `JEST_JUNIT_CLASSNAME="{classname}"`, `JEST_JUNIT_TITLE="{title}"` and `JEST_JUNIT_ANCESTOR_SEPARATOR=" > "`. In the jest-junit configuration, the same settings are `addFileAttribute: "true"`, `classNameTemplate: "{classname}"`, `titleTemplate: "{title}"` and `ancestorSeparator: " > "`. With the default templates, the test ID holds the describe titles two times.
+
 ## Codex Integration
 
 When Codex is present (the `codex` binary is on PATH, or a `~/.codex` home exists),
@@ -176,6 +299,11 @@ Claude-only artifacts excluded from Codex: the `chain-of-command` and `recover`
 skills, and the `swarm`, `goal-maker`, `browser-reset`, and `jacked-setup`
 commands (each is wired to Claude Code machinery Codex has no analog for).
 Upgrades prune any previously-shipped copies of these.
+
+Codex does not start the `cleanup` command or the `review-animations` skill
+by itself. Each one sets `disable-model-invocation: true`, so the install gives
+its Codex skill an `agents/openai.yaml` with `allow_implicit_invocation: false`.
+To start one in Codex, type `$cleanup` or `$review-animations`.
 
 Manifest and uninstall: everything above is recorded in
 `~/.codex/jacked-codex-manifest.json` (skills, prompts, agents, mcp, hooks), which

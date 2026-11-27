@@ -1,0 +1,1058 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!--
+  jacked artifact template — for plans, specs, research, checkpoints.
+  Replace placeholders, keep what you need, delete sections you don't.
+  Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
+-->
+<title>Test diet: design</title>
+
+<!-- Metadata block — adjust fields per artifact type -->
+<meta name="jacked:type" content="spec">
+<meta name="jacked:status" content="draft">
+<meta name="jacked:branch" content="jack_20261125_test_diet">
+<meta name="jacked:date" content="2026-11-25">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 .25rem;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 .5rem;
+    color: var(--fg-muted);
+  }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+
+  /* Metadata strip under title */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    margin: .5rem 0 2rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    font-size: .9rem;
+  }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+
+  /* Status badges — drop into a <span class="badge X"> */
+  .badge {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 99px;
+    font-size: .8rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .badge.ok       { background: var(--ok-bg);     color: var(--ok); }
+  .badge.warn     { background: var(--warn-bg);   color: var(--warn); }
+  .badge.danger   { background: var(--danger-bg); color: var(--danger); }
+  .badge.info     { background: var(--accent-bg); color: var(--accent); }
+
+  /* Table of contents */
+  nav.toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    margin: 0 0 .5rem;
+    font-size: .9rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--fg-muted);
+    border: none;
+    padding: 0;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.5rem;
+  }
+  nav.toc li { margin: .15rem 0; }
+
+  /* Callouts — drop into <aside class="callout warn"> ... </aside> */
+  aside.callout {
+    margin: 1rem 0;
+    padding: .9rem 1.1rem;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  aside.callout.warn   { border-color: var(--warn);   background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok     { border-color: var(--ok);     background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child  { margin-bottom: 0; }
+
+  /* Code */
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: var(--code-bg);
+    padding: .12em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: .88rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    font-size: .9rem;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  /* Task checklist — use <ul class="tasks"> + <li><input type="checkbox" disabled> ...</li> */
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li {
+    padding: .25rem 0;
+    display: flex;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+
+  /* Mermaid diagram wrappers */
+  .diagram {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  /* If mermaid fails (no network), fall back to showing the source in a code block */
+  .diagram pre.mermaid-source {
+    text-align: left;
+    display: none;
+  }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+
+  blockquote {
+    border-left: 3px solid var(--border);
+    padding: .2rem 1rem;
+    margin: 1rem 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  /* Print: paginate cleanly, drop the dark-mode flip, expand TOC */
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Test diet: design</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge warn">approved by the owner on 2026-11-26; the owner answered the open questions the same day</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-11-25, revised 2026-11-26</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">jack_20261125_test_diet</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">spec</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#intent">Intent</a></li>
+    <li><a href="#said">What the owner said, and what is my call</a></li>
+    <li><a href="#facts">The facts that shape the design</a></li>
+    <li><a href="#goals">Goals, non-goals and anti-goals</a></li>
+    <li><a href="#approaches">Approaches</a></li>
+    <li><a href="#parts">The parts</a></li>
+    <li><a href="#flow">What a run does</a></li>
+    <li><a href="#evidence">What proves a cut</a></li>
+    <li><a href="#safety">Safety rules</a></li>
+    <li><a href="#source">Changes to the text that jacked ships</a></li>
+    <li><a href="#acceptance">Acceptance criteria</a></li>
+    <li><a href="#files">Files and interfaces</a></li>
+    <li><a href="#builder">Left to the builder</a></li>
+    <li><a href="#review-changes">Changes after the plan review</a></li>
+    <li><a href="#open">Decisions for the owner</a></li>
+  </ol>
+</nav>
+
+<h2 id="intent">Intent</h2>
+<p>Agents add tests and do not retire them. The gates become slow, and a red gate costs one more
+full run. The owner wants one command that they can run in a repository folder. The command makes the
+test suite smaller and much faster, and it keeps the tests that protect real behavior. It must work
+in every place where jacked is installed, for Claude Code and for Codex.</p>
+<p>The research is in
+<a href="../research/2026-11-25-test-suite-diet-research.html">2026-11-25-test-suite-diet-research.html</a>.</p>
+
+<h2 id="said">What the owner said, and what is my call</h2>
+<table>
+  <thead><tr><th>The owner said (2026-11-25 and 2026-11-26)</th><th>My calls, each one open to a correction</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>
+        <ul>
+          <li>"gives me the ability to clean up tests in a repo", "in all the places that have Jack installed"</li>
+          <li>"something that I can run in a folder that'll clean up the tests and make stuff that's really fast"</li>
+          <li>"It never deprecates something that's stale. It never removes a legacy test."</li>
+          <li>After a removal "it makes sure it has a test to make sure you don't reintroduce the legacy thing."</li>
+          <li>"tests that are not useful for actual QA purposes"</li>
+          <li>The aim: "more time developing and creating, and less time just sitting and spinning on tests"</li>
+          <li>2026-11-26: the second live proof can run on the Python data service.</li>
+          <li>2026-11-26: "i dont want it to cpu peg this laptop". The tests of that proof must run on
+          their second machine, "or cloud resources or something".</li>
+        </ul>
+      </td>
+      <td>
+        <ul>
+          <li>The name: the skill <code>/test-diet</code> and the command group <code>jacked tests</code>.</li>
+          <li>The measure of success is seconds of gate time and red gates avoided. It is never the number of deleted tests.</li>
+          <li>A gate recorder comes with the skill, so that the skill has data and the result can be measured.</li>
+          <li>A run edits on its own branch in its own worktree and opens a pull request. It never merges.</li>
+          <li>A person starts it. It does not run inside an autonomous run.</li>
+          <li>The text that jacked ships changes too, so that the growth stops at its source.</li>
+          <li>The reports of lost tests, of growth and of time are advice. They do not fail a gate.
+          The first draft had a hard check for lost tests. The owner's own history does not support
+          it (see the facts).</li>
+          <li>A gate can run on a different machine from the session. The record names the machine,
+          and times of two machines are never compared.</li>
+          <li>When a gate is red, the recorder says if the same failing set was recorded before.</li>
+        </ul>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="facts">The facts that shape the design</h2>
+<ul>
+  <li><strong>Deletion alone does not make a gate fast.</strong> The best public pruning skill deleted
+  about 400,000 test lines and claims no runtime saving.</li>
+  <li><strong>The runner time is in the full and broad runs.</strong> In three repositories the test
+  runner uses 11% to 35% of the summed agent time. Small pytest runs have a median of 5 to 11
+  seconds. A full run has a median of 9 to 17 minutes. The research did not measure the wait on the
+  critical path of one goal, which can be much larger than the summed share.</li>
+  <li><strong>A red gate is followed by one more run.</strong> 11% to 43% of the big runs are red.
+  Most of them fail on 5 tests or fewer.</li>
+  <li><strong>The same failure goes through the full gate again and again.</strong> In the Python
+  data service, 82 red big runs show the failing files. One failing set returns in 13 big runs in
+  2 days, one in 12 big runs in 4 days, and one in 9 big runs in 3 days. Those three sets are 34
+  of the 82 runs. The three files that fail most often fail together in 19 of 19 runs, in days
+  for which that repository's own notes name two of the three files and blame a stale local data
+  file that git ignores. So the repeat
+  failures there are incidents: a known failure, or the state of one checkout, that ran through
+  the full gate many times. They are not a list of brittle tests.</li>
+  <li><strong>The time is in a few files.</strong> In one repository 5.5% of the test files hold half
+  of the time.</li>
+  <li><strong>The causes differ by repository.</strong> A ranked list from other projects does not
+  transfer. The skill must measure first.</li>
+  <li><strong>Agents delete tests to get a green run: reported by others, not seen here.</strong>
+  It is the most reported failure of agents in public reports. In the owner's five repositories,
+  2,524 commits of the last 120 days change test declarations. They add 30,417 declarations and
+  remove 3,914. Only 28 commits have a net loss, and their subjects are reverts, splits of a pull
+  request, removed features and one deliberate prune. This count reads declarations and commit
+  subjects. It cannot see a weakened assertion or a new skip. The design must not give that
+  failure a tool, and it does not need a hard check against it.</li>
+  <li><strong>A cut of the count does not move the clock.</strong> The Python data service had a
+  prune on 2026-11-24: 397 tests removed with evidence, about 2% of the suite. Its commit says that
+  the cut does not move the wall clock and names the slow tests as the next work.</li>
+  <li><strong>The machine is loaded.</strong> Other work on the owner's laptop kept its load high
+  during this work. One run before and one run after cannot show a saving of 10% to 20%. The owner
+  does not want full gates of a large suite on this machine.</li>
+</ul>
+
+<h2 id="goals">Goals, non-goals and anti-goals</h2>
+<h3>Goals</h3>
+<ol>
+  <li>One command in a repository folder gives a smaller and faster suite on a branch, with a pull
+  request and a measured result.</li>
+  <li>The skill knows where the wait is without extra full runs.</li>
+  <li>The skill retires tests of removed code, tests that assert a removed thing stays removed, tests
+  that cannot fail, duplicates and change detectors. Each cut has evidence.</li>
+  <li>The skill makes a slow test that has value cheaper. It does not delete it.</li>
+  <li>The skill lowers the number of red gates. It gives a verdict on each failing set that returns
+  in many red gates: the state of the checkout, a known failure that ran through the full gate
+  again, a real guard, or a brittle test. A real guard stays and joins the targeted set, so that it
+  fails before the gate. A brittle test gets a repair or a cut.</li>
+  <li>The growth stops at its source: rules for a new test, a report of lost tests, a report of
+  growth.</li>
+  <li>A full gate does not have to run on the machine that the owner works on.</li>
+</ol>
+<h3>Non-goals</h3>
+<ul>
+  <li>It does not write new tests, and it has no coverage target.</li>
+  <li>It is not a test selection service. It uses the related-test features that each runner has.</li>
+  <li>It does not need a mutation testing framework.</li>
+  <li>It does not merge. It does not change hosted CI without the owner's approval.</li>
+  <li>One repository for each run.</li>
+</ul>
+<h3>Anti-goals (the design fails if one of these occurs)</h3>
+<ul>
+  <li>A deletion count is the measure of success.</li>
+  <li>A failing test is deleted, or the run cuts tests when the baseline is red.</li>
+  <li>A size or a time threshold decides that a test is junk.</li>
+  <li>A slow tier that no runner runs. That is a deletion with a different name.</li>
+  <li>A time budget turns a gate red because the machine is loaded.</li>
+  <li>A growth limit pushes an agent to delete adjacent tests to fit.</li>
+  <li>Transcript text, test output or failure text goes into a committed file.</li>
+</ul>
+
+<h2 id="approaches">Approaches</h2>
+<table>
+  <thead><tr><th>Approach</th><th>What it gives</th><th>What it costs or misses</th></tr></thead>
+  <tbody>
+    <tr><td>1. Install an existing pruning skill as a pack</td>
+        <td>No build. Evidence-based pruning today.</td>
+        <td>No time measurement, no lanes, no guard. It does not change the number or the length of
+        the full runs.</td></tr>
+    <tr><td>2. The <code>/test-diet</code> skill alone</td>
+        <td>Measure, repair the slow files and the repeat failures, prune with evidence, pull
+        request.</td>
+        <td>One extra full run before and one after in each repository. On a loaded machine those
+        two runs prove little. No history of red gates on a machine that has no transcripts.</td></tr>
+    <tr><td><strong>3. A gate recorder and the <code>/test-diet</code> skill (chosen)</strong></td>
+        <td>Each gate run records its durations, its failing tests and the identity of the tree.
+        The skill reads that history. The saving is measured across real gates. A red gate says if
+        its failing set was recorded before. The same record answers "did this exact tree pass
+        already?".</td>
+        <td>More to build: a command group in the jacked package and one line in each repository's
+        gate.</td></tr>
+    <tr><td>4. Test selection only</td>
+        <td>Fewer tests for each change.</td>
+        <td>Targeted runs are already quick. Nothing becomes smaller.</td></tr>
+  </tbody>
+</table>
+<p>Approach 3 is chosen because the measured problem is the number and the length of the full runs,
+and because a result that cannot be measured on a loaded machine cannot be trusted.</p>
+
+<h2 id="parts">The parts</h2>
+<div class="diagram">
+  <pre class="mermaid">
+flowchart LR
+    G[Repository gate run] -->|JUnit XML| R[jacked tests record]
+    R --> H[(Local history, not committed)]
+    H --> P[profile and history]
+    P --> S[/test-diet skill/]
+    S --> L[Ledger: one row for each decision]
+    L --> E[Edits in batches]
+    E --> C[jacked tests ids check and ledger verify]
+    C --> PR[Pull request and report]
+    H --> X[Red gate: was this failing set recorded before?]
+  </pre>
+  <pre class="mermaid-source">
+gate run -> jacked tests record -> local history
+local history -> profile and history -> /test-diet skill -> ledger -> edits in batches
+edits -> jacked tests ids check and ledger verify -> pull request and report
+local history -> red gate: was this failing set recorded before?
+  </pre>
+</div>
+
+<h3>Part 1: the command group <code>jacked tests</code></h3>
+<p>This is ordinary Python in the jacked package with ordinary tests. It does the mechanical work.
+The skill does the judgment. It is a command group and not a script beside the skill, because a
+script beside the skill needs an interpreter that the target repository may not have.</p>
+<table>
+  <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>run</code></td><td>Wraps the gate command: <code>jacked tests run -- &lt;gate
+    command&gt;</code>. It measures the wall time, the load average, and the processor time of the
+    child processes where the system gives it. It returns the exit code of the gate command without
+    a change. Then it reads the JUnit XML of the run and adds one record to the local history: the
+    identity of the tree, the runner, the kind of run (full or targeted), the counts, the duration
+    of each file and each test, and the IDs of the failing tests. It keeps IDs, numbers and states
+    only. It keeps no failure text. Each record names the machine that ran the gate. When the gate
+    is red, <code>run</code> prints how many earlier records hold the same failing set, their dates
+    and their trees, and if the base branch is one of them.</td></tr>
+    <tr><td><code>record</code></td><td>Adds a record from the JUnit XML of a run that was not wrapped,
+    for example an artifact of hosted CI. A value that the file does not hold stays empty. It is
+    not zero.</td></tr>
+    <tr><td><code>profile</code></td><td>Prints where the time is: how many files hold half of the time,
+    the slow files and tests, the setup share, and the difference between repeat runs of the same
+    tree (the noise).</td></tr>
+    <tr><td><code>history</code></td><td>Prints the full runs, the red runs, the failing sets that
+    return in many red runs with their dates and trees, and the full runs of a tree that had passed
+    already.</td></tr>
+    <tr><td><code>seen</code></td><td>Answers: did this exact tree pass the full gate? It prints the
+    record. A gate script or an agent can ask before it starts a full run. Its limit: the identity
+    of a tree does not include files that git ignores. When a gate reads such files, a tree that
+    passed can fail later with no change that <code>seen</code> can see.</td></tr>
+    <tr><td><code>ids</code></td><td>Takes a list of the collected test IDs before and after a batch
+    and compares both sides with the ledger. A removed ID, an added ID and a renamed ID must each
+    have a ledger row. It knows the ID form of each runner.</td></tr>
+    <tr><td><code>ledger</code></td><td>Checks that each ledger row has the evidence that its kind
+    needs. It refuses a delete row that has a missing field.</td></tr>
+    <tr><td><code>loss</code></td><td>A report. It reads git only, so it needs no history and no test
+    run. For the test files that a change touches, it counts the test declarations at the base and
+    at the head. It prints the net change and the names of the removed declarations. A rename, a
+    move and an edited parameter value do not change the count. It always exits 0. A reviewer or a
+    gate log shows the line. It does not stop a change.</td></tr>
+  </tbody>
+</table>
+<p>The history is in the common git directory of the clone, so all worktrees of one clone share it
+and git never commits it. The identity of a tree includes the changes that are not committed.</p>
+<p>The ledger of a run is a file in <code>docs/test-diet/</code> and is part of the pull request of
+that run. It records what was retired and why, so that an agent does not write the same test again.
+The commits of a batch carry a <code>Tests-removed:</code> trailer that names the ledger rows, as a
+record in the history of the repository.</p>
+
+<h3>A gate on a different machine</h3>
+<p><code>jacked tests run --on &lt;label&gt; -- &lt;gate command&gt;</code> runs the gate command on a
+gate machine and records it here. The session and the history stay on the owner's machine. The gate
+machine needs git, Python, an SSH server and the tools of the repository. It does not need jacked.
+A gate machine can be a Linux, a macOS or a Windows system. The gate command of the repository owns its
+environment there: its database, its data files and its Python. The recorder applies these
+rules.</p>
+<ul>
+  <li><strong>The tree must be the same.</strong> A gate machine runs a commit. <code>run</code>
+  refuses a tree with changes that are not committed. It sends the commit over SSH to a clone on
+  the gate machine and runs the gate in a new worktree of that commit, so no other work on that
+  machine changes. The gate machine reports the commit that it ran and that its tree was clean.
+  When the report does not match the commit that was sent, <code>run</code> makes no record and
+  says why.</li>
+  <li><strong>A lost connection stops the gate.</strong> The owner's answer of 2026-11-26: "Stop on
+  drop, no reattach". The gate runs only while the connection lives. The local side sends a
+  heartbeat every 15 seconds; when the gate machine gets no input for 60 seconds, or gets the end
+  of its input, it stops the gate and its child processes (a stop signal, a grace period, then a
+  kill). A lost connection is not a verdict: there is no record,
+  no pass and no failure, <code>run</code> gives exit 75 and says why, and the user runs the gate
+  again.</li>
+  <li><strong>Times of two machines are never compared.</strong> <code>profile</code> and the
+  report compare records of one machine only. The baseline and the final gate of a diet run are on
+  the same machine.</li>
+  <li><strong>The address stays local.</strong> A committed file names the gate machine by a label.
+  The host name, the address and the user are in a local file that git ignores.</li>
+  <li><strong>No lock for one full gate at a time.</strong> An earlier version of this document
+  had a lock that made a second full gate wait. The lock was my call, and the smaller form drops it
+  (also my call): the owner sets the number of workers and the priority for gates on each gate
+  machine, and <code>run</code> prints the load and the free memory before the gate.</li>
+  <li><strong>The gate machine has its own work.</strong> The owner sets the number of workers and
+  the priority for the gate there. <code>run</code> prints the processor load and the free memory
+  of the gate machine before it starts the gate. It cannot stop work that other tools started
+  there.</li>
+  <li><strong>A rented machine needs the owner's account.</strong> A gate machine holds a clone of
+  the repository and its test data. The owner names the account and approves the cost before a
+  rented machine is used.</li>
+</ul>
+
+<h3>Part 2: the skill <code>/test-diet</code></h3>
+<p>A skill directory with <code>SKILL.md</code> and a <code>references/</code> folder. The text is
+guidance for a model. A name or a text pattern only nominates a test. The verdict comes from the
+assertions of the test and from evidence.</p>
+<table>
+  <thead><tr><th>How it is started</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>/test-diet report</code></td><td>Read-only. Where the wait is, the candidate ledger,
+    the saving that the history supports. It edits no tracked file.</td></tr>
+    <tr><td><code>/test-diet</code></td><td>The report, then the edits in batches on a branch, then
+    a pull request. Its scope is the slow files and the tests that fail gate after gate.</td></tr>
+    <tr><td><code>/test-diet full</code></td><td>The whole suite by owner area, across sessions. The
+    ledger file says which areas are done, so a later session continues.</td></tr>
+    <tr><td><code>/test-diet &lt;path&gt;</code></td><td>The same, for one part of the suite.</td></tr>
+  </tbody>
+</table>
+
+<h3>Part 3: Codex must not start it by itself</h3>
+<p>Claude Code obeys <code>disable-model-invocation</code>. Codex does not read that key. Codex reads
+<code>agents/openai.yaml</code> in the skill directory: <code>policy: allow_implicit_invocation:
+false</code> (the default is true; read in the Codex documentation on 2026-11-25). The installer
+must write that file for each skill and each command that has the key. Today
+it does not, so <code>review-animations</code> and <code>cleanup</code> have the same defect. The
+fix covers all three.</p>
+
+<h2 id="flow">What a run does</h2>
+<ol>
+  <li><strong>Preflight.</strong> The run uses its own worktree. It never changes the branch of a
+  checkout that other sessions use. It stops when the tree has changes that are not committed, or
+  when it is inside an autonomous run. It reads the repository's rules for tests: a lock for one
+  test session, a shared test database, ports. It obeys them in the scratch worktrees too. The
+  refusal of an autonomous run is an instruction in the skill text: the skill stops when the
+  session works on a /goal, /bhag, /loop or night-shift brief, or when a subagent starts it.
+  jacked has no detector for this.</li>
+  <li><strong>Baseline.</strong> It uses the newest green full-gate record of the tree from the
+  history. When no record exists, it runs the repository's full gate one time with JUnit output and
+  records it. When the repository names a gate machine, each full gate of the run goes there, and
+  the baseline is a record of that machine. When the baseline is red, the run gives a report only.
+  It lists the failing tests as possible defects. A failing test is never a candidate.</li>
+  <li><strong>Where the wait is.</strong> From the history and the profile: the number of full runs,
+  the share of red runs, the failing sets that return in many red runs, the full runs of a tree
+  that had passed already, the slow files, the setup share, the collection and import time. For a
+  failing set that returns, it runs those tests on the base branch in the same checkout. A failure
+  there is the state of the checkout or a defect of the base, not a defect of the branch. It ranks
+  the levers by measured seconds.</li>
+  <li><strong>The ledger, read-only.</strong> One row for each decision: Retain, Fix, Consolidate,
+  Delete, Speed (make it cheaper) or Tier (move it to a slow lane). It works down the files from the
+  largest measured share. The session's agent budget is the limit. The report says which share of
+  the time it covered and what remains.</li>
+  <li><strong>Edits in batches by owner area.</strong> One commit for each batch: deletions that name
+  the kept test, consolidations, speed repairs and tier marks. Speed repairs come from the measured
+  cause: a shared fixture or one shared parse of the source tree, a call in the same process and
+  not a subprocess, an injected clock, a rollback and not a commit, a smaller input.</li>
+  <li><strong>Proof for each batch.</strong> See <a href="#evidence">What proves a cut</a>.</li>
+  <li><strong>Preservation review.</strong> A separate read-only reviewer compares the deleted tests
+  with the kept tests and looks for a contract that lost its only proof. Where the runner has a
+  coverage tool, the run compares the covered production lines before and after. A line that lost
+  its only test names a contract to restore. Coverage finds a lost line. It does not prove that a
+  kept test checks the behavior. The number of reviewers stays inside the chain-of-command agent
+  budget.</li>
+  <li><strong>Lanes.</strong> The run writes a Tests section into the repository's instruction file:
+  how to run one file, the targeted set, the full gate with its record step, the label of the gate
+  machine if there is one, and each one's measured time. It adds the rule for a red full gate: run
+  the failed tests first. When the recorder says that the same failing set was recorded before,
+  run those tests on the base branch in the same checkout before a repair. Repair, then run the
+  full gate one more time. When the repository has a gate script, the run adds the wrapper, the
+  JUnit output and the loss report there. When it has none, the run writes those commands into the
+  Tests section. It creates a gate script only when the rules of the repository ask for one.</li>
+  <li><strong>The final gate.</strong> One full gate on the combined tree, recorded. The report
+  compares the records: processor seconds and the sum of the call times, and the wall time with the
+  load stated. A saving that is smaller than the noise is reported as not measurable. The report is
+  an HTML file in <code>docs/test-diet/</code> with numbers and IDs only. Then a pull request.</li>
+</ol>
+
+<h2 id="evidence">What proves a cut</h2>
+<p>Each cut names one of these proofs. The opinion of a reader is not a proof, and the agreement of
+several readers is not a proof.</p>
+<table>
+  <thead><tr><th>Kind</th><th>The claim</th><th>The proof</th></tr></thead>
+  <tbody>
+    <tr><td>Dead target</td><td>The test exercises code that does not exist: a removed import, a
+    deleted subject file, a test that is skipped for good.</td><td>The runner or the dead-code tool
+    shows it. A check that the skip does not hide a real defect.</td></tr>
+    <tr><td>The past</td><td>The test asserts that a removed thing stays removed.</td><td>The assertion
+    reads the definition of the thing itself, and no user depends on the absence. A test that guards
+    a rule between two live structures is not this kind.</td></tr>
+    <tr><td>Shape</td><td>The test cannot fail: no assertion, or an assertion that the types make
+    always true.</td><td>A script lists the members. One member still passes on a planted defect.
+    A test stays in the batch only when each of its assertions has the shape.</td></tr>
+    <tr><td>Duplicate</td><td>Two tests have the same input and the same expected result.</td>
+    <td>A script matches them. The kept copy exists and passes.</td></tr>
+    <tr><td>Covered</td><td>A kept test catches the same mistake.</td><td>A planted defect in a scratch
+    worktree fails the test to be deleted first. The same defect then fails the kept test. Coverage
+    of the same lines only nominates the pair.</td></tr>
+    <tr><td>Test</td><td>All other cases: a change detector, a mock that supplies the asserted value,
+    a copied list, a pin on source text.</td><td>One test at a time: the full evidence fields below,
+    a planted defect that the test does not catch, or a refactor that breaks it and changes no
+    behavior.</td></tr>
+  </tbody>
+</table>
+<p>The evidence fields of a row: the exact test and its location; the failure that it can detect;
+the callers of the covered code that are not tests; the stronger proof that remains, or why none is
+necessary; why the test exists (history); the code that the cut makes dead; the risk and the
+command that validates the cut. A row with a missing field is not ready.</p>
+<p>Calibration on four tests of this repository whose names say "no longer", "retired" or "removed":
+one is a pure test of the past (a delete), one mixes a past assertion with a live length limit (a
+fix), one is an architecture rule with an incident behind it (keep, or move to a linter deny-list),
+and one guards a rule between two live structures (keep). A name finds candidates. It does not give
+the verdict.</p>
+
+<h2 id="safety">Safety rules</h2>
+<ul>
+  <li><strong>Protected classes.</strong> Security, access and tenancy, health data and consent,
+  money and billing, licenses, data integrity, migrations, public contracts, parity between two
+  surfaces, tripwires, a test that a rule file of the repository cites, the only test of a public
+  call, and tests that are the only proof that a shipped instruction text keeps a rule. These get
+  Speed or Fix. A Delete needs a named approval in the pull request. Six of these classes
+  (licenses, data integrity, parity, tripwires, cited by a rule file, the only test of a public
+  call) come from the prune of 2026-11-24 in one of the owner's repositories.</li>
+  <li><strong>Slow is not a reason to delete.</strong> A slow test gets a repair or a smaller input.</li>
+  <li><strong>Tier needs a runner.</strong> The run refuses a Tier row unless the plan names the
+  runner that runs the slow lane and how often. The full gate always runs the slow lane, so a Tier
+  row does not make the full gate shorter. Its only use is a broad run during work.</li>
+  <li><strong>IDs on both sides.</strong> After each batch, the removed, added and renamed test IDs
+  must match the ledger. A collection error fails the check. The check uses the selection of the
+  full gate, without parallel workers.</li>
+  <li><strong>Order.</strong> The tests of a batch run alone, in random order, and with two workers
+  when the runner can do that. A deleted test can hide the state that a kept test needs.</li>
+  <li><strong>Side files.</strong> Files that name tests are updated in the same batch: shard and
+  duration files, pin lists, coverage floors, count assertions.</li>
+  <li><strong>Isolation.</strong> A speed repair must not weaken a tripwire that keeps tests away
+  from the real machine.</li>
+  <li><strong>No content in the history.</strong> The history and the report hold IDs, numbers and
+  states. Agent transcripts are an optional local source for the history of one machine. Their text
+  is never copied.</li>
+</ul>
+
+<h2 id="source">Changes to the text that jacked ships</h2>
+<p>These change rules that are settled. They are my proposals. Each one needs the owner's approval,
+and the plan will show the exact old and new wording.</p>
+<table>
+  <thead><tr><th>File</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/data/rules/jacked_behaviors.md</code></td><td>One rule: a test has a cost.
+    Before a new test, name the defect that it catches and why the present tests miss it. When a
+    change removes behavior on purpose, delete the tests of that behavior in the same change and
+    say so in the commit. Do not add a test that asserts a removed thing stays removed. Never delete
+    or weaken a test to get a green run.</td></tr>
+    <tr><td><code>commands/goal-maker.md</code> (53, 130), <code>skills/whats-next/SKILL.md</code>
+    (310), <code>commands/bhag.md</code> (62, 63)</td><td>The brief templates ask for "NEW tests
+    covering every milestone and its edge cases". Change to: tests at the boundary that owns the
+    behavior, one for each contract; retire the tests that the change made obsolete; report the
+    seconds that the change adds to the gate. The line in bhag that forbids a deleted or weakened
+    test stays, with the one exception named.</td></tr>
+    <tr><td><code>skills/dcr/SKILL.md</code> (90), <code>commands/dc.md</code> (55)</td><td>The Testing
+    lens also looks at cost and redundancy: a test that repeats a proof, a pin on the implementation,
+    a test of the past, a slow new test.</td></tr>
+    <tr><td><code>agents/test-coverage-engineer.md</code>,
+    <code>agents/test-coverage-improver.md</code></td><td>Add the rule for a new test. These two
+    agents add tests for coverage today.</td></tr>
+    <tr><td>Three test files that pin the old wording</td><td>Update the pins with the new wording
+    (<code>test_command_whats_next_goal.py</code>, <code>test_long_run_ledger_contract.py</code>,
+    <code>test_dispatch_shape_guidance.py</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="acceptance">Acceptance criteria</h2>
+<ol>
+  <li><strong>Install.</strong> <code>jacked install</code> puts the skill and its references into
+  <code>~/.claude/skills/test-diet</code> and into the Codex skills folder. The dashboard toggle and
+  the uninstall work. Claude Code does not list the skill for the model. Codex gets a policy file
+  that forbids implicit invocation, for this skill and for each other skill or command that has
+  <code>disable-model-invocation</code>.</li>
+  <li><strong>Record and profile.</strong> Given JUnit files captured from real runs of pytest,
+  Vitest, Jest, Playwright, gotestsum and cargo-nextest, <code>record</code> and
+  <code>profile</code> give the same normalized fields, with the correct unit for each runner. The
+  sample files come from real runs. They are not written by hand.</li>
+  <li><strong>IDs.</strong> The check fails on a removal that has no ledger row. It fails when a
+  delete row's test is still collected. It passes on a consolidation that renames tests when the
+  ledger has the map. A line shift in a Playwright file is not a change. A collection error
+  fails.</li>
+  <li><strong>Ledger.</strong> A delete row with a missing evidence field is refused.</li>
+  <li><strong>Loss report.</strong> For a change that lowers the net count of test declarations,
+  <code>loss</code> prints the net change and the removed names. A rename, a move to a different
+  file and an edited parameter value print no loss. It exits 0 in each case.</li>
+  <li><strong>Wrapper.</strong> <code>jacked tests run</code> returns the exit code of the command
+  that it wraps, for a pass and for a failure.</li>
+  <li><strong>Repeat failure.</strong> A red run whose failing set is in two earlier records prints
+  those records, and says when the base branch is one of them. A red run with a new failing set
+  prints no such line.</li>
+  <li><strong>Gate machine.</strong> <code>run --on</code> records a gate only when the commit that
+  the gate machine reports is the commit that was sent. A run whose connection drops makes no
+  record and gives exit 75. No process of that gate stays on the gate machine 75 seconds after the
+  last heartbeat: 60 seconds with no input, then the stop and its grace period.
+  <code>profile</code> does not compare the times of two machines. No committed file holds a host name or an address. The proof uses
+  a real second machine, not a second folder of one machine. It covers a Windows gate machine and
+  a Linux gate machine.</li>
+  <li><strong>Refusals.</strong> A tree with changes that are not committed stops the run. A red
+  baseline gives a report only. A failing test is never in a delete row. The skill text refuses an
+  autonomous run. That is an instruction, and the live proof tries it one time inside a brief.</li>
+  <li><strong>Privacy.</strong> The history holds no failure text. <code>record</code> writes to no
+  tracked file.</li>
+  <li><strong>Live proof, this repository.</strong> A full <code>/test-diet</code> run on
+  claude-jacked in a worktree: recorded gates before and after, the ledger, the report and its own
+  pull request.</li>
+  <li><strong>Live proof, the Python data service (the owner's pick, 2026-11-26).</strong> No full
+  gate of this proof runs on the owner's laptop. The first milestone is one green recorded full
+  gate on the gate machine. A red baseline there stops the edit phase, by the rule above. Then: the
+  record step in its gate, a report from real recorded gates, and the edit phase, with the rules of
+  that repository for its test database obeyed. That repository had a prune of redundant tests on
+  2026-11-24, so this proof is about seconds: the slow files and the failing sets that return. The
+  baseline and the final gate are records of the same machine.</li>
+  <li><strong>The shipped text.</strong> The approved changes are in, the pins are updated, the
+  full suite is green, and the counts in the README and in the reference are correct.</li>
+</ol>
+
+<h2 id="files">Files and interfaces</h2>
+<table>
+  <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+  <tbody>
+    <tr><td><code>jacked/testdiet/</code> (new package)</td><td>The JUnit reader, the history store, the
+    tree identity, the ID forms of each runner, the ledger check, the loss report, the transport to
+    a gate machine. No module name starts with <code>test_</code>, because pytest would collect
+    it.</td></tr>
+    <tr><td><code>jacked/cli.py</code></td><td>The command group <code>jacked tests</code>.</td></tr>
+    <tr><td><code>jacked/data/skills/test-diet/SKILL.md</code></td><td>The skill. It has no engine
+    marker, so the contract for the ten migrated skills does not change.</td></tr>
+    <tr><td><code>jacked/data/skills/test-diet/references/</code></td><td>The runner commands, the
+    evidence kinds, the slow causes with a detection and a repair for each, the Tests section and
+    the gate lines that the run writes into a repository.</td></tr>
+    <tr><td><code>jacked/codex/</code></td><td>Write the Codex policy file for a skill or a command
+    that has <code>disable-model-invocation</code>.</td></tr>
+    <tr><td><code>jacked/data/rules/</code>, <code>commands/</code>, <code>skills/</code>,
+    <code>agents/</code></td><td>The approved text changes.</td></tr>
+    <tr><td><code>README.md</code>, <code>jacked/data/rules/jacked-reference.md</code></td><td>29 skills,
+    the new command group, the new skill in the lists. The count of the marketing pack (28) does
+    not change.</td></tr>
+    <tr><td><code>tests/</code></td><td>Tests of the command group on real sample files. The
+    updated pins. No test that pins the prose of the new skill.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="builder">Left to the builder</h2>
+<ul>
+  <li>The format of the history files and of the ledger file.</li>
+  <li>The flags of each command.</li>
+  <li>The exact commands for each runner. Read each one in the runner's own documentation before
+  you write it into a reference file. The research lists the facts that are verified and the facts
+  that are not.</li>
+  <li>The exact wording of the skill and of the text changes. The plan shows the old and the new
+  wording for the approval.</li>
+  <li>The form of the Codex policy file. Read the Codex documentation first.</li>
+  <li>The transport to a gate machine: how the commit is sent, how a dropped connection stops the gate, where the
+  local file with the address is. Before a time from a gate machine is trusted, check that its
+  file system gives the repository's test database the quick clone that it has on the owner's
+  machine.</li>
+</ul>
+
+<h2 id="review-changes">Changes after the plan review (the builder's calls)</h2>
+<aside class="callout warn">
+  <strong>The owner has not read this section.</strong> The owner approved this design on
+  2026-11-26. Two review cycles read the plan after that, and these are the changes that they
+  made to the recorder. Each one is my call. A rule here is stricter than the text above where
+  the two differ.
+</aside>
+<table>
+  <thead><tr><th>Subject</th><th>The text above</th><th>Now</th></tr></thead>
+  <tbody>
+    <tr><td><code>seen</code></td><td>"Did this exact tree pass the full gate?"</td><td>It says yes
+    only for a record that <code>run</code> made, with the verdict <code>passed</code>, with a tree
+    that did not change during the gate, and with the same tree, the same typed gate command, the
+    same declared input files and the same machine. <code>--any-machine</code> removes the last
+    condition. The label <code>full</code> is for the views only.</td></tr>
+    <tr><td>Verdict of a run</td><td>A pass or a failure, from the exit code.</td><td>Five
+    verdicts. <code>passed</code>: exit code 0, a report with one test or more, no failure.
+    <code>failed</code>: exit code not 0. <code>conflict</code>: exit code 0 and a failure in the
+    report; <code>run --strict</code> returns 1 for it. <code>no-data</code>: exit code 0 and no
+    report. <code>unknown</code>: no exit code.</td></tr>
+    <tr><td>The report path</td><td>Not said.</td><td>The gate command can hold
+    <code>{junit}</code>. <code>run</code> makes a private folder for the report, puts the path in,
+    reads the report and removes the folder. The hash of the command is the hash of the typed
+    command, so a new folder for each run does not change it. <code>--junit GLOB</code> names a
+    report at a fixed path; it is read only when its content changed.</td></tr>
+    <tr><td>Machine</td><td>"Each record names the machine that ran the gate."</td><td>A label
+    (<code>local</code>, or the value of <code>record --machine</code>) and a private random
+    identity that is made one time for each user of a machine. No command prints the
+    identity.</td></tr>
+    <tr><td><code>record</code></td><td>Reads a report that was not wrapped.</td><td>Also
+    <code>--report-root</code>, for a report that holds the paths of a different machine.</td></tr>
+    <tr><td>Setup share</td><td><code>profile</code> prints it.</td><td><code>profile</code> prints
+    it only when the record holds it. A JUnit file does not.</td></tr>
+    <tr><td>Retention</td><td>Not said.</td><td>Nothing is deleted automatically.
+    <code>jacked tests prune --before DATE</code> deletes on request and prints each deleted
+    run.</td></tr>
+    <tr><td>Codex policy file</td><td>"The installer must write that file for each skill and each
+    command that has the key."</td><td>A skill directory ships the file as a real source file, and
+    a test fails when a skill has the key and no file. The installer writes the file only for a
+    skill that it makes from a command. Reason: the installer refuses a target file that the
+    source does not have.</td></tr>
+  </tbody>
+</table>
+<p><strong>Three plans.</strong> The review limit of two cycles was reached with open defects, so
+the plan is three documents:
+<a href="../plans/2026-11-26-test-diet-recorder.html">the recorder</a> (built first),
+<a href="../plans/2026-11-26-test-diet.html">the skill</a> and
+<a href="../plans/2026-11-26-test-diet-gate-machine.html">the gate machine</a>.</p>
+<h3 id="build-changes">Changes during the build (the builder's calls)</h3>
+<aside class="callout warn">
+  <strong>The owner has not read this table.</strong> The task reviews of the recorder found these
+  points, and I decided each one while the recorder was built. Each row says what the recorder does
+  now.
+</aside>
+<table>
+  <thead><tr><th>Subject</th><th>What the recorder does</th></tr></thead>
+  <tbody>
+    <tr><td>The base of <code>loss</code></td><td><code>--base REF</code> compares against the merge
+    base of REF and HEAD. With no <code>--base</code>, the base is the merge base of HEAD and
+    <code>origin/HEAD</code>. A branch tip that moved ahead does not show its new tests as removed.
+    Each output gives the base that it used. A shallow clone gets one line that names
+    <code>git fetch --unshallow</code>.</td></tr>
+    <tr><td>What <code>loss</code> reports</td><td>The net change, the removed tests, and these
+    lines: <code>moved</code> (a test with the same name in a different file), <code>fewer
+    assertions</code>, <code>fewer cases</code>, <code>not read</code> (a test on both sides with a
+    computed case list or a body that <code>loss</code> cannot read) and <code>not read file</code>
+    (a symbolic link, a submodule, a type change, or a file that does not parse).
+    <code>loss</code> reports and does not gate: it gives exit 0 for a report.</td></tr>
+    <tr><td>Case counts</td><td><code>loss</code> counts the items of a literal
+    <code>parametrize</code> list, the rows of a literal <code>.each</code> table, and the
+    <code>t.Run</code> calls of a Go loop over a literal table in the same function. The Go rule
+    reads code that <code>gofmt</code> formatted. Any other case list prints <code>not
+    read</code>.</td></tr>
+    <tr><td>A bad stored value</td><td>A stored machine label, machine identity or tree that fails
+    its check reads as empty. The record stays in the history, and the views show the label as
+    <code>(no label)</code>.</td></tr>
+    <tr><td>An empty value</td><td>A view prints an empty value as text (<code>no time
+    recorded</code>, <code>not recorded</code>), never as 0. JSON gives <code>null</code>.</td></tr>
+    <tr><td>Exit codes of the views</td><td><code>history</code> on an empty history prints one
+    line and gives exit 0. <code>profile</code> on an empty history, and an unknown
+    <code>--run</code> or <code>--machine</code>, give exit 1.</td></tr>
+    <tr><td>Time order</td><td>The order of runs and <code>--days</code> use the time in the run
+    ID, which this machine's clock wrote. No view compares the clocks of two machines.</td></tr>
+    <tr><td>Tree identity</td><td>The hash of the tree that a commit of the work tree would have,
+    read from a copy of the index. A repository setting cannot weaken the stat checks: the copy runs
+    with <code>core.checkStat=default</code>, <code>core.trustctime=true</code> and
+    <code>core.ignoreStat=false</code>. Before the add, jacked clears the assume-unchanged bits in
+    the copy, and (when <code>core.sparseCheckout</code> is not true) the skip-worktree bits. In a
+    sparse checkout the skip-worktree bits stay, so a tracked file that the cone leaves out stays as
+    HEAD has it. The real index is never written. The copy keeps the time of the index, so git's
+    same-second rule sees an edit that keeps the file size. On Windows, git reads the creation time
+    as the change time. So, as with <code>git status</code> there, an edit that keeps the size and
+    puts back the old time is not seen.</td></tr>
+    <tr><td>The folder of the gate</td><td>The run identity holds the folder of the gate, relative
+    to the top of the work tree. <code>seen</code> from another folder never matches: a gate in a
+    package folder runs only that package's tests.</td></tr>
+    <tr><td>The newest run decides</td><td>For one identity (tree, folder and command, input files,
+    machine), only the newest run decides <code>seen</code>. When it did not pass, <code>seen</code>
+    says no and names that run.</td></tr>
+    <tr><td>The record version</td><td>Each record holds <code>"schema": 1</code>. Only a record
+    with the current schema proves a tree.</td></tr>
+    <tr><td>A store that cannot be written</td><td>For example in a sandbox that makes
+    <code>.git</code> read-only. <code>run</code> prints one line that names the store and says
+    that the run is not recorded, and keeps the gate's exit code. There is no second store.</td></tr>
+    <tr><td>The machine identity in the store</td><td>Each record holds the private random identity
+    in clear. It has no meaning off the machine, and the store is never pushed, so no keyed hash is
+    used.</td></tr>
+    <tr><td>Where the commands live</td><td>The command group is in
+    <code>jacked/testdiet/commands.py</code>, not in <code>jacked/cli.py</code>, because
+    <code>cli.py</code> is at its size limit. That module imports <code>click</code>, which jacked
+    already depends on. Every other module of <code>jacked/testdiet/</code> uses only the standard
+    library and jacked.</td></tr>
+  </tbody>
+</table>
+<h3 id="skill-plan-changes">Changes in the skill plan review (the builder's calls)</h3>
+<aside class="callout warn">
+  <strong>The owner has not read this table.</strong> The third review of
+  <a href="../plans/2026-11-26-test-diet.html">the skill plan</a> found these points, and the
+  revised plan answers them as each row says. The source column says which rule each row comes from.
+</aside>
+<table>
+  <thead><tr><th>Subject</th><th>What the skill plan does</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>The status <code>proposed</code></td><td>A delete or a consolidate row of a protected test is proposed, never planned or applied; reconcile treats it as no row.</td><td>The builder's call that implements the owner's answer (CRITICAL 2)</td></tr>
+    <tr><td>The proof of a duplicate</td><td>The covered proof (subject failed, keeper failed), in addition to the script that matches the pair.</td><td>The builder's call (MEDIUM 9)</td></tr>
+    <tr><td>The body of a proof</td><td><code>proof.commit</code> and <code>proof.blobs</code>, compared with the trees of the chain.</td><td>The builder's call (MEDIUM 8)</td></tr>
+    <tr><td>The command of the ID check</td><td><code>id_command_sha</code> in the ledger; a ref with a different command SHA is refused.</td><td>The builder's call (MEDIUM 11)</td></tr>
+    <tr><td>The ID refs of jest and go</td><td>Runs of the full gate's selection with a JUnit file, without parallel workers, because their listings name no single test.</td><td>The spec's rule "the selection of the full gate", applied to two runners (MEDIUM 11)</td></tr>
+    <tr><td>The tree chain</td><td>Trees are compared modulo the run folder, for batch 1, each link and the final gate.</td><td>The lead's ruling (CRITICAL 1)</td></tr>
+    <tr><td>The report mode</td><td><code>/test-diet report</code> writes to the git common directory, not to the work tree.</td><td>"It edits no tracked file", and an untracked file changes the tree identity (CRITICAL 1)</td></tr>
+    <tr><td>A dead target</td><td>Three forms; the code is already gone in <code>base_tree</code>.</td><td>The spec's Dead target and the lead's ruling (MEDIUMs 6 and 7)</td></tr>
+    <tr><td>No deleted production file</td><td><code>ids</code> refuses a batch that deletes a file that holds no test.</td><td>The builder's call: the mechanism for the lead's ruling "the plan never deletes production code"</td></tr>
+    <tr><td>The kind <code>test</code></td><td>The proof is a planted defect or a refactor.</td><td>The spec's "What proves a cut"</td></tr>
+    <tr><td>The base-branch run of a failing set</td><td>In the run's own worktree, before its first edit.</td><td>The builder's reading of "in the same checkout" (see the open questions)</td></tr>
+    <tr><td>The lanes</td><td>The Tests section and the gate lines are the last batch, checked by <code>ids</code>.</td><td>The spec's Lanes, inside the tree chain (MEDIUM 26)</td></tr>
+    <tr><td>The Cobertura reader</td><td>A DOCTYPE with a system ID and no internal subset is read and never loaded.</td><td>The sources of the writers, read on 2026-11-26 (LOW 24)</td></tr>
+    <tr><td>Private values</td><td>The login matches only in a path or before <code>@</code>.</td><td>LOW 15</td></tr>
+  </tbody>
+</table>
+<h3 id="gate-plan-changes">Changes in the gate machine plan review (the builder's calls)</h3>
+<aside class="callout warn">
+  <strong>The owner has not read this table.</strong> The third review of
+  <a href="../plans/2026-11-26-test-diet-gate-machine.html">the gate machine plan</a> found these
+  points. Each row is the builder's call in the revised plan.
+</aside>
+<table>
+  <thead><tr><th>Subject</th><th>What the gate machine plan does</th></tr></thead>
+  <tbody>
+    <tr><td>The memory floor on macOS</td><td>A macOS gate machine has no free-memory floor: the
+    driver refuses an entry with a floor on macOS and says why. Linux reads MemAvailable, and Windows
+    reads the system memory status.</td></tr>
+    <tr><td>Stopping a gate on Windows</td><td>The driver owns a job object that kills every process
+    of the gate when the job closes, and a small leader process holds it. The plan does not accept a
+    window in which a process can leave the job.</td></tr>
+    <tr><td>Gate output from a gate machine</td><td>Color codes (SGR) pass. Other terminal control
+    sequences (OSC, DCS) are removed before the output reaches this machine's terminal.</td></tr>
+    <tr><td>The setup time</td><td>A record of <code>run --on</code> holds the seconds of the setup
+    command in its own field.</td></tr>
+    <tr><td>Two machine identities for one user</td><td>A gate machine that also runs jacked for its
+    own user has two identities, one for its own runs and one for gates that it runs for others.
+    Both are accepted.</td></tr>
+  </tbody>
+</table>
+<h3>The owner's answers (2026-11-26)</h3>
+<table>
+  <thead><tr><th>Question</th><th>Answer</th></tr></thead>
+  <tbody>
+    <tr><td>Push the research with numbers of five private repositories, with letters for their
+    names</td><td>Yes.</td></tr>
+    <tr><td>The wording of the changes to the text that jacked ships, and one more sentence for the
+    gate cadence rule (run the one full suite through <code>jacked tests run</code>, ask
+    <code>jacked tests seen</code> first)</td><td>Both approved.</td></tr>
+    <tr><td>The gate machine</td><td>The owner's answers, word for word, in order, with the
+    name of a machine replaced by [machine]. To the choice between a self-hosted runner and
+    <code>run --on</code>: "Runner pattern, rented box". Then, in the same turn: "but also want to
+    support running on a machine of your own choosing across like ssh via tailscale or something
+    like that". To the prices of a rented box: "hm maybe managed runners? those others seem very
+    expensive for what we use them for jesus or just use my [machine] i dont want to pay that
+    much" ([machine] is the owner's own Windows machine). So there are two lanes, a runner lane
+    and the section "A gate on a different machine"; the provider of the runner lane is
+    open.</td></tr>
+    <tr><td>A gate on a different machine when the connection drops (asked 2026-11-26, after a
+    review found that an earlier version of this row gave the smaller form as the owner's answer,
+    which it was not)</td><td>"Stop on drop, no reattach". A dropped connection stops the remote
+    gate and records nothing; the gate is not detached and cannot be attached again. This is the
+    smaller form of
+    <a href="../plans/2026-11-26-test-diet-gate-machine.html">the gate machine plan</a>, and it
+    replaces the detach and reattach parts of the section "A gate on a different
+    machine".</td></tr>
+    <tr><td>Six commands that the plan review added (<code>collect</code>, <code>covdiff</code>,
+    <code>report</code>, <code>prove</code>, <code>ledger protect</code>,
+    <code>ledger approve</code>)</td><td>Build the first three. Do not build the last three as
+    commands: the skill keeps the planted-defect check as a method, a second agent runs a sample of
+    the checks again, and a run never cuts a protected test (the pull request proposes
+    it).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="open">Decisions for the owner</h2>
+<ol>
+  <li><strong>The design: approved by the owner on 2026-11-26</strong>, with the changes to the
+  shipped text, growth as advice, lost tests as a report, and <code>run --on</code> as a part of
+  jacked for each repository. The plan shows the old and the new wording of each shipped
+  text.</li>
+  <li><strong>The slow repository for the second live proof: decided.</strong> The owner picked the
+  Python data service on 2026-11-26, with its tests away from their laptop. The proof needs a branch
+  and a pull request in that repository.</li>
+  <li><strong>The gate machine: two lanes, decided; the runner provider: open.</strong> The
+  answers are in the table above, word for word. <code>run --on</code> reaches a machine of the
+  user's choice over SSH, and a dropped connection stops the gate. For the runner lane the owner
+  named managed runners or their own Windows machine, because a rented box costs too much for its
+  use. The account and the cost need their approval.</li>
+  <li><strong>The changes to the shipped text: approved.</strong> Each row of the table above.</li>
+  <li><strong>Growth: advice (approved).</strong> Not a hard limit. A hard limit for each
+  change (OpenClaw uses 400 net test lines with a written allowance) gives an agent a reason to
+  delete adjacent tests to fit.</li>
+  <li><strong>Lost tests: a report (approved).</strong> My pick changed from a hard check. The first
+  draft had a hard check that failed a change with fewer tests and no reason in a commit trailer.
+  The owner's history shows no commit that deletes tests to get a green run in 120 days, the agent
+  that deletes a test can write the trailer too, and a hard check adds work to each removal that
+  the owner wants more of. The owner can ask for the hard check.</li>
+  <li><strong><code>run --on</code> as a part of jacked: approved</strong> for each repository. The
+  lock for one full gate at a time was my addition after that approval; the smaller form drops it
+  (my call). The owner can ask for it again.</li>
+  <li><strong>The message to the other sessions: held.</strong> The owner asked on 2026-11-26 that
+  the sessions of three other repositories use the second machine for tests when that is possible.
+  The message waits for a gate machine that has room and for a proven path.</li>
+</ol>
+
+<hr>
+</div>
+
+<!-- Mermaid: render diagrams, fail gracefully if CDN unreachable -->
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    // startOnLoad waits for the window "load" event, which has already fired by the time this
+    // dynamic import resolves, so it never renders. Render explicitly instead.
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+    await mermaid.run({ querySelector: ".diagram pre.mermaid" });
+  } catch (err) {
+    // Network unreachable or import failed — show source instead of broken diagrams.
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>

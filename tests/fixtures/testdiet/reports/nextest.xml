@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="6" skipped="0" failures="1" errors="0" uuid="3ffe13ab-6b71-494e-980d-c2bbfac17a52" timestamp="2026-11-26T09:26:40.739-05:00" time="0.524">
+    <testsuite name="sample" tests="5" skipped="0" errors="0" failures="1">
+        <testcase name="tests::table" classname="sample" timestamp="2026-11-26T09:26:40.740-05:00" time="0.018"/>
+        <testcase name="tests::group::in_nested_group" classname="sample" timestamp="2026-11-26T09:26:40.740-05:00" time="0.023"/>
+        <testcase name="tests::fails" classname="sample" timestamp="2026-11-26T09:26:40.740-05:00" time="0.023">
+            <failure message="thread &apos;tests::fails&apos; (99328624) panicked at src/lib.rs:18:9" type="test failure with exit code 101">thread &apos;tests::fails&apos; (99328624) panicked at src/lib.rs:18:9:
+assertion `left == right` failed
+  left: &quot;sample-failure-message&quot;
+ right: &quot;a different value&quot;
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</failure>
+            <system-out>
+running 1 test
+test tests::fails ... FAILED
+
+failures:
+
+failures:
+    tests::fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>
+thread &apos;tests::fails&apos; (99328624) panicked at src/lib.rs:18:9:
+assertion `left == right` failed
+  left: &quot;sample-failure-message&quot;
+ right: &quot;a different value&quot;
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+        </testcase>
+        <testcase name="tests::passes" classname="sample" timestamp="2026-11-26T09:26:40.740-05:00" time="0.026"/>
+        <testcase name="tests::sleeps_half_a_second" classname="sample" timestamp="2026-11-26T09:26:40.740-05:00" time="0.523"/>
+    </testsuite>
+    <testsuite name="sample::integration" tests="1" skipped="0" errors="0" failures="0">
+        <testcase name="passes_in_an_integration_test" classname="sample::integration" timestamp="2026-11-26T09:26:40.740-05:00" time="0.024"/>
+    </testsuite>
+</testsuites>

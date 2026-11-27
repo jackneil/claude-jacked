@@ -168,6 +168,8 @@ You will NOT create tests that:
 - Are time-dependent or rely on external state
 - Test implementation details rather than public interfaces
 - Duplicate existing test coverage
+- Assert that removed code or a removed feature stays removed
+- Have no defect that you can name before you write them
 - Require excessive mocking that obscures intent
 - Take longer than 1 second to execute (unless performance tests)
 

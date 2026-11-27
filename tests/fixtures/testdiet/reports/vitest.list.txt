@@ -1,0 +1,7 @@
+src/sample.test.js > passes
+src/sample.test.js > fails
+src/sample.test.js > parametrized 1
+src/sample.test.js > parametrized 2
+src/sample.test.js > group > in group
+src/sample.test.js > group > nested > in nested group
+src/sample.test.js > sleeps_half_a_second

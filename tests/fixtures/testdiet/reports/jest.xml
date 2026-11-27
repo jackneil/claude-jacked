@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="9" failures="1" errors="0" time="2.495">
+  <testsuite name="undefined" errors="0" failures="0" skipped="0" timestamp="2026-11-26T14:25:55" time="1.037" tests="1">
+    <testcase classname="" name="passes in a second file" time="0.019" file="src/other.test.js">
+    </testcase>
+  </testsuite>
+  <testsuite name="undefined" errors="0" failures="1" skipped="1" timestamp="2026-11-26T14:25:55" time="1.704" tests="8">
+    <testcase classname="" name="passes" time="0.01" file="src/sample.test.js">
+    </testcase>
+    <testcase classname="" name="fails" time="0.008" file="src/sample.test.js">
+      <failure>Error: expect(received).toBe(expected) // Object.is equality
+
+Expected: &quot;a different value&quot;
+Received: &quot;sample-failure-message&quot;
+    at Object.toBe (/work/src/sample.test.js:6:36)
+    at Promise.finally.completed (/work/node_modules/jest-circus/build/jestAdapterInit.js:1834:28)
+    at new Promise (&lt;anonymous&gt;)
+    at callAsyncCircusFn (/work/node_modules/jest-circus/build/jestAdapterInit.js:1774:10)
+    at _callCircusTest (/work/node_modules/jest-circus/build/jestAdapterInit.js:1167:40)
+    at processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at _runTestInContext (/work/node_modules/jest-circus/build/jestAdapterInit.js:1103:3)
+    at runTestWithContext (/work/node_modules/jest-circus/build/jestAdapterInit.js:996:5)
+    at _runTestsForDescribeBlockOnce (/work/node_modules/jest-circus/build/jestAdapterInit.js:1008:11)
+    at _runTestsForDescribeBlock (/work/node_modules/jest-circus/build/jestAdapterInit.js:824:5)
+    at run (/work/node_modules/jest-circus/build/jestAdapterInit.js:789:3)
+    at runAndTransformResultsToJestFormat (/work/node_modules/jest-circus/build/jestAdapterInit.js:2300:21)
+    at jestAdapter (/work/node_modules/jest-circus/build/runner.js:111:19)
+    at runTestInternal (/work/node_modules/jest-runner/build/testWorker.js:247:16)
+    at runTest (/work/node_modules/jest-runner/build/testWorker.js:315:7)
+    at Object.worker (/work/node_modules/jest-runner/build/testWorker.js:479:12)</failure>
+    </testcase>
+    <testcase classname="" name="skipped" time="0" file="src/sample.test.js">
+      <skipped/>
+    </testcase>
+    <testcase classname="" name="parametrized 1" time="0.001" file="src/sample.test.js">
+    </testcase>
+    <testcase classname="" name="parametrized 2" time="0.003" file="src/sample.test.js">
+    </testcase>
+    <testcase classname="group" name="in group" time="0.001" file="src/sample.test.js">
+    </testcase>
+    <testcase classname="group &gt; nested" name="in nested group" time="0.004" file="src/sample.test.js">
+    </testcase>
+    <testcase classname="" name="sleeps_half_a_second" time="0.505" file="src/sample.test.js">
+    </testcase>
+  </testsuite>
+</testsuites>

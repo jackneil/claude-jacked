@@ -391,7 +391,7 @@ def _as_text(value) -> str:
     return ""
 
 
-def _truthy(value) -> bool:
+def truthy(value) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
@@ -519,7 +519,7 @@ def read_listing_settings(
                     if env_budget else None)
 
     def env_flag(name: str) -> bool:
-        return _truthy(env_block.get(name)) or _truthy(environ.get(name))
+        return truthy(env_block.get(name)) or truthy(environ.get(name))
 
     model, model_from = _configured_model(settings, env_block, environ)
 
@@ -537,7 +537,7 @@ def read_listing_settings(
         "enabled_plugins": enabled_plugins if isinstance(enabled_plugins, dict) else {},
         "model": model,
         "model_from": model_from,
-        "disable_bundled_skills": (_truthy(settings.get("disableBundledSkills"))
+        "disable_bundled_skills": (truthy(settings.get("disableBundledSkills"))
                                    or env_flag("CLAUDE_CODE_DISABLE_BUNDLED_SKILLS")),
         "disable_1m_context": env_flag("CLAUDE_CODE_DISABLE_1M_CONTEXT"),
         "settings_unreadable": unreadable,
@@ -673,7 +673,7 @@ def context_window_for_model(model: str | None, environ: dict | None = None,
     environ = os.environ if environ is None else environ
     if not model or not isinstance(model, str):
         return None, "unknown"
-    if disable_1m or _truthy(environ.get("CLAUDE_CODE_DISABLE_1M_CONTEXT")):
+    if disable_1m or truthy(environ.get("CLAUDE_CODE_DISABLE_1M_CONTEXT")):
         return 200_000, "CLAUDE_CODE_DISABLE_1M_CONTEXT"
     if re.search(r"\[1m\]", model, re.I):
         return 1_000_000, "model"
@@ -832,7 +832,7 @@ def _make_entry(
     """Apply the inclusion rules for one file and append it to ``inv``."""
     if err:
         inv.yaml_warnings.append(YamlWarning(name=name, path=display_path(str(path)), error=err))
-    if _truthy(fm.get("disable-model-invocation")):
+    if truthy(fm.get("disable-model-invocation")):
         inv.excluded.append({"name": name, "source": source, "reason": "disable-model-invocation"})
         return
     description = _as_text(fm.get("description"))

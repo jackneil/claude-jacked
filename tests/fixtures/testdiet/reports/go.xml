@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="10" failures="1" errors="0" time="0.659134">
+	<testsuite tests="10" failures="1" skipped="1" time="0.659000" name="example.com/sample/calc" timestamp="2026-11-26T09:26:34-05:00">
+		<properties>
+			<property name="go.version" value="go1.26.4 darwin/arm64"></property>
+		</properties>
+		<testcase classname="example.com/sample/calc" name="TestFails" time="0.000000">
+			<failure message="Failed" type="">=== RUN   TestFails&#xA;    calc_test.go:15: sample-failure-message&#xA;--- FAIL: TestFails (0.00s)&#xA;</failure>
+		</testcase>
+		<testcase classname="example.com/sample/calc" name="TestSkipped" time="0.000000">
+			<skipped message="=== RUN   TestSkipped&#xA;    calc_test.go:19: sample-skip-reason&#xA;--- SKIP: TestSkipped (0.00s)&#xA;"></skipped>
+		</testcase>
+		<testcase classname="example.com/sample/calc" name="TestPasses" time="0.000000"></testcase>
+		<testcase classname="example.com/sample/calc" name="TestTable/one" time="0.000000"></testcase>
+		<testcase classname="example.com/sample/calc" name="TestTable/two" time="0.000000"></testcase>
+		<testcase classname="example.com/sample/calc" name="TestTable" time="0.000000"></testcase>
+		<testcase classname="example.com/sample/calc" name="TestGroup/nested/in_nested_group" time="0.000000"></testcase>
+		<testcase classname="example.com/sample/calc" name="TestGroup/nested" time="0.000000"></testcase>
+		<testcase classname="example.com/sample/calc" name="TestGroup" time="0.000000"></testcase>
+		<testcase classname="example.com/sample/calc" name="Test_sleeps_half_a_second" time="0.500000"></testcase>
+	</testsuite>
+</testsuites>

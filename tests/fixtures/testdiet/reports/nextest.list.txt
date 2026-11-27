@@ -1,0 +1,6 @@
+sample tests::fails
+sample tests::group::in_nested_group
+sample tests::passes
+sample tests::sleeps_half_a_second
+sample tests::table
+sample::integration passes_in_an_integration_test

@@ -1,0 +1,7 @@
+TestPasses
+TestFails
+TestSkipped
+TestTable
+TestGroup
+Test_sleeps_half_a_second
+ok  	example.com/sample/calc	0.103s
