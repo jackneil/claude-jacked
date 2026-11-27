@@ -1362,3 +1362,19 @@ def test_a_tests_file_with_a_field_of_the_wrong_type_is_damaged(tmp_path, capsys
     (tmp_path / "runs" / f"{meta.id}.tests.json.gz").write_bytes(_gzip.compress(raw))
     assert history.load_tests(tmp_path, meta.id) is None
     assert "skipped the damaged record" in capsys.readouterr().err
+
+
+def test_a_temporary_file_that_cannot_be_deleted_keeps_the_new_machine_id(tmp_path, monkeypatch, caplog):
+    real = Path.unlink
+
+    def refuse_temp(self, missing_ok=False):
+        if self.name.endswith(".tmp"):
+            raise PermissionError(13, "Permission denied")
+        return real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", refuse_temp)
+    with caplog.at_level("DEBUG", logger="jacked.testdiet.machine"):
+        value = machine.machine_id(tmp_path)
+    assert value is not None and re.fullmatch(r"[0-9a-f]{32}", value)
+    assert machine.machine_id(tmp_path) == value
+    assert any("temporary file" in record.getMessage() for record in caplog.records)

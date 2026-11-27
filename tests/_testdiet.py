@@ -44,13 +44,18 @@ def provenance() -> dict:
     return json.loads((FIXTURES / "PROVENANCE.json").read_bytes())
 
 
-def private_hits(text: str, *, host: str, login: str, home: str) -> list[str]:
+def private_hits(text: str, *, host: str, login: str, home: str, allowed: frozenset[str] = frozenset()) -> list[str]:
     """Return each private value that ``text`` holds.
 
     The home path matches as text, with ``/`` or ``\\`` as the separator. The
     host name (the full name and its first part) and the login name match as
     a whole word: the character before and the character after are not a
-    letter, a digit or an underscore. The match ignores case.
+    letter, a digit or an underscore. The match ignores case. A word in
+    ``allowed`` (lowercase) is a word that the text uses on purpose, for
+    example a host whose first part is "local": it is not a hit.
+
+    >>> private_hits("the local machine", host="local.lan", login="", home="/x", allowed=frozenset({"local"}))
+    []
 
     >>> private_hits("built by jack.", host="box.lan", login="jack", home="/home/jack")
     ['jack']
@@ -68,7 +73,7 @@ def private_hits(text: str, *, host: str, login: str, home: str) -> list[str]:
     if host:
         words += [host, host.split(".", 1)[0]]
     for word in words:
-        if not word or word in hits:
+        if not word or word in hits or word.lower() in allowed:
             continue
         pattern = r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])"
         if re.search(pattern, text, flags=re.IGNORECASE):

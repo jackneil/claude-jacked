@@ -380,6 +380,21 @@ def test_a_cmd_shim_by_its_bare_name_starts_on_windows(repo, tmp_path, monkeypat
     assert _last(repo).command_sha == tree.command_sha(argv, folder=".")
 
 
+@pytest.mark.skipif(os.name != "nt", reason="a .cmd shim exists only on Windows")
+def test_a_cmd_shim_gets_the_junit_path_in_a_folder_with_a_space(repo, tmp_path, monkeypatch):
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    # %~1 is the argument with its quotes removed; the path holds a space.
+    (shims / "jackedjunit.cmd").write_bytes(f'@copy /y "{GREEN}" "%~1" >nul\r\n@exit /b 0\r\n'.encode("ascii"))
+    monkeypatch.setenv("PATH", str(shims) + os.pathsep + os.environ.get("PATH", ""))
+    spaced = tmp_path / "with space"
+    spaced.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(spaced))
+    assert run.run_gate(["jackedjunit", "{junit}"], cwd=repo) == 0
+    meta = _last(repo)
+    assert meta.verdict == "passed" and meta.counts["passed"] == 2
+
+
 @POSIX
 def test_a_sigterm_to_the_run_records_and_cleans_up(repo, side, tmp_path, monkeypatch):
     if threading.current_thread() is not threading.main_thread():
@@ -951,8 +966,18 @@ def test_a_bare_name_only_in_an_install_folder_off_path_does_not_start(repo, tmp
     target = folder / (name + (".exe" if os.name == "nt" else ""))
     target.write_bytes(b"#!/bin/sh\nexit 0\n")
     target.chmod(0o755)
+    if os.name == "nt":
+        # A program that runs and exits 0, so a start through find_bin would not give 127.
+        shutil.copyfile(os.path.join(os.environ["SystemRoot"], "System32", "whoami.exe"), target)
     monkeypatch.setenv("UV_TOOL_BIN_DIR", str(folder))
     assert findbin.find_on_path(name) is None
+    # The positive control: find_bin finds the program, and the program runs and exits 0.
+    found = findbin.find_bin(name, home=str(tmp_path))
+    if found is None:
+        pytest.skip("find_bin does not trust this temporary folder here, so the control cannot run")
+    assert os.path.samefile(found, target)
+    assert subprocess.run([found], capture_output=True, stdin=subprocess.DEVNULL).returncode == 0
+    # run starts a bare name from PATH only: the same name gives 127, not 0.
     assert run.run_gate([name], cwd=repo) == 127
     assert name in capsys.readouterr().err
 
@@ -1316,3 +1341,18 @@ def test_the_fixed_reports_are_listed_one_time_after_the_gate(repo, monkeypatch)
     monkeypatch.setattr(_globs, "matches", lambda top, pattern: calls.append(pattern) or real(top, pattern))
     reports.read_reports(repo, None, ["a/*.xml", "b/*.xml"], {}, None)
     assert calls == ["a/*.xml", "b/*.xml"]
+
+
+def test_each_step_of_run_keeps_the_size_guardrails():
+    """JACKED_GUARDRAILS.md: 50 lines at most for a function, and 4 arguments (an options object beyond)."""
+    import ast
+
+    source = Path(run.__file__).read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        assert node.end_lineno - node.lineno + 1 <= 50, node.name
+        # run_gate is the public keyword API; it packs its options into GateOptions.
+        if node.name != "run_gate":
+            names = [a.arg for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs]
+            assert len([n for n in names if n != "self"]) <= 4, node.name

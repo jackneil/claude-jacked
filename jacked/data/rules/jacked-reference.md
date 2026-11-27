@@ -187,7 +187,7 @@ jacked tests prune --before YYYY-MM-DD [--dry-run]
 jacked tests loss [--base REF] [--json]
 ```
 
-- `jacked tests run` runs CMD, records the run, and returns the exit code of CMD. A recorder error never changes that code. The one exception is `--strict`: it gives exit 1 when the gate returns 0 and the report holds failures. When CMD cannot start, the exit code is 127. When signal N stops CMD, the exit code is 128 plus N. A SIGTERM or a SIGHUP to `run` goes on to CMD. Under `nohup`, SIGHUP stays ignored for CMD, as with `nohup CMD`. Put the options before CMD. Put `--` between the options and CMD.
+- `jacked tests run` runs CMD, records the run, and returns the exit code of CMD. A recorder error never changes that code. The one exception is `--strict`: it gives exit 1 when the gate returns 0 and the report holds failures. `--strict` needs a git work tree: outside one, `run` reads no report and records nothing, so the exit code is the code of the gate. When CMD cannot start, the exit code is 127. When signal N stops CMD, the exit code is 128 plus N. A SIGTERM or a SIGHUP to `run` goes on to CMD. Under `nohup`, SIGHUP stays ignored for CMD, as with `nohup CMD`. Put the options before CMD. Put `--` between the options and CMD.
   - Ctrl-C before the gate starts gives exit 130, and jacked records nothing. Ctrl-C while the gate runs goes to the gate too. Then the exit code is the code of the gate, and the record says that the user stopped the run. `profile` does not use such a run as the newest full run. Ctrl-C after the gate stops makes `run` write the record without the tree after the gate, so that run cannot prove a tree.
   - The placeholder `{junit}`: an argument that holds the text `{junit}` gets the path of a private report file. `run` makes a private temporary folder for it, reads the report after the gate, and then removes the folder. The record holds the SHA-256 of the arguments as you typed them, so the path does not change the identity of the command.
   - A command with no `{junit}` and a run with no `--junit` have no report. Then `run` prints one line before the gate: the run cannot prove a tree.
@@ -268,6 +268,7 @@ When the gate is red, read the failing tests. When the same tests fail on the ba
 - pytest: give `--junitxml={junit}`.
 - vitest: give `--reporter=junit --outputFile.junit={junit}`.
 - gotestsum: give `--junitfile {junit}`.
+- PowerShell: quote the placeholder, for example `--junitfile '{junit}'`. Without quotes, PowerShell reads `{junit}` as a script block, and the command does not get the text `{junit}`.
 - Playwright, cargo-nextest and jest write the report at the path that their configuration gives. Give that path with `run --junit GLOB`.
 - jest: the reader needs four jest-junit settings. In the environment, set `JEST_JUNIT_ADD_FILE_ATTRIBUTE="true"`, `JEST_JUNIT_CLASSNAME="{classname}"`, `JEST_JUNIT_TITLE="{title}"` and `JEST_JUNIT_ANCESTOR_SEPARATOR=" > "`. In the jest-junit configuration, the same settings are `addFileAttribute: "true"`, `classNameTemplate: "{classname}"`, `titleTemplate: "{title}"` and `ancestorSeparator: " > "`. With the default templates, the test ID holds the describe titles two times.
 

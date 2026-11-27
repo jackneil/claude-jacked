@@ -247,6 +247,28 @@ def test_each_command_of_the_group_is_in_the_reference(name):
         assert f"jacked tests {sub}" in section, f"{name}: jacked tests {sub}"
 
 
+def _recorder_words() -> frozenset[str]:
+    """The words of the recorder itself: its commands, its option names and its fixed values."""
+    from jacked.cli import main
+    from jacked.testdiet import model, record
+
+    group = main.commands["tests"]
+    words = {"jacked", "tests", "gate", "junit", record.LOCAL, *model.KINDS, *model.VERDICTS, *model.RUNNERS}
+    for name, command in group.commands.items():
+        words.add(name)
+        for param in command.params:
+            words.update(part for opt in param.opts for part in opt.lstrip("-").split("-"))
+    return frozenset(word.lower() for word in words)
+
+
+def test_a_host_named_like_a_recorder_word_is_not_a_hit_and_the_real_home_is_checked():
+    assert private_hits("the local machine", host="local.lan", login="", home="/x",
+                        allowed=_recorder_words()) == []
+    assert private_hits("the local machine", host="local.lan", login="", home="/x") == ["local"]
+    home = os.environ.get("JACKED_TESTS_REAL_HOME") or str(Path.home())
+    assert private_hits(f"see {home}/x", host="", login="", home=home) == [home]
+
+
 @pytest.mark.parametrize("name", sorted(DOCS))
 def test_the_new_sections_have_no_em_dash_and_name_no_host(name):
     section = _section(name)
@@ -255,9 +277,12 @@ def test_the_new_sections_have_no_em_dash_and_name_no_host(name):
     assert "--" not in prose, "a double hyphen in prose is a dash; put an option in a code span"
     assert " \u2013 " not in prose
     host = socket.gethostname()
+    # The real home, not the per-test HOME of tests/conftest.py: else the check never fires.
+    home = os.environ.get("JACKED_TESTS_REAL_HOME") or str(Path.home())
     # The login is not checked: on hosted CI it is "runner", a word that the
-    # text uses for the --runner option.
-    assert private_hits(section, host=host, login="", home=str(Path.home())) == []
+    # text uses for the --runner option. A host whose first part is a word of
+    # the recorder (a command, an option, a machine label) is not a hit.
+    assert private_hits(section, host=host, login="", home=home, allowed=_recorder_words()) == []
     for shape in ("/Users/", "/home/", "C:\\Users", "/private/var/", "/var/folders/"):
         assert shape not in section, shape
     assert not re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", section)

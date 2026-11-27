@@ -16,7 +16,7 @@ from pathlib import Path
 
 from jacked.atomic_io import atomic_write_bytes
 from jacked.packs import jacked_home
-from jacked.public_errors import os_error_reason
+from jacked.public_errors import describe, os_error_reason
 from jacked.regular_file import open_regular_fd
 from jacked.testdiet.model import MACHINE_ID_BYTES, MACHINE_ID_RE, emit
 
@@ -101,7 +101,11 @@ def _make_machine_id(path: Path) -> None:
         # when another process made the file first.
         _write_machine_id(path, value)
     finally:
-        temp.unlink(missing_ok=True)
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError as exc:
+            # Windows: a reader that holds the linked file open blocks the delete. The identity is made.
+            logger.debug("machine_id: the temporary file cannot be deleted (%s)", describe(exc))
 
 
 class _IdExists(Exception):
