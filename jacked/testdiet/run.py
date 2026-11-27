@@ -39,6 +39,11 @@ from jacked.testdiet.record import (
 
 logger = logging.getLogger(__name__)
 
+#: The line before the gate when the run has no report source.
+NO_REPORT_SOURCE = ("the command has no {junit} argument, and the run has no --junit option. "
+                    "So the run has no report, and it cannot prove a tree. "
+                    "Put {junit} in the command, or give --junit GLOB.")
+
 
 def _load() -> float | None:
     """The 1-minute load average, or None where the system does not give it."""
@@ -118,6 +123,8 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
         inputs_sha = _guard("hash the input files", lambda: tree.inputs_fingerprint(top, inputs),
                             INPUTS_UNAVAILABLE if inputs else None)
         report_dir, report, child_argv = _placeholder(argv)
+        if not junit and not any(reports.JUNIT_PLACEHOLDER in arg for arg in argv):
+            emit(NO_REPORT_SOURCE)
         # None (not empty) when the hash step fails: then no fixed report is read,
         # because an old report must not become this run.
         fixed_before = _guard("hash the fixed reports",
@@ -159,6 +166,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
             notice = _guard("read the earlier records", lambda: repeat_notice(store, meta), None)
             history.write_run(store, meta, known["data"])
             known["written"] = True
+            _closing_line(meta)
             if notice:
                 # jacked built each line, and each stored value in it went through one_line.
                 for line in notice.split("\n"):
@@ -190,7 +198,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
             emit(f"the run got signal {stop.args[0]} after the gate stopped. The recorder skips its "
                  "other steps and writes the record.")
             if not known["written"]:
-                _guard("write the record", lambda: history.write_run(store, build(), known["data"]), None)
+                _guard("write the record", lambda: _write_after_stop(store, build(), known["data"]), None)
             return code
         except KeyboardInterrupt:
             # The gate is done. An interrupt now stops only the recorder.
@@ -217,6 +225,15 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
 def _placeholder(argv: list[str]) -> tuple[Path | None, Path | None, list[str]]:
     """The report folder, the report path and the child argv. A folder that cannot be made is logged."""
     return reports.placeholder(argv, lambda: _guard("make the report folder", reports.make_report_folder, None))
+
+
+def _closing_line(meta: RunMeta) -> None:
+    emit(f"recorded {meta.id}, verdict {meta.verdict}.")
+
+
+def _write_after_stop(store: Path, meta: RunMeta, data) -> None:
+    history.write_run(store, meta, data)
+    _closing_line(meta)
 
 
 def _top_or_none(cwd: Path) -> Path | None:

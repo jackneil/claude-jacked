@@ -237,11 +237,36 @@ def test_a_gate_that_writes_no_report_at_the_placeholder_is_no_data(repo):
     assert meta.verdict == "no-data" and meta.counts is None
 
 
-def test_run_without_junit_is_no_data_and_keeps_the_exit_code(repo):
+def test_run_without_junit_is_no_data_and_keeps_the_exit_code(repo, capsys):
     assert run.run_gate(gate(0), cwd=repo) == 0
-    assert _last(repo).verdict == "no-data"
+    meta = _last(repo)
+    assert meta.verdict == "no-data"
+    err = capsys.readouterr().err.splitlines()
+    warning = [line for line in err if "has no report" in line]
+    assert len(warning) == 1 and "cannot prove a tree" in warning[0]
+    assert "{junit}" in warning[0] and "--junit GLOB" in warning[0]
+    assert [line for line in err if line.startswith("jacked tests: recorded ")] == [
+        f"jacked tests: recorded {meta.id}, verdict no-data."]
     assert run.run_gate(gate(4), cwd=repo) == 4
     assert _last(repo).verdict == "failed"
+
+
+def test_the_no_report_line_comes_before_the_gate_and_only_with_no_report_source(repo, side, capfd):
+    marker = side / "ran"
+    run.run_gate(gate(0, "argv", str(marker), "x"), cwd=repo)
+    err = capfd.readouterr().err
+    assert err.index("has no report") < err.index("recorded ")
+    for argv, globs in ((junit_gate(0, GREEN), ()), (gate(0), (str(side / "*.xml"),))):
+        run.run_gate(argv, cwd=repo, junit=globs)
+        assert "has no report" not in capfd.readouterr().err
+
+
+def test_each_recorded_run_prints_one_closing_line_with_its_id_and_verdict(repo, capsys):
+    for code, report, verdict in ((0, GREEN, "passed"), (1, RED, "failed"), (0, RED, "conflict")):
+        run.run_gate(junit_gate(code, report), cwd=repo)
+        meta = _last(repo)
+        lines = [line for line in capsys.readouterr().err.splitlines() if " recorded " in line]
+        assert lines == [f"jacked tests: recorded {meta.id}, verdict {verdict}."]
 
 
 def test_run_reads_a_fixed_report_whose_content_changed(repo, side):

@@ -750,7 +750,7 @@ jacked tests record --junit report.xml --exit-code 0 --machine ci   # a run that
 jacked tests prune --before 2026-01-01
 ```
 
-`jacked tests run` returns the exit code of the gate command. A recorder error never changes it. An argument that holds `{junit}` gets the path of a private report file. For a runner that writes its report at a fixed path, give that path with `run --junit GLOB`. `seen` matches the tree hash (with the changes that are not committed), the command as you typed it, the folder that the gate ran in and the machine. Run `seen` in the folder where the gate runs. It never compares the times of two machines.
+`jacked tests run` returns the exit code of the gate command. A recorder error never changes it. An argument that holds `{junit}` gets the path of a private report file. For a runner that writes its report at a fixed path, give that path with `run --junit GLOB`. A run with no report cannot prove a tree, and `run` says so before the gate starts. After each record, `run` prints the run ID and the verdict. `seen` matches the tree hash (with the changes that are not committed), the command as you typed it, the folder that the gate ran in and the machine. Run `seen` in the folder where the gate runs. It never compares the times of two machines.
 
 To use the recorder in a gate script and keep the script working with an older jacked, use this gate line. When the `tests` group is not there, it runs the bare command and prints one line:
 
