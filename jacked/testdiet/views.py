@@ -241,15 +241,10 @@ def history(store: Path, *, machine: str | None = None, days: int | None = None,
             by_sig.setdefault(meta.failing_sig, []).append(meta)
     failing_sets = []
     for sig, group in by_sig.items():  # each group is newest first
-        trees = {m.tree.tree for m in group if m.tree is not None}
-        known_branch = [m.on_default_branch for m in group if m.on_default_branch is not None]
         failing_sets.append({
-            "sig": sig, "runs": len(group), "first": group[-1].started, "last": group[0].started,
+            "sig": sig, "first": group[-1].started, "last": group[0].started,
             # None when no run of the set holds the value; *_unknown counts the runs with no value.
-            "trees": len(trees) if trees else None,
-            "trees_unknown": sum(1 for m in group if m.tree is None),
-            "on_default_branch": sum(known_branch) if known_branch else None,
-            "on_default_branch_unknown": len(group) - len(known_branch),
+            **_history.failing_set_summary(group),
             "ids": list(group[0].failing),
         })
     failing_sets.sort(key=lambda s: (-s["runs"], s["sig"]))
@@ -315,10 +310,10 @@ def _time_range(low, high) -> str:
     return f"{_time(low)}-{_time(high)}"
 
 
-def _recorded(value, missing: int, runs: int) -> str:
+def recorded_count(value, missing: int, runs: int) -> str:
     """A count that only some runs hold: ``K``, ``K (M not recorded)`` or ``not recorded (N runs)``."""
     if value is None:
-        return f"not recorded ({runs} runs)"
+        return f"not recorded ({runs} {'run' if runs == 1 else 'runs'})"
     return _num(value) + (f" ({missing} not recorded)" if missing else "")
 
 
@@ -391,8 +386,8 @@ def render_history(result: dict, *, size: bool = False) -> str:
               for r in result["repeated_green"]] or ["  none"]
     lines.append("failing sets:")
     for s in result["failing_sets"]:
-        trees = _recorded(s["trees"], s["trees_unknown"], s["runs"])
-        branch = _recorded(s["on_default_branch"], s["on_default_branch_unknown"], s["runs"])
+        trees = recorded_count(s["trees"], s["trees_unknown"], s["runs"])
+        branch = recorded_count(s["on_default_branch"], s["on_default_branch_unknown"], s["runs"])
         lines.append(f"  {_num(s['runs'])} runs, trees: {trees}, on the default branch: {branch}, "
                      f"first {one_line(s['first'])}, last {one_line(s['last'])}, set {s['sig'][:12]}:")
         lines += [f"    {one_line(test_id)}" for test_id in s["ids"]]

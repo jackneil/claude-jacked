@@ -17,6 +17,7 @@ from typing import TypeVar
 
 from jacked.public_errors import describe
 from jacked.testdiet import history, junit, tree
+from jacked.testdiet.views import recorded_count
 from jacked.testdiet import machine as identity
 from jacked.testdiet.model import (
     LABEL_RE,
@@ -230,15 +231,12 @@ def repeat_notice(store: Path, meta: RunMeta) -> str | None:
     # The records are grouped by machine label, and in run-ID order in a group.
     # A record with no label sorts after each real label.
     earlier.sort(key=lambda m: (*label_order(m.machine), m.id))
-    trees = {m.tree.tree for m in earlier if m.tree is not None}
-    no_tree = sum(1 for m in earlier if m.tree is None)
-    default = sum(1 for m in earlier if m.on_default_branch is True)
+    found = history.failing_set_summary(earlier)
     records = "record" if len(earlier) == 1 else "records"
-    tree_word = "tree" if len(trees) == 1 else "trees"
-    summary = f"the same failing set is in {len(earlier)} earlier {records}, on {len(trees)} {tree_word}"
-    if no_tree:
-        summary += f" ({no_tree} with no tree)"
-    summary += f", {default} of them on the default branch."
+    trees = recorded_count(found["trees"], found["trees_unknown"], found["runs"])
+    branch = recorded_count(found["on_default_branch"], found["on_default_branch_unknown"], found["runs"])
+    summary = (f"the same failing set is in {len(earlier)} earlier {records}, trees: {trees}, "
+               f"on the default branch: {branch}.")
     lines = [summary, f"the failing set has {len(meta.failing)} test(s):"]
     lines += [f"  {one_line(test_id)}" for test_id in meta.failing]
     lines.append("the earlier records, by machine:")

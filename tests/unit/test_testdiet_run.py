@@ -266,7 +266,8 @@ def test_each_recorded_run_prints_one_closing_line_with_its_id_and_verdict(repo,
     for code, report, verdict in ((0, GREEN, "passed"), (1, RED, "failed"), (0, RED, "conflict")):
         run.run_gate(junit_gate(code, report), cwd=repo)
         meta = _last(repo)
-        lines = [line for line in capsys.readouterr().err.splitlines() if " recorded " in line]
+        lines = [line for line in capsys.readouterr().err.splitlines()
+                 if line.startswith("jacked tests: recorded ")]
         assert lines == [f"jacked tests: recorded {meta.id}, verdict {verdict}."]
 
 
@@ -638,7 +639,7 @@ def test_a_red_run_with_a_failing_set_in_two_earlier_records_prints_them(repo, c
     err = capsys.readouterr().err
     lines = _notice_lines(err)
     assert lines and "2 earlier records" in lines[0]
-    assert "1 tree" in lines[0]
+    assert "trees: 1," in lines[0]
     for run_id in earlier:
         assert run_id in err
     assert "tests/test_sample.py::test_fails" in err
@@ -663,7 +664,7 @@ def test_the_notice_counts_default_branch_records_and_gives_no_cause(repo, capsy
     run.run_gate(argv, cwd=repo)
     text = record.repeat_notice(tree.store_dir(repo), _last(repo))
     assert text is not None
-    assert "2 earlier records" in text and "1 of them on the default branch" in text
+    assert "2 earlier records" in text and "on the default branch: 1 (1 not recorded)" in text
     for word in ("cause", "caused", "defect", "fault", "blame", "flaky", "your", "regression"):
         assert not re.search(rf"\b{word}\b", text, flags=re.IGNORECASE), word
 
@@ -1030,3 +1031,21 @@ def test_a_recorder_step_error_logs_no_traceback_at_warning(repo, monkeypatch, c
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warnings and not any(r.exc_info for r in warnings)
     assert any(r.exc_info for r in caplog.records if r.levelno == logging.DEBUG)
+
+
+def test_the_notice_and_history_give_one_summary_of_a_failing_set(tmp_path):
+    from jacked.testdiet import views
+    from tests._testdiet import make_case, store_run
+
+    store = tmp_path / "store"
+    red = [make_case("tests/test_x.py::test_fails", "tests/test_x.py", 0.1, "failed")]
+    store_run(store, "20261120T080000", exit_code=1, tests=red)
+    store_run(store, "20261121T080000", exit_code=1, tests=red, tree=None)
+    now = store_run(store, "20261122T080000", exit_code=1, tests=red)
+    meta = next(m for m in history.iter_runs(store) if m.id == now)
+    notice = record.repeat_notice(store, meta).splitlines()[0]
+    assert "on the default branch: not recorded (2 runs)" in notice and " 0 " not in notice
+    assert "trees: 1 (1 not recorded)" in notice
+    text = views.render_history(views.history(store))
+    assert "trees: 1 (1 not recorded), on the default branch: not recorded (3 runs)" in text
+    assert views.recorded_count(None, 1, 1) == "not recorded (1 run)"

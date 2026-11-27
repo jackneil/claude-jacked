@@ -113,6 +113,27 @@ def failing_signature(cases: Iterable[CaseResult]) -> str | None:
     return hashlib.sha256(text.encode("ascii")).hexdigest()
 
 
+def failing_set_summary(records: Iterable[RunMeta]) -> dict[str, int | None]:
+    """Return the tree and default-branch counts of the records of one failing set.
+
+    ``trees`` is the number of distinct trees, or None when no record holds
+    a tree; ``trees_unknown`` counts the records with no tree.
+    ``on_default_branch`` is the number of records on the default branch, or
+    None when no record holds that value; ``on_default_branch_unknown``
+    counts the records with no value. An unknown value is never 0.
+    """
+    records = list(records)
+    trees = {m.tree.tree for m in records if m.tree is not None}
+    known_branch = [m.on_default_branch for m in records if m.on_default_branch is not None]
+    return {
+        "runs": len(records),
+        "trees": len(trees) if trees else None,
+        "trees_unknown": sum(1 for m in records if m.tree is None),
+        "on_default_branch": sum(known_branch) if known_branch else None,
+        "on_default_branch_unknown": len(records) - len(known_branch),
+    }
+
+
 def verdict_of(exit_code: int | None, data: RunData | None) -> str:
     """Return the verdict of a run.
 
