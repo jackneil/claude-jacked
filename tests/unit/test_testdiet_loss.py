@@ -910,3 +910,19 @@ def test_a_jsx_apostrophe_gives_no_not_read_line_and_its_tests_pair(repo):
     assert not any(line.startswith("not read file") for line in out), out
     # The tests pair: "after" lost its assertion, and "shows text" is not named.
     assert any("after" in line for line in out) and not any("shows text" in line for line in out), out
+
+
+def test_the_blobs_are_views_of_one_batch_output_with_no_copy(repo):
+    # o-L7: one cat-file --batch output; each blob is a slice of it, not a second copy.
+    from jacked.testdiet import tree as _tree
+
+    write(repo, "tests/test_a.py", b"def test_a():\n    assert 1\n")
+    write(repo, "tests/test_b.py", b"def test_b():\n    assert 2\n")
+    commit(repo, "two")
+    env = _tree.object_env(repo, repo / ".git" / "objects")
+    blobs = [git(repo, "rev-parse", f"HEAD:tests/test_{n}.py") for n in "ab"]
+    found = loss._read_blobs(repo, blobs, env)
+    views = [found[b] for b in blobs]
+    assert all(isinstance(v, memoryview) for v in views)
+    assert views[0].obj is views[1].obj  # one buffer
+    assert [bytes(v) for v in views] == [b"def test_a():\n    assert 1\n", b"def test_b():\n    assert 2\n"]

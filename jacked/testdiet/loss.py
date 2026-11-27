@@ -147,8 +147,12 @@ def _touched(top: Path, base: str, head_tree: str, env: dict[str, str]):
     return touched, skipped
 
 
-def _read_blobs(top: Path, blobs: list[str], env: dict[str, str]) -> dict[str, bytes]:
-    """Read each blob with one ``git cat-file --batch`` process. An empty name is an absent side."""
+def _read_blobs(top: Path, blobs: list[str], env: dict[str, str]) -> dict[str, memoryview]:
+    """Read each blob with one ``git cat-file --batch`` process. An empty name is an absent side.
+
+    Each value is a ``memoryview`` slice of the one output buffer, so the
+    blobs are in memory one time, not two. There is no size limit.
+    """
     wanted = sorted({blob for blob in blobs if blob})
     if not wanted:
         return {}
@@ -158,7 +162,8 @@ def _read_blobs(top: Path, blobs: list[str], env: dict[str, str]) -> dict[str, b
         code, out = tree.git(top, "cat-file", "--batch", env=env, stdin=names)
     if code != 0:
         raise LossError(f"git cat-file --batch exited with {code}")
-    found: dict[str, bytes] = {}
+    found: dict[str, memoryview] = {}
+    view = memoryview(out)
     pos = 0
     for blob in wanted:
         newline = out.find(b"\n", pos)
@@ -166,7 +171,7 @@ def _read_blobs(top: Path, blobs: list[str], env: dict[str, str]) -> dict[str, b
         if len(header) != 3 or header[0] != blob.encode("ascii") or header[1] != b"blob":
             raise LossError(f"git cannot read the object {blob}")
         start = newline + 1
-        found[blob] = out[start:start + int(header[2])]
+        found[blob] = view[start:start + int(header[2])]
         pos = start + int(header[2]) + 1  # the content ends with one newline
     return found
 
@@ -206,7 +211,7 @@ def loss_report(cwd: Path, base: str | None = None) -> LossReport:
             for side, blob in zip(sides, blobs):
                 data = contents.get(blob) if blob else None
                 if data is not None:
-                    side[path], reason = scan_file(path, data.decode("utf-8", "replace"))
+                    side[path], reason = scan_file(path, str(data, "utf-8", "replace"))
                     if reason is not None and (path, reason) not in skipped:
                         skipped.append((path, reason))
     finally:
