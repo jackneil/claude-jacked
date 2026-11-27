@@ -100,9 +100,9 @@ class TestDecodeProjectHash:
 
     def test_deep_nesting(self):
         from jacked.web.analytics_paths import decode_project_hash
-        result = decode_project_hash("-Users-jack-conductor-workspaces-hank-ehr-raleigh")
+        result = decode_project_hash("-Users-jack-conductor-workspaces-acme-app-raleigh")
         # Should extract meaningful last segments, not the full path
-        assert "raleigh" in result["name"].lower() or "hank-ehr" in result["name"].lower()
+        assert "raleigh" in result["name"].lower() or "acme-app" in result["name"].lower()
 
     def test_unknown_returns_truncated_hash(self):
         from jacked.web.analytics_paths import decode_project_hash

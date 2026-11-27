@@ -165,9 +165,9 @@ CREATE TABLE analytics_settings (
 - `inactive_burn` — output without user input (too many false positives with subagent workflows)
 
 **Flag descriptions are actionable and specific:**
-- "hank-rcm session 4a2f: 312K output in 22 min — 3.2× your average"
+- "billing-api session 4a2f: 312K output in 22 min — 3.2× your average"
 - "claude-jacked session 8b1c: cache hit rate dropped to 17% (your average is 94%) — possible cache bug"
-- "hank-os session 3f9a: 42 subagent calls — each duplicates full context"
+- "web-app session 3f9a: 42 subagent calls — each duplicates full context"
 - "Session e2d1: context growing 180% across messages — consider /compact"
 - "Session 7c3b: resume cost spike — 480K cache_create tokens, 0 cache_read"
 
@@ -264,7 +264,7 @@ Decoding logic (same approach as cchubber):
 3. Take the last 2-3 meaningful segments as the display name
 4. Cache decoded names in memory
 
-Example: `-Users-jack-neil-Github-claude-jacked` → "claude-jacked"
+Example: `-Users-first-last-Github-claude-jacked` → "claude-jacked"
 
 ### 7. Cost Estimation
 

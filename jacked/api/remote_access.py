@@ -128,7 +128,7 @@ def client_in_scope(host: str | None, scope: str) -> bool:
     pinning in cli.py/tray.py), so a name here means an exotic proxy or a
     stub, and guessing is not a thing a credential gate should do.
 
-    >>> client_in_scope('100.116.47.72', 'tailscale')
+    >>> client_in_scope('100.64.47.72', 'tailscale')
     True
     >>> client_in_scope('192.168.42.5', 'tailscale')
     False
@@ -138,7 +138,7 @@ def client_in_scope(host: str | None, scope: str) -> bool:
     True
     >>> client_in_scope('2001:db8::1', 'tailscale')
     False
-    >>> client_in_scope('hank-llm', 'all')
+    >>> client_in_scope('gpu-box', 'all')
     False
     >>> client_in_scope(None, 'all')
     False
@@ -169,7 +169,7 @@ def credential_policy_editable(host: str | None) -> bool:
     True
     >>> credential_policy_editable('localhost')
     True
-    >>> credential_policy_editable('100.116.47.72')
+    >>> credential_policy_editable('100.64.47.72')
     False
     >>> credential_policy_editable(None)
     False
@@ -195,9 +195,9 @@ def credential_mutation_decision(
 
     >>> credential_mutation_decision('127.0.0.1', False, 'tailscale')
     (True, None)
-    >>> credential_mutation_decision('100.116.47.72', False, 'tailscale')
+    >>> credential_mutation_decision('100.64.47.72', False, 'tailscale')
     (False, 'remote_access_off')
-    >>> credential_mutation_decision('100.116.47.72', True, 'tailscale')
+    >>> credential_mutation_decision('100.64.47.72', True, 'tailscale')
     (True, None)
     >>> credential_mutation_decision('192.168.42.5', True, 'tailscale')
     (False, 'outside_scope')
@@ -223,9 +223,9 @@ def credential_mutation_allowed(
 
     >>> credential_mutation_allowed('127.0.0.1', False, 'tailscale')
     True
-    >>> credential_mutation_allowed('100.116.47.72', False, 'tailscale')
+    >>> credential_mutation_allowed('100.64.47.72', False, 'tailscale')
     False
-    >>> credential_mutation_allowed('100.116.47.72', True, 'tailscale')
+    >>> credential_mutation_allowed('100.64.47.72', True, 'tailscale')
     True
     >>> credential_mutation_allowed('192.168.42.5', True, 'tailscale')
     False

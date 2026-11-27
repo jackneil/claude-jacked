@@ -43,8 +43,8 @@ def encode(path: str) -> str:
 def project_dir_name(path: str) -> str:
     """Return the folder name that Claude Code gives ``path`` under ``projects/``.
 
-    >>> project_dir_name("/Users/jack.neil/Github/claude-jacked")
-    '-Users-jack-neil-Github-claude-jacked'
+    >>> project_dir_name("/Users/first.last/Github/claude-jacked")
+    '-Users-first-last-Github-claude-jacked'
     >>> project_dir_name("/tmp/" + "a" * 196)[195:]
     'aaaaa-r0traf'
     """

@@ -898,7 +898,7 @@ def test_use_account_committed_switch_records_the_active_pointer(client, db):
 
 _PAGE_SESSION_HEADERS = {"X-Jacked-Page-Session": "page-session-123456"}
 
-TAILNET_IP = "100.116.47.72"
+TAILNET_IP = "100.64.47.72"
 LAN_IP = "192.168.42.5"
 
 # (host, remote_access_enabled, remote_access_scope, gate_passes)

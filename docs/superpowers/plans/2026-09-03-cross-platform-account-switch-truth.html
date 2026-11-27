@@ -285,7 +285,7 @@ uv run ruff format --check .</code></pre>
   <li>Run <code>$qa</code> against the local account/session UI. Cover committed, ACL denied, interactive pending, diverged, indeterminate, remote read-only, session pending, scoped and legacy unknown states.</li>
   <li>Use disposable homes and processes for CLI/service end-to-end tests. Never use the maintainer's real Keychain, accounts, port 8321 listener or live Claude sessions.</li>
   <li>Capture exact evidence for AC1-AC16 in the PR description: command, platform, result and artifact/log location.</li>
-  <li>After dependency and workflow changes, run <code>$lockdown --workspace=/Users/jackneil/Github</code> before release.</li>
+  <li>After dependency and workflow changes, run <code>$lockdown --workspace=~/Github</code> before release.</li>
 </ol>
 
 <h3>Required model-based failure points</h3>

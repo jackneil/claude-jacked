@@ -951,7 +951,7 @@ done
 
 ### Repo-name privacy
 
-By default, output sibling repo names as-is (`jack-cli`, `hank-codesets`). The user can opt to redact: `--workspace=PATH --redact-names` replaces each name with a stable hash (`repo:a1b2c3`). Recommend redaction in writing if the audit report will be committed to a repo that could ever become public — the HTML report file lives in `docs/lockdown/` and is git-tracked.
+By default, output sibling repo names as-is (`web-cli`, `api-server`). The user can opt to redact: `--workspace=PATH --redact-names` replaces each name with a stable hash (`repo:a1b2c3`). Recommend redaction in writing if the audit report will be committed to a repo that could ever become public — the HTML report file lives in `docs/lockdown/` and is git-tracked.
 
 ### Report rendering (escape all untrusted strings)
 
@@ -960,8 +960,8 @@ When inserting repo names, manifest matches, or scanner output into the HTML rep
 ### Sample output
 
 > **Cross-repo blast radius for upgrading `requests` to 2.34.2:**
-> - jack-cli — `pyproject.toml: "requests>=2.31"`
-> - hank-codesets — `pyproject.toml: "requests==2.33.0"`
+> - web-cli — `pyproject.toml: "requests>=2.31"`
+> - api-server — `pyproject.toml: "requests==2.33.0"`
 >
 > Apply this upgrade in this repo, then verify these sibling repos still install/build cleanly before they next deploy. `/lockdown` did NOT modify those sibling repos.
 

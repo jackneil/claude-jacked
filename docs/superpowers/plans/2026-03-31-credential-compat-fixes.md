@@ -10,7 +10,7 @@
 
 ### Reference
 
-See `/Users/jack.neil/Github/claude-code/docs/auth-architecture.md` for the full CC auth architecture. Key source files:
+See `~/Github/claude-code/docs/auth-architecture.md` for the full CC auth architecture. Key source files:
 - CC keychain: `claude-code/src/utils/secureStorage/macOsKeychainStorage.ts`
 - CC service names: `claude-code/src/utils/secureStorage/macOsKeychainHelpers.ts`
 - CC scopes: `claude-code/src/constants/oauth.ts`

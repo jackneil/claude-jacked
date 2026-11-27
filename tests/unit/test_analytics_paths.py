@@ -97,21 +97,21 @@ class TestDecodeProjectHash:
     def test_deep_nesting(self, tmp_path):
         _build_fs_tree(
             tmp_path,
-            ["Users", "jack", "neil", "conductor", "workspaces",
-             "hank", "ehr", "kolkata"],
+            ["Users", "first", "last", "conductor", "workspaces",
+             "acme", "app", "kolkata"],
         )
         with patch(
             "jacked.web.analytics_paths._probe_filesystem"
         ) as mock_probe:
             mock_probe.return_value = [
-                "Users", "jack", "neil", "conductor", "workspaces",
-                "hank", "ehr", "kolkata",
+                "Users", "first", "last", "conductor", "workspaces",
+                "acme", "app", "kolkata",
             ]
             result = decode_project_hash(
-                "-Users-jack-neil-conductor-workspaces-hank-ehr-kolkata"
+                "-Users-first-last-conductor-workspaces-acme-app-kolkata"
             )
         assert result["path"] == (
-            "Users/jack/neil/conductor/workspaces/hank/ehr/kolkata"
+            "Users/first/last/conductor/workspaces/acme/app/kolkata"
         )
         assert "kolkata" in result["name"]
 

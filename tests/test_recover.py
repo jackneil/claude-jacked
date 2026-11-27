@@ -27,9 +27,9 @@ SID_A = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
 
 def test_resolve_matches_by_cwd_field_despite_lossy_slug(tmp_path):
     projects = tmp_path / "projects"
-    cwd = "/Users/jack.neil/Github/claude-jacked"  # dot in username defeats naive slug
+    cwd = "/Users/first.last/Github/claude-jacked"  # dot in username defeats naive slug
     # Folder name uses the CURRENT encoding (dots -> dash, leading dash kept):
-    pdir = projects / "-Users-jack-neil-Github-claude-jacked"
+    pdir = projects / "-Users-first-last-Github-claude-jacked"
     _write_session(pdir, SID_A, [_user_line(cwd)])
     assert rec.resolve_project_dir(cwd, projects_root=projects) == pdir
 
@@ -38,7 +38,7 @@ def test_resolve_returns_none_when_no_match(tmp_path):
     projects = tmp_path / "projects"
     pdir = projects / "-some-other-repo"
     _write_session(pdir, SID_A, [_user_line("/some/other/repo")])
-    assert rec.resolve_project_dir("/Users/jack.neil/Github/claude-jacked",
+    assert rec.resolve_project_dir("/Users/first.last/Github/claude-jacked",
                                    projects_root=projects) is None
 
 
@@ -48,9 +48,9 @@ def test_resolve_returns_none_when_root_missing(tmp_path):
 
 def test_encode_cwd_replaces_every_non_alphanumeric():
     # Claude Code maps spaces, '@', '.' and separators all to '-'.
-    cwd = "/Users/jack.neil/Library/CloudStorage/GoogleDrive-jack.neil@hank.ai/My Drive/213SCC Net"
+    cwd = "/Users/first.last/Library/CloudStorage/GoogleDrive-first.last@example.com/My Drive/42ABC Net"
     assert rec._encode_cwd(cwd) == (
-        "-Users-jack-neil-Library-CloudStorage-GoogleDrive-jack-neil-hank-ai-My-Drive-213SCC-Net")
+        "-Users-first-last-Library-CloudStorage-GoogleDrive-first-last-example-com-My-Drive-42ABC-Net")
     assert rec._encode_cwd("C:\\Users\\me\\repo") == "C--Users-me-repo"
 
 

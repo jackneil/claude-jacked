@@ -79,10 +79,10 @@ def _log_count(vault):
 
 
 def _fixture_root(env):
-    """A root dir with three repos: two 'hank-*' (cluster) + one 'claude-jacked'."""
+    """A root dir with three repos: two 'acme-*' (cluster) + one 'claude-jacked'."""
     root = env.tmp / "Github"
-    _make_repo(root / "hank-captable", "git@github.com:jackneil/hank-captable.git")
-    _make_repo(root / "hank-scholar", "https://github.com/jackneil/hank-scholar.git")
+    _make_repo(root / "acme-ledger", "git@github.com:jackneil/acme-ledger.git")
+    _make_repo(root / "acme-notes", "https://github.com/jackneil/acme-notes.git")
     _make_repo(root / "claude-jacked", "git@github.com:jackneil/claude-jacked.git")
     return root
 
@@ -110,7 +110,7 @@ def _today():
 
 @pytest.mark.parametrize("url,expected", [
     ("git@github.com:jackneil/claude-jacked.git", "github.com/jackneil/claude-jacked"),
-    ("https://github.com/jackneil/hank-scholar.git", "github.com/jackneil/hank-scholar"),
+    ("https://github.com/jackneil/acme-notes.git", "github.com/jackneil/acme-notes"),
     ("https://user:pass@github.com/owner/repo.git", "github.com/owner/repo"),
     ("ssh://git@gitlab.com/team/proj", "gitlab.com/team/proj"),
     ("https://github.com/Owner/Repo", "github.com/owner/repo"),
@@ -141,32 +141,32 @@ def test_scan_and_suggest_groups(env):
     discovered = vault_mod.scan_roots([root])
     idents = {i for _, i in discovered}
     assert idents == {
-        "github.com/jackneil/hank-captable",
-        "github.com/jackneil/hank-scholar",
+        "github.com/jackneil/acme-ledger",
+        "github.com/jackneil/acme-notes",
         "github.com/jackneil/claude-jacked",
     }
     groups = vault_mod.suggest_groups(discovered)
-    # Shared org + shared 'hank' prefix clusters into one group.
-    assert set(groups["hank"]) == {
-        "github.com/jackneil/hank-captable",
-        "github.com/jackneil/hank-scholar",
+    # Shared org + shared 'acme' prefix clusters into one group.
+    assert set(groups["acme"]) == {
+        "github.com/jackneil/acme-ledger",
+        "github.com/jackneil/acme-notes",
     }
     # The odd one out is its own solo group named after the repo.
     assert groups["claude-jacked"] == ["github.com/jackneil/claude-jacked"]
 
 
 def test_suggest_groups_unique_names_on_collision(env):
-    # Two different orgs, same 'hank' token -> the second cluster's name is
+    # Two different orgs, same 'acme' token -> the second cluster's name is
     # disambiguated instead of clobbering the first.
     discovered = [
-        (env.tmp / "a", "github.com/orgA/hank-x"),
-        (env.tmp / "b", "github.com/orgA/hank-y"),
-        (env.tmp / "c", "github.com/orgB/hank-p"),
-        (env.tmp / "d", "github.com/orgB/hank-q"),
+        (env.tmp / "a", "github.com/orgA/acme-x"),
+        (env.tmp / "b", "github.com/orgA/acme-y"),
+        (env.tmp / "c", "github.com/orgB/acme-p"),
+        (env.tmp / "d", "github.com/orgB/acme-q"),
     ]
     groups = vault_mod.suggest_groups(discovered)
-    assert "hank" in groups
-    assert "hank-2" in groups
+    assert "acme" in groups
+    assert "acme-2" in groups
     assert len(groups) == 2
 
 
@@ -188,11 +188,11 @@ def test_init_writes_vault_skeleton_and_git(env):
 
     cfg = json.loads((vault / "vault.json").read_text())
     assert cfg["version"] == 1
-    assert "hank" in cfg["groups"]
-    assert cfg["repo_map"]["github.com/jackneil/hank-captable"] == "hank"
+    assert "acme" in cfg["groups"]
+    assert cfg["repo_map"]["github.com/jackneil/acme-ledger"] == "acme"
     # Group skeletons exist.
-    assert (vault / "groups" / "hank" / "index.md").exists()
-    assert (vault / "groups" / "hank" / "hot.md").exists()
+    assert (vault / "groups" / "acme" / "index.md").exists()
+    assert (vault / "groups" / "acme" / "hot.md").exists()
     # Exactly one initial commit.
     assert _log_count(vault) == 1
 
@@ -241,7 +241,7 @@ def test_init_installs_hooks_and_reports(env):
     assert "memory_recall" in settings_text
 
     # The post-merge git hook landed in a mapped repo.
-    assert (root / "hank-captable" / ".git" / "hooks" / "post-merge").exists()
+    assert (root / "acme-ledger" / ".git" / "hooks" / "post-merge").exists()
 
     # The output tells the user hooks were installed.
     assert "hooks installed" in env.buf.getvalue().lower()
@@ -276,22 +276,22 @@ def test_add_writes_note_index_and_commit(env):
 
     r = CliRunner().invoke(main, [
         "memory", "add", "--type", "decision", "--title", "Test decision",
-        "--group", "hank", "--repos", "github.com/jackneil/hank-captable",
+        "--group", "acme", "--repos", "github.com/jackneil/acme-ledger",
         "--tags", "candidate,milestone", "--body", "We chose X because Y.",
     ])
     assert r.exit_code == 0, r.output + env.buf.getvalue()
 
-    note = env.vault / "groups" / "hank" / "decision" / "test-decision.md"
+    note = env.vault / "groups" / "acme" / "decision" / "test-decision.md"
     assert note.exists()
     meta, body = vault_mod.parse_frontmatter(note.read_text())
     assert meta["type"] == "decision"
-    assert meta["group"] == "hank"
-    assert meta["repos"] == ["github.com/jackneil/hank-captable"]
+    assert meta["group"] == "acme"
+    assert meta["repos"] == ["github.com/jackneil/acme-ledger"]
     assert meta["tags"] == ["candidate", "milestone"]
     assert meta["created"] == _today()
     assert "We chose X because Y." in body
 
-    index = (env.vault / "groups" / "hank" / "index.md").read_text()
+    index = (env.vault / "groups" / "acme" / "index.md").read_text()
     assert "[Test decision](decision/test-decision.md)" in index
     assert "We chose X because Y." in index  # first-sentence hook
 
@@ -304,18 +304,18 @@ def test_add_auto_group_from_cwd(env):
     root = _fixture_root(env)
     assert _init_with(env, root).exit_code == 0
     # Work from inside a mapped repo; no --group -> resolves to its group.
-    env.monkeypatch.chdir(root / "hank-scholar")
+    env.monkeypatch.chdir(root / "acme-notes")
     r = CliRunner().invoke(main, [
         "memory", "add", "--type", "progress", "--title", "Did a thing",
         "--body", "Landed the parser.",
     ])
     assert r.exit_code == 0, r.output + env.buf.getvalue()
-    assert (env.vault / "groups" / "hank" / "progress" / "did-a-thing.md").exists()
+    assert (env.vault / "groups" / "acme" / "progress" / "did-a-thing.md").exists()
     # repos defaulted to the current repo identity.
     meta, _ = vault_mod.read_note(
-        env.vault / "groups" / "hank" / "progress" / "did-a-thing.md"
+        env.vault / "groups" / "acme" / "progress" / "did-a-thing.md"
     )
-    assert meta["repos"] == ["github.com/jackneil/hank-scholar"]
+    assert meta["repos"] == ["github.com/jackneil/acme-notes"]
 
 
 def test_add_unmapped_repo_creates_solo_group(env):
@@ -336,17 +336,17 @@ def test_add_slug_sanitizes_traversal(env):
     _init_empty(env)
     r = CliRunner().invoke(main, [
         "memory", "add", "--type", "decision", "--title", "../../etc/passwd & danger!",
-        "--group", "hank", "--body", "Nope.",
+        "--group", "acme", "--body", "Nope.",
     ])
     assert r.exit_code == 0, r.output + env.buf.getvalue()
-    decision_dir = env.vault / "groups" / "hank" / "decision"
+    decision_dir = env.vault / "groups" / "acme" / "decision"
     files = list(decision_dir.glob("*.md"))
     assert len(files) == 1
     name = files[0].name
     assert "/" not in name and ".." not in name
     assert name == "etc-passwd-danger.md"
     # Nothing escaped the group dir.
-    assert files[0].resolve().is_relative_to((env.vault / "groups" / "hank").resolve())
+    assert files[0].resolve().is_relative_to((env.vault / "groups" / "acme").resolve())
 
 
 def test_add_duplicate_slug_gets_suffix(env):
@@ -354,10 +354,10 @@ def test_add_duplicate_slug_gets_suffix(env):
     for _ in range(2):
         r = CliRunner().invoke(main, [
             "memory", "add", "--type", "decision", "--title", "Same title",
-            "--group", "hank", "--body", "Body text here.",
+            "--group", "acme", "--body", "Body text here.",
         ])
         assert r.exit_code == 0, r.output + env.buf.getvalue()
-    decision_dir = env.vault / "groups" / "hank" / "decision"
+    decision_dir = env.vault / "groups" / "acme" / "decision"
     names = sorted(p.name for p in decision_dir.glob("*.md"))
     assert names == ["same-title-2.md", "same-title.md"]
 
@@ -424,7 +424,7 @@ def test_cli_add_git_timeout_prints_clean_failure(env):
     env.monkeypatch.setattr(vault_mod, "_run_git", _timeout)
     r = CliRunner().invoke(main, [
         "memory", "add", "--type", "decision", "--title", "Timeout note",
-        "--group", "hank", "--body", "body",
+        "--group", "acme", "--body", "body",
     ])
     assert r.exit_code == 2
     out = r.output + env.buf.getvalue()
@@ -532,7 +532,7 @@ def test_frontmatter_round_trip():
     meta = {
         "type": "decision",
         "repos": ["github.com/a/b", "github.com/a/c"],
-        "group": "hank",
+        "group": "acme",
         "created": "2026-07-18",
         "updated": "2026-07-18",
         "tags": ["candidate"],
@@ -684,14 +684,14 @@ def test_status_renders_groups_and_counts(env):
     _init_empty(env)
     CliRunner().invoke(main, [
         "memory", "add", "--type", "decision", "--title", "One",
-        "--group", "hank", "--body", "Body.",
+        "--group", "acme", "--body", "Body.",
     ])
     env.buf.truncate(0)
     env.buf.seek(0)
     r = CliRunner().invoke(main, ["memory", "status"])
     assert r.exit_code == 0
     out = env.buf.getvalue()
-    assert "hank" in out
+    assert "acme" in out
     assert "enabled" in out
     assert str(env.vault) in out
 
@@ -705,7 +705,7 @@ def test_no_em_dash_in_command_output(env):
     _init_with(env, root)
     CliRunner().invoke(main, [
         "memory", "add", "--type", "decision", "--title", "A decision",
-        "--group", "hank", "--body", "We picked A over B.",
+        "--group", "acme", "--body", "We picked A over B.",
     ])
     CliRunner().invoke(main, ["memory", "status"])
     assert "—" not in env.buf.getvalue()
@@ -737,7 +737,7 @@ def test_slugify_distinct_non_ascii_names_stay_distinct():
 
 
 def test_slugify_normal_ascii_unchanged():
-    assert vault_mod.slugify("Hank Captable") == "hank-captable"
+    assert vault_mod.slugify("Acme Ledger") == "acme-ledger"
     assert vault_mod.slugify("../../etc/passwd") == "etc-passwd"
 
 
@@ -1095,13 +1095,13 @@ def test_status_prints_the_budget_line_after_the_groups_table(env):
     _init_empty(env)
     CliRunner().invoke(main, [
         "memory", "add", "--type", "decision", "--title", "One",
-        "--group", "hank", "--body", "Body.",
+        "--group", "acme", "--body", "Body.",
     ])
     memory = _budget_memory(env)
     _seed_over_cap(memory)
     lines = _status_lines(env)
     assert lines[-1] == _status_230_line(memory)
-    assert any("hank" in line for line in lines[:-1])
+    assert any("acme" in line for line in lines[:-1])
 
 
 def test_status_prints_no_budget_line_under_the_cap(env):

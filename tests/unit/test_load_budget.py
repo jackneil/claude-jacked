@@ -257,8 +257,8 @@ def test_a_cap_of_none_turns_that_axis_off():
 def test_a_short_name_is_the_recover_encoding():
     from jacked.recover import _encode_cwd
 
-    path = "/Users/jack.neil/Github/claude-jacked"
-    assert lb.project_dir_name(path) == _encode_cwd(path) == "-Users-jack-neil-Github-claude-jacked"
+    path = "/Users/first.last/Github/claude-jacked"
+    assert lb.project_dir_name(path) == _encode_cwd(path) == "-Users-first-last-Github-claude-jacked"
 
 
 # Expected names come from Claude Code 2.1.317's own xM() run under node.
@@ -291,9 +291,9 @@ _CLAUDE_CODE_XM = (
 @requires_node
 def test_project_dir_name_matches_claude_codes_own_function(tmp_path):
     paths = [
-        "/Users/jack.neil/Github/claude-jacked",
+        "/Users/first.last/Github/claude-jacked",
         "C:\\Users\\u\\Github\\repo",
-        "/Users/jack.neil/" + "very-long-directory-name/" * 12 + "repo",
+        "/Users/first.last/" + "very-long-directory-name/" * 12 + "repo",
         "/srv/" + "Ünïcödé/" * 40,
         "/x/" + "Q" * 199,
         "/tmp/\U0001F600",

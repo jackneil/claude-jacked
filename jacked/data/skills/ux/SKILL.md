@@ -468,7 +468,7 @@ Use tools prefixed with `mcp__plugin_playwright_playwright__browser_*`:
 ## SCREENSHOT PATH (agent-browser and Playwright only)
 
 Save screenshots to: `[REPO_ROOT]/tmp/ux_screenshots/[agent-letter]-[description].png`
-Example: `/Users/jack.neil/myproject/tmp/ux_screenshots/A-homepage-mobile.png`
+Example: `/Users/you/myproject/tmp/ux_screenshots/A-homepage-mobile.png`
 
 **Chrome only:** `claude-in-chrome` does not support saving screenshots to files. Skip file-based screenshot saving — use accessibility tree snapshots instead.
 
