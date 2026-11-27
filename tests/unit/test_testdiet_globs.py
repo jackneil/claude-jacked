@@ -139,3 +139,21 @@ def test_skip_or_fail_in_ci_fails_on_ci_and_skips_elsewhere(monkeypatch, ci, sto
         skip_or_fail_in_ci("the administrative share \\\\localhost\\C$ is not available")
     message = str(caught.value)
     assert len(message.splitlines()) == 1 and "administrative share" in message
+
+
+_NO_GIT = "this test drives the real git binary"
+
+
+def test_a_missing_git_binary_is_never_a_silent_skip(monkeypatch, tmp_path):
+    # Every CI leg has git; a leg without it must fail, not skip most of the testdiet tests in silence.
+    files = sorted((REPO_ROOT / "tests" / "unit").glob("test_*.py"))
+    text = {path.name: path.read_text(encoding="utf-8") for path in files}
+    plain = [name for name, body in text.items() if f'pytest.skip("{_NO_GIT}")' in body]
+    assert plain == [], plain
+    assert sum(body.count(f'skip_or_fail_in_ci("{_NO_GIT}")') for body in text.values()) == 6
+    from tests.unit import test_testdiet_tree_history as module
+
+    monkeypatch.setattr(module.shutil, "which", lambda name, *args, **kwargs: None)
+    monkeypatch.setenv("CI", "true")
+    with pytest.raises(pytest.fail.Exception):
+        module.test_a_repository_with_no_commit_has_no_tree(tmp_path, tmp_path)

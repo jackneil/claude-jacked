@@ -14,6 +14,7 @@ from jacked.cli import main
 from jacked.testdiet import history, record, tree, views
 from jacked.testdiet import machine as identity
 from tests._testdiet import git as _git
+from tests._testdiet import skip_or_fail_in_ci
 from tests._testdiet import (
     COMMAND,
     FAILING_ID,
@@ -42,7 +43,7 @@ def store(tmp_path) -> Path:
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     if shutil.which("git") is None:
-        pytest.skip("this test drives the real git binary")
+        skip_or_fail_in_ci("this test drives the real git binary")
     hermetic_git(tmp_path, monkeypatch)
     path = make_repo(tmp_path / "repo")
     monkeypatch.chdir(path)

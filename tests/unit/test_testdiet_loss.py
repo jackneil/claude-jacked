@@ -19,7 +19,7 @@ from click.testing import CliRunner
 
 from jacked.cli import main
 from jacked.testdiet import loss, loss_braces, loss_scan
-from tests._testdiet import git, hermetic_git, make_repo
+from tests._testdiet import git, hermetic_git, make_repo, skip_or_fail_in_ci
 
 CALC = b"""\
 import pytest
@@ -43,7 +43,7 @@ def test_doubles(n):
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     if shutil.which("git") is None:
-        pytest.skip("this test drives the real git binary")
+        skip_or_fail_in_ci("this test drives the real git binary")
     hermetic_git(tmp_path, monkeypatch)
     path = make_repo(tmp_path / "repo")
     write(path, "tests/test_calc.py", CALC)

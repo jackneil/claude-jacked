@@ -32,6 +32,7 @@ from tests._testdiet import git as _git
 from tests._testdiet import tree_of
 from tests._testdiet import hermetic_git as _hermetic_git
 from tests._testdiet import make_repo
+from tests._testdiet import skip_or_fail_in_ci
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -45,7 +46,7 @@ def hermetic_git(tmp_path, monkeypatch):
 @pytest.fixture
 def repo(hermetic_git):
     if shutil.which("git") is None:
-        pytest.skip("this test drives the real git binary")
+        skip_or_fail_in_ci("this test drives the real git binary")
     return make_repo(hermetic_git / "repo")
 
 
@@ -342,7 +343,7 @@ def test_an_untracked_file_outside_the_sparse_cone_is_in_the_tree(repo, tmp_path
 
 def test_a_repository_with_no_commit_has_no_tree(tmp_path, hermetic_git):
     if shutil.which("git") is None:
-        pytest.skip("this test drives the real git binary")
+        skip_or_fail_in_ci("this test drives the real git binary")
     empty = tmp_path / "empty"
     empty.mkdir()
     _git(empty, "init", "-q")

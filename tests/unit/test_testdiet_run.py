@@ -27,7 +27,7 @@ import pytest
 
 from jacked.testdiet import globs, history, junit, machine, process, record, reports, run, tree
 from jacked.testdiet.model import TreeId
-from tests._testdiet import fixture_project, fixture_reports, make_repo
+from tests._testdiet import fixture_project, fixture_reports, make_repo, skip_or_fail_in_ci
 from tests._testdiet import git as _git
 from tests._testdiet import tree_of
 from tests._testdiet import hermetic_git as _hermetic_git
@@ -89,7 +89,7 @@ def hermetic_git(tmp_path, monkeypatch):
 @pytest.fixture
 def repo(hermetic_git):
     if shutil.which("git") is None:
-        pytest.skip("this test drives the real git binary")
+        skip_or_fail_in_ci("this test drives the real git binary")
     path = make_repo(hermetic_git / "repo")
     # The test files of the sample projects, so the pytest IDs have their files.
     for name in ("pytest", "pytest_rerun", "pytest_import_error"):

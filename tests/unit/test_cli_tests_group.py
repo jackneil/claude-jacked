@@ -17,7 +17,7 @@ from rich.console import Console
 import jacked.cli as cli
 from jacked.cli import main
 from jacked.testdiet import history, machine, tree
-from tests._testdiet import fixture_reports, hermetic_git, make_repo
+from tests._testdiet import fixture_reports, hermetic_git, make_repo, skip_or_fail_in_ci
 
 GREEN = fixture_reports("pytest_rerun")[0]
 RED = fixture_reports("pytest")[0]
@@ -31,7 +31,7 @@ def gate(report: Path, code: int) -> list[str]:
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
     if shutil.which("git") is None:
-        pytest.skip("this test drives the real git binary")
+        skip_or_fail_in_ci("this test drives the real git binary")
     hermetic_git(tmp_path, monkeypatch)
     path = make_repo(tmp_path / "repo")
     (path / "sub").mkdir()
