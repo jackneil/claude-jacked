@@ -129,7 +129,7 @@ Named security profiles that bundle permission rules + gatekeeper configuration 
 {
   "name": "strict-security",
   "description": "Locked-down profile for open-source work",
-  "author": "jack",
+  "author": "alex",
   "jacked_version": "0.8.0",
   "created_at": "2026-02-25T14:30:00+00:00",
   "rules": {
@@ -143,7 +143,7 @@ Named security profiles that bundle permission rules + gatekeeper configuration 
     "command_categories": {"git": "allow", "network": "evaluate"},
     "path_safety": {
       "enabled": true,
-      "allowed_paths": ["/Users/jack/projects"],
+      "allowed_paths": ["/Users/alex/projects"],
       "disabled_patterns": [],
       "watched_paths": []
     },

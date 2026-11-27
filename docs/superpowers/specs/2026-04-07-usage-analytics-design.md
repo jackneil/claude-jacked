@@ -256,7 +256,7 @@ async def _analytics_live_monitor(app):
 
 ### 6. Project Hash Decoding
 
-Claude Code encodes project paths as directory names: `/Users/jack/Github/my-repo` → `-Users-jack-Github-my-repo`. The analytics UI needs readable names.
+Claude Code encodes project paths as directory names: `/Users/alex/Github/my-repo` → `-Users-alex-Github-my-repo`. The analytics UI needs readable names.
 
 Decoding logic (same approach as cchubber):
 1. Replace leading drive letter pattern: `C--` → `C:/`

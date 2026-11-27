@@ -254,10 +254,10 @@ class TestFileToolPrefixValidation:
     """Tests for the dynamic shallow-path validation regex."""
 
     def test_regex_matches_prefix_pattern(self):
-        m = _FILE_TOOL_PREFIX_RE.match("Read(/Users/jack/project:*)")
+        m = _FILE_TOOL_PREFIX_RE.match("Read(/Users/alex/project:*)")
         assert m is not None
         assert m.group(1) == "Read"
-        assert m.group(2) == "/Users/jack/project"
+        assert m.group(2) == "/Users/alex/project"
 
     def test_regex_matches_single_segment(self):
         m = _FILE_TOOL_PREFIX_RE.match("Edit(/Users:*)")
@@ -266,7 +266,7 @@ class TestFileToolPrefixValidation:
 
     def test_regex_no_match_exact(self):
         """Exact path patterns (no :*) don't match the prefix regex."""
-        m = _FILE_TOOL_PREFIX_RE.match("Read(/Users/jack/project/file.py)")
+        m = _FILE_TOOL_PREFIX_RE.match("Read(/Users/alex/project/file.py)")
         assert m is None
 
     def test_regex_no_match_bash(self):
@@ -280,8 +280,8 @@ class TestFileToolPrefixValidation:
         [
             ("Read(/:*)", True),           # root — 0 segments
             ("Read(/Users:*)", True),      # 1 segment
-            ("Edit(/Users/jack:*)", True), # 2 segments
-            ("Read(/Users/jack/project:*)", False),  # 3 segments — OK
+            ("Edit(/Users/alex:*)", True), # 2 segments
+            ("Read(/Users/alex/project:*)", False),  # 3 segments — OK
             ("Write(/a/b/c/d:*)", False),  # 4 segments — OK
         ],
     )

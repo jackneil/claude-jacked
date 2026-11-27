@@ -101,7 +101,7 @@ def decode_project_hash(hash_name: str) -> dict:
     Parameters
     ----------
     hash_name:
-        The encoded directory name, e.g. ``-Users-jack-Github-claude-jacked``.
+        The encoded directory name, e.g. ``-Users-alex-Github-claude-jacked``.
 
     Returns
     -------

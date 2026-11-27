@@ -48,14 +48,14 @@ def _hook(name: str):
 **Before (0.40.x):**
 ```json
 {
-  "command": "/Users/jack/.local/share/uv/tools/claude-jacked/lib/python3.12/site-packages/jacked/data/hooks/security_gatekeeper.py"
+  "command": "/Users/alex/.local/share/uv/tools/claude-jacked/lib/python3.12/site-packages/jacked/data/hooks/security_gatekeeper.py"
 }
 ```
 
 **After (0.41.x):**
 ```json
 {
-  "command": "/Users/jack/.local/bin/jacked _hook security_gatekeeper"
+  "command": "/Users/alex/.local/bin/jacked _hook security_gatekeeper"
 }
 ```
 

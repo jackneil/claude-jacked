@@ -284,7 +284,7 @@ Each vector point stores:
     "repo_name": "claude-jacked",
     "repo_id": "hash",
     "machine": "DESKTOP-ABC",
-    "user_name": "jack",
+    "user_name": "alex",
     "timestamp": "2026-01-19T12:00:00Z",
 
     # NEW: Content type for filtering
@@ -353,7 +353,7 @@ Never truncate content mid-text. Instead, calculate token costs and exclude lowe
   "staleness_warning_days": 7,
   "qdrant_endpoint": "https://your-cluster.qdrant.io",
   "qdrant_api_key": "your-api-key",
-  "user_name": "jack",
+  "user_name": "alex",
   "teammate_weight": 0.8,
   "other_repo_weight": 0.7,
   "time_decay_halflife_weeks": 35
@@ -502,7 +502,7 @@ First run with env vars:
 │  {                                                              │
 │    "qdrant_endpoint": "https://xxx.qdrant.io",                  │
 │    "qdrant_api_key": "my-secret-key",                           │
-│    "user_name": "jack"                                          │
+│    "user_name": "alex"                                          │
 │  }                                                              │
 │                           │                                     │
 │                           ▼                                     │
