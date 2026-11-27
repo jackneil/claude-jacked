@@ -28,7 +28,6 @@ their tests are never reported as removed.
 
 from __future__ import annotations
 
-import os
 import re
 import tempfile
 from collections import defaultdict
@@ -40,7 +39,7 @@ from jacked.findbin import find_bin
 from jacked.testdiet import tree
 from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.loss_scan import NOT_PARSED, Declaration, declarations, scan, scan_file, scan_kind
-from jacked.testdiet.model import DEFAULT_BRANCH_REF, clean_text, one_line
+from jacked.testdiet.model import DEFAULT_BRANCH_REF, clean_text, git_name, one_line
 
 __all__ = ["DEFAULT_NAME", "DEFAULT_REF", "Declaration", "LossError", "LossReport",
            "declarations", "loss_report", "render", "scan", "scan_kind"]
@@ -132,8 +131,8 @@ def _touched(top: Path, base: str, head_tree: str, env: dict[str, str]):
     fields = out.split(b"\0")
     touched, skipped = [], []
     for i in range(0, len(fields) - 1, 2):
-        meta = os.fsdecode(fields[i]).lstrip(":").split()
-        path = os.fsdecode(fields[i + 1])
+        meta = git_name(fields[i]).lstrip(":").split()
+        path = git_name(fields[i + 1])
         if len(meta) < 4 or not scan_kind(path):
             continue
         sides = [(meta[0], meta[2]), (meta[1], meta[3])]

@@ -1249,7 +1249,9 @@ def test_a_folder_outside_a_repository_names_the_first_error_line_of_git(hermeti
 
 
 def test_a_case_file_that_is_not_utf8_is_written_and_read_back(tmp_path):
-    name = os.fsdecode(b"tests/test_\xff.py")
+    from jacked.testdiet import model
+
+    name = model.git_name(b"tests/test_\xff.py")
     data = RunData(runner="pytest", seconds_reported=None, tests=(
         CaseResult(id=name + "::t", file=name, seconds=1.0, state="passed", failure_type=None, attempts=1),))
     meta = _meta(history.new_run_id(), failing=(name + "::t",))

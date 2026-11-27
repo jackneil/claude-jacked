@@ -52,9 +52,8 @@ def test_emit_never_prints_two_lines(capsys):
 
 def test_one_line_shows_a_lone_surrogate_as_an_escape():
     import io
-    import os
 
-    name = os.fsdecode(b"t/test_\xff.py::test_a")
+    name = model.git_name(b"t/test_\xff.py::test_a")
     text = model.one_line(name)
     assert text == "t/test_\\udcff.py::test_a"
     stream = io.TextIOWrapper(io.BytesIO(), "utf-8", errors="strict")
@@ -83,3 +82,50 @@ def test_emit_escapes_every_format_character(ch, capsys):
     model.emit(f"a{ch}b c")
     err = capsys.readouterr().err
     assert ch not in err and err.isascii() and len(err.splitlines()) == 1
+
+
+# --------------------------------------------------------------------------- git output with a name that is not UTF-8
+
+def _fsdecode_like_windows(monkeypatch):
+    """os.fsdecode as Windows has it: UTF-8 with surrogatepass, so the byte 0xff raises."""
+    import os
+
+    def strict(value):
+        return value if isinstance(value, str) else bytes(value).decode("utf-8", "surrogatepass")
+
+    monkeypatch.setattr(os, "fsdecode", strict)
+
+
+def test_git_name_decodes_a_name_that_is_not_utf8_the_same_on_every_os(monkeypatch):
+    _fsdecode_like_windows(monkeypatch)
+    assert model.git_name(b"tests/test_\xff.py") == "tests/test_\udcff.py"
+    assert model.git_name("tests/é.py".encode()) == "tests/é.py"
+    assert model.git_name(b"tests/test_\xff.py").encode("utf-8", "surrogateescape") == b"tests/test_\xff.py"
+
+
+def test_git_output_with_a_name_that_is_not_utf8_never_calls_fsdecode(monkeypatch, tmp_path):
+    from jacked.testdiet import loss, tree
+
+    _fsdecode_like_windows(monkeypatch)
+    assert tree.output_lines(b"tests/test_\xff.py\nb.py\n") == ["tests/test_\udcff.py", "b.py"]
+    zero = "0" * 40
+    diff = (b":100644 100644 " + b"1" * 40 + b" " + b"2" * 40 + b" M\0tests/test_\xff.py\0"
+            b":100644 000000 " + b"3" * 40 + b" " + zero.encode() + b" D\0tests/test_ok.py\0")
+    monkeypatch.setattr(tree, "git", lambda *args, **kwargs: (0, diff))
+    touched, skipped = loss._touched(tmp_path, "a" * 40, "b" * 40, {})
+    assert [path for path, *_ in touched] == ["tests/test_\udcff.py", "tests/test_ok.py"] and skipped == []
+    monkeypatch.setattr(tree, "git", lambda *args, **kwargs: (0, b"tests/test_\xff.py\0b.py\0"))
+    same = model.TreeId(commit="c" * 40, tree="d" * 40, clean=True)
+    assert tree.changed_paths(tmp_path, same, same) == ["b.py", "tests/test_\udcff.py"]
+    monkeypatch.setattr(tree, "git", lambda *args, **kwargs: (0, b"sub_\xff/\n"))
+    assert tree.work_folder(tmp_path) == "sub_\udcff"
+
+
+def test_no_testdiet_module_calls_fsdecode_on_git_output():
+    import pathlib
+
+    import jacked.testdiet as package
+
+    hits = [f"{path.name}:{n}" for path in sorted(pathlib.Path(package.__file__).parent.glob("*.py"))
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1) if "os.fsdecode(" in line]
+    assert hits == [], "decode git output with model.git_name: " + ", ".join(hits)

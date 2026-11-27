@@ -38,7 +38,7 @@ from jacked import git_guard
 from jacked.findbin import find_bin
 from jacked.public_errors import describe, os_error_reason
 from jacked.testdiet.cleanup import remove_tree_quietly
-from jacked.testdiet.model import DEFAULT_BRANCH_REF, TreeId
+from jacked.testdiet.model import DEFAULT_BRANCH_REF, TreeId, git_name
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +188,7 @@ def no_tree_line(problem: str) -> str:
 
 def output_lines(data: bytes) -> list[str]:
     """Return the lines of git output that are not empty, decoded as file names."""
-    return [os.fsdecode(line) for line in data.splitlines() if line]
+    return [git_name(line) for line in data.splitlines() if line]
 
 
 def rev(cwd: Path, spec: str) -> str | None:
@@ -418,7 +418,7 @@ def changed_paths(cwd: Path, a: TreeId, b: TreeId, *, objects: Path | None = Non
                      a.tree, b.tree, env=env)
     if code != 0:
         raise TreeError(f"git diff-tree exited with {code}; a tree object can be missing")
-    return sorted(os.fsdecode(name) for name in out.split(b"\0") if name)
+    return sorted(git_name(name) for name in out.split(b"\0") if name)
 
 
 def common_dir(cwd: Path) -> Path:
@@ -495,5 +495,5 @@ def work_folder(cwd: Path) -> str:
     code, out = git(Path(cwd), "rev-parse", "--show-prefix")
     if code != 0:
         raise NotAWorkTree(NOT_IN_WORK_TREE)
-    prefix = os.fsdecode(out[:-1] if out.endswith(b"\n") else out).rstrip("/")
+    prefix = git_name(out[:-1] if out.endswith(b"\n") else out).rstrip("/")
     return prefix or "."

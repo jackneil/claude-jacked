@@ -80,7 +80,7 @@ def one_line(value) -> str:
         # the Tags block, the bidi set) can hide text, so it shows as an escape.
         # The check is per character, so it follows the Unicode data of this Python.
         text = "".join(_escape(ch) if unicodedata.category(ch) == "Cf" else ch for ch in text)
-    # A file name that is not UTF-8 holds a lone surrogate (os.fsdecode); a
+    # A file name that is not UTF-8 holds a lone surrogate (git_name); a
     # strict UTF-8 stream cannot write it, so it shows as an escape.
     return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
@@ -338,3 +338,18 @@ def _boundary(code: str, start: int, end: int) -> str:
     """One space when the white space ``code[start:end]`` is between two word characters, else nothing."""
     before, after = code[start - 1:start] if start else "", code[end:end + 1]
     return " " if all(ch and (ch.isalnum() or ch in "_$") for ch in (before, after)) else ""
+
+
+def git_name(data: bytes) -> str:
+    """A name or a line of git output as text: UTF-8, and each byte that is not UTF-8 as a lone surrogate.
+
+    This is what ``os.fsdecode`` gives on POSIX with a UTF-8 file system, on
+    every OS. On Windows ``os.fsdecode`` uses ``surrogatepass`` and raises on
+    such a byte, and a repository that has a name that is not UTF-8 (made on
+    Linux) gives git output with that byte. One decode also keeps the stored
+    test IDs equal on all systems. ``os.fsencode`` gives the bytes back.
+
+    >>> git_name(b"tests/test_\\xff.py")
+    'tests/test_\\udcff.py'
+    """
+    return bytes(data).decode("utf-8", "surrogateescape")
