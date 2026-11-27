@@ -49,6 +49,7 @@ LOCAL = "local"
 
 
 INPUTS_UNAVAILABLE = history.INPUTS_UNAVAILABLE
+INPUTS_INVALID = history.INPUTS_INVALID
 
 
 T = TypeVar("T")
@@ -186,6 +187,7 @@ def _same_identity(meta: RunMeta, tree_value: TreeId, command_sha: str, folder: 
 def _proves(meta: RunMeta) -> bool:
     # With --input, the files after the gate must be known to be the same (fail closed).
     return (meta.verdict == "passed" and meta.tree_changed is False and meta.inputs_changed is not True
+            and meta.inputs_sha != INPUTS_INVALID
             and (meta.inputs_sha is None or meta.inputs_changed is False))
 
 
@@ -276,6 +278,9 @@ def _nearest(store: Path, tree_value: TreeId, command_sha: str, folder: str, inp
         return ("a run of this tree and this command is on another machine. Give --any-machine to accept "
                 "a run of any machine.")
     mine = [m for m in same_command if any_machine or m.machine_id == machine_id]
+    if any(m.inputs_sha == INPUTS_INVALID for m in mine):
+        return ("a record of this tree and this command has an --input fingerprint that is not valid "
+                "(a damaged record), so it proves nothing. Run the gate with jacked tests run.")
     if mine:
         return ("the runs of this tree and this command have other --input files. Run the gate with "
                 "jacked tests run, with the same --input options.")

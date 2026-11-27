@@ -1257,6 +1257,7 @@ def test_a_case_file_that_is_not_utf8_is_written_and_read_back(tmp_path):
 
 @pytest.mark.parametrize("field", ["command_sha", "inputs_sha", "failing_sig"])
 def test_a_hash_field_that_is_not_64_hex_reads_as_none(tmp_path, field):
+    # inputs_sha is the exception: None means "no --input", so a bad value reads as INPUTS_INVALID.
     meta = _meta(history.new_run_id(), inputs_sha="e" * 64, failing_sig="f" * 64)
     history.write_run(tmp_path, meta, None)
     path = tmp_path / "runs" / f"{meta.id}.meta.json"
@@ -1264,7 +1265,7 @@ def test_a_hash_field_that_is_not_64_hex_reads_as_none(tmp_path, field):
     raw[field] = "\nforged line"
     path.write_bytes(json.dumps(raw).encode("utf-8"))
     [back] = history.iter_runs(tmp_path)
-    assert getattr(back, field) is None
+    assert getattr(back, field) == (history.INPUTS_INVALID if field == "inputs_sha" else None)
     raw[field] = "unavailable"
     path.write_bytes(json.dumps(raw).encode("utf-8"))
     [back] = history.iter_runs(tmp_path)

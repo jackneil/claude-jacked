@@ -334,3 +334,19 @@ def test_cli_profile_refuses_a_run_id_with_non_ascii_digits(repo):
     fake = "٠" * 8 + "T" + "0" * 12 + "Z-abcdef12"
     result = _invoke("tests", "profile", "--run", fake)
     assert result.exit_code == 1 and "a run ID must be" in result.stderr
+
+
+@pytest.mark.parametrize("bad", ["broken", 7, ""])
+def test_cli_seen_refuses_a_record_whose_input_fingerprint_is_not_valid(repo, bad):
+    import json as _json
+
+    argv = gate(GREEN, 0)
+    assert _invoke("tests", "run", "--", *argv).exit_code == 0
+    assert _invoke("tests", "seen", "--", *argv).exit_code == 0  # control: the record proves the tree
+    store = tree.store_dir(repo)
+    [path] = (store / history.RUNS).glob("*.meta.json")
+    raw = _json.loads(path.read_bytes())
+    raw["inputs_sha"] = bad
+    path.write_bytes(_json.dumps(raw).encode("ascii"))
+    result = _invoke("tests", "seen", "--", *argv)
+    assert result.exit_code == 1 and "--input fingerprint" in result.stderr and "not valid" in result.stderr

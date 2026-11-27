@@ -60,6 +60,10 @@ _HASH_FIELDS = ("command_sha", "inputs_sha", "failing_sig")
 #: The ``inputs_sha`` of a run whose ``--input`` files could not be hashed.
 #: ``seen`` never matches it. It is not None, because None means "no --input".
 INPUTS_UNAVAILABLE = "unavailable"
+#: The ``inputs_sha`` of a stored record whose value is not valid (damaged, or forged).
+#: It never equals a request value and never proves a tree. None stays reserved
+#: for a record of a run with no ``--input``.
+INPUTS_INVALID = "invalid"
 _META_FIELDS = tuple(f.name for f in dataclasses.fields(RunMeta))
 _CASE_FIELDS = tuple(f.name for f in dataclasses.fields(CaseResult))
 _TUPLE_FIELDS = ("failing", "flaky")
@@ -263,11 +267,14 @@ def _meta_from(run_id: str, raw) -> RunMeta:
             value = value if isinstance(value, str) and LABEL_RE.fullmatch(value) else None
         elif name == "machine_id":
             value = value if isinstance(value, str) and MACHINE_ID_RE.fullmatch(value) else None
+        elif name == "inputs_sha":
+            # None means "no --input", so a value that is not valid must not read as None.
+            if value is not None and not (isinstance(value, str) and (
+                    _SHA256_RE.fullmatch(value) or value == INPUTS_UNAVAILABLE)):
+                value = INPUTS_INVALID
         elif name in _HASH_FIELDS:
             # A hash that is not 64 hex characters reads as empty; seen never matches it.
-            ok = isinstance(value, str) and (_SHA256_RE.fullmatch(value) or (
-                name == "inputs_sha" and value == INPUTS_UNAVAILABLE))
-            value = value if ok else None
+            value = value if isinstance(value, str) and _SHA256_RE.fullmatch(value) else None
         elif name == "schema":
             # A version that is not an integer reads as no version: seen never uses the record.
             value = value if _is(value, int) else None
