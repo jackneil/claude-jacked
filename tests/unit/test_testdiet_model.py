@@ -155,9 +155,13 @@ def _latin1_locale(monkeypatch):
                         else bytes(data).decode("latin-1", "surrogateescape"))
 
 
+# What a latin-1 locale makes of the UTF-8 bytes of "/répo" (ASCII escapes, so no console can blur them).
+_LATIN_REPO = "/rÃ©po"
+
+
 def test_git_os_path_follows_the_locale_on_posix_and_is_git_name_on_windows(monkeypatch):
     _latin1_locale(monkeypatch)
-    assert model.git_os_path(b"/r\xc3\xa9po") == "/rÃ©po"
+    assert model.git_os_path(b"/r\xc3\xa9po") == _LATIN_REPO
     monkeypatch.setattr(model, "_ON_WINDOWS", True)
     for data in (b"/r\xc3\xa9po", b"/r\xffpo"):
         assert model.git_os_path(data) == model.git_name(data)
@@ -166,11 +170,12 @@ def test_git_os_path_follows_the_locale_on_posix_and_is_git_name_on_windows(monk
 def test_the_paths_that_go_to_the_os_follow_the_locale_and_the_shown_names_do_not(monkeypatch, tmp_path):
     from jacked.testdiet import tree
 
-    _latin1_locale(monkeypatch)
+    _latin1_locale(monkeypatch)  # a POSIX locale: model._ON_WINDOWS is False, on Windows too
     monkeypatch.setattr(tree, "git", lambda *args, **kwargs: (0, b"/r\xc3\xa9po\n"))
-    assert str(tree.work_tree_top(tmp_path)) == "/rÃ©po"
-    assert str(tree.common_dir(tmp_path)) == "/rÃ©po"
-    assert tree.object_env(tmp_path, tmp_path)["GIT_ALTERNATE_OBJECT_DIRECTORIES"].startswith("/rÃ©po")
+    # A path is compared as a path: on Windows str(Path("/x")) is "\\x".
+    assert tree.work_tree_top(tmp_path).as_posix() == _LATIN_REPO
+    assert tree.common_dir(tmp_path).as_posix() == _LATIN_REPO
+    assert tree.object_env(tmp_path, tmp_path)["GIT_ALTERNATE_OBJECT_DIRECTORIES"].startswith(_LATIN_REPO)
     monkeypatch.setattr(tree, "git", lambda *args, **kwargs: (0, b"s\xc3\xa9b/\n"))
     assert tree.work_folder(tmp_path) == "sÃ©b"
     # A name that jacked only shows or compares stays git_name on every OS.
