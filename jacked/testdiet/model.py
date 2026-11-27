@@ -48,7 +48,8 @@ def one_line(value) -> str:
 
     Each line boundary of ``str.splitlines`` and each bidi control shows as
     an escape (``\\n``, ``\\u2028``, ``\\u202e``), so a stored value cannot
-    add a line to the output or turn the text of a line around.
+    add a line to the output or turn the text of a line around. A lone
+    surrogate (a file name that is not UTF-8) shows as ``\\udcff``.
 
     >>> one_line("a\\nb")
     'a\\\\nb'
@@ -59,7 +60,10 @@ def one_line(value) -> str:
     """
     if value is None:
         return ""
-    return str(value).translate(_ESCAPES)
+    text = str(value).translate(_ESCAPES)
+    # A file name that is not UTF-8 holds a lone surrogate (os.fsdecode); a
+    # strict UTF-8 stream cannot write it, so it shows as an escape.
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 #: The first text of each message that the recorder prints on standard error.

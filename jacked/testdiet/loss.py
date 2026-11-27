@@ -33,6 +33,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from jacked import git_guard
+from jacked.findbin import find_bin
 from jacked.testdiet import tree
 from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.loss_scan import NOT_PARSED, Declaration, declarations, scan, scan_file, scan_kind
@@ -170,10 +172,15 @@ def loss_report(cwd: Path, base: str | None = None) -> LossReport:
     """
     top = tree.work_tree_top(cwd)
     commit = _base_commit(top, base)
+    guarded = git_guard.guarded_git_env(find_bin("git") or "git", str(top))
+    if guarded is None:
+        raise LossError("git cannot list the filter drivers of this repository, so loss does not "
+                        "read the work tree")
     objects = Path(tempfile.mkdtemp(prefix="jacked-loss-"))
     try:
         try:
-            head = tree.read_tree_id(top, objects=objects)
+            # A read-only report: no filter driver of the repository config runs.
+            head = tree.read_tree_id(top, objects=objects, base_env=guarded)
         except tree.TreeError as exc:
             detail = getattr(exc, "detail", "")
             raise LossError(f"git cannot give the tree of the work tree ({exc}"

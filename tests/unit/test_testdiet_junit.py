@@ -284,3 +284,16 @@ def test_the_fixture_folder_has_no_npm_manifest():
     banned = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"}
     for path in FIXTURES.rglob("*"):
         assert path.name not in banned and path.name != "node_modules", path
+
+
+def test_an_old_expat_is_refused_with_its_version(tmp_path, monkeypatch):
+    import pyexpat
+
+    from jacked.testdiet.model import JUnitError
+
+    report = tmp_path / "r.xml"
+    report.write_bytes(b'<testsuites><testsuite name="s"><testcase name="t"/></testsuite></testsuites>')
+    monkeypatch.setattr(pyexpat, "version_info", (2, 2, 9))
+    with pytest.raises(JUnitError) as caught:
+        read_junit([report], root=tmp_path)
+    assert "2.2.9" in str(caught.value) and "2.4.1" in str(caught.value)

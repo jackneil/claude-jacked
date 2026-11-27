@@ -47,9 +47,7 @@ KINDS = ("full", "targeted")
 _LOCAL = "local"
 
 
-#: The ``inputs_sha`` of a run whose ``--input`` files could not be hashed.
-#: ``seen`` never matches it. It is not None, because None means "no --input".
-INPUTS_UNAVAILABLE = "unavailable"
+INPUTS_UNAVAILABLE = history.INPUTS_UNAVAILABLE
 
 
 T = TypeVar("T")

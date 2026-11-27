@@ -239,7 +239,7 @@ Each run has two files: `<id>.tests.json.gz` and `<id>.meta.json`. The files hol
 
 To delete runs, run `jacked tests prune --before YYYY-MM-DD`. To delete all of the history, delete the `jacked-tests` folder in the common git directory.
 
-A machine has a label: `local` for a run of `run`, or the value of `record --machine`. A machine also has a private random identity in `~/.claude/jacked-tests-machine-id` (under `JACKED_HOME` when it is set). No command prints the identity. One label can have two identities, for example a host and a container that open one clone. Then `history` and `profile` say so.
+A machine has a label: `local` for a run of `run`, or the value of `record --machine`. A machine also has a private random identity in `~/.claude/jacked-tests-machine-id` (under `JACKED_HOME` when it is set). No command prints the identity. Each record in the store holds it, so the identity leaves the machine when a copy of the `.git` folder leaves. It has no meaning on another machine. One label can have two identities, for example a host and a container that open one clone. Then `history` and `profile` say so.
 
 ### Limits of seen
 
@@ -249,6 +249,7 @@ A machine has a label: `local` for a run of `run`, or the value of `record --mac
 - An assume-unchanged bit, `core.ignoreStat` and a skip-worktree bit do not hide an edit from the tree identity. jacked clears these bits in its own copy of the index, and never in the real index. In a sparse checkout, the skip-worktree bits stay: a tracked file that the cone leaves out stays as HEAD has it.
 - With git-lfs, the clean filter can write a copy of a new large file into `.git/lfs/objects` of the clone. The copy uses disk space, and no commit uses it. To remove such copies, run `git lfs prune`.
 - On Windows, an edit that keeps the size and puts back the old modification time is not seen. `git status` does not see it either.
+- `run` and `seen` run the clean filters of the repository when they read the work tree, as `git status` does, so the hash is the tree of a commit. `loss` is a report, and it turns the filter drivers off.
 
 ### A red gate
 

@@ -8,18 +8,73 @@ regular file below a matched folder, and it never follows a symbolic link.
 
 from __future__ import annotations
 
+import fnmatch
 import glob
 import hashlib
 import json
 import os
+import re
 import stat
 from collections.abc import Sequence
 from pathlib import Path
 
 
+_MAGIC = re.compile(r"[*?[]")
+_SEPARATORS = re.compile(r"[\\/]" if os.name == "nt" else r"/")
+
+
 def matches(top: Path, pattern: str) -> list[str]:
-    """Return the names that one glob matches, sorted. A relative name is relative to ``top``."""
-    return sorted(glob.glob(pattern, root_dir=top, recursive=True, include_hidden=True))
+    """Return the names that one glob matches, sorted. A relative name is relative to ``top``.
+
+    The names are the names of ``glob.glob(pattern, root_dir=top,
+    recursive=True, include_hidden=True)``, but ``**`` never goes into a
+    symbolic link to a folder: two links to ``.`` would make that walk
+    endless. There is no limit on the count or the depth.
+    """
+    if "**" not in pattern:
+        return sorted(glob.glob(pattern, root_dir=top, include_hidden=True))
+    parts = [part for part in _SEPARATORS.split(pattern) if part]
+    absolute = os.path.isabs(pattern)
+    fixed = []
+    while parts and not _MAGIC.search(parts[0]):
+        fixed.append(parts.pop(0))
+    prefix = os.path.join(*fixed) if fixed else ""
+    if absolute:
+        anchor = pattern[: len(pattern) - len(pattern.lstrip("\\/"))] or os.sep
+        prefix = os.path.join(os.path.splitdrive(pattern)[0] + anchor, prefix)
+    base = prefix if absolute else os.path.join(top, prefix) if prefix else str(top)
+    dirs_only = bool(_SEPARATORS.match(pattern[-1:]))
+    found = [os.path.join(prefix, rel) for rel in _walk_matches(base, parts, dirs_only)]
+    if prefix and os.path.isdir(base) and all(part == "**" for part in parts):
+        found.append(os.path.join(prefix, ""))  # glob gives "dir/" for "dir/**"
+    return sorted(found)
+
+
+def _walk_matches(base: str, parts: list[str], dirs_only: bool) -> list[str]:
+    """The paths below ``base`` (relative to it) that the glob components ``parts`` match.
+
+    With ``dirs_only`` (a pattern that ends with a separator), only folders
+    match, and each name ends with a separator, as glob gives them.
+    """
+    if not os.path.isdir(base):
+        return []
+    found: list[str] = []
+    for here, dirs, files in os.walk(base, followlinks=False):
+        rel_here = os.path.relpath(here, base)
+        for name in dirs if dirs_only else dirs + files:
+            rel = name if rel_here == "." else os.path.join(rel_here, name)
+            if _match_parts(_SEPARATORS.split(rel), parts):
+                found.append(os.path.join(rel, "") if dirs_only else rel)
+    return found
+
+
+def _match_parts(path: list[str], parts: list[str]) -> bool:
+    """Match path components with glob components. ``**`` matches zero or more components."""
+    if not parts:
+        return not path
+    if parts[0] == "**":
+        return any(_match_parts(path[k:], parts[1:]) for k in range(len(path) + 1))
+    return bool(path) and fnmatch.fnmatch(path[0], parts[0]) and _match_parts(path[1:], parts[1:])
 
 
 def full_path(top: Path, name: str) -> Path:

@@ -97,7 +97,22 @@ class _Target:
         return None
 
 
+#: Expat before 2.4.1 has no limit on entity expansion ("billion laughs").
+_MIN_EXPAT = (2, 4, 1)
+
+
+def _check_expat() -> None:
+    """Refuse to parse with an expat that has no limit on entity expansion. It fails closed."""
+    import pyexpat
+
+    if tuple(pyexpat.version_info) < _MIN_EXPAT:
+        found = ".".join(str(n) for n in pyexpat.version_info)
+        raise JUnitError(f"the XML parser of this Python is expat {found}. The reader needs expat "
+                         f"{'.'.join(map(str, _MIN_EXPAT))} or later, which limits entity expansion.")
+
+
 def _parse(path: Path) -> _Target:
+    _check_expat()
     target = _Target()
     parser = ET.XMLParser(target=target)
     try:

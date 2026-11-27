@@ -47,3 +47,15 @@ def test_emit_never_prints_two_lines(capsys):
     model.emit("a\nb c")
     err = capsys.readouterr().err
     assert err == model.PREFIX + "a\\nb c\n"
+
+
+def test_one_line_shows_a_lone_surrogate_as_an_escape():
+    import io
+    import os
+
+    name = os.fsdecode(b"t/test_\xff.py::test_a")
+    text = model.one_line(name)
+    assert text == "t/test_\\udcff.py::test_a"
+    stream = io.TextIOWrapper(io.BytesIO(), "utf-8", errors="strict")
+    stream.write(model.clean_text(text))
+    stream.flush()

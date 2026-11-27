@@ -824,3 +824,20 @@ def test_a_damaged_script_file_prints_a_not_read_file_line(repo):
     write(repo, "src/b.test.ts", b'test("one", () => {});\n/* open\ntest("two", () => {});\n')
     out = _invoke("tests", "loss", "--base", "HEAD").output.splitlines()
     assert any(line.startswith("not read file src/b.test.ts (") for line in out), out
+
+
+def test_loss_does_not_run_a_filter_driver_of_the_repository(repo, tmp_path):
+    marker = tmp_path / "filter-ran"
+    script = tmp_path / "clean.sh"
+    script.write_bytes(f"#!/bin/sh\ntouch '{marker}'\ncat\n".encode())
+    script.chmod(0o755)
+    if os.name == "nt":
+        pytest.skip("a shell filter needs POSIX")
+    git(repo, "config", "filter.x.clean", str(script))
+    write(repo, ".gitattributes", b"*.py filter=x\n")
+    write(repo, "tests/test_calc.py", CALC + b"\ndef test_more():\n    assert True\n")
+    if marker.exists():
+        marker.unlink()
+    report = loss.loss_report(repo)
+    assert "tests/test_calc.py::test_more" in report.added
+    assert not marker.exists()

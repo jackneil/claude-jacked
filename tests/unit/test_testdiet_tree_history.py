@@ -1227,3 +1227,33 @@ def test_a_folder_outside_a_repository_names_the_first_error_line_of_git(hermeti
         tree.work_tree_top(plain)
     assert "not in the work tree of a git repository" in str(caught.value)
     assert "not a git repository" in str(caught.value).split("repository", 1)[1]
+
+
+# --------------------------------------------------------------------------- stored text that is not clean
+
+
+def test_a_case_file_that_is_not_utf8_is_written_and_read_back(tmp_path):
+    name = os.fsdecode(b"tests/test_\xff.py")
+    data = RunData(runner="pytest", seconds_reported=None, tests=(
+        CaseResult(id=name + "::t", file=name, seconds=1.0, state="passed", failure_type=None, attempts=1),))
+    meta = _meta(history.new_run_id(), failing=(name + "::t",))
+    history.write_run(tmp_path, meta, data)
+    [back] = history.iter_runs(tmp_path)
+    assert back.failing == (name + "::t",)
+    assert history.load_tests(tmp_path, meta.id).tests[0].file == name
+
+
+@pytest.mark.parametrize("field", ["command_sha", "inputs_sha", "failing_sig"])
+def test_a_hash_field_that_is_not_64_hex_reads_as_none(tmp_path, field):
+    meta = _meta(history.new_run_id(), inputs_sha="e" * 64, failing_sig="f" * 64)
+    history.write_run(tmp_path, meta, None)
+    path = tmp_path / "runs" / f"{meta.id}.meta.json"
+    raw = json.loads(path.read_bytes())
+    raw[field] = "\nforged line"
+    path.write_bytes(json.dumps(raw).encode("utf-8"))
+    [back] = history.iter_runs(tmp_path)
+    assert getattr(back, field) is None
+    raw[field] = "unavailable"
+    path.write_bytes(json.dumps(raw).encode("utf-8"))
+    [back] = history.iter_runs(tmp_path)
+    assert getattr(back, field) == ("unavailable" if field == "inputs_sha" else None)

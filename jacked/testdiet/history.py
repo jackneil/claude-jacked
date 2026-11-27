@@ -44,6 +44,11 @@ _RAN_STATES = ("passed", "flaky")
 #: writer, not a limit on data.
 ORPHAN_AGE = timedelta(hours=24)
 _HEX_ID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_HASH_FIELDS = ("command_sha", "inputs_sha", "failing_sig")
+#: The ``inputs_sha`` of a run whose ``--input`` files could not be hashed.
+#: ``seen`` never matches it. It is not None, because None means "no --input".
+INPUTS_UNAVAILABLE = "unavailable"
 _META_FIELDS = tuple(f.name for f in dataclasses.fields(RunMeta))
 _CASE_FIELDS = tuple(f.name for f in dataclasses.fields(CaseResult))
 _TUPLE_FIELDS = ("failing", "flaky")
@@ -179,10 +184,11 @@ def write_run(store: Path, meta: RunMeta, data: RunData | None) -> None:
     if data is not None:
         payload = {"runner": data.runner, "seconds_reported": data.seconds_reported,
                    "tests": [dataclasses.asdict(case) for case in data.tests]}
-        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        # ASCII JSON: a file name that is not UTF-8 (a lone surrogate) is kept as an escape.
+        raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
         atomic_write_bytes(runs / f"{run_id}{TESTS_SUFFIX}", gzip.compress(raw, mtime=0))
-    text = json.dumps(dataclasses.asdict(meta), ensure_ascii=False, indent=1, sort_keys=True)
-    atomic_write_bytes(runs / f"{run_id}{META_SUFFIX}", (text + "\n").encode("utf-8"))
+    text = json.dumps(dataclasses.asdict(meta), ensure_ascii=True, indent=1, sort_keys=True)
+    atomic_write_bytes(runs / f"{run_id}{META_SUFFIX}", (text + "\n").encode("ascii"))
 
 
 def _is(value, kinds) -> bool:
@@ -217,6 +223,11 @@ def _meta_from(run_id: str, raw) -> RunMeta:
             value = value if isinstance(value, str) and LABEL_RE.fullmatch(value) else None
         elif name == "machine_id":
             value = value if isinstance(value, str) and MACHINE_ID_RE.fullmatch(value) else None
+        elif name in _HASH_FIELDS:
+            # A hash that is not 64 hex characters reads as empty; seen never matches it.
+            ok = isinstance(value, str) and (_SHA256_RE.fullmatch(value) or (
+                name == "inputs_sha" and value == INPUTS_UNAVAILABLE))
+            value = value if ok else None
         elif name == "schema":
             # A version that is not an integer reads as no version: seen never uses the record.
             value = value if _is(value, int) else None

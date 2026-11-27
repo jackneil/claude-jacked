@@ -225,12 +225,15 @@ def _first_line(handle) -> str:
     return ""
 
 
-def read_tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
+def read_tree_id(cwd: Path, *, objects: Path | None = None,
+                 base_env: Mapping[str, str] | None = None) -> TreeId | None:
     """Return the identity of the work tree, as ``tree_id`` does, but raise when git fails.
 
     The result is None for a bare repository and for a repository with no
     commit. A failed read of the work tree raises ``TreeError``; its
-    ``detail`` holds the first line of the error text of git.
+    ``detail`` holds the first line of the error text of git. ``base_env``
+    goes under the environment of the index-copy calls (``loss`` gives the
+    guarded environment, so no filter driver of the repository runs).
     """
     cwd = Path(cwd)
     code, out = git(cwd, "rev-parse", "--is-bare-repository")
@@ -256,6 +259,7 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
         object_dir = Path(objects) if objects is not None else work / "objects"
         object_dir.mkdir(parents=True, exist_ok=True)
         env = {
+            **(base_env or {}),
             "GIT_INDEX_FILE": str(index_copy),
             "GIT_OBJECT_DIRECTORY": str(object_dir),
             "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates(real_objects),
