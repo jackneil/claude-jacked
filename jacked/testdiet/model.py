@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sys
 import unicodedata
@@ -353,3 +354,19 @@ def git_name(data: bytes) -> str:
     'tests/test_\\udcff.py'
     """
     return bytes(data).decode("utf-8", "surrogateescape")
+
+
+#: True on Windows, where os.fsdecode raises on a byte that is not UTF-8 (a test patches it).
+_ON_WINDOWS = os.name == "nt"
+
+
+def git_os_path(data: bytes) -> str:
+    """A path in git output that jacked hands to the OS: the top folder, the index, the object folders.
+
+    On POSIX this is ``os.fsdecode``: it is total (surrogateescape), and
+    ``os.fsencode`` gives the same bytes back under any locale. A name that
+    jacked only shows or compares uses ``git_name``, which is the same on
+    all systems. On Windows ``os.fsdecode`` raises on a byte that is not
+    UTF-8, and git for Windows prints UTF-8, so this is ``git_name`` there.
+    """
+    return git_name(data) if _ON_WINDOWS else os.fsdecode(bytes(data))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import unicodedata
 
@@ -117,15 +118,62 @@ def test_git_output_with_a_name_that_is_not_utf8_never_calls_fsdecode(monkeypatc
     monkeypatch.setattr(tree, "git", lambda *args, **kwargs: (0, b"tests/test_\xff.py\0b.py\0"))
     same = model.TreeId(commit="c" * 40, tree="d" * 40, clean=True)
     assert tree.changed_paths(tmp_path, same, same) == ["b.py", "tests/test_\udcff.py"]
+    monkeypatch.setattr(model, "_ON_WINDOWS", True)  # a path that goes to the OS: git_name on Windows
     monkeypatch.setattr(tree, "git", lambda *args, **kwargs: (0, b"sub_\xff/\n"))
     assert tree.work_folder(tmp_path) == "sub_\udcff"
 
 
-def test_no_testdiet_module_calls_fsdecode_on_git_output():
+def test_only_git_os_path_calls_fsdecode():
+    import ast
     import pathlib
 
     import jacked.testdiet as package
 
-    hits = [f"{path.name}:{n}" for path in sorted(pathlib.Path(package.__file__).parent.glob("*.py"))
-            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1) if "os.fsdecode(" in line]
-    assert hits == [], "decode git output with model.git_name: " + ", ".join(hits)
+    files = sorted(pathlib.Path(package.__file__).parent.glob("*.py"))
+    hits = []
+    for path in files:
+        for func in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                hits += [f"{path.name}:{func.name}" for call in ast.walk(func)
+                         if isinstance(call, ast.Call) and ast.unparse(call.func) == "os.fsdecode"]
+    assert hits == ["model.py:git_os_path"], hits
+    assert sum(path.read_text(encoding="utf-8").count("os.fsdecode(") for path in files) == 1
+
+
+# --------------------------------------------------------------------------- a path that jacked hands to the OS
+
+@pytest.mark.skipif(os.name == "nt", reason="the round trip of os.fsdecode is a POSIX property")
+@pytest.mark.parametrize("data", [b"/r\xc3\xa9po", b"/r\xffpo", b"/plain"])
+def test_git_os_path_round_trips_through_os_fsencode_on_posix(data):
+    assert os.fsencode(model.git_os_path(data)) == data
+
+
+def _latin1_locale(monkeypatch):
+    """os.fsdecode of a POSIX latin-1 locale: "Ã©" for the UTF-8 bytes of "é"."""
+    monkeypatch.setattr(model, "_ON_WINDOWS", False)
+    monkeypatch.setattr(os, "fsdecode", lambda data: data if isinstance(data, str)
+                        else bytes(data).decode("latin-1", "surrogateescape"))
+
+
+def test_git_os_path_follows_the_locale_on_posix_and_is_git_name_on_windows(monkeypatch):
+    _latin1_locale(monkeypatch)
+    assert model.git_os_path(b"/r\xc3\xa9po") == "/rÃ©po"
+    monkeypatch.setattr(model, "_ON_WINDOWS", True)
+    for data in (b"/r\xc3\xa9po", b"/r\xffpo"):
+        assert model.git_os_path(data) == model.git_name(data)
+
+
+def test_the_paths_that_go_to_the_os_follow_the_locale_and_the_shown_names_do_not(monkeypatch, tmp_path):
+    from jacked.testdiet import tree
+
+    _latin1_locale(monkeypatch)
+    monkeypatch.setattr(tree, "git", lambda *args, **kwargs: (0, b"/r\xc3\xa9po\n"))
+    assert str(tree.work_tree_top(tmp_path)) == "/rÃ©po"
+    assert str(tree.common_dir(tmp_path)) == "/rÃ©po"
+    assert tree.object_env(tmp_path, tmp_path)["GIT_ALTERNATE_OBJECT_DIRECTORIES"].startswith("/rÃ©po")
+    monkeypatch.setattr(tree, "git", lambda *args, **kwargs: (0, b"s\xc3\xa9b/\n"))
+    assert tree.work_folder(tmp_path) == "sÃ©b"
+    # A name that jacked only shows or compares stays git_name on every OS.
+    monkeypatch.setattr(tree, "git", lambda *args, **kwargs: (0, b"t\xc3\xa9st.py\0"))
+    same = model.TreeId(commit="c" * 40, tree="d" * 40, clean=True)
+    assert tree.changed_paths(tmp_path, same, same) == ["tést.py"]

@@ -38,7 +38,7 @@ from jacked import git_guard
 from jacked.findbin import find_bin
 from jacked.public_errors import describe, os_error_reason
 from jacked.testdiet.cleanup import remove_tree_quietly
-from jacked.testdiet.model import DEFAULT_BRANCH_REF, TreeId, git_name
+from jacked.testdiet.model import DEFAULT_BRANCH_REF, TreeId, git_name, git_os_path
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +156,7 @@ def work_tree_top(cwd: Path) -> Path:
         errors.seek(0)
         # All of it: a trace (GIT_TRACE, GIT_TRACE2_PERF) can come before the refusal.
         text = errors.read().decode("utf-8", "replace")
-    lines = output_lines(out)
+    lines = output_lines(out, git_os_path)
     if code == 0 and len(lines) == 1:
         return Path(lines[0])
     first = git_detail(text)
@@ -186,9 +186,9 @@ def no_tree_line(problem: str) -> str:
     return f"{problem}, so jacked tests cannot prove this tree. Run git status to see the cause."
 
 
-def output_lines(data: bytes) -> list[str]:
-    """Return the lines of git output that are not empty, decoded as file names."""
-    return [git_name(line) for line in data.splitlines() if line]
+def output_lines(data: bytes, decode=git_name) -> list[str]:
+    """The lines of git output that are not empty, as text (``git_os_path`` for a path that goes to the OS)."""
+    return [decode(line) for line in data.splitlines() if line]
 
 
 def rev(cwd: Path, spec: str) -> str | None:
@@ -267,7 +267,7 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None,
         return None
     code, out = git(cwd, "rev-parse", "--path-format=absolute", "--git-path", "index",
                      "--git-path", "objects", "--show-toplevel")
-    paths = output_lines(out)
+    paths = output_lines(out, git_os_path)
     if code != 0 or len(paths) != 3:
         raise TreeError("git did not give the index path, the object path and the top folder")
     real_index, real_objects, top = Path(paths[0]), paths[1], Path(paths[2])
@@ -399,7 +399,7 @@ def object_env(cwd: Path, objects: Path) -> dict[str, str]:
     Raise ``TreeError`` when git does not give the real object folder.
     """
     code, out = git(Path(cwd), "rev-parse", "--path-format=absolute", "--git-path", "objects")
-    lines = output_lines(out)
+    lines = output_lines(out, git_os_path)
     if code != 0 or len(lines) != 1:
         raise TreeError("git did not give the object path")
     return {"GIT_OBJECT_DIRECTORY": str(objects), "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates(lines[0])}
@@ -428,7 +428,7 @@ def common_dir(cwd: Path) -> Path:
     is not in a git repository raises ``TreeError``.
     """
     code, out = git(Path(cwd), "rev-parse", "--path-format=absolute", "--git-common-dir")
-    lines = output_lines(out)
+    lines = output_lines(out, git_os_path)
     if code != 0 or len(lines) != 1:
         raise TreeError("the folder is not in a git repository")
     return Path(lines[0])
@@ -495,5 +495,5 @@ def work_folder(cwd: Path) -> str:
     code, out = git(Path(cwd), "rev-parse", "--show-prefix")
     if code != 0:
         raise NotAWorkTree(NOT_IN_WORK_TREE)
-    prefix = git_name(out[:-1] if out.endswith(b"\n") else out).rstrip("/")
+    prefix = git_os_path(out[:-1] if out.endswith(b"\n") else out).rstrip("/")
     return prefix or "."
