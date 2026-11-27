@@ -332,22 +332,39 @@ def test_strict_returns_1_on_a_conflict_and_the_gate_code_in_each_other_case(rep
     assert run.run_gate(gate(0), cwd=repo, strict=True) == 0  # no-data
 
 
-def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch, capsys):
-    def boom(*args, **kwargs):
-        raise RuntimeError("recorder broke")
+def _boom(*args, **kwargs):
+    raise RuntimeError("recorder broke")
 
+
+@pytest.mark.parametrize("owner, name", [
+    (history, "write_run"), (tree, "tree_state"), (junit, "read_junit"), (tree, "store_dir"),
+    (globs, "input_fingerprint"),
+], ids=["write_run", "tree_state", "read_junit", "store_dir", "input_fingerprint"])
+@pytest.mark.parametrize("code", [0, 7])
+def test_a_recorder_error_in_one_step_does_not_change_the_exit_code(repo, monkeypatch, capsys, owner,
+                                                                    name, code):
     store = tree.store_dir(repo)
-    monkeypatch.setattr(history, "write_run", boom)
-    assert run.run_gate(junit_gate(6, RED), cwd=repo) == 6
-    monkeypatch.setattr(tree, "tree_state", boom)
-    assert run.run_gate(junit_gate(6, RED), cwd=repo) == 6
-    monkeypatch.setattr(junit, "read_junit", boom)
-    monkeypatch.setattr(tree, "store_dir", boom)
-    monkeypatch.setattr(globs, "input_fingerprint", boom)
-    assert run.run_gate(junit_gate(7, RED), cwd=repo, inputs=["*.txt"]) == 7
+    monkeypatch.setattr(owner, name, _boom)
+    assert run.run_gate(junit_gate(code, RED), cwd=repo, inputs=["*.txt"]) == code
+    err = capsys.readouterr().err
+    assert "failed (RuntimeError)" in err and "Traceback" not in err
+    runs = list(history.iter_runs(store))
+    if name in ("write_run", "store_dir"):
+        assert runs == []
+        return
+    [meta] = runs
+    assert meta.exit_code == code
+    if name == "read_junit":
+        assert meta.counts is None and meta.verdict == ("failed" if code else "no-data")
+    elif name == "tree_state":
+        assert meta.tree is None and meta.tree_changed is None
+    else:
+        assert meta.inputs_sha == record.INPUTS_UNAVAILABLE
+
+
+def test_strict_keeps_the_gate_code_when_the_store_cannot_be_found(repo, monkeypatch):
+    monkeypatch.setattr(tree, "store_dir", _boom)
     assert run.run_gate(junit_gate(0, RED), cwd=repo, strict=True) == 0
-    assert "jacked tests: " in capsys.readouterr().err
-    assert list(history.iter_runs(store)) == []
 
 
 def test_a_command_that_cannot_start_returns_127(repo, tmp_path, capsys):
