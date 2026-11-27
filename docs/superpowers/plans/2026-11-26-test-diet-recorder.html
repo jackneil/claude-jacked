@@ -700,7 +700,7 @@ class RunMeta:
     load_start: float | None; load_end: float | None; child_cpu_seconds: float | None
     failing: tuple[str, ...]; flaky: tuple[str, ...]; failing_sig: str | None
 
-def tree_id(cwd: Path) -> TreeId | None
+def tree_state(cwd: Path, *, objects: Path | None = None) -> tuple[TreeId | None, str]   # built as tree_id; the review moved callers here (the str says why there is no tree)
 def changed_paths(cwd: Path, a: TreeId, b: TreeId) -> list[str]
 def inputs_fingerprint(cwd: Path, globs: Sequence[str]) -> str | None      # None when no glob is given
 def common_dir(cwd: Path) -> Path
