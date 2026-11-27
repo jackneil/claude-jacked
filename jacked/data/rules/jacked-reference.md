@@ -203,11 +203,12 @@ jacked tests loss [--base REF] [--json]
 - `jacked tests record` records the JUnit files of a gate run that `run` did not wrap, for example a run on hosted CI. Without `--exit-code`, the verdict is `unknown`. `--machine LABEL` names the machine that ran the gate. `--report-root PATH` gives the root folder of the machine that wrote the report, so the reader can make the paths relative. `--started ISO` needs a time zone. The command prints `<run id> <verdict>`.
 - `jacked tests seen` looks for a wrapped run on this machine that proves that this tree passed this command. When it finds one, it prints one line about the run and gives exit 0. When not, it prints one line and gives exit 1.
   - A run proves it when all of these are true: `run` made it, its verdict is `passed`, and the gate did not change the tree. The tree hash, the command SHA-256 and the `--input` fingerprint must also be equal.
+  - The newest run of the same tree, command, folder, inputs and machine decides. When that run did not pass, `seen` gives exit 1, and its line names that run and the cause. An older pass never hides a newer failure.
   - The command identity holds the folder that the gate ran in, relative to the top of the work tree. A run in `sub` never proves the same command at the top, because the same command can collect a different set of tests in a different folder. Run `seen` in the folder where the gate runs. The hit line names that folder.
   - A record of an older or newer record format never proves a tree. `history` and `profile` still show it.
   - The commit is not compared, so two commits with the same content are one tree. A run of `record` never proves a tree.
   - When this machine has no identity (the file cannot be read or made, or holds no valid identity), `seen` prints one line that names the file and the cause.
-  - `--any-machine` also accepts a run of a different machine. `seen` never compares the times of two machines. `--json` prints the record, or `null`.
+  - `--any-machine` also accepts a run of a different machine. The newest run of each machine decides for that machine. `seen` never compares the times of two machines. `--json` prints the record, or `null`.
 - `jacked tests profile` shows where the time of a run goes, by file and by test.
   - By default, it shows the newest run with the kind full. When no run has the kind full, it shows the newest run. The default machine is the machine of the newest full run.
   - It prints the number of files that hold half of the test seconds. When each file took 0 seconds, it prints `every file took 0 seconds`. When some files have no time and each other file took 0 seconds, it prints `every file with a time took 0 seconds`.

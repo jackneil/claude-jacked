@@ -131,6 +131,32 @@ def seen_command(inputs, any_machine, as_json, command):
     """
     import dataclasses
     import json as _json
+
+    if not command:
+        raise click.UsageError("give the gate command after --")
+    answer = _seen_answer(list(command), inputs, any_machine)
+    found = answer.hit if answer is not None else None
+    if as_json:
+        data = None
+        if found is not None:
+            data = dataclasses.asdict(found)
+            data.pop("machine_id", None)
+        click.echo(_json.dumps(data, indent=1, sort_keys=True))
+    elif found is not None:
+        click.echo(_seen_line(found))
+    elif answer is not None:
+        _model.emit(answer.why or "no passed run of this tree, this command and this machine.")
+    raise SystemExit(0 if found is not None else 1)
+
+
+def _seen_line(meta) -> str:
+    from jacked.testdiet import record as _record
+
+    return _record.seen_line(meta)
+
+
+def _seen_answer(command: list[str], inputs, any_machine: bool):
+    """The answer of seen for the current folder, or None when a line already said why there is none."""
     import os as _os
 
     from jacked.testdiet import machine as _machine
@@ -138,9 +164,6 @@ def seen_command(inputs, any_machine, as_json, command):
     from jacked.testdiet import run as _run
     from jacked.testdiet import tree as _tree
 
-    if not command:
-        raise click.UsageError("give the gate command after --")
-    found = None
     try:
         here = Path(_os.getcwd())
         top = _tree.work_tree_top(here)
@@ -150,28 +173,19 @@ def seen_command(inputs, any_machine, as_json, command):
         if machine_id is None and not any_machine:
             _model.emit(f"{problem} seen cannot match a run of this machine with no identity. "
                         "Give --any-machine to accept a run of any machine.")
-        if current is not None:
-            found = _record.seen(_tree.store_dir(top), current,
-                                 _tree.command_sha(list(command), folder=folder), folder=folder,
-                                 inputs_sha=_run.hash_inputs(top, inputs),
-                                 machine_id=machine_id, any_machine=any_machine)
-        else:
+            return None
+        if current is None:
             _model.emit(f"{problem_tree}, so seen cannot prove a tree.")
+            return None
+        return _record.seen_answer(_tree.store_dir(top), current,
+                                   _tree.command_sha(command, folder=folder), folder=folder,
+                                   inputs_sha=_run.hash_inputs(top, inputs),
+                                   machine_id=machine_id, any_machine=any_machine)
     except _tree.TreeError as exc:
         _model.emit(f"{exc}.")
     except Exception as exc:  # noqa: BLE001 -- an unknown answer is "not seen", never a traceback
         _model.emit(f"cannot check the history ({type(exc).__name__}). The answer is: not seen.")
-    if as_json:
-        data = None
-        if found is not None:
-            data = dataclasses.asdict(found)
-            data.pop("machine_id", None)
-        click.echo(_json.dumps(data, indent=1, sort_keys=True))
-    elif found is not None:
-        click.echo(_record.seen_line(found))
-    else:
-        _model.emit("no passed run of this tree, this command and this machine.")
-    raise SystemExit(0 if found is not None else 1)
+    return None
 
 
 def _store_or_exit() -> Path:

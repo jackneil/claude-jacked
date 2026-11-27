@@ -1127,3 +1127,72 @@ def test_an_ignored_sighup_stays_ignored_for_the_gate_and_is_not_forwarded(repo,
         signal.signal(signal.SIGHUP, previous)
     assert got.read_text(encoding="utf-8") == str(int(signal.SIG_IGN))
     assert restored is signal.SIG_IGN
+
+
+# --------------------------------------------------------------------------- the newest run of one identity decides
+
+
+def _identity_store(tmp_path, *verdict_codes, machine_id=None):
+    from tests._testdiet import LOCAL_ID, make_case, store_run
+
+    store = tmp_path / "identity-store"
+    green = [make_case("t::a", "t.py", 1.0)]
+    ids = []
+    for n, (code, mid) in enumerate(verdict_codes):
+        ids.append(store_run(store, f"2026112{n}T080000", exit_code=code, tests=green,
+                             machine_id=mid or machine_id or LOCAL_ID))
+    return store, ids
+
+
+def test_seen_says_no_when_a_newer_run_of_the_same_identity_did_not_pass(tmp_path):
+    from tests._testdiet import COMMAND, LOCAL_ID, TREE_1
+
+    store, (r1, r2) = _identity_store(tmp_path, (0, None), (1, None))
+    current = TreeId(commit="c" * 40, tree=TREE_1, clean=True)
+    answer = record.seen_answer(store, current, COMMAND, folder=".", inputs_sha=None, machine_id=LOCAL_ID)
+    assert answer.hit is None and answer.decider.id == r2
+    assert r2 in answer.why and "failed" in answer.why
+    assert record.seen(store, current, COMMAND, folder=".", inputs_sha=None, machine_id=LOCAL_ID) is None
+
+
+def test_seen_says_yes_when_the_newest_run_of_the_identity_passed(tmp_path):
+    from tests._testdiet import COMMAND, LOCAL_ID, TREE_1
+
+    store, (r1, r2) = _identity_store(tmp_path, (1, None), (0, None))
+    current = TreeId(commit="c" * 40, tree=TREE_1, clean=True)
+    found = record.seen(store, current, COMMAND, folder=".", inputs_sha=None, machine_id=LOCAL_ID)
+    assert found is not None and found.id == r2
+
+
+def test_any_machine_lets_the_newest_run_of_each_machine_decide_for_that_machine(tmp_path):
+    from tests._testdiet import COMMAND, LOCAL_ID, LOCAL_TWIN_ID, TREE_1
+
+    # The twin machine passed and then failed; this machine passed.
+    store, (twin_pass, local_pass, twin_fail) = _identity_store(
+        tmp_path, (0, LOCAL_TWIN_ID), (0, LOCAL_ID), (1, LOCAL_TWIN_ID))
+    current = TreeId(commit="c" * 40, tree=TREE_1, clean=True)
+    args = dict(folder=".", inputs_sha=None, machine_id="9" * 32, any_machine=True)
+    assert record.seen(store, current, COMMAND, **args).id == local_pass
+    store2, _ = _identity_store(tmp_path / "two", (0, LOCAL_TWIN_ID), (1, LOCAL_TWIN_ID))
+    assert record.seen(store2, current, COMMAND, **args) is None
+
+
+_FLAG_GATE = ("import os, shutil, sys; red = os.path.exists(sys.argv[1]); "
+              "shutil.copyfile(sys.argv[3] if red else sys.argv[2], sys.argv[4]); sys.exit(1 if red else 0)")
+
+
+def test_cli_seen_names_the_newer_run_that_failed(repo, side, monkeypatch):
+    from click.testing import CliRunner
+
+    from jacked.cli import main
+
+    flag = side / "red"
+    argv = [sys.executable, "-c", _FLAG_GATE, str(flag), str(GREEN), str(RED), "{junit}"]
+    assert run.run_gate(argv, cwd=repo) == 0
+    flag.write_bytes(b"x")
+    assert run.run_gate(argv, cwd=repo) == 1
+    newer = _last(repo).id
+    monkeypatch.chdir(repo)
+    result = CliRunner().invoke(main, ["tests", "seen", "--", *argv], catch_exceptions=False)
+    assert result.exit_code == 1
+    assert newer in result.stderr and "failed" in result.stderr

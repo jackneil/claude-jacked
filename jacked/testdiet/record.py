@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeVar
@@ -174,31 +175,83 @@ def _commit_tree(top: Path, commit: str) -> TreeId:
     return TreeId(commit=found[0], tree=found[1], clean=True)
 
 
-def seen(store: Path, tree_value: TreeId, command_sha: str, *, folder: str, inputs_sha: str | None,
-         machine_id: str | None, any_machine: bool = False) -> RunMeta | None:
-    """Return the newest run that proves this tree passed this command on this machine, or None.
+@dataclass(frozen=True)
+class SeenAnswer:
+    """The answer of ``seen``: the run that proves the tree, or the reason that none does.
 
-    A run proves it when all of these are true: its source is "run"; its
-    schema is ``SCHEMA``; its verdict is "passed"; ``tree_changed`` is False
-    (not empty); the tree hash, the command SHA, the gate folder and the
-    inputs fingerprint are equal (a fingerprint that is "unavailable" never
-    matches); and the machine identity is equal and not empty.
-    ``any_machine`` removes the last condition. The commit is not
-    compared, so a second commit with the same content is the same tree.
+    ``decider`` is the newest run of the same identity (on this machine, or
+    on each machine with ``any_machine``) when it did not prove the tree.
+    ``why`` is one line for the user; it is empty for a hit.
+    """
+
+    hit: RunMeta | None
+    decider: RunMeta | None
+    why: str
+
+
+def _same_identity(meta: RunMeta, tree_value: TreeId, command_sha: str, folder: str,
+                   inputs_sha: str | None) -> bool:
+    return (meta.source == "run" and meta.schema == SCHEMA and meta.tree is not None
+            and meta.tree.tree == tree_value.tree and meta.command_sha == command_sha
+            and meta.folder == folder and meta.inputs_sha == inputs_sha)
+
+
+def _proves(meta: RunMeta) -> bool:
+    return meta.verdict == "passed" and meta.tree_changed is False
+
+
+def _not_proved(meta: RunMeta) -> str:
+    if meta.verdict != "passed":
+        cause = f"its verdict is {one_line(meta.verdict) or 'not recorded'}"
+    elif meta.tree_changed is True:
+        cause = "the gate changed the tree"
+    else:
+        cause = "the tree after the gate is not known"
+    return (f"the newest run of this tree and this command is {meta.id}, and it does not prove the tree: "
+            f"{cause}.")
+
+
+def seen_answer(store: Path, tree_value: TreeId, command_sha: str, *, folder: str,
+                inputs_sha: str | None, machine_id: str | None, any_machine: bool = False) -> SeenAnswer:
+    """Find the run that proves this tree passed this command on this machine.
+
+    The identity of a run: its source is "run", its schema is ``SCHEMA``,
+    and the tree hash, the command SHA, the gate folder and the inputs
+    fingerprint are equal (a fingerprint that is "unavailable" never
+    matches), on the same machine identity (not empty). The newest run of
+    that identity decides: it proves the tree when its verdict is "passed"
+    and ``tree_changed`` is False. A newer run that did not pass is never
+    hidden by an older pass. ``any_machine`` lets the newest run of each
+    machine identity decide for that machine, so the times of two machines
+    are never compared. The commit is not compared, so a second commit
+    with the same content is the same tree.
     """
     if tree_value is None or not command_sha or inputs_sha == INPUTS_UNAVAILABLE:
-        return None
+        return SeenAnswer(None, None, "")
     if not any_machine and not machine_id:
-        return None
+        return SeenAnswer(None, None, "")
+    deciders: dict[str | None, RunMeta] = {}
     for meta in history.iter_runs(store):
-        if (meta.source == "run" and meta.schema == SCHEMA and meta.verdict == "passed"
-                and meta.tree_changed is False
-                and meta.tree is not None and meta.tree.tree == tree_value.tree
-                and meta.command_sha == command_sha and meta.folder == folder
-                and meta.inputs_sha == inputs_sha
-                and (any_machine or meta.machine_id == machine_id)):
-            return meta
-    return None
+        if not _same_identity(meta, tree_value, command_sha, folder, inputs_sha):
+            continue
+        if not any_machine and meta.machine_id != machine_id:
+            continue
+        if meta.machine_id in deciders:
+            continue  # an older run of a machine that already has its newest run
+        deciders[meta.machine_id] = meta
+        if _proves(meta):
+            return SeenAnswer(meta, None, "")
+        if not any_machine:
+            break
+    decider = next(iter(deciders.values()), None)
+    return SeenAnswer(None, decider, _not_proved(decider) if decider is not None else "")
+
+
+def seen(store: Path, tree_value: TreeId, command_sha: str, *, folder: str, inputs_sha: str | None,
+         machine_id: str | None, any_machine: bool = False) -> RunMeta | None:
+    """Return the run of ``seen_answer`` that proves the tree, or None."""
+    return seen_answer(store, tree_value, command_sha, folder=folder, inputs_sha=inputs_sha,
+                       machine_id=machine_id, any_machine=any_machine).hit
 
 
 def repeat_notice(store: Path, meta: RunMeta) -> str | None:
