@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from jacked.cli import main
-from tests._testdiet import private_hits
+from tests._testdiet import private_hits, skip_or_fail_in_ci
 
 REPO = Path(__file__).resolve().parents[2]
 REFERENCE = REPO / "jacked" / "data" / "rules" / "jacked-reference.md"
@@ -67,7 +67,8 @@ def _gate_env(tmp_path: Path, standins: dict[str, bytes]) -> tuple[Path, dict[st
     """
     sh = shutil.which("sh")
     if sh is None:
-        pytest.skip("the gate line is an sh block, and this machine has no sh")
+        # The only proof of the gate line: on CI it must not skip in silence.
+        skip_or_fail_in_ci("the gate line is an sh block, and this machine has no sh")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for name, body in standins.items():
@@ -308,3 +309,15 @@ def test_the_sections_say_where_the_history_is(name):
     assert "jacked-tests" in section
     assert "git rev-parse --git-common-dir" in section
     assert "jacked tests prune --before" in section
+
+
+def test_a_machine_with_no_sh_fails_the_gate_line_test_on_ci(tmp_path, monkeypatch):
+    # The gate-line test is the only proof of the gate line; a CI leg must not skip it in silence.
+    monkeypatch.setattr(shutil, "which", lambda name, *args, **kwargs: None)
+    monkeypatch.setenv("CI", "true")
+    with pytest.raises(pytest.fail.Exception) as caught:
+        _gate_env(tmp_path, {})
+    assert "no sh" in str(caught.value)
+    monkeypatch.setenv("CI", "false")
+    with pytest.raises(pytest.skip.Exception):
+        _gate_env(tmp_path, {})

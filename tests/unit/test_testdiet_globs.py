@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from jacked.testdiet import globs
+from tests._testdiet import skip_or_fail_in_ci
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -106,29 +107,13 @@ def test_an_absolute_double_star_input_fingerprint_changes_with_a_file(tmp_path)
     assert globs.inputs_fingerprint(Path("/nowhere"), [pattern]) != first
 
 
-def _on_ci() -> bool:
-    """True when the CI variable is true, 1 or yes (any case). "false", "0" and empty are not CI."""
-    return os.environ.get("CI", "").strip().lower() in ("true", "1", "yes")
-
-
-def _unc_share_or_stop(share_dir: str, exists=os.path.isdir) -> None:
-    """Go on when the share folder is there. Else skip with the reason, but on CI fail with one line.
-
-    The UNC test is the only test that walks a real UNC path, so a CI leg must not skip it in silence.
-    """
-    if exists(share_dir):
-        return
-    if _on_ci():
-        pytest.fail(f"the administrative share {share_dir} is not available on CI, "
-                    "so the only real UNC test cannot run", pytrace=False)
-    pytest.skip("the administrative share of this drive is not available")
-
-
 @pytest.mark.skipif(os.name != "nt", reason="a UNC path exists only on Windows")
 def test_a_unc_double_star_pattern_finds_the_files_of_the_share(tmp_path):
     drive, rest = os.path.splitdrive(str(tmp_path))
     share_root = f"\\\\localhost\\{drive.rstrip(':')}$"
-    _unc_share_or_stop(share_root + rest)
+    if not os.path.isdir(share_root + rest):
+        # The only test that walks a real UNC path: on CI it must not skip in silence.
+        skip_or_fail_in_ci(f"the administrative share {share_root} of this drive is not available")
     (tmp_path / "data" / "deep").mkdir(parents=True)
     (tmp_path / "data" / "deep" / "a.db").write_bytes(b"one")
     pattern = share_root + rest + "\\data\\**\\*.db"
@@ -143,15 +128,14 @@ def test_a_unc_double_star_pattern_finds_the_files_of_the_share(tmp_path):
     ("true", "fail"), ("TRUE", "fail"), ("1", "fail"), ("Yes", "fail"),
     ("false", "skip"), ("0", "skip"), ("", "skip"), (None, "skip"),
 ])
-def test_a_missing_share_fails_on_ci_and_skips_elsewhere(monkeypatch, ci, stops_with):
-    # The UNC test is the only real UNC proof: on CI a missing share must fail, not skip silently.
+def test_skip_or_fail_in_ci_fails_on_ci_and_skips_elsewhere(monkeypatch, ci, stops_with):
+    # A test that is the only proof of a behavior (the UNC walk, the gate line) must fail on CI, not skip.
     if ci is None:
         monkeypatch.delenv("CI", raising=False)
     else:
         monkeypatch.setenv("CI", ci)
     expected = pytest.fail.Exception if stops_with == "fail" else pytest.skip.Exception
     with pytest.raises(expected) as caught:
-        _unc_share_or_stop("\\\\localhost\\C$\\x", exists=lambda path: False)
+        skip_or_fail_in_ci("the administrative share \\\\localhost\\C$ is not available")
     message = str(caught.value)
     assert len(message.splitlines()) == 1 and "administrative share" in message
-    assert _unc_share_or_stop("\\\\localhost\\C$\\x", exists=lambda path: True) is None

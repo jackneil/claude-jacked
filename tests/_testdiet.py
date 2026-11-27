@@ -7,14 +7,35 @@ needs a repository defines its own fixture from ``make_repo``.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
+from typing import NoReturn
+
+import pytest
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "testdiet"
 REPORTS = FIXTURES / "reports"
 PROJECTS = FIXTURES / "projects"
 REPORT_ROOT = "/work"
+
+
+def on_ci() -> bool:
+    """True when the CI variable is true, 1 or yes (any case). "false", "0", empty and no variable are not CI."""
+    return os.environ.get("CI", "").strip().lower() in ("true", "1", "yes")
+
+
+def skip_or_fail_in_ci(reason: str) -> NoReturn:
+    """Skip the test with ``reason``. On CI, fail it with one line instead.
+
+    For a test that is the only proof of a behavior: CI runs pytest with no
+    ``-rs``, so a skip there drops the proof with no sign. GitHub Actions
+    sets CI=true.
+    """
+    if on_ci():
+        pytest.fail(f"{reason}; on CI this test must run, so it fails instead of a skip", pytrace=False)
+    pytest.skip(reason)
 
 
 
