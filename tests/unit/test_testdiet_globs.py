@@ -63,3 +63,60 @@ def test_a_double_star_glob_does_not_follow_a_link_to_a_folder(tmp_path):
         proc.wait()
         pytest.fail("the ** walk followed the links and did not end")
     assert proc.returncode == 0 and out.strip() == before
+
+
+# --------------------------------------------------------------------------- the fixed base of a ** pattern
+
+import ntpath  # noqa: E402
+import posixpath  # noqa: E402
+
+
+@pytest.mark.parametrize("pattern, base, parts", [
+    ("\\\\server\\share\\data\\**\\*.db", "\\\\server\\share\\data", ["**", "*.db"]),
+    ("//server/share/data/**/*.db", "//server/share/data", ["**", "*.db"]),
+    ("\\\\server\\share\\**", "\\\\server\\share\\", ["**"]),
+    ("C:\\data\\**\\*.db", "C:\\data", ["**", "*.db"]),
+    ("C:\\**\\report.xml", "C:\\", ["**", "report.xml"]),
+    ("data\\**\\*.db", "data", ["**", "*.db"]),
+    ("**\\*.db", "", ["**", "*.db"]),
+])
+def test_a_windows_pattern_gives_the_right_base(pattern, base, parts):
+    assert globs._split_base(pattern, ntpath) == (base, parts)
+
+
+@pytest.mark.parametrize("pattern, base, parts", [
+    ("/data/**/*.db", "/data", ["**", "*.db"]),
+    ("/**/*.db", "/", ["**", "*.db"]),
+    ("data/**", "data", ["**"]),
+    ("**", "", ["**"]),
+])
+def test_a_posix_pattern_gives_the_right_base(pattern, base, parts):
+    assert globs._split_base(pattern, posixpath) == (base, parts)
+
+
+def test_an_absolute_double_star_input_fingerprint_changes_with_a_file(tmp_path):
+    # On Windows this is a drive-letter pattern; on POSIX a rooted one.
+    data = tmp_path / "data" / "deep"
+    data.mkdir(parents=True)
+    (data / "a.db").write_bytes(b"one")
+    pattern = os.path.join(str(tmp_path / "data"), "**", "*.db")
+    assert globs.matches(Path("/nowhere"), pattern) == [str(data / "a.db")]
+    first = globs.inputs_fingerprint(Path("/nowhere"), [pattern])
+    (data / "a.db").write_bytes(b"a longer content")
+    assert globs.inputs_fingerprint(Path("/nowhere"), [pattern]) != first
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a UNC path exists only on Windows")
+def test_a_unc_double_star_pattern_finds_the_files_of_the_share(tmp_path):
+    drive, rest = os.path.splitdrive(str(tmp_path))
+    share_root = f"\\\\localhost\\{drive.rstrip(':')}$"
+    if not os.path.isdir(share_root + rest):
+        pytest.skip("the administrative share of this drive is not available")
+    (tmp_path / "data" / "deep").mkdir(parents=True)
+    (tmp_path / "data" / "deep" / "a.db").write_bytes(b"one")
+    pattern = share_root + rest + "\\data\\**\\*.db"
+    found = globs.matches(Path("C:\\nowhere"), pattern)
+    assert [os.path.basename(name) for name in found] == ["a.db"]
+    first = globs.inputs_fingerprint(Path("C:\\nowhere"), [pattern])
+    (tmp_path / "data" / "deep" / "a.db").write_bytes(b"a longer content")
+    assert globs.inputs_fingerprint(Path("C:\\nowhere"), [pattern]) != first

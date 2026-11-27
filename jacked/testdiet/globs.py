@@ -33,21 +33,36 @@ def matches(top: Path, pattern: str) -> list[str]:
     """
     if "**" not in pattern:
         return sorted(glob.glob(pattern, root_dir=top, include_hidden=True))
-    parts = [part for part in _SEPARATORS.split(pattern) if part]
-    absolute = os.path.isabs(pattern)
-    fixed = []
-    while parts and not _MAGIC.search(parts[0]):
-        fixed.append(parts.pop(0))
-    prefix = os.path.join(*fixed) if fixed else ""
-    if absolute:
-        anchor = pattern[: len(pattern) - len(pattern.lstrip("\\/"))] or os.sep
-        prefix = os.path.join(os.path.splitdrive(pattern)[0] + anchor, prefix)
-    base = prefix if absolute else os.path.join(top, prefix) if prefix else str(top)
+    prefix, parts = _split_base(pattern)
+    rooted = bool(os.path.splitdrive(prefix)[0]) or os.path.isabs(prefix)
+    base = prefix if rooted else os.path.join(top, prefix) if prefix else str(top)
     dirs_only = bool(_SEPARATORS.match(pattern[-1:]))
     found = [os.path.join(prefix, rel) for rel in _walk_matches(base, parts, dirs_only)]
     if prefix and os.path.isdir(base) and all(part == "**" for part in parts):
         found.append(os.path.join(prefix, ""))  # glob gives "dir/" for "dir/**"
     return sorted(found)
+
+
+def _split_base(pattern: str, path=os.path) -> tuple[str, list[str]]:
+    """Split a ``**`` pattern into its fixed base folder and its glob parts.
+
+    The drive or the UNC share (``\\\\server\\share``) and the root separator
+    come first, so they never become glob parts. Then the parts with no glob
+    character join the base. The base is "" for a relative pattern that
+    starts with a glob part. ``path`` is ``ntpath`` or ``posixpath`` (a test
+    gives the other one).
+    """
+    separators = "\\/" if path.sep == "\\" else "/"
+    drive, rest = path.splitdrive(pattern)
+    body = rest.lstrip(separators)
+    root = drive + rest[: len(rest) - len(body)]
+    parts = [part for part in re.split(f"[{re.escape(separators)}]", body) if part]
+    fixed: list[str] = []
+    while parts and not _MAGIC.search(parts[0]):
+        fixed.append(parts.pop(0))
+    if root:
+        return path.join(root, *fixed), parts
+    return (path.join(*fixed) if fixed else ""), parts
 
 
 def _walk_matches(base: str, parts: list[str], dirs_only: bool) -> list[str]:
