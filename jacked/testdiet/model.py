@@ -33,19 +33,33 @@ def label_text(label: str | None) -> str:
     return NO_LABEL if label is None else label
 
 
+# Each character that str.splitlines() reads as a line boundary, and each
+# bidi control (the "Trojan Source" class). A stored value shows each one as a
+# visible escape, so it cannot add a line or change how a line reads.
+_LINE_BOUNDARIES = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+_BIDI_CONTROLS = "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+_ESCAPES = {ord(ch): ("\\n" if ch == "\n" else "\\r" if ch == "\r"
+                      else f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}")
+            for ch in _LINE_BOUNDARIES + _BIDI_CONTROLS}
+
+
 def one_line(value) -> str:
     """Return stored free text (a test ID, a file, a time) as one line. None is empty.
 
-    A line break shows as ``\\n``, so a stored value cannot add a line to the output.
+    Each line boundary of ``str.splitlines`` and each bidi control shows as
+    an escape (``\\n``, ``\\u2028``, ``\\u202e``), so a stored value cannot
+    add a line to the output or turn the text of a line around.
 
     >>> one_line("a\\nb")
     'a\\\\nb'
+    >>> one_line("a\\u2028b")
+    'a\\\\u2028b'
     >>> one_line(None)
     ''
     """
     if value is None:
         return ""
-    return str(value).replace("\r", "\\r").replace("\n", "\\n")
+    return str(value).translate(_ESCAPES)
 
 
 #: The first text of each message that the recorder prints on standard error.
@@ -65,13 +79,15 @@ def clean_text(text: str) -> str:
 
 
 def emit(message: str) -> None:
-    """Print one message on standard error, with the prefix and with no control characters.
+    """Print one message on standard error, as one line, with the prefix and no control characters.
 
-    A standard error that cannot be written (closed, a broken pipe) is
-    ignored, because a message must never stop or change the gate.
+    Each caller gives one line. A line boundary or a bidi control in the
+    message (a file name, the text of an error) shows as an escape, as in
+    ``one_line``. A standard error that cannot be written (closed, a broken
+    pipe) is ignored, because a message must never stop or change the gate.
     """
     try:
-        print(PREFIX + clean_text(message), file=sys.stderr, flush=True)
+        print(PREFIX + clean_text(one_line(message)), file=sys.stderr, flush=True)
     except Exception:  # noqa: BLE001 -- a message must never stop or change the gate
         logger.debug("emit: standard error cannot be written", exc_info=True)
 

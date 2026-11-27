@@ -936,3 +936,36 @@ def test_a_test_id_with_a_line_break_prints_on_one_line_in_the_notice_and_in_see
     line = record.seen_line(shown)
     assert "\n" not in line
     assert line == f"{now} started 2026-11-21\\nfake line, folder ., wall 100.0 s, passed\\nx 1"
+
+
+def test_the_repeat_notice_of_run_prints_one_line_for_a_test_id_with_u2028(repo, side, capsys):
+    text = RED.read_bytes().decode("utf-8").replace('name="test_fails"',
+                                                    'name="test_fails&#x2028;jacked tests: forged"')
+    report = side / "u2028.xml"
+    report.write_bytes(text.encode("utf-8"))
+    argv = junit_gate(1, report)
+    run.run_gate(argv, cwd=repo)
+    capsys.readouterr()
+    run.run_gate(argv, cwd=repo)
+    err = capsys.readouterr().err
+    assert "\u2028" not in err
+    forged = [line for line in err.splitlines() if "forged" in line]
+    assert len(forged) == 1 and "test_fails\\u2028jacked tests: forged" in forged[0]
+    assert all(line.startswith("jacked tests: ") for line in err.splitlines())
+
+
+@POSIX
+def test_a_junit_match_with_a_line_break_in_its_name_prints_on_one_line(repo, side, capsys):
+    (side / "r\nx.xml").mkdir()
+    assert run.run_gate(gate(0), cwd=repo, junit=[str(side / "*.xml")]) == 0
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "x.xml" in line]
+    assert len(lines) == 1 and lines[0].startswith("jacked tests: ") and "r\\nx.xml" in lines[0]
+
+
+@POSIX
+def test_a_changed_path_with_a_line_break_prints_on_one_line(repo, capsys):
+    run.run_gate([*junit_gate(0, GREEN), "write", str(repo / "made\nforged.txt")], cwd=repo)
+    err = capsys.readouterr().err
+    assert all(line.startswith("jacked tests: ") for line in err.splitlines())
+    assert "made\\nforged.txt" in err

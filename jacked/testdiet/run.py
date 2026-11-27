@@ -160,7 +160,8 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
             history.write_run(store, meta, known["data"])
             known["written"] = True
             if notice:
-                for line in notice.splitlines():
+                # jacked built each line, and each stored value in it went through one_line.
+                for line in notice.split("\n"):
                     emit(line)
             return meta
 
