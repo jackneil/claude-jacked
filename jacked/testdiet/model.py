@@ -58,9 +58,10 @@ _ESCAPES = {ord(ch): ("\\n" if ch == "\n" else "\\r" if ch == "\r"
 def one_line(value) -> str:
     """Return stored free text (a test ID, a file, a time) as one line. None is empty.
 
-    Each line boundary of ``str.splitlines`` and each bidi control shows as
-    an escape (``\\n``, ``\\u2028``, ``\\u202e``), so a stored value cannot
-    add a line to the output or turn the text of a line around. A lone
+    Each line boundary of ``str.splitlines`` and each format character
+    (category Cf, the bidi controls included) shows as an escape (``\\n``,
+    ``\\u2028``, ``\\u202e``, ``\\u200b``), so a stored value cannot add a
+    line to the output, hide text, or turn the text of a line around. A lone
     surrogate (a file name that is not UTF-8) shows as ``\\udcff``.
 
     >>> one_line("a\\nb")
@@ -73,9 +74,19 @@ def one_line(value) -> str:
     if value is None:
         return ""
     text = str(value).translate(_ESCAPES)
+    if not text.isascii():
+        # Each format character (category Cf: zero-width characters, U+FEFF,
+        # the Tags block, the bidi set) can hide text, so it shows as an escape.
+        # The check is per character, so it follows the Unicode data of this Python.
+        text = "".join(_escape(ch) if unicodedata.category(ch) == "Cf" else ch for ch in text)
     # A file name that is not UTF-8 holds a lone surrogate (os.fsdecode); a
     # strict UTF-8 stream cannot write it, so it shows as an escape.
     return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _escape(ch: str) -> str:
+    code = ord(ch)
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
 
 
 #: The first text of each message that the recorder prints on standard error.

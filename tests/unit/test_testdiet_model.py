@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import unicodedata
 
 import pytest
 
@@ -59,3 +60,19 @@ def test_one_line_shows_a_lone_surrogate_as_an_escape():
     stream = io.TextIOWrapper(io.BytesIO(), "utf-8", errors="strict")
     stream.write(model.clean_text(text))
     stream.flush()
+
+
+# Every format character (category Cf): zero-width characters, U+FEFF, the Tags block, the bidi set.
+FORMAT = [chr(n) for n in range(sys.maxunicode + 1) if unicodedata.category(chr(n)) == "Cf"]
+
+
+def test_the_format_sweep_holds_the_known_hidden_characters():
+    assert {"​", "‍", "﻿", "\U000e0041", "‮", "⁦"} <= set(FORMAT)
+
+
+@pytest.mark.parametrize("ch", FORMAT, ids=lambda ch: f"U+{ord(ch):04X}")
+def test_one_line_escapes_every_format_character(ch):
+    text = model.one_line(f"a{ch}b")
+    assert ch not in text and text.isascii()
+    width = 4 if ord(ch) <= 0xFFFF else 8
+    assert text == f"a\\{'u' if width == 4 else 'U'}{ord(ch):0{width}x}b"
