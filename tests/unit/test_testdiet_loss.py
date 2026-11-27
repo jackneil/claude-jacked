@@ -397,12 +397,13 @@ def by_name(path: str, body: str) -> dict[str, loss.Declaration]:
     return {d.name: d for d in loss.scan(path, body)}
 
 
-def test_a_jsx_apostrophe_marks_only_its_own_body_as_not_read():
+def test_a_jsx_apostrophe_is_text_so_its_body_is_read():
+    # o-L6: a one-line quote that does not close is JSX text in a script, not a string.
     body = ('test("before", () => { expect(1).toBe(1); });\n'
             'test("jsx", () => {\n  render(<p>Don\'t</p>);\n  expect(1).toBe(1);\n});\n'
             'test("after", () => { expect(2).toBe(2); });\n')
     found = by_name("a.test.tsx", body)
-    assert (found["jsx"].asserts, found["jsx"].unread) == (None, (loss_scan.BODY_NOT_READ,))
+    assert (found["jsx"].asserts, found["jsx"].unread) == (1, ())
     assert (found["before"].asserts, found["after"].asserts) == (1, 1)
     assert found["after"].unread == ()
 
@@ -491,13 +492,15 @@ def test_a_large_file_with_bodies_that_do_not_close_is_read_in_one_pass():
 
 # The report: not read, cases, moves and the git errors.
 
-def test_a_jsx_apostrophe_prints_a_not_read_line(repo):
-    body = b'test("jsx", () => {\n  render(<p>Don\'t</p>);\n  expect(1).toBe(1);\n});\n'
+def test_a_jsx_apostrophe_body_is_compared_in_loss(repo):
+    # o-L6: the body is read, so a removed assertion in it is seen, and no "not read" line prints.
+    body = b'test("jsx", () => {\n  render(<p>Don\'t</p>);\n  expect(1).toBe(1);\n  expect(2).toBe(2);\n});\n'
     write(repo, "tests/view.test.tsx", body)
     commit(repo, "jsx")
-    write(repo, "tests/view.test.tsx", body + b"\n")
-    out = _invoke("tests", "loss", "--base", "HEAD").output
-    assert "not read tests/view.test.tsx::jsx (body not read)" in out.splitlines()
+    write(repo, "tests/view.test.tsx", body.replace(b"  expect(2).toBe(2);\n", b""))
+    out = _invoke("tests", "loss", "--base", "HEAD").output.splitlines()
+    assert "fewer assertions tests/view.test.tsx::jsx" in out, out
+    assert not any(line.startswith("not read") for line in out), out
 
 
 def test_a_cut_parametrize_list_prints_fewer_cases(repo):
@@ -886,3 +889,24 @@ def test_a_long_git_error_in_loss_is_cut_at_300_characters(repo, monkeypatch):
     with pytest.raises(loss.LossError) as caught:
         loss.loss_report(repo)
     assert str(caught.value).count("y") <= 300
+
+
+_JSX = ('import { render } from "@testing-library/react";\n'
+        'test("shows text", () => {\n  render(<p>Don\'t panic</p>);\n  expect(1).toBe(1);\n});\n'
+        'test("after", () => {\n  render(<p>It\'s "fine"</p>);\n  expect(2).toBe(2);\n});\n')
+
+
+def test_a_jsx_apostrophe_is_text_and_not_file_damage():
+    found, reason = loss_scan.scan_file("src/view.test.tsx", _JSX)
+    assert reason is None
+    assert [(d.name, d.asserts, d.unread) for d in found] == [("shows text", 1, ()), ("after", 1, ())]
+
+
+def test_a_jsx_apostrophe_gives_no_not_read_line_and_its_tests_pair(repo):
+    write(repo, "src/view.test.tsx", _JSX.encode())
+    commit(repo, "jsx")
+    write(repo, "src/view.test.tsx", _JSX.replace("expect(2).toBe(2);\n", "").encode())
+    out = _invoke("tests", "loss", "--base", "HEAD").output.splitlines()
+    assert not any(line.startswith("not read file") for line in out), out
+    # The tests pair: "after" lost its assertion, and "shows text" is not named.
+    assert any("after" in line for line in out) and not any("shows text" in line for line in out), out

@@ -86,9 +86,14 @@ class _Index:
 
     Damage is a string that does not close (it ends at the line end) or a
     bracket that has no partner. A body that holds damage is not read.
+    ``script`` is True for JavaScript and TypeScript: a ``/`` can start a
+    regex literal, and a one-line quote that does not close on its line is
+    text, not a string. JS and TS strings cannot span lines, and JSX text
+    holds apostrophes (``<p>Don't panic</p>``). Only a block comment or a
+    template string that does not close is damage there.
     """
 
-    def __init__(self, text: str, quotes: str, multiline: str, chars: bool, regex: bool = False) -> None:
+    def __init__(self, text: str, quotes: str, multiline: str, chars: bool, script: bool = False) -> None:
         self.closes: dict[int, int] = {}
         self.spans: dict[int, int] = {}
         #: The start of each comment or string that does not close.
@@ -103,6 +108,9 @@ class _Index:
                 end = char.end()
             elif ch in quotes:
                 end = _skip_quoted(text, j, ch, ch in multiline)
+                if end < 0 and script and ch not in multiline:
+                    j += 1  # JSX text, not a string
+                    continue
                 if end < 0:
                     damage.append(j)
                     self.unclosed.append(j)
@@ -117,7 +125,7 @@ class _Index:
                     damage.append(j)
                     self.unclosed.append(j)
                 end = size if close < 0 else close + 2
-            elif regex and ch == "/" and _regex_start(text, j) and (end := _skip_regex(text, j)) > 0:
+            elif script and ch == "/" and _regex_start(text, j) and (end := _skip_regex(text, j)) > 0:
                 pass
             else:
                 if ch in _PAIRS:
@@ -217,7 +225,7 @@ def _print(text: str, start: int, end: int) -> str | None:
 
 
 def script(text: str) -> tuple[list[Declaration], str | None]:
-    index = _Index(text, _JS_QUOTES, "`", chars=False, regex=True)
+    index = _Index(text, _JS_QUOTES, "`", chars=False, script=True)
     found: list[Declaration] = []
     for head in _JS_HEAD.finditer(text):
         mods = re.findall(r"[A-Za-z]+", head["mods"])
