@@ -766,7 +766,7 @@ fi
 
 **Where the history is.** The runs are in the `jacked-tests` folder of the common git directory of the clone (run `git rev-parse --git-common-dir` to find it). All linked worktrees share it, and git never commits it. A run holds test IDs, times, states and the SHA-256 of the command, never a failure message, test output or the command text. jacked deletes nothing automatically. To delete runs, run `jacked tests prune --before YYYY-MM-DD`, or delete the `jacked-tests` folder.
 
-**Limits.** `seen` does not see a change to a file that git ignores. Give such files with `run --input GLOB`. Then give the same globs with `seen --input GLOB`. `seen` also does not see a change inside a submodule. A gate that writes a file that git sees cannot prove a tree. Add the cache folders of the gate to `.gitignore`. See the "Gate recorder" section of `jacked/data/rules/jacked-reference.md` for each command, the jest-junit settings and the rule for a red gate.
+**Limits.** `seen` does not see a change to a file that git ignores. Give such files with `run --input GLOB`. A glob that matches a folder adds each file below it. Then give the same globs with `seen --input GLOB`. `seen` also does not see a change inside a submodule. A gate that writes a file that git sees cannot prove a tree. Add the cache folders of the gate to `.gitignore`. See the "Gate recorder" section of `jacked/data/rules/jacked-reference.md` for each command, the jest-junit settings and the rule for a red gate.
 
 ### QA Browser Testing
 

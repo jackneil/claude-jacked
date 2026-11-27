@@ -7,7 +7,6 @@ before the gate, and ``read_reports`` reads the reports after the gate.
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import os
 import tempfile
@@ -15,7 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from jacked.regular_file import open_regular_fd
-from jacked.testdiet import junit
+from jacked.testdiet import globs, junit
 from jacked.testdiet.model import RunData, emit
 
 #: The text in a gate argument that ``run_gate`` replaces with the path of a private report file.
@@ -37,19 +36,19 @@ def sha_of(path: Path) -> str | None:
     return digest.hexdigest()
 
 
-def matches(top: Path, globs: Sequence[str]) -> list[Path]:
+def matches(top: Path, patterns: Sequence[str]) -> list[Path]:
     """The paths that the globs match. A relative glob starts at ``top``. No path is listed two times."""
     found: dict[str, Path] = {}
-    for pattern in globs:
-        for name in sorted(glob.glob(pattern, root_dir=top, recursive=True, include_hidden=True)):
-            path = Path(name) if os.path.isabs(name) else top / name
+    for pattern in patterns:
+        for name in globs.matches(top, pattern):
+            path = globs.full_path(top, name)
             found.setdefault(os.path.normpath(path), path)
     return list(found.values())
 
 
-def hash_fixed(top: Path, globs: Sequence[str]) -> dict[str, str | None]:
+def hash_fixed(top: Path, patterns: Sequence[str]) -> dict[str, str | None]:
     """The SHA-256 of each file that the ``--junit`` globs match, keyed by its normalized path."""
-    return {os.path.normpath(p): sha_of(p) for p in matches(top, globs)}
+    return {os.path.normpath(p): sha_of(p) for p in matches(top, patterns)}
 
 
 def placeholder(argv: list[str], make_folder) -> tuple[Path | None, Path | None, list[str]]:
@@ -73,7 +72,7 @@ def make_report_folder() -> Path:
     return Path(tempfile.mkdtemp(prefix="jacked-junit-"))
 
 
-def read_reports(top: Path, report: Path | None, globs: Sequence[str],
+def read_reports(top: Path, report: Path | None, patterns: Sequence[str],
                  fixed_before: dict[str, str | None] | None, runner: str | None) -> RunData | None:
     """Read the report at the placeholder path and each fixed report that is new or changed.
 
@@ -90,8 +89,8 @@ def read_reports(top: Path, report: Path | None, globs: Sequence[str],
             emit("the gate wrote no report at the {junit} path.")
     if fixed_before is None:
         emit("did not read the --junit reports: they were not hashed before the run.")
-        globs = ()
-    for path in matches(top, globs):
+        patterns = ()
+    for path in matches(top, patterns):
         key = os.path.normpath(path)
         now = sha_of(path)
         if now is None:
@@ -100,7 +99,7 @@ def read_reports(top: Path, report: Path | None, globs: Sequence[str],
             emit(f"did not read {path}: its content did not change during the run.")
         else:
             paths.append(path)
-    if globs and not any(matches(top, [g]) for g in globs):
+    if patterns and not any(matches(top, [g]) for g in patterns):
         emit("no file matches the --junit pattern(s).")
     if not paths:
         return None

@@ -135,6 +135,7 @@ def seen_command(inputs, any_machine, as_json, command):
 
     from jacked.testdiet import machine as _machine
     from jacked.testdiet import record as _record
+    from jacked.testdiet import run as _run
     from jacked.testdiet import tree as _tree
 
     if not command:
@@ -152,7 +153,7 @@ def seen_command(inputs, any_machine, as_json, command):
         if current is not None:
             found = _record.seen(_tree.store_dir(top), current,
                                  _tree.command_sha(list(command), folder=folder), folder=folder,
-                                 inputs_sha=_tree.inputs_fingerprint(top, inputs),
+                                 inputs_sha=_run.hash_inputs(top, inputs),
                                  machine_id=machine_id, any_machine=any_machine)
         else:
             _model.emit("this repository has no tree identity (no commit, or git failed).")

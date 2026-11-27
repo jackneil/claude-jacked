@@ -343,7 +343,7 @@ def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch, capsy
     assert run.run_gate(junit_gate(6, RED), cwd=repo) == 6
     monkeypatch.setattr(junit, "read_junit", boom)
     monkeypatch.setattr(tree, "store_dir", boom)
-    monkeypatch.setattr(tree, "inputs_fingerprint", boom)
+    monkeypatch.setattr(tree, "input_fingerprint", boom)
     assert run.run_gate(junit_gate(7, RED), cwd=repo, inputs=["*.txt"]) == 7
     assert run.run_gate(junit_gate(0, RED), cwd=repo, strict=True) == 0
     assert "jacked tests: " in capsys.readouterr().err
@@ -776,8 +776,8 @@ def test_a_failed_input_hash_is_unavailable_and_never_seen(repo, monkeypatch):
         raise RuntimeError("hash broke")
 
     argv = junit_gate(0, GREEN)
-    real = tree.inputs_fingerprint
-    monkeypatch.setattr(tree, "inputs_fingerprint", boom)
+    real = tree.input_fingerprint
+    monkeypatch.setattr(tree, "input_fingerprint", boom)
     run.run_gate(argv, cwd=repo, inputs=["cache.bin"])
     meta = _last(repo)
     assert meta.verdict == "passed" and meta.inputs_sha == record.INPUTS_UNAVAILABLE
@@ -786,7 +786,7 @@ def test_a_failed_input_hash_is_unavailable_and_never_seen(repo, monkeypatch):
     # Neither the sentinel nor "no --input" matches it.
     assert record.seen(store, current, meta.command_sha, inputs_sha=record.INPUTS_UNAVAILABLE, **args) is None
     assert record.seen(store, current, meta.command_sha, inputs_sha=None, **args) is None
-    monkeypatch.setattr(tree, "inputs_fingerprint", real)
+    monkeypatch.setattr(tree, "input_fingerprint", real)
     run.run_gate(argv, cwd=repo)  # no --input: inputs_sha None
     assert _last(repo).inputs_sha is None
 

@@ -25,7 +25,6 @@ the cone then has no tree.
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import json
 import logging
@@ -40,6 +39,7 @@ from jacked import git_guard
 from jacked.findbin import find_bin
 from jacked.public_errors import describe
 from jacked.testdiet.cleanup import remove_tree_quietly
+from jacked.testdiet.globs import input_entries
 from jacked.testdiet.model import TreeId
 
 logger = logging.getLogger(__name__)
@@ -340,27 +340,21 @@ def inputs_fingerprint(cwd: Path, globs: Sequence[str]) -> str | None:
     """Return a SHA-256 of the files that ``globs`` match, or None when no glob is given.
 
     A relative glob starts at ``cwd``. ``**`` matches folders at all depths,
-    and a hidden file matches. Each file gives its path, its size and its
-    modification time in nanoseconds, not its content. A glob that matches
-    no file is in the hash too.
+    and a hidden file matches. A matched folder adds every regular file
+    below it, with no link followed. Each file gives its path, its size and
+    its modification time in nanoseconds, not its content. A glob that
+    matches no file is in the hash too.
     """
+    return input_fingerprint(cwd, globs)[0]
+
+
+def input_fingerprint(cwd: Path, globs: Sequence[str]) -> tuple[str | None, list[str]]:
+    """Return ``inputs_fingerprint`` and the globs that match no regular file."""
     if not globs:
-        return None
-    cwd = Path(cwd)
-    entries: list[list] = []
-    for pattern in globs:
-        found: list[list] = []
-        for name in glob.glob(pattern, root_dir=cwd, recursive=True, include_hidden=True):
-            path = Path(name) if os.path.isabs(name) else cwd / name
-            try:
-                info = path.stat()
-            except OSError:
-                continue
-            if path.is_file():
-                found.append([Path(name).as_posix(), info.st_size, info.st_mtime_ns])
-        entries.append([pattern, sorted(found)])
+        return None, []
+    entries = input_entries(Path(cwd), globs)
     text = json.dumps(entries, ensure_ascii=True, separators=(",", ":"))
-    return hashlib.sha256(text.encode("ascii")).hexdigest()
+    return hashlib.sha256(text.encode("ascii")).hexdigest(), [p for p, files in entries if not files]
 
 
 def common_dir(cwd: Path) -> Path:

@@ -196,3 +196,25 @@ def test_cli_seen_says_why_when_this_machine_has_no_identity(repo, tmp_path, mon
     result = _invoke("tests", "seen", "--", *argv)
     lines = [line for line in result.stderr.splitlines() if "machine identity" in line]
     assert result.exit_code == 1 and len(lines) == 1 and "no valid identity" in lines[0]
+
+
+def test_cli_seen_sees_a_change_inside_an_input_folder(repo):
+    (repo / ".gitignore").write_bytes(b"data/\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "ignore"], cwd=repo,
+                   check=True, capture_output=True)
+    (repo / "data").mkdir()
+    (repo / "data" / "fixture.db").write_bytes(b"one")
+    argv = gate(GREEN, 0)
+    assert _invoke("tests", "run", "--input", "data", "--", *argv).exit_code == 0
+    assert _invoke("tests", "seen", "--input", "data", "--", *argv).exit_code == 0
+    (repo / "data" / "fixture.db").write_bytes(b"one and a change")
+    assert _invoke("tests", "seen", "--input", "data", "--", *argv).exit_code == 1
+
+
+def test_cli_run_and_seen_name_an_input_glob_that_matches_no_regular_file(repo):
+    argv = gate(GREEN, 0)
+    for sub in ("run", "seen"):
+        result = _invoke("tests", sub, "--input", "nothing/*", "--", *argv)
+        lines = [line for line in result.stderr.splitlines() if "nothing/*" in line]
+        assert len(lines) == 1 and "no regular file matches" in lines[0], sub

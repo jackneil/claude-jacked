@@ -121,7 +121,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
         folder = _guard("find the gate folder", lambda: tree.work_folder(cwd), None)
         # No folder, no command identity: such a run can never prove a tree.
         sha = tree.command_sha(argv, folder=folder) if folder is not None else None
-        inputs_sha = _guard("hash the input files", lambda: tree.inputs_fingerprint(top, inputs),
+        inputs_sha = _guard("hash the input files", lambda: hash_inputs(top, inputs),
                             INPUTS_UNAVAILABLE if inputs else None)
         report_dir, report, child_argv = _placeholder(argv)
         if not junit and not any(reports.JUNIT_PLACEHOLDER in arg for arg in argv):
@@ -238,6 +238,15 @@ def _write_record(store: Path, meta: RunMeta, data) -> bool:
         return False
     emit(f"recorded {meta.id}, verdict {meta.verdict}.")
     return True
+
+
+def hash_inputs(top: Path, inputs: Sequence[str]) -> str | None:
+    """The ``--input`` fingerprint. Each glob that matches no regular file gives one line."""
+    sha, empty = tree.input_fingerprint(top, inputs)
+    for pattern in empty:
+        emit(f"no regular file matches the --input pattern {pattern!r}. "
+             "It is in the fingerprint as a pattern with no file.")
+    return sha
 
 
 def _top_or_none(cwd: Path) -> Path | None:

@@ -1142,3 +1142,43 @@ def test_clearing_the_bits_keeps_the_early_time_of_the_index_copy(repo, monkeypa
     monkeypatch.setattr(tree, "git", watch)
     assert tree.tree_id(repo) is not None
     assert seen and times and all(ns <= times[0] for ns in seen)
+
+
+# --------------------------------------------------------------------------- --input folders
+
+
+def test_an_input_folder_adds_every_regular_file_below_it(repo):
+    data = repo / "data"
+    data.mkdir()
+    empty = tree.inputs_fingerprint(repo, ["data"])
+    assert empty == tree.inputs_fingerprint(repo, ["data"])
+    (data / "deep").mkdir()
+    (data / "deep" / ".hidden.db").write_bytes(b"one")
+    added = tree.inputs_fingerprint(repo, ["data"])
+    assert added != empty
+    (data / "deep" / ".hidden.db").write_bytes(b"one and more")
+    changed = tree.inputs_fingerprint(repo, ["data"])
+    assert changed not in (empty, added)
+    assert tree.inputs_fingerprint(repo, ["data/*"]) not in (empty, changed)  # data/* matches the folder deep
+
+
+def test_the_input_globs_that_match_no_regular_file_are_named(repo):
+    (repo / "data").mkdir()
+    (repo / "one.bin").write_bytes(b"x")
+    sha, empty = tree.input_fingerprint(repo, ["one.bin", "data", "nothing/*"])
+    assert sha == tree.inputs_fingerprint(repo, ["one.bin", "data", "nothing/*"])
+    assert empty == ["data", "nothing/*"]
+    assert tree.input_fingerprint(repo, []) == (None, [])
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a symbolic link needs a privilege on Windows")
+def test_an_input_folder_does_not_follow_a_link(repo, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "big.db").write_bytes(b"x")
+    data = repo / "data"
+    data.mkdir()
+    (data / "link").symlink_to(outside)
+    before = tree.inputs_fingerprint(repo, ["data"])
+    (outside / "big.db").write_bytes(b"changed")
+    assert tree.inputs_fingerprint(repo, ["data"]) == before
