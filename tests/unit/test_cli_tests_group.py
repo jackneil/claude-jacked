@@ -350,3 +350,25 @@ def test_cli_seen_refuses_a_record_whose_input_fingerprint_is_not_valid(repo, ba
     path.write_bytes(_json.dumps(raw).encode("ascii"))
     result = _invoke("tests", "seen", "--", *argv)
     assert result.exit_code == 1 and "--input fingerprint" in result.stderr and "not valid" in result.stderr
+
+
+def test_a_run_id_with_an_impossible_date_is_not_a_run_file(repo):
+    # Month 13 passes the pattern, but its time does not parse.
+    assert _invoke("tests", "run", "--", *gate(GREEN, 0)).exit_code == 0
+    runs = tree.store_dir(repo) / history.RUNS
+    [real] = runs.glob("*" + history.META_SUFFIX)
+    fake = "20261399T999999999999Z-0a1b2c3d"
+    assert history.RUN_ID_RE.fullmatch(fake)
+    meta = runs / f"{fake}{history.META_SUFFIX}"
+    temp = runs / f".{fake}{history.META_SUFFIX}.x1y2.tmp"
+    meta.write_bytes(real.read_bytes())
+    temp.write_bytes(b"{}")
+    for argv in (["history", "--days", "1"], ["prune", "--before", "2099-01-01"]):
+        result = _invoke("tests", *argv)
+        assert result.exception is None or isinstance(result.exception, SystemExit), (argv, result.exception)
+        assert "Traceback" not in result.output + result.stderr
+    assert meta.exists() and temp.exists()
+    assert fake not in history.run_ids(tree.store_dir(repo))
+    with pytest.raises(ValueError):
+        history.check_id(fake)
+    assert _invoke("tests", "profile", "--run", fake).exit_code == 1

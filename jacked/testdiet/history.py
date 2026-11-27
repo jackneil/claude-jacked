@@ -116,9 +116,20 @@ def new_run_id(now: datetime | None = None) -> str:
     return f"{moment:%Y%m%dT%H%M%S%f}Z-{secrets.token_hex(4)}"
 
 
+def is_run_id(name) -> bool:
+    """True when ``name`` matches ``RUN_ID_RE`` and its time is real. A month 13 is not a run file, so it stays."""
+    if not isinstance(name, str) or not RUN_ID_RE.fullmatch(name):
+        return False
+    try:
+        id_time(name)
+    except ValueError:
+        return False
+    return True
+
+
 def check_id(run_id: str) -> str:
     """Return ``run_id`` when it is a valid run ID. Else raise ``ValueError``."""
-    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+    if not is_run_id(run_id):
         raise ValueError("a run ID must be <UTC time>Z-<8 hex characters>")
     return run_id
 
@@ -332,7 +343,7 @@ def iter_runs(store: Path) -> Iterator[RunMeta]:
         return
     ids = sorted((n[: -len(META_SUFFIX)] for n in names if n.endswith(META_SUFFIX)), reverse=True)
     for run_id in ids:
-        if not RUN_ID_RE.fullmatch(run_id):
+        if not is_run_id(run_id):
             continue
         name = f"{run_id}{META_SUFFIX}"
         try:
@@ -394,7 +405,7 @@ def run_ids(store: Path) -> set[str]:
     except FileNotFoundError:
         return set()
     return {name[: -len(META_SUFFIX)] for name in names
-            if name.endswith(META_SUFFIX) and RUN_ID_RE.fullmatch(name[: -len(META_SUFFIX)])}
+            if name.endswith(META_SUFFIX) and is_run_id(name[: -len(META_SUFFIX)])}
 
 
 #: The temporary file of an atomic write: ".<run file>.<random>.tmp".
@@ -409,7 +420,7 @@ def _prune_temp_files(runs: Path, names: set[str], orphan_limit: datetime, dry_r
     A young one can still be in progress, so it stays.
     """
     stale = sorted(name for name in names if (match := _TEMP_RE.fullmatch(name))
-                   and id_time(match.group("id")) < orphan_limit)
+                   and is_run_id(match.group("id")) and id_time(match.group("id")) < orphan_limit)
     gone = 0
     for name in stale:
         if dry_run:
@@ -454,8 +465,8 @@ def prune(store: Path, before: date, *, now: datetime | None = None, dry_run: bo
     for name in names:
         for suffix in (META_SUFFIX, TESTS_SUFFIX):
             run_id = name[: -len(suffix)]
-            if name.endswith(suffix) and (match := RUN_ID_RE.fullmatch(run_id)):
-                if match.group(1) < limit:
+            if name.endswith(suffix) and is_run_id(run_id):
+                if run_id[:8] < limit:
                     found.setdefault(run_id, set()).add(suffix)
     deleted: list[str] = []
     failed: list[tuple[str, str]] = []
