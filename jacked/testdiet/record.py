@@ -188,7 +188,7 @@ def _same_identity(meta: RunMeta, tree_value: TreeId, command_sha: str, folder: 
 def _proves(meta: RunMeta) -> bool:
     # With --input, the files after the gate must be known to be the same (fail closed).
     return (meta.verdict == "passed" and meta.tree_changed is False and meta.inputs_changed is not True
-            and meta.inputs_sha != INPUTS_INVALID
+            and meta.inputs_sha != INPUTS_INVALID and meta.interrupted is not True
             and (meta.inputs_sha is None or meta.inputs_changed is False))
 
 
@@ -196,6 +196,8 @@ def _cause(meta: RunMeta) -> str:
     """Why the run ``meta`` does not prove the tree."""
     if meta.verdict != "passed":
         return f"its verdict is {one_line(meta.verdict) or 'not recorded'}"
+    if meta.interrupted is True:
+        return "the user stopped the run"
     if meta.tree_changed is True:
         return "the gate changed the tree"
     if meta.inputs_changed is True:

@@ -543,6 +543,8 @@ _OTHER_TREE = TreeId(commit="c" * 40, tree="d" * 40, clean=True)
     ("schema", None),
     ("schema", 2),
     ("inputs_changed", True),
+    ("inputs_sha", "invalid"),
+    ("interrupted", True),
 ])
 def test_seen_rejects_a_run_that_differs_in_one_field(repo, tmp_path, field, value):
     argv = junit_gate(0, GREEN)
@@ -1428,3 +1430,14 @@ def test_a_gate_in_a_subfolder_sees_a_hidden_edit_at_the_top(repo):
     # seen at the top reads the hidden edit too, so it never matches the clean tree.
     assert record.seen(tree.store_dir(repo), TreeId(commit="c" * 40, tree=head_tree, clean=True),
                        meta.command_sha, folder="sub", inputs_sha=None, machine_id=meta.machine_id) is None
+
+
+def test_the_miss_line_says_that_the_user_stopped_the_run(repo, tmp_path):
+    argv = junit_gate(0, GREEN)
+    run.run_gate(argv, cwd=repo)
+    real = _last(repo)
+    store = tmp_path / "stopped"
+    history.write_run(store, dataclasses.replace(real, interrupted=True), None)
+    answer = record.seen_answer(store, tree_of(repo), real.command_sha, folder=".", inputs_sha=real.inputs_sha,
+                                machine_id=machine.machine_id())
+    assert answer.hit is None and "the user stopped the run" in answer.why
