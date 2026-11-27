@@ -169,12 +169,16 @@ def work_tree_top(cwd: Path) -> Path:
 
 
 def git_detail(text: str) -> str:
-    """The first ``fatal:``, ``error:`` or ``warning:`` line of git's error text, else its first
-    line that is not empty, cut at ``DETAIL_CHARS``: the one line of git that a message prints."""
+    """The one line of git's error text that a message prints, cut at ``DETAIL_CHARS``: the first
+    ``error:`` line, else ``fatal:``, else ``warning:``, else the first line that is not empty. git's
+    error() names the cause (``error: open("a.txt"): Permission denied``), and die() then sums up
+    (``fatal: adding files failed``); a CRLF ``warning:`` notice can come before both."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    chosen = next((line for line in lines if line.startswith(("fatal:", "error:", "warning:"))),
-                  lines[0] if lines else "")
-    return chosen[:DETAIL_CHARS]
+    for tag in ("error:", "fatal:", "warning:"):
+        found = next((line for line in lines if line.startswith(tag)), None)
+        if found is not None:
+            return found[:DETAIL_CHARS]
+    return lines[0][:DETAIL_CHARS] if lines else ""
 
 
 def no_tree_line(problem: str) -> str:

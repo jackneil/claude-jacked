@@ -1472,7 +1472,16 @@ def test_a_refusal_after_a_long_trace_is_still_a_refusal(repo, monkeypatch):
 
 
 def test_the_git_detail_prefers_the_error_line_and_is_cut_at_300():
-    assert tree.git_detail("12:00 trace: run\nwarning: w\nfatal: f\n") == "warning: w"
+    # By priority over all of stderr: error: (the cause), then fatal: (the summary), then warning:.
+    assert tree.git_detail("12:00 trace: run\nwarning: w\nfatal: f\n") == "fatal: f"
+    crlf = "warning: in the working copy of 'a.txt', LF will be replaced by CRLF\r\nerror: e\r\n"
+    assert tree.git_detail(crlf) == "error: e"
+    locked = ("error: open(\"locked.txt\"): Permission denied\nerror: unable to index file 'locked.txt'\n"
+              "fatal: adding files failed\n")
+    assert tree.git_detail(locked) == "error: open(\"locked.txt\"): Permission denied"
+    refusal = "fatal: detected dubious ownership in repository at '/r'\nTo add an exception for this directory\n"
+    assert tree.git_detail(refusal) == "fatal: detected dubious ownership in repository at '/r'"
+    assert tree.git_detail("trace: a\nwarning: w\n") == "warning: w"
     assert tree.git_detail("trace: a\n\nsome text\n") == "trace: a"
     assert tree.git_detail("") == ""
     assert len(tree.git_detail("fatal: " + "x" * 5000)) == 300
