@@ -189,19 +189,35 @@ def _proves(meta: RunMeta) -> bool:
             and (meta.inputs_sha is None or meta.inputs_changed is False))
 
 
-def _not_proved(meta: RunMeta) -> str:
+def _cause(meta: RunMeta) -> str:
+    """Why the run ``meta`` does not prove the tree."""
     if meta.verdict != "passed":
-        cause = f"its verdict is {one_line(meta.verdict) or 'not recorded'}"
-    elif meta.tree_changed is True:
-        cause = "the gate changed the tree"
-    elif meta.inputs_changed is True:
-        cause = "the gate changed the --input files"
-    elif meta.inputs_sha is not None and meta.inputs_changed is None:
-        cause = "the --input files after the gate are not known"
-    else:
-        cause = "the tree after the gate is not known"
+        return f"its verdict is {one_line(meta.verdict) or 'not recorded'}"
+    if meta.tree_changed is True:
+        return "the gate changed the tree"
+    if meta.inputs_changed is True:
+        return "the gate changed the --input files"
+    if meta.inputs_sha is not None and meta.inputs_changed is None:
+        return "the --input files after the gate are not known"
+    return "the tree after the gate is not known"
+
+
+def _not_proved(meta: RunMeta) -> str:
     return (f"the newest run of this tree and this command is {meta.id}, and it does not prove the tree: "
-            f"{cause}.")
+            f"{_cause(meta)}.")
+
+
+def _not_proved_any(deciders: list[RunMeta]) -> str:
+    """One line for an ``--any-machine`` miss: the newest run of each machine, at most ``DEFAULT_TOP``.
+
+    The runs are in machine-label order, never in time order: the times of
+    two machines are never compared.
+    """
+    ordered = sorted(deciders, key=lambda m: (*label_order(m.machine), m.id))
+    shown = "; ".join(f"{m.id} ({_cause(m)})" for m in ordered[:DEFAULT_TOP])
+    rest = len(ordered) - DEFAULT_TOP
+    more = "" if rest <= 0 else f"; and {rest} more machine{'s' if rest > 1 else ''}"
+    return f"no machine's newest run of this tree and this command proves the tree: {shown}{more}."
 
 
 def seen_answer(store: Path, tree_value: TreeId, command_sha: str, *, folder: str,
@@ -216,7 +232,8 @@ def seen_answer(store: Path, tree_value: TreeId, command_sha: str, *, folder: st
     and ``tree_changed`` is False. A newer run that did not pass is never
     hidden by an older pass. ``any_machine`` lets the newest run of each
     machine identity decide for that machine, so the times of two machines
-    are never compared. The commit is not compared, so a second commit
+    are never compared; a miss then names the newest run of each machine
+    (at most ``DEFAULT_TOP``). The commit is not compared, so a second commit
     with the same content is the same tree.
     """
     if tree_value is None or not command_sha or inputs_sha == INPUTS_UNAVAILABLE:
@@ -238,7 +255,8 @@ def seen_answer(store: Path, tree_value: TreeId, command_sha: str, *, folder: st
             break
     decider = next(iter(deciders.values()), None)
     if decider is not None:
-        return SeenAnswer(None, decider, _not_proved(decider))
+        why = _not_proved_any(list(deciders.values())) if any_machine else _not_proved(decider)
+        return SeenAnswer(None, decider, why)
     return SeenAnswer(None, None, _nearest(store, tree_value, command_sha, folder, inputs_sha,
                                            machine_id, any_machine))
 

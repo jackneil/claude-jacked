@@ -1179,7 +1179,7 @@ def _identity_store(tmp_path, *verdict_codes, machine_id=None):
     green = [make_case("t::a", "t.py", 1.0)]
     ids = []
     for n, (code, mid) in enumerate(verdict_codes):
-        ids.append(store_run(store, f"2026112{n}T080000", exit_code=code, tests=green,
+        ids.append(store_run(store, f"20261120T08{n:02d}00", exit_code=code, tests=green,
                              machine_id=mid or machine_id or LOCAL_ID))
     return store, ids
 
@@ -1376,3 +1376,34 @@ def test_a_run_whose_input_files_after_the_gate_are_not_known_never_proves_a_tre
     answer = record.seen_answer(tree.store_dir(repo), tree.tree_id(repo), meta.command_sha, folder=".",
                                 inputs_sha=meta.inputs_sha, machine_id=meta.machine_id)
     assert answer.hit is None and "after the gate are not known" in answer.why
+
+
+def test_machine_a_passed_and_machine_b_failed_any_machine_hits_on_a_and_b_alone_names_its_run(tmp_path):
+    from tests._testdiet import COMMAND, LOCAL_ID, LOCAL_TWIN_ID, TREE_1
+
+    a_id, b_id = LOCAL_ID, LOCAL_TWIN_ID
+    store, (a_pass, b_fail) = _identity_store(tmp_path, (0, a_id), (1, b_id))
+    current = TreeId(commit="c" * 40, tree=TREE_1, clean=True)
+    common = dict(folder=".", inputs_sha=None)
+    hit = record.seen_answer(store, current, COMMAND, machine_id=b_id, any_machine=True, **common)
+    assert hit.hit is not None and hit.hit.id == a_pass
+    miss = record.seen_answer(store, current, COMMAND, machine_id=b_id, **common)
+    assert miss.hit is None and miss.decider.id == b_fail and b_fail in miss.why and a_pass not in miss.why
+
+
+def test_an_any_machine_miss_names_the_newest_run_of_each_machine_up_to_default_top(tmp_path):
+    from jacked.testdiet.model import DEFAULT_TOP
+    from tests._testdiet import COMMAND, TREE_1
+
+    machines = [f"{n:032x}" for n in range(1, DEFAULT_TOP + 3)]
+    store, ids = _identity_store(tmp_path, *[(1, mid) for mid in machines])
+    current = TreeId(commit="c" * 40, tree=TREE_1, clean=True)
+    miss = record.seen_answer(store, current, COMMAND, folder=".", inputs_sha=None, machine_id=None,
+                              any_machine=True)
+    assert miss.hit is None
+    assert sum(run_id in miss.why for run_id in ids) == DEFAULT_TOP
+    assert "2 more machines" in miss.why and len(miss.why.splitlines()) == 1
+    two = _identity_store(tmp_path / "two", (1, machines[0]), (1, machines[1]))
+    why = record.seen_answer(two[0], current, COMMAND, folder=".", inputs_sha=None, machine_id=None,
+                             any_machine=True).why
+    assert all(run_id in why for run_id in two[1]) and "more machines" not in why

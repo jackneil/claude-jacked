@@ -212,7 +212,7 @@ jacked tests loss [--base REF] [--json]
   - A record of an older or newer record format never proves a tree. `history` and `profile` still show it.
   - The commit is not compared, so two commits with the same content are one tree. A run of `record` never proves a tree.
   - When this machine has no identity (the file cannot be read or made, or holds no valid identity), `seen` prints one line that names the file and the cause.
-  - `--any-machine` also accepts a run of a different machine. The newest run of each machine decides for that machine. `seen` never compares the times of two machines. `--json` prints the record, or `null`.
+  - `--any-machine` also accepts a run of a different machine. The newest run of each machine decides for that machine. When no machine has a newest run that proves the tree, the line names the newest run of each machine (at most 20) and its cause. `seen` never compares the times of two machines. `--json` prints the record, or `null`.
 - `jacked tests profile` shows where the time of a run goes, by file and by test.
   - By default, it shows the newest run with the kind full. When no run has the kind full, it shows the newest run. The default machine is the machine of the newest full run.
   - It prints the number of files that hold half of the test seconds. When each file took 0 seconds, it prints `every file took 0 seconds`. When some files have no time and each other file took 0 seconds, it prints `every file with a time took 0 seconds`.
