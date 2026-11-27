@@ -26,6 +26,11 @@ _FLAKY_ATTEMPTS = {"flakyFailure": "failed", "flakyError": "error"}
 _RERUN_ATTEMPTS = {"rerunFailure": "failed", "rerunError": "error"}
 # The worst state first.
 _ORDER = ("error", "failed", "passed", "skipped")
+#: The order of the states of two or more elements with one ID (most severe first).
+_MERGE_ORDER = ("error", "failed", "flaky", "passed", "skipped")
+#: The runners that write each attempt of a rerun as its own testcase element, in order.
+#: gotestsum --rerun-fails does; no other supported runner does.
+_RERUN_AS_ELEMENTS = frozenset({"go"})
 
 
 def _seconds(value: str | None) -> float | None:
@@ -39,9 +44,11 @@ def _seconds(value: str | None) -> float | None:
 
 
 def _count(value: str | None) -> int:
-    """A count attribute of a suite. A missing or bad value counts 0."""
+    """A count attribute of a suite. A missing or bad value counts 0, and so does a non-ASCII digit."""
+    if value is None or not value.isascii():
+        return 0
     try:
-        return max(0, int(value)) if value is not None else 0
+        return max(0, int(value))
     except ValueError:
         return 0
 
@@ -175,9 +182,27 @@ def _attempts(case: dict) -> list[tuple[str, str | None]]:
 
 
 def _state(states: list[str]) -> str:
+    """The state of one testcase element from its attempts (a rerun marker of the runner, then the final)."""
     if "passed" in states and ("failed" in states or "error" in states):
         return "flaky"
     return next(state for state in _ORDER if state in states)
+
+
+def _merged_state(runner: str, elements: list[list[tuple[str, str | None]]]) -> str:
+    """The state of one ID from its elements, in report order, by the documented format of the runner.
+
+    go (gotestsum ``--rerun-fails``) writes each attempt as its own testcase,
+    in order: the last element decides, and a pass after a failure is
+    flaky. For every other runner, two elements with one ID are two tests
+    with one name: the ID is failing when one of them failed, and flaky only
+    through the rerun markers that the runner writes inside one element.
+    """
+    states = [_state([state for state, _ in element]) for element in elements]
+    if runner in _RERUN_AS_ELEMENTS:
+        if states[-1] == "passed" and any(s in ("failed", "error", "flaky") for s in states[:-1]):
+            return "flaky"
+        return states[-1]
+    return next(state for state in _MERGE_ORDER if state in states)
 
 
 def read_junit(paths: Sequence[Path], *, root: Path, report_root: str | None = None,
@@ -189,8 +214,12 @@ def read_junit(paths: Sequence[Path], *, root: Path, report_root: str | None = N
     ``runner`` is found from the files when it is None.
 
     One ID that is in the files more than one time gives one ``CaseResult``:
-    ``attempts`` counts the attempts, the seconds are the sum, and the state
-    is ``flaky`` when one attempt passed and one failed or had an error.
+    ``attempts`` counts the attempts, and the seconds are the sum. The state
+    follows the documented format of the runner (``_merged_state``): for go,
+    the last element decides and a pass after a failure is ``flaky``; for
+    the other runners, the ID is failing when one element failed, and
+    ``flaky`` only through a rerun marker inside one element (the
+    ``flakyFailure`` and ``rerunFailure`` children).
     """
     lookup = TreeLookup(root)
     runners: list[str] = []
@@ -213,22 +242,23 @@ def read_junit(paths: Sequence[Path], *, root: Path, report_root: str | None = N
         for case in target.cases:
             test_id, file = normalize(file_runner, case["classname"], case["name"], case["file"],
                                       root=root, report_root=report_root, lookup=lookup)
-            entry = merged.setdefault(test_id, {"file": None, "seconds": [], "attempts": []})
+            entry = merged.setdefault(test_id, {"file": None, "seconds": [], "elements": [],
+                                                "runner": file_runner})
             entry["file"] = entry["file"] or file
             if case["seconds"] is not None:
                 entry["seconds"].append(case["seconds"])
-            entry["attempts"].extend(_attempts(case))
+            entry["elements"].append(_attempts(case))
     tests = []
     for test_id, entry in merged.items():
-        states = [state for state, _ in entry["attempts"]]
-        failure_type = next((t for state, t in entry["attempts"] if state in FAILING_STATES and t), None)
+        attempts = [attempt for element in entry["elements"] for attempt in element]
+        failure_type = next((t for state, t in attempts if state in FAILING_STATES and t), None)
         tests.append(CaseResult(
             id=test_id,
             file=entry["file"],
             seconds=sum(entry["seconds"]) if entry["seconds"] else None,
-            state=_state(states),
+            state=_merged_state(entry["runner"], entry["elements"]),
             failure_type=failure_type,
-            attempts=len(entry["attempts"]),
+            attempts=len(attempts),
         ))
     distinct = set(runners)
     return RunData(

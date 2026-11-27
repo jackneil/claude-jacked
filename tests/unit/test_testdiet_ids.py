@@ -239,3 +239,10 @@ def test_the_go_lookup_lists_a_package_folder_one_time(tmp_path, monkeypatch):
     assert lookup.go_file("example.com/m/pkg", "TestA") == "pkg/a_test.go"
     assert lookup.go_file("example.com/m/pkg", "TestB") == "pkg/b_test.go"
     assert len(listed) == 1
+
+
+def test_a_playwright_location_needs_ascii_digits():
+    from jacked.testdiet import ids
+
+    assert ids._PLAYWRIGHT_LOCATION.match("a.spec.ts:12:3 › t")
+    assert ids._PLAYWRIGHT_LOCATION.match("a.spec.ts:١٢:3 › t") is None

@@ -327,3 +327,10 @@ def test_the_cli_choices_and_defaults_come_from_the_model():
         assert tuple(params["runner"].type.choices) == tuple(r for r in model.RUNNERS if r != "unknown")
     top = next(p for p in group.commands["profile"].params if p.name == "top")
     assert top.default == model.DEFAULT_TOP
+
+
+def test_cli_profile_refuses_a_run_id_with_non_ascii_digits(repo):
+    _invoke("tests", "run", "--", *gate(GREEN, 0))
+    fake = "٠" * 8 + "T" + "0" * 12 + "Z-abcdef12"
+    result = _invoke("tests", "profile", "--run", fake)
+    assert result.exit_code == 1 and "a run ID must be" in result.stderr

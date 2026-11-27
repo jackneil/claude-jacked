@@ -254,6 +254,7 @@ def script(text: str) -> tuple[list[Declaration], str | None]:
 
 # Go and Rust ------------------------------------------------------------
 
+# \w stays Unicode on purpose: Go and Rust allow Unicode identifiers (see loss_scan).
 _GO_HEAD = re.compile(r"^func[ \t]+(?P<name>Test(?![a-z])\w*)[ \t]*\((?P<params>[^)]*)\)", re.M)
 _GO_RECEIVER = re.compile(r"\s*(\w+)\s+\*testing\.(?:T|B|F|TB)\b")
 _RUST_TEST = re.compile(r"#\[(?:\w+::)*test\b")

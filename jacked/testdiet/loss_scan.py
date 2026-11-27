@@ -217,6 +217,9 @@ def _times(a: int | None, b: int | None) -> int | None:
     return None if a is None or b is None else a * b
 
 
+# \w stays Unicode here on purpose: these read identifiers of source code, and
+# Python, Go and Rust allow Unicode identifiers. The regexes that check a stored
+# or a typed value (run IDs, hashes, labels) use explicit ASCII classes.
 _PY_DEF = re.compile(r"^(?P<indent>[ \t]*)(?:async[ \t]+)?def[ \t]+(?P<name>\w+)")
 _PY_CLASS = re.compile(r"^(?P<indent>[ \t]*)class[ \t]+(?P<name>\w+)")
 

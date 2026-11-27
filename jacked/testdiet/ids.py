@@ -38,7 +38,7 @@ from jacked.testdiet.model import SCRIPT_FILE_RE, ListingError
 
 _SKIP_DIRS = {".git", "node_modules", "target", "vendor", "__pycache__"}
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:/")
-_PLAYWRIGHT_LOCATION = re.compile(r"^(?P<file>.+?):\d+:\d+(?P<rest> › .*)$")
+_PLAYWRIGHT_LOCATION = re.compile(r"^(?P<file>.+?):[0-9]+:[0-9]+(?P<rest> › .*)$")
 
 
 def _read_tree_file(path: Path) -> bytes | None:

@@ -44,7 +44,9 @@ RUNS = "runs"
 META_SUFFIX = ".meta.json"
 TESTS_SUFFIX = ".tests.json.gz"
 #: A run ID: the UTC time to the microsecond, then 8 random hex characters.
-RUN_ID_RE = re.compile(r"(\d{8})T\d{12}Z-[0-9a-f]{8}")
+# Explicit ASCII classes, not \d: \d also matches digits such as U+0660, and a
+# pattern that embeds this one (``_TEMP_RE``) does not get the flag of this one.
+RUN_ID_RE = re.compile(r"([0-9]{8})T[0-9]{12}Z-[0-9a-f]{8}", re.ASCII)
 
 _RAN_STATES = ("passed", "flaky")
 #: A tests file with no meta file is a write that is in progress or that
@@ -390,7 +392,7 @@ def run_ids(store: Path) -> set[str]:
 
 #: The temporary file of an atomic write: ".<run file>.<random>.tmp".
 _TEMP_RE = re.compile(rf"\.(?P<id>{RUN_ID_RE.pattern})(?:{re.escape(META_SUFFIX)}|{re.escape(TESTS_SUFFIX)})"
-                      r"\.[A-Za-z0-9_]+\.tmp")
+                      r"\.[A-Za-z0-9_]+\.tmp", re.ASCII)
 
 
 def _prune_temp_files(runs: Path, names: set[str], orphan_limit: datetime, dry_run: bool) -> None:

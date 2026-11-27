@@ -329,3 +329,48 @@ def test_each_sample_report_has_no_failure_at_suite_level_only():
     assert len(paths) >= 10
     for path in paths:
         assert read_junit([path], root=Path("/nowhere"), report_root=REPORT_ROOT).suite_failures == 0, path.name
+
+
+# --------------------------------------------------------------------------- same-ID elements, by runner
+
+
+def test_the_go_rerun_capture_stays_flaky_and_its_gate_stays_passed():
+    from jacked.testdiet import history
+
+    data = read_junit(fixture_reports("go_rerun"), root=fixture_project("go_rerun"), report_root=REPORT_ROOT)
+    assert {c.id: c.state for c in data.tests}["example.com/sample/calc.TestFailsThenPasses"] == "flaky"
+    assert history.verdict_of(0, data) == "passed"
+
+
+@pytest.mark.parametrize("children, state", [
+    (("", "<failure/>"), "failed"),           # passed, then failed: the last attempt decides
+    (("<failure/>", "<failure/>"), "failed"),
+    (("<failure/>", ""), "flaky"),             # failed, then passed
+    (("<failure/>", "<error/>"), "error"),
+])
+def test_a_go_report_gives_each_id_the_state_of_its_last_attempt(tmp_path, children, state):
+    cases = "".join(f'<testcase classname="example.com/x" name="TestA">{c}</testcase>' for c in children)
+    report = _write(tmp_path, f'<testsuites><testsuite name="example.com/x">{cases}</testsuite></testsuites>')
+    (case,) = read_junit([report], root=tmp_path, runner="go").tests
+    assert (case.state, case.attempts) == (state, 2)
+
+
+@pytest.mark.parametrize("runner", ["jest", "vitest", "pytest", "playwright", "nextest"])
+def test_two_tests_with_one_id_in_one_report_are_failing_when_one_failed(tmp_path, runner):
+    from jacked.testdiet import history
+
+    report = _write(tmp_path, (
+        '<testsuites name="jest tests"><testsuite name="a.test.js">'
+        '<testcase classname="works" name="works" file="a.test.js"/>'
+        '<testcase classname="works" name="works" file="a.test.js"><failure type="E"/></testcase>'
+        "</testsuite></testsuites>"))
+    (case,) = read_junit([report], root=tmp_path, runner=runner).tests
+    assert (case.state, case.failure_type) == ("failed", "E")
+    data = read_junit([report], root=tmp_path, runner=runner)
+    assert history.verdict_of(0, data) == "conflict" and history.failing_of(data) == (case.id,)
+
+
+def test_a_suite_count_with_non_ascii_digits_counts_zero(tmp_path):
+    report = _write(tmp_path, '<testsuites failures="١"><testsuite name="s" failures="١">'
+                              '<testcase classname="a" name="t"/></testsuite></testsuites>')
+    assert read_junit([report], root=tmp_path).suite_failures == 0

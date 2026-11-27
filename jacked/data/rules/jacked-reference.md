@@ -197,6 +197,7 @@ jacked tests loss [--base REF] [--json]
   - `--junit GLOB`: use it for a runner that writes its report at a fixed path. Before the gate, `run` takes the SHA-256 of each file that matches. After the gate, it reads each match that is new or that has new content. It prints one line for each match that it did not read, so an old report never becomes this run. Two runs at the same time with one fixed `--junit` path can read the report of the other run. When two gates can run at the same time, use `{junit}`: each run gets its own private path.
   - `--kind full|targeted` is a label for `profile` and `history` only.
   - The verdict of a run is one of five values. `passed`: exit code 0, a report with at least one test, and no failed or error test. `failed`: an exit code that is not 0. `conflict`: exit code 0 and a failed or an error test in the report, or a failure that only a suite counts (a `failures` or `errors` count of a suite that is more than its failed test cases, or a failure element of the suite itself). `no-data`: exit code 0 and no test data. `unknown`: no exit code. A pipe can turn a red gate into exit code 0, and then the verdict is `conflict`.
+  - Two test cases with one ID in one report are two tests with one name: the ID fails when one of them failed. A test is flaky only through the rerun marks of its runner. The exception is go: when gotestsum runs the failed tests again, it writes each attempt as its own test case, so the last one decides, and a pass after a failure is flaky.
   - A conflict prints one line. Without `--strict`, the line says that `seen` does not accept the run, and that `--strict` gives exit 1.
   - When git cannot read the work tree (for example, a file that you cannot read, or a clean filter that git cannot start), `run` prints one line with the first error line of git, and the run cannot prove a tree. `seen` prints the same line. A repository with no commit gives a line too.
   - A gate can change a path that git sees, for example a cache file that git does not ignore. Then `run` prints each changed path, and the run cannot prove a tree. Add these paths to `.gitignore`.
@@ -229,7 +230,7 @@ jacked tests loss [--base REF] [--json]
   - The output lines are `base <commit> (<ref>)`, `net <+N|-N|0>` and `added N, removed N`. Then come the lines `removed <test>`, `added <test>`, `moved <old> -> <new>`, `fewer assertions <test>`, `fewer cases <test> <before> -> <after>`, `skip mark added <test>`, `not read <test> (<reason>)` and `not read file <path> (<kind>)`.
   - A renamed file, a test that moves to a different file, and an edited parameter value give no loss. A test that gets a new name inside one file shows as one removed test and one added test. A test that moves into a class or out of one pairs only when its body stays the same. Otherwise it shows as one removed test and one added test.
   - `loss` reads a Python file only when its name is `test_*.py` or `*_test.py`, the default names of pytest. A function named `test_x` in another Python file is not a test.
-  - `loss` reads a TypeScript or JavaScript file only when its name is `*.test.*` or `*.spec.*`, a bare `test.js` or `spec.ts`, or when it is in a `__tests__` folder. These are the default names of jest, vitest and Playwright. A file that a custom `testMatch` or `include` adds is not read.
+  - `loss` reads a TypeScript or JavaScript file only when its name is `*.test.*` or `*.spec.*`, a bare `test.js` or `spec.ts`, or when it is in a `__tests__` folder. These are the default names of jest, vitest and Playwright.
   - `loss` counts these cases: the literal lists of Python parametrize marks, the rows of a literal `.each` table (TypeScript and JavaScript), and the `t.Run` calls of a Go test.
   - A `t.Run` in a for-range loop over a slice literal counts each element of that literal. The literal must be inline, or assigned in the same function and not assigned again. This Go rule reads gofmt spacing.
   - `loss` does not count a computed case list. It also does not count a `t.Run` in a loop over any other value, or a fixture parameter.
@@ -258,6 +259,10 @@ A machine has a label: `local` for a run of `run`, or the value of `record --mac
 - With git-lfs, the clean filter can write a copy of a new large file into `.git/lfs/objects` of the clone. The copy uses disk space, and no commit uses it. To remove such copies, run `git lfs prune`.
 - On Windows, an edit that keeps the size and puts back the old modification time is not seen. `git status` does not see it either.
 - `run` and `seen` run the clean filters of the repository when they read the work tree, as `git status` does, so the hash is the tree of a commit. `loss` is a report, and it turns the filter drivers off.
+
+### Limits of loss
+
+- `loss` does not read a test file that only a custom `testMatch` or `include` setting adds, or a Python file that only a custom `python_files` setting of pytest adds. A removed test in such a file gives no line.
 
 ### A red gate
 

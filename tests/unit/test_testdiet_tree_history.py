@@ -1378,3 +1378,54 @@ def test_a_temporary_file_that_cannot_be_deleted_keeps_the_new_machine_id(tmp_pa
     assert value is not None and re.fullmatch(r"[0-9a-f]{32}", value)
     assert machine.machine_id(tmp_path) == value
     assert any("temporary file" in record.getMessage() for record in caplog.records)
+
+
+# --------------------------------------------------------------------------- ASCII only in stored values
+
+_ARABIC_ZERO = "٠"  # a digit for str.isdigit and for re's \d without re.ASCII
+
+
+def _validators():
+    from jacked.testdiet import model
+
+    good_id = history.new_run_id()
+    return [
+        ("RUN_ID_RE", history.RUN_ID_RE, good_id),
+        ("_TEMP_RE", history._TEMP_RE, f".{good_id}.meta.json.abc123.tmp"),
+        ("MACHINE_ID_RE", model.MACHINE_ID_RE, "0" * 32),
+        ("_SHA256_RE", history._SHA256_RE, "0" * 64),
+        ("_HEX_ID_RE", history._HEX_ID_RE, "0" * 40),
+        ("LABEL_RE", model.LABEL_RE, "ci0"),
+    ]
+
+
+@pytest.mark.parametrize("name, pattern, good", _validators(), ids=[v[0] for v in _validators()])
+def test_each_validator_of_a_stored_value_refuses_a_non_ascii_digit(name, pattern, good):
+    assert pattern.fullmatch(good)
+    first = good.index("0") if "0" in good else next(i for i, ch in enumerate(good) if ch.isdigit())
+    bad = good[:first] + _ARABIC_ZERO + good[first + 1:]
+    assert pattern.fullmatch(bad) is None, name
+
+
+def test_a_run_id_with_non_ascii_digits_is_refused_by_history_prune_and_run(tmp_path, capsys):
+    from datetime import date
+
+    good = _meta(history.new_run_id())
+    history.write_run(tmp_path, good, None)
+    fake = _ARABIC_ZERO * 8 + "T" + "0" * 12 + "Z-abcdef12"
+    assert history.RUN_ID_RE.fullmatch(fake) is None
+    path = tmp_path / "runs" / f"{fake}.meta.json"
+    path.write_bytes((tmp_path / "runs" / f"{good.id}.meta.json").read_bytes())
+    assert [m.id for m in history.iter_runs(tmp_path)] == [good.id]
+    with pytest.raises(ValueError):
+        history.check_id(fake)
+    with pytest.raises(ValueError):
+        history.load_tests(tmp_path, fake)
+    assert history.prune(tmp_path, date(2099, 1, 1), dry_run=True) == [good.id]
+    assert fake not in history.run_ids(tmp_path)
+    history.prune(tmp_path, date(2099, 1, 1))
+    assert path.exists()
+    from jacked.testdiet import views
+
+    with pytest.raises(views.ViewError):
+        views.profile(tmp_path, fake)
