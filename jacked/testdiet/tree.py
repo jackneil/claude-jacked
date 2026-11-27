@@ -258,11 +258,11 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None,
     if commit is None or head_tree is None:
         return None
     code, out = git(cwd, "rev-parse", "--path-format=absolute", "--git-path", "index",
-                     "--git-path", "objects")
+                     "--git-path", "objects", "--show-toplevel")
     paths = output_lines(out)
-    if code != 0 or len(paths) != 2:
-        raise TreeError("git did not give the index and object paths")
-    real_index, real_objects = Path(paths[0]), paths[1]
+    if code != 0 or len(paths) != 3:
+        raise TreeError("git did not give the index path, the object path and the top folder")
+    real_index, real_objects, top = Path(paths[0]), paths[1], Path(paths[2])
 
     work = Path(tempfile.mkdtemp(prefix="jacked-tree-"))
     try:
@@ -277,7 +277,8 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None,
         }
         if real_index.is_file():
             source_times = _copy_index(real_index, index_copy)
-            if _clear_hiding_bits(cwd, env, work):
+            # From the top: ls-files in a subfolder lists that subfolder only, and add -A hashes all.
+            if _clear_hiding_bits(top, env, work):
                 _set_index_times(index_copy, source_times)
         with tempfile.TemporaryFile(dir=work) as errors:
             code, _ = git(cwd, *_INDEX_COPY_ARGS, "add", "-A", "--sparse", env=env, stderr=errors)
@@ -346,8 +347,9 @@ def _clear_hiding_bits(cwd: Path, env: Mapping[str, str], work: Path) -> bool:
     and, when ``core.sparseCheckout`` is not true, skip-worktree (tag ``S``
     or ``s``). In a sparse checkout the skip-worktree bits stay, as the
     module docstring says. The real index is never written: ``env`` names
-    the copy. Return True when the copy changed. A git error raises
-    ``TreeError``.
+    the copy. ``cwd`` is the top of the work tree, so the list holds every
+    path, not only the paths below a gate folder. Return True when the copy
+    changed. A git error raises ``TreeError``.
     """
     code, out = git(cwd, "ls-files", "-v", "-z", env=env)
     if code != 0:

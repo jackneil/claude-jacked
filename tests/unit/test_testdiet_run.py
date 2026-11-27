@@ -1407,3 +1407,23 @@ def test_an_any_machine_miss_names_the_newest_run_of_each_machine_up_to_default_
     why = record.seen_answer(two[0], current, COMMAND, folder=".", inputs_sha=None, machine_id=None,
                              any_machine=True).why
     assert all(run_id in why for run_id in two[1]) and "more machines" not in why
+
+
+def test_a_gate_in_a_subfolder_sees_a_hidden_edit_at_the_top(repo):
+    (repo / "sub").mkdir()
+    (repo / "sub" / "x.txt").write_bytes(b"x\n")
+    _git(repo, "add", "sub/x.txt")
+    _git(repo, "commit", "-q", "-m", "sub")
+    head_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    _git(repo, "update-index", "--assume-unchanged", "README.md")
+    (repo / "README.md").write_bytes(b"hidden edit at the top\n")
+    index = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+    before = index.read_bytes()
+    argv = junit_gate(0, GREEN)
+    assert run.run_gate(argv, cwd=repo / "sub") == 0
+    meta = _last(repo)
+    assert meta.tree.tree != head_tree and meta.tree.clean is False
+    assert index.read_bytes() == before
+    # seen at the top reads the hidden edit too, so it never matches the clean tree.
+    assert record.seen(tree.store_dir(repo), TreeId(commit="c" * 40, tree=head_tree, clean=True),
+                       meta.command_sha, folder="sub", inputs_sha=None, machine_id=meta.machine_id) is None

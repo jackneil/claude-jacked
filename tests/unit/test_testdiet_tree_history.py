@@ -1429,3 +1429,18 @@ def test_a_run_id_with_non_ascii_digits_is_refused_by_history_prune_and_run(tmp_
 
     with pytest.raises(views.ViewError):
         views.profile(tmp_path, fake)
+
+
+@pytest.mark.parametrize("bit", ["--assume-unchanged", "--skip-worktree"])
+def test_a_hidden_edit_outside_the_gate_folder_is_in_the_tree(repo, bit):
+    # ls-files in a subfolder lists that subfolder only; add -A hashes the whole tree.
+    (repo / "sub").mkdir()
+    (repo / "sub" / "x.txt").write_bytes(b"x\n")
+    _commit_all(repo, "sub")
+    head_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    _git(repo, "update-index", bit, "README.md")
+    (repo / "README.md").write_bytes(b"hidden edit at the top\n")
+    before = _index_bytes(repo)
+    found, _reason = tree.tree_state(repo / "sub")
+    assert found.tree != head_tree and found.clean is False
+    assert _index_bytes(repo) == before
