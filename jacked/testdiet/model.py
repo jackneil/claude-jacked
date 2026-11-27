@@ -144,9 +144,9 @@ def error_text(exc: BaseException) -> str:
 def emit(message: str) -> None:
     """Print one message on standard error, as one line, with the prefix and no control characters.
 
-    Each caller gives one line. A line boundary or a bidi control in the
-    message (a file name, the text of an error) shows as an escape, as in
-    ``one_line``. A standard error that cannot be written (closed, a broken
+    Each caller gives one line. A line boundary or a format character (a
+    bidi control, a zero-width character) in the message (a file name, the
+    text of an error) shows as an escape, as in ``one_line``. A standard error that cannot be written (closed, a broken
     pipe) is ignored, because a message must never stop or change the gate.
     """
     try:

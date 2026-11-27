@@ -76,3 +76,10 @@ def test_one_line_escapes_every_format_character(ch):
     assert ch not in text and text.isascii()
     width = 4 if ord(ch) <= 0xFFFF else 8
     assert text == f"a\\{'u' if width == 4 else 'U'}{ord(ch):0{width}x}b"
+
+
+@pytest.mark.parametrize("ch", FORMAT, ids=lambda ch: f"U+{ord(ch):04X}")
+def test_emit_escapes_every_format_character(ch, capsys):
+    model.emit(f"a{ch}b c")
+    err = capsys.readouterr().err
+    assert ch not in err and err.isascii() and len(err.splitlines()) == 1
