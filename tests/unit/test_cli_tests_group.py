@@ -218,3 +218,19 @@ def test_cli_run_and_seen_name_an_input_glob_that_matches_no_regular_file(repo):
         result = _invoke("tests", sub, "--input", "nothing/*", "--", *argv)
         lines = [line for line in result.stderr.splitlines() if "nothing/*" in line]
         assert len(lines) == 1 and "no regular file matches" in lines[0], sub
+
+
+@pytest.mark.skipif(sys.platform == "win32" or (hasattr(__import__("os"), "geteuid")
+                                                and __import__("os").geteuid() == 0),
+                    reason="needs POSIX modes and a user that is not root")
+def test_cli_seen_says_why_the_work_tree_cannot_be_read(repo):
+    locked = repo / "locked.txt"
+    locked.write_bytes(b"x")
+    locked.chmod(0)
+    try:
+        result = _invoke("tests", "seen", "--", *gate(GREEN, 0))
+    finally:
+        locked.chmod(0o600)
+    assert result.exit_code == 1
+    lines = [line for line in result.stderr.splitlines() if "cannot prove a tree" in line]
+    assert len(lines) == 1 and "locked.txt" in lines[0]

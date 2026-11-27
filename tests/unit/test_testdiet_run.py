@@ -339,7 +339,7 @@ def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch, capsy
     store = tree.store_dir(repo)
     monkeypatch.setattr(history, "write_run", boom)
     assert run.run_gate(junit_gate(6, RED), cwd=repo) == 6
-    monkeypatch.setattr(tree, "tree_id", boom)
+    monkeypatch.setattr(tree, "tree_state", boom)
     assert run.run_gate(junit_gate(6, RED), cwd=repo) == 6
     monkeypatch.setattr(junit, "read_junit", boom)
     monkeypatch.setattr(tree, "store_dir", boom)
@@ -1049,3 +1049,41 @@ def test_the_notice_and_history_give_one_summary_of_a_failing_set(tmp_path):
     text = views.render_history(views.history(store))
     assert "trees: 1 (1 not recorded), on the default branch: not recorded (3 runs)" in text
     assert views.recorded_count(None, 1, 1) == "not recorded (1 run)"
+
+
+@ROOT_OR_WINDOWS
+def test_a_work_tree_that_git_cannot_read_gives_one_line_with_the_git_detail(repo, capsys):
+    locked = repo / "locked.txt"
+    locked.write_bytes(b"x")
+    locked.chmod(0)
+    try:
+        assert run.run_gate(junit_gate(0, GREEN), cwd=repo) == 0
+    finally:
+        locked.chmod(0o600)
+    lines = [line for line in capsys.readouterr().err.splitlines() if "cannot prove a tree" in line]
+    assert len(lines) == 1, lines
+    assert "git add exited with" in lines[0] and "locked.txt" in lines[0]
+    assert _last(repo).tree is None
+
+
+def test_a_repository_with_no_commit_says_so_in_run(hermetic_git, capsys):
+    bare_start = hermetic_git / "fresh"
+    bare_start.mkdir()
+    subprocess.run(["git", "init", "-q", str(bare_start)], check=True, capture_output=True)
+    assert run.run_gate(junit_gate(0, GREEN), cwd=bare_start) == 0
+    lines = [line for line in capsys.readouterr().err.splitlines() if "cannot prove a tree" in line]
+    assert len(lines) == 1 and "no commit" in lines[0]
+
+
+def test_the_tree_state_bounds_the_git_detail(repo, monkeypatch):
+    real = tree.git
+
+    def failing_add(cwd, *args, env=None, stderr=None, stdin=None):
+        if "add" in args:
+            stderr.write(b"error: " + b"x" * 5000 + b"\n")
+            return 128, b""
+        return real(cwd, *args, env=env, stderr=stderr, stdin=stdin)
+
+    monkeypatch.setattr(tree, "git", failing_add)
+    found, problem = tree.tree_state(repo)
+    assert found is None and "git add exited with 128" in problem and len(problem) < 400

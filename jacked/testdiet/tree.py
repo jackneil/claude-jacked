@@ -37,7 +37,7 @@ from pathlib import Path
 
 from jacked import git_guard
 from jacked.findbin import find_bin
-from jacked.public_errors import describe
+from jacked.public_errors import describe, os_error_reason
 from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.globs import input_entries
 from jacked.testdiet.model import TreeId
@@ -129,19 +129,42 @@ def tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
     ``objects`` is a folder that the caller owns: when it is given, the
     objects of a tree with changes stay there, so ``changed_paths`` can read
     them later. When it is not given, they go into a temporary folder that
-    this function removes.
+    this function removes. ``tree_state`` also says why there is no identity.
+    """
+    found, problem = tree_state(cwd, objects=objects, warn=True)
+    return found
+
+
+#: The longest git error text that a ``tree_state`` line holds.
+_DETAIL_CHARS = 300
+
+
+def tree_state(cwd: Path, *, objects: Path | None = None, warn: bool = False) -> tuple[TreeId | None, str]:
+    """Return the identity of ``tree_id`` and, when it is None, the reason as text.
+
+    The reason holds the exit code and the first error line of git (at
+    most ``_DETAIL_CHARS`` characters), for a caller that prints it. With
+    ``warn``, a failed work-tree read is logged at WARNING one time in each
+    process; else the log is at DEBUG.
     """
     try:
-        return read_tree_id(cwd, objects=objects)
+        found = read_tree_id(cwd, objects=objects)
     except _AddError as exc:
         global _warned_add
-        level = logging.DEBUG if _warned_add else logging.WARNING
-        _warned_add = True
+        level = logging.WARNING if warn and not _warned_add else logging.DEBUG
+        _warned_add = _warned_add or warn
         logger.log(level, "tree_id: no tree identity, the work tree read failed (%s)", exc)
-        return None
-    except (TreeError, OSError) as exc:
+        detail = exc.detail[:_DETAIL_CHARS]
+        return None, f"git cannot read the work tree ({exc}{': ' + detail if detail else ''})"
+    except TreeError as exc:
         logger.debug("tree_id: no tree identity (%s)", describe(exc))
-        return None
+        return None, f"git cannot read the work tree ({exc})"
+    except OSError as exc:
+        logger.debug("tree_id: no tree identity (%s)", describe(exc))
+        return None, f"the work tree cannot be read ({os_error_reason(exc)})"
+    if found is None:
+        return None, "the repository has no commit, or it is a bare repository"
+    return found, ""
 
 
 class _AddError(TreeError):

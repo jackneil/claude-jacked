@@ -117,7 +117,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                      None)
     report_dir: Path | None = None
     try:
-        before = _guard("read the tree", lambda: tree.tree_id(cwd, objects=objects), None)
+        before = _guard("read the tree", lambda: _read_tree(cwd, objects), None)
         folder = _guard("find the gate folder", lambda: tree.work_folder(cwd), None)
         # No folder, no command identity: such a run can never prove a tree.
         sha = tree.command_sha(argv, folder=folder) if folder is not None else None
@@ -183,7 +183,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                 if report_dir is not None:
                     remove_tree_quietly(report_dir)
                     report_dir = None
-                after = _guard("read the tree", lambda: tree.tree_id(cwd, objects=objects), None)
+                after = _guard("read the tree", lambda: _read_tree(cwd, objects, quiet=before is None), None)
                 known["changed"] = changed = _tree_changed(before, after)
                 if changed:
                     _guard("list the changed paths",
@@ -238,6 +238,14 @@ def _write_record(store: Path, meta: RunMeta, data) -> bool:
         return False
     emit(f"recorded {meta.id}, verdict {meta.verdict}.")
     return True
+
+
+def _read_tree(cwd: Path, objects: Path | None, *, quiet: bool = False) -> TreeId | None:
+    """The tree identity. When there is none, one line says why, unless ``quiet``."""
+    found, problem = tree.tree_state(cwd, objects=objects)
+    if found is None and not quiet:
+        emit(f"{problem}, so this run cannot prove a tree.")
+    return found
 
 
 def hash_inputs(top: Path, inputs: Sequence[str]) -> str | None:

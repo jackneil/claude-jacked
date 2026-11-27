@@ -145,7 +145,7 @@ def seen_command(inputs, any_machine, as_json, command):
         here = Path(_os.getcwd())
         top = _record.work_tree_top(here)
         folder = _tree.work_folder(here)
-        current = _tree.tree_id(top)
+        current, problem_tree = _tree.tree_state(top)
         machine_id, problem = _machine.identity()
         if machine_id is None and not any_machine:
             _model.emit(f"{problem} seen cannot match a run of this machine with no identity. "
@@ -156,7 +156,7 @@ def seen_command(inputs, any_machine, as_json, command):
                                  inputs_sha=_run.hash_inputs(top, inputs),
                                  machine_id=machine_id, any_machine=any_machine)
         else:
-            _model.emit("this repository has no tree identity (no commit, or git failed).")
+            _model.emit(f"{problem_tree}, so seen cannot prove a tree.")
     except _tree.TreeError:
         _model.emit("this folder is not in the work tree of a git repository.")
     except Exception as exc:  # noqa: BLE001 -- an unknown answer is "not seen", never a traceback
