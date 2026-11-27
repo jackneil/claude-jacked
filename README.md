@@ -744,7 +744,7 @@ A full test gate can take many minutes. A session often runs it again on a tree 
 jacked tests run --kind full -- uv run python -m pytest -n auto --junitxml={junit}
 jacked tests seen -- uv run python -m pytest -n auto --junitxml={junit}   # exit 0: this tree passed
 jacked tests profile               # the slowest files and tests of the newest full run
-jacked tests history --size        # verdicts, failing sets, flaky tests, repeat green runs
+jacked tests history               # verdicts, failing sets, flaky tests, repeat green runs, size
 jacked tests loss                  # tests that the change removes or weakens, against the merge base with origin/HEAD
 jacked tests record --junit report.xml --exit-code 0 --machine ci   # a run that run did not wrap
 jacked tests prune --dry-run --before 2026-01-01   # prints the runs that it would delete
@@ -766,7 +766,7 @@ fi
 
 **Where the history is.** The runs are in the `jacked-tests` folder of the common git directory of the clone (run `git rev-parse --git-common-dir` to find it). All linked worktrees share it, and git never commits it. A run holds test IDs, times, states and the SHA-256 of the command, never a failure message, test output or the command text. jacked deletes nothing automatically. To delete runs, run `jacked tests prune --before YYYY-MM-DD`, or delete the `jacked-tests` folder. To see which runs a prune deletes, run `jacked tests prune --dry-run --before YYYY-MM-DD`.
 
-**Limits.** `seen` does not see a change to a file that git ignores. Give such files with `run --input GLOB`. A glob that matches a folder adds each file below it. Then give the same globs with `seen --input GLOB`. `seen` also does not see a change inside a submodule. A gate that writes a file that git sees cannot prove a tree. Add the cache folders of the gate to `.gitignore`. See the "Gate recorder" section of `jacked/data/rules/jacked-reference.md` for each command, the jest-junit settings and the rule for a red gate.
+**Limits.** `seen` does not see a change to a file that git ignores. Give such files with `run --input GLOB`. A glob that matches a folder adds each file below it. Then give the same globs with `seen --input GLOB`. `seen` also does not see a change inside a submodule, or an environment variable that selects tests (for example `PYTEST_ADDOPTS`). A gate that writes a file that git sees cannot prove a tree. Add the cache folders of the gate to `.gitignore`. See the "Gate recorder" section of `jacked/data/rules/jacked-reference.md` for each command, the jest-junit settings and the rule for a red gate.
 
 ### QA Browser Testing
 

@@ -1257,3 +1257,24 @@ def test_a_hash_field_that_is_not_64_hex_reads_as_none(tmp_path, field):
     path.write_bytes(json.dumps(raw).encode("utf-8"))
     [back] = history.iter_runs(tmp_path)
     assert getattr(back, field) == ("unavailable" if field == "inputs_sha" else None)
+
+
+def test_a_damaged_record_line_names_the_cause(tmp_path, capsys):
+    meta = _meta(history.new_run_id())
+    history.write_run(tmp_path, meta, None)
+    path = tmp_path / "runs" / f"{meta.id}.meta.json"
+    raw = json.loads(path.read_bytes())
+    raw["counts"] = "x"
+    path.write_bytes(json.dumps(raw).encode("ascii"))
+    assert list(history.iter_runs(tmp_path)) == []
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1 and "counts is not a map of numbers" in err
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a folder in place of a file reads differently on Windows")
+def test_a_meta_file_that_cannot_be_read_gives_a_cause_with_no_path(tmp_path, capsys):
+    run_id = history.new_run_id()
+    (tmp_path / "runs" / f"{run_id}.meta.json").mkdir(parents=True)
+    assert list(history.iter_runs(tmp_path)) == []
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1 and "Error" in err and str(tmp_path) not in err

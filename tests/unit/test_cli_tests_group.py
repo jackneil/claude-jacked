@@ -301,3 +301,28 @@ def test_cli_seen_outside_a_repository_prints_one_line(tmp_path, monkeypatch):
     assert result.exit_code == 1 and len(result.stderr.splitlines()) == 1
     assert "this tree" not in result.stderr
 
+
+
+def test_cli_seen_prints_the_escaped_message_of_an_unknown_error(repo, monkeypatch):
+    from jacked.testdiet import record as _record
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("bad\nline")
+
+    monkeypatch.setattr(_record, "seen_answer", broken)
+    result = _invoke("tests", "seen", "--", *gate(GREEN, 0))
+    assert result.exit_code == 1 and len(result.stderr.splitlines()) == 1
+    assert "RuntimeError: bad\\nline" in result.stderr
+
+
+def test_cli_record_with_no_machine_says_the_run_is_filed_under_this_machine(repo):
+    result = _invoke("tests", "record", "--junit", str(GREEN))
+    lines = [line for line in result.stderr.splitlines() if "this machine" in line]
+    assert result.exit_code == 0 and len(lines) == 1 and "--machine" in lines[0]
+    assert "this machine" not in _invoke("tests", "record", "--junit", str(GREEN), "--machine", "ci").stderr
+
+
+def test_cli_history_prints_the_size_line_by_default(repo):
+    _invoke("tests", "run", "--", *gate(GREEN, 0))
+    out = _invoke("tests", "history").stdout
+    assert out.splitlines()[-1].startswith("size of the history: ") and out.rstrip().endswith(" bytes")

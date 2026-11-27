@@ -20,7 +20,6 @@ import json
 import os
 import re
 import secrets
-import sys
 import zlib
 from collections.abc import Iterable, Iterator
 from datetime import date, datetime, timedelta, timezone
@@ -28,7 +27,16 @@ from pathlib import Path
 
 from jacked.atomic_io import atomic_write_bytes
 from jacked.regular_file import open_regular_fd
-from jacked.testdiet.model import LABEL_RE, MACHINE_ID_RE, CaseResult, RunData, RunMeta, TreeId
+from jacked.testdiet.model import (
+    LABEL_RE,
+    MACHINE_ID_RE,
+    CaseResult,
+    RunData,
+    RunMeta,
+    TreeId,
+    emit,
+    error_text,
+)
 
 RUNS = "runs"
 META_SUFFIX = ".meta.json"
@@ -266,8 +274,7 @@ def _tree_from(value) -> TreeId | None:
 
 
 def _warn(name: str, exc: Exception) -> None:
-    print(f"jacked tests: skipped the damaged record {name} ({type(exc).__name__})",
-          file=sys.stderr)
+    emit(f"skipped the damaged record {name} ({error_text(exc)})")
 
 
 def iter_runs(store: Path) -> Iterator[RunMeta]:

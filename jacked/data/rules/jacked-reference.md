@@ -182,7 +182,7 @@ jacked tests run [--kind full|targeted] [--junit GLOB] [--input GLOB] [--label T
 jacked tests record --junit PATH [--exit-code N] [--wall SECONDS] [--commit SHA] [--machine LABEL] [--report-root PATH] [--started ISO] [--kind full|targeted] [--label TEXT] [--runner NAME]
 jacked tests seen [--input GLOB] [--any-machine] [--json] -- CMD...
 jacked tests profile [--run ID] [--machine LABEL] [--top N] [--json]
-jacked tests history [--machine LABEL] [--days N] [--size] [--json]
+jacked tests history [--machine LABEL] [--days N] [--json]
 jacked tests prune --before YYYY-MM-DD [--dry-run]
 jacked tests loss [--base REF] [--json]
 ```
@@ -202,7 +202,7 @@ jacked tests loss [--base REF] [--json]
   - A red run whose failing set is in an earlier record prints a notice. The notice gives the number of earlier records, the number of trees, and how many of the records are on the default branch. A count that some records do not hold prints as in `history`: `K (M not recorded)`, or `not recorded (N runs)`. Then it gives the failing test IDs and one line for each earlier record, by machine. It does not say whose defect it is. The last line points to "A red gate" in this reference.
   - Outside a git repository, the gate runs and jacked records nothing. The line says which git failure it is: no git program, a git call that does not answer, a repository that another user owns (git names `safe.directory`), or a folder outside a work tree. The line holds the first error line of git. The other commands print the same line and give exit 1.
   - Each output line of `jacked tests` is one line. A line break or a bidi control in a stored value (a test ID, a file name, the text of an error) prints as an escape, for example `\n` or `\u2028`.
-- `jacked tests record` records the JUnit files of a gate run that `run` did not wrap, for example a run on hosted CI. Without `--exit-code`, the verdict is `unknown`. `--machine LABEL` names the machine that ran the gate. `--report-root PATH` gives the root folder of the machine that wrote the report, so the reader can make the paths relative. `--started ISO` needs a time zone. The command prints `<run id> <verdict>`.
+- `jacked tests record` records the JUnit files of a gate run that `run` did not wrap, for example a run on hosted CI. Without `--exit-code`, the verdict is `unknown`. `--machine LABEL` names the machine that ran the gate. `--report-root PATH` gives the root folder of the machine that wrote the report, so the reader can make the paths relative. `--started ISO` needs a time zone. The command prints `<run id> <verdict>`. With no `--machine`, it also prints one line that says that the record is filed under this machine (`local`).
 - `jacked tests seen` looks for a wrapped run on this machine that proves that this tree passed this command. When it finds one, it prints one line that starts with `passed before:` and gives exit 0. When not, it prints one line and gives exit 1. That line names the nearest record and what to do: a run on another machine, a run with other `--input` files, a run of another command or in another folder, or only records of `record`.
   - A run proves it when all of these are true: `run` made it, its verdict is `passed`, and the gate did not change the tree. The tree hash, the command SHA-256 and the `--input` fingerprint must also be equal.
   - The newest run of the same tree, command, folder, inputs and machine decides. When that run did not pass, `seen` gives exit 1, and its line names that run and the cause. An older pass never hides a newer failure.
@@ -219,7 +219,7 @@ jacked tests loss [--base REF] [--json]
   - With no run in the history, `profile` gives exit 1, and its line says to run the gate with `jacked tests run` first. An unknown `--run` or `--machine` also gives exit 1. The line for an unknown `--machine` gives the machine labels in the history.
 - `jacked tests history` shows the runs of one machine.
   - It shows the verdict counts, the failing sets and the flaky tests. It also shows the trees that passed one command two times or more, and the labels of the other machines.
-  - `--days N` shows only the last N days. `--size` adds the size of the history in bytes.
+  - `--days N` shows only the last N days. The last line gives the size of the history in bytes, because jacked deletes nothing automatically.
   - A value that the record does not hold prints as text, never as 0. A count of a failing set that no run holds prints `not recorded (N runs)`. A count that only some runs hold prints `K (M not recorded)`. A size that jacked cannot read prints `the folder cannot be read`.
   - With no run in the history, `history` prints one line and gives exit 0. An unknown `--machine` gives exit 1.
 - `jacked tests prune --before YYYY-MM-DD` deletes each run whose UTC date is before that date. It prints `deleted <run id>` for each deleted run. Then it prints the number of runs that stay. With `--dry-run`, it prints `would delete <run id>` for each run, and it deletes nothing. jacked deletes nothing automatically.
@@ -245,6 +245,7 @@ A machine has a label: `local` for a run of `run`, or the value of `record --mac
 
 ### Limits of seen
 
+- The identity does not hold the environment. A variable that selects tests (for example `PYTEST_ADDOPTS="-k smoke"`, `CI=1`, or a jest or vitest selector) can make the same command run fewer tests. Then a run of fewer tests can prove the tree. Do not set such a variable for a gate whose run `seen` must prove.
 - The tree identity does not hold a file that git ignores. When the gate reads such a file, give it with `run --input GLOB`. Then give the same globs with `seen --input GLOB`.
 - The `--input` fingerprint holds the path, the size and the modification time in nanoseconds of each file. It does not hold the content. A glob that matches a folder adds each regular file below that folder, hidden files too. It does not follow a symbolic link. A glob that matches no regular file gives one line in `run` and in `seen`.
 - The tree identity does not hold a change inside the work tree of a submodule.

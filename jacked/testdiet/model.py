@@ -82,6 +82,26 @@ def clean_text(text: str) -> str:
     return "".join(ch for ch in text if ch in "\n\t" or unicodedata.category(ch) != "Cc")
 
 
+def error_text(exc: BaseException) -> str:
+    """The class and the cause of ``exc`` for one output line.
+
+    An ``OSError`` can hold a path, so it gives the class, the errno name and
+    the system text of the errno, never the path. Another error gives its
+    class and its message, escaped by ``one_line``.
+
+    >>> error_text(PermissionError(13, "Permission denied", "/home/u/x"))
+    'PermissionError(EACCES): Permission denied'
+    >>> error_text(ValueError("a\\nb"))
+    'ValueError: a\\\\nb'
+    """
+    from jacked.public_errors import describe, os_error_reason
+
+    if isinstance(exc, OSError):
+        return f"{describe(exc)}: {os_error_reason(exc)}"
+    message = one_line(str(exc))
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
 def emit(message: str) -> None:
     """Print one message on standard error, as one line, with the prefix and no control characters.
 

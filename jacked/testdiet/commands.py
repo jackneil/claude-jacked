@@ -6,6 +6,7 @@ inside the function, so ``jacked --help`` does not load the recorder.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import click
@@ -116,6 +117,9 @@ def record_command(junit, kind, label, runner, exit_code, wall, commit, machine,
     except (JUnitError, TreeError, OSError, ValueError) as exc:
         _model.emit(f"nothing is recorded: {exc}")
         raise SystemExit(1)
+    if machine is None:
+        _model.emit("the record has no --machine, so it is filed under this machine (local). "
+                    "Give --machine LABEL for a run of another machine.")
     click.echo(f"{meta.id} {meta.verdict}")
 
 
@@ -186,7 +190,8 @@ def _seen_answer(command: list[str], inputs, any_machine: bool):
     except _tree.TreeError as exc:
         _model.emit(f"{exc}.")
     except Exception as exc:  # noqa: BLE001 -- an unknown answer is "not seen", never a traceback
-        _model.emit(f"cannot check the history ({type(exc).__name__}). The answer is: not seen.")
+        logging.getLogger(__name__).debug("seen: the check failed", exc_info=True)
+        _model.emit(f"cannot check the history ({_model.error_text(exc)}). The answer is: not seen.")
     return None
 
 
@@ -229,8 +234,7 @@ def profile_command(run_id, machine, top, as_json):
 @click.option("--days", type=click.IntRange(min=0), default=None, metavar="N",
               help="Show only the runs of the last N days.")
 @click.option("--json", "as_json", is_flag=True, help="Print every row as JSON.")
-@click.option("--size", is_flag=True, help="Also print the size of the history in bytes.")
-def history_command(machine, days, as_json, size):
+def history_command(machine, days, as_json):
     """Show the runs of one machine: verdicts, failing sets, flaky tests and green repeats."""
     from jacked.testdiet import views as _views
 
@@ -240,7 +244,7 @@ def history_command(machine, days, as_json, size):
     except _views.ViewError as exc:
         _model.emit(str(exc))
         raise SystemExit(1)
-    click.echo(_views.to_json(result) if as_json else _views.render_history(result, size=size))
+    click.echo(_views.to_json(result) if as_json else _views.render_history(result))
 
 
 @recorder_group.command(name="prune")

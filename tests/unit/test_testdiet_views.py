@@ -182,7 +182,7 @@ def test_no_view_prints_a_machine_id(store, capsys):
     for machine in (None, "ci"):
         p = views.profile(store, machine=machine, top=None)
         h = views.history(store, machine=machine)
-        print(views.render_profile(p), views.to_json(p), views.render_history(h, size=True),
+        print(views.render_profile(p), views.to_json(p), views.render_history(h),
               views.to_json(h))
     out, err = capsys.readouterr()
     for text in (out, err):
@@ -285,9 +285,7 @@ def test_cli_prune_prints_each_run_that_it_deletes(repo, monkeypatch):
 def test_cli_views_outside_a_work_tree_and_with_no_run(repo, tmp_path, monkeypatch):
     # An empty history is not an error for history. It is for profile.
     empty = _invoke("tests", "history")
-    assert (empty.exit_code, empty.output) == (0, "the history has no run.\n")
-    sized = _invoke("tests", "history", "--size")
-    assert (sized.exit_code, sized.output) == (0, "the history has no run.\nsize of the history: 0 bytes\n")
+    assert (empty.exit_code, empty.output) == (0, "the history has no run.\nsize of the history: 0 bytes\n")
     data = json.loads(_invoke("tests", "history", "--json").output)
     assert (data["machine"], data["runs"], data["failing_sets"]) == (None, 0, [])
     assert set(data["verdicts"].values()) == {0}
@@ -312,11 +310,10 @@ def test_cli_views_outside_a_work_tree_and_with_no_run(repo, tmp_path, monkeypat
         assert result.exit_code == 1 and "not in the work tree" in result.output
 
 
-def test_cli_history_prints_the_size_with_the_size_flag(store, repo):
+def test_cli_history_prints_the_size_of_the_store(store, repo):
     shutil.copytree(store / history.RUNS, tree.store_dir(repo) / history.RUNS)
     size = sum(p.stat().st_size for p in (store / history.RUNS).iterdir())
-    assert f"size of the history: {size} bytes" in _invoke("tests", "history", "--size").output
-    assert "size of the history" not in _invoke("tests", "history").output
+    assert _invoke("tests", "history").output.splitlines()[-1] == f"size of the history: {size} bytes"
     data = json.loads(_invoke("tests", "history", "--json", "--machine", "ci").output)
     assert data["machine"] == "ci" and data["size_bytes"] == size
 
@@ -437,7 +434,7 @@ def test_no_command_prints_a_machine_id(store, repo):
         ("profile", "--machine", "ci", "--json"), ("profile", "--run", ci_run, "--json"),
         ("profile", "--run", ci_run, "--machine", "local"), ("profile", "--machine", "nobody"),
         ("profile", "--run", "20200101T000000000000Z-00000000"), ("profile", "--run", "bad"),
-        ("history",), ("history", "--json", "--size"), ("history", "--machine", "ci"),
+        ("history",), ("history", "--json"), ("history", "--machine", "ci"),
         ("history", "--machine", "ci", "--json"), ("history", "--machine", "nobody"),
         ("history", "--days", "1", "--json"), ("prune", "--before", "2000-01-01"),
     ]
@@ -501,10 +498,10 @@ def test_profile_repeat_line_with_no_wall_time_says_no_time_recorded(store):
 def test_history_size_line_of_a_folder_that_cannot_be_read(store):
     result = views.history(store)
     result["size_bytes"] = None
-    line = _one_line(views.render_history(result, size=True), "size of the history")
+    line = _one_line(views.render_history(result), "size of the history")
     assert line == "size of the history: the folder cannot be read"
     result["size_bytes"] = 0
-    assert _one_line(views.render_history(result, size=True), "size of") == "size of the history: 0 bytes"
+    assert _one_line(views.render_history(result), "size of") == "size of the history: 0 bytes"
 
 
 def test_history_failing_set_counts_that_only_some_runs_hold(store):

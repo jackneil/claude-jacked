@@ -370,14 +370,14 @@ def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
     return clean_text("\n".join(lines))
 
 
-def render_history(result: dict, *, size: bool = False) -> str:
-    """The text output of ``history``. ``size`` adds the size of the store.
+def render_history(result: dict) -> str:
+    """The text output of ``history``. The last line gives the size of the store.
 
-    A store with no run gives one line (and the size line with ``size``).
+    A store with no run gives one line and the size line.
     """
     size_bytes = result["size_bytes"]
     size_text = "the folder cannot be read" if size_bytes is None else f"{_num(size_bytes)} bytes"
-    size_line = [f"size of the history: {size_text}"] if size else []
+    size_line = [f"size of the history: {size_text}"]
     if result["store_runs"] == 0:
         return clean_text("\n".join([NO_RUN, *size_line]))
     lines = list(result["notes"])
