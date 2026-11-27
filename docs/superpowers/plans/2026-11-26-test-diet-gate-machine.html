@@ -444,7 +444,8 @@ decisions remove them, and the two have different sources:</p>
     <tr><td>G3: cadence and the leak sweep</td><td>Targeted tests per task with the
     <code>grep -rl</code> hits, the scanner, help-copy and pin tests; one full suite at the end
     through <code>jacked tests run --kind full</code>; <code>/dcr</code> beside it; a local sweep
-    for machine names before the pull request.</td><td>Tasks 3 to 5</td></tr>
+    for machine names before the first push; hosted CI before the live proofs, so the Windows code
+    first runs on a hosted runner, not on the owner's machine.</td><td>Tasks 3 to 5</td></tr>
     <tr><td>R1: reuse and small items</td><td>A copy of the remove rule with a Windows test; the
     processor time of the gate only; a <code>setup_seconds</code> field; two machine identities
     accepted and stated; no shell layer for the gate.</td><td>Decisions "The machine identity",
@@ -689,7 +690,9 @@ live").</p>
     header, the bundle, a byte after the bundle that is not the heartbeat byte). 66: Python is older
     than the floor; one line names the two versions. 75: stopped, no verdict. Never 2, which is
     Python's own code for a file that it cannot open. The exit code of the gate travels in the
-    result line, never as the exit code of the driver or of <code>ssh</code>.</td><td>The local
+    result line, never as the exit code of the driver or of <code>ssh</code>. Each other exit code
+    of <code>ssh</code> or of the driver (for example 127, when the remote shell finds no Python)
+    gives exit 75 and one line with the code, the label and the log path.</td><td>The local
     side must tell "no driver" from "a refused value", and the exit 255 of <code>ssh</code> from a
     gate code.</td></tr>
     <tr><td>Root on the gate machine</td><td><code>~/.jacked-gate</code>, resolved by the driver
@@ -722,22 +725,31 @@ live").</p>
     <tr><td>Sending the commit</td><td><code>have REPO</code> gives the tips of
     <code>refs/jacked/keep/*</code> of the gate clone, one SHA on each line, and nothing else. The
     local side checks each element: the SHA grammar first; then one <code>git cat-file
-    --batch-check</code> with the elements on standard input keeps the commits of the local
-    repository; then <code>git merge-base --is-ancestor --end-of-options &lt;tip&gt;
-    &lt;sent&gt;</code> for each one that is left. An element that fails a check is dropped with one
-    printed line. The local side makes a temporary ref <code>refs/jacked/gate/&lt;RUN&gt;</code>,
-    makes a bundle of that ref with <code>git bundle create ... --stdin</code> (the ref and each
-    kept tip as <code>^&lt;sha&gt;</code> on standard input), and deletes the ref.</td><td>A bundle
+    --batch-check</code> with the elements on standard input keeps each element whose type is
+    <code>commit</code> in the local repository. An element that fails a check is dropped with one
+    printed line. A kept tip need not be an ancestor of the sent commit: the remote holds each
+    commit that a tip reaches, so a tip of a different branch still removes the shared history from
+    the bundle. When <code>git merge-base --is-ancestor --end-of-options &lt;sent&gt;
+    &lt;tip&gt;</code> holds for a kept tip, the gate clone already holds the sent commit: the
+    header gives <code>bundle_size</code> 0 and no bundle follows (git refuses to make an empty
+    bundle). Else the local side makes a temporary ref <code>refs/jacked/gate/&lt;RUN&gt;</code>,
+    makes a bundle with <code>git bundle create &lt;file&gt; --stdin</code> (the ref, and each kept
+    tip as <code>^&lt;sha&gt;</code>, on standard input), and deletes the ref.</td><td>A bundle
     needs a ref name. A <code>have</code> answer of <code>--all</code> fails the grammar, which
     comes first: <code>git rev-list --stdin</code> accepts pseudo-options from standard input since
-    Git 2.42. The tips are few, because the driver keeps only the keep refs that no other keep ref
-    contains.</td></tr>
+    Git 2.42. An ancestor rule would drop the only tip after each branch change or rebase, because
+    the driver deletes the keep refs that a newer one contains, and each such run would send the
+    full history. A false tip costs nothing: the fetch fails on a missing prerequisite, and the run
+    gives exit 75. Checked on 2026-11-26 with git 2.54 in a scratch repository: a
+    <code>^&lt;tip&gt;</code> of a sibling branch gives a bundle whose prerequisite is the merge
+    base.</td></tr>
     <tr><td>The header</td><td>The first line of standard input of <code>gate</code> is one JSON
     object: <code>command</code> (the argv list), <code>setup</code> (a string, or null),
     <code>env</code> (key to value), <code>junit</code> (globs relative to the worktree folder),
     <code>folder</code> (the gate folder relative to the top of the work tree, "." at the top),
     <code>workers</code>, <code>priority</code>, <code>min_free_mb</code> (or null),
-    <code>bundle_size</code> (bytes), <code>silence_seconds</code>. Then the bundle bytes. Then one
+    <code>bundle_size</code> (bytes; 0 when the gate clone already holds the commit),
+    <code>silence_seconds</code>. Then the bundle bytes. Then one
     heartbeat byte, <code>.</code>, each 15 seconds, until the result ends. The driver refuses a
     line longer than 1 MiB; a glob or a folder that is absolute, that holds a <code>..</code>
     part or a backslash; an env key that does not match <code>[A-Za-z_][A-Za-z0-9_]*</code> or
@@ -755,10 +767,13 @@ live").</p>
     environment <code>GIT_TERMINAL_PROMPT=0</code>. The bundle goes into
     <code>refs/jacked/gate/&lt;RUN&gt;</code>. The worktree is <code>runs/&lt;RUN&gt;/tree</code>,
     made with <code>git worktree add --detach</code>. The driver checks that its <code>HEAD</code>
-    is the sent SHA. Then <code>git update-ref</code> moves the ref to
-    <code>refs/jacked/keep/&lt;SHA&gt;</code> (one ref for each sent commit), and the driver
-    deletes each keep ref that <code>git for-each-ref --merged=&lt;SHA&gt;
-    refs/jacked/keep/</code> lists, other than the new one. The gate runs in
+    is the sent SHA. With <code>bundle_size</code> 0, there is no gate ref: the driver first checks
+    <code>git cat-file -e &lt;SHA&gt;^{commit}</code> (a protocol error when it fails), and adds the
+    worktree from the SHA. Then <code>git update-ref refs/jacked/keep/&lt;SHA&gt; &lt;SHA&gt;</code>
+    makes the keep ref (one ref for each sent commit), <code>git update-ref -d</code> deletes
+    <code>refs/jacked/gate/&lt;RUN&gt;</code>, and the driver deletes each keep ref that
+    <code>git for-each-ref --merged=&lt;SHA&gt; refs/jacked/keep/</code> lists, other than the new
+    one (the list holds the new one too). The gate runs in
     <code>runs/&lt;RUN&gt;/tree/&lt;folder&gt;</code>.</td><td>Nothing of a repository runs on a
     fetch or a worktree add. No git process of the driver outlives it as a detached automatic gc.
     The keep refs are a cache: a deleted one costs one larger bundle, and no data. A keep ref that a
@@ -844,6 +859,10 @@ live").</p>
     watch thread also runs while the result is written: when <code>silence_seconds</code> pass with
     no beat in that phase, it ends the driver with <code>os._exit(75)</code>. Nothing is left on
     the disk at that point.
+    <br><strong>The reads before the gate have the same limit.</strong> The input thread starts
+    with the first read: a stall of 60 seconds (or of <code>silence_seconds</code> when the header
+    is read) in the header or the bundle ends the run as a protocol error. So a link that dies
+    during the upload does not hold the run folder and its lock either.
     <br><strong>The time line</strong> after the last beat: at most <code>silence_seconds</code>
     (60), plus 1 second for the check, plus 10 seconds of grace (POSIX). So no process of the gate
     is left after 71 seconds. At the end of input the stop starts at once.</td><td>A laptop lid or
@@ -985,11 +1004,12 @@ live").</p>
   the changed modules. Run them with <code>uv run python -m pytest</code>, serial, in the form
   <code>cmd &gt; log 2&gt;&amp;1; rc=$?</code>, and quote the summary line of the log. Run
   <code>uptime</code> first; above a load of about 15, wait. The one full suite runs at the end
-  (5.3), through <code>jacked tests run --kind full</code>, with <code>/dcr</code> beside it.
+  (5.1), through <code>jacked tests run --kind full</code>, with <code>/dcr</code> beside it.
 </aside>
 
 <h3>Task 1: the tripwire, the archive and the driver: grammar, root, <code>install</code>, <code>probe</code>, <code>have</code></h3>
-<p><strong>Files.</strong> Modify <code>tests/conftest.py</code>. Create
+<p><strong>Files.</strong> Modify <code>tests/conftest.py</code> and the pytest
+<code>markers</code> of <code>pyproject.toml</code>. Create
 <code>tests/unit/test_ssh_tripwire.py</code>; in <code>jacked/testdiet/gate_driver/</code>:
 <code>__init__.py</code>, <code>archive_main.py</code>, <code>cli.py</code>,
 <code>grammar.py</code>, <code>root.py</code>, <code>probe.py</code>, <code>files.py</code>, and
@@ -1011,9 +1031,13 @@ def build_driver() -> tuple[bytes, str]                 # jacked/testdiet/driver
   <code>call</code> and <code>check_output</code>) and fails the test when the program, after
   <code>os.path.basename</code> and the removal of <code>.exe</code>, is <code>ssh</code> or
   <code>scp</code>. The opt-out is the marker <code>real_ssh</code>, which no test of this plan
-  uses. Its shape follows the tripwire <code>_no_real_service_processes</code>. HOME isolation is
-  not enough: OpenSSH on POSIX finds <code>~/.ssh</code> from the password entry, not from
-  <code>$HOME</code>. Write <code>test_ssh_tripwire.py</code>, run it (FAIL), add the fixture, run
+  uses; register it in the <code>markers</code> list of <code>pyproject.toml</code>. It is its own
+  fixture, so the marker <code>real_process</code> of the tripwire
+  <code>_no_real_service_processes</code> does not open it; its shape follows that tripwire. HOME
+  isolation is not enough: OpenSSH on POSIX finds <code>~/.ssh</code> from the password entry, not
+  from <code>$HOME</code>. Checked on 2026-11-26: no module of <code>jacked/</code> and no test
+  starts <code>ssh</code> or <code>scp</code> (<code>jacked/cli.py</code> names them only in a
+  table of command descriptions), so the tripwire breaks no current test. Write <code>test_ssh_tripwire.py</code>, run it (FAIL), add the fixture, run
   it (PASS).</li>
   <li><input type="checkbox" disabled> 1.2 Write the failing tests below. Run them. Expected:
   FAIL.</li>
@@ -1068,7 +1092,8 @@ driver test files.</p>
   <li><input type="checkbox" disabled> 2.2 Implement.</li>
   <li><input type="checkbox" disabled> 2.3 Run the targeted set of the cadence callout, then the
   two driver test files under <code>uv run --python 3.11</code>. Expected: PASS. The macOS and
-  Windows parts get their proof on the macOS and Windows legs of hosted CI (5.3).</li>
+  Windows parts get their first run on the macOS and Windows legs of hosted CI (5.3), before any
+  live proof.</li>
   <li><input type="checkbox" disabled> 2.4 Commit: <code>feat(testdiet): a gate lives as long as
   its connection</code>.</li>
 </ul>
@@ -1172,7 +1197,9 @@ def test_a_result_for_a_different_commit_returns_75(repo, tmp_path): ...
 def test_a_different_machine_under_the_label_returns_75_and_names_the_accept_command(repo, tmp_path, capsys): ...  # S4: a second root
 def test_probe_accept_stores_the_new_identity(repo, tmp_path): ...
 def test_a_junit_file_with_a_doctype_from_the_gate_machine_gives_no_test_data(repo, tmp_path): ...
-def test_a_have_answer_that_is_not_an_ancestor_is_dropped_and_printed(repo, tmp_path, capsys): ...   # focus 2
+def test_a_have_answer_that_is_not_a_commit_here_is_dropped_and_printed(repo, tmp_path, capsys): ...   # focus 2
+def test_a_tip_of_a_different_branch_still_makes_a_small_bundle(repo, tmp_path): ...
+def test_a_commit_that_the_gate_clone_holds_sends_no_bundle(repo, tmp_path): ...       # bundle_size 0
 def test_the_alias_the_remote_root_and_the_identity_are_never_printed_or_recorded(repo, tmp_path, capsys): ...
 def test_machines_list_and_probe_print_no_machine_identity(tmp_path, capsys): ...  # S1
 @pytest.mark.parametrize("entry", BAD_ENTRIES)   # ssh "-x", "u@h", "h:22", "a/b", "a b"; python ".", "-c"; label "local"
@@ -1215,28 +1242,34 @@ def test_the_ssh_and_scp_lines_have_the_fixed_options_and_no_value_outside_the_g
 of the section <a href="#owner-proofs">"Proofs that only the owner's machines can give"</a> for
 that machine and gets the owner's go-ahead for that machine. A go-ahead for one machine does not
 carry to the other.</p>
+<p>The order puts hosted CI before the live proofs. So the Windows-only code (the job, the
+leader, the <code>msvcrt</code> lock) first runs on the Windows leg of hosted CI, and only then on
+the owner's Windows machine. It is still one full gate and one CI run.</p>
 <ul class="tasks">
-  <li><input type="checkbox" disabled> 5.1 A POSIX gate machine. <strong>Waits on the
-  owner:</strong> which Linux host. Each proof of the table for this machine, and these: a green
-  and a red gate of this repository; the record with the label; <code>seen --on</code> exit 0
-  and 1; <code>gc</code>.</li>
-  <li><input type="checkbox" disabled> 5.2 The owner's Windows machine, at priority
-  <code>low</code> with a floor that the owner sets. Each proof of the table for this machine, and
-  the same checks as 5.1.</li>
-  <li><input type="checkbox" disabled> 5.3 The one full suite of this branch, in the form
-  <code>jacked tests run --kind full [--on &lt;POSIX label&gt;] -- uv run python -m pytest -n auto
-  --junitxml={junit} &gt; log 2&gt;&amp;1; rc=$?</code>, with <code>--on</code> only after the
-  owner's go-ahead for that machine (then it is a live proof too). Quote the summary line of the
-  log. <code>/dcr</code> runs beside this gate as a read-only review, not after it. A review fix
-  that changes code costs one more targeted run and one more full gate.</li>
-  <li><input type="checkbox" disabled> 5.4 Before the first push, a local sweep of the branch diff
-  and its commit messages (<code>git log -p &lt;merge base&gt;..HEAD</code>) for each
+  <li><input type="checkbox" disabled> 5.1 The one full suite of this branch, in the form
+  <code>jacked tests run --kind full -- uv run python -m pytest -n auto --junitxml={junit} &gt; log
+  2&gt;&amp;1; rc=$?</code>. Quote the summary line of the log. <code>/dcr</code> runs beside this
+  gate as a read-only review, not after it. A review fix that changes code costs one more targeted
+  run and one more full gate.</li>
+  <li><input type="checkbox" disabled> 5.2 Before each push, a local sweep of the branch diff and
+  its commit messages (<code>git log -p &lt;merge base&gt;..HEAD</code>) for each
   <code>ssh</code> value of the local machine list, each Tailscale name and each remote user name.
   Expected: zero hits. The sweep runs locally, prints only counts, and writes nothing to the
   repository. This repository is public, so a hit stops the push.</li>
-  <li><input type="checkbox" disabled> 5.5 <code>/pr</code>: push, open the pull request, and let
-  hosted CI run on the three systems. Quote the "N passed" line of each leg. Stop at the pull
-  request.</li>
+  <li><input type="checkbox" disabled> 5.3 <code>/pr</code>: push, open the pull request, and let
+  hosted CI run on the three systems. Quote the "N passed" line of each leg. A red leg gets a fix
+  with its targeted tests, and only the failing CI step runs again.</li>
+  <li><input type="checkbox" disabled> 5.4 A POSIX gate machine. <strong>Waits on the
+  owner:</strong> which Linux host, and the go-ahead for it. Each proof of the table for this
+  machine, and these: a green and a red gate of this repository; the record with the label;
+  <code>seen --on</code> exit 0 and 1; <code>gc</code>; and the full suite of this branch through
+  <code>run --on</code>.</li>
+  <li><input type="checkbox" disabled> 5.5 The owner's Windows machine, at priority
+  <code>low</code> with a floor that the owner sets, after the go-ahead for it. Each proof of the
+  table for this machine, and the same checks as 5.4.</li>
+  <li><input type="checkbox" disabled> 5.6 When a live proof needs a code change: its targeted
+  tests, one more full gate in the form of 5.1, the sweep of 5.2, the push, and the failing CI step
+  again. Stop at the pull request.</li>
 </ul>
 
 <h2 id="owner-proofs">Proofs that only the owner's machines can give</h2>
@@ -1314,7 +1347,7 @@ want to pay that much" ([machine] is the owner's own Windows machine; the spec t
 answers (2026-11-26)", row "The gate machine"). So the choices are managed runners or the owner's
 Windows machine; a rented box is not chosen. The owner picks, and approves the account and the
 cost.</p>
-<p>When a machine of this lane is also a POSIX gate machine of Task 5.1, the gate over SSH uses a
+<p>When a machine of this lane is also a POSIX gate machine of Task 5.4, the gate over SSH uses a
 second user, so a gate and a CI job never share files.</p>
 <p>The setup is a separate runbook that the main session writes after the owner picks, and walks
 before it hands it over. It holds: the operating system and Docker; a supervisor that starts the
@@ -1327,6 +1360,11 @@ step that writes to the machine is named before it runs, and needs the owner's g
   <li><strong>The provider of the runner lane.</strong> Managed runners or the owner's Windows
   machine. The owner picks.</li>
   <li><strong>The POSIX leg of the live proof.</strong> Which Linux host.</li>
+  <li><strong>The time limit of the acceptance item "Gate machine".</strong> It says that no
+  process of the gate stays "after 60 seconds". With the ruled 60 seconds of silence, the real
+  bound is 71 seconds after the last heartbeat (60 s, 1 s for the check, 10 s of grace), and the
+  live proof waits 75 seconds. The lead decides: a new text for the acceptance item, or a shorter
+  silence limit.</li>
 </ul>
 
 <hr>
