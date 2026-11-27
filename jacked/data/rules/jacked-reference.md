@@ -187,7 +187,7 @@ jacked tests prune --before YYYY-MM-DD
 jacked tests loss [--base REF] [--json]
 ```
 
-- `jacked tests run` runs CMD, records the run, and returns the exit code of CMD. A recorder error never changes that code. The one exception is `--strict`: it gives exit 1 when the gate returns 0 and the report holds failures. When CMD cannot start, the exit code is 127. When signal N stops CMD, the exit code is 128 plus N. Put the options before CMD. Put `--` between the options and CMD.
+- `jacked tests run` runs CMD, records the run, and returns the exit code of CMD. A recorder error never changes that code. The one exception is `--strict`: it gives exit 1 when the gate returns 0 and the report holds failures. When CMD cannot start, the exit code is 127. When signal N stops CMD, the exit code is 128 plus N. A SIGTERM or a SIGHUP to `run` goes on to CMD. Under `nohup`, SIGHUP stays ignored for CMD, as with `nohup CMD`. Put the options before CMD. Put `--` between the options and CMD.
   - The placeholder `{junit}`: an argument that holds the text `{junit}` gets the path of a private report file. `run` makes a private temporary folder for it, reads the report after the gate, and then removes the folder. The record holds the SHA-256 of the arguments as you typed them, so the path does not change the identity of the command.
   - A command with no `{junit}` and a run with no `--junit` have no report. Then `run` prints one line before the gate: the run cannot prove a tree.
   - After each record, `run` prints one line: `recorded <run id>, verdict <verdict>.`

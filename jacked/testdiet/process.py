@@ -67,10 +67,17 @@ class Signals:
         self._old: dict = {}
 
     def install(self) -> None:
+        """Set the handlers. A signal that this process ignores (``nohup``) stays ignored.
+
+        The gate then inherits the ignore, as it does with ``nohup <gate>``, and
+        that signal is not sent on.
+        """
         if os.name == "nt" or threading.current_thread() is not threading.main_thread():
             return
         for signum in _FORWARDED:
             try:
+                if signal.getsignal(signum) is signal.SIG_IGN:
+                    continue
                 self._old[signum] = signal.signal(signum, self._handle)
             except (ValueError, OSError):
                 continue

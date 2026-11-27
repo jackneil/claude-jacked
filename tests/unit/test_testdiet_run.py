@@ -1087,3 +1087,26 @@ def test_the_tree_state_bounds_the_git_detail(repo, monkeypatch):
     monkeypatch.setattr(tree, "git", failing_add)
     found, problem = tree.tree_state(repo)
     assert found is None and "git add exited with 128" in problem and len(problem) < 400
+
+
+@POSIX
+def test_an_ignored_sighup_stays_ignored_for_the_gate_and_is_not_forwarded(repo, side):
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("a signal handler needs the main thread")
+    got = side / "sighup.txt"
+    probe = ("import signal, sys; open(sys.argv[1], 'w').write(str(int(signal.getsignal(signal.SIGHUP))))")
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        assert run.run_gate([sys.executable, "-c", probe, str(got)], cwd=repo) == 0
+        restored = signal.getsignal(signal.SIGHUP)
+        signals = process.Signals()
+        signals.install()
+        try:
+            assert signal.SIGHUP not in signals._old
+            assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+        finally:
+            signals.restore()
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+    assert got.read_text(encoding="utf-8") == str(int(signal.SIG_IGN))
+    assert restored is signal.SIG_IGN
