@@ -876,3 +876,13 @@ def test_a_script_file_that_is_not_a_test_file_name_is_not_read(repo):
     # The shortest default names: jest collects a bare test.js or spec.ts. No default runner collects x_test.ts.
     assert loss.scan_kind("src/test.js") and loss.scan_kind("spec.ts") and loss.scan_kind("a.b.test.cjs")
     assert not loss.scan_kind("src/x_test.ts") and not loss.scan_kind("src/footest.ts")
+
+
+def test_a_long_git_error_in_loss_is_cut_at_300_characters(repo, monkeypatch):
+    def fail(*args, **kwargs):
+        raise loss.tree._AddError("git add exited with 128", "fatal: " + "y" * 5000)
+
+    monkeypatch.setattr(loss.tree, "read_tree_id", fail)
+    with pytest.raises(loss.LossError) as caught:
+        loss.loss_report(repo)
+    assert str(caught.value).count("y") <= 300

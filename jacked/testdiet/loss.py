@@ -195,7 +195,7 @@ def loss_report(cwd: Path, base: str | None = None) -> LossReport:
         except tree.TreeError as exc:
             detail = getattr(exc, "detail", "")
             raise LossError(f"git cannot give the tree of the work tree ({exc}"
-                            + (f": {one_line(detail)})" if detail else ")")) from exc
+                            + (f": {one_line(detail[:tree.DETAIL_CHARS])})" if detail else ")")) from exc
         if head is None:
             raise LossError("git cannot give the tree of the work tree")
         env = tree.object_env(top, objects)

@@ -1212,7 +1212,11 @@ def test_a_dubious_ownership_refusal_names_safe_directory(repo, monkeypatch):
     monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
     with pytest.raises(tree.GitRefused) as caught:
         tree.work_tree_top(repo)
-    assert "safe.directory" in str(caught.value) and "dubious ownership" in str(caught.value)
+    text = str(caught.value)
+    assert "safe.directory" in text and "dubious ownership" in text
+    # The caution comes first, and the trust command is conditional on it.
+    caution = text.index("only when you trust its owner")
+    assert caution < text.index("git config --global") and "filter drivers" in text
 
 
 def test_git_that_is_not_installed_is_its_own_error(repo, monkeypatch):
@@ -1445,3 +1449,31 @@ def test_a_hidden_edit_outside_the_gate_folder_is_in_the_tree(repo, bit):
     found, _reason = tree.tree_state(repo / "sub")
     assert found.tree != head_tree and found.clean is False
     assert _index_bytes(repo) == before
+
+
+def test_a_git_trace_line_is_not_the_detail(tmp_path, monkeypatch):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    monkeypatch.setenv("GIT_TRACE", "1")
+    with pytest.raises(tree.NotAWorkTree) as caught:
+        tree.work_tree_top(plain)
+    assert "not a git repository" in str(caught.value) and "trace:" not in str(caught.value)
+
+
+def test_a_refusal_after_a_long_trace_is_still_a_refusal(repo, monkeypatch):
+    if not _refuses_owner(repo):
+        pytest.skip("this git does not know GIT_TEST_ASSUME_DIFFERENT_OWNER")
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+    monkeypatch.setenv("GIT_TRACE2_PERF", "1")
+    monkeypatch.setenv("GIT_TRACE", "1")
+    with pytest.raises(tree.GitRefused) as caught:
+        tree.work_tree_top(repo)
+    assert "trace" not in str(caught.value).split("(", 1)[1].split(")", 1)[0]
+
+
+def test_the_git_detail_prefers_the_error_line_and_is_cut_at_300():
+    assert tree.git_detail("12:00 trace: run\nwarning: w\nfatal: f\n") == "warning: w"
+    assert tree.git_detail("trace: a\n\nsome text\n") == "trace: a"
+    assert tree.git_detail("") == ""
+    assert len(tree.git_detail("fatal: " + "x" * 5000)) == 300
+    assert len(tree.git_detail("x" * 5000)) == 300

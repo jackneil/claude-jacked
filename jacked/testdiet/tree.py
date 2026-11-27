@@ -60,7 +60,7 @@ _GIT_TIMEOUT_S = 600.0
 _INDEX_COPY_ARGS = ("-c", "core.splitIndex=false", "-c", "core.checkStat=default",
                     "-c", "core.trustctime=true", "-c", "core.ignoreStat=false")
 # The longest git error text that a printed line holds (a message, not data).
-_DETAIL_CHARS = 300
+DETAIL_CHARS = 300
 # The exit code of git for an option that it does not know.
 _GIT_USAGE_ERROR = 129
 # 1980-01-01 UTC, the first time that a FAT file system can store.
@@ -149,16 +149,27 @@ def work_tree_top(cwd: Path) -> Path:
     with tempfile.TemporaryFile() as errors:
         code, out = git(Path(cwd), "rev-parse", "--show-toplevel", env={"LC_ALL": "C"}, stderr=errors)
         errors.seek(0)
-        text = errors.read(4096).decode("utf-8", "replace")
+        # All of it: a trace (GIT_TRACE, GIT_TRACE2_PERF) can come before the refusal.
+        text = errors.read().decode("utf-8", "replace")
     lines = output_lines(out)
     if code == 0 and len(lines) == 1:
         return Path(lines[0])
-    first = next((line.strip() for line in text.splitlines() if line.strip()), "")[:_DETAIL_CHARS]
+    first = git_detail(text)
     if "safe.directory" in text:
         raise GitRefused(f"git refuses this repository because another user owns it ({first}). "
-                         "To trust it, add it to safe.directory: git config --global --add "
-                         "safe.directory <path>")
+                         "Trust it only when you trust its owner: git and jacked tests then run "
+                         "the repository config of that owner, for example its filter drivers. "
+                         "Only then run: git config --global --add safe.directory <path>")
     raise NotAWorkTree(NOT_IN_WORK_TREE + (f" ({first})" if first else ""))
+
+
+def git_detail(text: str) -> str:
+    """The first ``fatal:``, ``error:`` or ``warning:`` line of git's error text, else its first
+    line that is not empty, cut at ``DETAIL_CHARS``: the one line of git that a message prints."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    chosen = next((line for line in lines if line.startswith(("fatal:", "error:", "warning:"))),
+                  lines[0] if lines else "")
+    return chosen[:DETAIL_CHARS]
 
 
 def output_lines(data: bytes) -> list[str]:
@@ -196,7 +207,7 @@ def tree_state(cwd: Path, *, objects: Path | None = None, warn: bool = False) ->
     """Return the identity of ``tree_id`` and, when it is None, the reason as text.
 
     The reason holds the exit code and the first error line of git (at
-    most ``_DETAIL_CHARS`` characters), for a caller that prints it. With
+    most ``DETAIL_CHARS`` characters), for a caller that prints it. With
     ``warn``, a failed work-tree read is logged at WARNING one time in each
     process; else the log is at DEBUG.
     """
@@ -207,7 +218,7 @@ def tree_state(cwd: Path, *, objects: Path | None = None, warn: bool = False) ->
         level = logging.WARNING if warn and not _warned_add else logging.DEBUG
         _warned_add = _warned_add or warn
         logger.log(level, "tree_id: no tree identity, the work tree read failed (%s)", exc)
-        detail = exc.detail[:_DETAIL_CHARS]
+        detail = exc.detail[:DETAIL_CHARS]
         return None, f"git cannot read the work tree ({exc}{': ' + detail if detail else ''})"
     except TreeError as exc:
         logger.debug("tree_id: no tree identity (%s)", describe(exc))
@@ -234,10 +245,7 @@ class _AddError(TreeError):
 
 def _first_line(handle) -> str:
     handle.seek(0)
-    for line in handle.read(4096).decode("utf-8", "replace").splitlines():
-        if line.strip():
-            return line.strip()
-    return ""
+    return git_detail(handle.read().decode("utf-8", "replace"))
 
 
 def read_tree_id(cwd: Path, *, objects: Path | None = None,
