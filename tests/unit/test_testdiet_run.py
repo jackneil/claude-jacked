@@ -29,6 +29,7 @@ from jacked.testdiet import globs, history, junit, machine, process, record, rep
 from jacked.testdiet.model import TreeId
 from tests._testdiet import fixture_project, fixture_reports, make_repo
 from tests._testdiet import git as _git
+from tests._testdiet import tree_of
 from tests._testdiet import hermetic_git as _hermetic_git
 
 POSIX = pytest.mark.skipif(os.name == "nt", reason="needs POSIX signals, FIFOs or file names")
@@ -118,7 +119,7 @@ def _last(repo: Path):
 
 def _seen(repo: Path, argv, *, inputs=(), any_machine=False, machine_id="unset", folder="."):
     mid = machine.machine_id() if machine_id == "unset" else machine_id
-    return record.seen(tree.store_dir(repo), tree.tree_id(repo), tree.command_sha(argv, folder=folder),
+    return record.seen(tree.store_dir(repo), tree_of(repo), tree.command_sha(argv, folder=folder),
                        folder=folder, inputs_sha=globs.inputs_fingerprint(repo, inputs), machine_id=mid,
                        any_machine=any_machine)
 
@@ -146,7 +147,7 @@ def test_run_records_counts_failing_ids_the_tree_and_the_command_sha(repo):
     assert meta.counts == {"passed": 6, "failed": 1, "error": 0, "skipped": 1, "flaky": 0}
     assert meta.failing == ("tests/test_sample.py::test_fails",)
     assert meta.failing_sig is not None
-    assert meta.tree == tree.tree_id(repo) and meta.tree.clean is True
+    assert meta.tree == tree_of(repo) and meta.tree.clean is True
     assert meta.tree_changed is False
     assert meta.command_sha == tree.command_sha(argv, folder=".")
     assert (meta.folder, meta.schema) == (".", 1)
@@ -551,7 +552,7 @@ def test_seen_rejects_a_run_that_differs_in_one_field(repo, tmp_path, field, val
     history.write_run(control, real, None)
     history.write_run(twin, dataclasses.replace(real, **{field: value}), None)
     args = dict(folder=".", inputs_sha=real.inputs_sha, machine_id=machine.machine_id())
-    current = tree.tree_id(repo)
+    current = tree_of(repo)
     assert record.seen(control, current, real.command_sha, **args) is not None
     assert record.seen(twin, current, real.command_sha, **args) is None
     if field == "machine_id":
@@ -585,9 +586,9 @@ def test_seen_is_false_for_a_green_record_that_was_not_wrapped(repo):
                                commit="HEAD", exit_code=0, wall_seconds=3.0, machine=None,
                                report_root=None)
     assert meta.source == "record" and meta.verdict == "passed"
-    assert meta.tree is not None and meta.tree.tree == tree.tree_id(repo).tree
+    assert meta.tree is not None and meta.tree.tree == tree_of(repo).tree
     stored = _last(repo)
-    found = record.seen(tree.store_dir(repo), tree.tree_id(repo), "0" * 64, folder=".", inputs_sha=None,
+    found = record.seen(tree.store_dir(repo), tree_of(repo), "0" * 64, folder=".", inputs_sha=None,
                         machine_id=machine.machine_id(), any_machine=True)
     assert stored.id == meta.id and found is None
 
@@ -608,10 +609,10 @@ def test_seen_is_false_when_a_declared_input_changed(repo):
     argv = junit_gate(0, GREEN)
     run.run_gate(argv, cwd=repo, inputs=["cache.bin"])
     assert _seen(repo, argv, inputs=["cache.bin"]) is not None
-    before_tree = tree.tree_id(repo)
+    before_tree = tree_of(repo)
     cache.write_bytes(b"two")
     os.utime(cache, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
-    assert tree.tree_id(repo) == before_tree  # the ignored file is not in the tree
+    assert tree_of(repo) == before_tree  # the ignored file is not in the tree
     assert _seen(repo, argv, inputs=["cache.bin"]) is None
 
 
@@ -636,9 +637,9 @@ def test_seen_is_false_when_this_machine_has_no_identity(repo, monkeypatch):
 def test_seen_is_true_for_a_second_commit_with_the_same_content(repo):
     argv = junit_gate(0, GREEN)
     run.run_gate(argv, cwd=repo)
-    first = tree.tree_id(repo)
+    first = tree_of(repo)
     _git(repo, "commit", "-q", "--allow-empty", "-m", "same content")
-    second = tree.tree_id(repo)
+    second = tree_of(repo)
     assert second.commit != first.commit and second.tree == first.tree
     assert _seen(repo, argv) is not None
 
@@ -827,7 +828,7 @@ def test_a_failed_input_hash_is_unavailable_and_never_seen(repo, monkeypatch):
     run.run_gate(argv, cwd=repo, inputs=["cache.bin"])
     meta = _last(repo)
     assert meta.verdict == "passed" and meta.inputs_sha == record.INPUTS_UNAVAILABLE
-    store, current = tree.store_dir(repo), tree.tree_id(repo)
+    store, current = tree.store_dir(repo), tree_of(repo)
     args = dict(folder=".", machine_id=machine.machine_id())
     # Neither the sentinel nor "no --input" matches it.
     assert record.seen(store, current, meta.command_sha, inputs_sha=record.INPUTS_UNAVAILABLE, **args) is None
@@ -1252,7 +1253,7 @@ def test_the_repeat_notice_ends_with_the_next_action(tmp_path):
 
 def test_the_seen_miss_names_the_nearest_record(repo, side, monkeypatch):
     argv = junit_gate(0, GREEN)
-    current = tree.tree_id(repo)
+    current = tree_of(repo)
     sha = tree.command_sha(argv, folder=".")
     args = dict(folder=".", inputs_sha=None, machine_id=machine.machine_id())
     store = tree.store_dir(repo)
@@ -1307,7 +1308,7 @@ def test_a_gate_that_changes_an_input_file_cannot_prove_a_tree(repo, capsys):
     assert len(lines) == 1 and "cannot prove a tree" in lines[0]
     meta = _last(repo)
     assert meta.inputs_changed is True and meta.verdict == "passed"
-    assert record.seen_answer(tree.store_dir(repo), tree.tree_id(repo), meta.command_sha, folder=".",
+    assert record.seen_answer(tree.store_dir(repo), tree_of(repo), meta.command_sha, folder=".",
                               inputs_sha=meta.inputs_sha, machine_id=meta.machine_id).hit is None
     run.run_gate(junit_gate(0, GREEN), cwd=repo, inputs=["data/*.txt"])
     assert _last(repo).inputs_changed is False
@@ -1373,7 +1374,7 @@ def test_a_run_whose_input_files_after_the_gate_are_not_known_never_proves_a_tre
     meta = _last(repo)
     assert meta.inputs_sha not in (None, record.INPUTS_UNAVAILABLE) and meta.inputs_changed is None
     monkeypatch.undo()
-    answer = record.seen_answer(tree.store_dir(repo), tree.tree_id(repo), meta.command_sha, folder=".",
+    answer = record.seen_answer(tree.store_dir(repo), tree_of(repo), meta.command_sha, folder=".",
                                 inputs_sha=meta.inputs_sha, machine_id=meta.machine_id)
     assert answer.hit is None and "after the gate are not known" in answer.why
 

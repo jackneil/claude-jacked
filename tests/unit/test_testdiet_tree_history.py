@@ -29,6 +29,7 @@ from jacked import git_guard
 from jacked.testdiet import cleanup, globs, history, machine, tree
 from jacked.testdiet.model import CaseResult, RunData, RunMeta, TreeId
 from tests._testdiet import git as _git
+from tests._testdiet import tree_of
 from tests._testdiet import hermetic_git as _hermetic_git
 from tests._testdiet import make_repo
 
@@ -68,15 +69,15 @@ def _index_bytes(cwd: Path) -> bytes:
 
 
 def test_a_clean_tree_is_clean_and_has_the_head_tree(repo):
-    tid = tree.tree_id(repo)
+    tid = tree_of(repo)
     assert tid == TreeId(commit=_git(repo, "rev-parse", "HEAD"),
                          tree=_git(repo, "rev-parse", "HEAD^{tree}"), clean=True)
 
 
 def test_an_edit_that_is_not_committed_changes_the_tree_and_is_not_clean(repo):
-    before = tree.tree_id(repo)
+    before = tree_of(repo)
     (repo / "README.md").write_bytes(b"changed\n")
-    after = tree.tree_id(repo)
+    after = tree_of(repo)
     assert after.clean is False
     assert after.commit == before.commit
     assert after.tree != before.tree
@@ -86,25 +87,25 @@ def test_an_edit_that_is_not_committed_changes_the_tree_and_is_not_clean(repo):
 
 
 def test_a_new_file_that_git_does_not_ignore_changes_the_tree(repo):
-    before = tree.tree_id(repo)
+    before = tree_of(repo)
     (repo / "new.txt").write_bytes(b"new\n")
-    after = tree.tree_id(repo)
+    after = tree_of(repo)
     assert after.clean is False and after.tree != before.tree
 
 
 def test_an_ignored_file_does_not_change_the_tree(repo):
     (repo / ".gitignore").write_bytes(b"*.log\n")
     _commit_all(repo, "ignore logs")
-    before = tree.tree_id(repo)
+    before = tree_of(repo)
     (repo / "debug.log").write_bytes(b"noise\n")
-    after = tree.tree_id(repo)
+    after = tree_of(repo)
     assert after == before and after.clean is True
 
 
 def test_two_commits_with_the_same_content_have_one_tree(repo):
-    first = tree.tree_id(repo)
+    first = tree_of(repo)
     _git(repo, "commit", "-q", "--allow-empty", "-m", "empty")
-    second = tree.tree_id(repo)
+    second = tree_of(repo)
     assert second.commit != first.commit
     assert second.tree == first.tree
 
@@ -113,7 +114,7 @@ def test_tree_id_does_not_change_the_real_index(repo):
     (repo / "README.md").write_bytes(b"changed\n")
     (repo / "new.txt").write_bytes(b"new\n")
     before = _index_bytes(repo)
-    assert tree.tree_id(repo).clean is False
+    assert tree_of(repo).clean is False
     assert _index_bytes(repo) == before
     status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True,
                             text=True, stdin=subprocess.DEVNULL).stdout
@@ -128,9 +129,9 @@ def test_tree_id_in_a_linked_worktree_does_not_change_its_index(repo, hermetic_g
     main_index = _index_bytes(repo)
     linked_index = _index_bytes(linked)
     objects = _objects(repo)
-    tid = tree.tree_id(linked)
+    tid = tree_of(linked)
     assert tid.clean is False
-    assert tid.tree != tree.tree_id(repo).tree
+    assert tid.tree != tree_of(repo).tree
     assert _index_bytes(linked) == linked_index
     assert _index_bytes(repo) == main_index
     assert _objects(repo) == objects
@@ -142,7 +143,7 @@ def test_tree_id_of_a_dirty_tree_writes_no_object_into_the_repository(repo):
     (repo / "sub" / "new.txt").write_bytes(b"a new file\n")
     count_before = _git(repo, "count-objects", "-v")
     files_before = _objects(repo)
-    tid = tree.tree_id(repo)
+    tid = tree_of(repo)
     assert tid.clean is False
     assert _git(repo, "count-objects", "-v") == count_before
     assert _objects(repo) == files_before
@@ -160,7 +161,7 @@ def test_each_git_call_of_tree_id_has_optional_locks_off(repo, monkeypatch):
 
     monkeypatch.setattr(git_guard, "run_git", spy)
     (repo / "README.md").write_bytes(b"dirty\n")
-    assert tree.tree_id(repo).clean is False
+    assert tree_of(repo).clean is False
     assert len(envs) >= 3
     assert all(env.get("GIT_OPTIONAL_LOCKS") == "0" for env in envs)
 
@@ -171,14 +172,14 @@ def test_tree_id_leaves_no_temporary_folder(repo, tmp_path, monkeypatch):
     monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
     (repo / "README.md").write_bytes(b"dirty, so git writes loose objects\n")
     (repo / "new.txt").write_bytes(b"new\n")
-    assert tree.tree_id(repo).clean is False
+    assert tree_of(repo).clean is False
     assert list(temp_root.iterdir()) == []
 
 
-def test_a_caller_folder_of_objects_stays_after_tree_id(repo, tmp_path):
+def test_a_caller_folder_of_objects_stays_after_tree_state(repo, tmp_path):
     objects = tmp_path / "kept-objects"
     (repo / "README.md").write_bytes(b"dirty\n")
-    tid = tree.tree_id(repo, objects=objects)
+    tid = tree_of(repo, objects=objects)
     assert any(p.is_file() for p in objects.rglob("*"))
     cleanup.remove_tree_quietly(objects)
     assert not objects.exists()
@@ -278,14 +279,13 @@ def test_a_git_that_does_not_know_sparse_still_gives_a_tree(repo, monkeypatch):
 
     monkeypatch.setattr(tree, "git", old_git)
     (repo / "README.md").write_bytes(b"dirty\n")
-    tid = tree.tree_id(repo)
+    tid = tree_of(repo)
     assert tid is not None and tid.clean is False
     adds = [a for a in seen if "add" in a]
     assert len(adds) == 2 and "--sparse" in adds[0] and "--sparse" not in adds[1]
 
 
-def test_a_failed_work_tree_read_warns_one_time_with_the_exit_code(repo, monkeypatch, caplog):
-    monkeypatch.setattr(tree, "_warned_add", False)
+def test_a_failed_work_tree_read_gives_the_exit_code_in_the_reason(repo, monkeypatch, caplog):
     real = tree.git
 
     def failing_add(cwd, *args, env=None, stderr=None):
@@ -295,11 +295,11 @@ def test_a_failed_work_tree_read_warns_one_time_with_the_exit_code(repo, monkeyp
 
     monkeypatch.setattr(tree, "git", failing_add)
     with caplog.at_level(logging.DEBUG, logger="jacked.testdiet.tree"):
-        assert tree.tree_id(repo) is None
-        assert tree.tree_id(repo) is None
+        found, reason = tree.tree_state(repo)
+    assert found is None and "128" in reason
+    # The caller prints the reason, so the log stays at DEBUG.
     records = [r for r in caplog.records if "work tree read failed" in r.getMessage()]
-    assert [r.levelno for r in records] == [logging.WARNING, logging.DEBUG]
-    assert "128" in records[0].getMessage()
+    assert [r.levelno for r in records] == [logging.DEBUG] and "128" in records[0].getMessage()
 
 
 def test_tree_id_is_empty_when_the_temporary_folder_cannot_be_made(repo, monkeypatch):
@@ -307,7 +307,7 @@ def test_tree_id_is_empty_when_the_temporary_folder_cannot_be_made(repo, monkeyp
         raise PermissionError(13, "refused")
 
     monkeypatch.setattr(tempfile, "mkdtemp", refuse)
-    assert tree.tree_id(repo) is None
+    assert tree_of(repo) is None
 
 
 def _sparse_repo(repo: Path) -> Path:
@@ -323,7 +323,7 @@ def _sparse_repo(repo: Path) -> Path:
 
 def test_a_clean_sparse_checkout_has_the_head_tree(repo):
     _sparse_repo(repo)
-    tid = tree.tree_id(repo)
+    tid = tree_of(repo)
     assert tid == TreeId(commit=_git(repo, "rev-parse", "HEAD"),
                          tree=_git(repo, "rev-parse", "HEAD^{tree}"), clean=True)
 
@@ -331,10 +331,10 @@ def test_a_clean_sparse_checkout_has_the_head_tree(repo):
 def test_an_untracked_file_outside_the_sparse_cone_is_in_the_tree(repo, tmp_path):
     _sparse_repo(repo)
     objects = tmp_path / "objects"
-    clean = tree.tree_id(repo, objects=objects)
+    clean = tree_of(repo, objects=objects)
     (repo / "out").mkdir(exist_ok=True)
     (repo / "out" / "new.txt").write_bytes(b"new\n")
-    dirty = tree.tree_id(repo, objects=objects)
+    dirty = tree_of(repo, objects=objects)
     assert dirty is not None and dirty.clean is False
     # The tracked file that the cone leaves out is not staged as deleted.
     assert tree.changed_paths(repo, clean, dirty, objects=objects) == ["out/new.txt"]
@@ -347,24 +347,24 @@ def test_a_repository_with_no_commit_has_no_tree(tmp_path, hermetic_git):
     empty.mkdir()
     _git(empty, "init", "-q")
     (empty / "a.txt").write_bytes(b"a\n")
-    assert tree.tree_id(empty) is None
+    assert tree_of(empty) is None
     bare = tmp_path / "bare.git"
     subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, capture_output=True)
-    assert tree.tree_id(bare) is None
+    assert tree_of(bare) is None
     plain = tmp_path / "plain"
     plain.mkdir()
-    assert tree.tree_id(plain) is None
+    assert tree_of(plain) is None
 
 
 def test_changed_paths_names_the_file_that_differs(repo):
     (repo / "keep.txt").write_bytes(b"keep\n")
     _commit_all(repo, "keep")
-    a = tree.tree_id(repo)
+    a = tree_of(repo)
     (repo / "keep.txt").write_bytes(b"changed\n")
     (repo / "dir").mkdir()
     (repo / "dir" / "added.txt").write_bytes(b"added\n")
     _commit_all(repo, "change")
-    b = tree.tree_id(repo)
+    b = tree_of(repo)
     assert tree.changed_paths(repo, a, b) == ["dir/added.txt", "keep.txt"]
     assert tree.changed_paths(repo, a, a) == []
 
@@ -373,16 +373,16 @@ def test_changed_paths_of_two_dirty_trees_reads_a_shared_object_folder(repo, tmp
     objects = tmp_path / "tree-objects"
     objects.mkdir()
     (repo / "one.txt").write_bytes(b"one\n")
-    a = tree.tree_id(repo, objects=objects)
+    a = tree_of(repo, objects=objects)
     (repo / "two.txt").write_bytes(b"two\n")
-    b = tree.tree_id(repo, objects=objects)
+    b = tree_of(repo, objects=objects)
     assert tree.changed_paths(repo, a, b, objects=objects) == ["two.txt"]
 
 
 def test_changed_paths_fails_when_a_tree_object_is_gone(repo):
-    a = tree.tree_id(repo)
+    a = tree_of(repo)
     (repo / "README.md").write_bytes(b"dirty\n")
-    b = tree.tree_id(repo)
+    b = tree_of(repo)
     with pytest.raises(tree.TreeError):
         tree.changed_paths(repo, a, b)
 
@@ -396,9 +396,9 @@ def test_the_inputs_fingerprint_changes_when_an_ignored_input_changes(repo):
     assert globs.inputs_fingerprint(repo, []) is None
     first = globs.inputs_fingerprint(repo, ["data/*.bin"])
     assert first == globs.inputs_fingerprint(repo, ["data/*.bin"])
-    tid = tree.tree_id(repo)
+    tid = tree_of(repo)
     cache.write_bytes(b"one and more")
-    assert tree.tree_id(repo) == tid  # git does not see the change
+    assert tree_of(repo) == tid  # git does not see the change
     second = globs.inputs_fingerprint(repo, ["data/*.bin"])
     assert second != first
     stat = cache.stat()
@@ -812,7 +812,7 @@ def test_on_default_branch_is_true_for_a_clean_tree_at_an_ancestor_of_the_remote
     (repo / "b.txt").write_bytes(b"b\n")
     _set_remote_head(repo, _commit_all(repo, "second"))
     _git(repo, "checkout", "-q", first)
-    tid = tree.tree_id(repo)
+    tid = tree_of(repo)
     assert tid.commit == first and tid.clean
     assert tree.on_default_branch(repo, tid) is True
 
@@ -820,16 +820,16 @@ def test_on_default_branch_is_true_for_a_clean_tree_at_an_ancestor_of_the_remote
 def test_on_default_branch_is_false_for_a_dirty_tree_and_for_a_commit_that_is_not_an_ancestor(repo):
     _set_remote_head(repo, _git(repo, "rev-parse", "HEAD"))
     (repo / "README.md").write_bytes(b"dirty\n")
-    dirty = tree.tree_id(repo)
+    dirty = tree_of(repo)
     assert tree.on_default_branch(repo, dirty) is False
     _commit_all(repo, "local only")
-    ahead = tree.tree_id(repo)
+    ahead = tree_of(repo)
     assert ahead.clean
     assert tree.on_default_branch(repo, ahead) is False
 
 
 def test_on_default_branch_is_empty_with_no_remote_head(repo):
-    tid = tree.tree_id(repo)
+    tid = tree_of(repo)
     _git(repo, "update-ref", "refs/remotes/origin/main", tid.commit)
     assert tree.on_default_branch(repo, tid) is None
 
@@ -975,7 +975,7 @@ def test_a_failed_work_tree_read_raises_with_the_first_error_line_of_git(repo):
     try:
         with pytest.raises(tree.TreeError) as caught:
             tree.read_tree_id(repo)
-        assert tree.tree_id(repo) is None
+        assert tree_of(repo) is None
     finally:
         locked.chmod(0o600)
     assert "git add exited with" in str(caught.value)
@@ -1003,7 +1003,7 @@ def test_a_same_size_edit_that_git_status_sees_is_never_a_clean_tree(repo):
                             text=True, stdin=subprocess.DEVNULL, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     assert status.stdout == " M same.py\n"
     assert os.stat(index).st_mtime_ns == old
-    tid = tree.tree_id(repo)
+    tid = tree_of(repo)
     assert tid is not None and tid.clean is False
 
 
@@ -1023,7 +1023,7 @@ def test_a_repo_that_does_not_trust_ctime_still_sees_an_edit_that_restores_the_t
     time.sleep(1.1)  # the change time of the edit is in a later second than the one in the index
     path.write_bytes(b"VALUES\n")
     os.utime(path, ns=(old, old))
-    tid = tree.tree_id(repo)
+    tid = tree_of(repo)
     assert tid is not None and tid.clean is False
 
 
@@ -1102,19 +1102,19 @@ def test_core_ignorestat_does_not_hide_an_edit_from_the_tree(repo):
     (repo / "c.txt").write_bytes(b"one\n")
     _commit_all(repo, "c")
     assert "h c.txt" in _bits(repo)  # git set the assume-unchanged bit
-    clean = tree.tree_id(repo)
+    clean = tree_of(repo)
     assert clean.clean is True
     (repo / "c.txt").write_bytes(b"a longer edit\n")
-    changed = tree.tree_id(repo)
+    changed = tree_of(repo)
     assert changed.tree != clean.tree and changed.clean is False
     assert "h c.txt" in _bits(repo)  # the real index keeps its bit
 
 
 def test_an_assume_unchanged_bit_does_not_hide_an_edit_from_the_tree(repo):
-    clean = tree.tree_id(repo)
+    clean = tree_of(repo)
     _git(repo, "update-index", "--assume-unchanged", "README.md")
     (repo / "README.md").write_bytes(b"hidden edit\n")
-    changed = tree.tree_id(repo)
+    changed = tree_of(repo)
     assert changed.tree != clean.tree and changed.clean is False
     assert "h README.md" in _bits(repo)
 
@@ -1123,10 +1123,10 @@ def test_a_skip_worktree_bit_outside_a_sparse_checkout_does_not_hide_an_edit(rep
     (repo / "sub").mkdir()
     (repo / "sub" / "a.txt").write_bytes(b"a\n")
     _commit_all(repo, "sub")
-    clean = tree.tree_id(repo)
+    clean = tree_of(repo)
     _git(repo, "update-index", "--skip-worktree", "sub/a.txt")
     (repo / "sub" / "a.txt").write_bytes(b"hidden edit\n")
-    changed = tree.tree_id(repo)
+    changed = tree_of(repo)
     assert changed.tree != clean.tree and changed.clean is False
     assert "S sub/a.txt" in _bits(repo)
 
@@ -1152,7 +1152,7 @@ def test_clearing_the_bits_keeps_the_early_time_of_the_index_copy(repo, monkeypa
         return real_git(cwd, *args, env=env, stderr=stderr, stdin=stdin)
 
     monkeypatch.setattr(tree, "git", watch)
-    assert tree.tree_id(repo) is not None
+    assert tree_of(repo) is not None
     assert seen and times and all(ns <= times[0] for ns in seen)
 
 
@@ -1477,3 +1477,12 @@ def test_the_git_detail_prefers_the_error_line_and_is_cut_at_300():
     assert tree.git_detail("") == ""
     assert len(tree.git_detail("fatal: " + "x" * 5000)) == 300
     assert len(tree.git_detail("x" * 5000)) == 300
+
+
+def test_tree_state_is_the_one_entry_for_the_identity():
+    import inspect
+
+    # tree_id and its warn-once flag had no caller outside the tests after M8.
+    assert not hasattr(tree, "tree_id") and not hasattr(tree, "_warned_add")
+    assert "warn" not in inspect.signature(tree.tree_state).parameters
+    assert "tree_id" not in (tree.__doc__ or "").replace("read_tree_id", "")

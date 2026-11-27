@@ -121,6 +121,13 @@ def git(repo: Path, *args: str) -> str:
     return proc.stdout.rstrip("\n")
 
 
+def tree_of(cwd: Path, **kwargs):
+    """The tree identity of ``cwd`` (``tree.tree_state(...)[0]``), or None."""
+    from jacked.testdiet import tree
+
+    return tree.tree_state(cwd, **kwargs)[0]
+
+
 def make_repo(path: Path) -> Path:
     """Make a git repository at ``path`` with one commit, and return ``path``.
 

@@ -1,6 +1,6 @@
 """The identity of a git tree and the fingerprint of input files.
 
-``tree_id`` gives the hash of the tree that a commit of the work tree would
+``tree_state`` gives the hash of the tree that a commit of the work tree would
 have. Changes that are not committed are part of it. It never changes the
 real index or the real object store: it adds the work tree to a copy of the
 index, and git writes the new objects into a temporary folder.
@@ -65,8 +65,6 @@ DETAIL_CHARS = 300
 _GIT_USAGE_ERROR = 129
 # 1980-01-01 UTC, the first time that a FAT file system can store.
 _FAT_FLOOR_NS = 315_532_800 * 10**9
-# A failure of the work-tree read is logged at WARNING one time in each process.
-_warned_add = False
 
 
 class TreeError(RuntimeError):
@@ -189,42 +187,28 @@ def rev(cwd: Path, spec: str) -> str | None:
     return lines[0] if code == 0 and len(lines) == 1 else None
 
 
-def tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
-    """Return the identity of the work tree that holds ``cwd``.
+def tree_state(cwd: Path, *, objects: Path | None = None) -> tuple[TreeId | None, str]:
+    """Return the identity of the work tree that holds ``cwd`` and, when it is None, the reason as text.
 
-    The result is None for a folder that is not in a git repository, for a
+    The identity is None for a folder that is not in a git repository, for a
     bare repository, for a repository with no commit, and when git fails.
     ``objects`` is a folder that the caller owns: when it is given, the
     objects of a tree with changes stay there, so ``changed_paths`` can read
     them later. When it is not given, they go into a temporary folder that
-    this function removes. ``tree_state`` also says why there is no identity.
-    """
-    found, problem = tree_state(cwd, objects=objects, warn=True)
-    return found
-
-
-def tree_state(cwd: Path, *, objects: Path | None = None, warn: bool = False) -> tuple[TreeId | None, str]:
-    """Return the identity of ``tree_id`` and, when it is None, the reason as text.
-
-    The reason holds the exit code and the first error line of git (at
-    most ``DETAIL_CHARS`` characters), for a caller that prints it. With
-    ``warn``, a failed work-tree read is logged at WARNING one time in each
-    process; else the log is at DEBUG.
+    is removed. The reason holds the exit code and the git line of
+    ``git_detail``, for a caller that prints it; the log is at DEBUG.
     """
     try:
         found = read_tree_id(cwd, objects=objects)
     except _AddError as exc:
-        global _warned_add
-        level = logging.WARNING if warn and not _warned_add else logging.DEBUG
-        _warned_add = _warned_add or warn
-        logger.log(level, "tree_id: no tree identity, the work tree read failed (%s)", exc)
+        logger.debug("tree_state: no tree identity, the work tree read failed (%s)", exc)
         detail = exc.detail[:DETAIL_CHARS]
         return None, f"git cannot read the work tree ({exc}{': ' + detail if detail else ''})"
     except TreeError as exc:
-        logger.debug("tree_id: no tree identity (%s)", describe(exc))
+        logger.debug("tree_state: no tree identity (%s)", describe(exc))
         return None, f"git cannot read the work tree ({exc})"
     except OSError as exc:
-        logger.debug("tree_id: no tree identity (%s)", describe(exc))
+        logger.debug("tree_state: no tree identity (%s)", describe(exc))
         return None, f"the work tree cannot be read ({os_error_reason(exc)})"
     if found is None:
         return None, "the repository has no commit, or it is a bare repository"
@@ -250,7 +234,7 @@ def _first_line(handle) -> str:
 
 def read_tree_id(cwd: Path, *, objects: Path | None = None,
                  base_env: Mapping[str, str] | None = None) -> TreeId | None:
-    """Return the identity of the work tree, as ``tree_id`` does, but raise when git fails.
+    """Return the identity of the work tree, as ``tree_state`` does, but raise when git fails.
 
     The result is None for a bare repository and for a repository with no
     commit. A failed read of the work tree raises ``TreeError``; its
@@ -410,7 +394,7 @@ def changed_paths(cwd: Path, a: TreeId, b: TreeId, *, objects: Path | None = Non
     """Return the sorted paths whose content or mode differs between the trees ``a`` and ``b``.
 
     The tree of a work tree with changes is only in the folder ``objects``
-    that ``tree_id`` got. A tree object that git cannot find raises
+    that ``tree_state`` got. A tree object that git cannot find raises
     ``TreeError``: an empty list always means that no path differs.
     """
     cwd = Path(cwd)
