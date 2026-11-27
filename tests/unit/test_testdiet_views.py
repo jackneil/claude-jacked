@@ -12,7 +12,8 @@ import pytest
 from click.testing import CliRunner
 
 from jacked.cli import main
-from jacked.testdiet import history, machine, record, tree, views
+from jacked.testdiet import history, record, tree, views
+from jacked.testdiet import machine as identity
 from tests._testdiet import (
     COMMAND,
     FAILING_ID,
@@ -429,7 +430,7 @@ def test_no_command_prints_a_machine_id(store, repo):
               tests=[make_case("t::t", "t.py", 1.0)])
     shutil.copytree(store / history.RUNS, tree.store_dir(repo) / history.RUNS)
     ci_run = next(m.id for m in history.iter_runs(store) if m.machine == "ci")
-    real = machine.machine_id()
+    real = identity.machine_id()
     commands = [
         ("profile",), ("profile", "--json"), ("profile", "--machine", "ci"),
         ("profile", "--machine", "ci", "--json"), ("profile", "--run", ci_run, "--json"),
