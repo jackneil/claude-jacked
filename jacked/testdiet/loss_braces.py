@@ -54,17 +54,26 @@ def _regex_start(text: str, j: int) -> bool:
     return text[k + 1:end] in _REGEX_WORDS
 
 
-def _skip_regex(text: str, j: int) -> int:
+def _skip_regex(text: str, j: int, dead: set[tuple[int, bool]]) -> int:
     """Return the index after the regex literal at ``text[j]``, or -1 when it does not close on its line.
 
     A "/" inside a class (``[...]``) or after a backslash does not end it.
     A literal that does not close on its line is a division, not a regex.
+    ``dead`` holds each scan state (position, in a class) that an earlier
+    scan of the file found to end with no close. The scan from a state
+    depends only on that state, so a scan that reaches one stops. Each
+    state is added one time, so all the scans of a file read each
+    character a bounded number of times.
     """
     i, in_class = j + 1, False
+    seen: list[tuple[int, bool]] = []
     while i < len(text):
+        if (i, in_class) in dead:
+            break
+        seen.append((i, in_class))
         ch = text[i]
         if ch == "\n":
-            return -1
+            break
         if ch == "\\":
             i += 2
             continue
@@ -78,6 +87,7 @@ def _skip_regex(text: str, j: int) -> int:
                 i += 1
             return i
         i += 1
+    dead.update(seen)
     return -1
 
 
@@ -98,51 +108,76 @@ class _Index:
         self.spans: dict[int, int] = {}
         #: The start of each comment or string that does not close.
         self.unclosed: list[int] = []
-        damage: list[int] = []
-        stack: list[tuple[str, int]] = []
+        self._damage: list[int] = []
+        self._stack: list[tuple[str, int]] = []
+        self._script = script
+        # Linear scans: for a one-line script quote, the line end before which no quote of that
+        # kind closes (a later start on that line ends the same way); for a regex, the dead states.
+        self._no_close: dict[str, int] = {}
+        dead: set[tuple[int, bool]] = set()
         j, size = 0, len(text)
         while j < size:
             ch = text[j]
             char = _CHAR.match(text, j) if chars and ch == "'" else None
+            end: int | None
             if char:
                 end = char.end()
             elif ch in quotes:
-                end = _skip_quoted(text, j, ch, ch in multiline)
-                if end < 0 and script and ch not in multiline:
-                    j += 1  # JSX text, not a string
-                    continue
-                if end < 0:
-                    damage.append(j)
-                    self.unclosed.append(j)
-                    newline = text.find("\n", j)
-                    end = size if newline < 0 else newline
+                end = self._quote_end(text, j, ch in multiline)
             elif text.startswith("//", j):
                 newline = text.find("\n", j)
                 end = size if newline < 0 else newline
             elif text.startswith("/*", j):
                 close = text.find("*/", j + 2)
                 if close < 0:
-                    damage.append(j)
+                    self._damage.append(j)
                     self.unclosed.append(j)
                 end = size if close < 0 else close + 2
-            elif script and ch == "/" and _regex_start(text, j) and (end := _skip_regex(text, j)) > 0:
+            elif script and ch == "/" and _regex_start(text, j) and (end := _skip_regex(text, j, dead)) > 0:
                 pass
             else:
-                if ch in _PAIRS:
-                    stack.append((_PAIRS[ch], j))
-                elif ch in ")]}":
-                    if any(want == ch for want, _ in stack):
-                        while stack[-1][0] != ch:
-                            damage.append(stack.pop()[1])
-                        self.closes[stack.pop()[1]] = j + 1
-                    else:
-                        damage.append(j)
+                self._bracket(ch, j)
+                end = None
+            if end is None:
                 j += 1
                 continue
             self.spans[j] = end
             j = end
         self._starts = sorted(self.spans)
-        self._damage = sorted(damage)
+        self._damage = sorted(self._damage)
+
+    def _quote_end(self, text: str, j: int, multiline: bool) -> int | None:
+        """The end of the string at ``text[j]``, or None when a script quote is text (go on at ``j + 1``).
+
+        A string that does not close is damage, and it ends at the line end.
+        """
+        ch = text[j]
+        one_line_script = self._script and not multiline
+        if one_line_script and j < self._no_close.get(ch, -1):
+            return None  # an earlier quote of this kind on this line did not close: text
+        end = _skip_quoted(text, j, ch, multiline)
+        if end >= 0:
+            return end
+        newline = text.find("\n", j)
+        line_end = len(text) if newline < 0 else newline
+        if one_line_script:
+            self._no_close[ch] = line_end
+            return None  # JSX text, not a string
+        self._damage.append(j)
+        self.unclosed.append(j)
+        return line_end
+
+    def _bracket(self, ch: str, j: int) -> None:
+        """Pair a bracket at ``text[j]``. A close with no open, or an open that a close skips, is damage."""
+        if ch in _PAIRS:
+            self._stack.append((_PAIRS[ch], j))
+        elif ch in ")]}":
+            if any(want == ch for want, _ in self._stack):
+                while self._stack[-1][0] != ch:
+                    self._damage.append(self._stack.pop()[1])
+                self.closes[self._stack.pop()[1]] = j + 1
+            else:
+                self._damage.append(j)
 
     def damage_reason(self, text: str) -> str | None:
         """The file-level reason when a comment or a string does not close, else None."""

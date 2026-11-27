@@ -18,7 +18,7 @@ import pytest
 from click.testing import CliRunner
 
 from jacked.cli import main
-from jacked.testdiet import loss, loss_scan
+from jacked.testdiet import loss, loss_braces, loss_scan
 from tests._testdiet import git, hermetic_git, make_repo
 
 CALC = b"""\
@@ -926,3 +926,26 @@ def test_the_blobs_are_views_of_one_batch_output_with_no_copy(repo):
     assert all(isinstance(v, memoryview) for v in views)
     assert views[0].obj is views[1].obj  # one buffer
     assert [bytes(v) for v in views] == [b"def test_a():\n    assert 1\n", b"def test_b():\n    assert 2\n"]
+
+
+class _CountingText(str):
+    """A str that counts each index or slice read, to bound the work of a scan without a clock."""
+
+    reads = 0
+
+    def __getitem__(self, key):
+        _CountingText.reads += 1
+        return super().__getitem__(key)
+
+
+@pytest.mark.parametrize("line", [
+    "x = " + "\\'" * 3000,            # each ' is escaped: no quote closes on the line
+    'x = ' + '\\"' * 3000,
+    "(/[" * 3000,                      # each / starts a regex whose class never closes
+    "(/[ (/ x" * 1000,                 # a later regex start that does close
+])
+def test_the_script_scan_reads_each_character_a_bounded_number_of_times(line):
+    text = _CountingText('test("a", () => {\n' + line + "\n});\n")
+    _CountingText.reads = 0
+    loss_braces._Index(text, loss_braces._JS_QUOTES, "`", chars=False, script=True)
+    assert _CountingText.reads < 20 * len(text), _CountingText.reads
