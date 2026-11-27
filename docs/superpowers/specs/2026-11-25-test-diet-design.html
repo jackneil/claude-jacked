@@ -883,13 +883,16 @@ the plan is three documents:
     <code>--run</code> or <code>--machine</code>, give exit 1.</td></tr>
     <tr><td>Time order</td><td>The order of runs and <code>--days</code> use the time in the run
     ID, which this machine's clock wrote. No view compares the clocks of two machines.</td></tr>
-    <tr><td>Tree identity</td><td>The copy of the index keeps the time of the index, so git's
-    same-second rule sees an edit that keeps the file size. The copy sets
-    <code>core.checkStat=default</code> and <code>core.trustctime=true</code>, so a repository
-    setting cannot weaken it. On Windows, git reads the creation time as the change time. So, as
-    with <code>git status</code> there, an edit that keeps the size and puts back the old time is
-    not seen. The copy also clears the assume-unchanged bit, sets <code>core.ignoreStat=false</code>,
-    and clears skip-worktree when the checkout is not sparse.</td></tr>
+    <tr><td>Tree identity</td><td>The hash of the tree that a commit of the work tree would have,
+    read from a copy of the index. A repository setting cannot weaken the stat checks: the copy runs
+    with <code>core.checkStat=default</code>, <code>core.trustctime=true</code> and
+    <code>core.ignoreStat=false</code>. Before the add, jacked clears the assume-unchanged bits in
+    the copy, and (when <code>core.sparseCheckout</code> is not true) the skip-worktree bits. In a
+    sparse checkout the skip-worktree bits stay, so a tracked file that the cone leaves out stays as
+    HEAD has it. The real index is never written. The copy keeps the time of the index, so git's
+    same-second rule sees an edit that keeps the file size. On Windows, git reads the creation time
+    as the change time. So, as with <code>git status</code> there, an edit that keeps the size and
+    puts back the old time is not seen.</td></tr>
     <tr><td>The folder of the gate</td><td>The run identity holds the folder of the gate, relative
     to the top of the work tree. <code>seen</code> from another folder never matches: a gate in a
     package folder runs only that package's tests.</td></tr>
