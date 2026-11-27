@@ -366,9 +366,9 @@ in every place where jacked is installed, for Claude Code and for Codex.</p>
   <li><strong>A cut of the count does not move the clock.</strong> The Python data service had a
   prune on 2026-11-24: 397 tests removed with evidence, about 2% of the suite. Its commit says that
   the cut does not move the wall clock and names the slow tests as the next work.</li>
-  <li><strong>The machine is loaded.</strong> The load average was above 40 during this work, and 18
-  on 10 processors on 2026-11-26. One run before and one run after cannot show a saving of 10% to
-  20%. The owner does not want full gates of a large suite on this machine.</li>
+  <li><strong>The machine is loaded.</strong> Other work on the owner's laptop kept its load high
+  during this work. One run before and one run after cannot show a saving of 10% to 20%. The owner
+  does not want full gates of a large suite on this machine.</li>
 </ul>
 
 <h2 id="goals">Goals, non-goals and anti-goals</h2>
@@ -519,20 +519,21 @@ rules.</p>
   machine changes. The gate machine reports the commit that it ran and that its tree was clean.
   When the report does not match the commit that was sent, <code>run</code> makes no record and
   says why.</li>
-  <li><strong>A lost connection is not a verdict.</strong> The gate runs detached on the gate
-  machine and writes a log, its JUnit file and an exit marker. <code>run</code> waits for the
-  marker and can attach again after a lost connection. With no marker there is no record, no pass
-  and no failure. <code>run</code> returns the exit code that the marker holds.</li>
+  <li><strong>A lost connection stops the gate.</strong> The owner's answer of 2026-11-26: "Stop on
+  drop, no reattach". The gate runs only while the connection lives. The local side sends a
+  heartbeat; when the gate machine gets no input for 60 seconds, or gets the end of its input, it
+  stops the gate and its child processes. A lost connection is not a verdict: there is no record,
+  no pass and no failure, <code>run</code> gives exit 75 and says why, and the user runs the gate
+  again.</li>
   <li><strong>Times of two machines are never compared.</strong> <code>profile</code> and the
   report compare records of one machine only. The baseline and the final gate of a diet run are on
   the same machine.</li>
   <li><strong>The address stays local.</strong> A committed file names the gate machine by a label.
   The host name, the address and the user are in a local file that git ignores.</li>
-  <li><strong>One full gate at a time on a gate machine.</strong> <code>run --on</code> takes a
-  lock on the gate machine before it starts a full gate. A second full gate waits and prints who
-  holds the lock and since when. A lock whose holder is not alive is released. Without this lock,
-  the sessions of several repositories move their pile-up from one machine to the other. This lock
-  is my call.</li>
+  <li><strong>No lock for one full gate at a time.</strong> An earlier version of this document
+  had a lock that made a second full gate wait. The lock was my call, and the smaller form drops it
+  (also my call): the owner sets the number of workers and the priority for gates on each gate
+  machine, and <code>run</code> prints the load and the free memory before the gate.</li>
   <li><strong>The gate machine has its own work.</strong> The owner sets the number of workers and
   the priority for the gate there. <code>run</code> prints the processor load and the free memory
   of the gate machine before it starts the gate. It cannot stop work that other tools started
@@ -733,9 +734,9 @@ and the plan will show the exact old and new wording.</p>
   those records, and says when the base branch is one of them. A red run with a new failing set
   prints no such line.</li>
   <li><strong>Gate machine.</strong> <code>run --on</code> records a gate only when the commit that
-  the gate machine reports is the commit that was sent. A run with no exit marker makes no record.
-  <code>profile</code> does not compare the times of two machines. A second full gate for one gate
-  machine waits for the first. No committed file holds a host name or an address. The proof uses
+  the gate machine reports is the commit that was sent. A run whose connection drops makes no
+  record and gives exit 75, and no process of that gate stays on the gate machine after 60 seconds.
+  <code>profile</code> does not compare the times of two machines. No committed file holds a host name or an address. The proof uses
   a real second machine, not a second folder of one machine. It covers a Windows gate machine and
   a Linux gate machine.</li>
   <li><strong>Refusals.</strong> A tree with changes that are not committed stops the run. A red
@@ -793,7 +794,7 @@ and the plan will show the exact old and new wording.</p>
   <li>The exact wording of the skill and of the text changes. The plan shows the old and the new
   wording for the approval.</li>
   <li>The form of the Codex policy file. Read the Codex documentation first.</li>
-  <li>The transport to a gate machine: how the commit is sent, how the gate is detached, where the
+  <li>The transport to a gate machine: how the commit is sent, how a dropped connection stops the gate, where the
   local file with the address is. Before a time from a gate machine is trusted, check that its
   file system gives the repository's test database the quick clone that it has on the owner's
   machine.</li>
@@ -887,7 +888,27 @@ the plan is three documents:
     <code>core.checkStat=default</code> and <code>core.trustctime=true</code>, so a repository
     setting cannot weaken it. On Windows, git reads the creation time as the change time. So, as
     with <code>git status</code> there, an edit that keeps the size and puts back the old time is
-    not seen.</td></tr>
+    not seen. The copy also clears the assume-unchanged bit, sets <code>core.ignoreStat=false</code>,
+    and clears skip-worktree when the checkout is not sparse.</td></tr>
+    <tr><td>The folder of the gate</td><td>The run identity holds the folder of the gate, relative
+    to the top of the work tree. <code>seen</code> from another folder never matches: a gate in a
+    package folder runs only that package's tests.</td></tr>
+    <tr><td>The newest run decides</td><td>For one identity (tree, folder and command, input files,
+    machine), only the newest run decides <code>seen</code>. When it did not pass, <code>seen</code>
+    says no and names that run.</td></tr>
+    <tr><td>The record version</td><td>Each record holds <code>"schema": 1</code>. Only a record
+    with the current schema proves a tree.</td></tr>
+    <tr><td>A store that cannot be written</td><td>For example in a sandbox that makes
+    <code>.git</code> read-only. <code>run</code> prints one line that names the store and says
+    that the run is not recorded, and keeps the gate's exit code. There is no second store.</td></tr>
+    <tr><td>The machine identity in the store</td><td>Each record holds the private random identity
+    in clear. It has no meaning off the machine, and the store is never pushed, so no keyed hash is
+    used.</td></tr>
+    <tr><td>Where the commands live</td><td>The command group is in
+    <code>jacked/testdiet/commands.py</code>, not in <code>jacked/cli.py</code>, because
+    <code>cli.py</code> is at its size limit. That module imports <code>click</code>, which jacked
+    already depends on. Every other module of <code>jacked/testdiet/</code> uses only the standard
+    library and jacked.</td></tr>
   </tbody>
 </table>
 <h3>The owner's answers (2026-11-26)</h3>
@@ -899,12 +920,23 @@ the plan is three documents:
     <tr><td>The wording of the changes to the text that jacked ships, and one more sentence for the
     gate cadence rule (run the one full suite through <code>jacked tests run</code>, ask
     <code>jacked tests seen</code> first)</td><td>Both approved.</td></tr>
-    <tr><td>The gate machine</td><td>Two lanes. A self-hosted runner, in the pattern that the
-    owner already operates, on a Linux machine that the owner rents in their own account (the provider
-    is open). And, in the owner's words, support for "running on a machine of your own choosing
-    across like ssh via tailscale or something like that": the section "A gate on a different
-    machine", built in the smaller form of
-    <a href="../plans/2026-11-26-test-diet-gate-machine.html">the gate machine plan</a>.</td></tr>
+    <tr><td>The gate machine</td><td>The owner's answers, word for word, in order, with the
+    name of a machine replaced by [machine]. To the choice between a self-hosted runner and
+    <code>run --on</code>: "Runner pattern, rented box". Then, in the same turn: "but also want to
+    support running on a machine of your own choosing across like ssh via tailscale or something
+    like that". To the prices of a rented box: "hm maybe managed runners? those others seem very
+    expensive for what we use them for jesus or just use my [machine] i dont want to pay that
+    much" ([machine] is the owner's own Windows machine). So there are two lanes, a runner lane
+    and the section "A gate on a different machine"; the provider of the runner lane is
+    open.</td></tr>
+    <tr><td>A gate on a different machine when the connection drops (asked 2026-11-26, after a
+    review found that an earlier version of this row gave the smaller form as the owner's answer,
+    which it was not)</td><td>"Stop on drop, no reattach". A dropped connection stops the remote
+    gate and records nothing; the gate is not detached and cannot be attached again. This is the
+    smaller form of
+    <a href="../plans/2026-11-26-test-diet-gate-machine.html">the gate machine plan</a>, and it
+    replaces the detach and reattach parts of the section "A gate on a different
+    machine".</td></tr>
     <tr><td>Six commands that the plan review added (<code>collect</code>, <code>covdiff</code>,
     <code>report</code>, <code>prove</code>, <code>ledger protect</code>,
     <code>ledger approve</code>)</td><td>Build the first three. Do not build the last three as
@@ -923,12 +955,11 @@ the plan is three documents:
   <li><strong>The slow repository for the second live proof: decided.</strong> The owner picked the
   Python data service on 2026-11-26, with its tests away from their laptop. The proof needs a branch
   and a pull request in that repository.</li>
-  <li><strong>The gate machine: open.</strong> SSH from the laptop to the owner's second machine
-  works. An earlier version of this document said that it did not: that check used the wrong user
-  name. A measurement on 2026-11-26 found no room on that machine at that time. The numbers are in
-  the owner's local notes and not in this repository. The choices: make room on the second
-  machine, or rent a Linux machine for each gate. The owner offered cloud resources on 2026-11-26.
-  The account and the cost need their approval.</li>
+  <li><strong>The gate machine: two lanes, decided; the runner provider: open.</strong> The
+  answers are in the table above, word for word. <code>run --on</code> reaches a machine of the
+  user's choice over SSH, and a dropped connection stops the gate. For the runner lane the owner
+  named managed runners or their own Windows machine, because a rented box costs too much for its
+  use. The account and the cost need their approval.</li>
   <li><strong>The changes to the shipped text: approved.</strong> Each row of the table above.</li>
   <li><strong>Growth: advice (approved).</strong> Not a hard limit. A hard limit for each
   change (OpenClaw uses 400 net test lines with a written allowance) gives an agent a reason to
@@ -939,8 +970,8 @@ the plan is three documents:
   that deletes a test can write the trailer too, and a hard check adds work to each removal that
   the owner wants more of. The owner can ask for the hard check.</li>
   <li><strong><code>run --on</code> as a part of jacked: approved</strong> for each repository. The
-  lock for one full gate at a time on a gate machine is my addition after that approval. The owner
-  can remove it.</li>
+  lock for one full gate at a time was my addition after that approval; the smaller form drops it
+  (my call). The owner can ask for it again.</li>
   <li><strong>The message to the other sessions: held.</strong> The owner asked on 2026-11-26 that
   the sessions of three other repositories use the second machine for tests when that is possible.
   The message waits for a gate machine that has room and for a proven path.</li>
