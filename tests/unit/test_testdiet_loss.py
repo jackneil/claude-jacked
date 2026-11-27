@@ -294,7 +294,9 @@ def test_cli_loss_gives_one_line_and_exit_1_for_an_input_it_cannot_read(repo, tm
     monkeypatch.chdir(outside)
     away = _invoke("tests", "loss", "--base", "main")
     assert away.exit_code == 1
-    assert away.output == "jacked tests: this folder is not in the work tree of a git repository.\n"
+    assert away.output.count("\n") == 1
+    assert away.output.startswith("jacked tests: this folder is not in the work tree of a git repository (")
+    assert "not a git repository" in away.output.split("(", 1)[1]
 
 
 def test_a_test_name_with_a_control_character_prints_on_one_line(repo):

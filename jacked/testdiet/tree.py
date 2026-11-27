@@ -9,7 +9,7 @@ Limits of the identity: it does not hold a file that git ignores, and it does
 not hold a change inside the work tree of a submodule. On Windows, Git reads the
 creation time as the change time, so an edit that keeps the size and puts
 back the old modification time is not seen (git status does not see it
-either). ``inputs_fingerprint``
+either). ``jacked.testdiet.globs.inputs_fingerprint``
 adds named files to a record. The clean and smudge filters stay on, so the
 hash is equal to the tree of a commit. With git-lfs, the clean filter can
 write a copy of a new large file into the lfs folder of the clone. In a
@@ -26,7 +26,6 @@ the cone then has no tree.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import shutil
@@ -39,7 +38,6 @@ from jacked import git_guard
 from jacked.findbin import find_bin
 from jacked.public_errors import describe, os_error_reason
 from jacked.testdiet.cleanup import remove_tree_quietly
-from jacked.testdiet.globs import input_entries
 from jacked.testdiet.model import TreeId
 
 logger = logging.getLogger(__name__)
@@ -61,6 +59,8 @@ _GIT_TIMEOUT_S = 600.0
 #: cleared in the copy before the add (``_clear_hiding_bits``).
 _INDEX_COPY_ARGS = ("-c", "core.splitIndex=false", "-c", "core.checkStat=default",
                     "-c", "core.trustctime=true", "-c", "core.ignoreStat=false")
+# The longest git error text that a printed line holds (a message, not data).
+_DETAIL_CHARS = 300
 # The exit code of git for an option that it does not know.
 _GIT_USAGE_ERROR = 129
 # 1980-01-01 UTC, the first time that a FAT file system can store.
@@ -71,6 +71,22 @@ _warned_add = False
 
 class TreeError(RuntimeError):
     """Git cannot give the answer (for example, a tree object is not in the repository)."""
+
+
+class GitMissing(TreeError):
+    """No git program is on PATH."""
+
+
+class GitTimeout(TreeError):
+    """A git call did not end within its time limit."""
+
+
+class GitRefused(TreeError):
+    """git refuses the repository because another user owns it (``safe.directory``)."""
+
+
+class NotAWorkTree(TreeError):
+    """The folder is not in the work tree of a git repository."""
 
 
 class _All:
@@ -98,7 +114,7 @@ def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
     """
     binary = find_bin("git")
     if binary is None:
-        raise TreeError("git is not installed")
+        raise GitMissing("git is not installed: no git program is on PATH")
     full_env = dict(os.environ)
     full_env.update(env or {})
     full_env["GIT_OPTIONAL_LOCKS"] = "0"
@@ -111,9 +127,35 @@ def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
         code = git_guard.run_git(argv, name=rest[0] if rest else "git",
                                  env=full_env, timeout=_GIT_TIMEOUT_S, consumer=out, stderr=stderr,
                                  stdin=stdin)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise TreeError(f"git did not run: {type(exc).__name__}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitTimeout(f"git did not answer in {int(_GIT_TIMEOUT_S)} seconds") from exc
+    except OSError as exc:
+        raise TreeError(f"git did not run: {describe(exc)}") from exc
     return code, bytes(out.data)
+
+
+def work_tree_top(cwd: Path) -> Path:
+    """Return the top folder of the work tree that holds ``cwd``.
+
+    A folder outside a work tree raises ``NotAWorkTree``, and a repository
+    that another user owns raises ``GitRefused``. Each message holds the
+    first error line of git. ``git`` raises ``GitMissing`` and ``GitTimeout``.
+    The call runs with ``LC_ALL=C``, so the error text is not translated.
+    """
+    with tempfile.TemporaryFile() as errors:
+        code, out = git(Path(cwd), "rev-parse", "--show-toplevel", env={"LC_ALL": "C"}, stderr=errors)
+        errors.seek(0)
+        text = errors.read(4096).decode("utf-8", "replace")
+    lines = output_lines(out)
+    if code == 0 and len(lines) == 1:
+        return Path(lines[0])
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")[:_DETAIL_CHARS]
+    if "safe.directory" in text:
+        raise GitRefused(f"git refuses this repository because another user owns it ({first}). "
+                         "To trust it, add it to safe.directory: git config --global --add "
+                         "safe.directory <path>")
+    raise NotAWorkTree("this folder is not in the work tree of a git repository"
+                       + (f" ({first})" if first else ""))
 
 
 def output_lines(data: bytes) -> list[str]:
@@ -133,10 +175,6 @@ def tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
     """
     found, problem = tree_state(cwd, objects=objects, warn=True)
     return found
-
-
-#: The longest git error text that a ``tree_state`` line holds.
-_DETAIL_CHARS = 300
 
 
 def tree_state(cwd: Path, *, objects: Path | None = None, warn: bool = False) -> tuple[TreeId | None, str]:
@@ -357,27 +395,6 @@ def changed_paths(cwd: Path, a: TreeId, b: TreeId, *, objects: Path | None = Non
     if code != 0:
         raise TreeError(f"git diff-tree exited with {code}; a tree object can be missing")
     return sorted(os.fsdecode(name) for name in out.split(b"\0") if name)
-
-
-def inputs_fingerprint(cwd: Path, globs: Sequence[str]) -> str | None:
-    """Return a SHA-256 of the files that ``globs`` match, or None when no glob is given.
-
-    A relative glob starts at ``cwd``. ``**`` matches folders at all depths,
-    and a hidden file matches. A matched folder adds every regular file
-    below it, with no link followed. Each file gives its path, its size and
-    its modification time in nanoseconds, not its content. A glob that
-    matches no file is in the hash too.
-    """
-    return input_fingerprint(cwd, globs)[0]
-
-
-def input_fingerprint(cwd: Path, globs: Sequence[str]) -> tuple[str | None, list[str]]:
-    """Return ``inputs_fingerprint`` and the globs that match no regular file."""
-    if not globs:
-        return None, []
-    entries = input_entries(Path(cwd), globs)
-    text = json.dumps(entries, ensure_ascii=True, separators=(",", ":"))
-    return hashlib.sha256(text.encode("ascii")).hexdigest(), [p for p, files in entries if not files]
 
 
 def common_dir(cwd: Path) -> Path:

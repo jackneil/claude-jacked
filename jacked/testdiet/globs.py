@@ -3,11 +3,14 @@
 A relative glob starts at the top of the work tree. ``**`` matches folders
 at all depths, and a hidden file matches. ``input_entries`` adds every
 regular file below a matched folder, and it never follows a symbolic link.
+``inputs_fingerprint`` hashes those files for a record.
 """
 
 from __future__ import annotations
 
 import glob
+import hashlib
+import json
 import os
 import stat
 from collections.abc import Sequence
@@ -65,3 +68,24 @@ def input_entries(top: Path, patterns: Sequence[str]) -> list[list]:
                 found += _folder_files(path, name)
         entries.append([pattern, sorted(found)])
     return entries
+
+
+def inputs_fingerprint(cwd: Path, patterns: Sequence[str]) -> str | None:
+    """Return a SHA-256 of the files that ``patterns`` match, or None when no glob is given.
+
+    A relative glob starts at ``cwd``. ``**`` matches folders at all depths,
+    and a hidden file matches. A matched folder adds every regular file
+    below it, with no link followed. Each file gives its path, its size and
+    its modification time in nanoseconds, not its content. A glob that
+    matches no file is in the hash too.
+    """
+    return input_fingerprint(cwd, patterns)[0]
+
+
+def input_fingerprint(cwd: Path, patterns: Sequence[str]) -> tuple[str | None, list[str]]:
+    """Return ``inputs_fingerprint`` and the globs that match no regular file."""
+    if not patterns:
+        return None, []
+    entries = input_entries(Path(cwd), patterns)
+    text = json.dumps(entries, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("ascii")).hexdigest(), [p for p, files in entries if not files]

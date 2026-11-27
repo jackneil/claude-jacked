@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 from jacked import git_guard
-from jacked.testdiet import cleanup, history, machine, tree
+from jacked.testdiet import cleanup, globs, history, machine, tree
 from jacked.testdiet.model import CaseResult, RunData, RunMeta, TreeId
 from tests._testdiet import make_repo
 
@@ -411,19 +411,19 @@ def test_the_inputs_fingerprint_changes_when_an_ignored_input_changes(repo):
     (repo / "data").mkdir()
     cache = repo / "data" / "cache.bin"
     cache.write_bytes(b"one")
-    assert tree.inputs_fingerprint(repo, []) is None
-    first = tree.inputs_fingerprint(repo, ["data/*.bin"])
-    assert first == tree.inputs_fingerprint(repo, ["data/*.bin"])
+    assert globs.inputs_fingerprint(repo, []) is None
+    first = globs.inputs_fingerprint(repo, ["data/*.bin"])
+    assert first == globs.inputs_fingerprint(repo, ["data/*.bin"])
     tid = tree.tree_id(repo)
     cache.write_bytes(b"one and more")
     assert tree.tree_id(repo) == tid  # git does not see the change
-    second = tree.inputs_fingerprint(repo, ["data/*.bin"])
+    second = globs.inputs_fingerprint(repo, ["data/*.bin"])
     assert second != first
     stat = cache.stat()
     os.utime(cache, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
-    assert tree.inputs_fingerprint(repo, ["data/*.bin"]) != second
+    assert globs.inputs_fingerprint(repo, ["data/*.bin"]) != second
     # A glob that matches nothing is not the same as no glob.
-    assert tree.inputs_fingerprint(repo, ["nothing/*"]) is not None
+    assert globs.inputs_fingerprint(repo, ["nothing/*"]) is not None
 
 
 def test_two_worktrees_of_one_clone_share_one_store(repo, hermetic_git):
@@ -1150,25 +1150,25 @@ def test_clearing_the_bits_keeps_the_early_time_of_the_index_copy(repo, monkeypa
 def test_an_input_folder_adds_every_regular_file_below_it(repo):
     data = repo / "data"
     data.mkdir()
-    empty = tree.inputs_fingerprint(repo, ["data"])
-    assert empty == tree.inputs_fingerprint(repo, ["data"])
+    empty = globs.inputs_fingerprint(repo, ["data"])
+    assert empty == globs.inputs_fingerprint(repo, ["data"])
     (data / "deep").mkdir()
     (data / "deep" / ".hidden.db").write_bytes(b"one")
-    added = tree.inputs_fingerprint(repo, ["data"])
+    added = globs.inputs_fingerprint(repo, ["data"])
     assert added != empty
     (data / "deep" / ".hidden.db").write_bytes(b"one and more")
-    changed = tree.inputs_fingerprint(repo, ["data"])
+    changed = globs.inputs_fingerprint(repo, ["data"])
     assert changed not in (empty, added)
-    assert tree.inputs_fingerprint(repo, ["data/*"]) not in (empty, changed)  # data/* matches the folder deep
+    assert globs.inputs_fingerprint(repo, ["data/*"]) not in (empty, changed)  # data/* matches the folder deep
 
 
 def test_the_input_globs_that_match_no_regular_file_are_named(repo):
     (repo / "data").mkdir()
     (repo / "one.bin").write_bytes(b"x")
-    sha, empty = tree.input_fingerprint(repo, ["one.bin", "data", "nothing/*"])
-    assert sha == tree.inputs_fingerprint(repo, ["one.bin", "data", "nothing/*"])
+    sha, empty = globs.input_fingerprint(repo, ["one.bin", "data", "nothing/*"])
+    assert sha == globs.inputs_fingerprint(repo, ["one.bin", "data", "nothing/*"])
     assert empty == ["data", "nothing/*"]
-    assert tree.input_fingerprint(repo, []) == (None, [])
+    assert globs.input_fingerprint(repo, []) == (None, [])
 
 
 @pytest.mark.skipif(os.name == "nt", reason="a symbolic link needs a privilege on Windows")
@@ -1179,6 +1179,51 @@ def test_an_input_folder_does_not_follow_a_link(repo, tmp_path):
     data = repo / "data"
     data.mkdir()
     (data / "link").symlink_to(outside)
-    before = tree.inputs_fingerprint(repo, ["data"])
+    before = globs.inputs_fingerprint(repo, ["data"])
     (outside / "big.db").write_bytes(b"changed")
-    assert tree.inputs_fingerprint(repo, ["data"]) == before
+    assert globs.inputs_fingerprint(repo, ["data"]) == before
+
+
+# --------------------------------------------------------------------------- git failures that are not "no repository"
+
+
+def _refuses_owner(repo: Path) -> bool:
+    env = {**os.environ, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+    proc = subprocess.run(["git", "-C", str(repo), "rev-parse", "--show-toplevel"], env=env,
+                          capture_output=True, stdin=subprocess.DEVNULL)
+    return proc.returncode != 0
+
+
+def test_a_dubious_ownership_refusal_names_safe_directory(repo, monkeypatch):
+    if not _refuses_owner(repo):
+        pytest.skip("this git does not know GIT_TEST_ASSUME_DIFFERENT_OWNER")
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+    with pytest.raises(tree.GitRefused) as caught:
+        tree.work_tree_top(repo)
+    assert "safe.directory" in str(caught.value) and "dubious ownership" in str(caught.value)
+
+
+def test_git_that_is_not_installed_is_its_own_error(repo, monkeypatch):
+    monkeypatch.setattr(tree, "find_bin", lambda name: None)
+    with pytest.raises(tree.GitMissing) as caught:
+        tree.work_tree_top(repo)
+    assert "git is not installed" in str(caught.value)
+
+
+def test_a_git_timeout_is_its_own_error(repo, monkeypatch):
+    def slow(*args, **kwargs):
+        raise subprocess.TimeoutExpired("git", 600)
+
+    monkeypatch.setattr(git_guard, "run_git", slow)
+    with pytest.raises(tree.GitTimeout) as caught:
+        tree.work_tree_top(repo)
+    assert "did not answer" in str(caught.value)
+
+
+def test_a_folder_outside_a_repository_names_the_first_error_line_of_git(hermetic_git):
+    plain = hermetic_git / "plain"
+    plain.mkdir()
+    with pytest.raises(tree.NotAWorkTree) as caught:
+        tree.work_tree_top(plain)
+    assert "not in the work tree of a git repository" in str(caught.value)
+    assert "not a git repository" in str(caught.value).split("repository", 1)[1]

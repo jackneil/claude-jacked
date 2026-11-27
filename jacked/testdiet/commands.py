@@ -143,7 +143,7 @@ def seen_command(inputs, any_machine, as_json, command):
     found = None
     try:
         here = Path(_os.getcwd())
-        top = _record.work_tree_top(here)
+        top = _tree.work_tree_top(here)
         folder = _tree.work_folder(here)
         current, problem_tree = _tree.tree_state(top)
         machine_id, problem = _machine.identity()
@@ -157,8 +157,8 @@ def seen_command(inputs, any_machine, as_json, command):
                                  machine_id=machine_id, any_machine=any_machine)
         else:
             _model.emit(f"{problem_tree}, so seen cannot prove a tree.")
-    except _tree.TreeError:
-        _model.emit("this folder is not in the work tree of a git repository.")
+    except _tree.TreeError as exc:
+        _model.emit(f"{exc}.")
     except Exception as exc:  # noqa: BLE001 -- an unknown answer is "not seen", never a traceback
         _model.emit(f"cannot check the history ({type(exc).__name__}). The answer is: not seen.")
     if as_json:
@@ -178,13 +178,12 @@ def _store_or_exit() -> Path:
     """The history store of the work tree that holds the current folder. Outside one, exit 1."""
     import os as _os
 
-    from jacked.testdiet import record as _record
     from jacked.testdiet import tree as _tree
 
     try:
-        return _tree.store_dir(_record.work_tree_top(Path(_os.getcwd())))
-    except _tree.TreeError:
-        _model.emit("this folder is not in the work tree of a git repository.")
+        return _tree.store_dir(_tree.work_tree_top(Path(_os.getcwd())))
+    except _tree.TreeError as exc:
+        _model.emit(f"{exc}.")
         raise SystemExit(1)
 
 
@@ -282,10 +281,10 @@ def loss_command(base, as_json):
 
     try:
         report = _loss.loss_report(Path(_os.getcwd()), base)
-    except _loss.NotInWorkTree:
-        _model.emit("this folder is not in the work tree of a git repository.")
+    except TreeError as exc:
+        _model.emit(f"{exc}.")
         raise SystemExit(1)
-    except (_loss.LossError, TreeError) as exc:
+    except _loss.LossError as exc:
         _model.emit(f"no loss report: {one_line(str(exc))}")
         raise SystemExit(1)
     if as_json:

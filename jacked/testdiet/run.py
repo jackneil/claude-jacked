@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from jacked.public_errors import os_error_reason
-from jacked.testdiet import history, machine, reports, tree
+from jacked.testdiet import globs, history, machine, reports, tree
 from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.model import SCHEMA, RunMeta, TreeId, emit
 from jacked.testdiet.process import Signals, Stopped, start_and_wait
@@ -35,7 +35,6 @@ from jacked.testdiet.record import (
     _guard,
     _now,
     repeat_notice,
-    work_tree_top,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,9 +101,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
     top = _guard("find the work tree", lambda: _top_or_none(cwd), None)
     store = _guard("find the store", lambda: tree.store_dir(top), None) if top is not None else None
     if top is None or store is None:
-        if top is None:
-            emit("this folder is not in a git repository. The gate runs, and the run is not recorded.")
-        else:
+        if top is not None:
             emit("the history store cannot be found. The gate runs, and the run is not recorded.")
         report_dir, _report, child_argv = _placeholder(argv)
         try:
@@ -250,7 +247,7 @@ def _read_tree(cwd: Path, objects: Path | None, *, quiet: bool = False) -> TreeI
 
 def hash_inputs(top: Path, inputs: Sequence[str]) -> str | None:
     """The ``--input`` fingerprint. Each glob that matches no regular file gives one line."""
-    sha, empty = tree.input_fingerprint(top, inputs)
+    sha, empty = globs.input_fingerprint(top, inputs)
     for pattern in empty:
         emit(f"no regular file matches the --input pattern {pattern!r}. "
              "It is in the fingerprint as a pattern with no file.")
@@ -258,9 +255,11 @@ def hash_inputs(top: Path, inputs: Sequence[str]) -> str | None:
 
 
 def _top_or_none(cwd: Path) -> Path | None:
+    """The top of the work tree, or None. With None, one line names the git failure."""
     try:
-        return work_tree_top(cwd)
-    except tree.TreeError:
+        return tree.work_tree_top(cwd)
+    except tree.TreeError as exc:
+        emit(f"{exc}. The gate runs, and the run is not recorded.")
         return None
 
 

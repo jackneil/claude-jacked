@@ -234,3 +234,21 @@ def test_cli_seen_says_why_the_work_tree_cannot_be_read(repo):
     assert result.exit_code == 1
     lines = [line for line in result.stderr.splitlines() if "cannot prove a tree" in line]
     assert len(lines) == 1 and "locked.txt" in lines[0]
+
+
+@pytest.mark.parametrize("sub", [["run", "--"], ["seen", "--"], ["history"], ["loss"]])
+def test_cli_names_a_dubious_ownership_refusal_and_not_a_missing_repository(repo, monkeypatch, sub):
+    env = {**__import__("os").environ, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+    probe = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=repo, env=env, capture_output=True)
+    if probe.returncode == 0:
+        pytest.skip("this git does not know GIT_TEST_ASSUME_DIFFERENT_OWNER")
+    monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+    argv = [*sub, *gate(GREEN, 0)] if sub[-1] == "--" else sub
+    result = _invoke("tests", *argv)
+    lines = [line for line in result.stderr.splitlines() if "safe.directory" in line]
+    assert len(lines) == 1, result.stderr
+    assert "not in the work tree" not in result.stderr and "not in a git repository" not in result.stderr
+    if sub[0] == "run":
+        assert result.exit_code == 0
+    else:
+        assert result.exit_code == 1

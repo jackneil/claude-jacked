@@ -83,15 +83,6 @@ def _check_options(kind: str | None, label: str | None, runner: str | None) -> N
         raise ValueError("the runner must be one of " + ", ".join(RUNNERS))
 
 
-def work_tree_top(cwd: Path) -> Path:
-    """Return the top folder of the work tree that holds ``cwd``. Raise ``TreeError`` outside one."""
-    code, out = tree.git(Path(cwd), "rev-parse", "--show-toplevel")
-    lines = tree.output_lines(out)
-    if code != 0 or len(lines) != 1:
-        raise tree.TreeError("the folder is not in the work tree of a git repository")
-    return Path(lines[0])
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -135,7 +126,7 @@ def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, la
         raise ValueError("the wall time must be 0 or more seconds")
     started_text = parse_started(started) if started is not None else _now()
     cwd = Path(cwd)
-    top = work_tree_top(cwd)
+    top = tree.work_tree_top(cwd)
     store = tree.store_dir(top)
     tree_value = _commit_tree(top, commit) if commit is not None else None
     data = junit.read_junit([Path(p) for p in junit_paths], root=top, report_root=report_root,

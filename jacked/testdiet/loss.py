@@ -38,7 +38,7 @@ from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.loss_scan import NOT_PARSED, Declaration, declarations, scan, scan_file, scan_kind
 from jacked.testdiet.model import clean_text, one_line
 
-__all__ = ["DEFAULT_NAME", "DEFAULT_REF", "Declaration", "LossError", "LossReport", "NotInWorkTree",
+__all__ = ["DEFAULT_NAME", "DEFAULT_REF", "Declaration", "LossError", "LossReport",
            "declarations", "loss_report", "render", "scan", "scan_kind"]
 
 #: The ref of the default branch. There is no fetch and no network call.
@@ -53,10 +53,6 @@ Sides = dict[str, list[Declaration]]
 
 class LossError(RuntimeError):
     """An input of the loss report cannot be read (a ref, a tree or a file)."""
-
-
-class NotInWorkTree(LossError):
-    """The folder is not in the work tree of a git repository."""
 
 
 @dataclass(frozen=True)
@@ -93,14 +89,6 @@ def _rev(top: Path, spec: str) -> str | None:
     code, out = tree.git(top, "rev-parse", "--verify", "-q", "--end-of-options", spec)
     lines = tree.output_lines(out)
     return lines[0] if code == 0 and len(lines) == 1 else None
-
-
-def _top(cwd: Path) -> Path:
-    code, out = tree.git(Path(cwd), "rev-parse", "--show-toplevel")
-    lines = tree.output_lines(out)
-    if code != 0 or len(lines) != 1:
-        raise NotInWorkTree("this folder is not in the work tree of a git repository.")
-    return Path(lines[0])
 
 
 def _base_commit(top: Path, base: str | None) -> str:
@@ -176,10 +164,11 @@ def loss_report(cwd: Path, base: str | None = None) -> LossReport:
     ``base`` is a ref or a commit. The compared commit is the merge base of
     HEAD and ``base``. With no ``base``, it is the merge base of HEAD and the
     default branch (``refs/remotes/origin/HEAD``). Outside a work tree this
-    raises ``NotInWorkTree``. An input that cannot be read raises
-    ``LossError``. A git that cannot start raises ``tree.TreeError``.
+    raises ``tree.NotAWorkTree``, and git errors raise the other
+    ``tree.TreeError`` classes. An input that cannot be read raises
+    ``LossError``.
     """
-    top = _top(cwd)
+    top = tree.work_tree_top(cwd)
     commit = _base_commit(top, base)
     objects = Path(tempfile.mkdtemp(prefix="jacked-loss-"))
     try:

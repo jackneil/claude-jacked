@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from jacked.testdiet import history, junit, machine, process, record, reports, run, tree
+from jacked.testdiet import globs, history, junit, machine, process, record, reports, run, tree
 from jacked.testdiet.model import TreeId
 from tests._testdiet import fixture_project, fixture_reports, make_repo
 
@@ -137,7 +137,7 @@ def _last(repo: Path):
 def _seen(repo: Path, argv, *, inputs=(), any_machine=False, machine_id="unset", folder="."):
     mid = machine.machine_id() if machine_id == "unset" else machine_id
     return record.seen(tree.store_dir(repo), tree.tree_id(repo), tree.command_sha(argv, folder=folder),
-                       folder=folder, inputs_sha=tree.inputs_fingerprint(repo, inputs), machine_id=mid,
+                       folder=folder, inputs_sha=globs.inputs_fingerprint(repo, inputs), machine_id=mid,
                        any_machine=any_machine)
 
 
@@ -257,8 +257,8 @@ def test_the_no_report_line_comes_before_the_gate_and_only_with_no_report_source
     run.run_gate(gate(0, "argv", str(marker), "x"), cwd=repo)
     err = capfd.readouterr().err
     assert err.index("has no report") < err.index("recorded ")
-    for argv, globs in ((junit_gate(0, GREEN), ()), (gate(0), (str(side / "*.xml"),))):
-        run.run_gate(argv, cwd=repo, junit=globs)
+    for argv, fixed in ((junit_gate(0, GREEN), ()), (gate(0), (str(side / "*.xml"),))):
+        run.run_gate(argv, cwd=repo, junit=fixed)
         assert "has no report" not in capfd.readouterr().err
 
 
@@ -343,7 +343,7 @@ def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch, capsy
     assert run.run_gate(junit_gate(6, RED), cwd=repo) == 6
     monkeypatch.setattr(junit, "read_junit", boom)
     monkeypatch.setattr(tree, "store_dir", boom)
-    monkeypatch.setattr(tree, "input_fingerprint", boom)
+    monkeypatch.setattr(globs, "input_fingerprint", boom)
     assert run.run_gate(junit_gate(7, RED), cwd=repo, inputs=["*.txt"]) == 7
     assert run.run_gate(junit_gate(0, RED), cwd=repo, strict=True) == 0
     assert "jacked tests: " in capsys.readouterr().err
@@ -776,8 +776,8 @@ def test_a_failed_input_hash_is_unavailable_and_never_seen(repo, monkeypatch):
         raise RuntimeError("hash broke")
 
     argv = junit_gate(0, GREEN)
-    real = tree.input_fingerprint
-    monkeypatch.setattr(tree, "input_fingerprint", boom)
+    real = globs.input_fingerprint
+    monkeypatch.setattr(globs, "input_fingerprint", boom)
     run.run_gate(argv, cwd=repo, inputs=["cache.bin"])
     meta = _last(repo)
     assert meta.verdict == "passed" and meta.inputs_sha == record.INPUTS_UNAVAILABLE
@@ -786,7 +786,7 @@ def test_a_failed_input_hash_is_unavailable_and_never_seen(repo, monkeypatch):
     # Neither the sentinel nor "no --input" matches it.
     assert record.seen(store, current, meta.command_sha, inputs_sha=record.INPUTS_UNAVAILABLE, **args) is None
     assert record.seen(store, current, meta.command_sha, inputs_sha=None, **args) is None
-    monkeypatch.setattr(tree, "input_fingerprint", real)
+    monkeypatch.setattr(globs, "input_fingerprint", real)
     run.run_gate(argv, cwd=repo)  # no --input: inputs_sha None
     assert _last(repo).inputs_sha is None
 
