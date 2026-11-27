@@ -14,6 +14,8 @@ import stat
 import sys
 from pathlib import Path
 
+from jacked.testdiet.model import one_line
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,7 +32,7 @@ def remove_tree_quietly(path: Path) -> None:
     try:
         _remove_tree(Path(path), os.path.abspath(path), nested=False)
     except Exception as exc:  # noqa: BLE001 -- a cleanup helper must never raise
-        logger.warning("remove_tree: cannot remove %s (%s)", path, type(exc).__name__)
+        logger.warning("remove_tree: cannot remove %s (%s)", one_line(os.fspath(path)), type(exc).__name__)
 
 
 def _remove_tree(path: Path, root: str, *, nested: bool) -> None:
@@ -52,11 +54,12 @@ def _remove_tree(path: Path, root: str, *, nested: bool) -> None:
                 # rmtree could not open or list this folder. Remove it one more time.
                 _remove_tree(Path(failed), root, nested=True)
             else:
-                logger.warning("remove_tree: cannot remove %s (%s)", failed, type(exc).__name__)
+                logger.warning("remove_tree: cannot remove %s (%s)", one_line(failed), type(exc).__name__)
         except FileNotFoundError:
             return
         except Exception as again:  # noqa: BLE001 -- a cleanup helper must never raise
-            logger.warning("remove_tree: cannot remove %s (%s)", failed, type(again).__name__)
+            logger.warning("remove_tree: cannot remove %s (%s)", one_line(os.fspath(failed)),
+                           type(again).__name__)
 
     if sys.version_info >= (3, 12):
         shutil.rmtree(path, onexc=retry)

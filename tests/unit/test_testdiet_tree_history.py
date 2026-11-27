@@ -1486,3 +1486,25 @@ def test_tree_state_is_the_one_entry_for_the_identity():
     assert not hasattr(tree, "tree_id") and not hasattr(tree, "_warned_add")
     assert "warn" not in inspect.signature(tree.tree_state).parameters
     assert "tree_id" not in (tree.__doc__ or "").replace("read_tree_id", "")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a file name with a line break is POSIX only")
+def test_a_cleanup_warning_shows_a_line_break_in_a_name_as_an_escape(tmp_path, monkeypatch, caplog):
+    from jacked.testdiet import cleanup
+
+    folder = tmp_path / "work"
+    folder.mkdir()
+    (folder / "a\nb").write_bytes(b"x")
+    real_unlink = os.unlink
+
+    def refuse(path, *args, **kwargs):
+        if "\n" in os.fsdecode(path if not isinstance(path, int) else ""):
+            raise PermissionError(13, "refused")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", refuse)
+    with caplog.at_level(logging.WARNING, logger="jacked.testdiet.cleanup"):
+        cleanup.remove_tree_quietly(folder)
+    lines = [r.getMessage() for r in caplog.records if "cannot remove" in r.getMessage()]
+    assert lines and all("\n" not in line for line in lines)
+    assert any("a\\nb" in line for line in lines)
