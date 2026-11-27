@@ -120,7 +120,10 @@ def test_the_failure_type_is_kept_as_a_class_name():
 
 
 def test_a_test_that_failed_and_passed_on_a_rerun_is_flaky():
-    # gotestsum --rerun-fails writes the failed attempt and the passed attempt.
+    """A control: it passed before the b-L3 per-runner rule too, and it must keep passing.
+
+    gotestsum --rerun-fails writes the failed attempt and the passed attempt.
+    """
     data = read_junit(fixture_reports("go_rerun"), root=fixture_project("go_rerun"), report_root=REPORT_ROOT)
     cases = {case.id: case for case in data.tests}
     rerun = cases["example.com/sample/calc.TestFailsThenPasses"]
@@ -129,6 +132,7 @@ def test_a_test_that_failed_and_passed_on_a_rerun_is_flaky():
 
 
 def test_the_pytest_rerun_report_shows_two_attempts_and_no_failure():
+    """A control of b-L3: it passes on the code before the per-runner rule by design."""
     # pytest-rerunfailures writes the failed first attempt as an empty
     # testcase: the report does not show that it failed. The state is the
     # state that the report shows.
@@ -335,6 +339,10 @@ def test_each_sample_report_has_no_failure_at_suite_level_only():
 
 
 def test_the_go_rerun_capture_stays_flaky_and_its_gate_stays_passed():
+    """A control of b-L3: it passes on the code before the per-runner rule by design.
+
+    The rule changed the other runners; this pins that the real go capture keeps its result.
+    """
     from jacked.testdiet import history
 
     data = read_junit(fixture_reports("go_rerun"), root=fixture_project("go_rerun"), report_root=REPORT_ROOT)
