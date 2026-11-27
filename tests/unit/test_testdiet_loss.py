@@ -861,8 +861,9 @@ def test_loss_reads_every_blob_with_one_git_process(repo, monkeypatch):
     for n in range(3):
         write(repo, f"tests/test_m{n}.py", f"def test_{n}():\n    pass\n".encode())
     calls = []
-    real = loss.tree.git
+    real, real_buffer = loss.tree.git, loss.tree.git_buffer
     monkeypatch.setattr(loss.tree, "git", lambda *a, **k: calls.append(a[1:3]) or real(*a, **k))
+    monkeypatch.setattr(loss.tree, "git_buffer", lambda *a, **k: calls.append(a[1:3]) or real_buffer(*a, **k))
     report = loss.loss_report(repo, "HEAD")
     assert len(report.fewer_assertions) == 3
     assert sum(1 for args in calls if args[0] == "cat-file") == 1
@@ -912,7 +913,7 @@ def test_a_jsx_apostrophe_gives_no_not_read_line_and_its_tests_pair(repo):
     assert any("after" in line for line in out) and not any("shows text" in line for line in out), out
 
 
-def test_the_blobs_are_views_of_one_batch_output_with_no_copy(repo):
+def test_the_blobs_are_views_of_one_batch_output_with_no_copy(repo, monkeypatch):
     # o-L7: one cat-file --batch output; each blob is a slice of it, not a second copy.
     from jacked.testdiet import tree as _tree
 
@@ -921,10 +922,20 @@ def test_the_blobs_are_views_of_one_batch_output_with_no_copy(repo):
     commit(repo, "two")
     env = _tree.object_env(repo, repo / ".git" / "objects")
     blobs = [git(repo, "rev-parse", f"HEAD:tests/test_{n}.py") for n in "ab"]
+    buffers = []
+    real_all = _tree._All
+
+    class Recording(real_all):
+        def __init__(self):
+            super().__init__()
+            buffers.append(self.data)
+
+    monkeypatch.setattr(_tree, "_All", Recording)
     found = loss._read_blobs(repo, blobs, env)
     views = [found[b] for b in blobs]
     assert all(isinstance(v, memoryview) for v in views)
     assert views[0].obj is views[1].obj  # one buffer
+    assert views[0].obj is buffers[0]  # the buffer that git wrote into: no copy of the whole output either
     assert [bytes(v) for v in views] == [b"def test_a():\n    assert 1\n", b"def test_b():\n    assert 2\n"]
 
 

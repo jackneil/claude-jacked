@@ -114,6 +114,13 @@ def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
     binary file for the error text of git; with no value it is discarded.
     ``stdin`` is a binary file that git reads; with no value it is empty.
     """
+    code, data = git_buffer(cwd, *args, env=env, stderr=stderr, stdin=stdin)
+    return code, bytes(data)
+
+
+def git_buffer(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
+               stderr=None, stdin=None) -> tuple[int, bytearray]:
+    """``git``, with the output as the one buffer that holds it: no copy, for a large output."""
     binary = find_bin("git")
     if binary is None:
         raise GitMissing("git is not installed: no git program is on PATH")
@@ -133,7 +140,7 @@ def git(cwd: Path, *args: str, env: Mapping[str, str] | None = None,
         raise GitTimeout(f"git did not answer in {int(_GIT_TIMEOUT_S)} seconds") from exc
     except OSError as exc:
         raise TreeError(f"git did not run: {describe(exc)}") from exc
-    return code, bytes(out.data)
+    return code, out.data
 
 
 def work_tree_top(cwd: Path) -> Path:

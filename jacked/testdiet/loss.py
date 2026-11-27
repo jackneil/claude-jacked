@@ -159,7 +159,7 @@ def _read_blobs(top: Path, blobs: list[str], env: dict[str, str]) -> dict[str, m
     with tempfile.TemporaryFile() as names:
         names.write("".join(f"{blob}\n" for blob in wanted).encode("ascii"))
         names.seek(0)
-        code, out = tree.git(top, "cat-file", "--batch", env=env, stdin=names)
+        code, out = tree.git_buffer(top, "cat-file", "--batch", env=env, stdin=names)
     if code != 0:
         raise LossError(f"git cat-file --batch exited with {code}")
     found: dict[str, memoryview] = {}
