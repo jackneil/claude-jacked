@@ -141,6 +141,7 @@ def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, la
         counts=_counts(data), seconds_reported=data.seconds_reported, load_start=None,
         load_end=None, child_cpu_seconds=None, failing=_failing(data), flaky=_flaky(data),
         failing_sig=history.failing_signature(data.tests), folder=None, schema=SCHEMA,
+        test_seconds=history.sum_test_seconds(data),
     )
     history.write_run(store, meta, data)
     return meta

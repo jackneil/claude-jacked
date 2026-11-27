@@ -515,3 +515,39 @@ def test_history_failing_set_counts_that_only_some_runs_hold(store):
     group.update(trees=None, trees_unknown=3, on_default_branch=0, on_default_branch_unknown=0)
     line = views.render_history(result)
     assert "trees: not recorded (3 runs), on the default branch: 0," in line
+
+
+def test_profile_reads_the_test_seconds_of_a_repeat_run_from_its_record(store, monkeypatch):
+    from jacked.testdiet import history as _history
+
+    read: list[str] = []
+    real = _history.load_tests
+    monkeypatch.setattr(_history, "load_tests", lambda s, run_id: read.append(run_id) or real(s, run_id))
+    result = views.profile(store)
+    assert read == [result["run"]]  # only the profiled run's own tests file
+    assert result["repeats"] and result["repeats"][0]["test_seconds_min"] is not None
+
+
+def test_a_record_with_no_stored_test_seconds_reads_its_tests_file(store, monkeypatch):
+    import json as _json
+
+    from jacked.testdiet import history as _history
+
+    for path in (store / _history.RUNS).glob("*.meta.json"):
+        raw = _json.loads(path.read_bytes())
+        raw.pop("test_seconds", None)
+        raw.pop("schema", None)
+        path.write_bytes(_json.dumps(raw).encode("utf-8"))
+    read: list[str] = []
+    real = _history.load_tests
+    monkeypatch.setattr(_history, "load_tests", lambda s, run_id: read.append(run_id) or real(s, run_id))
+    result = views.profile(store)
+    assert len(read) > 1 and result["repeats"][0]["test_seconds_min"] is not None
+
+
+def test_a_written_record_holds_the_sum_of_its_test_seconds(store):
+    by_id = {m.id: m for m in history.iter_runs(store)}
+    for run_id, meta in by_id.items():
+        data = history.load_tests(store, run_id)
+        expected = None if data is None else views._sum(c.seconds for c in data.tests)
+        assert meta.test_seconds == expected, run_id

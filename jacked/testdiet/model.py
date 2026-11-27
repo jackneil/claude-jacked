@@ -154,6 +154,8 @@ class RunMeta:
     or None for a record of ``record``. ``schema`` is the version of the
     record format (``SCHEMA``), or None for a record with no version.
     ``machine`` is None when a stored record holds no valid label.
+    ``test_seconds`` is the sum of the seconds of the tests that have a
+    time, or None when no test has one (or the run has no report).
     """
 
     id: str
@@ -182,6 +184,7 @@ class RunMeta:
     failing_sig: str | None
     folder: str | None = None
     schema: int | None = None
+    test_seconds: float | None = None
 
 
 class JUnitError(ValueError):

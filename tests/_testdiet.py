@@ -154,6 +154,7 @@ def store_run(store: Path, when: str, *, exit_code: int | None, tests=None, kind
         failing=tuple(sorted(c.id for c in cases if c.state in ("failed", "error"))),
         flaky=tuple(sorted(c.id for c in cases if c.state == "flaky")),
         failing_sig=history.failing_signature(cases), folder=folder, schema=SCHEMA,
+        test_seconds=history.sum_test_seconds(data),
     )
     history.write_run(store, meta, data)
     return meta.id

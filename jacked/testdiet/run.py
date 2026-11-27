@@ -156,7 +156,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                                    if cpu_start is not None and cpu_end is not None else None),
                 failing=_failing(data), flaky=_flaky(data),
                 failing_sig=history.failing_signature(data.tests) if data else None,
-                folder=folder, schema=SCHEMA,
+                folder=folder, schema=SCHEMA, test_seconds=history.sum_test_seconds(data),
             )
 
         def write() -> RunMeta:

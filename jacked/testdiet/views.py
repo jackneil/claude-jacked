@@ -79,8 +79,11 @@ def _seconds_order(seconds: float | None, name: str | None) -> tuple:
     return (seconds is None, -(seconds or 0.0), name or "")
 
 
-def _test_seconds(store: Path, run_id: str) -> float | None:
-    data = _history.load_tests(store, run_id)
+def _test_seconds(store: Path, meta: RunMeta) -> float | None:
+    """The test seconds of a run: from its record, else (an older record) from its tests file."""
+    if meta.test_seconds is not None or meta.counts is None:
+        return meta.test_seconds
+    data = _history.load_tests(store, meta.id)
     return None if data is None else _sum(case.seconds for case in data.tests)
 
 
@@ -173,7 +176,7 @@ def profile(store: Path, run_id: str | None = None, *, machine: str | None = Non
         if len(group) < 2:
             continue
         wall_min, wall_max = _min_max(m.wall_seconds for m in group)
-        sec_min, sec_max = _min_max(_test_seconds(store, m.id) for m in group)
+        sec_min, sec_max = _min_max(_test_seconds(store, m) for m in group)
         repeats.append({"tree": tree_hash, "command_sha": command, "runs": len(group),
                         "wall_min": wall_min, "wall_max": wall_max,
                         "test_seconds_min": sec_min, "test_seconds_max": sec_max})

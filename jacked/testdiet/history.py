@@ -48,7 +48,8 @@ _META_FIELDS = tuple(f.name for f in dataclasses.fields(RunMeta))
 _CASE_FIELDS = tuple(f.name for f in dataclasses.fields(CaseResult))
 _TUPLE_FIELDS = ("failing", "flaky")
 _INT_FIELDS = ("exit_code",)
-_NUMBER_FIELDS = ("wall_seconds", "seconds_reported", "load_start", "load_end", "child_cpu_seconds")
+_NUMBER_FIELDS = ("wall_seconds", "seconds_reported", "load_start", "load_end", "child_cpu_seconds",
+                  "test_seconds")
 _BOOL_FIELDS = ("tree_changed", "on_default_branch")
 
 
@@ -111,6 +112,18 @@ def failing_signature(cases: Iterable[CaseResult]) -> str | None:
         return None
     text = json.dumps(pairs, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+def sum_test_seconds(data: RunData | None) -> float | None:
+    """Return the sum of the test seconds that the report holds, or None when no test has a time.
+
+    >>> sum_test_seconds(None) is None
+    True
+    """
+    if data is None:
+        return None
+    known = [case.seconds for case in data.tests if case.seconds is not None]
+    return sum(known) if known else None
 
 
 def failing_set_summary(records: Iterable[RunMeta]) -> dict[str, int | None]:
