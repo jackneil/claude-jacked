@@ -227,6 +227,7 @@ jacked tests loss [--base REF] [--json]
   - A `t.Run` in a for-range loop over a slice literal counts each element of that literal. The literal must be inline, or assigned in the same function and not assigned again. This Go rule reads gofmt spacing.
   - `loss` does not count a computed case list. It also does not count a `t.Run` in a loop over any other value, or a fixture parameter.
   - When a paired test has a computed case list, or a body that `loss` cannot read, `loss` prints a `not read` line.
+  - A TypeScript, JavaScript, Go or Rust file with a comment or a string that does not close gives a `not read file` line with the line number, because `loss` cannot be sure of the rest of that file. A regex literal (for example `/\/*$/`) is not a comment.
   - When `loss` cannot make a report, it prints one line and gives exit 1. With no `refs/remotes/origin/HEAD`, give `--base`, or run `git remote set-head origin --auto`. In a shallow clone with no merge base, run `git fetch --unshallow`. On a branch with no commit, make a commit first.
 
 ### Where the history is

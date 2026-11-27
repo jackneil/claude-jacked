@@ -107,18 +107,20 @@ def scan(path: str, text: str) -> list[Declaration]:
 def scan_file(path: str, text: str) -> tuple[list[Declaration], str | None]:
     """Return the tests of ``text``, and the reason when the file as a whole is not read.
 
-    The reason is ``NOT_PARSED`` for a Python file that does not parse.
+    The reason is ``NOT_PARSED`` for a Python file that does not parse. For
+    a script, Go or Rust file, it names the line of a comment or a string
+    that does not close: the scan of the rest of that file is not sure.
     """
     from jacked.testdiet import loss_braces
 
     if path.endswith(".py"):
         return _python(text)
     if _SCRIPT.search(path):
-        return loss_braces.script(text), None
+        return loss_braces.script(text)
     if path.endswith("_test.go"):
-        return loss_braces.go(text), None
+        return loss_braces.go(text)
     if path.endswith(".rs"):
-        return loss_braces.rust(text), None
+        return loss_braces.rust(text)
     return [], None
 
 

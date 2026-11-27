@@ -774,3 +774,53 @@ def test_a_go_function_literal_in_a_for_header_is_not_the_loop_body():
     brace = body.index("{", body.index("TestFuncRange"))
     (loop,) = loss_braces._go_loops(body, index, brace, index.body(brace))
     assert loop[1] == body.index("{\n\t\tt.Run")
+
+
+# --------------------------------------------------------------------------- regex literals and damaged files
+
+_GLOB_TESTS = (b'import { test, expect } from "vitest";\n'
+               b'test("glob", () => {\n  expect(p).toMatch(/^src\\/*.ts$/);\n});\n'
+               b'test("trim", () => {\n  expect(s.replace(/\\/*$/, "")).toBe("a");\n});\n'
+               b'test("guard", () => {\n  expect(1).toBe(1);\n});\n')
+
+
+def test_a_regex_literal_with_a_comment_opener_does_not_hide_the_next_tests():
+    names = [d.name for d in loss_scan.scan("src/a.test.ts", _GLOB_TESTS.decode())]
+    assert names == ["glob", "trim", "guard"]
+    assert loss_scan.scan_file("src/a.test.ts", _GLOB_TESTS.decode())[1] is None
+
+
+def test_a_removed_test_after_a_regex_literal_is_named(repo):
+    write(repo, "src/a.test.ts", _GLOB_TESTS)
+    commit(repo, "globs")
+    write(repo, "src/a.test.ts", _GLOB_TESTS.split(b'test("guard"')[0])
+    report = loss.loss_report(repo, "HEAD")
+    assert report.removed == ("src/a.test.ts::guard",) and report.files_not_read == ()
+
+
+def test_jsx_closing_tags_and_self_closing_tags_are_not_regex_literals():
+    body = ('test("view", () => {\n  render(<div><Foo x={y} /><br/></div>);\n'
+            '  const half = a / b / c;\n  expect(1).toBe(1);\n});\n'
+            'test("after", () => {\n  expect(2).toBe(2);\n});\n')
+    found, reason = loss_scan.scan_file("src/view.test.tsx", body)
+    assert [(d.name, d.asserts, d.unread) for d in found] == [("view", 1, ()), ("after", 1, ())]
+    assert reason is None
+
+
+@pytest.mark.parametrize("path, text", [
+    ("src/a.test.ts", 'test("one", () => {});\n/* a comment that does not close\ntest("two", () => {});\n'),
+    ("src/a.test.js", 'test("one", () => {});\nconst t = `a template that does not close\n'),
+    ("pkg/a_test.go", "func TestOne(t *testing.T) {}\nvar s = `raw text that does not close\n"),
+    ("src/lib.rs", "#[test]\nfn one() {}\n/* a comment that does not close\n#[test]\nfn two() {}\n"),
+])
+def test_a_file_with_a_comment_or_a_string_that_does_not_close_is_named(path, text):
+    reason = loss_scan.scan_file(path, text)[1]
+    assert reason is not None and "line" in reason and "does not close" in reason
+
+
+def test_a_damaged_script_file_prints_a_not_read_file_line(repo):
+    write(repo, "src/b.test.ts", b'test("one", () => {});\ntest("two", () => {});\n')
+    commit(repo, "two")
+    write(repo, "src/b.test.ts", b'test("one", () => {});\n/* open\ntest("two", () => {});\n')
+    out = _invoke("tests", "loss", "--base", "HEAD").output.splitlines()
+    assert any(line.startswith("not read file src/b.test.ts (") for line in out), out

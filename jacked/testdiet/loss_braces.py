@@ -33,6 +33,52 @@ def _skip_quoted(text: str, i: int, quote: str, multiline: bool) -> int:
 
 _CHAR = re.compile(r"'(?:\\.[^'\n]{0,9}|[^'\\\n])'")
 _PAIRS = {"(": ")", "[": "]", "{": "}"}
+# A "/" after one of these characters (or after one of these words) is in
+# expression position, so it starts a regex literal. "<" and "}" are left out,
+# so a JSX close tag ("</div>", "{y} />") is never read as a regex.
+_REGEX_AFTER = set("(,=:[!&|?;{+-*%~^>")
+_REGEX_WORDS = {"return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void",
+                "throw", "instanceof", "yield", "await"}
+
+
+def _regex_start(text: str, j: int) -> bool:
+    """Return True when the "/" at ``text[j]`` is in expression position (it starts a regex literal)."""
+    k = j - 1
+    while k >= 0 and text[k] in " \t\r\n":
+        k -= 1
+    if k < 0 or text[k] in _REGEX_AFTER:
+        return True
+    end = k + 1
+    while k >= 0 and (text[k].isalnum() or text[k] in "_$"):
+        k -= 1
+    return text[k + 1:end] in _REGEX_WORDS
+
+
+def _skip_regex(text: str, j: int) -> int:
+    """Return the index after the regex literal at ``text[j]``, or -1 when it does not close on its line.
+
+    A "/" inside a class (``[...]``) or after a backslash does not end it.
+    A literal that does not close on its line is a division, not a regex.
+    """
+    i, in_class = j + 1, False
+    while i < len(text):
+        ch = text[i]
+        if ch == "\n":
+            return -1
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "[":
+            in_class = True
+        elif ch == "]":
+            in_class = False
+        elif ch == "/" and not in_class:
+            i += 1
+            while i < len(text) and text[i].isalpha():
+                i += 1
+            return i
+        i += 1
+    return -1
 
 
 class _Index:
@@ -42,9 +88,11 @@ class _Index:
     bracket that has no partner. A body that holds damage is not read.
     """
 
-    def __init__(self, text: str, quotes: str, multiline: str, chars: bool) -> None:
+    def __init__(self, text: str, quotes: str, multiline: str, chars: bool, regex: bool = False) -> None:
         self.closes: dict[int, int] = {}
         self.spans: dict[int, int] = {}
+        #: The start of each comment or string that does not close.
+        self.unclosed: list[int] = []
         damage: list[int] = []
         stack: list[tuple[str, int]] = []
         j, size = 0, len(text)
@@ -57,6 +105,7 @@ class _Index:
                 end = _skip_quoted(text, j, ch, ch in multiline)
                 if end < 0:
                     damage.append(j)
+                    self.unclosed.append(j)
                     newline = text.find("\n", j)
                     end = size if newline < 0 else newline
             elif text.startswith("//", j):
@@ -66,7 +115,10 @@ class _Index:
                 close = text.find("*/", j + 2)
                 if close < 0:
                     damage.append(j)
+                    self.unclosed.append(j)
                 end = size if close < 0 else close + 2
+            elif regex and ch == "/" and _regex_start(text, j) and (end := _skip_regex(text, j)) > 0:
+                pass
             else:
                 if ch in _PAIRS:
                     stack.append((_PAIRS[ch], j))
@@ -83,6 +135,12 @@ class _Index:
             j = end
         self._starts = sorted(self.spans)
         self._damage = sorted(damage)
+
+    def damage_reason(self, text: str) -> str | None:
+        """The file-level reason when a comment or a string does not close, else None."""
+        if not self.unclosed:
+            return None
+        return f"a comment or a string does not close at line {text.count(chr(10), 0, self.unclosed[0]) + 1}"
 
     def in_code(self, pos: int) -> bool:
         """Return True when ``pos`` is not in a comment or a string."""
@@ -149,8 +207,8 @@ def _array_rows(text: str, index: _Index, start: int, end: int) -> int | None:
     return _elements(text, index, k, close)
 
 
-def script(text: str) -> list[Declaration]:
-    index = _Index(text, _JS_QUOTES, "`", chars=False)
+def script(text: str) -> tuple[list[Declaration], str | None]:
+    index = _Index(text, _JS_QUOTES, "`", chars=False, regex=True)
     found: list[Declaration] = []
     for head in _JS_HEAD.finditer(text):
         mods = re.findall(r"[A-Za-z]+", head["mods"])
@@ -182,7 +240,7 @@ def script(text: str) -> list[Declaration]:
         skipped = head["fn"].startswith("x") or bool(_JS_SKIPS & set(mods))
         found.append(Declaration(text[start + 1:name_end - 1], _count(_JS_ASSERT, text, name_end, end),
                                  skipped, cases, _unread(end, cases)))
-    return found
+    return found, index.damage_reason(text)
 
 
 # Go and Rust ------------------------------------------------------------
@@ -320,7 +378,7 @@ def _go_cases(text: str, index: _Index, brace: int, end: int, runs: re.Pattern[s
     return total
 
 
-def go(text: str) -> list[Declaration]:
+def go(text: str) -> tuple[list[Declaration], str | None]:
     index = _Index(text, "\"`", "`", chars=True)
     found: list[Declaration] = []
     for head in _GO_HEAD.finditer(text):
@@ -334,10 +392,10 @@ def go(text: str) -> list[Declaration]:
         cases = None if end < 0 else _go_cases(text, index, brace, end, runs)
         found.append(Declaration(head["name"], _count(asserts, text, brace, end), skipped, cases,
                                  _unread(end, cases) if end >= 0 else (BODY_NOT_READ,)))
-    return found
+    return found, index.damage_reason(text)
 
 
-def rust(text: str) -> list[Declaration]:
+def rust(text: str) -> tuple[list[Declaration], str | None]:
     index = _Index(text, "\"", "\"", chars=True)
     found: list[Declaration] = []
     for head in _RUST_TEST.finditer(text):
@@ -365,4 +423,4 @@ def rust(text: str) -> list[Declaration]:
         brace = text.find("{", fn.end())
         end = -1 if brace < 0 else index.body(brace)
         found.append(Declaration(fn["name"], _count(_RUST_ASSERT, text, brace, end), ignored, 1, _unread(end, 1)))
-    return found
+    return found, index.damage_reason(text)
