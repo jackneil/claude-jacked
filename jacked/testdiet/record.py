@@ -10,6 +10,7 @@ Each message goes to standard error through ``jacked.testdiet.model.emit``.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -243,7 +244,9 @@ def seen_answer(store: Path, tree_value: TreeId, command_sha: str, *, folder: st
     if not any_machine and not machine_id:
         return SeenAnswer(None, None, "")
     deciders: dict[str | None, RunMeta] = {}
+    read: list[RunMeta] = []  # one read of the store: each store warning prints one time
     for meta in history.iter_runs(store):
+        read.append(meta)
         if not _same_identity(meta, tree_value, command_sha, folder, inputs_sha):
             continue
         if not any_machine and meta.machine_id != machine_id:
@@ -259,19 +262,36 @@ def seen_answer(store: Path, tree_value: TreeId, command_sha: str, *, folder: st
     if decider is not None:
         why = _not_proved_any(list(deciders.values())) if any_machine else _not_proved(decider)
         return SeenAnswer(None, decider, why)
-    return SeenAnswer(None, None, _nearest(store, tree_value, command_sha, folder, inputs_sha,
+    all_runs = read if read or not _runs_unreadable(store) else None
+    return SeenAnswer(None, None, _nearest(all_runs, tree_value, command_sha, folder, inputs_sha,
                                            machine_id, any_machine))
 
 
-def _nearest(store: Path, tree_value: TreeId, command_sha: str, folder: str, inputs_sha: str | None,
-             machine_id: str | None, any_machine: bool) -> str:
+def _runs_unreadable(store: Path) -> bool:
+    """True when the history folder exists but cannot be listed (``iter_runs`` printed why)."""
+    try:
+        with os.scandir(Path(store) / history.RUNS):
+            return False
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _nearest(all_runs: list[RunMeta] | None, tree_value: TreeId, command_sha: str, folder: str,
+             inputs_sha: str | None, machine_id: str | None, any_machine: bool) -> str:
     """One line that names the nearest record when no run of the same identity exists.
 
-    The order: the same identity on another machine, the same command with
-    other ``--input`` files, other commands in this folder, a run in another
-    folder, a record of ``record``. Each line ends with what to do.
+    ``all_runs`` is the one read of the store, or None when the history
+    folder cannot be read. The order: the same identity on another machine,
+    the same command with other ``--input`` files, other commands in this
+    folder, a run in another folder, a record of ``record``. Each line ends
+    with what to do.
     """
-    same_tree = [m for m in history.iter_runs(store) if m.tree is not None and m.tree.tree == tree_value.tree]
+    if all_runs is None:
+        return ("the history cannot be read, so no record can prove this tree. Make the history "
+                "folder readable, or run the gate with jacked tests run.")
+    same_tree = [m for m in all_runs if m.tree is not None and m.tree.tree == tree_value.tree]
     runs = [m for m in same_tree if m.source == "run" and m.schema == SCHEMA]
     same_command = [m for m in runs if m.command_sha == command_sha and m.folder == folder]
     if not any_machine and any(m.inputs_sha == inputs_sha and m.machine_id != machine_id for m in same_command):

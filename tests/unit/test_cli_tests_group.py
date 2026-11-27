@@ -372,3 +372,25 @@ def test_a_run_id_with_an_impossible_date_is_not_a_run_file(repo):
     with pytest.raises(ValueError):
         history.check_id(fake)
     assert _invoke("tests", "profile", "--run", fake).exit_code == 1
+
+
+def test_seen_reads_the_store_one_time_so_a_damaged_record_warns_one_time(repo):
+    argv = gate(GREEN, 0)
+    assert _invoke("tests", "run", "--", *argv).exit_code == 0
+    runs = tree.store_dir(repo) / history.RUNS
+    (runs / f"{history.new_run_id()}{history.META_SUFFIX}").write_bytes(b"{not json")
+    (repo / "README.md").write_bytes(b"a new tree, so seen misses and names the nearest record\n")
+    result = _invoke("tests", "seen", "--", *argv)
+    assert result.exit_code == 1
+    assert result.stderr.count("skipped the damaged record") == 1, result.stderr
+
+
+def test_seen_with_a_history_folder_that_cannot_be_read_does_not_say_the_history_is_empty(repo):
+    store = tree.store_dir(repo)
+    store.mkdir(parents=True, exist_ok=True)
+    (store / history.RUNS).write_bytes(b"a file, not a folder")
+    result = _invoke("tests", "seen", "--", *gate(GREEN, 0))
+    assert result.exit_code == 1
+    assert result.stderr.count("No run is read") == 1, result.stderr  # the warning of iter_runs
+    assert "no run of this tree is in the history" not in result.stderr
+    assert "the history cannot be read, so no record can prove this tree" in result.stderr
