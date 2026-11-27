@@ -541,6 +541,7 @@ _OTHER_TREE = TreeId(commit="c" * 40, tree="d" * 40, clean=True)
     ("folder", None),
     ("schema", None),
     ("schema", 2),
+    ("inputs_changed", True),
 ])
 def test_seen_rejects_a_run_that_differs_in_one_field(repo, tmp_path, field, value):
     argv = junit_gate(0, GREEN)
@@ -1356,3 +1357,22 @@ def test_each_step_of_run_keeps_the_size_guardrails():
         if node.name != "run_gate":
             names = [a.arg for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs]
             assert len([n for n in names if n != "self"]) <= 4, node.name
+
+
+def test_a_run_whose_input_files_after_the_gate_are_not_known_never_proves_a_tree(repo, monkeypatch, capsys):
+    (repo / ".gitignore").write_bytes(b"data/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "ignore data")
+    (repo / "data").mkdir()
+    (repo / "data" / "in.txt").write_bytes(b"same")
+    argv = junit_gate(0, GREEN)
+    # The second hash, after the gate, fails; the first one works.
+    monkeypatch.setattr(globs, "inputs_fingerprint", _boom)
+    assert run.run_gate(argv, cwd=repo, inputs=["data/*.txt"]) == 0
+    assert "hash the input files again" in capsys.readouterr().err
+    meta = _last(repo)
+    assert meta.inputs_sha not in (None, record.INPUTS_UNAVAILABLE) and meta.inputs_changed is None
+    monkeypatch.undo()
+    answer = record.seen_answer(tree.store_dir(repo), tree.tree_id(repo), meta.command_sha, folder=".",
+                                inputs_sha=meta.inputs_sha, machine_id=meta.machine_id)
+    assert answer.hit is None and "after the gate are not known" in answer.why

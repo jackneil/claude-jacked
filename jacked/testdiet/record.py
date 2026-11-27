@@ -185,7 +185,7 @@ def _same_identity(meta: RunMeta, tree_value: TreeId, command_sha: str, folder: 
 
 def _proves(meta: RunMeta) -> bool:
     # With --input, the files after the gate must be known to be the same (fail closed).
-    return (meta.verdict == "passed" and meta.tree_changed is False
+    return (meta.verdict == "passed" and meta.tree_changed is False and meta.inputs_changed is not True
             and (meta.inputs_sha is None or meta.inputs_changed is False))
 
 

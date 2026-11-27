@@ -873,3 +873,6 @@ def test_a_script_file_that_is_not_a_test_file_name_is_not_read(repo):
     write(repo, "src/__tests__/util.ts", b"\n")
     assert loss.loss_report(repo, "HEAD").removed == ("src/__tests__/util.ts::in tests",)
     assert loss.scan_kind("web/a.spec.mjs") and loss.scan_kind("a.test.tsx") and not loss.scan_kind("src/util.ts")
+    # The shortest default names: jest collects a bare test.js or spec.ts. No default runner collects x_test.ts.
+    assert loss.scan_kind("src/test.js") and loss.scan_kind("spec.ts") and loss.scan_kind("a.b.test.cjs")
+    assert not loss.scan_kind("src/x_test.ts") and not loss.scan_kind("src/footest.ts")

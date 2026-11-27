@@ -72,8 +72,10 @@ from jacked.testdiet.model import (  # noqa: F401 -- loss and the tests read the
 )
 
 _PY_SKIPS = {"skip", "skipif", "skipIf", "skipUnless"}
-#: The default test file name of jest, vitest and Playwright: "<name>.test.ts", "<name>.spec.mjs".
-_SCRIPT_TEST_NAME = re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$")
+#: The default test file names of jest, vitest and Playwright, as one rule: "<name>.test.ts",
+#: "<name>.spec.mjs", and (jest only) a bare "test.js" or "spec.ts". jest's default is
+#: "?(*.)+(spec|test).?([mc])[jt]s?(x)"; vitest's and Playwright's need the dot.
+_SCRIPT_TEST_NAME = re.compile(r"^(?:.*\.)?(?:test|spec)+\.[cm]?[jt]sx?$")
 
 
 def declarations(path: str, text: str) -> list[str]:
@@ -92,7 +94,8 @@ def scan_kind(path: str) -> bool:
     (``test_*.py``, ``*_test.py``), so a helper ``def test_x`` in
     ``src/db.py`` is not a test. A TypeScript or JavaScript file is a test
     file only by the default names of jest, vitest and Playwright
-    (``*.test.*``, ``*.spec.*``, or a file in a ``__tests__`` folder).
+    (``*.test.*``, ``*.spec.*``, a bare ``test.js`` or ``spec.ts``, or a
+    file in a ``__tests__`` folder).
 
     >>> scan_kind("tests/test_a.py"), scan_kind("src/db.py"), scan_kind("web/a.test.ts")
     (True, False, True)
