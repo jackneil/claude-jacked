@@ -1,4 +1,4 @@
-"""Tests for jacked.testdiet.record: run, record, seen and the repeat-failure notice.
+"""Tests for jacked.testdiet.run and jacked.testdiet.record: run, record, seen and the repeat notice.
 
 Each gate is ``sys.executable -c`` with a small script. The script copies a
 real sample report to the path that it gets, and exits with a chosen code.
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from jacked.testdiet import history, record, run, tree
+from jacked.testdiet import history, junit, machine, process, record, reports, run, tree
 from jacked.testdiet.model import TreeId
 from tests._testdiet import fixture_project, fixture_reports, make_repo
 
@@ -134,7 +134,7 @@ def _last(repo: Path):
 
 
 def _seen(repo: Path, argv, *, inputs=(), any_machine=False, machine_id="unset"):
-    mid = tree.machine_id() if machine_id == "unset" else machine_id
+    mid = machine.machine_id() if machine_id == "unset" else machine_id
     return record.seen(tree.store_dir(repo), tree.tree_id(repo), tree.command_sha(argv),
                        inputs_sha=tree.inputs_fingerprint(repo, inputs), machine_id=mid,
                        any_machine=any_machine)
@@ -151,13 +151,13 @@ def _set_default_branch(repo: Path) -> None:
 
 @pytest.mark.parametrize("code", [0, 1, 2, 5])
 def test_run_returns_the_exit_code_of_the_gate(repo, code):
-    assert record.run_gate(junit_gate(code, GREEN), cwd=repo) == code
+    assert run.run_gate(junit_gate(code, GREEN), cwd=repo) == code
     assert _last(repo).exit_code == code
 
 
 def test_run_records_counts_failing_ids_the_tree_and_the_command_sha(repo):
     argv = junit_gate(1, RED)
-    record.run_gate(argv, cwd=repo, kind="full", label="ci-gate", runner="pytest")
+    run.run_gate(argv, cwd=repo, kind="full", label="ci-gate", runner="pytest")
     meta = _last(repo)
     assert meta.source == "run" and meta.verdict == "failed"
     assert meta.counts == {"passed": 6, "failed": 1, "error": 0, "skipped": 1, "flaky": 0}
@@ -167,7 +167,7 @@ def test_run_records_counts_failing_ids_the_tree_and_the_command_sha(repo):
     assert meta.tree_changed is False
     assert meta.command_sha == tree.command_sha(argv)
     assert (meta.kind, meta.label, meta.runner, meta.machine) == ("full", "ci-gate", "pytest", "local")
-    assert meta.machine_id == tree.machine_id()
+    assert meta.machine_id == machine.machine_id()
     assert meta.wall_seconds is not None and meta.wall_seconds > 0
     data = history.load_tests(tree.store_dir(repo), meta.id)
     assert data is not None and len(data.tests) == 8
@@ -176,7 +176,7 @@ def test_run_records_counts_failing_ids_the_tree_and_the_command_sha(repo):
 def test_the_store_holds_the_sha_of_the_command_and_not_its_text(repo):
     marker = "command-text-marker-4471"
     argv = [*junit_gate(0, GREEN), "argv", os.devnull, marker]
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     store = tree.store_dir(repo)
     for path in (store / history.RUNS).iterdir():
         raw = path.read_bytes()
@@ -190,7 +190,7 @@ def test_the_store_holds_the_sha_of_the_command_and_not_its_text(repo):
 def test_run_puts_a_report_path_in_place_of_the_placeholder(repo, side):
     got = side / "got.txt"
     argv = gate(0, "argv", str(got), "--junitxml={junit}", "copy", str(GREEN), "{junit}")
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     text = got.read_text(encoding="utf-8")
     assert text.startswith("--junitxml=") and "{junit}" not in text
     assert text.endswith("junit.xml") and os.path.isabs(text[len("--junitxml="):])
@@ -202,7 +202,7 @@ def test_two_runs_with_different_junit_folders_have_one_command_sha(repo, side):
     argv = gate(0, "copy", str(GREEN), "{junit}", "argv", str(got), "{junit}")
     paths = []
     for _ in range(2):
-        record.run_gate(argv, cwd=repo)
+        run.run_gate(argv, cwd=repo)
         paths.append(got.read_text(encoding="utf-8"))
     assert paths[0] != paths[1]
     runs = _runs(repo)
@@ -212,14 +212,14 @@ def test_two_runs_with_different_junit_folders_have_one_command_sha(repo, side):
 def test_seen_is_true_for_the_same_command_with_a_new_junit_folder(repo):
     argv = junit_gate(0, GREEN)
     assert _seen(repo, argv) is None
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     found = _seen(repo, argv)
     assert found is not None and found.id == _last(repo).id
 
 
 def test_the_placeholder_folder_is_outside_the_tree_and_is_removed(repo, side):
     got = side / "got.txt"
-    record.run_gate(gate(0, "argv", str(got), "{junit}", "copy", str(GREEN), "{junit}"), cwd=repo)
+    run.run_gate(gate(0, "argv", str(got), "{junit}", "copy", str(GREEN), "{junit}"), cwd=repo)
     path = Path(got.read_text(encoding="utf-8"))
     assert not path.exists() and not path.parent.exists()
     assert not path.resolve().is_relative_to(repo.resolve())
@@ -231,15 +231,15 @@ def test_the_placeholder_folder_is_outside_the_tree_and_is_removed(repo, side):
 # --------------------------------------------------------------------------- #
 
 def test_a_gate_that_writes_no_report_at_the_placeholder_is_no_data(repo):
-    assert record.run_gate(gate(0, "argv", os.devnull, "{junit}"), cwd=repo) == 0
+    assert run.run_gate(gate(0, "argv", os.devnull, "{junit}"), cwd=repo) == 0
     meta = _last(repo)
     assert meta.verdict == "no-data" and meta.counts is None
 
 
 def test_run_without_junit_is_no_data_and_keeps_the_exit_code(repo):
-    assert record.run_gate(gate(0), cwd=repo) == 0
+    assert run.run_gate(gate(0), cwd=repo) == 0
     assert _last(repo).verdict == "no-data"
-    assert record.run_gate(gate(4), cwd=repo) == 4
+    assert run.run_gate(gate(4), cwd=repo) == 4
     assert _last(repo).verdict == "failed"
 
 
@@ -250,7 +250,7 @@ def test_run_reads_a_fixed_report_whose_content_changed(repo, side):
     old_ns = 1_600_000_000_000_000_000
     os.utime(fixed, ns=(old_ns, old_ns))
     argv = gate(0, "copy", str(GREEN), str(fixed), "mtime", str(fixed), str(old_ns))
-    assert record.run_gate(argv, cwd=repo, junit=[str(fixed)]) == 0
+    assert run.run_gate(argv, cwd=repo, junit=[str(fixed)]) == 0
     assert fixed.stat().st_size == size and fixed.stat().st_mtime_ns == old_ns
     meta = _last(repo)
     assert meta.verdict == "passed" and meta.counts["passed"] == 2
@@ -259,14 +259,14 @@ def test_run_reads_a_fixed_report_whose_content_changed(repo, side):
 def test_run_does_not_read_a_fixed_report_that_did_not_change_and_says_so(repo, side, capsys):
     fixed = side / "report.xml"
     shutil.copyfile(GREEN, fixed)
-    assert record.run_gate(gate(0), cwd=repo, junit=[str(fixed)]) == 0
+    assert run.run_gate(gate(0), cwd=repo, junit=[str(fixed)]) == 0
     err = capsys.readouterr().err
     assert "jacked tests: " in err and "did not change" in err and "report.xml" in err
     assert _last(repo).verdict == "no-data"
 
 
 def test_run_with_a_truncated_junit_keeps_the_exit_code_and_is_no_data(repo, capsys):
-    assert record.run_gate(gate(0, "half", str(GREEN), "{junit}"), cwd=repo) == 0
+    assert run.run_gate(gate(0, "half", str(GREEN), "{junit}"), cwd=repo) == 0
     assert _last(repo).verdict == "no-data"
     assert "jacked tests: " in capsys.readouterr().err
 
@@ -277,7 +277,7 @@ def test_a_junit_path_that_is_a_fifo_does_not_block_the_run(repo, side, capsys):
     os.mkfifo(fifo)
     result: dict = {}
     worker = threading.Thread(
-        target=lambda: result.setdefault("code", record.run_gate(gate(3), cwd=repo, junit=[str(fifo)])),
+        target=lambda: result.setdefault("code", run.run_gate(gate(3), cwd=repo, junit=[str(fifo)])),
         daemon=True)
     worker.start()
     worker.join(60)
@@ -291,17 +291,17 @@ def test_a_junit_path_that_is_a_fifo_does_not_block_the_run(repo, side, capsys):
 # --------------------------------------------------------------------------- #
 
 def test_exit_0_with_failures_in_the_report_is_a_conflict_and_is_printed(repo, capsys):
-    assert record.run_gate(junit_gate(0, RED), cwd=repo) == 0
+    assert run.run_gate(junit_gate(0, RED), cwd=repo) == 0
     assert _last(repo).verdict == "conflict"
     lines = [line for line in capsys.readouterr().err.splitlines() if "returned 0" in line]
     assert len(lines) == 1 and "failures" in lines[0]
 
 
 def test_strict_returns_1_on_a_conflict_and_the_gate_code_in_each_other_case(repo):
-    assert record.run_gate(junit_gate(0, RED), cwd=repo, strict=True) == 1
-    assert record.run_gate(junit_gate(0, GREEN), cwd=repo, strict=True) == 0
-    assert record.run_gate(junit_gate(2, RED), cwd=repo, strict=True) == 2
-    assert record.run_gate(gate(0), cwd=repo, strict=True) == 0  # no-data
+    assert run.run_gate(junit_gate(0, RED), cwd=repo, strict=True) == 1
+    assert run.run_gate(junit_gate(0, GREEN), cwd=repo, strict=True) == 0
+    assert run.run_gate(junit_gate(2, RED), cwd=repo, strict=True) == 2
+    assert run.run_gate(gate(0), cwd=repo, strict=True) == 0  # no-data
 
 
 def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch, capsys):
@@ -310,28 +310,28 @@ def test_a_recorder_error_does_not_change_the_exit_code(repo, monkeypatch, capsy
 
     store = tree.store_dir(repo)
     monkeypatch.setattr(history, "write_run", boom)
-    assert record.run_gate(junit_gate(6, RED), cwd=repo) == 6
+    assert run.run_gate(junit_gate(6, RED), cwd=repo) == 6
     monkeypatch.setattr(tree, "tree_id", boom)
-    assert record.run_gate(junit_gate(6, RED), cwd=repo) == 6
-    monkeypatch.setattr(run.junit, "read_junit", boom)
+    assert run.run_gate(junit_gate(6, RED), cwd=repo) == 6
+    monkeypatch.setattr(junit, "read_junit", boom)
     monkeypatch.setattr(tree, "store_dir", boom)
     monkeypatch.setattr(tree, "inputs_fingerprint", boom)
-    assert record.run_gate(junit_gate(7, RED), cwd=repo, inputs=["*.txt"]) == 7
-    assert record.run_gate(junit_gate(0, RED), cwd=repo, strict=True) == 0
+    assert run.run_gate(junit_gate(7, RED), cwd=repo, inputs=["*.txt"]) == 7
+    assert run.run_gate(junit_gate(0, RED), cwd=repo, strict=True) == 0
     assert "jacked tests: " in capsys.readouterr().err
     assert list(history.iter_runs(store)) == []
 
 
 def test_a_command_that_cannot_start_returns_127(repo, tmp_path, capsys):
     missing = str(tmp_path / "no-such-program")
-    assert record.run_gate([missing, "x"], cwd=repo) == 127
+    assert run.run_gate([missing, "x"], cwd=repo) == 127
     assert _last(repo).exit_code == 127
     lines = [line for line in capsys.readouterr().err.splitlines() if "cannot start" in line]
     assert len(lines) == 1 and "no-such-program" in lines[0]
 
 
 def test_a_bare_program_name_that_is_not_found_returns_127_and_one_line(repo, capsys):
-    assert record.run_gate(["jacked-no-such-program-4471", "x"], cwd=repo) == 127
+    assert run.run_gate(["jacked-no-such-program-4471", "x"], cwd=repo) == 127
     lines = [line for line in capsys.readouterr().err.splitlines() if "cannot start" in line]
     assert len(lines) == 1 and "jacked-no-such-program-4471" in lines[0]
 
@@ -343,7 +343,7 @@ def test_a_cmd_shim_by_its_bare_name_starts_on_windows(repo, tmp_path, monkeypat
     (shims / "jackedshim.cmd").write_bytes(b"@exit /b 7\r\n")
     monkeypatch.setenv("PATH", str(shims) + os.pathsep + os.environ.get("PATH", ""))
     argv = ["jackedshim", "--flag"]
-    assert record.run_gate(argv, cwd=repo) == 7
+    assert run.run_gate(argv, cwd=repo) == 7
     assert _last(repo).command_sha == tree.command_sha(argv)
 
 
@@ -373,7 +373,7 @@ def test_a_sigterm_to_the_run_records_and_cleans_up(repo, side, tmp_path, monkey
     sender.start()
     try:
         argv = gate(0, "copy", str(GREEN), "{junit}", "write", str(ready), "sleep", "20")
-        code = record.run_gate(argv, cwd=repo)
+        code = run.run_gate(argv, cwd=repo)
         restored = signal.getsignal(signal.SIGTERM)
     finally:
         sender.join(60)
@@ -390,15 +390,15 @@ def test_an_interrupt_after_the_gate_keeps_its_exit_code(repo, monkeypatch, caps
     def interrupt(*args, **kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(run.junit, "read_junit", interrupt)
-    assert record.run_gate(junit_gate(5, RED), cwd=repo) == 5
+    monkeypatch.setattr(junit, "read_junit", interrupt)
+    assert run.run_gate(junit_gate(5, RED), cwd=repo) == 5
     assert "after the gate stopped" in capsys.readouterr().err
     assert _runs(repo) == []
 
 
 @POSIX
 def test_a_child_that_a_signal_stops_returns_128_plus_the_signal(repo):
-    assert record.run_gate(gate(0, "kill"), cwd=repo) == 128 + signal.SIGTERM
+    assert run.run_gate(gate(0, "kill"), cwd=repo) == 128 + signal.SIGTERM
     assert _last(repo).exit_code == 128 + signal.SIGTERM
 
 
@@ -416,7 +416,7 @@ def test_an_interrupt_of_the_parent_waits_for_the_child(repo, monkeypatch, capsy
             return super().wait(*args, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", InterruptOnce)
-    assert record.run_gate(gate(3, "sleep", "0.2"), cwd=repo) == 3
+    assert run.run_gate(gate(3, "sleep", "0.2"), cwd=repo) == 3
     assert interrupted == [True]
     assert _last(repo).exit_code == 3
     assert "interrupt" in capsys.readouterr().err
@@ -425,7 +425,7 @@ def test_an_interrupt_of_the_parent_waits_for_the_child(repo, monkeypatch, capsy
 def test_run_outside_a_git_repository_records_nothing_and_keeps_the_exit_code(hermetic_git, capsys):
     plain = hermetic_git / "plain"
     plain.mkdir()
-    assert record.run_gate(junit_gate(5, GREEN), cwd=plain) == 5
+    assert run.run_gate(junit_gate(5, GREEN), cwd=plain) == 5
     err = capsys.readouterr().err
     assert len([line for line in err.splitlines() if line.startswith("jacked tests: ")]) == 1
     assert sorted(p.name for p in plain.iterdir()) == []
@@ -437,12 +437,12 @@ def test_run_outside_a_git_repository_records_nothing_and_keeps_the_exit_code(he
 
 def test_a_gate_that_writes_a_file_into_the_tree_is_named_and_never_seen(repo, capsys):
     argv = [*junit_gate(0, GREEN), "write", str(repo / "made-by-gate.txt")]
-    assert record.run_gate(argv, cwd=repo) == 0
+    assert run.run_gate(argv, cwd=repo) == 0
     assert "made-by-gate.txt" in capsys.readouterr().err
     meta = _last(repo)
     assert meta.tree_changed is True and meta.verdict == "passed"
     found = record.seen(tree.store_dir(repo), meta.tree, meta.command_sha, inputs_sha=None,
-                        machine_id=tree.machine_id())
+                        machine_id=machine.machine_id())
     assert found is None
     (repo / "made-by-gate.txt").unlink()
     assert _seen(repo, argv) is None
@@ -467,12 +467,12 @@ _OTHER_TREE = TreeId(commit="c" * 40, tree="d" * 40, clean=True)
 ])
 def test_seen_rejects_a_run_that_differs_in_one_field(repo, tmp_path, field, value):
     argv = junit_gate(0, GREEN)
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     real = _last(repo)
     control, twin = tmp_path / "control", tmp_path / "twin"
     history.write_run(control, real, None)
     history.write_run(twin, dataclasses.replace(real, **{field: value}), None)
-    args = dict(inputs_sha=real.inputs_sha, machine_id=tree.machine_id())
+    args = dict(inputs_sha=real.inputs_sha, machine_id=machine.machine_id())
     current = tree.tree_id(repo)
     assert record.seen(control, current, real.command_sha, **args) is not None
     assert record.seen(twin, current, real.command_sha, **args) is None
@@ -482,22 +482,22 @@ def test_seen_rejects_a_run_that_differs_in_one_field(repo, tmp_path, field, val
 
 def test_seen_is_false_for_a_dirty_tree_whose_head_passed(repo):
     argv = junit_gate(0, GREEN)
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     assert _seen(repo, argv) is not None
     (repo / "README.md").write_bytes(b"changed\n")
     assert _seen(repo, argv) is None
 
 
 def test_seen_is_false_when_the_gate_command_differs(repo):
-    record.run_gate(junit_gate(0, GREEN), cwd=repo)
+    run.run_gate(junit_gate(0, GREEN), cwd=repo)
     assert _seen(repo, [*junit_gate(0, GREEN), "-x"]) is None
 
 
 def test_seen_is_false_for_a_conflict_and_for_no_data(repo):
     conflict = junit_gate(0, RED)
-    record.run_gate(conflict, cwd=repo)
+    run.run_gate(conflict, cwd=repo)
     no_data = gate(0)
-    record.run_gate(no_data, cwd=repo)
+    run.run_gate(no_data, cwd=repo)
     assert [m.verdict for m in _runs(repo)] == ["no-data", "conflict"]
     assert _seen(repo, conflict) is None and _seen(repo, no_data) is None
 
@@ -510,7 +510,7 @@ def test_seen_is_false_for_a_green_record_that_was_not_wrapped(repo):
     assert meta.tree is not None and meta.tree.tree == tree.tree_id(repo).tree
     stored = _last(repo)
     found = record.seen(tree.store_dir(repo), tree.tree_id(repo), "0" * 64, inputs_sha=None,
-                        machine_id=tree.machine_id(), any_machine=True)
+                        machine_id=machine.machine_id(), any_machine=True)
     assert stored.id == meta.id and found is None
 
 
@@ -528,7 +528,7 @@ def test_seen_is_false_when_a_declared_input_changed(repo):
     cache = repo / "cache.bin"
     cache.write_bytes(b"one")
     argv = junit_gate(0, GREEN)
-    record.run_gate(argv, cwd=repo, inputs=["cache.bin"])
+    run.run_gate(argv, cwd=repo, inputs=["cache.bin"])
     assert _seen(repo, argv, inputs=["cache.bin"]) is not None
     before_tree = tree.tree_id(repo)
     cache.write_bytes(b"two")
@@ -538,9 +538,9 @@ def test_seen_is_false_when_a_declared_input_changed(repo):
 
 
 def test_seen_is_false_for_a_record_of_a_different_machine_without_the_flag(repo, monkeypatch):
-    monkeypatch.setattr(tree, "machine_id", lambda home=None: "a" * 32)
+    monkeypatch.setattr(machine, "machine_id", lambda home=None: "a" * 32)
     argv = junit_gate(0, GREEN)
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     assert _seen(repo, argv, machine_id="a" * 32) is not None
     assert _seen(repo, argv, machine_id="b" * 32) is None
     assert _seen(repo, argv, machine_id="b" * 32, any_machine=True) is not None
@@ -548,8 +548,8 @@ def test_seen_is_false_for_a_record_of_a_different_machine_without_the_flag(repo
 
 def test_seen_is_false_when_this_machine_has_no_identity(repo, monkeypatch):
     argv = junit_gate(0, GREEN)
-    monkeypatch.setattr(tree, "machine_id", lambda home=None: None)
-    record.run_gate(argv, cwd=repo)
+    monkeypatch.setattr(machine, "machine_id", lambda home=None: None)
+    run.run_gate(argv, cwd=repo)
     assert _last(repo).machine_id is None
     assert _seen(repo, argv, machine_id=None) is None
     assert _seen(repo, argv, machine_id="a" * 32) is None
@@ -557,7 +557,7 @@ def test_seen_is_false_when_this_machine_has_no_identity(repo, monkeypatch):
 
 def test_seen_is_true_for_a_second_commit_with_the_same_content(repo):
     argv = junit_gate(0, GREEN)
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     first = tree.tree_id(repo)
     _git(repo, "commit", "-q", "--allow-empty", "-m", "same content")
     second = tree.tree_id(repo)
@@ -599,11 +599,11 @@ def _notice_lines(err: str) -> list[str]:
 
 def test_a_red_run_with_a_failing_set_in_two_earlier_records_prints_them(repo, capsys):
     argv = junit_gate(1, RED)
-    record.run_gate(argv, cwd=repo)
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     earlier = [m.id for m in _runs(repo)]
     capsys.readouterr()
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     err = capsys.readouterr().err
     lines = _notice_lines(err)
     assert lines and "2 earlier records" in lines[0]
@@ -614,22 +614,22 @@ def test_a_red_run_with_a_failing_set_in_two_earlier_records_prints_them(repo, c
 
 
 def test_a_red_run_with_a_new_failing_set_prints_no_notice(repo, capsys):
-    record.run_gate(junit_gate(1, RED), cwd=repo)
-    record.run_gate(junit_gate(1, RED), cwd=repo)
+    run.run_gate(junit_gate(1, RED), cwd=repo)
+    run.run_gate(junit_gate(1, RED), cwd=repo)
     capsys.readouterr()
-    record.run_gate(junit_gate(1, RED_OTHER), cwd=repo)
+    run.run_gate(junit_gate(1, RED_OTHER), cwd=repo)
     assert _notice_lines(capsys.readouterr().err) == []
     assert record.repeat_notice(tree.store_dir(repo), _last(repo)) is None
 
 
 def test_the_notice_counts_default_branch_records_and_gives_no_cause(repo, capsys):
     argv = junit_gate(1, RED)
-    record.run_gate(argv, cwd=repo)  # no default branch yet
+    run.run_gate(argv, cwd=repo)  # no default branch yet
     _set_default_branch(repo)
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     assert _last(repo).on_default_branch is True
     capsys.readouterr()
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     text = record.repeat_notice(tree.store_dir(repo), _last(repo))
     assert text is not None
     assert "2 earlier records" in text and "1 of them on the default branch" in text
@@ -642,7 +642,7 @@ def test_the_notice_counts_default_branch_records_and_gives_no_cause(repo, capsy
 # --------------------------------------------------------------------------- #
 
 def test_the_load_and_the_processor_time_are_recorded_or_empty_on_windows(repo):
-    record.run_gate(junit_gate(0, GREEN), cwd=repo)
+    run.run_gate(junit_gate(0, GREEN), cwd=repo)
     meta = _last(repo)
     if os.name == "nt":
         assert meta.load_start is None and meta.load_end is None and meta.child_cpu_seconds is None
@@ -653,7 +653,7 @@ def test_the_load_and_the_processor_time_are_recorded_or_empty_on_windows(repo):
 
 
 def test_record_writes_to_no_tracked_file(repo):
-    record.run_gate(junit_gate(1, RED), cwd=repo)
+    run.run_gate(junit_gate(1, RED), cwd=repo)
     record.record_files([GREEN], cwd=repo, kind=None, label=None, runner=None, commit="HEAD",
                         exit_code=0, wall_seconds=None, machine=None, report_root=None)
     assert _git(repo, "status", "--porcelain", "--ignored", "--untracked-files=all") == ""
@@ -661,7 +661,7 @@ def test_record_writes_to_no_tracked_file(repo):
 
 
 def test_the_store_holds_no_failure_text(repo):
-    record.run_gate(junit_gate(1, RED), cwd=repo)
+    run.run_gate(junit_gate(1, RED), cwd=repo)
     raw = b""
     for path in (tree.store_dir(repo) / history.RUNS).iterdir():
         data = path.read_bytes()
@@ -679,8 +679,8 @@ def test_a_printed_id_has_no_escape_sequence(repo, side, capsys):
     report = side / "csi.xml"
     report.write_bytes(text.encode("utf-8"))
     argv = junit_gate(1, report)
-    record.run_gate(argv, cwd=repo)
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     err = capsys.readouterr().err
     assert "tests/test_sample.py::test_fails31m" in err
     assert "\u009b" not in err and "\x1b" not in err
@@ -689,7 +689,7 @@ def test_a_printed_id_has_no_escape_sequence(repo, side, capsys):
 @POSIX
 def test_a_printed_path_has_no_escape_sequence(repo, capsys):
     name = "evil\x1b[31m.txt"
-    record.run_gate([*junit_gate(0, GREEN), "write", str(repo / name)], cwd=repo)
+    run.run_gate([*junit_gate(0, GREEN), "write", str(repo / name)], cwd=repo)
     err = capsys.readouterr().err
     assert "evil[31m.txt" in err and "\x1b" not in err
 
@@ -697,7 +697,7 @@ def test_a_printed_path_has_no_escape_sequence(repo, capsys):
 def test_a_label_with_a_newline_at_its_end_is_refused(repo, side):
     got = side / "ran.txt"
     with pytest.raises(ValueError):
-        record.run_gate(gate(0, "write", str(got)), cwd=repo, label="gate\n")
+        run.run_gate(gate(0, "write", str(got)), cwd=repo, label="gate\n")
     assert not got.exists()
     with pytest.raises(ValueError):
         record.record_files([GREEN], cwd=repo, kind=None, label=None, runner=None, commit=None,
@@ -712,15 +712,15 @@ def test_a_failed_hash_of_the_fixed_reports_reads_no_old_report(repo, side, monk
     def boom(top, globs):
         raise RuntimeError("glob broke")
 
-    real_matches = run._matches
+    real_matches = reports.matches
     calls = []
 
     def first_call_fails(top, globs):
         calls.append(1)
         return boom(top, globs) if len(calls) == 1 else real_matches(top, globs)
 
-    monkeypatch.setattr(run, "_matches", first_call_fails)
-    assert record.run_gate(gate(0), cwd=repo, junit=[str(fixed)]) == 0
+    monkeypatch.setattr(reports, "matches", first_call_fails)
+    assert run.run_gate(gate(0), cwd=repo, junit=[str(fixed)]) == 0
     assert _last(repo).verdict == "no-data"
     assert "not hashed before the run" in capsys.readouterr().err
 
@@ -736,7 +736,7 @@ def test_a_standard_error_that_cannot_be_written_does_not_stop_the_gate(hermetic
     plain = hermetic_git / "plain"
     plain.mkdir()
     monkeypatch.setattr(sys, "stderr", Broken())
-    assert record.run_gate(gate(4), cwd=plain) == 4
+    assert run.run_gate(gate(4), cwd=plain) == 4
 
 
 def test_a_failed_input_hash_is_unavailable_and_never_seen(repo, monkeypatch):
@@ -746,16 +746,16 @@ def test_a_failed_input_hash_is_unavailable_and_never_seen(repo, monkeypatch):
     argv = junit_gate(0, GREEN)
     real = tree.inputs_fingerprint
     monkeypatch.setattr(tree, "inputs_fingerprint", boom)
-    record.run_gate(argv, cwd=repo, inputs=["cache.bin"])
+    run.run_gate(argv, cwd=repo, inputs=["cache.bin"])
     meta = _last(repo)
     assert meta.verdict == "passed" and meta.inputs_sha == record.INPUTS_UNAVAILABLE
     store, current = tree.store_dir(repo), tree.tree_id(repo)
-    args = dict(machine_id=tree.machine_id())
+    args = dict(machine_id=machine.machine_id())
     # Neither the sentinel nor "no --input" matches it.
     assert record.seen(store, current, meta.command_sha, inputs_sha=record.INPUTS_UNAVAILABLE, **args) is None
     assert record.seen(store, current, meta.command_sha, inputs_sha=None, **args) is None
     monkeypatch.setattr(tree, "inputs_fingerprint", real)
-    record.run_gate(argv, cwd=repo)  # no --input: inputs_sha None
+    run.run_gate(argv, cwd=repo)  # no --input: inputs_sha None
     assert _last(repo).inputs_sha is None
 
 
@@ -764,18 +764,18 @@ def test_a_store_that_cannot_be_found_says_so(repo, monkeypatch, capsys):
         raise RuntimeError("store broke")
 
     monkeypatch.setattr(tree, "store_dir", boom)
-    assert record.run_gate(gate(3), cwd=repo) == 3
+    assert run.run_gate(gate(3), cwd=repo) == 3
     err = capsys.readouterr().err
     assert "the history store cannot be found" in err and "not in a git repository" not in err
 
 
 def test_the_notice_groups_records_by_machine_and_has_no_date_range(repo, capsys):
     argv = junit_gate(1, RED)
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     ci = record.record_files([RED], cwd=repo, kind=None, label=None, runner=None, commit=None,
                              exit_code=1, wall_seconds=None, machine="ci", report_root=None,
                              started="2026-11-01T00:00:00+00:00")
-    record.run_gate(argv, cwd=repo)
+    run.run_gate(argv, cwd=repo)
     text = record.repeat_notice(tree.store_dir(repo), _last(repo))
     lines = text.splitlines()
     assert "2 earlier records" in lines[0] and " to " not in lines[0] and "from" not in lines[0]
@@ -812,12 +812,12 @@ def test_a_sigterm_during_the_post_run_steps_keeps_the_code_and_cleans_up(repo, 
         time.sleep(10)
         raise AssertionError("the signal did not stop the recorder")
 
-    monkeypatch.setattr(run.junit, "read_junit", slow_read)
+    monkeypatch.setattr(junit, "read_junit", slow_read)
     caught = _CaughtTerm()
     previous = signal.signal(signal.SIGTERM, caught)
     try:
         started = time.monotonic()
-        code = record.run_gate(junit_gate(5, GREEN), cwd=repo)
+        code = run.run_gate(junit_gate(5, GREEN), cwd=repo)
         elapsed = time.monotonic() - started
         restored = signal.getsignal(signal.SIGTERM)
     finally:
@@ -849,7 +849,7 @@ def test_a_sigterm_before_the_gate_starts_leaves_no_orphan(repo, side, monkeypat
     previous = signal.signal(signal.SIGTERM, caught)
     try:
         started = time.monotonic()
-        code = record.run_gate(gate(0, "argv", str(pid_file), "x", "sleep", "30"), cwd=repo)
+        code = run.run_gate(gate(0, "argv", str(pid_file), "x", "sleep", "30"), cwd=repo)
         elapsed = time.monotonic() - started
     finally:
         signal.signal(signal.SIGTERM, previous)
@@ -868,7 +868,7 @@ def test_a_signal_goes_to_the_gate_once_for_each_signal_number():
         def send_signal(self, signum):
             sent.append(signum)
 
-    signals = run._Signals()
+    signals = process.Signals()
     signals._handle(15, None)  # before the gate exists: kept
     assert sent == []
     signals.started(Proc())
@@ -891,7 +891,7 @@ def test_a_bare_name_only_in_an_install_folder_off_path_does_not_start(repo, tmp
     target.chmod(0o755)
     monkeypatch.setenv("UV_TOOL_BIN_DIR", str(folder))
     assert findbin.find_on_path(name) is None
-    assert record.run_gate([name], cwd=repo) == 127
+    assert run.run_gate([name], cwd=repo) == 127
     assert name in capsys.readouterr().err
 
 

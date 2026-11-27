@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 from jacked import git_guard
-from jacked.testdiet import history, tree
+from jacked.testdiet import cleanup, history, machine, tree
 from jacked.testdiet.model import CaseResult, RunData, RunMeta, TreeId
 from tests._testdiet import make_repo
 
@@ -198,7 +198,7 @@ def test_a_caller_folder_of_objects_stays_after_tree_id(repo, tmp_path):
     (repo / "README.md").write_bytes(b"dirty\n")
     tid = tree.tree_id(repo, objects=objects)
     assert any(p.is_file() for p in objects.rglob("*"))
-    tree.remove_tree(objects)
+    cleanup.remove_tree_quietly(objects)
     assert not objects.exists()
     assert tid.clean is False
 
@@ -211,9 +211,9 @@ def test_remove_tree_removes_a_read_only_file(tmp_path):
     os.chmod(loose, stat.S_IREAD)
     if os.name != "nt":
         os.chmod(folder / "ab", stat.S_IREAD | stat.S_IEXEC)
-    tree.remove_tree(folder)
+    cleanup.remove_tree_quietly(folder)
     assert not folder.exists()
-    tree.remove_tree(folder)  # a missing folder is not an error
+    cleanup.remove_tree_quietly(folder)  # a missing folder is not an error
 
 
 def test_remove_tree_logs_a_path_that_it_cannot_remove(tmp_path, monkeypatch, caplog):
@@ -225,8 +225,8 @@ def test_remove_tree_logs_a_path_that_it_cannot_remove(tmp_path, monkeypatch, ca
         raise PermissionError(13, "refused")
 
     monkeypatch.setattr(os, "unlink", refuse)
-    with caplog.at_level(logging.WARNING, logger="jacked.testdiet.tree"):
-        tree.remove_tree(folder)
+    with caplog.at_level(logging.WARNING, logger="jacked.testdiet.cleanup"):
+        cleanup.remove_tree_quietly(folder)
     assert any("cannot remove" in r.getMessage() and "file" in r.getMessage() for r in caplog.records)
 
 
@@ -238,8 +238,8 @@ def test_remove_tree_removes_a_folder_with_an_unreadable_subfolder(tmp_path, cap
     (locked / "inner").write_bytes(b"x")
     os.chmod(locked, 0)
     try:
-        with caplog.at_level(logging.WARNING, logger="jacked.testdiet.tree"):
-            tree.remove_tree(folder)  # must return, never raise
+        with caplog.at_level(logging.WARNING, logger="jacked.testdiet.cleanup"):
+            cleanup.remove_tree_quietly(folder)  # must return, never raise
         assert not folder.exists() or any("cannot remove" in r.getMessage() for r in caplog.records)
         assert not folder.exists()
     finally:
@@ -255,8 +255,8 @@ def test_remove_tree_never_raises(tmp_path, monkeypatch, caplog):
         raise TypeError("a bug in a removal call")
 
     monkeypatch.setattr(shutil, "rmtree", broken)
-    with caplog.at_level(logging.WARNING, logger="jacked.testdiet.tree"):
-        tree.remove_tree(folder)
+    with caplog.at_level(logging.WARNING, logger="jacked.testdiet.cleanup"):
+        cleanup.remove_tree_quietly(folder)
     assert any("TypeError" in r.getMessage() for r in caplog.records)
 
 
@@ -278,7 +278,7 @@ def test_remove_tree_does_not_change_the_mode_of_a_link_target(tmp_path, monkeyp
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "unlink", unlink)
-    tree.remove_tree(folder)
+    cleanup.remove_tree_quietly(folder)
     assert refused and not folder.exists()
     assert outside.read_bytes() == b"keep"
     assert stat.S_IMODE(outside.stat().st_mode) == 0o444
@@ -825,12 +825,12 @@ def test_on_default_branch_is_empty_with_no_remote_head(repo):
 
 
 def test_the_machine_id_is_made_one_time_and_read_back(tmp_path):
-    first = tree.machine_id(tmp_path)
+    first = machine.machine_id(tmp_path)
     assert re.fullmatch(r"[0-9a-f]{32}", first)
     path = tmp_path / ".claude" / "jacked-tests-machine-id"
     assert path.read_bytes().decode("ascii").strip() == first
-    assert tree.machine_id(tmp_path) == first
-    assert tree.machine_id(tmp_path / "other") != first
+    assert machine.machine_id(tmp_path) == first
+    assert machine.machine_id(tmp_path / "other") != first
 
 
 def test_two_processes_that_make_the_machine_id_at_once_get_one_id(tmp_path):
@@ -838,11 +838,11 @@ def test_two_processes_that_make_the_machine_id_at_once_get_one_id(tmp_path):
         import sys, time
         sys.path.insert(0, sys.argv[1])
         from pathlib import Path
-        from jacked.testdiet import tree
+        from jacked.testdiet import machine
         Path(sys.argv[3]).touch()
         while not Path(sys.argv[4]).exists():
             time.sleep(0.001)
-        print(tree.machine_id(Path(sys.argv[2])))
+        print(machine.machine_id(Path(sys.argv[2])))
     """)
     go = tmp_path / "go"
     procs = []
@@ -873,25 +873,25 @@ def test_the_machine_id_is_made_on_a_file_system_with_no_hard_links(tmp_path, mo
         raise OSError(1, "Operation not permitted")
 
     monkeypatch.setattr(os, "link", no_links)
-    first = tree.machine_id(tmp_path)
+    first = machine.machine_id(tmp_path)
     assert re.fullmatch(r"[0-9a-f]{32}", first)
-    assert tree.machine_id(tmp_path) == first
+    assert machine.machine_id(tmp_path) == first
     assert sorted(p.name for p in (tmp_path / ".claude").iterdir()) == ["jacked-tests-machine-id"]
 
 
 def test_the_machine_id_is_empty_when_the_file_cannot_be_read_or_made(tmp_path):
     blocker = tmp_path / "blocked"
     blocker.write_bytes(b"a file where the .claude folder must be")
-    assert tree.machine_id(blocker) is None
+    assert machine.machine_id(blocker) is None
     damaged = tmp_path / "damaged"
     (damaged / ".claude").mkdir(parents=True)
     (damaged / ".claude" / "jacked-tests-machine-id").write_bytes(b"not an id")
-    assert tree.machine_id(damaged) is None
+    assert machine.machine_id(damaged) is None
 
 
 def test_the_machine_id_uses_the_jacked_home_by_default(tmp_path, monkeypatch):
     monkeypatch.setenv("JACKED_HOME", str(tmp_path))
-    made = tree.machine_id()
+    made = machine.machine_id()
     assert (tmp_path / ".claude" / "jacked-tests-machine-id").read_bytes().decode().strip() == made
 
 
@@ -908,7 +908,7 @@ def test_the_machine_id_holds_no_part_of_the_host_name(tmp_path, monkeypatch):
     monkeypatch.setattr(socket, "gethostname", recorder("gethostname"))
     monkeypatch.setattr(socket, "getfqdn", recorder("getfqdn"))
     monkeypatch.setattr(platform, "node", recorder("node"))
-    made = tree.machine_id(tmp_path)
+    made = machine.machine_id(tmp_path)
     text = (tmp_path / ".claude" / "jacked-tests-machine-id").read_bytes().decode("ascii")
     assert calls == []
     for part in ("zqxhost.lan", "zqxhost"):
@@ -918,7 +918,7 @@ def test_the_machine_id_holds_no_part_of_the_host_name(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows has no POSIX mode bits")
 def test_the_machine_id_file_is_for_the_user_only(tmp_path):
-    tree.machine_id(tmp_path)
+    machine.machine_id(tmp_path)
     mode = (tmp_path / ".claude" / "jacked-tests-machine-id").stat().st_mode & 0o777
     assert mode == 0o600
 

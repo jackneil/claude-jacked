@@ -10,6 +10,8 @@ from pathlib import Path
 
 import click
 
+from jacked.testdiet import model as _model
+
 
 @click.group(name="tests")
 def recorder_group():
@@ -110,7 +112,7 @@ def record_command(junit, kind, label, runner, exit_code, wall, commit, machine,
                                     wall_seconds=wall, machine=machine, report_root=report_root,
                                     started=started)
     except (JUnitError, TreeError, OSError, ValueError) as exc:
-        _record.emit(f"nothing is recorded: {exc}")
+        _model.emit(f"nothing is recorded: {exc}")
         raise SystemExit(1)
     click.echo(f"{meta.id} {meta.verdict}")
 
@@ -131,6 +133,7 @@ def seen_command(inputs, any_machine, as_json, command):
     import json as _json
     import os as _os
 
+    from jacked.testdiet import machine as _machine
     from jacked.testdiet import record as _record
     from jacked.testdiet import tree as _tree
 
@@ -143,13 +146,13 @@ def seen_command(inputs, any_machine, as_json, command):
         if current is not None:
             found = _record.seen(_tree.store_dir(top), current, _tree.command_sha(list(command)),
                                  inputs_sha=_tree.inputs_fingerprint(top, inputs),
-                                 machine_id=_tree.machine_id(), any_machine=any_machine)
+                                 machine_id=_machine.machine_id(), any_machine=any_machine)
         else:
-            _record.emit("this repository has no tree identity (no commit, or git failed).")
+            _model.emit("this repository has no tree identity (no commit, or git failed).")
     except _tree.TreeError:
-        _record.emit("this folder is not in the work tree of a git repository.")
+        _model.emit("this folder is not in the work tree of a git repository.")
     except Exception as exc:  # noqa: BLE001 -- an unknown answer is "not seen", never a traceback
-        _record.emit(f"cannot check the history ({type(exc).__name__}). The answer is: not seen.")
+        _model.emit(f"cannot check the history ({type(exc).__name__}). The answer is: not seen.")
     if as_json:
         data = None
         if found is not None:
@@ -159,7 +162,7 @@ def seen_command(inputs, any_machine, as_json, command):
     elif found is not None:
         click.echo(_record.seen_line(found))
     else:
-        _record.emit("no passed run of this tree, this command and this machine.")
+        _model.emit("no passed run of this tree, this command and this machine.")
     raise SystemExit(0 if found is not None else 1)
 
 
@@ -173,7 +176,7 @@ def _store_or_exit() -> Path:
     try:
         return _tree.store_dir(_record.work_tree_top(Path(_os.getcwd())))
     except _tree.TreeError:
-        _record.emit("this folder is not in the work tree of a git repository.")
+        _model.emit("this folder is not in the work tree of a git repository.")
         raise SystemExit(1)
 
 
@@ -186,14 +189,13 @@ def _store_or_exit() -> Path:
 @click.option("--json", "as_json", is_flag=True, help="Print every row as JSON.")
 def profile_command(run_id, machine, top, as_json):
     """Show where the time of a run goes, by file and by test."""
-    from jacked.testdiet import record as _record
     from jacked.testdiet import views as _views
 
     store = _store_or_exit()
     try:
         result = _views.profile(store, run_id, machine=machine, top=None if as_json else top)
     except _views.ViewError as exc:
-        _record.emit(str(exc))
+        _model.emit(str(exc))
         raise SystemExit(1)
     click.echo(_views.to_json(result) if as_json else _views.render_profile(result, top))
 
@@ -207,14 +209,13 @@ def profile_command(run_id, machine, top, as_json):
 @click.option("--size", is_flag=True, help="Also print the size of the history in bytes.")
 def history_command(machine, days, as_json, size):
     """Show the runs of one machine: verdicts, failing sets, flaky tests and green repeats."""
-    from jacked.testdiet import record as _record
     from jacked.testdiet import views as _views
 
     store = _store_or_exit()
     try:
         result = _views.history(store, machine=machine, days=days)
     except _views.ViewError as exc:
-        _record.emit(str(exc))
+        _model.emit(str(exc))
         raise SystemExit(1)
     click.echo(_views.to_json(result) if as_json else _views.render_history(result, size=size))
 
@@ -225,21 +226,20 @@ def history_command(machine, days, as_json, size):
 def prune_command(before):
     """Delete the runs before a date. Print each run that is deleted."""
     from jacked.testdiet import history as _history
-    from jacked.testdiet import record as _record
 
     store = _store_or_exit()
     try:
         deleted = _history.prune(store, before.date())
     except _history.PruneError as exc:
         for run_id in exc.deleted:
-            click.echo(_record.clean_text(f"deleted {run_id}"))
+            click.echo(_model.clean_text(f"deleted {run_id}"))
         for name, error in exc.failed:
-            _record.emit(f"cannot delete {name} ({error})")
+            _model.emit(f"cannot delete {name} ({error})")
         raise SystemExit(1)
     for run_id in deleted:
-        click.echo(_record.clean_text(f"deleted {run_id}"))
+        click.echo(_model.clean_text(f"deleted {run_id}"))
     if not deleted:
-        _record.emit(f"no run is before {before:%Y-%m-%d}. Nothing is deleted.")
+        _model.emit(f"no run is before {before:%Y-%m-%d}. Nothing is deleted.")
 
 
 @recorder_group.command(name="loss")
@@ -269,17 +269,16 @@ def loss_command(base, as_json):
     import os as _os
 
     from jacked.testdiet import loss as _loss
-    from jacked.testdiet import record as _record
     from jacked.testdiet.model import one_line
     from jacked.testdiet.tree import TreeError
 
     try:
         report = _loss.loss_report(Path(_os.getcwd()), base)
     except _loss.NotInWorkTree:
-        _record.emit("this folder is not in the work tree of a git repository.")
+        _model.emit("this folder is not in the work tree of a git repository.")
         raise SystemExit(1)
     except (_loss.LossError, TreeError) as exc:
-        _record.emit(f"no loss report: {one_line(str(exc))}")
+        _model.emit(f"no loss report: {one_line(str(exc))}")
         raise SystemExit(1)
     if as_json:
         click.echo(_json.dumps(dataclasses.asdict(report), indent=1, sort_keys=True))

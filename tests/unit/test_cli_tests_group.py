@@ -16,7 +16,7 @@ from rich.console import Console
 
 import jacked.cli as cli
 from jacked.cli import main
-from jacked.testdiet import history, tree
+from jacked.testdiet import history, machine, tree
 from tests._testdiet import fixture_reports, make_repo
 
 GREEN = fixture_reports("pytest_rerun")[0]
@@ -87,7 +87,7 @@ def test_cli_seen_exits_0_after_a_green_run_and_1_before_it(repo):
     assert as_json.exit_code == 0
     data = json.loads(as_json.stdout)
     assert data["id"] == run_id and data["verdict"] == "passed"
-    assert "machine_id" not in data and tree.machine_id() not in as_json.output
+    assert "machine_id" not in data and machine.machine_id() not in as_json.output
     assert json.loads(_invoke("tests", "seen", "--json", "--", *gate(RED, 0)).stdout) is None
 
 

@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import sys
+import unicodedata
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 STATES = ("passed", "failed", "error", "skipped", "flaky")
 RUNNERS = ("pytest", "vitest", "jest", "playwright", "go", "nextest", "unknown")
 #: The pattern of a label, a machine label and a runner name.
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]+")
-#: The pattern of a machine identity: 32 lowercase hex characters.
-MACHINE_ID_RE = re.compile(r"[0-9a-f]{32}")
+#: The size of a machine identity in random bytes. ``MACHINE_ID_RE`` derives from it.
+MACHINE_ID_BYTES = 16
+#: The pattern of a machine identity: ``2 * MACHINE_ID_BYTES`` lowercase hex characters.
+MACHINE_ID_RE = re.compile(rf"[0-9a-f]{{{2 * MACHINE_ID_BYTES}}}")
 #: The text of a machine whose record holds no valid label.
 NO_LABEL = "(no label)"
 
@@ -37,6 +44,34 @@ def one_line(value) -> str:
     if value is None:
         return ""
     return str(value).replace("\r", "\\r").replace("\n", "\\n")
+
+
+#: The first text of each message that the recorder prints on standard error.
+PREFIX = "jacked tests: "
+
+
+def clean_text(text: str) -> str:
+    """Remove each control character from ``text``, except the newline and the tab.
+
+    The control characters are the Unicode category Cc: C0, DEL and C1 (C1
+    holds CSI, U+009B, which a terminal reads as ESC ``[``).
+
+    >>> clean_text("a\\x1b[31mb\\u009bc\\td")
+    'a[31mbc\\td'
+    """
+    return "".join(ch for ch in text if ch in "\n\t" or unicodedata.category(ch) != "Cc")
+
+
+def emit(message: str) -> None:
+    """Print one message on standard error, with the prefix and with no control characters.
+
+    A standard error that cannot be written (closed, a broken pipe) is
+    ignored, because a message must never stop or change the gate.
+    """
+    try:
+        print(PREFIX + clean_text(message), file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 -- a message must never stop or change the gate
+        logger.debug("emit: standard error cannot be written", exc_info=True)
 
 
 def label_order(label: str | None) -> tuple[bool, str]:

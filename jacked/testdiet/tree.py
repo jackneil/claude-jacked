@@ -1,4 +1,4 @@
-"""The identity of a git tree, the fingerprint of input files, and the identity of a machine.
+"""The identity of a git tree and the fingerprint of input files.
 
 ``tree_id`` gives the hash of the tree that a commit of the work tree would
 have. Changes that are not committed are part of it. It never changes the
@@ -30,28 +30,22 @@ import hashlib
 import json
 import logging
 import os
-import secrets
 import shutil
-import stat
 import subprocess
-import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from jacked import git_guard
-from jacked.atomic_io import atomic_write_bytes
 from jacked.findbin import find_bin
-from jacked.packs import jacked_home
-from jacked.regular_file import open_regular_fd
+from jacked.public_errors import describe
+from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.model import TreeId
 
 logger = logging.getLogger(__name__)
 
 #: The name of the store folder in the common git directory of a clone.
 STORE_NAME = "jacked-tests"
-#: The file of the machine identity, in the ``.claude`` folder of the jacked home.
-MACHINE_ID_NAME = "jacked-tests-machine-id"
 
 # The time that one git call can take. ``git add -A`` hashes each changed file
 # of the work tree, so a large checkout needs minutes, not seconds. The limit
@@ -71,8 +65,6 @@ _GIT_USAGE_ERROR = 129
 _FAT_FLOOR_NS = 315_532_800 * 10**9
 # A failure of the work-tree read is logged at WARNING one time in each process.
 _warned_add = False
-# The size of the machine identity, in random bytes (32 hex characters).
-_MACHINE_ID_BYTES = 16
 
 
 class TreeError(RuntimeError):
@@ -144,8 +136,7 @@ def tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
         logger.log(level, "tree_id: no tree identity, the work tree read failed (%s)", exc)
         return None
     except (TreeError, OSError) as exc:
-        logger.debug("tree_id: no tree identity (%s)", type(exc).__name__ if isinstance(exc, OSError)
-                     else exc)
+        logger.debug("tree_id: no tree identity (%s)", describe(exc))
         return None
 
 
@@ -220,7 +211,7 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
             if code != 0 or len(lines) != 1:
                 raise _AddError(f"git write-tree exited with {code}", _first_line(errors))
     finally:
-        remove_tree(work)
+        remove_tree_quietly(work)
     return TreeId(commit=commit, tree=lines[0], clean=lines[0] == head_tree)
 
 
@@ -254,53 +245,6 @@ def _copy_index(source: Path, target: Path) -> None:
                     os.utime(target, ns=(_FAT_FLOOR_NS, _FAT_FLOOR_NS))
                 except OSError as exc:
                     raise TreeError(f"cannot set an early time on the index copy: {type(exc).__name__}") from exc
-
-
-def remove_tree(path: Path) -> None:
-    """Remove the folder ``path`` and all that it holds. This function never raises.
-
-    Git makes its loose objects read-only, and Windows does not delete a
-    read-only file. So a path that cannot be removed gets write permission
-    (and its folder too, when that folder is inside ``path``), and the
-    removal tries again. A symbolic link never gets a new mode, because the
-    mode change would go to its target. A path that still cannot be removed
-    is logged at WARNING. A missing folder is not an error.
-    """
-    try:
-        _remove_tree(Path(path), os.path.abspath(path), nested=False)
-    except Exception as exc:  # noqa: BLE001 -- a cleanup helper must never raise
-        logger.warning("remove_tree: cannot remove %s (%s)", path, type(exc).__name__)
-
-
-def _remove_tree(path: Path, root: str, *, nested: bool) -> None:
-    def retry(func, failed, exc) -> None:
-        if isinstance(exc, FileNotFoundError):
-            return
-        try:
-            failed = os.fspath(failed)
-            parent = os.path.dirname(os.path.abspath(failed))
-            # Only a folder inside ``path`` gets a new mode, never the folder that holds it.
-            if parent == root or parent.startswith(root + os.sep):
-                os.chmod(parent, stat.S_IRWXU)
-            if not os.path.islink(failed) and os.path.lexists(failed):
-                is_dir = os.path.isdir(failed)
-                os.chmod(failed, stat.S_IRWXU if is_dir else stat.S_IREAD | stat.S_IWRITE)
-            if func in (os.unlink, os.remove, os.rmdir):
-                func(failed)
-            elif not nested and os.path.isdir(failed) and not os.path.islink(failed):
-                # rmtree could not open or list this folder. Remove it one more time.
-                _remove_tree(Path(failed), root, nested=True)
-            else:
-                logger.warning("remove_tree: cannot remove %s (%s)", failed, type(exc).__name__)
-        except FileNotFoundError:
-            return
-        except Exception as again:  # noqa: BLE001 -- a cleanup helper must never raise
-            logger.warning("remove_tree: cannot remove %s (%s)", failed, type(again).__name__)
-
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=retry)
-    else:
-        shutil.rmtree(path, onerror=lambda func, failed, info: retry(func, failed, info[1]))
 
 
 def alternates(real_objects: str) -> str:
@@ -354,11 +298,11 @@ def inputs_fingerprint(cwd: Path, globs: Sequence[str]) -> str | None:
         for name in glob.glob(pattern, root_dir=cwd, recursive=True, include_hidden=True):
             path = Path(name) if os.path.isabs(name) else cwd / name
             try:
-                stat = path.stat()
+                info = path.stat()
             except OSError:
                 continue
             if path.is_file():
-                found.append([Path(name).as_posix(), stat.st_size, stat.st_mtime_ns])
+                found.append([Path(name).as_posix(), info.st_size, info.st_mtime_ns])
         entries.append([pattern, sorted(found)])
     text = json.dumps(entries, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("ascii")).hexdigest()
@@ -425,74 +369,3 @@ def command_sha(argv: Sequence[str]) -> str:
     """
     text = "\0".join(argv)
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
-
-
-def machine_id(home: Path | None = None) -> str | None:
-    """Return the private random identity of this machine, and make it on first use.
-
-    The identity is 32 random hex characters in
-    ``<home>/.claude/jacked-tests-machine-id``. ``home`` is the jacked home
-    when it is not given. The file has mode 0600 where the system has
-    modes. The identity holds no part of the host name. Two processes that
-    make it at the same time get the same identity. The result is None when
-    the file cannot be read or made, or holds no valid identity.
-    """
-    path = Path(home if home is not None else jacked_home()) / ".claude" / MACHINE_ID_NAME
-    try:
-        if not os.path.lexists(path):
-            _make_machine_id(path)
-        return _read_machine_id(path)
-    except (OSError, ValueError) as exc:
-        logger.debug("machine_id: no machine identity (%s)", type(exc).__name__)
-        return None
-
-
-def _make_machine_id(path: Path) -> None:
-    """Make the file with a complete content, or keep the file that another process made.
-
-    The value goes into a private temporary file first. A hard link then puts
-    it at ``path``; the link fails when ``path`` exists, so the first process
-    wins and no reader sees a partial file. Where the file system has no hard
-    links, an atomic replace that checks for the file just before it is used.
-    """
-    value = secrets.token_hex(_MACHINE_ID_BYTES)
-    temp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
-    atomic_write_bytes(temp, (value + "\n").encode("ascii"), mode=0o600)
-    try:
-        os.link(temp, path)
-    except FileExistsError:
-        pass
-    except OSError:
-        # A file system with no hard links: an atomic replace that stops
-        # when another process made the file first.
-        _write_machine_id(path, value)
-    finally:
-        temp.unlink(missing_ok=True)
-
-
-class _IdExists(Exception):
-    """The machine identity file exists. The write stops."""
-
-
-def _write_machine_id(path: Path, value: str) -> None:
-    def refuse_when_made() -> None:
-        if os.path.lexists(path):
-            raise _IdExists
-
-    try:
-        atomic_write_bytes(path, (value + "\n").encode("ascii"), mode=0o600,
-                           before_replace=refuse_when_made)
-    except _IdExists:
-        pass
-
-
-def _read_machine_id(path: Path) -> str | None:
-    fd = open_regular_fd(path)
-    try:
-        data = os.read(fd, 4096)
-    finally:
-        os.close(fd)
-    value = data.decode("ascii").strip()
-    if len(value) == 2 * _MACHINE_ID_BYTES and all(c in "0123456789abcdef" for c in value):
-        return value
-    return None

@@ -34,8 +34,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from jacked.testdiet import tree
+from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.loss_scan import NOT_PARSED, Declaration, declarations, scan, scan_file, scan_kind
-from jacked.testdiet.model import one_line
+from jacked.testdiet.model import clean_text, one_line
 
 __all__ = ["DEFAULT_NAME", "DEFAULT_REF", "Declaration", "LossError", "LossReport", "NotInWorkTree",
            "declarations", "loss_report", "render", "scan", "scan_kind"]
@@ -201,7 +202,7 @@ def loss_report(cwd: Path, base: str | None = None) -> LossReport:
                     if reason is not None and (path, reason) not in skipped:
                         skipped.append((path, reason))
     finally:
-        tree.remove_tree(objects)
+        remove_tree_quietly(objects)
     return _compare(commit, *sides, base_ref=DEFAULT_NAME if base is None else base, files_not_read=skipped)
 
 
@@ -268,8 +269,6 @@ def _compare(base: str, before: Sides, after: Sides, *, base_ref: str = DEFAULT_
 
 def render(report: LossReport) -> str:
     """Return the report as text lines. Each name is on one line, with no control character."""
-    from jacked.testdiet.record import clean_text
-
     lines = [f"base {report.base[:12]} ({one_line(report.base_ref)})", f"net {report.net:+d}" if report.net else "net 0",
              f"added {len(report.added)}, removed {len(report.removed)}"]
     lines += [f"removed {one_line(name)}" for name in report.removed]

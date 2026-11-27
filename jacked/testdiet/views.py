@@ -19,8 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from jacked.testdiet import history as _history
-from jacked.testdiet.model import CaseResult, RunMeta, label_text, one_line
-from jacked.testdiet.record import clean_text
+from jacked.testdiet.model import CaseResult, RunMeta, clean_text, label_text, one_line
 
 VERDICTS = ("passed", "failed", "conflict", "no-data", "unknown")
 #: The text output shows this number of rows in each table when no --top is given.

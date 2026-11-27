@@ -1,26 +1,22 @@
 """Record a report that was not wrapped, ask if a tree passed, and the repeat-failure notice.
 
 ``jacked.testdiet.run`` runs a gate and records it (``run_gate``). This
-module holds what ``run`` and the commands share: the messages, the label
-check, the verdict counts, ``record_files``, ``seen`` and ``repeat_notice``.
-``run_gate`` and ``JUNIT_PLACEHOLDER`` can also be read from here.
+module holds what ``run`` and the commands share: the label check, the
+verdict counts, ``record_files``, ``seen`` and ``repeat_notice``.
 
-Each message goes to standard error and starts with ``jacked tests: ``.
-Control characters (except the newline and the tab) are removed from a
-message before the print, because a test ID or a file name is free text.
+Each message goes to standard error through ``jacked.testdiet.model.emit``.
 """
 
 from __future__ import annotations
 
 import logging
-import sys
-import unicodedata
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeVar
 
 from jacked.testdiet import history, junit, tree
+from jacked.testdiet import machine as identity
 from jacked.testdiet.model import (
     LABEL_RE,
     RUNNERS,
@@ -28,6 +24,8 @@ from jacked.testdiet.model import (
     RunData,
     RunMeta,
     TreeId,
+    clean_text,
+    emit,
     label_order,
     label_text,
     one_line,
@@ -42,9 +40,6 @@ logger = logging.getLogger(__name__)
 KINDS = ("full", "targeted")
 
 
-PREFIX = "jacked tests: "
-
-
 _LOCAL = "local"
 
 
@@ -54,30 +49,6 @@ INPUTS_UNAVAILABLE = "unavailable"
 
 
 T = TypeVar("T")
-
-
-def clean_text(text: str) -> str:
-    """Remove each control character from ``text``, except the newline and the tab.
-
-    The control characters are the Unicode category Cc: C0, DEL and C1 (C1
-    holds CSI, U+009B, which a terminal reads as ESC ``[``).
-
-    >>> clean_text("a\\x1b[31mb\\u009bc\\td")
-    'a[31mbc\\td'
-    """
-    return "".join(ch for ch in text if ch in "\n\t" or unicodedata.category(ch) != "Cc")
-
-
-def emit(message: str) -> None:
-    """Print one message on standard error, with the prefix and with no control characters.
-
-    A standard error that cannot be written (closed, a broken pipe) is
-    ignored, because a message must never stop or change the gate.
-    """
-    try:
-        print(PREFIX + clean_text(message), file=sys.stderr, flush=True)
-    except Exception:  # noqa: BLE001 -- a message must never stop or change the gate
-        logger.debug("emit: standard error cannot be written", exc_info=True)
 
 
 def _guard(step: str, func: Callable[[], T], default: T) -> T:
@@ -166,7 +137,7 @@ def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, la
         id=history.new_run_id(), started=started_text, source="record", wall_seconds=wall_seconds,
         exit_code=exit_code, verdict=history.verdict_of(exit_code, data), kind=kind, label=label,
         runner=runner or data.runner, command_sha=None, inputs_sha=None,
-        machine=machine or _LOCAL, machine_id=None if machine else tree.machine_id(),
+        machine=machine or _LOCAL, machine_id=None if machine else identity.machine_id(),
         tree=tree_value, tree_changed=None,
         on_default_branch=tree.on_default_branch(top, tree_value) if tree_value else None,
         counts=_counts(data), seconds_reported=data.seconds_reported, load_start=None,
@@ -280,16 +251,3 @@ def seen_line(meta: RunMeta) -> str:
     counts = ", ".join(f"{one_line(k)} {v}" for k, v in (meta.counts or {}).items()) or "no counts"
     wall = "unknown" if meta.wall_seconds is None else f"{meta.wall_seconds} s"
     return clean_text(f"{meta.id} started {one_line(meta.started)}, wall {wall}, {counts}")
-
-
-# ``run_gate`` lives in ``jacked.testdiet.run``, which imports this module.
-# A lazy read keeps the two imports free of a cycle.
-_FROM_RUN = ("run_gate", "JUNIT_PLACEHOLDER", "EXIT_NOT_STARTED")
-
-
-def __getattr__(name: str):
-    if name in _FROM_RUN:
-        from jacked.testdiet import run
-
-        return getattr(run, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
