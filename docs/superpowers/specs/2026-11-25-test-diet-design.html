@@ -521,8 +521,9 @@ rules.</p>
   says why.</li>
   <li><strong>A lost connection stops the gate.</strong> The owner's answer of 2026-11-26: "Stop on
   drop, no reattach". The gate runs only while the connection lives. The local side sends a
-  heartbeat; when the gate machine gets no input for 60 seconds, or gets the end of its input, it
-  stops the gate and its child processes. A lost connection is not a verdict: there is no record,
+  heartbeat every 15 seconds; when the gate machine gets no input for 60 seconds, or gets the end
+  of its input, it stops the gate and its child processes (a stop signal, a grace period, then a
+  kill). A lost connection is not a verdict: there is no record,
   no pass and no failure, <code>run</code> gives exit 75 and says why, and the user runs the gate
   again.</li>
   <li><strong>Times of two machines are never compared.</strong> <code>profile</code> and the
@@ -735,7 +736,8 @@ and the plan will show the exact old and new wording.</p>
   prints no such line.</li>
   <li><strong>Gate machine.</strong> <code>run --on</code> records a gate only when the commit that
   the gate machine reports is the commit that was sent. A run whose connection drops makes no
-  record and gives exit 75, and no process of that gate stays on the gate machine after 60 seconds.
+  record and gives exit 75. No process of that gate stays on the gate machine 75 seconds after the
+  last heartbeat: 60 seconds with no input, then the stop and its grace period.
   <code>profile</code> does not compare the times of two machines. No committed file holds a host name or an address. The proof uses
   a real second machine, not a second folder of one machine. It covers a Windows gate machine and
   a Linux gate machine.</li>
@@ -937,6 +939,30 @@ the plan is three documents:
     <tr><td>The lanes</td><td>The Tests section and the gate lines are the last batch, checked by <code>ids</code>.</td><td>The spec's Lanes, inside the tree chain (MEDIUM 26)</td></tr>
     <tr><td>The Cobertura reader</td><td>A DOCTYPE with a system ID and no internal subset is read and never loaded.</td><td>The sources of the writers, read on 2026-11-26 (LOW 24)</td></tr>
     <tr><td>Private values</td><td>The login matches only in a path or before <code>@</code>.</td><td>LOW 15</td></tr>
+  </tbody>
+</table>
+<h3 id="gate-plan-changes">Changes in the gate machine plan review (the builder's calls)</h3>
+<aside class="callout warn">
+  <strong>The owner has not read this table.</strong> The third review of
+  <a href="../plans/2026-11-26-test-diet-gate-machine.html">the gate machine plan</a> found these
+  points. Each row is the builder's call in the revised plan.
+</aside>
+<table>
+  <thead><tr><th>Subject</th><th>What the gate machine plan does</th></tr></thead>
+  <tbody>
+    <tr><td>The memory floor on macOS</td><td>A macOS gate machine has no free-memory floor: the
+    driver refuses an entry with a floor on macOS and says why. Linux reads MemAvailable, and Windows
+    reads the system memory status.</td></tr>
+    <tr><td>Stopping a gate on Windows</td><td>The driver owns a job object that kills every process
+    of the gate when the job closes, and a small leader process holds it. The plan does not accept a
+    window in which a process can leave the job.</td></tr>
+    <tr><td>Gate output from a gate machine</td><td>Color codes (SGR) pass. Other terminal control
+    sequences (OSC, DCS) are removed before the output reaches this machine's terminal.</td></tr>
+    <tr><td>The setup time</td><td>A record of <code>run --on</code> holds the seconds of the setup
+    command in its own field.</td></tr>
+    <tr><td>Two machine identities for one user</td><td>A gate machine that also runs jacked for its
+    own user has two identities, one for its own runs and one for gates that it runs for others.
+    Both are accepted.</td></tr>
   </tbody>
 </table>
 <h3>The owner's answers (2026-11-26)</h3>
