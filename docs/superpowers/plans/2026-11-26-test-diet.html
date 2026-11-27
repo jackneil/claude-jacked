@@ -572,8 +572,9 @@ change.</p>
     and an index ID moves when a case is cut.</td></tr>
     <tr><td>Protected tests</td><td>A row has <code>protected</code> (the class, or
     <code>null</code>). The classes are the thirteen of the spec's "Safety rules" (Task 4 lists
-    them). Speed and fix rows of a protected test can be planned and applied.</td><td>The spec:
-    "These get Speed or Fix."</td></tr>
+    them). Speed and fix rows of a protected test can be planned and applied: only a cut of a
+    protected test must be proposed. This is the builder's reading of the rule "a protected row may
+    be proposed, never planned or applied".</td><td>The spec: "These get Speed or Fix."</td></tr>
   </tbody>
 </table>
 
@@ -602,7 +603,8 @@ rules apply to delete and consolidate rows by their kind.</p>
     removed import, a deleted subject file, a test that is skipped for good." Its proof: "The runner
     or the dead-code tool shows it. A check that the skip does not hide a real defect."</p>
     <p>So the code is already gone in <code>base_tree</code>. A dead-target cut deletes the test only.
-    The field <code>dead_target</code> has one of three forms:</p>
+    The field <code>dead_target</code> has one of three forms. "The subject test's own file" is the
+    <code>file</code> of the row's test in the baseline record.</p>
     <ul>
       <li><code>path</code>: a file that does not exist in <code>base_tree</code>. The link: the stem
       of the file (its name with no folder and no extension) is a whole word in the subject test's own
@@ -628,14 +630,16 @@ rules apply to delete and consolidate rows by their kind.</p>
     a test (a fixture or a helper that only the cut tests use). The report lists each
     <code>dead_code</code> for the person.</td><td>The two fields had one name in the older
     plan.</td></tr>
-    <tr><td>No production code is deleted</td><td><code>ids</code> refuses a batch that deletes a
-    file outside the run folder that no test of the before side is in (the file of a test of a run
-    ref, or the file part of a collected ID). A dead helper file stays, and the report lists it. A
+    <tr><td>No production code is deleted <span class="badge warn">builder's call</span></td><td><code>ids</code> refuses a batch that deletes a
+    file outside the run folder that holds no test. The files that hold a test are the
+    <code>file</code> of each test of the baseline record (the recorder gives it for each runner, and
+    it is the only source for nextest), the <code>file</code> of each test of a run ref, and the file
+    part of each collected ID. A dead helper file stays, and the report lists it. A
     speed repair can change production code for its measured cause; the spec names "an injected
     clock" and "a call in the same process and not a subprocess". The report lists each changed file
     that holds no test, with its batch.</td><td>The lead's ruling: the plan never deletes production
-    code. The spec allows speed repairs to change code. It has no rule that deletes
-    code.</td></tr>
+    code; this check is the builder's mechanism for that ruling. The spec allows speed repairs to
+    change code. It has no rule that deletes code.</td></tr>
   </tbody>
 </table>
 
@@ -933,8 +937,8 @@ batch up to N count. A proposed row counts as no row.</p>
   <li>A counted <code>dead-target</code> row gets the checks of its form (the decisions), on the
   before tree of its batch and on <code>base_tree</code>.</li>
   <li>Each path of <code>deleted_paths</code> outside the run folder must be in
-  <code>before.files</code>. A deleted file that holds no test is a problem: a run never deletes
-  production code.</li>
+  <code>before.files</code> or be the file of a test of the baseline record. A deleted file that
+  holds no test is a problem: a run never deletes production code.</li>
   <li>A planned row of a later batch is not a problem.</li>
 </ul>
 <p>A line shift in a Playwright file is not a change: <code>ids.normalize</code> drops the line and
@@ -1170,14 +1174,16 @@ algorithm.</p>
       <code>Next:</code> and <code>Co-Authored-By</code>, with no blank line between them. Run the tests of the batch alone, in random order, with two workers when the
       runner can. Then <code>jacked tests collect</code> (or a run ref for jest and go),
       <code>jacked tests ids</code>, and a commit of the ledger.</li>
-      <li><strong>The lanes.</strong> Write the Tests section and the gate lines by
-      <code>references/lanes.md</code>. This is the last batch: <code>collect</code> and
-      <code>ids</code> check it like each batch.</li>
       <li><strong>Preservation review.</strong> A separate read-only reviewer compares the deleted
       tests with the kept tests and looks for a contract that lost its only proof. Where the runner
       has a coverage tool, write Cobertura XML on the base commit and on the last commit, and run
-      <code>jacked tests covdiff</code>. A line that lost its only test names a contract to
-      restore.</li>
+      <code>jacked tests covdiff</code>. Write each XML file outside the run's work tree (in
+      <code>&lt;git common dir&gt;/jacked-test-diet/&lt;date&gt;-&lt;slug&gt;/</code>), because an
+      untracked file changes the tree identity. A line that lost its only test names a contract to
+      restore: the restore is one more batch.</li>
+      <li><strong>The lanes.</strong> Write the Tests section and the gate lines by
+      <code>references/lanes.md</code>. This is the last batch: <code>collect</code> and
+      <code>ids</code> check it like each batch.</li>
       <li><strong>The checks.</strong> <code>jacked tests ledger verify</code>, then
       <code>jacked tests loss</code> once more.</li>
       <li><strong>The final gate.</strong> One full gate on the last commit, recorded on the machine of
@@ -1293,7 +1299,8 @@ exists proves the same thing (the rule "A test has a cost"):</p>
       <li>Write a list of the SHA-256 of each file under the real <code>~/.claude/skills</code> and
       <code>~/.agents/skills</code>.</li>
       <li>Install the branch build into the scratch home:
-      <code>JACKED_HOME=$SCRATCH uv run --project $BUILD python -m jacked install --no-tray --no-packs</code>.
+      <code>JACKED_HOME=$SCRATCH uv run --project $BUILD python -m jacked install --no-tray --no-packs --force</code>
+      (<code>--force</code> only stops a prompt; the scratch home has nothing to overwrite).
       Show <code>$SCRATCH/.claude/skills/test-diet/</code> with its references, and
       <code>$SCRATCH/.agents/skills/test-diet/agents/openai.yaml</code>.</li>
       <li>Write the shim <code>$SCRATCH/bin/jacked</code>:
@@ -1305,7 +1312,10 @@ exists proves the same thing (the rule "A test has a cost"):</p>
       <li>First, prove the mechanism in that session: <code>command -v jacked</code> prints the shim;
       <code>jacked tests --help</code> lists <code>ledger</code>, <code>collect</code>,
       <code>ids</code>, <code>covdiff</code> and <code>report</code>; <code>/test-diet</code> is in the
-      list of slash commands. If one of these fails, stop: the proof would prove nothing.</li>
+      list of slash commands. If one of these fails, stop and report: the proof would prove nothing.
+      This step exists because two facts are not verified when this plan is written: that a session
+      with <code>CLAUDE_CONFIG_DIR</code> loads its skills from that folder, and that the shim is the
+      <code>jacked</code> that the skill's commands reach.</li>
       <li>Run <code>/test-diet report</code>, then <code>/test-diet</code> with the ledger, the
       evidence, the batches, the ID check, the coverage comparison, the report and its own pull
       request. The baseline and the final gate both run in this session, so both records have the one
@@ -1345,7 +1355,8 @@ with the source of each.</p>
     <tr><td>The ID refs of jest and go</td><td>Runs of the full gate's selection with a JUnit file, without parallel workers, because their listings name no single test.</td><td>The spec's rule "the selection of the full gate", applied to two runners (MEDIUM 11)</td></tr>
     <tr><td>The tree chain</td><td>Trees are compared modulo the run folder, for batch 1, each link and the final gate.</td><td>The lead's ruling (CRITICAL 1)</td></tr>
     <tr><td>The report mode</td><td><code>/test-diet report</code> writes to the git common directory, not to the work tree.</td><td>"It edits no tracked file", and an untracked file changes the tree identity (CRITICAL 1)</td></tr>
-    <tr><td>A dead target</td><td>Three forms; the code is already gone in <code>base_tree</code>; a batch never deletes a file that holds no test.</td><td>The spec's Dead target and the lead's ruling (MEDIUMs 6 and 7)</td></tr>
+    <tr><td>A dead target</td><td>Three forms; the code is already gone in <code>base_tree</code>.</td><td>The spec's Dead target and the lead's ruling (MEDIUMs 6 and 7)</td></tr>
+    <tr><td>No deleted production file</td><td><code>ids</code> refuses a batch that deletes a file that holds no test.</td><td>The builder's call: the mechanism for the lead's ruling "the plan never deletes production code"</td></tr>
     <tr><td>The kind <code>test</code></td><td>The proof is a planted defect or a refactor.</td><td>The spec's "What proves a cut"</td></tr>
     <tr><td>The base-branch run of a failing set</td><td>In the run's own worktree, before its first edit.</td><td>The builder's reading of "in the same checkout" (see the open questions)</td></tr>
     <tr><td>The lanes</td><td>The Tests section and the gate lines are the last batch, checked by <code>ids</code>.</td><td>The spec's Lanes, inside the tree chain (MEDIUM 26)</td></tr>
