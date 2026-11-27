@@ -963,7 +963,7 @@ LEGACY_HEAD = (
 LEGACY_MAC = {"type": "command", "command": 'bash "$HOME/.claude/statusline.sh"'}
 LEGACY_WINDOWS = {
     "type": "command",
-    "command": '"C:\\Program Files\\Git\\bin\\bash.exe" C:/Users/jack/.claude/statusline.sh',
+    "command": '"C:\\Program Files\\Git\\bin\\bash.exe" C:/Users/alex/.claude/statusline.sh',
 }
 
 
@@ -978,7 +978,7 @@ def _write_legacy_script(home_dir, text=LEGACY_HEAD) -> Path:
     [
         LEGACY_MAC,
         LEGACY_WINDOWS,
-        {"type": "command", "command": r"bash C:\Users\jack\.claude\statusline.sh"},
+        {"type": "command", "command": r"bash C:\Users\alex\.claude\statusline.sh"},
         {"type": "command", "command": "bash ~/.claude/statusline.sh"},
     ],
 )

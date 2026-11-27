@@ -495,7 +495,7 @@ def test_csrf_guard_holds_even_when_bound_all_interfaces(client, monkeypatch):
 # anything until the socket is rebound by a restart.
 # ---------------------------------------------------------------------------
 
-TAILNET_IP = "100.116.47.72"
+TAILNET_IP = "100.64.47.72"
 LAN_IP = "192.168.42.5"
 
 _SETTINGS_LOCAL_ONLY_MESSAGE = (

@@ -153,8 +153,8 @@ Before adding any new commands, establish:
 
 ## Proposal: teach `jacked install` about graphify, and about subscription billing
 
-> Added 2026-08-20 from a live hank-hq session that built a 2,500-node company
-> graph. Two separate proposals; the second is the one that costs users money
+> Added 2026-08-20 from a live session in another repo that built a 2,500-node
+> knowledge graph. Two separate proposals; the second is the one that costs users money
 > today.
 
 ### 1. Offer graphify wiring in per-repo setup, where it earns its keep

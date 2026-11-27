@@ -535,7 +535,7 @@ Track whether user has scrolled up (reading history). If `scrollTop + clientHeig
 ### Automated Tests
 
 ```
-C:/Users/jack/.conda/envs/jacked/python.exe -m pytest tests/unit/chat/ -v
+C:/Users/alex/.conda/envs/jacked/python.exe -m pytest tests/unit/chat/ -v
 ```
 
 - `test_protocol.py`: NDJSON parse/build, message classification, edge cases (empty lines, malformed JSON)
@@ -560,7 +560,7 @@ C:/Users/jack/.conda/envs/jacked/python.exe -m pytest tests/unit/chat/ -v
 
 Use `tests/debugging/chat/mock_cli.py` to develop without burning Claude tokens:
 ```
-C:/Users/jack/.conda/envs/jacked/python.exe tests/debugging/chat/mock_cli.py ws://127.0.0.1:8321/ws/cli/{session_id}
+C:/Users/alex/.conda/envs/jacked/python.exe tests/debugging/chat/mock_cli.py ws://127.0.0.1:8321/ws/cli/{session_id}
 ```
 
 ---

@@ -28,7 +28,7 @@ from jacked.api import write_gate
 from jacked.api.main import app
 from jacked.web.database import Database
 
-TAILNET_IP = "100.116.47.72"
+TAILNET_IP = "100.64.47.72"
 LAN_IP = "192.168.42.5"
 UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
 

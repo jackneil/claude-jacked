@@ -284,7 +284,7 @@ Each vector point stores:
     "repo_name": "claude-jacked",
     "repo_id": "hash",
     "machine": "DESKTOP-ABC",
-    "user_name": "jack",
+    "user_name": "alex",
     "timestamp": "2026-01-19T12:00:00Z",
 
     # NEW: Content type for filtering
@@ -353,7 +353,7 @@ Never truncate content mid-text. Instead, calculate token costs and exclude lowe
   "staleness_warning_days": 7,
   "qdrant_endpoint": "https://your-cluster.qdrant.io",
   "qdrant_api_key": "your-api-key",
-  "user_name": "jack",
+  "user_name": "alex",
   "teammate_weight": 0.8,
   "other_repo_weight": 0.7,
   "time_decay_halflife_weeks": 35
@@ -502,7 +502,7 @@ First run with env vars:
 │  {                                                              │
 │    "qdrant_endpoint": "https://xxx.qdrant.io",                  │
 │    "qdrant_api_key": "my-secret-key",                           │
-│    "user_name": "jack"                                          │
+│    "user_name": "alex"                                          │
 │  }                                                              │
 │                           │                                     │
 │                           ▼                                     │
@@ -619,7 +619,7 @@ def fit_to_budget(
 Token budget: 15,000 | Used: 12,450 | Remaining: 2,550
 
 --- Session 1: abc123 (8,200 tokens) ---
-Age: 24 days ago | Repo: hank-coder
+Age: 24 days ago | Repo: acme-api
 
 ⚠️ STALENESS NOTICE: ...
 
@@ -662,9 +662,9 @@ Users can select none, one, multiple, or all sessions from search results:
 
 ```
 Search results:
-  1. [85%] YOU - hank-coder - 24 days ago
-  2. [72%] @bob - hank-coder - 3 months ago
-  3. [68%] YOU - krac-llm - 2 days ago
+  1. [85%] YOU - acme-api - 24 days ago
+  2. [72%] @bob - acme-api - 3 months ago
+  3. [68%] YOU - acme-worker - 2 days ago
 
 Select sessions (e.g., "1", "1,3", "1-3", "all", or "skip"): 1,3
 ```
@@ -709,7 +709,7 @@ def format_relative_time(timestamp: datetime) -> str:
 ```markdown
 === CONTEXT FROM PREVIOUS SESSION ===
 Session: abc123
-Repository: hank-coder
+Repository: acme-api
 Machine: DESKTOP-JACK
 Age: 24 days ago
 
@@ -1028,15 +1028,15 @@ Example AskUserQuestion call:
     "options": [
       {
         "label": "1. YOU - 24 days ago",
-        "description": "hank-coder: Implementing overnight time calculation..."
+        "description": "acme-api: Implementing overnight time calculation..."
       },
       {
         "label": "2. @bob - 3 months ago",
-        "description": "hank-coder: Time handling refactor for multiple..."
+        "description": "acme-api: Time handling refactor for multiple..."
       },
       {
         "label": "3. YOU - 2 days ago",
-        "description": "krac-llm: Staff time merging edge cases..."
+        "description": "acme-worker: Staff time merging edge cases..."
       },
       {
         "label": "None - skip",
@@ -1055,7 +1055,7 @@ show top 3 + "None" option. User can always ask for more results.
 When injecting context older than 7 days, include appropriate warning:
 
 === CONTEXT FROM PREVIOUS SESSION ===
-Session: abc123 | Repo: hank-coder | Age: 24 days ago
+Session: abc123 | Repo: acme-api | Age: 24 days ago
 
 ⚠️ STALENESS NOTICE: This context is from 24 days ago. Code may have
 changed. Use this as a starting point for WHERE to look, not WHAT is there.

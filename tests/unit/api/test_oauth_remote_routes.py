@@ -451,7 +451,7 @@ def test_reopen_surfaces_a_refusal_without_failing_the_request(client, monkeypat
 # port.
 # ---------------------------------------------------------------------------
 
-TAILNET_IP = "100.116.47.72"
+TAILNET_IP = "100.64.47.72"
 LAN_IP = "192.168.42.5"
 
 

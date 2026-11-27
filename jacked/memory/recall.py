@@ -67,11 +67,11 @@ _L_DRIFT = "drift nudge"
 
 # EMISSION order: stable sections first, per-session-volatile sections last.
 # The brief lands in the model's cached prompt preamble, and inference-side
-# prefix caches (Anthropic's, and self-hosted gateways like the hank lane)
+# prefix caches (Anthropic's, and self-hosted gateways)
 # match byte-for-byte from the front: one changed byte invalidates everything
 # after it. The episodic entry changes EVERY session and the drift nudge
 # toggles as notes accumulate, so placing them mid-brief was measured (on the
-# hank gateway, 2026-08-03) to cap cross-session cache reuse at the ~16% mark
+# self-hosted gateway, 2026-08-03) to cap cross-session cache reuse at the ~16% mark
 # of the hook block. Trim PRIORITY is unchanged and stays the
 # _assemble_sections list order; this only reorders what survives the budget.
 _EMIT_ORDER = [_L_HEADER, _L_HOT, _L_DECISIONS, _L_INDEX, _L_EPISODIC, _L_DRIFT]

@@ -70,8 +70,8 @@ def _build_fs_tree(tmp_path, path_parts):
 class TestDecodeProjectHash:
     def test_simple_project_with_fs(self, tmp_path):
         """Filesystem probing resolves 'claude-jacked' as a single dir."""
-        _build_fs_tree(tmp_path, ["Users", "jack", "Github", "claude-jacked"])
-        # The hash represents: /<tmp>/Users/jack/Github/claude-jacked
+        _build_fs_tree(tmp_path, ["Users", "alex", "Github", "claude-jacked"])
+        # The hash represents: /<tmp>/Users/alex/Github/claude-jacked
         # We need to make the probe root be tmp_path.
         # Since the hash starts with -, the fs_root is "/" — we'll patch
         # _probe_filesystem to use our tmp tree.
@@ -79,15 +79,15 @@ class TestDecodeProjectHash:
             "jacked.web.analytics_paths._probe_filesystem"
         ) as mock_probe:
             mock_probe.return_value = [
-                "Users", "jack", "Github", "claude-jacked"
+                "Users", "alex", "Github", "claude-jacked"
             ]
-            result = decode_project_hash("-Users-jack-Github-claude-jacked")
+            result = decode_project_hash("-Users-alex-Github-claude-jacked")
         assert result["name"] == "claude-jacked"
-        assert result["path"] == "Users/jack/Github/claude-jacked"
+        assert result["path"] == "Users/alex/Github/claude-jacked"
 
     def test_real_filesystem_probing(self):
         """On a real system, /Users should exist and be resolved correctly."""
-        result = decode_project_hash("-Users-jack-Github-claude-jacked")
+        result = decode_project_hash("-Users-alex-Github-claude-jacked")
         # /Users exists on macOS, so 'Users' resolves as one segment.
         # The rest falls through as individual segments or merged.
         assert result["path"].startswith("Users/")
@@ -97,21 +97,21 @@ class TestDecodeProjectHash:
     def test_deep_nesting(self, tmp_path):
         _build_fs_tree(
             tmp_path,
-            ["Users", "jack", "neil", "conductor", "workspaces",
-             "hank", "ehr", "kolkata"],
+            ["Users", "first", "last", "conductor", "workspaces",
+             "acme", "app", "kolkata"],
         )
         with patch(
             "jacked.web.analytics_paths._probe_filesystem"
         ) as mock_probe:
             mock_probe.return_value = [
-                "Users", "jack", "neil", "conductor", "workspaces",
-                "hank", "ehr", "kolkata",
+                "Users", "first", "last", "conductor", "workspaces",
+                "acme", "app", "kolkata",
             ]
             result = decode_project_hash(
-                "-Users-jack-neil-conductor-workspaces-hank-ehr-kolkata"
+                "-Users-first-last-conductor-workspaces-acme-app-kolkata"
             )
         assert result["path"] == (
-            "Users/jack/neil/conductor/workspaces/hank/ehr/kolkata"
+            "Users/first/last/conductor/workspaces/acme/app/kolkata"
         )
         assert "kolkata" in result["name"]
 
@@ -149,15 +149,15 @@ class TestDecodeProjectHash:
             "jacked.web.analytics_paths._probe_filesystem"
         ) as mock_probe:
             mock_probe.return_value = [
-                "Users", "jack", "Github", "claude-jacked"
+                "Users", "alex", "Github", "claude-jacked"
             ]
             result = decode_project_hash(
-                "-Users-jack-Github-claude-jacked"
+                "-Users-alex-Github-claude-jacked"
                 "--claude-worktrees-agent-a7c6b155"
             )
         assert "claude-jacked" in result["name"]
         assert result["path"] == (
-            "Users/jack/Github/claude-jacked"
+            "Users/alex/Github/claude-jacked"
             "/.claude-worktrees/agent-a7c6b155"
         )
 
@@ -235,7 +235,7 @@ class TestProbeFilesystem:
 
 class TestFindActiveJsonlFiles:
     def test_finds_recent_files(self, tmp_path):
-        proj = tmp_path / "projects" / "-Users-jack-proj"
+        proj = tmp_path / "projects" / "-Users-alex-proj"
         proj.mkdir(parents=True)
         recent = proj / "conversation.jsonl"
         recent.write_text('{"role":"user"}\n')
@@ -245,7 +245,7 @@ class TestFindActiveJsonlFiles:
         assert recent in files
 
     def test_ignores_old_files(self, tmp_path):
-        proj = tmp_path / "projects" / "-Users-jack-proj"
+        proj = tmp_path / "projects" / "-Users-alex-proj"
         proj.mkdir(parents=True)
         old = proj / "conversation.jsonl"
         old.write_text('{"role":"user"}\n')
@@ -257,7 +257,7 @@ class TestFindActiveJsonlFiles:
         assert old not in files
 
     def test_finds_subagent_files(self, tmp_path):
-        proj = tmp_path / "projects" / "-Users-jack-proj"
+        proj = tmp_path / "projects" / "-Users-alex-proj"
         subagents = proj / "subagents"
         subagents.mkdir(parents=True)
         sub_file = subagents / "agent-abc123.jsonl"
@@ -269,7 +269,7 @@ class TestFindActiveJsonlFiles:
 
     def test_handles_permission_error(self, tmp_path):
         """Should not raise even if a directory is unreadable."""
-        proj = tmp_path / "projects" / "-Users-jack-proj"
+        proj = tmp_path / "projects" / "-Users-alex-proj"
         proj.mkdir(parents=True)
         bad_dir = tmp_path / "nonexistent"
         files = find_active_jsonl_files(
@@ -282,7 +282,7 @@ class TestFindActiveJsonlFiles:
         assert files == []
 
     def test_ignores_non_jsonl_files(self, tmp_path):
-        proj = tmp_path / "projects" / "-Users-jack-proj"
+        proj = tmp_path / "projects" / "-Users-alex-proj"
         proj.mkdir(parents=True)
         txt = proj / "notes.txt"
         txt.write_text("not a jsonl")

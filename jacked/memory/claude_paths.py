@@ -84,8 +84,8 @@ def project_dir_name(path: str) -> str:
     ``jacked.project_slug`` owns the algorithm (the UTF-16 encoding, the
     200-unit limit and the hash).
 
-    >>> project_dir_name("/Users/jack.neil/Github/claude-jacked")
-    '-Users-jack-neil-Github-claude-jacked'
+    >>> project_dir_name("/Users/first.last/Github/claude-jacked")
+    '-Users-first-last-Github-claude-jacked'
     """
     return _project_slug.project_dir_name(path)
 

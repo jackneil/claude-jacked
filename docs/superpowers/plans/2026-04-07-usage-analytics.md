@@ -90,19 +90,19 @@ class TestDecodeProjectHash:
 
     def test_simple_project(self):
         from jacked.web.analytics_paths import decode_project_hash
-        result = decode_project_hash("-Users-jack-Github-claude-jacked")
+        result = decode_project_hash("-Users-alex-Github-claude-jacked")
         assert result["name"] == "claude-jacked"
 
     def test_windows_drive_letter(self):
         from jacked.web.analytics_paths import decode_project_hash
-        result = decode_project_hash("C--Users-jack-Documents-my-project")
+        result = decode_project_hash("C--Users-alex-Documents-my-project")
         assert "my-project" in result["name"]
 
     def test_deep_nesting(self):
         from jacked.web.analytics_paths import decode_project_hash
-        result = decode_project_hash("-Users-jack-conductor-workspaces-hank-ehr-raleigh")
+        result = decode_project_hash("-Users-alex-conductor-workspaces-acme-app-raleigh")
         # Should extract meaningful last segments, not the full path
-        assert "raleigh" in result["name"].lower() or "hank-ehr" in result["name"].lower()
+        assert "raleigh" in result["name"].lower() or "acme-app" in result["name"].lower()
 
     def test_unknown_returns_truncated_hash(self):
         from jacked.web.analytics_paths import decode_project_hash
@@ -187,8 +187,8 @@ def get_claude_data_dirs() -> list[Path]:
 def decode_project_hash(hash_name: str) -> dict:
     """Decode Claude Code's encoded project directory name into a readable name.
 
-    Format: -Users-jack-Github-my-project or C--Users-jack-Documents-project
-    Returns: {"name": "my-project", "path": "/Users/jack/Github/my-project"}
+    Format: -Users-alex-Github-my-project or C--Users-alex-Documents-project
+    Returns: {"name": "my-project", "path": "/Users/alex/Github/my-project"}
     """
     if not hash_name or hash_name == "unknown":
         return {"name": hash_name or "Unknown", "path": None}

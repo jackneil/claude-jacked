@@ -89,6 +89,8 @@ nul
 .claude/worktrees/
 .claude/checkpoints/
 .claude/research/
+# Per-machine Claude Code settings. Never commit this file.
+.claude/settings.local.json
 .superpowers/
 tmp/
 /*.png

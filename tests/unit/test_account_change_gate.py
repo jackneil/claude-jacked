@@ -23,7 +23,7 @@ from jacked.api.routes.auth import router
 from jacked.api.write_gate import MutationRefused, mutation_refused_handler, require_mutation_access
 from jacked.web.database import Database
 
-TAILNET_IP = "100.116.47.72"
+TAILNET_IP = "100.64.47.72"
 LAN_IP = "192.168.42.5"
 
 @pytest.fixture

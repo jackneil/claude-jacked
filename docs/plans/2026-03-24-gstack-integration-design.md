@@ -281,7 +281,7 @@ This is the main adaptation work — the monitoring logic stays the same, just t
 | `/qa` | `/qa` (jacked) — direct name collision, same concept |
 | `/qa-only` | Covered by existing `/qa` report mode |
 | `/browse` | firecrawl + chrome-devtools MCP — two browser tools already |
-| `/setup-browser-cookies` | Dev-login auth bypass flow in HANK OS |
+| `/setup-browser-cookies` | Dev-login auth bypass flow in a web app |
 
 ### Duplicate of Other Existing Tools
 | GStack | Jacked/Plugin Equivalent |

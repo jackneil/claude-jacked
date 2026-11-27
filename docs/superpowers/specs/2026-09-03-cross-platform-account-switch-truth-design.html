@@ -27,8 +27,8 @@
 <h2 id="incident">Incident contract</h2>
 <p>The 2026-09-03 incident produced three independent failures:</p>
 <ol>
-  <li>The Udifi account was written to SQLite, <code>~/.claude/.credentials.json</code>, and <code>~/.claude.json</code>, while macOS rejected the Keychain update. The API still returned <code>active</code>.</li>
-  <li>Two running sessions remained grouped under Raider because session identity was only detected at session start; response hooks refreshed liveness without re-observing identity.</li>
+  <li>One account was written to SQLite, <code>~/.claude/.credentials.json</code>, and <code>~/.claude.json</code>, while macOS rejected the Keychain update. The API still returned <code>active</code>.</li>
+  <li>Two running sessions remained grouped under the previous account because session identity was only detected at session start; response hooks refreshed liveness without re-observing identity.</li>
   <li>An untracked jacked process owned port 8321 while launchd repeatedly tried and failed to start its registered replacement. PID-file absence made status report <code>stopped</code>.</li>
 </ol>
 <p>The same inspection exposed a secret-bearing environment inherited by the launch agent. Supervisor diagnostics must never emit full environments, and service processes must be created with a curated environment.</p>

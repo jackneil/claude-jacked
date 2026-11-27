@@ -9,7 +9,7 @@ Three related issues with usage monitoring:
 
 1. **No visibility into active account polling.** The server polls the active account every 60s for auto-swap decisions, but the UI shows no indication of when the next check happens.
 
-2. **Redundant usage fetches cause 429 rate limits.** The active account gets hit by multiple independent callers: the 60s active poll, the 5-min sweep, the UI auto-refresh, and post-ping fetches. Account 5 (udifi) is getting 429'd every minute because these callers don't coordinate. The 30s cache guard helps but is bypassed when `access_token` is passed directly.
+2. **Redundant usage fetches cause 429 rate limits.** The active account gets hit by multiple independent callers: the 60s active poll, the 5-min sweep, the UI auto-refresh, and post-ping fetches. Account 5 is getting 429'd every minute because these callers don't coordinate. The 30s cache guard helps but is bypassed when `access_token` is passed directly.
 
 3. **No 429 backoff.** When the usage endpoint returns 429, we log a warning and retry at the normal interval. We should back off.
 

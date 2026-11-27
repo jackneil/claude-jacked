@@ -8843,7 +8843,7 @@ def claude_cmd(account, claude_args):
     Examples:
         jacked claude 2
         jacked claude alice@test.com
-        jacked claude udifi
+        jacked claude acme
         jacked claude 2 -p editor
 
     >>> # CLI command: jacked claude [ACCOUNT] [CLAUDE_ARGS...]

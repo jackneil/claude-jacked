@@ -201,14 +201,14 @@ def test_explicit_uncooperative_switch_repairs_preexisting_split_brain() -> None
     authority_before = CredentialPayload.from_mapping(
         {
             "_jackedAccountId": 1,
-            "claudeAiOauth": {"accessToken": "raider-token"},
+            "claudeAiOauth": {"accessToken": "first-token"},
             "authorityOnly": {"preserve": True},
         }
     )
     mirror_before = CredentialPayload.from_mapping(
         {
             "_jackedAccountId": 2,
-            "claudeAiOauth": {"accessToken": "udifi-old-token"},
+            "claudeAiOauth": {"accessToken": "second-old-token"},
             "mirrorOnly": "must-not-be-imported",
         }
     )
@@ -234,7 +234,7 @@ def test_explicit_uncooperative_switch_repairs_preexisting_split_brain() -> None
         )
     )
 
-    result = engine.activate(_request(_payload(2, "udifi-new-token")))
+    result = engine.activate(_request(_payload(2, "second-new-token")))
 
     assert result.outcome is SwitchOutcome.OBSERVED_TARGET_UNFENCED
     assert result.committed_authority.account_id is None
@@ -244,7 +244,7 @@ def test_explicit_uncooperative_switch_repairs_preexisting_split_brain() -> None
     for store in (authority, mirror):
         mapping = store.read().payload.to_mapping()
         assert mapping["_jackedAccountId"] == 2
-        assert mapping["claudeAiOauth"]["accessToken"] == "udifi-new-token"
+        assert mapping["claudeAiOauth"]["accessToken"] == "second-new-token"
         assert mapping["authorityOnly"] == {"preserve": True}
         assert "mirrorOnly" not in mapping
 
@@ -253,7 +253,7 @@ def test_missing_authority_never_erases_readable_mirror_during_repair() -> None:
     mirror_before = CredentialPayload.from_mapping(
         {
             "_jackedAccountId": 2,
-            "claudeAiOauth": {"accessToken": "udifi-old-token"},
+            "claudeAiOauth": {"accessToken": "second-old-token"},
             "mirrorOnly": "cannot-be-preserved-without-authority",
         }
     )
@@ -279,7 +279,7 @@ def test_missing_authority_never_erases_readable_mirror_during_repair() -> None:
         )
     )
 
-    result = engine.activate(_request(_payload(2, "udifi-new-token")))
+    result = engine.activate(_request(_payload(2, "second-new-token")))
 
     assert result.outcome is SwitchOutcome.DIVERGED
     assert authority.write_count == 0

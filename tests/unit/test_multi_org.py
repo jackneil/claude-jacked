@@ -463,13 +463,13 @@ class TestFreshDBWithOrg:
         db = Database(str(tmp_path / "test.db"))
         try:
             acct = db.create_account(
-                email="jack@hank.ai",
+                email="jack@example.com",
                 access_token="at1",
                 expires_at=int(time.time()) + 3600,
                 organization_uuid="org-hank-uuid",
                 organization_name="Acme",
             )
-            assert acct["email"] == "jack@hank.ai"
+            assert acct["email"] == "jack@example.com"
             assert acct["organization_uuid"] == "org-hank-uuid"
             assert acct["organization_name"] == "Acme"
             assert acct["id"] > 0

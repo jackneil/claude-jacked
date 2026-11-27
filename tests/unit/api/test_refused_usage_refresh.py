@@ -24,7 +24,7 @@ from jacked.api.main import app
 from jacked.web import auth
 from jacked.web.database import Database
 
-TAILNET_IP = "100.116.47.72"
+TAILNET_IP = "100.64.47.72"
 
 
 @pytest.fixture

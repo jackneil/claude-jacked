@@ -52,7 +52,7 @@ Write a concise rule following these principles:
 - **Be concrete** - "use pydantic v2 for model definitions (v1 validators are deprecated)" not "use modern libraries"
 - **Be actionable** - Claude should know exactly what to do differently
 - **Match firmness to proven confidence** - a lesson that has recurred 2-3x (graduating from lessons.md or auto-memory) has earned a hard `ALWAYS`/`NEVER`. A first-time, single-observation lesson is a *hypothesis*, not a law: write it as a softer note (e.g. "prefer X over Y" / "this repo seems to use pnpm") or leave it in lessons.md/auto-memory to mature — do NOT promote a one-off into an enforced rule. One light inline marker is enough; don't invent a confidence schema.
-- **NEVER hardcode machine-specific paths** (e.g. `/Users/jack/...`, `/home/user/...`, `~/.local/share/uv/tools/...`). Use generic references like "the project root", "the Claude config directory", or `~/.claude/` when referring to well-known locations. These files get synced to the repo and must work for any contributor.
+- **NEVER hardcode machine-specific paths** (e.g. `/Users/alex/...`, `/home/user/...`, `~/.local/share/uv/tools/...`). Use generic references like "the project root", "the Claude config directory", or `~/.claude/` when referring to well-known locations. These files get synced to the repo and must work for any contributor.
 
 Good examples:
 ```
@@ -66,7 +66,7 @@ Bad examples:
 - try to write better code (too vague)
 - remember to be careful with paths (not actionable)
 - there was a bug with the thing (not a rule)
-- check /Users/jack/.local/share/uv/tools/... (machine-specific path)
+- check /Users/alex/.local/share/uv/tools/... (machine-specific path)
 ```
 
 ### Step 4: Write the Rule

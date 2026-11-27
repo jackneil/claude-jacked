@@ -3,7 +3,7 @@
 Claude Code reads frontmatter leniently, so an unquoted ``: `` inside a
 description still shows up there. Strict parsers do not: PyYAML, Codex, and
 other agent runtimes reject the block, and the skill or agent loses its name
-and description. On 2026-10-01 eight shipped agents and one hank skill carried
+and description. On 2026-10-01 eight shipped agents and one skill in another repo carried
 this defect. These tests keep the whole class out.
 """
 

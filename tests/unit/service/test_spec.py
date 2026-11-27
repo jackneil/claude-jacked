@@ -338,8 +338,8 @@ def _fake_nss(monkeypatch, *, groups, users, uid, platform, os_release=""):
 def test_darwin_trusts_admin_and_wheel_members_without_enumerating(monkeypatch):
     spec_module = _fake_nss(
         monkeypatch,
-        groups=[_Group("admin", 80, ["root", "jack", "alice"]), _Group("wheel", 0), _Group("staff", 20)],
-        users=[_User("root", 0, 0), _User("jack", 501, 20), _User("alice", 502, 20)],
+        groups=[_Group("admin", 80, ["root", "alex", "alice"]), _Group("wheel", 0), _Group("staff", 20)],
+        users=[_User("root", 0, 0), _User("alex", 501, 20), _User("alice", 502, 20)],
         uid=501,
         platform="darwin",
     )
@@ -362,8 +362,8 @@ def test_linux_wheel_is_trusted_only_where_the_family_grants_sudo(
 ):
     spec_module = _fake_nss(
         monkeypatch,
-        groups=[_Group("sudo", 27, ["jack"]), _Group("wheel", 10, ["bob"]), _Group("admin", 900, ["mallory"]), _Group("jack", 1001)],
-        users=[_User("root", 0, 0), _User("jack", 1001, 1001), _User("bob", 1002, 100), _User("mallory", 1003, 100)],
+        groups=[_Group("sudo", 27, ["alex"]), _Group("wheel", 10, ["bob"]), _Group("admin", 900, ["mallory"]), _Group("alex", 1001)],
+        users=[_User("root", 0, 0), _User("alex", 1001, 1001), _User("bob", 1002, 100), _User("mallory", 1003, 100)],
         uid=1001,
         platform="linux",
         os_release=os_release,
@@ -379,28 +379,28 @@ def test_linux_wheel_is_trusted_only_where_the_family_grants_sudo(
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
 def test_user_private_group_requires_same_name_no_members_and_a_user_range_gid(monkeypatch):
-    base = dict(users=[_User("jack", 1001, 1001)], uid=1001, platform="linux")
-    assert _fake_nss(monkeypatch, groups=[_Group("jack", 1001)], **base)._user_private_group_id() == 1001
-    assert _fake_nss(monkeypatch, groups=[_Group("jack", 1001, ["bob"])], **base)._user_private_group_id() is None
+    base = dict(users=[_User("alex", 1001, 1001)], uid=1001, platform="linux")
+    assert _fake_nss(monkeypatch, groups=[_Group("alex", 1001)], **base)._user_private_group_id() == 1001
+    assert _fake_nss(monkeypatch, groups=[_Group("alex", 1001, ["bob"])], **base)._user_private_group_id() is None
     assert _fake_nss(monkeypatch, groups=[_Group("users", 1001)], **base)._user_private_group_id() is None
-    low = dict(users=[_User("jack", 501, 501)], uid=501, platform="linux")
-    assert _fake_nss(monkeypatch, groups=[_Group("jack", 501)], **low)._user_private_group_id() is None
+    low = dict(users=[_User("alex", 501, 501)], uid=501, platform="linux")
+    assert _fake_nss(monkeypatch, groups=[_Group("alex", 501)], **low)._user_private_group_id() is None
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX runtime trust model")
 def test_trust_sets_are_not_cached_across_calls(monkeypatch):
     spec_module = _fake_nss(
         monkeypatch,
-        groups=[_Group("admin", 80, ["jack", "alice"]), _Group("wheel", 0)],
-        users=[_User("jack", 501, 20), _User("alice", 502, 20)],
+        groups=[_Group("admin", 80, ["alex", "alice"]), _Group("wheel", 0)],
+        users=[_User("alex", 501, 20), _User("alice", 502, 20)],
         uid=501,
         platform="darwin",
     )
     assert 502 in spec_module._trusted_owner_ids()
     _fake_nss(
         monkeypatch,
-        groups=[_Group("admin", 80, ["jack"]), _Group("wheel", 0)],
-        users=[_User("jack", 501, 20), _User("alice", 502, 20)],
+        groups=[_Group("admin", 80, ["alex"]), _Group("wheel", 0)],
+        users=[_User("alex", 501, 20), _User("alice", 502, 20)],
         uid=501,
         platform="darwin",
     )

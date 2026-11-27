@@ -27,7 +27,7 @@ from jacked.api.remote_access import (
 
 # A real tailnet address (CGNAT 100.64.0.0/10) and a LAN address that is NOT
 # on the tailnet — the pair the whole policy turns on.
-TAILNET_IP = "100.116.47.72"
+TAILNET_IP = "100.64.47.72"
 LAN_IP = "192.168.42.5"
 TAILNET_IPV6 = "fd7a:115c:a1e0::1"
 
@@ -103,7 +103,7 @@ def test_client_in_scope_tailscale_rejects_lan_ipv4():
 
 def test_client_in_scope_tailscale_accepts_the_ipv6_ula_prefix():
     assert client_in_scope(TAILNET_IPV6, "tailscale") is True
-    assert client_in_scope("fd7a:115c:a1e0:ab12:4843:cd96:6274:2f01", "tailscale") is True
+    assert client_in_scope("fd7a:115c:a1e0:ab12:4843:cd96:6440:2f48", "tailscale") is True
 
 
 def test_client_in_scope_tailscale_rejects_other_ipv6():
@@ -111,7 +111,7 @@ def test_client_in_scope_tailscale_rejects_other_ipv6():
     assert client_in_scope("fd00::1", "tailscale") is False
 
 
-@pytest.mark.parametrize("host", ["hank-llm", "", None, "not an ip", "100.64.0.9/10"])
+@pytest.mark.parametrize("host", ["gpu-box", "", None, "not an ip", "100.64.0.9/10"])
 @pytest.mark.parametrize("scope", ["tailscale", "all"])
 def test_client_in_scope_rejects_unparsable_hosts(host, scope):
     assert client_in_scope(host, scope) is False
@@ -159,7 +159,7 @@ def test_scope_tailscale_allows_only_tailnet_clients():
     assert credential_mutation_allowed("2001:db8::1", True, "tailscale") is False
 
 
-@pytest.mark.parametrize("host", ["hank-llm", "", None])
+@pytest.mark.parametrize("host", ["gpu-box", "", None])
 @pytest.mark.parametrize("enabled,scope", [(False, "tailscale"), (True, "tailscale"), (True, "all")])
 def test_unparsable_or_missing_host_is_denied(host, enabled, scope):
     assert credential_mutation_allowed(host, enabled, scope) is False
@@ -248,7 +248,7 @@ def test_policy_is_editable_from_loopback(host):
     assert credential_policy_editable(host) is True
 
 
-@pytest.mark.parametrize("host", [TAILNET_IP, LAN_IP, TAILNET_IPV6, "hank-llm", "", None])
+@pytest.mark.parametrize("host", [TAILNET_IP, LAN_IP, TAILNET_IPV6, "gpu-box", "", None])
 def test_policy_is_not_editable_from_anywhere_else(host):
     """The switch that grants remote credential control is flipped only at
     the host, whatever the setting currently says."""
@@ -290,7 +290,7 @@ def test_decision_reports_outside_scope():
         "outside_scope",
     )
     # An unparsable host is outside every scope, not "remote access off".
-    assert credential_mutation_decision("hank-llm", True, "all") == (
+    assert credential_mutation_decision("gpu-box", True, "all") == (
         False,
         "outside_scope",
     )
@@ -302,7 +302,7 @@ def test_decision_allows_in_scope_remote_with_no_reason():
 
 
 def test_decision_and_boolean_helper_never_disagree():
-    for host in [TAILNET_IP, LAN_IP, TAILNET_IPV6, "127.0.0.1", "hank-llm", None]:
+    for host in [TAILNET_IP, LAN_IP, TAILNET_IPV6, "127.0.0.1", "gpu-box", None]:
         for enabled in (True, False):
             for scope in ("tailscale", "all"):
                 allowed, reason = credential_mutation_decision(host, enabled, scope)

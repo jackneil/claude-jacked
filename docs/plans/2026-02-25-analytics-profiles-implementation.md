@@ -725,7 +725,7 @@ git commit -m "feat(analytics): dashboard, heatmap, sessions, rules API endpoint
 **Step 1: Download Chart.js and matrix plugin**
 
 ```bash
-cd /Users/jack.neil/Github/claude-jacked/jacked/data/web/js
+cd jacked/data/web/js
 mkdir -p vendor
 curl -L "https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js" -o vendor/chart.umd.min.js
 curl -L "https://cdn.jsdelivr.net/npm/chartjs-chart-matrix@2/dist/chartjs-chart-matrix.min.js" -o vendor/chartjs-chart-matrix.min.js
