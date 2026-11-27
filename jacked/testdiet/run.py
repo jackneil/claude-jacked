@@ -20,6 +20,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from jacked.public_errors import os_error_reason
 from jacked.testdiet import history, machine, reports, tree
 from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.model import SCHEMA, RunMeta, TreeId, emit
@@ -164,9 +165,8 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
         def write() -> RunMeta:
             meta = build()
             notice = _guard("read the earlier records", lambda: repeat_notice(store, meta), None)
-            history.write_run(store, meta, known["data"])
-            known["written"] = True
-            _closing_line(meta)
+            if _write_record(store, meta, known["data"]):
+                known["written"] = True
             if notice:
                 # jacked built each line, and each stored value in it went through one_line.
                 for line in notice.split("\n"):
@@ -198,7 +198,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
             emit(f"the run got signal {stop.args[0]} after the gate stopped. The recorder skips its "
                  "other steps and writes the record.")
             if not known["written"]:
-                _guard("write the record", lambda: _write_after_stop(store, build(), known["data"]), None)
+                _guard("write the record", lambda: _write_record(store, build(), known["data"]), None)
             return code
         except KeyboardInterrupt:
             # The gate is done. An interrupt now stops only the recorder.
@@ -227,13 +227,17 @@ def _placeholder(argv: list[str]) -> tuple[Path | None, Path | None, list[str]]:
     return reports.placeholder(argv, lambda: _guard("make the report folder", reports.make_report_folder, None))
 
 
-def _closing_line(meta: RunMeta) -> None:
+def _write_record(store: Path, meta: RunMeta, data) -> bool:
+    """Write the record and print the closing line. A store that cannot be written gives one line."""
+    try:
+        history.write_run(store, meta, data)
+    except OSError as exc:
+        logger.debug("write_run: the store cannot be written", exc_info=True)
+        emit(f"cannot write the history store {store} ({os_error_reason(exc)}), so the run is not "
+             "recorded. A sandbox that makes the .git folder read-only gives this error.")
+        return False
     emit(f"recorded {meta.id}, verdict {meta.verdict}.")
-
-
-def _write_after_stop(store: Path, meta: RunMeta, data) -> None:
-    history.write_run(store, meta, data)
-    _closing_line(meta)
+    return True
 
 
 def _top_or_none(cwd: Path) -> Path | None:

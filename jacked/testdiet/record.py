@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeVar
 
+from jacked.public_errors import describe
 from jacked.testdiet import history, junit, tree
 from jacked.testdiet import machine as identity
 from jacked.testdiet.model import (
@@ -53,11 +54,15 @@ T = TypeVar("T")
 
 
 def _guard(step: str, func: Callable[[], T], default: T) -> T:
-    """Run one recorder step. An error is logged and printed, and ``default`` is the result."""
+    """Run one recorder step. An error is logged and printed, and ``default`` is the result.
+
+    The WARNING log line has no traceback; the traceback goes to DEBUG (``jacked -v``).
+    """
     try:
         return func()
     except Exception as exc:  # noqa: BLE001 -- a recorder error never stops or changes the gate
-        logger.warning("recorder step %s failed: %s", step, type(exc).__name__, exc_info=True)
+        logger.warning("recorder step %s failed: %s", step, describe(exc))
+        logger.debug("recorder step %s failed", step, exc_info=True)
         emit(f"the recorder step '{step}' failed ({type(exc).__name__}). The gate result is not changed.")
         return default
 

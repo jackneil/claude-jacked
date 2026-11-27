@@ -145,11 +145,15 @@ def seen_command(inputs, any_machine, as_json, command):
         top = _record.work_tree_top(here)
         folder = _tree.work_folder(here)
         current = _tree.tree_id(top)
+        machine_id, problem = _machine.identity()
+        if machine_id is None and not any_machine:
+            _model.emit(f"{problem} seen cannot match a run of this machine with no identity. "
+                        "Give --any-machine to accept a run of any machine.")
         if current is not None:
             found = _record.seen(_tree.store_dir(top), current,
                                  _tree.command_sha(list(command), folder=folder), folder=folder,
                                  inputs_sha=_tree.inputs_fingerprint(top, inputs),
-                                 machine_id=_machine.machine_id(), any_machine=any_machine)
+                                 machine_id=machine_id, any_machine=any_machine)
         else:
             _model.emit("this repository has no tree identity (no commit, or git failed).")
     except _tree.TreeError:

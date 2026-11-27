@@ -191,6 +191,7 @@ jacked tests loss [--base REF] [--json]
   - The placeholder `{junit}`: an argument that holds the text `{junit}` gets the path of a private report file. `run` makes a private temporary folder for it, reads the report after the gate, and then removes the folder. The record holds the SHA-256 of the arguments as you typed them, so the path does not change the identity of the command.
   - A command with no `{junit}` and a run with no `--junit` have no report. Then `run` prints one line before the gate: the run cannot prove a tree.
   - After each record, `run` prints one line: `recorded <run id>, verdict <verdict>.`
+  - When `run` cannot write the history store, it prints one line that names the store folder, and it does not record the run. The exit code is still the exit code of the gate. A sandbox that makes the `.git` folder read-only gives this result, for example the default sandbox of Codex.
   - `--junit GLOB`: use it for a runner that writes its report at a fixed path. Before the gate, `run` takes the SHA-256 of each file that matches. After the gate, it reads each match that is new or that has new content. It prints one line for each match that it did not read, so an old report never becomes this run.
   - `--kind full|targeted` is a label for `profile` and `history` only.
   - The verdict of a run is one of five values. `passed`: exit code 0, a report with at least one test, and no failed or error test. `failed`: an exit code that is not 0. `conflict`: exit code 0 and a failed or an error test in the report. `no-data`: exit code 0 and no test data. `unknown`: no exit code. A pipe can turn a red gate into exit code 0, and then the verdict is `conflict`.
@@ -204,6 +205,7 @@ jacked tests loss [--base REF] [--json]
   - The command identity holds the folder that the gate ran in, relative to the top of the work tree. A run in `sub` never proves the same command at the top, because the same command can collect a different set of tests in a different folder. Run `seen` in the folder where the gate runs. The hit line names that folder.
   - A record of an older or newer record format never proves a tree. `history` and `profile` still show it.
   - The commit is not compared, so two commits with the same content are one tree. A run of `record` never proves a tree.
+  - When this machine has no identity (the file cannot be read or made, or holds no valid identity), `seen` prints one line that names the file and the cause.
   - `--any-machine` also accepts a run of a different machine. `seen` never compares the times of two machines. `--json` prints the record, or `null`.
 - `jacked tests profile` shows where the time of a run goes, by file and by test.
   - By default, it shows the newest run with the kind full. When no run has the kind full, it shows the newest run. The default machine is the machine of the newest full run.

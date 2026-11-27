@@ -176,3 +176,23 @@ def test_cli_record_gives_one_line_and_exit_1_for_a_bad_value(repo, monkeypatch)
     monkeypatch.setattr(_record, "record_files", refuse)
     result = _invoke("tests", "record", "--junit", str(GREEN))
     assert result.exit_code == 1 and "nothing is recorded" in result.stderr
+
+
+def test_cli_seen_says_why_when_this_machine_has_no_identity(repo, tmp_path, monkeypatch):
+    argv = gate(GREEN, 0)
+    assert _invoke("tests", "run", "--", *argv).exit_code == 0
+    blocked = tmp_path / "blocked-home"
+    blocked.mkdir()
+    (blocked / ".claude").write_bytes(b"a file where the .claude folder must be")
+    monkeypatch.setenv("JACKED_HOME", str(blocked))
+    result = _invoke("tests", "seen", "--", *argv)
+    assert result.exit_code == 1
+    lines = [line for line in result.stderr.splitlines() if "machine identity" in line]
+    assert len(lines) == 1 and "jacked-tests-machine-id" in lines[0] and "--any-machine" in lines[0]
+    damaged = tmp_path / "damaged-home"
+    (damaged / ".claude").mkdir(parents=True)
+    (damaged / ".claude" / "jacked-tests-machine-id").write_bytes(b"not an id")
+    monkeypatch.setenv("JACKED_HOME", str(damaged))
+    result = _invoke("tests", "seen", "--", *argv)
+    lines = [line for line in result.stderr.splitlines() if "machine identity" in line]
+    assert result.exit_code == 1 and len(lines) == 1 and "no valid identity" in lines[0]

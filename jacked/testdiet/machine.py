@@ -16,6 +16,7 @@ from pathlib import Path
 
 from jacked.atomic_io import atomic_write_bytes
 from jacked.packs import jacked_home
+from jacked.public_errors import os_error_reason
 from jacked.regular_file import open_regular_fd
 from jacked.testdiet.model import MACHINE_ID_BYTES, MACHINE_ID_RE
 
@@ -34,14 +35,26 @@ def machine_id(home: Path | None = None) -> str | None:
     the same identity. The result is None when the file cannot be read or
     made, or holds no valid identity.
     """
+    return identity(home)[0]
+
+
+def identity(home: Path | None = None) -> tuple[str | None, str]:
+    """Return the identity of ``machine_id`` and, when it is None, one line that says why.
+
+    The line names the file and the cause. With an identity, the line is empty.
+    """
     path = Path(home if home is not None else jacked_home()) / ".claude" / MACHINE_ID_NAME
     try:
         if not os.path.lexists(path):
             _make_machine_id(path)
-        return _read_machine_id(path)
+        value = _read_machine_id(path)
     except (OSError, ValueError) as exc:
         logger.debug("machine_id: no machine identity (%s)", type(exc).__name__)
-        return None
+        cause = os_error_reason(exc) if isinstance(exc, OSError) else "it is not ASCII text"
+        return None, f"the machine identity {path} cannot be read or made ({cause})."
+    if value is None:
+        return None, f"the machine identity {path} holds no valid identity."
+    return value, ""
 
 
 def _make_machine_id(path: Path) -> None:

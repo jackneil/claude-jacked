@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import gzip
+import logging
 import os
 import re
 import shutil
@@ -994,3 +995,38 @@ def test_a_changed_path_with_a_line_break_prints_on_one_line(repo, capsys):
     err = capsys.readouterr().err
     assert all(line.startswith("jacked tests: ") for line in err.splitlines())
     assert "made\\nforged.txt" in err
+
+
+ROOT_OR_WINDOWS = pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                                     reason="needs POSIX modes and a user that is not root")
+
+
+@ROOT_OR_WINDOWS
+def test_a_store_that_cannot_be_written_gives_one_line_and_keeps_the_code(repo, capsys, caplog):
+    store = tree.store_dir(repo)
+    runs = store / history.RUNS
+    runs.mkdir(parents=True)
+    runs.chmod(0o500)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="jacked.testdiet"):
+            assert run.run_gate(junit_gate(6, RED), cwd=repo) == 6
+    finally:
+        runs.chmod(0o700)
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "not recorded" in line]
+    assert len(lines) == 1 and str(store) in lines[0] and "read-only" in lines[0]
+    assert "Traceback" not in err and "recorded 2" not in err
+    assert not any(r.exc_info for r in caplog.records if r.levelno >= logging.WARNING)
+    assert list(runs.iterdir()) == []
+
+
+def test_a_recorder_step_error_logs_no_traceback_at_warning(repo, monkeypatch, caplog):
+    def boom(*args, **kwargs):
+        raise RuntimeError("recorder broke")
+
+    monkeypatch.setattr(history, "write_run", boom)
+    with caplog.at_level(logging.DEBUG, logger="jacked.testdiet"):
+        assert run.run_gate(junit_gate(6, RED), cwd=repo) == 6
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings and not any(r.exc_info for r in warnings)
+    assert any(r.exc_info for r in caplog.records if r.levelno == logging.DEBUG)
