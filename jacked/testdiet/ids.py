@@ -103,17 +103,36 @@ def relative_path(text: str, *, root: Path, report_root: str | None = None) -> s
 class TreeLookup:
     """Lookups in the tree for runners whose report holds no file path.
 
-    One object reads each manifest one time. Make a new one for each read.
+    One object reads each file, lists each folder and answers each lookup
+    one time: the answers are kept for the life of the object, because the
+    tree does not change during one read. Make a new one for each read.
     """
 
     def __init__(self, root: Path):
         self.root = root
         self._manifests: dict[str, list[str]] = {}
         self._texts: dict[str, bytes | None] = {}
+        self._memo: dict[tuple, object] = {}
+
+    def _cached(self, key: tuple, compute):
+        if key not in self._memo:
+            self._memo[key] = compute()
+        return self._memo[key]
+
+    def _in_root(self, rel: str) -> bool:
+        return self._cached(("file", rel), lambda: _is_file_in_root(self.root, rel))
+
+    def _listing(self, folder: str) -> list[str] | None:
+        def read() -> list[str] | None:
+            try:
+                return sorted(os.listdir(self.root / folder))
+            except OSError:
+                return None
+        return self._cached(("listdir", folder), read)
 
     def _text(self, rel: str) -> bytes | None:
         if rel not in self._texts:
-            self._texts[rel] = _read_tree_file(self.root / rel) if _is_file_in_root(self.root, rel) else None
+            self._texts[rel] = _read_tree_file(self.root / rel) if self._in_root(rel) else None
         return self._texts[rel]
 
     def manifests(self, name: str) -> list[str]:
@@ -130,17 +149,23 @@ class TreeLookup:
 
     def pytest_module(self, dotted: str) -> tuple[str, list[str]] | None:
         """Find the longest dotted prefix that is a ``.py`` file. Return it and the rest."""
+        return self._cached(("pytest", dotted), lambda: self._pytest_module(dotted))
+
+    def _pytest_module(self, dotted: str) -> tuple[str, list[str]] | None:
         parts = dotted.split(".")
         if not dotted or any(part in ("", "..") for part in parts):
             return None
         for end in range(len(parts), 0, -1):
             rel = "/".join(parts[:end]) + ".py"
-            if relative_path(rel, root=self.root) and _is_file_in_root(self.root, rel):
+            if relative_path(rel, root=self.root) and self._in_root(rel):
                 return rel, parts[end:]
         return None
 
     def go_file(self, package: str, test: str) -> str | None:
         """Find the ``_test.go`` file of ``package`` that declares ``func test(``."""
+        return self._cached(("go", package, test), lambda: self._go_file(package, test))
+
+    def _go_file(self, package: str, test: str) -> str | None:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", test):
             return None
         declares = re.compile(rb"^func\s+" + re.escape(test.encode()) + rb"\s*\(", re.MULTILINE)
@@ -159,9 +184,8 @@ class TreeLookup:
             folder = "/".join(p for p in ("" if parent == "." else parent, sub) if p)
             if folder and relative_path(folder, root=self.root) is None:
                 return None
-            try:
-                names = sorted(os.listdir(self.root / folder))
-            except OSError:
+            names = self._listing(folder)
+            if names is None:
                 return None
             for name in names:
                 rel = f"{folder}/{name}" if folder else name
@@ -170,6 +194,9 @@ class TreeLookup:
         return None
 
     def _crate_dirs(self) -> dict[str, str]:
+        return self._cached(("crates",), self._read_crate_dirs)
+
+    def _read_crate_dirs(self) -> dict[str, str]:
         crates: dict[str, str] = {}
         for rel in self.manifests("Cargo.toml"):
             try:
@@ -185,6 +212,9 @@ class TreeLookup:
 
     def rust_file(self, binary_id: str, test: str) -> str | None:
         """Find the file that declares the nextest test ``test`` of ``binary_id``."""
+        return self._cached(("rust", binary_id, test), lambda: self._rust_file(binary_id, test))
+
+    def _rust_file(self, binary_id: str, test: str) -> str | None:
         crate, _, kind = binary_id.partition("::")
         crates = self._crate_dirs()
         if crate not in crates:
@@ -205,7 +235,7 @@ class TreeLookup:
             folder = {"example": "examples", "bench": "benches"}.get(kind.partition("/")[0], "tests")
             name = kind.partition("/")[2] if "/" in kind else kind
             entries = [join(folder, f"{name}.rs"), join(folder, name, "main.rs")]
-        entry = next((e for e in entries if relative_path(e, root=self.root) and _is_file_in_root(self.root, e)), None)
+        entry = next((e for e in entries if relative_path(e, root=self.root) and self._in_root(e)), None)
         if entry is None:
             return None
         parts = test.split("::")
@@ -217,7 +247,7 @@ class TreeLookup:
         for end in range(len(modules), 0, -1):
             stem = (module_base / "/".join(modules[:end])).as_posix()
             hit = next((c for c in (f"{stem}.rs", f"{stem}/mod.rs")
-                        if relative_path(c, root=self.root) and _is_file_in_root(self.root, c)), None)
+                        if relative_path(c, root=self.root) and self._in_root(c)), None)
             if hit:
                 found = hit
                 break

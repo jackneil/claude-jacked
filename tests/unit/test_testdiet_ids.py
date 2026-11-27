@@ -171,3 +171,71 @@ def test_private_hits_finds_the_host_and_its_first_part():
     assert private_hits("on box.lan", host="box.lan", login="zz", home="/h/zz") == ["box.lan", "box"]
     assert private_hits("on box today", host="box.lan", login="zz", home="/h/zz") == ["box"]
     assert private_hits("on boxes", host="box.lan", login="zz", home="/h/zz") == []
+
+
+# --------------------------------------------------------------------------- the lookup memo
+
+
+class _Counter:
+    def __init__(self, monkeypatch):
+        from jacked.testdiet import ids
+
+        self.calls = 0
+        for name in ("_is_file_in_root", "_read_tree_file"):
+            real = getattr(ids, name)
+            monkeypatch.setattr(ids, name, self._wrap(real))
+        real_listdir, real_walk = ids.os.listdir, ids.os.walk
+        monkeypatch.setattr(ids.os, "listdir", self._wrap(real_listdir))
+        monkeypatch.setattr(ids.os, "walk", self._wrap(real_walk))
+        monkeypatch.setattr(ids.tomllib, "loads", self._wrap(ids.tomllib.loads))
+
+    def _wrap(self, func):
+        def counted(*args, **kwargs):
+            self.calls += 1
+            return func(*args, **kwargs)
+        return counted
+
+
+def _lookup_tree(root: Path) -> Path:
+    (root / "tests").mkdir(parents=True)
+    (root / "tests" / "test_a.py").write_bytes(b"def test_x():\n    pass\n")
+    (root / "go.mod").write_bytes(b"module example.com/m\n")
+    (root / "pkg").mkdir()
+    (root / "pkg" / "a_test.go").write_bytes(b"package pkg\n\nfunc TestA(t *testing.T) {}\n")
+    (root / "Cargo.toml").write_bytes(b'[package]\nname = "crate"\n')
+    (root / "src").mkdir()
+    (root / "src" / "lib.rs").write_bytes(b"#[test]\nfn test_b() {}\n")
+    return root
+
+
+@pytest.mark.parametrize("call", [
+    lambda lookup: lookup.pytest_module("tests.test_a"),
+    lambda lookup: lookup.go_file("example.com/m/pkg", "TestA"),
+    lambda lookup: lookup.rust_file("crate", "test_b"),
+], ids=["pytest", "go", "nextest"])
+def test_a_second_lookup_of_the_same_key_does_not_touch_the_file_system(tmp_path, monkeypatch, call):
+    from jacked.testdiet.ids import TreeLookup
+
+    lookup = TreeLookup(_lookup_tree(tmp_path))
+    counter = _Counter(monkeypatch)
+    first = call(lookup)
+    assert first is not None and counter.calls > 0
+    before = counter.calls
+    assert call(lookup) == first
+    assert counter.calls == before
+
+
+def test_the_go_lookup_lists_a_package_folder_one_time(tmp_path, monkeypatch):
+    from jacked.testdiet.ids import TreeLookup
+
+    root = _lookup_tree(tmp_path)
+    (root / "pkg" / "b_test.go").write_bytes(b"package pkg\n\nfunc TestB(t *testing.T) {}\n")
+    lookup = TreeLookup(root)
+    from jacked.testdiet import ids
+
+    listed = []
+    real = ids.os.listdir
+    monkeypatch.setattr(ids.os, "listdir", lambda path: listed.append(path) or real(path))
+    assert lookup.go_file("example.com/m/pkg", "TestA") == "pkg/a_test.go"
+    assert lookup.go_file("example.com/m/pkg", "TestB") == "pkg/b_test.go"
+    assert len(listed) == 1
