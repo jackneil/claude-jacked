@@ -123,9 +123,11 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, options: GateOptions
             state.write_once()
             return state.code
         except KeyboardInterrupt:
-            # The gate is done. An interrupt now stops only the recorder, as a SIGTERM does.
+            # The gate is done. An interrupt now stops only the recorder, as a SIGTERM does. The
+            # record has no tree after the gate, so it cannot prove a tree, as the line says.
             emit("the run got an interrupt after the gate stopped. The recorder skips its other steps "
                  "and writes the record, which cannot prove a tree. The exit code is the code of the gate.")
+            state.changed, state.meta, state.written = None, None, False
             state.write_once()
             return state.code
         return state.finish()
@@ -165,6 +167,7 @@ class _Run:
         self.data = self.changed = self.inputs_changed = None
         self.meta: RunMeta | None = None
         self.written = False
+        self.run_id: str | None = None  # one ID for each run: a rebuilt meta replaces the same files
 
     def find_store(self) -> bool:
         self.top = guard("find the work tree", lambda: _top_or_none(self.cwd), None, then=NOT_RECORDED)
@@ -240,7 +243,7 @@ class _Run:
     def build(self) -> RunMeta:
         data, opt, before = self.data, self.opt, self.before
         return RunMeta(
-            id=history.new_run_id(), started=self.started, source="run",
+            id=self._id(), started=self.started, source="run",
             wall_seconds=round(self.wall, 3), exit_code=self.code, verdict=history.verdict_of(self.code, data),
             kind=opt.kind, label=opt.label, runner=opt.runner or (data.runner if data else None),
             command_sha=self.sha, inputs_sha=self.inputs_sha, machine=LOCAL, machine_id=machine.machine_id(),
@@ -257,6 +260,10 @@ class _Run:
             interrupted=self.signals.interrupted, inputs_changed=self.inputs_changed,
         )
 
+    def _id(self) -> str:
+        self.run_id = self.run_id or history.new_run_id()
+        return self.run_id
+
     def write(self) -> RunMeta:
         """Write the record, then print the repeat notice. One meta for each run."""
         meta = self.meta = self.build()
@@ -271,9 +278,11 @@ class _Run:
     def write_once(self) -> None:
         """After a stop: write the record when it is not written. A second write replaces the same files."""
         if not self.written:
-            meta = self.meta = self.meta or self.build()
-            guard("write the record", lambda: _write_record(self.store, meta, self.data, self.spent()), None,
-                  then=NOT_RECORDED)
+            guard("write the record", self._build_and_write, None, then=NOT_RECORDED)
+
+    def _build_and_write(self) -> None:
+        meta = self.meta = self.meta or self.build()
+        self.written = _write_record(self.store, meta, self.data, self.spent())
 
     def finish(self) -> int:
         """The exit code: the code of the gate, or 1 for a conflict with ``strict``."""

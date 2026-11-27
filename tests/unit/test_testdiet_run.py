@@ -1441,3 +1441,57 @@ def test_the_miss_line_says_that_the_user_stopped_the_run(repo, tmp_path):
     answer = record.seen_answer(store, tree_of(repo), real.command_sha, folder=".", inputs_sha=real.inputs_sha,
                                 machine_id=machine.machine_id())
     assert answer.hit is None and "the user stopped the run" in answer.why
+
+
+def _interrupt_once(monkeypatch, module, name, then=None):
+    """Replace module.name: the first call raises KeyboardInterrupt, the next calls ``then`` or the real one."""
+    real = getattr(module, name)
+    calls = []
+
+    def fake(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise KeyboardInterrupt
+        return (then or real)(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, fake)
+    return calls
+
+
+@pytest.mark.parametrize("where", ["build", "write", "after-write"])
+def test_an_interrupt_while_the_record_is_written_gives_a_record_that_proves_nothing(repo, monkeypatch, capsys, where):
+    # The tree after the gate is read (no change), then Ctrl-C lands in build(), in write_run, or
+    # just after write_run wrote a whole record: the stop path replaces that record (one ID).
+    if where == "build":
+        calls = _interrupt_once(monkeypatch, tree, "on_default_branch")
+    elif where == "write":
+        calls = _interrupt_once(monkeypatch, history, "write_run")
+    else:
+        real_write, calls = history.write_run, []
+
+        def write_then_interrupt(*args, **kwargs):
+            real_write(*args, **kwargs)
+            calls.append(1)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(history, "write_run", write_then_interrupt)
+    argv = junit_gate(0, GREEN)
+    assert run.run_gate(argv, cwd=repo) == 0
+    assert len(calls) == 2  # the stop path wrote the record
+    [meta] = _runs(repo)
+    assert meta.exit_code == 0 and meta.tree_changed is None
+    assert _seen(repo, argv) is None
+    lines = [line for line in capsys.readouterr().err.splitlines() if "after the gate stopped" in line]
+    assert len(lines) == 1 and "cannot prove a tree" in lines[0]
+
+
+def test_a_failed_build_after_an_interrupt_is_guarded(repo, monkeypatch, capsys):
+    def broken(*args, **kwargs):
+        raise RuntimeError("no branch")
+
+    _interrupt_once(monkeypatch, tree, "on_default_branch", then=broken)
+    assert run.run_gate(junit_gate(0, GREEN), cwd=repo) == 0
+    err = capsys.readouterr().err
+    assert "write the record" in err and "Traceback" not in err
+    assert _runs(repo) == []
