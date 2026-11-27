@@ -220,7 +220,7 @@ def test_cli_seen_says_why_the_work_tree_cannot_be_read(repo):
     finally:
         locked.chmod(0o600)
     assert result.exit_code == 1
-    lines = [line for line in result.stderr.splitlines() if "cannot prove a tree" in line]
+    lines = [line for line in result.stderr.splitlines() if "cannot prove this tree" in line]
     assert len(lines) == 1 and "locked.txt" in lines[0]
 
 
@@ -394,3 +394,56 @@ def test_seen_with_a_history_folder_that_cannot_be_read_does_not_say_the_history
     assert result.stderr.count("No run is read") == 1, result.stderr  # the warning of iter_runs
     assert "no run of this tree is in the history" not in result.stderr
     assert "the history cannot be read, so no record can prove this tree" in result.stderr
+
+
+# --------------------------------------------------------------------------- o-L4: each miss line ends with what to do
+
+def test_a_no_data_miss_names_the_repair_and_the_next_action(repo):
+    argv = [sys.executable, "-c", "pass"]  # exit 0, no report: verdict no-data
+    assert _invoke("tests", "run", "--", *argv).exit_code == 0
+    result = _invoke("tests", "seen", "--", *argv)
+    assert result.exit_code == 1
+    [line] = [line for line in result.stderr.splitlines() if "does not prove the tree" in line]
+    assert "Put {junit} in the command, or give --junit GLOB." in line
+    assert line.endswith("Run the gate with jacked tests run.")
+
+
+def test_an_any_machine_miss_ends_with_the_next_action(repo):
+    argv = gate(RED, 1)
+    _invoke("tests", "run", "--", *argv)
+    result = _invoke("tests", "seen", "--any-machine", "--", *argv)
+    assert result.exit_code == 1
+    [line] = [line for line in result.stderr.splitlines() if "no machine's newest run" in line]
+    assert line.endswith("Run the gate with jacked tests run.")
+
+
+def test_run_and_seen_print_one_text_when_git_cannot_read_the_tree(repo, monkeypatch):
+    from jacked.testdiet import model
+
+    problem = "git cannot read the work tree (git add exited with 128: fatal: x)"
+    monkeypatch.setattr(tree, "tree_state", lambda *a, **k: (None, problem))
+    run_err = _invoke("tests", "run", "--", *gate(GREEN, 0)).stderr
+    seen_err = _invoke("tests", "seen", "--", *gate(GREEN, 0)).stderr
+    run_line = [line for line in run_err.splitlines() if problem in line]
+    seen_line = [line for line in seen_err.splitlines() if problem in line]
+    assert run_line and run_line == seen_line, (run_line, seen_line)
+    assert run_line[0] == model.PREFIX + tree.no_tree_line(problem)
+
+
+def test_seen_json_writes_the_miss_reason_to_stderr_and_null_to_stdout(repo):
+    argv = gate(RED, 1)
+    _invoke("tests", "run", "--", *argv)
+    result = _invoke("tests", "seen", "--json", "--", *argv)
+    assert result.exit_code == 1 and result.stdout.strip() == "null"
+    assert "does not prove the tree" in result.stderr
+
+
+def test_a_store_that_cannot_be_found_prints_one_line(repo, monkeypatch):
+    def refuse(top):
+        raise OSError(5, "no store")
+
+    monkeypatch.setattr(tree, "store_dir", refuse)
+    result = _invoke("tests", "run", "--", *gate(GREEN, 0))
+    assert result.exit_code == 0
+    lines = [line for line in result.stderr.splitlines() if "not recorded" in line]
+    assert len(lines) == 1, result.stderr

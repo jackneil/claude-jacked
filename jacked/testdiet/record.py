@@ -207,9 +207,20 @@ def _cause(meta: RunMeta) -> str:
     return "the tree after the gate is not known"
 
 
+#: The repair for a run with no test data, and the next action of each miss line.
+NO_DATA_REPAIR = "Put {junit} in the command, or give --junit GLOB."
+RUN_NEXT = "Run the gate with jacked tests run."
+
+
+def _then(metas: Sequence[RunMeta]) -> str:
+    """The end of a miss line: the no-data repair when a run has no data, then the next action."""
+    repair = f" {NO_DATA_REPAIR}" if any(m.verdict == "no-data" for m in metas) else ""
+    return f"{repair} {RUN_NEXT}"
+
+
 def _not_proved(meta: RunMeta) -> str:
     return (f"the newest run of this tree and this command is {meta.id}, and it does not prove the tree: "
-            f"{_cause(meta)}.")
+            f"{_cause(meta)}.{_then([meta])}")
 
 
 def _not_proved_any(deciders: list[RunMeta]) -> str:
@@ -222,7 +233,7 @@ def _not_proved_any(deciders: list[RunMeta]) -> str:
     shown = "; ".join(f"{m.id} ({_cause(m)})" for m in ordered[:DEFAULT_TOP])
     rest = len(ordered) - DEFAULT_TOP
     more = "" if rest <= 0 else f"; and {rest} more machine{'s' if rest > 1 else ''}"
-    return f"no machine's newest run of this tree and this command proves the tree: {shown}{more}."
+    return f"no machine's newest run of this tree and this command proves the tree: {shown}{more}.{_then(ordered)}"
 
 
 def seen_answer(store: Path, tree_value: TreeId, command_sha: str, *, folder: str,

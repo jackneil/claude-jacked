@@ -26,7 +26,8 @@ from jacked.testdiet import globs, history, machine, reports, tree
 from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.model import SCHEMA, RunMeta, TreeId, emit
 from jacked.testdiet.process import EXIT_INTERRUPTED, Signals, Stopped, start_and_wait
-from jacked.testdiet.record import INPUTS_UNAVAILABLE, LOCAL, check_options, guard, now_utc, repeat_notice
+from jacked.testdiet.record import (INPUTS_UNAVAILABLE, LOCAL, NO_DATA_REPAIR, check_options, guard, now_utc,
+                                    repeat_notice)
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,7 @@ logger = logging.getLogger(__name__)
 NOT_RECORDED = "The run is not recorded."
 NO_PROOF = "This run cannot prove a tree."
 NO_REPORT_SOURCE = ("the command has no {junit} argument, and the run has no --junit option. "
-                    "So the run has no report, and it cannot prove a tree. "
-                    "Put {junit} in the command, or give --junit GLOB.")
+                    "So the run has no report, and it cannot prove a tree. " + NO_DATA_REPAIR)
 
 
 def _load() -> float | None:
@@ -174,9 +174,7 @@ class _Run:
         if self.top is None:
             return False
         self.store = guard("find the store", lambda: tree.store_dir(self.top), None, then=NOT_RECORDED)
-        if self.store is None:
-            emit("the history store cannot be found. The gate runs, and the run is not recorded.")
-        return self.store is not None
+        return self.store is not None  # the guard line said why, and that the run is not recorded
 
     def prepare(self) -> None:
         """The steps before the gate: the tree, the command identity, the inputs and the reports."""
@@ -345,7 +343,7 @@ def _read_tree(cwd: Path, objects: Path | None, *, quiet: bool = False) -> TreeI
     """The tree identity. When there is none, one line says why, unless ``quiet``."""
     found, problem = tree.tree_state(cwd, objects=objects)
     if found is None and not quiet:
-        emit(f"{problem}, so this run cannot prove a tree. Run git status to see the cause.")
+        emit(tree.no_tree_line(problem))
     return found
 
 

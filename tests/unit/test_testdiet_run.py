@@ -847,7 +847,9 @@ def test_a_store_that_cannot_be_found_says_so(repo, monkeypatch, capsys):
     monkeypatch.setattr(tree, "store_dir", boom)
     assert run.run_gate(gate(3), cwd=repo) == 3
     err = capsys.readouterr().err
-    assert "the history store cannot be found" in err and "not in a git repository" not in err
+    # One line: the guard names the step and says that the run is not recorded (o-L4).
+    [line] = [line for line in err.splitlines() if "store" in line]
+    assert "'find the store' failed" in line and "not recorded" in line and "not in a git repository" not in err
 
 
 def test_the_notice_groups_records_by_machine_and_has_no_date_range(repo, capsys):
@@ -1120,7 +1122,7 @@ def test_a_work_tree_that_git_cannot_read_gives_one_line_with_the_git_detail(rep
         assert run.run_gate(junit_gate(0, GREEN), cwd=repo) == 0
     finally:
         locked.chmod(0o600)
-    lines = [line for line in capsys.readouterr().err.splitlines() if "cannot prove a tree" in line]
+    lines = [line for line in capsys.readouterr().err.splitlines() if "cannot prove this tree" in line]
     assert len(lines) == 1, lines
     assert "git add exited with" in lines[0] and "locked.txt" in lines[0]
     assert _last(repo).tree is None
@@ -1131,7 +1133,7 @@ def test_a_repository_with_no_commit_says_so_in_run(hermetic_git, capsys):
     bare_start.mkdir()
     subprocess.run(["git", "init", "-q", str(bare_start)], check=True, capture_output=True)
     assert run.run_gate(junit_gate(0, GREEN), cwd=bare_start) == 0
-    lines = [line for line in capsys.readouterr().err.splitlines() if "cannot prove a tree" in line]
+    lines = [line for line in capsys.readouterr().err.splitlines() if "cannot prove this tree" in line]
     assert len(lines) == 1 and "no commit" in lines[0]
 
 

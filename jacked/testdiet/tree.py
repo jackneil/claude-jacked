@@ -170,6 +170,11 @@ def git_detail(text: str) -> str:
     return chosen[:DETAIL_CHARS]
 
 
+def no_tree_line(problem: str) -> str:
+    """The one line of ``run`` and ``seen`` when the work tree has no identity: ``problem``, then what to do."""
+    return f"{problem}, so jacked tests cannot prove this tree. Run git status to see the cause."
+
+
 def output_lines(data: bytes) -> list[str]:
     """Return the lines of git output that are not empty, decoded as file names."""
     return [os.fsdecode(line) for line in data.splitlines() if line]

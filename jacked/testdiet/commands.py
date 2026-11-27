@@ -149,6 +149,9 @@ def seen_command(inputs, any_machine, as_json, command):
             data = dataclasses.asdict(found)
             data.pop("machine_id", None)
         click.echo(_json.dumps(data, indent=1, sort_keys=True))
+        if found is None and answer is not None:
+            # stdout stays valid JSON; the reason goes to stderr, as the other miss reasons do.
+            _model.emit(answer.why or "no passed run of this tree, this command and this machine.")
     elif found is not None:
         click.echo(_seen_line(found))
     elif answer is not None:
@@ -182,7 +185,7 @@ def _seen_answer(command: list[str], inputs, any_machine: bool):
                         "Give --any-machine to accept a run of any machine.")
             return None
         if current is None:
-            _model.emit(f"{problem_tree}, so seen cannot prove a tree.")
+            _model.emit(_tree.no_tree_line(problem_tree))
             return None
         return _record.seen_answer(_tree.store_dir(top), current,
                                    _tree.command_sha(command, folder=folder), folder=folder,
