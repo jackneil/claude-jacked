@@ -133,10 +133,10 @@ def _last(repo: Path):
     return runs[0]
 
 
-def _seen(repo: Path, argv, *, inputs=(), any_machine=False, machine_id="unset"):
+def _seen(repo: Path, argv, *, inputs=(), any_machine=False, machine_id="unset", folder="."):
     mid = machine.machine_id() if machine_id == "unset" else machine_id
-    return record.seen(tree.store_dir(repo), tree.tree_id(repo), tree.command_sha(argv),
-                       inputs_sha=tree.inputs_fingerprint(repo, inputs), machine_id=mid,
+    return record.seen(tree.store_dir(repo), tree.tree_id(repo), tree.command_sha(argv, folder=folder),
+                       folder=folder, inputs_sha=tree.inputs_fingerprint(repo, inputs), machine_id=mid,
                        any_machine=any_machine)
 
 
@@ -165,7 +165,8 @@ def test_run_records_counts_failing_ids_the_tree_and_the_command_sha(repo):
     assert meta.failing_sig is not None
     assert meta.tree == tree.tree_id(repo) and meta.tree.clean is True
     assert meta.tree_changed is False
-    assert meta.command_sha == tree.command_sha(argv)
+    assert meta.command_sha == tree.command_sha(argv, folder=".")
+    assert (meta.folder, meta.schema) == (".", 1)
     assert (meta.kind, meta.label, meta.runner, meta.machine) == ("full", "ci-gate", "pytest", "local")
     assert meta.machine_id == machine.machine_id()
     assert meta.wall_seconds is not None and meta.wall_seconds > 0
@@ -184,7 +185,7 @@ def test_the_store_holds_the_sha_of_the_command_and_not_its_text(repo):
             raw = gzip.decompress(raw)
         assert marker.encode() not in raw
         assert b"import os, shutil" not in raw
-    assert _last(repo).command_sha == tree.command_sha(argv)
+    assert _last(repo).command_sha == tree.command_sha(argv, folder=".")
 
 
 def test_run_puts_a_report_path_in_place_of_the_placeholder(repo, side):
@@ -344,7 +345,7 @@ def test_a_cmd_shim_by_its_bare_name_starts_on_windows(repo, tmp_path, monkeypat
     monkeypatch.setenv("PATH", str(shims) + os.pathsep + os.environ.get("PATH", ""))
     argv = ["jackedshim", "--flag"]
     assert run.run_gate(argv, cwd=repo) == 7
-    assert _last(repo).command_sha == tree.command_sha(argv)
+    assert _last(repo).command_sha == tree.command_sha(argv, folder=".")
 
 
 @POSIX
@@ -441,7 +442,7 @@ def test_a_gate_that_writes_a_file_into_the_tree_is_named_and_never_seen(repo, c
     assert "made-by-gate.txt" in capsys.readouterr().err
     meta = _last(repo)
     assert meta.tree_changed is True and meta.verdict == "passed"
-    found = record.seen(tree.store_dir(repo), meta.tree, meta.command_sha, inputs_sha=None,
+    found = record.seen(tree.store_dir(repo), meta.tree, meta.command_sha, folder=".", inputs_sha=None,
                         machine_id=machine.machine_id())
     assert found is None
     (repo / "made-by-gate.txt").unlink()
@@ -464,6 +465,10 @@ _OTHER_TREE = TreeId(commit="c" * 40, tree="d" * 40, clean=True)
     ("inputs_sha", "unavailable"),
     ("machine_id", "f" * 32),
     ("machine_id", None),
+    ("folder", "sub"),
+    ("folder", None),
+    ("schema", None),
+    ("schema", 2),
 ])
 def test_seen_rejects_a_run_that_differs_in_one_field(repo, tmp_path, field, value):
     argv = junit_gate(0, GREEN)
@@ -472,7 +477,7 @@ def test_seen_rejects_a_run_that_differs_in_one_field(repo, tmp_path, field, val
     control, twin = tmp_path / "control", tmp_path / "twin"
     history.write_run(control, real, None)
     history.write_run(twin, dataclasses.replace(real, **{field: value}), None)
-    args = dict(inputs_sha=real.inputs_sha, machine_id=machine.machine_id())
+    args = dict(folder=".", inputs_sha=real.inputs_sha, machine_id=machine.machine_id())
     current = tree.tree_id(repo)
     assert record.seen(control, current, real.command_sha, **args) is not None
     assert record.seen(twin, current, real.command_sha, **args) is None
@@ -509,7 +514,7 @@ def test_seen_is_false_for_a_green_record_that_was_not_wrapped(repo):
     assert meta.source == "record" and meta.verdict == "passed"
     assert meta.tree is not None and meta.tree.tree == tree.tree_id(repo).tree
     stored = _last(repo)
-    found = record.seen(tree.store_dir(repo), tree.tree_id(repo), "0" * 64, inputs_sha=None,
+    found = record.seen(tree.store_dir(repo), tree.tree_id(repo), "0" * 64, folder=".", inputs_sha=None,
                         machine_id=machine.machine_id(), any_machine=True)
     assert stored.id == meta.id and found is None
 
@@ -750,7 +755,7 @@ def test_a_failed_input_hash_is_unavailable_and_never_seen(repo, monkeypatch):
     meta = _last(repo)
     assert meta.verdict == "passed" and meta.inputs_sha == record.INPUTS_UNAVAILABLE
     store, current = tree.store_dir(repo), tree.tree_id(repo)
-    args = dict(machine_id=machine.machine_id())
+    args = dict(folder=".", machine_id=machine.machine_id())
     # Neither the sentinel nor "no --input" matches it.
     assert record.seen(store, current, meta.command_sha, inputs_sha=record.INPUTS_UNAVAILABLE, **args) is None
     assert record.seen(store, current, meta.command_sha, inputs_sha=None, **args) is None
@@ -930,4 +935,4 @@ def test_a_test_id_with_a_line_break_prints_on_one_line_in_the_notice_and_in_see
     shown = dataclasses.replace(meta, started="2026-11-21\nfake line", counts={"passed\nx": 1})
     line = record.seen_line(shown)
     assert "\n" not in line
-    assert line == f"{now} started 2026-11-21\\nfake line, wall 100.0 s, passed\\nx 1"
+    assert line == f"{now} started 2026-11-21\\nfake line, folder ., wall 100.0 s, passed\\nx 1"

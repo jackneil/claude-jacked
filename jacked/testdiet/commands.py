@@ -141,10 +141,13 @@ def seen_command(inputs, any_machine, as_json, command):
         raise click.UsageError("give the gate command after --")
     found = None
     try:
-        top = _record.work_tree_top(Path(_os.getcwd()))
+        here = Path(_os.getcwd())
+        top = _record.work_tree_top(here)
+        folder = _tree.work_folder(here)
         current = _tree.tree_id(top)
         if current is not None:
-            found = _record.seen(_tree.store_dir(top), current, _tree.command_sha(list(command)),
+            found = _record.seen(_tree.store_dir(top), current,
+                                 _tree.command_sha(list(command), folder=folder), folder=folder,
                                  inputs_sha=_tree.inputs_fingerprint(top, inputs),
                                  machine_id=_machine.machine_id(), any_machine=any_machine)
         else:

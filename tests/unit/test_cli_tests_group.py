@@ -91,12 +91,37 @@ def test_cli_seen_exits_0_after_a_green_run_and_1_before_it(repo):
     assert json.loads(_invoke("tests", "seen", "--json", "--", *gate(RED, 0)).stdout) is None
 
 
-def test_cli_seen_from_a_sub_folder_uses_the_top_of_the_work_tree_for_inputs(repo, monkeypatch):
-    (repo / "data.bin").write_bytes(b"x")
+def test_cli_seen_matches_only_the_folder_where_the_gate_ran(repo, monkeypatch):
     argv = gate(GREEN, 0)
-    assert _invoke("tests", "run", "--input", "data.bin", "--", *argv).exit_code == 0
+    assert _invoke("tests", "run", "--", *argv).exit_code == 0
     monkeypatch.chdir(repo / "sub")
+    assert _invoke("tests", "seen", "--", *argv).exit_code == 1
+    assert _invoke("tests", "run", "--", *argv).exit_code == 0
+    hit = _invoke("tests", "seen", "--", *argv)
+    assert hit.exit_code == 0 and "folder sub" in hit.stdout
+    monkeypatch.chdir(repo)
+    hit = _invoke("tests", "seen", "--", *argv)
+    assert hit.exit_code == 0 and "folder ." in hit.stdout
+    (repo / "data.bin").write_bytes(b"x")
+    monkeypatch.chdir(repo / "sub")
+    assert _invoke("tests", "run", "--input", "data.bin", "--", *argv).exit_code == 0
     assert _invoke("tests", "seen", "--input", "data.bin", "--", *argv).exit_code == 0
+    monkeypatch.chdir(repo)
+    assert _invoke("tests", "seen", "--input", "data.bin", "--", *argv).exit_code == 1
+
+
+_SUB_ONLY = ("import os, shutil, sys; ok = os.path.basename(os.getcwd()) == 'sub'; "
+             "shutil.copyfile(sys.argv[1] if ok else sys.argv[2], sys.argv[3]); sys.exit(0 if ok else 1)")
+
+
+def test_cli_seen_says_no_at_the_top_for_a_gate_that_passed_only_in_a_sub_folder(repo, monkeypatch):
+    argv = [sys.executable, "-c", _SUB_ONLY, str(GREEN), str(RED), "{junit}"]
+    monkeypatch.chdir(repo / "sub")
+    assert _invoke("tests", "run", "--", *argv).exit_code == 0
+    assert _invoke("tests", "seen", "--", *argv).exit_code == 0
+    monkeypatch.chdir(repo)
+    assert _invoke("tests", "seen", "--", *argv).exit_code == 1
+    assert _invoke("tests", "run", "--", *argv).exit_code == 1
 
 
 def test_cli_record_writes_a_record_and_prints_its_id(repo):

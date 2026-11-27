@@ -357,15 +357,32 @@ def on_default_branch(cwd: Path, tree: TreeId) -> bool | None:
     return None
 
 
-def command_sha(argv: Sequence[str]) -> str:
-    """Return the SHA-256 of the arguments as the caller typed them, joined by a NUL.
+def command_sha(argv: Sequence[str], *, folder: str) -> str:
+    """Return the SHA-256 of the gate folder and the arguments as the caller typed them.
 
-    The join is not ambiguous, because an argument of a real command line
-    cannot hold a NUL. The text is UTF-8 with "surrogatepass", so a lone
-    surrogate (from a Windows command line) gives a hash and never an error.
+    The text is ``folder\\0<folder>\\0argv\\0`` and then the arguments
+    joined by a NUL. The join is not ambiguous, because an argument of a
+    real command line cannot hold a NUL. So the same command in a different
+    folder has a different identity. The text is UTF-8 with
+    "surrogatepass", so a lone surrogate (from a Windows command line)
+    gives a hash and never an error.
 
-    >>> command_sha(["a b"]) == command_sha(["a", "b"])
+    >>> command_sha(["a b"], folder=".") == command_sha(["a", "b"], folder=".")
+    False
+    >>> command_sha(["pytest"], folder=".") == command_sha(["pytest"], folder="sub")
     False
     """
-    text = "\0".join(argv)
+    text = "folder\0" + folder + "\0argv\0" + "\0".join(argv)
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def work_folder(cwd: Path) -> str:
+    """Return the folder ``cwd`` relative to the top of its work tree, as a POSIX path.
+
+    The top itself is ".". Outside a work tree this raises ``TreeError``.
+    """
+    code, out = git(Path(cwd), "rev-parse", "--show-prefix")
+    if code != 0:
+        raise TreeError("the folder is not in the work tree of a git repository")
+    prefix = os.fsdecode(out[:-1] if out.endswith(b"\n") else out).rstrip("/")
+    return prefix or "."

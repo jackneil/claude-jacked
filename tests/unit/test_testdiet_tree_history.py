@@ -776,14 +776,45 @@ def test_the_failing_signature_differs_when_the_failure_type_differs():
 
 
 def test_the_command_sha_of_a_lone_surrogate_is_a_hash_not_an_error():
-    assert re.fullmatch(r"[0-9a-f]{64}", tree.command_sha(["\ud800"]))
-    assert tree.command_sha(["\ud800"]) != tree.command_sha(["\ud801"])
+    assert re.fullmatch(r"[0-9a-f]{64}", tree.command_sha(["\ud800"], folder="."))
+    assert tree.command_sha(["\ud800"], folder=".") != tree.command_sha(["\ud801"], folder=".")
 
 
 def test_the_command_sha_differs_when_one_argument_is_split_in_two():
-    assert tree.command_sha(["a b"]) != tree.command_sha(["a", "b"])
-    assert tree.command_sha(["pytest", "-q"]) == tree.command_sha(("pytest", "-q"))
-    assert re.fullmatch(r"[0-9a-f]{64}", tree.command_sha(["x"]))
+    assert tree.command_sha(["a b"], folder=".") != tree.command_sha(["a", "b"], folder=".")
+    assert tree.command_sha(["pytest", "-q"], folder=".") == tree.command_sha(("pytest", "-q"), folder=".")
+    assert re.fullmatch(r"[0-9a-f]{64}", tree.command_sha(["x"], folder="."))
+
+
+def test_the_command_sha_holds_the_folder_and_the_join_cannot_be_moved():
+    assert tree.command_sha(["pytest"], folder=".") != tree.command_sha(["pytest"], folder="sub")
+    # The folder and the argv are in separate domains: no split of one text gives the other.
+    assert tree.command_sha(["b", "c"], folder="a") != tree.command_sha(["c"], folder="a\0b")
+    assert tree.command_sha([], folder="a") != tree.command_sha(["a"], folder="")
+
+
+def test_the_work_folder_is_relative_to_the_top_and_dot_at_the_top(repo):
+    (repo / "sub" / "deep").mkdir(parents=True)
+    assert tree.work_folder(repo) == "."
+    assert tree.work_folder(repo / "sub") == "sub"
+    assert tree.work_folder(repo / "sub" / "deep") == "sub/deep"
+
+
+def test_a_written_record_has_the_schema_and_a_bad_schema_reads_as_none(tmp_path):
+    meta = _meta(history.new_run_id(), folder="sub", schema=1)
+    history.write_run(tmp_path, meta, None)
+    path = tmp_path / "runs" / f"{meta.id}.meta.json"
+    raw = json.loads(path.read_bytes())
+    assert (raw["schema"], raw["folder"]) == (1, "sub")
+    assert list(history.iter_runs(tmp_path)) == [meta]
+    for bad in ("1", True, 1.5, None):
+        raw["schema"] = bad
+        path.write_bytes(json.dumps(raw).encode("utf-8"))
+        [back] = history.iter_runs(tmp_path)
+        assert back.schema is None and back.folder == "sub"
+    del raw["schema"]
+    path.write_bytes(json.dumps(raw).encode("utf-8"))
+    assert next(history.iter_runs(tmp_path)).schema is None
 
 
 # --------------------------------------------------------------------------- default branch

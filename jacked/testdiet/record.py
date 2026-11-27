@@ -19,6 +19,7 @@ from jacked.testdiet import history, junit, tree
 from jacked.testdiet import machine as identity
 from jacked.testdiet.model import (
     LABEL_RE,
+    SCHEMA,
     RUNNERS,
     STATES,
     RunData,
@@ -142,7 +143,7 @@ def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, la
         on_default_branch=tree.on_default_branch(top, tree_value) if tree_value else None,
         counts=_counts(data), seconds_reported=data.seconds_reported, load_start=None,
         load_end=None, child_cpu_seconds=None, failing=_failing(data), flaky=_flaky(data),
-        failing_sig=history.failing_signature(data.tests),
+        failing_sig=history.failing_signature(data.tests), folder=None, schema=SCHEMA,
     )
     history.write_run(store, meta, data)
     return meta
@@ -175,27 +176,28 @@ def _commit_tree(top: Path, commit: str) -> TreeId:
     return TreeId(commit=found[0], tree=found[1], clean=True)
 
 
-def seen(store: Path, tree_value: TreeId, command_sha: str, *, inputs_sha: str | None,
+def seen(store: Path, tree_value: TreeId, command_sha: str, *, folder: str, inputs_sha: str | None,
          machine_id: str | None, any_machine: bool = False) -> RunMeta | None:
     """Return the newest run that proves this tree passed this command on this machine, or None.
 
     A run proves it when all of these are true: its source is "run"; its
-    verdict is "passed"; ``tree_changed`` is False (not empty); the tree
-    hash, the command SHA and the inputs fingerprint are equal (a
-    fingerprint that is "unavailable" never matches); and the
-    machine identity is equal and not empty. ``any_machine`` removes the
-    last condition. The commit is not compared, so a second commit with the
-    same content is the same tree.
+    schema is ``SCHEMA``; its verdict is "passed"; ``tree_changed`` is False
+    (not empty); the tree hash, the command SHA, the gate folder and the
+    inputs fingerprint are equal (a fingerprint that is "unavailable" never
+    matches); and the machine identity is equal and not empty.
+    ``any_machine`` removes the last condition. The commit is not
+    compared, so a second commit with the same content is the same tree.
     """
     if tree_value is None or not command_sha or inputs_sha == INPUTS_UNAVAILABLE:
         return None
     if not any_machine and not machine_id:
         return None
     for meta in history.iter_runs(store):
-        if (meta.source == "run" and meta.verdict == "passed" and meta.tree_changed is False
+        if (meta.source == "run" and meta.schema == SCHEMA and meta.verdict == "passed"
+                and meta.tree_changed is False
                 and meta.tree is not None and meta.tree.tree == tree_value.tree
-                and meta.command_sha == command_sha and meta.inputs_sha == inputs_sha
-                and meta.inputs_sha != INPUTS_UNAVAILABLE
+                and meta.command_sha == command_sha and meta.folder == folder
+                and meta.inputs_sha == inputs_sha
                 and (any_machine or meta.machine_id == machine_id)):
             return meta
     return None
@@ -250,4 +252,5 @@ def seen_line(meta: RunMeta) -> str:
     """
     counts = ", ".join(f"{one_line(k)} {v}" for k, v in (meta.counts or {}).items()) or "no counts"
     wall = "unknown" if meta.wall_seconds is None else f"{meta.wall_seconds} s"
-    return clean_text(f"{meta.id} started {one_line(meta.started)}, wall {wall}, {counts}")
+    return clean_text(f"{meta.id} started {one_line(meta.started)}, folder {one_line(meta.folder)}, "
+                      f"wall {wall}, {counts}")

@@ -18,6 +18,8 @@ LABEL_RE = re.compile(r"[A-Za-z0-9._-]+")
 MACHINE_ID_BYTES = 16
 #: The pattern of a machine identity: ``2 * MACHINE_ID_BYTES`` lowercase hex characters.
 MACHINE_ID_RE = re.compile(rf"[0-9a-f]{{{2 * MACHINE_ID_BYTES}}}")
+#: The version of the record format. ``seen`` proves a tree only with a record of this version.
+SCHEMA = 1
 #: The text of a machine whose record holds no valid label.
 NO_LABEL = "(no label)"
 
@@ -130,9 +132,12 @@ class RunMeta:
     A value that the recorder did not get is None (or an empty tuple for
     ``failing`` and ``flaky``). It is never zero. ``source`` is "run" or
     "record". ``verdict`` is "passed", "failed", "conflict", "no-data" or
-    "unknown". ``command_sha`` is the SHA-256 of the typed command, never
-    the command text. ``machine`` is None when a stored record holds no
-    valid label.
+    "unknown". ``command_sha`` is the SHA-256 of the gate folder and the
+    typed command, never the command text. ``folder`` is the work-tree
+    relative POSIX path of the folder that the gate ran in ("." at the top),
+    or None for a record of ``record``. ``schema`` is the version of the
+    record format (``SCHEMA``), or None for a record with no version.
+    ``machine`` is None when a stored record holds no valid label.
     """
 
     id: str
@@ -159,6 +164,8 @@ class RunMeta:
     failing: tuple[str, ...]
     flaky: tuple[str, ...]
     failing_sig: str | None
+    folder: str | None = None
+    schema: int | None = None
 
 
 class JUnitError(ValueError):

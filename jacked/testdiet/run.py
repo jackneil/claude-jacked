@@ -22,7 +22,7 @@ from pathlib import Path
 
 from jacked.testdiet import history, machine, reports, tree
 from jacked.testdiet.cleanup import remove_tree_quietly
-from jacked.testdiet.model import RunMeta, TreeId, emit
+from jacked.testdiet.model import SCHEMA, RunMeta, TreeId, emit
 from jacked.testdiet.process import Signals, Stopped, start_and_wait
 from jacked.testdiet.record import (
     _LOCAL,
@@ -112,7 +112,9 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
     report_dir: Path | None = None
     try:
         before = _guard("read the tree", lambda: tree.tree_id(cwd, objects=objects), None)
-        sha = tree.command_sha(argv)
+        folder = _guard("find the gate folder", lambda: tree.work_folder(cwd), None)
+        # No folder, no command identity: such a run can never prove a tree.
+        sha = tree.command_sha(argv, folder=folder) if folder is not None else None
         inputs_sha = _guard("hash the input files", lambda: tree.inputs_fingerprint(top, inputs),
                             INPUTS_UNAVAILABLE if inputs else None)
         report_dir, report, child_argv = _placeholder(argv)
@@ -149,6 +151,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                                    if cpu_start is not None and cpu_end is not None else None),
                 failing=_failing(data), flaky=_flaky(data),
                 failing_sig=history.failing_signature(data.tests) if data else None,
+                folder=folder, schema=SCHEMA,
             )
 
         def write() -> RunMeta:

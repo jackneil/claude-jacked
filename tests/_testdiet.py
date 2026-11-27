@@ -127,7 +127,8 @@ def make_case(test_id: str, file: str | None, seconds: float | None, state: str 
 def store_run(store: Path, when: str, *, exit_code: int | None, tests=None, kind: str | None = "full",
               machine: str = "local", machine_id: str | None = LOCAL_ID, tree: str | None = TREE_1,
               commit: str = COMMIT_1, command_sha: str | None = COMMAND, source: str = "run",
-              wall: float | None = 100.0, on_default_branch: bool | None = None) -> str:
+              wall: float | None = 100.0, on_default_branch: bool | None = None,
+              folder: str | None = ".") -> str:
     """Write one run into ``store`` and return its run ID.
 
     ``when`` is the UTC time of the run ID, as ``YYYYMMDDTHHMMSS``. ``tests``
@@ -136,7 +137,7 @@ def store_run(store: Path, when: str, *, exit_code: int | None, tests=None, kind
     from datetime import datetime, timezone
 
     from jacked.testdiet import history
-    from jacked.testdiet.model import STATES, RunData, RunMeta, TreeId
+    from jacked.testdiet.model import SCHEMA, STATES, RunData, RunMeta, TreeId
 
     moment = datetime.strptime(when, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
     data = None if tests is None else RunData(runner="pytest", tests=tuple(tests), seconds_reported=None)
@@ -152,7 +153,7 @@ def store_run(store: Path, when: str, *, exit_code: int | None, tests=None, kind
         seconds_reported=None, load_start=None, load_end=None, child_cpu_seconds=None,
         failing=tuple(sorted(c.id for c in cases if c.state in ("failed", "error"))),
         flaky=tuple(sorted(c.id for c in cases if c.state == "flaky")),
-        failing_sig=history.failing_signature(cases),
+        failing_sig=history.failing_signature(cases), folder=folder, schema=SCHEMA,
     )
     history.write_run(store, meta, data)
     return meta.id

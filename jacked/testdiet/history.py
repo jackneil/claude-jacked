@@ -161,10 +161,10 @@ def _meta_from(run_id: str, raw) -> RunMeta:
 
     A field that this version does not know is ignored. A field that the
     file does not hold is None (an empty tuple for ``failing`` and
-    ``flaky``). A machine label that does not match ``LABEL_RE`` and a
-    machine identity that is not 32 lowercase hex characters read as None,
-    and the record is still read. Another field of the wrong type makes the
-    file damaged.
+    ``flaky``). A machine label that does not match ``LABEL_RE``, a
+    machine identity that does not match ``MACHINE_ID_RE`` and a schema
+    that is not an integer read as None, and the record is still read.
+    Another field of the wrong type makes the file damaged.
     """
     if not isinstance(raw, dict):
         raise DamagedRecordError("the meta file is not an object")
@@ -183,6 +183,9 @@ def _meta_from(run_id: str, raw) -> RunMeta:
             value = value if isinstance(value, str) and LABEL_RE.fullmatch(value) else None
         elif name == "machine_id":
             value = value if isinstance(value, str) and MACHINE_ID_RE.fullmatch(value) else None
+        elif name == "schema":
+            # A version that is not an integer reads as no version: seen never uses the record.
+            value = value if _is(value, int) else None
         elif value is None:
             pass
         elif name == "tree":
