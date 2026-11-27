@@ -21,12 +21,15 @@ from pathlib import Path
 from jacked.testdiet import history as _history
 from jacked.testdiet.model import (
     DEFAULT_TOP,
+    NO_START,
+    NO_VERDICT,
     VERDICTS,
     CaseResult,
     RunMeta,
     clean_text,
     label_text,
     one_line,
+    or_text,
 )
 
 
@@ -336,8 +339,9 @@ def _hidden(count: int, what: str) -> list[str]:
 def render_profile(result: dict) -> str:
     """The text output of ``profile``. Each table shows the rows that ``hidden_rows`` does not hide."""
     lines = list(result["notes"])
-    lines.append(f"run: {one_line(result['run'])} started {one_line(result['started'])}, "
-                 f"kind {one_line(result['kind']) or 'not given'}, verdict {one_line(result['verdict'])}")
+    lines.append(f"run: {one_line(result['run'])} started {or_text(result['started'], NO_START)}, "
+                 f"kind {one_line(result['kind']) or 'not given'}, "
+                 f"verdict {or_text(result['verdict'], NO_VERDICT)}")
     lines.append(f"test seconds: {_time(result['total_test_seconds'])}")
     if result["tests_without_seconds"]:
         lines.append(f"tests with no seconds in the report: {_num(result['tests_without_seconds'])}")
@@ -401,7 +405,8 @@ def render_history(result: dict) -> str:
         trees = recorded_count(s["trees"], s["trees_unknown"], s["runs"])
         branch = recorded_count(s["on_default_branch"], s["on_default_branch_unknown"], s["runs"])
         lines.append(f"  {_num(s['runs'])} runs, trees: {trees}, on the default branch: {branch}, "
-                     f"first {one_line(s['first'])}, last {one_line(s['last'])}, set {s['sig'][:12]}:")
+                     f"first {or_text(s['first'], NO_START)}, last {or_text(s['last'], NO_START)}, "
+                     f"set {s['sig'][:12]}:")
         lines += [f"    {one_line(test_id)}" for test_id in s["ids"]]
     if not result["failing_sets"]:
         lines.append("  none")

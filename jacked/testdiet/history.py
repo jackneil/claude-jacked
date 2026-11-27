@@ -64,7 +64,7 @@ _TUPLE_FIELDS = ("failing", "flaky")
 _INT_FIELDS = ("exit_code",)
 _NUMBER_FIELDS = ("wall_seconds", "seconds_reported", "load_start", "load_end", "child_cpu_seconds",
                   "test_seconds")
-_BOOL_FIELDS = ("tree_changed", "on_default_branch", "interrupted")
+_BOOL_FIELDS = ("tree_changed", "on_default_branch", "interrupted", "inputs_changed")
 
 
 class DamagedRecordError(ValueError):
@@ -193,13 +193,15 @@ def verdict_of(exit_code: int | None, data: RunData | None) -> str:
     "unknown": no exit code. "failed": an exit code that is not 0.
     "no-data": exit code 0 and no report, or a report in which no test
     ran (no test, or only skipped tests). "conflict": exit code 0 and a
-    failed or an error test. "passed": exit code 0, no failed and no error
+    failed or an error test, or a failure that only a suite counts. "passed": exit code 0, no failed and no error
     test, and at least one test that passed (a flaky test passed too).
     """
     if exit_code is None:
         return "unknown"
     if exit_code != 0:
         return "failed"
+    if data is not None and data.suite_failures:
+        return "conflict"  # a failure that only a suite counts is still a failure
     if data is None or not data.tests:
         return "no-data"
     if any(case.state in FAILING_STATES for case in data.tests):
@@ -221,9 +223,10 @@ def write_run(store: Path, meta: RunMeta, data: RunData | None) -> None:
                    "tests": [dataclasses.asdict(case) for case in data.tests]}
         # ASCII JSON: a file name that is not UTF-8 (a lone surrogate) is kept as an escape.
         raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
-        atomic_write_bytes(runs / f"{run_id}{TESTS_SUFFIX}", gzip.compress(raw, mtime=0))
+        atomic_write_bytes(runs / f"{run_id}{TESTS_SUFFIX}", gzip.compress(raw, mtime=0), fsync=True)
     text = json.dumps(dataclasses.asdict(meta), ensure_ascii=True, indent=1, sort_keys=True)
-    atomic_write_bytes(runs / f"{run_id}{META_SUFFIX}", (text + "\n").encode("ascii"))
+    # fsync: after a power loss, a meta file (the mark of a complete run) is never empty.
+    atomic_write_bytes(runs / f"{run_id}{META_SUFFIX}", (text + "\n").encode("ascii"), fsync=True)
 
 
 def _is(value, kinds) -> bool:
@@ -315,6 +318,9 @@ def iter_runs(store: Path) -> Iterator[RunMeta]:
         names = [p.name for p in runs.iterdir()]
     except FileNotFoundError:
         return
+    except OSError as exc:
+        emit(f"the history folder {RUNS} cannot be read ({error_text(exc)}). No run is read.")
+        return
     ids = sorted((n[: -len(META_SUFFIX)] for n in names if n.endswith(META_SUFFIX)), reverse=True)
     for run_id in ids:
         if not RUN_ID_RE.fullmatch(run_id):
@@ -344,11 +350,32 @@ def load_tests(store: Path, run_id: str) -> RunData | None:
         _warn(name, exc)
         return None
     try:
-        tests = tuple(CaseResult(**{k: case.get(k) for k in _CASE_FIELDS}) for case in raw["tests"])
-        return RunData(runner=raw["runner"], tests=tests, seconds_reported=raw.get("seconds_reported"))
-    except (KeyError, TypeError, AttributeError) as exc:
+        tests = tuple(_case_from(case) for case in raw["tests"])
+        seconds = raw.get("seconds_reported")
+        if not isinstance(raw["runner"], str) or not (seconds is None or _is_number(seconds)):
+            raise DamagedRecordError("the runner or the reported seconds have the wrong type")
+        return RunData(runner=raw["runner"], tests=tests, seconds_reported=seconds)
+    except (KeyError, TypeError, AttributeError, DamagedRecordError) as exc:
         _warn(name, exc)
         return None
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _case_from(case: dict) -> CaseResult:
+    """One test of a tests file. A field of the wrong type makes the file damaged."""
+    values = {k: case.get(k) for k in _CASE_FIELDS}
+    ok = (isinstance(values["id"], str)
+          and (values["file"] is None or isinstance(values["file"], str))
+          and (values["seconds"] is None or _is_number(values["seconds"]))
+          and values["state"] in STATES
+          and (values["failure_type"] is None or isinstance(values["failure_type"], str))
+          and isinstance(values["attempts"], int) and not isinstance(values["attempts"], bool))
+    if not ok:
+        raise DamagedRecordError("a test has a field of the wrong type")
+    return CaseResult(**values)
 
 
 def run_ids(store: Path) -> set[str]:
@@ -361,10 +388,40 @@ def run_ids(store: Path) -> set[str]:
             if name.endswith(META_SUFFIX) and RUN_ID_RE.fullmatch(name[: -len(META_SUFFIX)])}
 
 
+#: The temporary file of an atomic write: ".<run file>.<random>.tmp".
+_TEMP_RE = re.compile(rf"\.(?P<id>{RUN_ID_RE.pattern})(?:{re.escape(META_SUFFIX)}|{re.escape(TESTS_SUFFIX)})"
+                      r"\.[A-Za-z0-9_]+\.tmp")
+
+
+def _prune_temp_files(runs: Path, names: set[str], orphan_limit: datetime, dry_run: bool) -> None:
+    """Delete each temporary file of a write that stopped more than ``ORPHAN_AGE`` ago. One line gives the count.
+
+    Such a file is never a run: a write that a hard stop or a power loss cut.
+    A young one can still be in progress, so it stays.
+    """
+    stale = sorted(name for name in names if (match := _TEMP_RE.fullmatch(name))
+                   and id_time(match.group("id")) < orphan_limit)
+    gone = 0
+    for name in stale:
+        if dry_run:
+            gone += 1
+            continue
+        try:
+            (runs / name).unlink(missing_ok=True)
+            gone += 1
+        except OSError as exc:
+            emit(f"cannot delete the temporary file {name} ({error_text(exc)})")
+    if gone:
+        what = "1 temporary file" if gone == 1 else f"{gone} temporary files"
+        emit(f"{'would delete' if dry_run else 'deleted'} {what} of a write that stopped.")
+
+
 def prune(store: Path, before: date, *, now: datetime | None = None, dry_run: bool = False) -> list[str]:
     """Delete each run whose UTC date is before ``before``. Return the deleted run IDs, sorted.
 
     With ``dry_run``, delete nothing, and return the IDs that a prune deletes.
+    A temporary file of a write that stopped more than ``ORPHAN_AGE`` ago
+    also goes (``_prune_temp_files``), at any date.
 
     For a complete run, the meta file goes first, so the run is gone in one
     step, and then its tests file. A tests file with no meta file is a write
@@ -383,6 +440,7 @@ def prune(store: Path, before: date, *, now: datetime | None = None, dry_run: bo
         return []
     limit = f"{before:%Y%m%d}"
     orphan_limit = (now or datetime.now(timezone.utc)) - ORPHAN_AGE
+    _prune_temp_files(runs, names, orphan_limit, dry_run)
     found: dict[str, set[str]] = {}
     for name in names:
         for suffix in (META_SUFFIX, TESTS_SUFFIX):

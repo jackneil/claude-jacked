@@ -1265,3 +1265,21 @@ def test_the_repeat_notice_shows_at_most_default_top_rows_and_counts_the_rest(tm
     assert ("  5 more earlier records are not shown. jacked tests history --machine LABEL shows the "
             "failing sets of each machine." in lines)
     assert lines[-1].startswith('see "A red gate"')
+
+
+def test_a_gate_that_changes_an_input_file_cannot_prove_a_tree(repo, capsys):
+    (repo / ".gitignore").write_bytes(b"data/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "ignore data")
+    (repo / "data").mkdir()
+    (repo / "data" / "in.txt").write_bytes(b"before")
+    argv = [*junit_gate(0, GREEN), "write", str(repo / "data" / "in.txt")]
+    assert run.run_gate(argv, cwd=repo, inputs=["data/*.txt"]) == 0
+    lines = [line for line in capsys.readouterr().err.splitlines() if "--input" in line]
+    assert len(lines) == 1 and "cannot prove a tree" in lines[0]
+    meta = _last(repo)
+    assert meta.inputs_changed is True and meta.verdict == "passed"
+    assert record.seen_answer(tree.store_dir(repo), tree.tree_id(repo), meta.command_sha, folder=".",
+                              inputs_sha=meta.inputs_sha, machine_id=meta.machine_id).hit is None
+    run.run_gate(junit_gate(0, GREEN), cwd=repo, inputs=["data/*.txt"])
+    assert _last(repo).inputs_changed is False

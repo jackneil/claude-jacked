@@ -134,7 +134,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
         cpu_end = guard("read the processor time", _child_cpu, None)
         load_end = _load()
         # What the post-run steps know. A stop keeps the values that are read.
-        known: dict = {"data": None, "changed": None, "written": False, "meta": None}
+        known: dict = {"data": None, "changed": None, "written": False, "meta": None, "inputs": None}
 
         def build() -> RunMeta:
             data = known["data"]
@@ -153,7 +153,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                 failing=history.failing_of(data), flaky=history.flaky_of(data),
                 failing_sig=history.failing_signature(data.tests) if data else None,
                 folder=folder, schema=SCHEMA, test_seconds=history.sum_test_seconds(data),
-                interrupted=signals.interrupted,
+                interrupted=signals.interrupted, inputs_changed=known["inputs"],
             )
 
         def write() -> RunMeta:
@@ -180,6 +180,8 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                     report_dir = None
                 after = guard("read the tree", lambda: _read_tree(cwd, objects, quiet=before is None), None)
                 known["changed"] = changed = _tree_changed(before, after)
+                known["inputs"] = guard("hash the input files again",
+                                        lambda: _inputs_changed(top, inputs, inputs_sha), None)
                 if changed:
                     guard("list the changed paths",
                            lambda: _print_changes(cwd, before, after, objects), None)
@@ -209,7 +211,10 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
         if verdict == "conflict":
             failing = len(history.failing_of(data))
             tests = "test" if failing == 1 else "tests"
-            emit(f"the gate returned 0, but the report holds failures ({failing} failed or error {tests}). "
+            suite = data.suite_failures if data is not None else 0
+            at_suite = f", and {suite} that only a suite counts" if suite else ""
+            emit(f"the gate returned 0, but the report holds failures ({failing} failed or error {tests}"
+                 f"{at_suite}). "
                  + ("--strict makes the exit code 1." if strict else
                     "This run is not a pass, and seen does not accept it. Give --strict to get exit 1."))
             if strict:
@@ -220,6 +225,17 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
             remove_tree_quietly(report_dir)
         if objects is not None:
             remove_tree_quietly(objects)
+
+
+def _inputs_changed(top: Path, inputs: Sequence[str], before: str | None) -> bool | None:
+    """True when the gate changed the ``--input`` files, and one line says so. None with no fingerprint."""
+    if not inputs or before is None or before == INPUTS_UNAVAILABLE:
+        return None
+    if globs.inputs_fingerprint(top, inputs) == before:
+        return False
+    emit("the gate changed the --input files, so this run cannot prove a tree. Make the gate write "
+         "them outside the --input globs.")
+    return True
 
 
 def _placeholder(argv: list[str]) -> tuple[Path | None, Path | None, list[str]]:

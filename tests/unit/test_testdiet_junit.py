@@ -297,3 +297,35 @@ def test_an_old_expat_is_refused_with_its_version(tmp_path, monkeypatch):
     with pytest.raises(JUnitError) as caught:
         read_junit([report], root=tmp_path)
     assert "2.2.9" in str(caught.value) and "2.4.1" in str(caught.value)
+
+
+# --------------------------------------------------------------------------- failures at suite level
+
+
+@pytest.mark.parametrize("body, count", [
+    (b'<testsuites failures="1"><testsuite name="s" failures="1"><testcase classname="a" name="t"/>'
+     b'</testsuite></testsuites>', 1),
+    (b'<testsuite name="s"><failure message="setup broke"/><testcase classname="a" name="t"/></testsuite>', 1),
+    (b'<testsuites errors="2"><testsuite name="s" errors="2"><testcase classname="a" name="t"><error/>'
+     b'</testcase></testsuite></testsuites>', 1),
+    (b'<testsuites failures="1"><testsuite name="s" failures="1"><testcase classname="a" name="t"><failure/>'
+     b'</testcase></testsuite></testsuites>', 0),
+])
+def test_a_failure_that_only_the_suite_counts_makes_exit_0_a_conflict(tmp_path, body, count):
+    from jacked.testdiet import history
+
+    report = tmp_path / "r.xml"
+    report.write_bytes(body)
+    data = read_junit([report], root=tmp_path)
+    assert data.suite_failures == count
+    assert history.verdict_of(0, data) == ("conflict" if count else history.verdict_of(0, data))
+    assert history.verdict_of(1, data) == "failed"
+
+
+def test_each_sample_report_has_no_failure_at_suite_level_only():
+    from tests._testdiet import REPORTS, REPORT_ROOT
+
+    paths = sorted(REPORTS.glob("*.xml"))
+    assert len(paths) >= 10
+    for path in paths:
+        assert read_junit([path], root=Path("/nowhere"), report_root=REPORT_ROOT).suite_failures == 0, path.name

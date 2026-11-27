@@ -822,3 +822,30 @@ def test_loss_does_not_run_a_filter_driver_of_the_repository(repo, tmp_path):
     report = loss.loss_report(repo)
     assert "tests/test_calc.py::test_more" in report.added
     assert not marker.exists()
+
+
+# --------------------------------------------------------------------------- pytest file names and weak pairs
+
+
+def test_a_python_file_that_is_not_a_pytest_file_name_is_not_read(repo):
+    write(repo, "src/db.py", b"def test_connection():\n    return True\n")
+    commit(repo, "a helper with a test_ name")
+    write(repo, "src/db.py", b"def check_connection():\n    return True\n")
+    report = loss.loss_report(repo, "HEAD")
+    assert report.removed == () and report.added == ()
+    assert loss.scan_kind("tests/test_a.py") and loss.scan_kind("pkg/a_test.py")
+    assert not loss.scan_kind("src/db.py") and not loss.scan_kind("tests/conftest.py")
+
+
+def test_a_removed_test_and_an_added_test_with_the_same_last_name_pair_only_with_the_same_body(repo):
+    write(repo, "tests/a/test_x.py", b"class TestA:\n    def test_ok(self):\n        assert 1\n")
+    commit(repo, "one class test")
+    (repo / "tests/a/test_x.py").unlink()
+    write(repo, "tests/b/test_y.py", b"def test_ok():\n    assert 2 == 2\n    assert 3\n")
+    report = loss.loss_report(repo, "HEAD")
+    assert report.removed == ("tests/a/test_x.py::TestA::test_ok",)
+    assert report.added == ("tests/b/test_y.py::test_ok",) and report.moved == ()
+    write(repo, "tests/b/test_y.py", b"def test_ok():\n    assert 1\n")
+    report = loss.loss_report(repo, "HEAD")
+    assert report.moved == (("tests/a/test_x.py::TestA::test_ok", "tests/b/test_y.py::test_ok"),)
+    assert report.removed == ()

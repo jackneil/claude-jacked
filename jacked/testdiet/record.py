@@ -22,6 +22,8 @@ from jacked.testdiet.views import recorded_count
 from jacked.testdiet import machine as identity
 from jacked.testdiet.model import (
     DEFAULT_TOP,
+    NO_SOURCE,
+    NO_START,
     KINDS,
     LABEL_RE,
     SCHEMA,
@@ -33,6 +35,7 @@ from jacked.testdiet.model import (
     label_order,
     label_text,
     one_line,
+    or_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -178,7 +181,7 @@ def _same_identity(meta: RunMeta, tree_value: TreeId, command_sha: str, folder: 
 
 
 def _proves(meta: RunMeta) -> bool:
-    return meta.verdict == "passed" and meta.tree_changed is False
+    return meta.verdict == "passed" and meta.tree_changed is False and meta.inputs_changed is not True
 
 
 def _not_proved(meta: RunMeta) -> str:
@@ -186,6 +189,8 @@ def _not_proved(meta: RunMeta) -> str:
         cause = f"its verdict is {one_line(meta.verdict) or 'not recorded'}"
     elif meta.tree_changed is True:
         cause = "the gate changed the tree"
+    elif meta.inputs_changed is True:
+        cause = "the gate changed the --input files"
     else:
         cause = "the tree after the gate is not known"
     return (f"the newest run of this tree and this command is {meta.id}, and it does not prove the tree: "
@@ -306,7 +311,8 @@ def repeat_notice(store: Path, meta: RunMeta) -> str | None:
     for m in earlier[:DEFAULT_TOP]:
         place = m.tree.commit[:12] if m.tree is not None else "no tree"
         flag = ", default branch" if m.on_default_branch is True else ""
-        lines.append(f"  {label_text(m.machine)} {m.id} {one_line(m.started)} {one_line(m.source)} "
+        lines.append(f"  {label_text(m.machine)} {m.id} {or_text(m.started, NO_START)} "
+                     f"{or_text(m.source, NO_SOURCE)} "
                      f"{place}{flag}")
     lines += _more(len(earlier), "earlier record",
                    "jacked tests history --machine LABEL shows the failing sets of each machine.")
@@ -331,5 +337,5 @@ def seen_line(meta: RunMeta) -> str:
     """
     counts = ", ".join(f"{one_line(k)} {v}" for k, v in (meta.counts or {}).items()) or "no counts"
     wall = "unknown" if meta.wall_seconds is None else f"{meta.wall_seconds} s"
-    return clean_text(f"passed before: {meta.id} started {one_line(meta.started)}, "
+    return clean_text(f"passed before: {meta.id} started {or_text(meta.started, NO_START)}, "
                       f"folder {one_line(meta.folder)}, wall {wall}, {counts}")

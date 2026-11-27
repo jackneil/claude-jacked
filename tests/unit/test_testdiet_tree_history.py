@@ -896,10 +896,40 @@ def test_the_machine_id_is_empty_when_the_file_cannot_be_read_or_made(tmp_path):
     blocker = tmp_path / "blocked"
     blocker.write_bytes(b"a file where the .claude folder must be")
     assert machine.machine_id(blocker) is None
-    damaged = tmp_path / "damaged"
-    (damaged / ".claude").mkdir(parents=True)
-    (damaged / ".claude" / "jacked-tests-machine-id").write_bytes(b"not an id")
-    assert machine.machine_id(damaged) is None
+    folder = tmp_path / "folder"
+    (folder / ".claude" / "jacked-tests-machine-id").mkdir(parents=True)
+    value, problem = machine.identity(folder)
+    assert value is None and "Delete" not in problem and (folder / ".claude" / "jacked-tests-machine-id").is_dir()
+
+
+@pytest.mark.parametrize("content", [b"not an id", b"", b"\xff\xfe", b"a" * 31])
+def test_a_machine_id_file_with_bad_content_is_made_again_with_one_line(tmp_path, capsys, content):
+    path = tmp_path / ".claude" / "jacked-tests-machine-id"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    value = machine.machine_id(tmp_path)
+    assert value is not None and re.fullmatch(r"[0-9a-f]{32}", value)
+    assert path.read_bytes() == (value + "\n").encode("ascii")
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1 and "made a new one" in err
+    assert machine.machine_id(tmp_path) == value and capsys.readouterr().err == ""
+
+
+def test_a_valid_machine_id_is_never_replaced(tmp_path, monkeypatch):
+    path = tmp_path / ".claude" / "jacked-tests-machine-id"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"bad")
+    other = "b" * 32
+    real = machine.atomic_write_bytes
+
+    def another_process_first(target, data, **kwargs):
+        # Another process writes a valid identity between the read and the replace.
+        path.write_bytes((other + "\n").encode("ascii"))
+        return real(target, data, **kwargs)
+
+    monkeypatch.setattr(machine, "atomic_write_bytes", another_process_first)
+    assert machine.machine_id(tmp_path) == other
+    assert path.read_bytes() == (other + "\n").encode("ascii")
 
 
 def test_the_machine_id_uses_the_jacked_home_by_default(tmp_path, monkeypatch):
@@ -1260,3 +1290,75 @@ def test_a_meta_file_that_cannot_be_read_gives_a_cause_with_no_path(tmp_path, ca
     assert list(history.iter_runs(tmp_path)) == []
     err = capsys.readouterr().err
     assert len(err.splitlines()) == 1 and "Error" in err and str(tmp_path) not in err
+
+
+# --------------------------------------------------------------------------- store states
+
+
+def test_prune_deletes_a_temporary_file_of_a_write_that_stopped(tmp_path, capsys):
+    from datetime import date, datetime, timedelta, timezone
+
+    runs = tmp_path / "runs"
+    old_id = history.new_run_id(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    young_id = history.new_run_id()
+    runs.mkdir(parents=True)
+    stale = runs / f".{old_id}.meta.json.k3j2h1.tmp"
+    young = runs / f".{young_id}.tests.json.gz.a1b2c3.tmp"
+    other = runs / "notes.txt"
+    for path in (stale, young, other):
+        path.write_bytes(b"x")
+    later = datetime.now(timezone.utc) + timedelta(hours=1)
+    assert history.prune(tmp_path, date(2026, 6, 1), now=later, dry_run=True) == []
+    assert stale.exists() and "would delete 1 temporary file" in capsys.readouterr().err
+    assert history.prune(tmp_path, date(2026, 6, 1), now=later) == []
+    assert not stale.exists() and young.exists() and other.exists()
+    assert "deleted 1 temporary file" in capsys.readouterr().err
+
+
+def test_write_run_flushes_each_file_to_disk_before_the_rename(tmp_path, monkeypatch):
+    calls = []
+    real = history.atomic_write_bytes
+    monkeypatch.setattr(history, "atomic_write_bytes",
+                        lambda path, data, **kw: calls.append((Path(path).name, kw.get("fsync"))) or
+                        real(path, data, **kw))
+    meta = _meta(history.new_run_id())
+    data = RunData(runner="pytest", seconds_reported=None, tests=(
+        CaseResult(id="t::a", file="t.py", seconds=1.0, state="passed", failure_type=None, attempts=1),))
+    history.write_run(tmp_path, meta, data)
+    assert [fsync for _, fsync in calls] == [True, True]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a folder mode needs POSIX")
+@pytest.mark.parametrize("state", ["file", "unreadable"])
+def test_a_runs_path_that_cannot_be_listed_gives_one_line(tmp_path, capsys, state):
+    runs = tmp_path / "runs"
+    if state == "file":
+        runs.write_bytes(b"not a folder")
+    else:
+        runs.mkdir()
+        runs.chmod(0)
+        if os.access(runs, os.R_OK):
+            runs.chmod(0o700)
+            pytest.skip("this user can read a folder with mode 0 (root)")
+    try:
+        assert list(history.iter_runs(tmp_path)) == []
+    finally:
+        if runs.is_dir():
+            runs.chmod(0o700)
+    err = capsys.readouterr().err
+    assert len(err.splitlines()) == 1 and "cannot be read" in err and str(tmp_path) not in err
+
+
+@pytest.mark.parametrize("field, value", [("seconds", "1.5"), ("seconds", True), ("state", "odd"),
+                                          ("attempts", "2"), ("id", 7), ("file", 3), ("failure_type", [1])])
+def test_a_tests_file_with_a_field_of_the_wrong_type_is_damaged(tmp_path, capsys, field, value):
+    import gzip as _gzip
+
+    meta = _meta(history.new_run_id())
+    case = {"id": "t::a", "file": "t.py", "seconds": 1.0, "state": "passed", "failure_type": None,
+            "attempts": 1, field: value}
+    history.write_run(tmp_path, meta, None)
+    raw = json.dumps({"runner": "pytest", "seconds_reported": None, "tests": [case]}).encode("ascii")
+    (tmp_path / "runs" / f"{meta.id}.tests.json.gz").write_bytes(_gzip.compress(raw))
+    assert history.load_tests(tmp_path, meta.id) is None
+    assert "skipped the damaged record" in capsys.readouterr().err

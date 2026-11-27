@@ -554,3 +554,28 @@ def test_history_of_an_empty_store_has_the_keys_of_a_full_one(store, tmp_path):
     empty = tmp_path / "empty-store"
     empty.mkdir()
     assert set(views.history(empty)) == set(views.history(store))
+
+
+def test_a_record_with_no_start_time_verdict_or_source_prints_text(tmp_path):
+    import json as _json
+
+    from jacked.testdiet import record as _record
+
+    store = tmp_path / "s"
+    red = [make_case("a::t", "a.py", 1.0, "failed")]
+    first = store_run(store, "20261120T080000", exit_code=1, kind="full", tests=red)
+    now = store_run(store, "20261121T080000", exit_code=1, kind="full", tests=red)
+    for run_id in (first, now):
+        path = store / history.RUNS / f"{run_id}.meta.json"
+        raw = _json.loads(path.read_bytes())
+        for key in ("started", "verdict", "source"):
+            raw.pop(key)
+        path.write_bytes(_json.dumps(raw).encode("ascii"))
+    texts = [views.render_profile(views.profile(store)), views.render_history(views.history(store))]
+    meta = next(m for m in history.iter_runs(store) if m.id == now)
+    texts += [_record.seen_line(meta), _record.repeat_notice(store, meta)]
+    for text in texts:
+        assert " ," not in text and "started ," not in text and not any(line.endswith(" ") for line in
+                                                                        text.splitlines())
+    assert "no start time recorded" in texts[0] and "verdict not recorded" in texts[0]
+    assert "no start time recorded" in texts[2] and "source not recorded" in texts[3]

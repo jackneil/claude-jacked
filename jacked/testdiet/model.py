@@ -94,6 +94,21 @@ def clean_text(text: str) -> str:
     return "".join(ch for ch in text if ch in "\n\t" or unicodedata.category(ch) != "Cc")
 
 
+#: The texts of a value that the record does not hold. A view never prints an empty slot.
+NO_START = "no start time recorded"
+NO_VERDICT = "not recorded"
+NO_SOURCE = "source not recorded"
+
+
+def or_text(value, missing: str) -> str:
+    """Return ``one_line(value)``, or ``missing`` when that is empty.
+
+    >>> or_text(None, NO_START), or_text("2026-11-26", NO_START)
+    ('no start time recorded', '2026-11-26')
+    """
+    return one_line(value) or missing
+
+
 def error_text(exc: BaseException) -> str:
     """The class and the cause of ``exc`` for one output line.
 
@@ -156,11 +171,17 @@ class CaseResult:
 
 @dataclass(frozen=True)
 class RunData:
-    """All tests of one run, and the total time that the report gives."""
+    """All tests of one run, and the total time that the report gives.
+
+    ``suite_failures`` counts the failures and errors that a suite counts
+    and that no test case of that suite holds (a failure at suite level).
+    It is not stored in the tests file; the verdict of the record keeps it.
+    """
 
     runner: str
     tests: tuple[CaseResult, ...]
     seconds_reported: float | None
+    suite_failures: int = 0
 
 
 @dataclass(frozen=True)
@@ -194,6 +215,8 @@ class RunMeta:
     time, or None when no test has one (or the run has no report).
     ``interrupted`` is True when the user stopped the run (Ctrl-C) while
     the gate ran, False when not, and None for a record of ``record``.
+    ``inputs_changed`` is True when the ``--input`` fingerprint after the
+    gate is not the one before it, and None with no ``--input``.
     """
 
     id: str
@@ -224,6 +247,7 @@ class RunMeta:
     schema: int | None = None
     test_seconds: float | None = None
     interrupted: bool | None = None
+    inputs_changed: bool | None = None
 
 
 class JUnitError(ValueError):
@@ -245,7 +269,8 @@ class Declaration:
     """One test of a file, as ``loss`` reads it.
 
     ``asserts``, ``skipped`` and ``cases`` are None when the source cannot
-    give them. ``unread`` holds the reason of each None value.
+    give them. ``unread`` holds the reason of each None value. ``body`` is
+    the ``body_print`` of the body, or None when the body is not read.
     """
 
     name: str
@@ -253,3 +278,15 @@ class Declaration:
     skipped: bool | None
     cases: int | None = 1
     unread: tuple[str, ...] = ()
+    body: str | None = None
+
+
+def body_print(text: str) -> str:
+    """A short SHA-256 of a test body with no white space, so a new indent gives the same value.
+
+    >>> body_print("assert 1") == body_print("  assert   1\\n")
+    True
+    """
+    import hashlib
+
+    return hashlib.sha256("".join(text.split()).encode("utf-8", "surrogatepass")).hexdigest()[:16]

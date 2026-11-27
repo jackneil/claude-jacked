@@ -68,6 +68,7 @@ from jacked.testdiet.model import (  # noqa: F401 -- loss and the tests read the
     NOT_PARSED,
     SCRIPT_FILE_RE,
     Declaration,
+    body_print,
 )
 
 _PY_SKIPS = {"skip", "skipif", "skipIf", "skipUnless"}
@@ -83,8 +84,19 @@ def declarations(path: str, text: str) -> list[str]:
 
 
 def scan_kind(path: str) -> bool:
-    """Return True when ``scan`` reads the file at ``path`` (by its name only)."""
-    return path.endswith((".py", "_test.go", ".rs")) or bool(SCRIPT_FILE_RE.search(path))
+    """Return True when ``scan`` reads the file at ``path`` (by its name only).
+
+    A Python file is a test file only by the default file names of pytest
+    (``test_*.py``, ``*_test.py``), so a helper ``def test_x`` in
+    ``src/db.py`` is not a test.
+
+    >>> scan_kind("tests/test_a.py"), scan_kind("src/db.py"), scan_kind("web/a.test.ts")
+    (True, False, True)
+    """
+    if path.endswith(".py"):
+        name = path.rsplit("/", 1)[-1]
+        return name.startswith("test_") or name.endswith("_test.py")
+    return path.endswith(("_test.go", ".rs")) or bool(SCRIPT_FILE_RE.search(path))
 
 
 def scan(path: str, text: str) -> list[Declaration]:
@@ -143,7 +155,8 @@ def _python_body(body: list[ast.stmt], prefix: str, skipped: bool, cases: int | 
             in_body = any(isinstance(sub, ast.Call) and _is_skip_call(sub.func) for sub in inner)
             number = _times(cases, _param_cases(node))
             found.append(Declaration(prefix + node.name, asserts, skipped or _decorated_skip(node) or in_body,
-                                     number, () if number is not None else (COMPUTED_CASES,)))
+                                     number, () if number is not None else (COMPUTED_CASES,),
+                                     body_print("".join(ast.dump(stmt) for stmt in node.body))))
 
 
 def _callee(func: ast.expr) -> str:

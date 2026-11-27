@@ -38,6 +38,14 @@ def _seconds(value: str | None) -> float | None:
     return number if number >= 0 and number == number and number != float("inf") else None
 
 
+def _count(value: str | None) -> int:
+    """A count attribute of a suite. A missing or bad value counts 0."""
+    try:
+        return max(0, int(value)) if value is not None else 0
+    except ValueError:
+        return 0
+
+
 class _Target:
     """The parser target. It reads attributes only. It keeps no text."""
 
@@ -51,11 +59,20 @@ class _Target:
         self._suites = 0
         # The times of the outer suites, for a root element with no time.
         self.suite_times: list[float | None] = []
+        # One [declared, held] pair for each open suite: the failures and errors
+        # that the suite counts, and the failing test cases inside it.
+        self._open: list[list[int]] = []
+        self._suite_depths: list[int] = []
+        #: The failures that a suite counts and that no test case of it holds.
+        self.suite_failures = 0
 
     def start(self, tag: str, attrib: dict[str, str]) -> None:
         self._depth += 1
         if self.root is None:
             self.root = {k: attrib[k] for k in ("name", "id", "time") if k in attrib}
+        if tag in ("testsuite", "testsuites"):
+            self._open.append([_count(attrib.get("failures")) + _count(attrib.get("errors")), 0])
+            self._suite_depths.append(self._depth)
         if tag == "testsuite":
             self._suites += 1
             if self._depth == 2:
@@ -77,14 +94,24 @@ class _Target:
                 self._case["outcomes"].append((tag, failure_type))
             elif tag in _FLAKY_ATTEMPTS or tag in _RERUN_ATTEMPTS:
                 self._case["extra"].append((tag, failure_type))
+        elif (self._case is None and tag in ("failure", "error") and self._suite_depths
+              and self._depth == self._suite_depths[-1] + 1):
+            self.suite_failures += 1  # a failure element of the suite itself
         elif (self._case is None and tag == "property" and self._suites == 1 and not self.cases
               and attrib.get("name") == "go.version"):
             self.properties["go.version"] = "1"
 
     def end(self, tag: str) -> None:
         if self._case is not None and tag == "testcase" and self._depth == self._case_depth:
+            if any(kind in ("failure", "error") for kind, _ in self._case["outcomes"]):
+                for pair in self._open:
+                    pair[1] += 1
             self.cases.append(self._case)
             self._case = None
+        elif tag in ("testsuite", "testsuites") and self._suite_depths and self._depth == self._suite_depths[-1]:
+            declared, held = self._open.pop()
+            self._suite_depths.pop()
+            self.suite_failures = max(self.suite_failures, declared - held)
         self._depth -= 1
 
     def data(self, data: str) -> None:
@@ -167,10 +194,12 @@ def read_junit(paths: Sequence[Path], *, root: Path, report_root: str | None = N
     """
     lookup = TreeLookup(root)
     runners: list[str] = []
+    suite_failures = 0
     merged: dict[str, dict] = {}
     reported: list[float] = []
     for path in paths:
         target = _parse(path)
+        suite_failures += target.suite_failures
         suite = {**(target.root or {}), **target.properties}
         first = target.cases[0] if target.cases else {}
         file_runner = runner or detect_runner(suite, {"classname": first.get("classname", "")})
@@ -206,4 +235,5 @@ def read_junit(paths: Sequence[Path], *, root: Path, report_root: str | None = N
         runner=distinct.pop() if len(distinct) == 1 else "unknown",
         tests=tuple(tests),
         seconds_reported=sum(reported) if reported else None,
+        suite_failures=suite_failures,
     )

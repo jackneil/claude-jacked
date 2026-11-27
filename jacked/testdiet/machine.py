@@ -18,7 +18,7 @@ from jacked.atomic_io import atomic_write_bytes
 from jacked.packs import jacked_home
 from jacked.public_errors import os_error_reason
 from jacked.regular_file import open_regular_fd
-from jacked.testdiet.model import MACHINE_ID_BYTES, MACHINE_ID_RE
+from jacked.testdiet.model import MACHINE_ID_BYTES, MACHINE_ID_RE, emit
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +32,9 @@ def machine_id(home: Path | None = None) -> str | None:
     The identity is in ``<home>/.claude/jacked-tests-machine-id``. ``home``
     is the jacked home when it is not given. The file has mode 0600 where
     the system has modes. Two processes that make it at the same time get
-    the same identity. The result is None when the file cannot be read or
-    made, or holds no valid identity.
+    the same identity. A regular file that holds no valid identity (a write
+    that a power loss cut) is made again, and one line says so. The result
+    is None when the file cannot be read or made.
     """
     return identity(home)[0]
 
@@ -48,13 +49,36 @@ def identity(home: Path | None = None) -> tuple[str | None, str]:
         if not os.path.lexists(path):
             _make_machine_id(path)
         value = _read_machine_id(path)
-    except (OSError, ValueError) as exc:
+        if value is None:
+            value = _replace_bad_machine_id(path)
+    except OSError as exc:
         logger.debug("machine_id: no machine identity (%s)", type(exc).__name__)
-        cause = os_error_reason(exc) if isinstance(exc, OSError) else "it is not ASCII text"
-        return None, f"the machine identity {path} cannot be read or made ({cause})."
+        return None, f"the machine identity {path} cannot be read or made ({os_error_reason(exc)})."
     if value is None:
         return None, f"the machine identity {path} holds no valid identity."
     return value, ""
+
+
+def _replace_bad_machine_id(path: Path) -> str | None:
+    """Replace a regular file that holds no valid identity, and return the identity that the file holds then.
+
+    The replace is atomic, and it stops when the file holds a valid identity
+    just before it (another process made one), so a valid identity is never
+    replaced. A run of the old identity cannot prove a tree after this, so
+    one line says so.
+    """
+    def refuse_when_valid() -> None:
+        if _read_machine_id(path) is not None:
+            raise _IdExists
+
+    try:
+        atomic_write_bytes(path, (secrets.token_hex(MACHINE_ID_BYTES) + "\n").encode("ascii"), mode=0o600,
+                           fsync=True, before_replace=refuse_when_valid)
+    except _IdExists:
+        return _read_machine_id(path)
+    emit(f"the machine identity {path} held no valid identity, so jacked made a new one. "
+         "A run of the old identity does not prove a tree on this machine.")
+    return _read_machine_id(path)
 
 
 def _make_machine_id(path: Path) -> None:
@@ -97,10 +121,11 @@ def _write_machine_id(path: Path, value: str) -> None:
 
 
 def _read_machine_id(path: Path) -> str | None:
+    """The identity in the regular file ``path``, or None when it holds no valid identity."""
     fd = open_regular_fd(path)
     try:
         data = os.read(fd, 4096)
     finally:
         os.close(fd)
-    value = data.decode("ascii").strip()
+    value = data.decode("ascii", "replace").strip()
     return value if MACHINE_ID_RE.fullmatch(value) else None

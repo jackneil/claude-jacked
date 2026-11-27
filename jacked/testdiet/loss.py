@@ -8,10 +8,12 @@ what it counts as an assertion, a case and a skip mark.
 
 Each test of the work tree is paired with a test of the base: first the
 same file and name, then the same name in a different touched file, then
-the same last name part (``Class::name`` gives ``name``). A pair that is not
-the same file and name prints a ``moved`` line. So a renamed file, a moved
-test, a renamed class and an edited parameter value give no loss. A test
-that gets a new name inside one file shows as one removed and one added name.
+the same last name part (``Class::name`` gives ``name``) with the same body
+(``Declaration.body``). A pair that is not the same file and name prints a
+``moved`` line. So a renamed file, a moved test, a renamed class and an
+edited parameter value give no loss. A test that gets a new name inside one
+file shows as one removed and one added name. A Python file is read only
+when pytest collects it by default (``test_*.py``, ``*_test.py``).
 
 ``fewer_assertions``, ``fewer_cases`` and ``skips_added`` are report lines,
 not a verdict. ``not_read`` names each paired test (a test on both sides,
@@ -206,22 +208,25 @@ def _match(before: Sides, after: Sides):
     """Pair the tests of the work tree with the tests of the base.
 
     The keys, in order: the same file and name, the same name, the same last
-    name part. Return the pairs (old path, old test, path, test), the
-    removed tests and the added tests, each as (path, test).
+    name part with the same body. A test whose body is not read never pairs
+    by the last key, so a removal and an unrelated addition with one last
+    name never read as a move. Return the pairs (old path, old test, path,
+    test), the removed tests and the added tests, each as (path, test).
     """
     pool = [(path, d) for path in sorted(before) for d in before[path]]
     used = [False] * len(pool)
     heads = [(path, d) for path in sorted(after) for d in after[path]]
     pairs, left = [], list(range(len(heads)))
-    for key in (lambda p, d: (p, d.name), lambda p, d: d.name, lambda p, d: _leaf(d.name)):
+    for key in (lambda p, d: (p, d.name), lambda p, d: d.name,
+                lambda p, d: None if d.body is None else (_leaf(d.name), d.body)):
         free: dict[object, list[int]] = defaultdict(list)
         for k, (path, d) in enumerate(pool):
-            if not used[k]:
+            if not used[k] and key(path, d) is not None:
                 free[key(path, d)].append(k)
         rest = []
         for h in left:
             path, d = heads[h]
-            spare = free.get(key(path, d))
+            spare = free.get(key(path, d)) if key(path, d) is not None else None
             if spare:
                 k = spare.pop(0)
                 used[k] = True
