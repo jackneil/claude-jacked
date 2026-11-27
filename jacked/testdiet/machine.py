@@ -62,23 +62,31 @@ def identity(home: Path | None = None) -> tuple[str | None, str]:
 def _replace_bad_machine_id(path: Path) -> str | None:
     """Replace a regular file that holds no valid identity, and return the identity that the file holds then.
 
-    The replace is atomic, and it stops when the file holds a valid identity
-    just before it (another process made one), so a valid identity is never
-    replaced. A run of the old identity cannot prove a tree after this, so
-    one line says so.
+    Two processes can repair one file. The repair holds the shared advisory
+    file lock of jacked (``jacked.memory.vault._file_lock``) on
+    ``<file>.lock`` and reads the file again under it, so the second process
+    reads the identity of the first and keeps it. The replace is atomic, and
+    it also stops when the file holds a valid identity just before it. A run
+    of the old identity cannot prove a tree after this, so one line says so.
     """
+    from jacked.memory.vault import _file_lock
+
     def refuse_when_valid() -> None:
         if _read_machine_id(path) is not None:
             raise _IdExists
 
-    try:
-        atomic_write_bytes(path, (secrets.token_hex(MACHINE_ID_BYTES) + "\n").encode("ascii"), mode=0o600,
-                           fsync=True, before_replace=refuse_when_valid)
-    except _IdExists:
+    with _file_lock(path.with_name(f"{path.name}.lock")):
+        again = _read_machine_id(path)
+        if again is not None:
+            return again  # another process repaired it first
+        try:
+            atomic_write_bytes(path, (secrets.token_hex(MACHINE_ID_BYTES) + "\n").encode("ascii"), mode=0o600,
+                               fsync=True, before_replace=refuse_when_valid)
+        except _IdExists:
+            return _read_machine_id(path)
+        emit(f"the machine identity {path} held no valid identity, so jacked made a new one. "
+             "A run of the old identity does not prove a tree on this machine.")
         return _read_machine_id(path)
-    emit(f"the machine identity {path} held no valid identity, so jacked made a new one. "
-         "A run of the old identity does not prove a tree on this machine.")
-    return _read_machine_id(path)
 
 
 def _make_machine_id(path: Path) -> None:

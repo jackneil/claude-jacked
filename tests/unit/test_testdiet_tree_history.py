@@ -1508,3 +1508,49 @@ def test_a_cleanup_warning_shows_a_line_break_in_a_name_as_an_escape(tmp_path, m
     lines = [r.getMessage() for r in caplog.records if "cannot remove" in r.getMessage()]
     assert lines and all("\n" not in line for line in lines)
     assert any("a\\nb" in line for line in lines)
+
+
+def test_two_repairs_of_one_bad_machine_id_end_with_one_identity(tmp_path, monkeypatch):
+    # g-L2: writer A passes its validity check and pauses; then B starts. With no lock, B passes its
+    # check too, A writes, and B replaces A's valid identity. With the lock, B waits and reads A's.
+    import threading
+
+    from jacked.testdiet import machine
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / machine.MACHINE_ID_NAME).write_bytes(b"cut by a power loss\n")
+    a_checked, b_checked, a_done = threading.Event(), threading.Event(), threading.Event()
+    real_write = machine.atomic_write_bytes
+
+    def paced(path, data, **kwargs):
+        check = kwargs["before_replace"]
+
+        def before():
+            check()
+            if threading.current_thread().name == "A":
+                a_checked.set()
+                b_checked.wait(2)  # no lock: B arrives; with the lock: B waits, and this times out
+            else:
+                b_checked.set()
+                a_done.wait(10)
+
+        return real_write(path, data, **{**kwargs, "before_replace": before})
+
+    monkeypatch.setattr(machine, "atomic_write_bytes", paced)
+    got: dict[str, str | None] = {}
+
+    def repair(name):
+        got[name] = machine.identity(home)[0]
+        if name == "A":
+            a_done.set()
+
+    first = threading.Thread(target=repair, args=("A",), name="A")
+    first.start()
+    assert a_checked.wait(10)
+    second = threading.Thread(target=repair, args=("B",), name="B")
+    second.start()
+    first.join(20)
+    second.join(20)
+    on_disk = machine.identity(home)[0]
+    assert got["A"] is not None and got["A"] == got["B"] == on_disk, (got, on_disk)
