@@ -11,7 +11,19 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 STATES = ("passed", "failed", "error", "skipped", "flaky")
+#: The states of a test that make the run fail.
+FAILING_STATES = ("failed", "error")
 RUNNERS = ("pytest", "vitest", "jest", "playwright", "go", "nextest", "unknown")
+#: The values of ``--kind``: a label for the views only.
+KINDS = ("full", "targeted")
+#: The verdicts of a run, in the order of the views.
+VERDICTS = ("passed", "failed", "conflict", "no-data", "unknown")
+#: The ref of the remote default branch. No command fetches it.
+DEFAULT_BRANCH_REF = "refs/remotes/origin/HEAD"
+#: The rows of each text table of ``profile`` and ``history``, and the rows of the repeat notice.
+DEFAULT_TOP = 20
+#: The name of a TypeScript or JavaScript file (ids and loss read the same set).
+SCRIPT_FILE_RE = re.compile(r"\.[cm]?[jt]sx?$")
 #: The pattern of a label, a machine label and a runner name.
 LABEL_RE = re.compile(r"[A-Za-z0-9._-]+")
 #: The size of a machine identity in random bytes. ``MACHINE_ID_RE`` derives from it.
@@ -220,3 +232,24 @@ class JUnitError(ValueError):
 
 class ListingError(ValueError):
     """A test listing holds an error line."""
+
+
+#: A reason in ``Declaration.unread``.
+NOT_PARSED = "does not parse"
+BODY_NOT_READ = "body not read"
+COMPUTED_CASES = "computed cases"
+
+
+@dataclass(frozen=True)
+class Declaration:
+    """One test of a file, as ``loss`` reads it.
+
+    ``asserts``, ``skipped`` and ``cases`` are None when the source cannot
+    give them. ``unread`` holds the reason of each None value.
+    """
+
+    name: str
+    asserts: int | None
+    skipped: bool | None
+    cases: int | None = 1
+    unread: tuple[str, ...] = ()

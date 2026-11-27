@@ -25,17 +25,7 @@ from jacked.testdiet import globs, history, machine, reports, tree
 from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.model import SCHEMA, RunMeta, TreeId, emit
 from jacked.testdiet.process import EXIT_INTERRUPTED, Signals, Stopped, start_and_wait
-from jacked.testdiet.record import (
-    _LOCAL,
-    INPUTS_UNAVAILABLE,
-    _check_options,
-    _counts,
-    _failing,
-    _flaky,
-    _guard,
-    _now,
-    repeat_notice,
-)
+from jacked.testdiet.record import INPUTS_UNAVAILABLE, LOCAL, check_options, guard, now_utc, repeat_notice
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +75,7 @@ def run_gate(argv: Sequence[str], *, cwd: Path, junit: Sequence[str] = (), input
     argv = [str(arg) for arg in argv]
     if not argv:
         raise ValueError("the gate command is empty")
-    _check_options(kind, label, runner)
+    check_options(kind, label, runner)
     cwd = Path(cwd)
     signals = Signals()
     signals.install()
@@ -104,8 +94,8 @@ def run_gate(argv: Sequence[str], *, cwd: Path, junit: Sequence[str] = (), input
 def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str],
               inputs: Sequence[str], kind: str | None, label: str | None, runner: str | None,
               strict: bool) -> int:
-    top = _guard("find the work tree", lambda: _top_or_none(cwd), None)
-    store = _guard("find the store", lambda: tree.store_dir(top), None) if top is not None else None
+    top = guard("find the work tree", lambda: _top_or_none(cwd), None)
+    store = guard("find the store", lambda: tree.store_dir(top), None) if top is not None else None
     if top is None or store is None:
         if top is not None:
             emit("the history store cannot be found. The gate runs, and the run is not recorded.")
@@ -116,32 +106,32 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
             if report_dir is not None:
                 remove_tree_quietly(report_dir)
 
-    objects = _guard("make a temporary folder", lambda: Path(tempfile.mkdtemp(prefix="jacked-objects-")),
+    objects = guard("make a temporary folder", lambda: Path(tempfile.mkdtemp(prefix="jacked-objects-")),
                      None)
     report_dir: Path | None = None
     try:
-        before = _guard("read the tree", lambda: _read_tree(cwd, objects), None)
-        folder = _guard("find the gate folder", lambda: tree.work_folder(cwd), None)
+        before = guard("read the tree", lambda: _read_tree(cwd, objects), None)
+        folder = guard("find the gate folder", lambda: tree.work_folder(cwd), None)
         # No folder, no command identity: such a run can never prove a tree.
         sha = tree.command_sha(argv, folder=folder) if folder is not None else None
-        inputs_sha = _guard("hash the input files", lambda: hash_inputs(top, inputs),
+        inputs_sha = guard("hash the input files", lambda: hash_inputs(top, inputs),
                             INPUTS_UNAVAILABLE if inputs else None)
         report_dir, report, child_argv = _placeholder(argv)
         if not junit and not any(reports.JUNIT_PLACEHOLDER in arg for arg in argv):
             emit(NO_REPORT_SOURCE)
         # None (not empty) when the hash step fails: then no fixed report is read,
         # because an old report must not become this run.
-        fixed_before = _guard("hash the fixed reports",
+        fixed_before = guard("hash the fixed reports",
                               lambda: reports.hash_fixed(top, junit),
                               None) if junit else {}
 
-        started = _now()
+        started = now_utc()
         load_start = _load()
-        cpu_start = _guard("read the processor time", _child_cpu, None)
+        cpu_start = guard("read the processor time", _child_cpu, None)
         clock = time.monotonic()
         code = start_and_wait(child_argv, cwd, signals)
         wall = time.monotonic() - clock
-        cpu_end = _guard("read the processor time", _child_cpu, None)
+        cpu_end = guard("read the processor time", _child_cpu, None)
         load_end = _load()
         # What the post-run steps know. A stop keeps the values that are read.
         known: dict = {"data": None, "changed": None, "written": False, "meta": None}
@@ -152,15 +142,15 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                 id=history.new_run_id(), started=started, source="run",
                 wall_seconds=round(wall, 3), exit_code=code, verdict=history.verdict_of(code, data),
                 kind=kind, label=label, runner=runner or (data.runner if data else None),
-                command_sha=sha, inputs_sha=inputs_sha, machine=_LOCAL, machine_id=machine.machine_id(),
+                command_sha=sha, inputs_sha=inputs_sha, machine=LOCAL, machine_id=machine.machine_id(),
                 tree=before, tree_changed=known["changed"],
                 on_default_branch=(tree.on_default_branch(cwd, before)
                                    if before and signals.stopped is None else None),
-                counts=_counts(data), seconds_reported=data.seconds_reported if data else None,
+                counts=history.counts_of(data), seconds_reported=data.seconds_reported if data else None,
                 load_start=load_start, load_end=load_end,
                 child_cpu_seconds=(round(cpu_end - cpu_start, 3)
                                    if cpu_start is not None and cpu_end is not None else None),
-                failing=_failing(data), flaky=_flaky(data),
+                failing=history.failing_of(data), flaky=history.flaky_of(data),
                 failing_sig=history.failing_signature(data.tests) if data else None,
                 folder=folder, schema=SCHEMA, test_seconds=history.sum_test_seconds(data),
                 interrupted=signals.interrupted,
@@ -169,7 +159,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
         def write() -> RunMeta:
             # One meta for each run: a second write of it replaces the same files.
             meta = known["meta"] = build()
-            notice = _guard("read the earlier records", lambda: repeat_notice(store, meta), None)
+            notice = guard("read the earlier records", lambda: repeat_notice(store, meta), None)
             if _write_record(store, meta, known["data"]):
                 known["written"] = True
             if notice:
@@ -183,27 +173,27 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                 signals.raise_ok = True
                 if signals.stopped is not None:
                     raise Stopped(signals.stopped)
-                known["data"] = _guard("read the report",
+                known["data"] = guard("read the report",
                                        lambda: reports.read_reports(top, report, junit, fixed_before, runner), None)
                 if report_dir is not None:
                     remove_tree_quietly(report_dir)
                     report_dir = None
-                after = _guard("read the tree", lambda: _read_tree(cwd, objects, quiet=before is None), None)
+                after = guard("read the tree", lambda: _read_tree(cwd, objects, quiet=before is None), None)
                 known["changed"] = changed = _tree_changed(before, after)
                 if changed:
-                    _guard("list the changed paths",
+                    guard("list the changed paths",
                            lambda: _print_changes(cwd, before, after, objects), None)
                 # No stop from here on: a signal between the tests file and the meta
                 # file, or after write_run, would leave an orphan or a second record.
                 signals.raise_ok = False
-                meta = _guard("write the record", write, None)
+                meta = guard("write the record", write, None)
             finally:
                 signals.raise_ok = False
         except Stopped as stop:
             emit(f"the run got signal {stop.args[0]} after the gate stopped. The recorder skips its "
                  "other steps and writes the record.")
             if not known["written"]:
-                _guard("write the record", lambda: _write_record(store, build(), known["data"]), None)
+                guard("write the record", lambda: _write_record(store, build(), known["data"]), None)
             return code
         except KeyboardInterrupt:
             # The gate is done. An interrupt now stops only the recorder, as a SIGTERM does.
@@ -211,13 +201,13 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                  "and writes the record, which cannot prove a tree. The exit code is the code of the gate.")
             if not known["written"]:
                 meta = known["meta"] or build()
-                _guard("write the record", lambda: _write_record(store, meta, known["data"]), None)
+                guard("write the record", lambda: _write_record(store, meta, known["data"]), None)
             return code
         data = known["data"]
-        verdict = meta.verdict if meta is not None else _guard(
+        verdict = meta.verdict if meta is not None else guard(
             "find the verdict", lambda: history.verdict_of(code, data), None)
         if verdict == "conflict":
-            failing = len(_failing(data))
+            failing = len(history.failing_of(data))
             tests = "test" if failing == 1 else "tests"
             emit(f"the gate returned 0, but the report holds failures ({failing} failed or error {tests}). "
                  + ("--strict makes the exit code 1." if strict else
@@ -234,7 +224,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
 
 def _placeholder(argv: list[str]) -> tuple[Path | None, Path | None, list[str]]:
     """The report folder, the report path and the child argv. A folder that cannot be made is logged."""
-    return reports.placeholder(argv, lambda: _guard("make the report folder", reports.make_report_folder, None))
+    return reports.placeholder(argv, lambda: guard("make the report folder", reports.make_report_folder, None))
 
 
 def _write_record(store: Path, meta: RunMeta, data) -> bool:

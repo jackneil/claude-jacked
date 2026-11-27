@@ -59,14 +59,14 @@ def _skill_dir(homes: dict, name: str) -> Path:
 
 
 def _has_the_key(skill_md: Path) -> bool:
-    from jacked.skill_listing import _truthy, parse_frontmatter
+    from jacked.skill_listing import truthy, parse_frontmatter
 
     meta, _ = parse_frontmatter(skill_md.read_bytes().decode("utf-8"))
-    return _truthy(meta.get("disable-model-invocation"))
+    return truthy(meta.get("disable-model-invocation"))
 
 
 def test_each_skill_with_the_key_ships_the_policy_file_with_the_exact_content():
-    from jacked.codex._generate import CODEX_NO_IMPLICIT
+    from jacked.codex._policy_files import CODEX_NO_IMPLICIT
 
     assert CODEX_NO_IMPLICIT.encode("utf-8") == EXACT
     with_key = [p.parent for p in sorted((DATA / "skills").glob("*/SKILL.md"))
@@ -96,7 +96,7 @@ def test_install_gives_the_cleanup_command_skill_the_policy_file(tmp_path):
 
 
 def test_a_command_without_the_key_gets_no_policy_file(tmp_path):
-    from jacked.codex._generate import _command_codex_policy
+    from jacked.codex._policy_files import _command_codex_policy
 
     root = _data_root(tmp_path)
     cmd = root / "commands" / "plain.md"
@@ -204,17 +204,14 @@ def test_the_claude_install_of_review_animations_still_passes_its_manifest_check
 
 
 def test_each_shipped_command_gets_the_policy_exactly_when_it_has_the_key():
-    from jacked.codex._generate import (
-        CODEX_NO_IMPLICIT,
-        _command_codex_policy,
-        _split_command_frontmatter,
-    )
-    from jacked.skill_listing import _truthy
+    from jacked.codex._generate import _split_command_frontmatter
+    from jacked.codex._policy_files import CODEX_NO_IMPLICIT, _command_codex_policy
+    from jacked.skill_listing import truthy
 
     with_key, without_key = [], []
     for cmd in sorted((DATA / "commands").glob("*.md")):
         meta, _ = _split_command_frontmatter(cmd.read_text(encoding="utf-8"))
-        if _truthy(meta.get("disable-model-invocation")):
+        if truthy(meta.get("disable-model-invocation")):
             with_key.append(cmd.stem)
             assert _command_codex_policy(cmd) == CODEX_NO_IMPLICIT, cmd.name
         else:

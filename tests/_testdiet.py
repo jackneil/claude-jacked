@@ -16,9 +16,6 @@ REPORTS = FIXTURES / "reports"
 PROJECTS = FIXTURES / "projects"
 REPORT_ROOT = "/work"
 
-# A sample report has the name of its capture. Most captures use the project
-# of the same name.
-_PROJECT_OF = {"pytest_rerun": "pytest_rerun", "pytest_import_error": "pytest_import_error"}
 
 
 def fixture_reports(runner: str) -> list[Path]:
@@ -34,7 +31,7 @@ def fixture_project(runner: str) -> Path:
 
     In the sample reports, ``/work`` is this folder.
     """
-    return PROJECTS / _PROJECT_OF.get(runner, runner)
+    return PROJECTS / runner
 
 
 def fixture_listing(runner: str) -> str:
@@ -77,6 +74,46 @@ def private_hits(text: str, *, host: str, login: str, home: str) -> list[str]:
         if re.search(pattern, text, flags=re.IGNORECASE):
             hits.append(word)
     return hits
+
+
+#: The git variables that point git at another repository, index, object store or config.
+_GIT_STATE = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+              "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_CONFIG_PARAMETERS",
+              "GIT_CONFIG_COUNT")
+
+
+def hermetic_git(tmp_path: Path, monkeypatch) -> Path:
+    """Make git hermetic for one test, and return ``tmp_path``.
+
+    No system config, an empty global config, a ceiling at ``tmp_path``, no
+    variable that points git at another repository or config (a hook can
+    set them), and a fixed author.
+    """
+    global_config = tmp_path / "gitconfig-global"
+    global_config.write_bytes(b"")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    for key in _GIT_STATE:
+        monkeypatch.delenv(key, raising=False)
+    for key, val in {
+        "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
+    }.items():
+        monkeypatch.setenv(key, val)
+    return tmp_path
+
+
+def git(repo: Path, *args: str) -> str:
+    """Run git in ``repo``, assert exit 0, and return the output with no newline at the end.
+
+    The leading space stays: in ``status --porcelain``, " M" (a work tree
+    change) and "M " (a change in the index) differ only there.
+    """
+    proc = subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false", *args],
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    assert proc.returncode == 0, f"git {args[0]} failed: {proc.stderr}"
+    return proc.stdout.rstrip("\n")
 
 
 def make_repo(path: Path) -> Path:
@@ -137,7 +174,7 @@ def store_run(store: Path, when: str, *, exit_code: int | None, tests=None, kind
     from datetime import datetime, timezone
 
     from jacked.testdiet import history
-    from jacked.testdiet.model import SCHEMA, STATES, RunData, RunMeta, TreeId
+    from jacked.testdiet.model import SCHEMA, RunData, RunMeta, TreeId
 
     moment = datetime.strptime(when, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
     data = None if tests is None else RunData(runner="pytest", tests=tuple(tests), seconds_reported=None)
@@ -149,10 +186,9 @@ def store_run(store: Path, when: str, *, exit_code: int | None, tests=None, kind
         inputs_sha=None, machine=machine, machine_id=machine_id,
         tree=None if tree is None else TreeId(commit=commit, tree=tree, clean=True),
         tree_changed=None if tree is None else False, on_default_branch=on_default_branch,
-        counts=None if data is None else {s: sum(1 for c in cases if c.state == s) for s in STATES},
+        counts=history.counts_of(data),
         seconds_reported=None, load_start=None, load_end=None, child_cpu_seconds=None,
-        failing=tuple(sorted(c.id for c in cases if c.state in ("failed", "error"))),
-        flaky=tuple(sorted(c.id for c in cases if c.state == "flaky")),
+        failing=history.failing_of(data), flaky=history.flaky_of(data),
         failing_sig=history.failing_signature(cases), folder=folder, schema=SCHEMA,
         test_seconds=history.sum_test_seconds(data),
     )

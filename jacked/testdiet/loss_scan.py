@@ -59,30 +59,18 @@ from __future__ import annotations
 import ast
 import re
 import warnings
-from dataclasses import dataclass
 
-#: A reason in ``Declaration.unread``.
-NOT_PARSED = "does not parse"
-BODY_NOT_READ = "body not read"
-COMPUTED_CASES = "computed cases"
+from jacked.testdiet import loss_braces
+# Declaration and the reasons live in model, so loss_braces needs no import of this module.
+from jacked.testdiet.model import (  # noqa: F401 -- loss and the tests read them from here
+    BODY_NOT_READ,
+    COMPUTED_CASES,
+    NOT_PARSED,
+    SCRIPT_FILE_RE,
+    Declaration,
+)
 
-_SCRIPT = re.compile(r"\.[cm]?[jt]sx?$")
 _PY_SKIPS = {"skip", "skipif", "skipIf", "skipUnless"}
-
-
-@dataclass(frozen=True)
-class Declaration:
-    """One test of a file.
-
-    ``asserts``, ``skipped`` and ``cases`` are None when the source cannot
-    give them. ``unread`` holds the reason of each None value.
-    """
-
-    name: str
-    asserts: int | None
-    skipped: bool | None
-    cases: int | None = 1
-    unread: tuple[str, ...] = ()
 
 
 def declarations(path: str, text: str) -> list[str]:
@@ -96,7 +84,7 @@ def declarations(path: str, text: str) -> list[str]:
 
 def scan_kind(path: str) -> bool:
     """Return True when ``scan`` reads the file at ``path`` (by its name only)."""
-    return path.endswith((".py", "_test.go", ".rs")) or bool(_SCRIPT.search(path))
+    return path.endswith((".py", "_test.go", ".rs")) or bool(SCRIPT_FILE_RE.search(path))
 
 
 def scan(path: str, text: str) -> list[Declaration]:
@@ -111,11 +99,9 @@ def scan_file(path: str, text: str) -> tuple[list[Declaration], str | None]:
     a script, Go or Rust file, it names the line of a comment or a string
     that does not close: the scan of the rest of that file is not sure.
     """
-    from jacked.testdiet import loss_braces
-
     if path.endswith(".py"):
         return _python(text)
-    if _SCRIPT.search(path):
+    if SCRIPT_FILE_RE.search(path):
         return loss_braces.script(text)
     if path.endswith("_test.go"):
         return loss_braces.go(text)

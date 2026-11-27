@@ -19,11 +19,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from jacked.testdiet import history as _history
-from jacked.testdiet.model import CaseResult, RunMeta, clean_text, label_text, one_line
-
-VERDICTS = ("passed", "failed", "conflict", "no-data", "unknown")
-#: The text output shows this number of rows in each table when no --top is given.
-DEFAULT_TOP = 20
+from jacked.testdiet.model import (
+    DEFAULT_TOP,
+    VERDICTS,
+    CaseResult,
+    RunMeta,
+    clean_text,
+    label_text,
+    one_line,
+)
 
 
 class ViewError(ValueError):
@@ -150,8 +154,10 @@ def profile(store: Path, run_id: str | None = None, *, machine: str | None = Non
     store = Path(store)
     runs = list(_history.iter_runs(store))
     if run_id is not None:
-        if not _history.RUN_ID_RE.fullmatch(run_id):
-            raise ViewError("a run ID must be <UTC time>Z-<8 hex characters>")
+        try:
+            _history.check_id(run_id)
+        except ValueError as exc:
+            raise ViewError(str(exc)) from None
         meta = next((m for m in runs if m.id == run_id), None)
         if meta is None:
             raise ViewError(f"the history has no run {run_id}")
@@ -327,8 +333,8 @@ def _hidden(count: int, what: str) -> list[str]:
     return [f"  {_num(count)} more {what} are not shown. --json shows all rows."] if count else []
 
 
-def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
-    """The text output of ``profile``. ``top`` is the number of rows of each table."""
+def render_profile(result: dict) -> str:
+    """The text output of ``profile``. Each table shows the rows that ``hidden_rows`` does not hide."""
     lines = list(result["notes"])
     lines.append(f"run: {one_line(result['run'])} started {one_line(result['started'])}, "
                  f"kind {one_line(result['kind']) or 'not given'}, verdict {one_line(result['verdict'])}")
@@ -349,13 +355,13 @@ def render_profile(result: dict, top: int | None = DEFAULT_TOP) -> str:
     if result["setup_share"] is not None:
         lines.append(f"setup share: {_num(result['setup_share'])}")
     lines.append("files (seconds, tests, file):")
-    rows = result["files"] if top is None else result["files"][:top]
+    rows = result["files"][:len(result["files"]) - result["hidden_rows"]["files"]]
     lines += [f"  {_time(r['seconds'], NO_TIME_CELL):>10} {_num(r['tests']):>6} "
               f"{one_line(r['file']) or '(no file)'}"
               for r in rows]
     lines += _hidden(result["hidden_rows"]["files"], "files")
     lines.append("tests (seconds, test ID):")
-    rows = result["tests"] if top is None else result["tests"][:top]
+    rows = result["tests"][:len(result["tests"]) - result["hidden_rows"]["tests"]]
     lines += [f"  {_time(r['seconds'], NO_TIME_CELL):>10} {one_line(r['id'])}" for r in rows]
     lines += _hidden(result["hidden_rows"]["tests"], "tests")
     if result["repeats"]:

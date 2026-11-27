@@ -34,12 +34,11 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from jacked.regular_file import open_regular_fd
-from jacked.testdiet.model import ListingError
+from jacked.testdiet.model import SCRIPT_FILE_RE, ListingError
 
 _SKIP_DIRS = {".git", "node_modules", "target", "vendor", "__pycache__"}
 _WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:/")
 _PLAYWRIGHT_LOCATION = re.compile(r"^(?P<file>.+?):\d+:\d+(?P<rest> › .*)$")
-_SCRIPT_FILE = re.compile(r"\.[cm]?[jt]sx?$")
 
 
 def _read_tree_file(path: Path) -> bytes | None:
@@ -291,16 +290,18 @@ def _normalize(runner: str, classname: str, name: str, file: str | None, root: P
 
 
 def normalize(runner: str, classname: str, name: str, file: str | None, *, root: Path,
-              report_root: str | None = None) -> tuple[str, str | None]:
+              report_root: str | None = None, lookup: TreeLookup | None = None) -> tuple[str, str | None]:
     """Return the normalized ID and the file of one test case.
 
     ``classname``, ``name`` and ``file`` are the attributes of the
-    ``testcase`` element (``file`` is None when it has none).
+    ``testcase`` element (``file`` is None when it has none). ``lookup``
+    reads the tree at ``root``; give one ``TreeLookup`` for all the cases
+    of one report, so each file and folder is read one time.
 
     >>> normalize("vitest", "src/a.test.js", "group > b", None, root=Path("/x"))
     ('src/a.test.js > group > b', 'src/a.test.js')
     """
-    return _normalize(runner, classname, name, file, root, report_root, TreeLookup(root))
+    return _normalize(runner, classname, name, file, root, report_root, lookup or TreeLookup(root))
 
 
 def _listing_error(runner: str, line: str) -> bool:
@@ -341,7 +342,7 @@ def ids_from_listing(runner: str, text: str, *, root: Path) -> list[str]:
                 ids.append(stripped)
         elif runner == "vitest":
             head, sep, _ = stripped.partition(" > ")
-            if sep and _SCRIPT_FILE.search(head):
+            if sep and SCRIPT_FILE_RE.search(head):
                 ids.append(stripped)
         elif runner == "jest":
             rel = relative_path(stripped, root=root)
@@ -386,6 +387,6 @@ def detect_runner(suite_attributes: Mapping[str, str], first_case: Mapping[str, 
         return by_name[name]
     if "go.version" in suite_attributes:
         return "go"
-    if "id" in suite_attributes and _SCRIPT_FILE.search(first_case.get("classname", "")):
+    if "id" in suite_attributes and SCRIPT_FILE_RE.search(first_case.get("classname", "")):
         return "playwright"
     return "unknown"

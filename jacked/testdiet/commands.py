@@ -23,8 +23,9 @@ def recorder_group():
     """
 
 
-_KINDS = ("full", "targeted")
-_RUNNERS = ("pytest", "vitest", "jest", "playwright", "go", "nextest")
+_KINDS = _model.KINDS
+#: The runner names that a user can give ("unknown" is only what the reader finds).
+_RUNNERS = tuple(name for name in _model.RUNNERS if name != "unknown")
 
 
 def _label_option(ctx, param, value):
@@ -212,7 +213,7 @@ def _store_or_exit() -> Path:
 @click.option("--run", "run_id", default=None, metavar="ID", help="The run to show. Default: the newest full run.")
 @click.option("--machine", default=None, callback=_label_option, metavar="LABEL",
               help="The machine label. Default: the machine of the newest full run.")
-@click.option("--top", type=click.IntRange(min=1), default=20, show_default=True,
+@click.option("--top", type=click.IntRange(min=1), default=_model.DEFAULT_TOP, show_default=True,
               help="The number of rows of each table in the text output.")
 @click.option("--json", "as_json", is_flag=True, help="Print every row as JSON.")
 def profile_command(run_id, machine, top, as_json):
@@ -225,7 +226,7 @@ def profile_command(run_id, machine, top, as_json):
     except _views.ViewError as exc:
         _model.emit(str(exc))
         raise SystemExit(1)
-    click.echo(_views.to_json(result) if as_json else _views.render_profile(result, top))
+    click.echo(_views.to_json(result) if as_json else _views.render_profile(result))
 
 
 @recorder_group.command(name="history")
@@ -279,7 +280,7 @@ def _kept_line(count: int) -> str:
 
 @recorder_group.command(name="loss")
 @click.option("--base", default=None, metavar="REF",
-              help="Compare with the merge base of HEAD and REF. Default REF: refs/remotes/origin/HEAD.")
+              help=f"Compare with the merge base of HEAD and REF. Default REF: {_model.DEFAULT_BRANCH_REF}.")
 @click.option("--json", "as_json", is_flag=True, help="Print the report as JSON.")
 def loss_command(base, as_json):
     """Show the tests that the change removes or weakens.

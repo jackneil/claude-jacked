@@ -28,8 +28,10 @@ from pathlib import Path
 from jacked.atomic_io import atomic_write_bytes
 from jacked.regular_file import open_regular_fd
 from jacked.testdiet.model import (
+    FAILING_STATES,
     LABEL_RE,
     MACHINE_ID_RE,
+    STATES,
     CaseResult,
     RunData,
     RunMeta,
@@ -44,7 +46,6 @@ TESTS_SUFFIX = ".tests.json.gz"
 #: A run ID: the UTC time to the microsecond, then 8 random hex characters.
 RUN_ID_RE = re.compile(r"(\d{8})T\d{12}Z-[0-9a-f]{8}")
 
-_FAILING_STATES = ("failed", "error")
 _RAN_STATES = ("passed", "flaky")
 #: A tests file with no meta file is a write that is in progress or that
 #: stopped. A write takes milliseconds, so ``prune`` deletes such a file only
@@ -109,7 +110,8 @@ def new_run_id(now: datetime | None = None) -> str:
     return f"{moment:%Y%m%dT%H%M%S%f}Z-{secrets.token_hex(4)}"
 
 
-def _check_id(run_id: str) -> str:
+def check_id(run_id: str) -> str:
+    """Return ``run_id`` when it is a valid run ID. Else raise ``ValueError``."""
     if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
         raise ValueError("a run ID must be <UTC time>Z-<8 hex characters>")
     return run_id
@@ -120,11 +122,36 @@ def failing_signature(cases: Iterable[CaseResult]) -> str | None:
 
     A flaky test is not in the failing set. The result is None when no test failed.
     """
-    pairs = sorted({(c.id, c.failure_type or "") for c in cases if c.state in _FAILING_STATES})
+    pairs = sorted({(c.id, c.failure_type or "") for c in cases if c.state in FAILING_STATES})
     if not pairs:
         return None
     text = json.dumps(pairs, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+def counts_of(data: RunData | None) -> dict[str, int] | None:
+    """Return the number of tests in each state, or None for a run with no report.
+
+    >>> counts_of(None) is None
+    True
+    """
+    if data is None:
+        return None
+    return {state: sum(1 for case in data.tests if case.state == state) for state in STATES}
+
+
+def failing_of(data: RunData | None) -> tuple[str, ...]:
+    """Return the sorted IDs of the failed and the error tests."""
+    if data is None:
+        return ()
+    return tuple(sorted(case.id for case in data.tests if case.state in FAILING_STATES))
+
+
+def flaky_of(data: RunData | None) -> tuple[str, ...]:
+    """Return the sorted IDs of the flaky tests."""
+    if data is None:
+        return ()
+    return tuple(sorted(case.id for case in data.tests if case.state == "flaky"))
 
 
 def sum_test_seconds(data: RunData | None) -> float | None:
@@ -175,7 +202,7 @@ def verdict_of(exit_code: int | None, data: RunData | None) -> str:
         return "failed"
     if data is None or not data.tests:
         return "no-data"
-    if any(case.state in _FAILING_STATES for case in data.tests):
+    if any(case.state in FAILING_STATES for case in data.tests):
         return "conflict"
     if not any(case.state in _RAN_STATES for case in data.tests):
         return "no-data"
@@ -187,7 +214,7 @@ def write_run(store: Path, meta: RunMeta, data: RunData | None) -> None:
 
     With no ``data``, only the meta file is written.
     """
-    run_id = _check_id(meta.id)
+    run_id = check_id(meta.id)
     runs = Path(store) / RUNS
     if data is not None:
         payload = {"runner": data.runner, "seconds_reported": data.seconds_reported,
@@ -308,7 +335,7 @@ def load_tests(store: Path, run_id: str) -> RunData | None:
 
     A damaged tests file gives None, with one warning on standard error.
     """
-    name = f"{_check_id(run_id)}{TESTS_SUFFIX}"
+    name = f"{check_id(run_id)}{TESTS_SUFFIX}"
     try:
         raw = json.loads(gzip.decompress(_read(Path(store) / RUNS / name)))
     except FileNotFoundError:

@@ -53,11 +53,10 @@ REPO_ROOT = HERE.parents[2]
 PROJECTS = HERE / "projects"
 REPORTS = HERE / "reports"
 PROVENANCE = HERE / "PROVENANCE.json"
-REPORT_ROOT = "/work"
 REPORT_HOST = "gate.example"
 
 sys.path.insert(0, str(REPO_ROOT))
-from tests._testdiet import private_hits  # noqa: E402
+from tests._testdiet import REPORT_ROOT, private_hits  # noqa: E402
 
 # Exact versions, with the publish date of each one (from the registry).
 PYTHON_PACKAGES = {

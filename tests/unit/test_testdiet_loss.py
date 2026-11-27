@@ -19,7 +19,7 @@ from click.testing import CliRunner
 
 from jacked.cli import main
 from jacked.testdiet import loss, loss_scan
-from tests._testdiet import make_repo
+from tests._testdiet import git, hermetic_git, make_repo
 
 CALC = b"""\
 import pytest
@@ -44,19 +44,7 @@ def test_doubles(n):
 def repo(tmp_path, monkeypatch):
     if shutil.which("git") is None:
         pytest.skip("this test drives the real git binary")
-    global_config = tmp_path / "gitconfig-global"
-    global_config.write_bytes(b"")
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
-    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"):
-        monkeypatch.delenv(key, raising=False)
-    for key, val in {
-        "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-        "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-    }.items():
-        monkeypatch.setenv(key, val)
+    hermetic_git(tmp_path, monkeypatch)
     path = make_repo(tmp_path / "repo")
     write(path, "tests/test_calc.py", CALC)
     commit(path, "base tests")
@@ -66,13 +54,6 @@ def repo(tmp_path, monkeypatch):
     git(path, "checkout", "-q", "-b", "work")
     monkeypatch.chdir(path)
     return path
-
-
-def git(repo: Path, *args: str) -> str:
-    proc = subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false", *args],
-                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    assert proc.returncode == 0, proc.stderr
-    return proc.stdout
 
 
 def write(repo: Path, rel: str, data: bytes) -> None:
@@ -171,7 +152,7 @@ def test_a_change_that_is_not_committed_counts(repo):
     assert report.removed == ("tests/test_calc.py::test_adds",)
     assert report.added == ("tests/test_untracked.py::test_new",)
     assert report.net == 0
-    assert git(repo, "status", "--porcelain") == " M tests/test_calc.py\n?? tests/test_untracked.py\n", \
+    assert git(repo, "status", "--porcelain") == " M tests/test_calc.py\n?? tests/test_untracked.py", \
         "the real index must not change"
 
 

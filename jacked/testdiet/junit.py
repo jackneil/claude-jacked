@@ -16,8 +16,8 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from jacked.regular_file import open_regular_fd
-from jacked.testdiet.ids import TreeLookup, _normalize, detect_runner
-from jacked.testdiet.model import CaseResult, JUnitError, RunData
+from jacked.testdiet.ids import TreeLookup, detect_runner, normalize
+from jacked.testdiet.model import FAILING_STATES, CaseResult, JUnitError, RunData
 
 _BLOCK = 1 << 16
 # A failed attempt that the testcase also shows (the elements of Maven
@@ -182,8 +182,8 @@ def read_junit(paths: Sequence[Path], *, root: Path, report_root: str | None = N
         if seconds is not None:
             reported.append(seconds)
         for case in target.cases:
-            test_id, file = _normalize(file_runner, case["classname"], case["name"], case["file"],
-                                       root, report_root, lookup)
+            test_id, file = normalize(file_runner, case["classname"], case["name"], case["file"],
+                                      root=root, report_root=report_root, lookup=lookup)
             entry = merged.setdefault(test_id, {"file": None, "seconds": [], "attempts": []})
             entry["file"] = entry["file"] or file
             if case["seconds"] is not None:
@@ -192,7 +192,7 @@ def read_junit(paths: Sequence[Path], *, root: Path, report_root: str | None = N
     tests = []
     for test_id, entry in merged.items():
         states = [state for state, _ in entry["attempts"]]
-        failure_type = next((t for state, t in entry["attempts"] if state in ("failed", "error") and t), None)
+        failure_type = next((t for state, t in entry["attempts"] if state in FAILING_STATES and t), None)
         tests.append(CaseResult(
             id=test_id,
             file=entry["file"],

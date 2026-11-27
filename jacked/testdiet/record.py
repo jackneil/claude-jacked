@@ -21,11 +21,11 @@ from jacked.testdiet import history, junit, tree
 from jacked.testdiet.views import recorded_count
 from jacked.testdiet import machine as identity
 from jacked.testdiet.model import (
+    DEFAULT_TOP,
+    KINDS,
     LABEL_RE,
     SCHEMA,
     RUNNERS,
-    STATES,
-    RunData,
     RunMeta,
     TreeId,
     clean_text,
@@ -41,10 +41,8 @@ logger = logging.getLogger(__name__)
 # LABEL_RE (the pattern of a label) is in jacked.testdiet.model and is read from here too.
 
 
-KINDS = ("full", "targeted")
-
-
-_LOCAL = "local"
+#: The machine label of a run of ``run`` and of a ``record`` with no ``--machine``.
+LOCAL = "local"
 
 
 INPUTS_UNAVAILABLE = history.INPUTS_UNAVAILABLE
@@ -53,7 +51,7 @@ INPUTS_UNAVAILABLE = history.INPUTS_UNAVAILABLE
 T = TypeVar("T")
 
 
-def _guard(step: str, func: Callable[[], T], default: T) -> T:
+def guard(step: str, func: Callable[[], T], default: T) -> T:
     """Run one recorder step. An error is logged and printed, and ``default`` is the result.
 
     The WARNING log line has no traceback; the traceback goes to DEBUG (``jacked -v``).
@@ -74,7 +72,8 @@ def check_label(value: str | None, what: str = "label") -> str | None:
     return value
 
 
-def _check_options(kind: str | None, label: str | None, runner: str | None) -> None:
+def check_options(kind: str | None, label: str | None, runner: str | None) -> None:
+    """Refuse a ``kind``, ``label`` or ``runner`` that is not valid with ``ValueError``."""
     if kind is not None and kind not in KINDS:
         raise ValueError("the kind must be full or targeted")
     check_label(label)
@@ -82,26 +81,9 @@ def _check_options(kind: str | None, label: str | None, runner: str | None) -> N
         raise ValueError("the runner must be one of " + ", ".join(RUNNERS))
 
 
-def _now() -> str:
+def now_utc() -> str:
+    """The time now in UTC, as ISO 8601 to the second."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _counts(data: RunData | None) -> dict[str, int] | None:
-    if data is None:
-        return None
-    return {state: sum(1 for case in data.tests if case.state == state) for state in STATES}
-
-
-def _failing(data: RunData | None) -> tuple[str, ...]:
-    if data is None:
-        return ()
-    return tuple(sorted(case.id for case in data.tests if case.state in ("failed", "error")))
-
-
-def _flaky(data: RunData | None) -> tuple[str, ...]:
-    if data is None:
-        return ()
-    return tuple(sorted(case.id for case in data.tests if case.state == "flaky"))
 
 
 def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, label: str | None,
@@ -119,11 +101,11 @@ def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, la
     read raises ``JUnitError`` and nothing is recorded. Outside a git
     repository, ``TreeError``.
     """
-    _check_options(kind, label, runner)
+    check_options(kind, label, runner)
     check_label(machine, "machine label")
     if wall_seconds is not None and not wall_seconds >= 0:
         raise ValueError("the wall time must be 0 or more seconds")
-    started_text = parse_started(started) if started is not None else _now()
+    started_text = parse_started(started) if started is not None else now_utc()
     cwd = Path(cwd)
     top = tree.work_tree_top(cwd)
     store = tree.store_dir(top)
@@ -134,11 +116,11 @@ def record_files(junit_paths: Sequence[Path], *, cwd: Path, kind: str | None, la
         id=history.new_run_id(), started=started_text, source="record", wall_seconds=wall_seconds,
         exit_code=exit_code, verdict=history.verdict_of(exit_code, data), kind=kind, label=label,
         runner=runner or data.runner, command_sha=None, inputs_sha=None,
-        machine=machine or _LOCAL, machine_id=None if machine else identity.machine_id(),
+        machine=machine or LOCAL, machine_id=None if machine else identity.machine_id(),
         tree=tree_value, tree_changed=None,
         on_default_branch=tree.on_default_branch(top, tree_value) if tree_value else None,
-        counts=_counts(data), seconds_reported=data.seconds_reported, load_start=None,
-        load_end=None, child_cpu_seconds=None, failing=_failing(data), flaky=_flaky(data),
+        counts=history.counts_of(data), seconds_reported=data.seconds_reported, load_start=None,
+        load_end=None, child_cpu_seconds=None, failing=history.failing_of(data), flaky=history.flaky_of(data),
         failing_sig=history.failing_signature(data.tests), folder=None, schema=SCHEMA,
         test_seconds=history.sum_test_seconds(data),
     )
@@ -168,13 +150,9 @@ def parse_started(text: str) -> str:
 
 def _commit_tree(top: Path, commit: str) -> TreeId:
     """The clean tree identity of ``commit``. A name that is not a commit raises ``TreeError``."""
-    found = []
-    for suffix in ("^{commit}", "^{tree}"):
-        code, out = tree.git(top, "rev-parse", "--verify", "-q", "--end-of-options", commit + suffix)
-        lines = tree.output_lines(out)
-        if code != 0 or len(lines) != 1:
-            raise tree.TreeError("the commit is not in this repository")
-        found += lines
+    found = [tree.rev(top, commit + suffix) for suffix in ("^{commit}", "^{tree}")]
+    if None in found:
+        raise tree.TreeError("the commit is not in this repository")
     return TreeId(commit=found[0], tree=found[1], clean=True)
 
 
@@ -319,17 +297,31 @@ def repeat_notice(store: Path, meta: RunMeta) -> str | None:
     branch = recorded_count(found["on_default_branch"], found["on_default_branch_unknown"], found["runs"])
     summary = (f"the same failing set is in {len(earlier)} earlier {records}, trees: {trees}, "
                f"on the default branch: {branch}.")
+    # At most DEFAULT_TOP rows of each list, then the count of the rest: the
+    # notice goes to standard error on each red run. The record keeps each ID.
     lines = [summary, f"the failing set has {len(meta.failing)} test(s):"]
-    lines += [f"  {one_line(test_id)}" for test_id in meta.failing]
+    lines += [f"  {one_line(test_id)}" for test_id in meta.failing[:DEFAULT_TOP]]
+    lines += _more(len(meta.failing), "failing test", "jacked tests history --json gives each ID of the set.")
     lines.append("the earlier records, by machine:")
-    for m in earlier:
+    for m in earlier[:DEFAULT_TOP]:
         place = m.tree.commit[:12] if m.tree is not None else "no tree"
         flag = ", default branch" if m.on_default_branch is True else ""
         lines.append(f"  {label_text(m.machine)} {m.id} {one_line(m.started)} {one_line(m.source)} "
                      f"{place}{flag}")
+    lines += _more(len(earlier), "earlier record",
+                   "jacked tests history --machine LABEL shows the failing sets of each machine.")
     lines.append('see "A red gate" in jacked-reference.md: a failure on the base branch never clears '
                  "the branch.")
     return "\n".join(lines)
+
+
+def _more(count: int, what: str, pointer: str) -> list[str]:
+    """The line for the rows after the first ``DEFAULT_TOP``. ``what`` is "failing test" or "earlier record"."""
+    rest = count - DEFAULT_TOP
+    if rest <= 0:
+        return []
+    return [f"  1 more {what} is not shown. {pointer}" if rest == 1 else
+            f"  {rest} more {what}s are not shown. {pointer}"]
 
 
 def seen_line(meta: RunMeta) -> str:

@@ -38,13 +38,13 @@ from jacked.findbin import find_bin
 from jacked.testdiet import tree
 from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.loss_scan import NOT_PARSED, Declaration, declarations, scan, scan_file, scan_kind
-from jacked.testdiet.model import clean_text, one_line
+from jacked.testdiet.model import DEFAULT_BRANCH_REF, clean_text, one_line
 
 __all__ = ["DEFAULT_NAME", "DEFAULT_REF", "Declaration", "LossError", "LossReport",
            "declarations", "loss_report", "render", "scan", "scan_kind"]
 
 #: The ref of the default branch. There is no fetch and no network call.
-DEFAULT_REF = "refs/remotes/origin/HEAD"
+DEFAULT_REF = DEFAULT_BRANCH_REF
 #: The name of the default base in the output.
 DEFAULT_NAME = "origin/HEAD"
 _ZERO = re.compile(r"0+")
@@ -87,12 +87,6 @@ class LossReport:
 
 # Git --------------------------------------------------------------------
 
-def _rev(top: Path, spec: str) -> str | None:
-    code, out = tree.git(top, "rev-parse", "--verify", "-q", "--end-of-options", spec)
-    lines = tree.output_lines(out)
-    return lines[0] if code == 0 and len(lines) == 1 else None
-
-
 def _base_commit(top: Path, base: str | None) -> str:
     """Return the merge base of HEAD and ``base`` (the default branch when ``base`` is None).
 
@@ -100,14 +94,14 @@ def _base_commit(top: Path, base: str | None) -> str:
     moved ahead after the fork gives the fork point, so its new tests are
     not read as removed.
     """
-    if _rev(top, "HEAD^{commit}") is None:
+    if tree.rev(top, "HEAD^{commit}") is None:
         raise LossError("the current branch has no commit. Make a commit, then run loss again.")
     if base is not None:
-        tip = _rev(top, f"{base}^{{commit}}")
+        tip = tree.rev(top, f"{base}^{{commit}}")
         if tip is None:
             raise LossError(f"the base {base!r} is not a commit of this repository")
     else:
-        tip = _rev(top, f"{DEFAULT_REF}^{{commit}}")
+        tip = tree.rev(top, f"{DEFAULT_REF}^{{commit}}")
         if tip is None:
             raise LossError(f"{DEFAULT_REF} does not exist. Give --base <branch>, "
                             "or run: git remote set-head origin --auto")
@@ -140,7 +134,7 @@ def _touched(top: Path, base: str, head_tree: str, env: dict[str, str]):
         path = os.fsdecode(fields[i + 1])
         if len(meta) < 4 or not scan_kind(path):
             continue
-        sides = [(mode, sha) for mode, sha in ((meta[0], meta[2]), (meta[1], meta[3]))]
+        sides = [(meta[0], meta[2]), (meta[1], meta[3])]
         present = [mode for mode, sha in sides if not _ZERO.fullmatch(sha)]
         kinds = {_FILE_KINDS.get(mode, "regular file") for mode in present}
         if kinds - {"regular file"}:

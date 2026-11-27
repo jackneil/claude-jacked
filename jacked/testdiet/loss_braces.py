@@ -12,7 +12,7 @@ import bisect
 import functools
 import re
 
-from jacked.testdiet.loss_scan import BODY_NOT_READ, COMPUTED_CASES, Declaration
+from jacked.testdiet.model import BODY_NOT_READ, COMPUTED_CASES, Declaration
 
 # A scanner for the languages with braces --------------------------------
 

@@ -364,7 +364,7 @@ def install_codex(
             # user's own, moved back after a failed write.
             # src None: this skill's content is GENERATED from the command, so
             # the expected-hash identity check is the only source test.
-            # A command that only the user may start: see _policy_files.
+            # A command that only the user may start: see _policy_files. The lambda is a test seam.
             expected, copy = _command_skill_parts(cmd, content, lambda *a: _write_solo_skill(*a))
             outcome = _install_codex_skill_dir(
                 None, skill_dir, cmd.stem, prior, preserved, expected=expected, copy=copy,

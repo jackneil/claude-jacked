@@ -28,6 +28,8 @@ import pytest
 from jacked import git_guard
 from jacked.testdiet import cleanup, globs, history, machine, tree
 from jacked.testdiet.model import CaseResult, RunData, RunMeta, TreeId
+from tests._testdiet import git as _git
+from tests._testdiet import hermetic_git as _hermetic_git
 from tests._testdiet import make_repo
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -36,20 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 @pytest.fixture
 def hermetic_git(tmp_path, monkeypatch):
     """A hermetic git config: no system file, an empty global file, a fixed author."""
-    global_config = tmp_path / "gitconfig-global"
-    global_config.write_bytes(b"")
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
-    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"):
-        monkeypatch.delenv(key, raising=False)
-    for key, val in {
-        "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-        "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-    }.items():
-        monkeypatch.setenv(key, val)
-    return tmp_path
+    return _hermetic_git(tmp_path, monkeypatch)
 
 
 @pytest.fixture
@@ -57,13 +46,6 @@ def repo(hermetic_git):
     if shutil.which("git") is None:
         pytest.skip("this test drives the real git binary")
     return make_repo(hermetic_git / "repo")
-
-
-def _git(repo: Path, *args: str) -> str:
-    proc = subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false", *args],
-                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    assert proc.returncode == 0, f"git {args[0]} failed: {proc.stderr}"
-    return proc.stdout.strip()
 
 
 def _commit_all(repo: Path, message: str) -> str:

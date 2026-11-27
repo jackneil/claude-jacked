@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +13,7 @@ from click.testing import CliRunner
 from jacked.cli import main
 from jacked.testdiet import history, record, tree, views
 from jacked.testdiet import machine as identity
+from tests._testdiet import git as _git
 from tests._testdiet import (
     COMMAND,
     FAILING_ID,
@@ -26,6 +26,7 @@ from tests._testdiet import (
     fill_store,
     fixture_project,
     fixture_reports,
+    hermetic_git,
     make_repo,
     store_run,
 )
@@ -42,19 +43,7 @@ def store(tmp_path) -> Path:
 def repo(tmp_path, monkeypatch):
     if shutil.which("git") is None:
         pytest.skip("this test drives the real git binary")
-    global_config = tmp_path / "gitconfig-global"
-    global_config.write_bytes(b"")
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
-    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"):
-        monkeypatch.delenv(key, raising=False)
-    for key, val in {
-        "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-        "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-    }.items():
-        monkeypatch.setenv(key, val)
+    hermetic_git(tmp_path, monkeypatch)
     path = make_repo(tmp_path / "repo")
     monkeypatch.chdir(path)
     return path
@@ -62,12 +51,6 @@ def repo(tmp_path, monkeypatch):
 
 def _invoke(*args: str):
     return CliRunner().invoke(main, list(args), catch_exceptions=False)
-
-
-def _git(repo: Path, *args: str) -> None:
-    proc = subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false", *args],
-                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    assert proc.returncode == 0, proc.stderr
 
 
 def _ids(store: Path) -> list[str]:
@@ -162,7 +145,7 @@ def test_json_output_is_not_shortened_and_the_text_says_what_it_hides(store, rep
     result = views.profile(store, top=2)
     assert len(result["files"]) == 6 and len(result["tests"]) == 7
     assert result["hidden_rows"] == {"files": 4, "tests": 5}
-    text = views.render_profile(result, 2)
+    text = views.render_profile(result)
     assert "4 more files are not shown" in text and "5 more tests are not shown" in text
     assert "tests/test_c.py" not in text
     # The command: --json holds every row, also with --top.
@@ -565,3 +548,9 @@ def test_a_run_that_the_user_stopped_is_not_the_default_profile_run(tmp_path):
     raw["interrupted"] = True
     path.write_bytes(_json.dumps(raw).encode("ascii"))
     assert views.profile(store)["run"] == kept
+
+
+def test_history_of_an_empty_store_has_the_keys_of_a_full_one(store, tmp_path):
+    empty = tmp_path / "empty-store"
+    empty.mkdir()
+    assert set(views.history(empty)) == set(views.history(store))

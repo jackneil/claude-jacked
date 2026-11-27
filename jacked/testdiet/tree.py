@@ -38,7 +38,7 @@ from jacked import git_guard
 from jacked.findbin import find_bin
 from jacked.public_errors import describe, os_error_reason
 from jacked.testdiet.cleanup import remove_tree_quietly
-from jacked.testdiet.model import TreeId
+from jacked.testdiet.model import DEFAULT_BRANCH_REF, TreeId
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,10 @@ class GitRefused(TreeError):
 
 class NotAWorkTree(TreeError):
     """The folder is not in the work tree of a git repository."""
+
+
+#: The one text for a folder that is not in a work tree.
+NOT_IN_WORK_TREE = "this folder is not in the work tree of a git repository"
 
 
 class _All:
@@ -154,13 +158,24 @@ def work_tree_top(cwd: Path) -> Path:
         raise GitRefused(f"git refuses this repository because another user owns it ({first}). "
                          "To trust it, add it to safe.directory: git config --global --add "
                          "safe.directory <path>")
-    raise NotAWorkTree("this folder is not in the work tree of a git repository"
-                       + (f" ({first})" if first else ""))
+    raise NotAWorkTree(NOT_IN_WORK_TREE + (f" ({first})" if first else ""))
 
 
 def output_lines(data: bytes) -> list[str]:
     """Return the lines of git output that are not empty, decoded as file names."""
     return [os.fsdecode(line) for line in data.splitlines() if line]
+
+
+def rev(cwd: Path, spec: str) -> str | None:
+    """Return the object name that ``spec`` names, or None when it names no object.
+
+    A spec that starts with "-" (one that a user typed) comes after
+    ``--end-of-options``, so git never reads it as an option.
+    """
+    end = ("--end-of-options",) if spec.startswith("-") else ()
+    code, out = git(cwd, "rev-parse", "--verify", "-q", *end, spec)
+    lines = output_lines(out)
+    return lines[0] if code == 0 and len(lines) == 1 else None
 
 
 def tree_id(cwd: Path, *, objects: Path | None = None) -> TreeId | None:
@@ -239,13 +254,9 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None,
     code, out = git(cwd, "rev-parse", "--is-bare-repository")
     if code != 0 or out.strip() != b"false":
         return None
-    heads = []
-    for spec in ("HEAD^{commit}", "HEAD^{tree}"):
-        code, out = git(cwd, "rev-parse", "--verify", "-q", spec)
-        if code != 0 or len(output_lines(out)) != 1:
-            return None
-        heads += output_lines(out)
-    commit, head_tree = heads
+    commit, head_tree = rev(cwd, "HEAD^{commit}"), rev(cwd, "HEAD^{tree}")
+    if commit is None or head_tree is None:
+        return None
     code, out = git(cwd, "rev-parse", "--path-format=absolute", "--git-path", "index",
                      "--git-path", "objects")
     paths = output_lines(out)
@@ -425,21 +436,19 @@ def store_dir(cwd: Path) -> Path:
 def on_default_branch(cwd: Path, tree: TreeId) -> bool | None:
     """Return True when ``tree`` is clean and its commit is an ancestor of the remote default branch.
 
-    The default branch is the commit that ``refs/remotes/origin/HEAD``
-    names. There is no fetch and no network call. The result is None when
+    The default branch is the commit that ``DEFAULT_BRANCH_REF``
+    (``refs/remotes/origin/HEAD``) names. There is no fetch and no network call. The result is None when
     that ref does not exist or when git fails, and False for a tree with
     changes.
     """
     cwd = Path(cwd)
     try:
-        code, out = git(cwd, "rev-parse", "--verify", "-q", "refs/remotes/origin/HEAD^{commit}")
-        lines = output_lines(out)
-        if code != 0 or len(lines) != 1:
+        tip = rev(cwd, f"{DEFAULT_BRANCH_REF}^{{commit}}")
+        if tip is None:
             return None
         if not tree.clean:
             return False
-        code, _ = git(cwd, "merge-base", "--is-ancestor", "--end-of-options", tree.commit,
-                       lines[0])
+        code, _ = git(cwd, "merge-base", "--is-ancestor", "--end-of-options", tree.commit, tip)
     except TreeError as exc:
         logger.debug("on_default_branch: no answer (%s)", exc)
         return None
@@ -476,6 +485,6 @@ def work_folder(cwd: Path) -> str:
     """
     code, out = git(Path(cwd), "rev-parse", "--show-prefix")
     if code != 0:
-        raise TreeError("the folder is not in the work tree of a git repository")
+        raise NotAWorkTree(NOT_IN_WORK_TREE)
     prefix = os.fsdecode(out[:-1] if out.endswith(b"\n") else out).rstrip("/")
     return prefix or "."

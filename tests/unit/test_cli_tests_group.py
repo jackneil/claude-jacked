@@ -17,7 +17,7 @@ from rich.console import Console
 import jacked.cli as cli
 from jacked.cli import main
 from jacked.testdiet import history, machine, tree
-from tests._testdiet import fixture_reports, make_repo
+from tests._testdiet import fixture_reports, hermetic_git, make_repo
 
 GREEN = fixture_reports("pytest_rerun")[0]
 RED = fixture_reports("pytest")[0]
@@ -32,19 +32,7 @@ def gate(report: Path, code: int) -> list[str]:
 def repo(tmp_path, monkeypatch):
     if shutil.which("git") is None:
         pytest.skip("this test drives the real git binary")
-    global_config = tmp_path / "gitconfig-global"
-    global_config.write_bytes(b"")
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
-    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"):
-        monkeypatch.delenv(key, raising=False)
-    for key, val in {
-        "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-        "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-    }.items():
-        monkeypatch.setenv(key, val)
+    hermetic_git(tmp_path, monkeypatch)
     path = make_repo(tmp_path / "repo")
     (path / "sub").mkdir()
     monkeypatch.chdir(path)
@@ -326,3 +314,16 @@ def test_cli_history_prints_the_size_line_by_default(repo):
     _invoke("tests", "run", "--", *gate(GREEN, 0))
     out = _invoke("tests", "history").stdout
     assert out.splitlines()[-1].startswith("size of the history: ") and out.rstrip().endswith(" bytes")
+
+
+def test_the_cli_choices_and_defaults_come_from_the_model():
+    from jacked.cli import main
+    from jacked.testdiet import model
+
+    group = main.commands["tests"]
+    for name in ("run", "record"):
+        params = {p.name: p for p in group.commands[name].params}
+        assert tuple(params["kind"].type.choices) == model.KINDS
+        assert tuple(params["runner"].type.choices) == tuple(r for r in model.RUNNERS if r != "unknown")
+    top = next(p for p in group.commands["profile"].params if p.name == "top")
+    assert top.default == model.DEFAULT_TOP

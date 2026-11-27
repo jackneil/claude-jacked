@@ -28,6 +28,8 @@ import pytest
 from jacked.testdiet import globs, history, junit, machine, process, record, reports, run, tree
 from jacked.testdiet.model import TreeId
 from tests._testdiet import fixture_project, fixture_reports, make_repo
+from tests._testdiet import git as _git
+from tests._testdiet import hermetic_git as _hermetic_git
 
 POSIX = pytest.mark.skipif(os.name == "nt", reason="needs POSIX signals, FIFOs or file names")
 
@@ -80,20 +82,7 @@ def junit_gate(code: int, report: Path) -> list[str]:
 
 @pytest.fixture
 def hermetic_git(tmp_path, monkeypatch):
-    global_config = tmp_path / "gitconfig-global"
-    global_config.write_bytes(b"")
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
-    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"):
-        monkeypatch.delenv(key, raising=False)
-    for key, val in {
-        "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-        "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-    }.items():
-        monkeypatch.setenv(key, val)
-    return tmp_path
+    return _hermetic_git(tmp_path, monkeypatch)
 
 
 @pytest.fixture
@@ -115,13 +104,6 @@ def side(tmp_path) -> Path:
     path = tmp_path / "side"
     path.mkdir()
     return path
-
-
-def _git(repo: Path, *args: str) -> str:
-    proc = subprocess.run(["git", "-C", str(repo), "-c", "commit.gpgsign=false", *args],
-                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    assert proc.returncode == 0, f"git {args[0]} failed: {proc.stderr}"
-    return proc.stdout.strip()
 
 
 def _runs(repo: Path) -> list:
@@ -1260,3 +1242,26 @@ def test_the_seen_miss_names_the_nearest_record(repo, side, monkeypatch):
     other = tree.command_sha(["other"], folder=".")
     why = record.seen_answer(store, current, other, **args).why
     assert "other commands" in why
+
+
+def test_the_repeat_notice_shows_at_most_default_top_rows_and_counts_the_rest(tmp_path):
+    from jacked.testdiet.model import DEFAULT_TOP
+    from tests._testdiet import make_case, store_run
+
+    store = tmp_path / "store"
+    red = [make_case(f"tests/test_x.py::test_{n:02d}", "tests/test_x.py", 0.1, "failed")
+           for n in range(DEFAULT_TOP + 3)]
+    for day in range(DEFAULT_TOP + 5):
+        store_run(store, f"202611{day + 1:02d}T080000", exit_code=1, tests=red)
+    now = store_run(store, "20261130T080000", exit_code=1, tests=red)
+    meta = next(m for m in history.iter_runs(store) if m.id == now)
+    lines = record.repeat_notice(store, meta).splitlines()
+    assert f"in {DEFAULT_TOP + 5} earlier records" in lines[0]
+    ids = [line for line in lines if line.startswith("  tests/test_x.py::")]
+    rows = [line for line in lines if line.startswith("  local ")]
+    assert len(ids) == DEFAULT_TOP and len(rows) == DEFAULT_TOP
+    assert ("  3 more failing tests are not shown. jacked tests history --json gives each ID of the set."
+            in lines)
+    assert ("  5 more earlier records are not shown. jacked tests history --machine LABEL shows the "
+            "failing sets of each machine." in lines)
+    assert lines[-1].startswith('see "A red gate"')
