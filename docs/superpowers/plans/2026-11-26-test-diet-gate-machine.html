@@ -1360,11 +1360,10 @@ step that writes to the machine is named before it runs, and needs the owner's g
   <li><strong>The provider of the runner lane.</strong> Managed runners or the owner's Windows
   machine. The owner picks.</li>
   <li><strong>The POSIX leg of the live proof.</strong> Which Linux host.</li>
-  <li><strong>The time limit of the acceptance item "Gate machine".</strong> It says that no
-  process of the gate stays "after 60 seconds". With the ruled 60 seconds of silence, the real
-  bound is 71 seconds after the last heartbeat (60 s, 1 s for the check, 10 s of grace), and the
-  live proof waits 75 seconds. The lead decides: a new text for the acceptance item, or a shorter
-  silence limit.</li>
+  <li><strong>The time limit of the acceptance item "Gate machine": decided.</strong> The spec now
+  says that no process of the gate stays 75 seconds after the last heartbeat (60 seconds with no
+  input, then the stop and its grace period). The stop path gives at most 71 seconds, and the live
+  proof waits 75 seconds.</li>
 </ul>
 
 <hr>
