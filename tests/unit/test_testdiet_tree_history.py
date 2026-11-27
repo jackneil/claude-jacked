@@ -1515,13 +1515,15 @@ def test_two_repairs_of_one_bad_machine_id_end_with_one_identity(tmp_path, monke
     # check too, A writes, and B replaces A's valid identity. With the lock, B waits and reads A's.
     import threading
 
+    from jacked.memory import vault
     from jacked.testdiet import machine
 
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
     (home / ".claude" / machine.MACHINE_ID_NAME).write_bytes(b"cut by a power loss\n")
-    a_checked, b_checked, a_done = threading.Event(), threading.Event(), threading.Event()
-    real_write = machine.atomic_write_bytes
+    # No clock decides: A goes on when B has passed its check (no lock) or has reached the lock.
+    a_checked, b_arrived, a_done = threading.Event(), threading.Event(), threading.Event()
+    real_write, real_acquire = machine.atomic_write_bytes, vault._lock_acquire
 
     def paced(path, data, **kwargs):
         check = kwargs["before_replace"]
@@ -1530,14 +1532,20 @@ def test_two_repairs_of_one_bad_machine_id_end_with_one_identity(tmp_path, monke
             check()
             if threading.current_thread().name == "A":
                 a_checked.set()
-                b_checked.wait(2)  # no lock: B arrives; with the lock: B waits, and this times out
+                assert b_arrived.wait(30)
             else:
-                b_checked.set()
-                a_done.wait(10)
+                b_arrived.set()
+                assert a_done.wait(30)
 
         return real_write(path, data, **{**kwargs, "before_replace": before})
 
+    def acquire(fh, timeout):
+        if threading.current_thread().name == "B":
+            b_arrived.set()
+        return real_acquire(fh, timeout)
+
     monkeypatch.setattr(machine, "atomic_write_bytes", paced)
+    monkeypatch.setattr(vault, "_lock_acquire", acquire)
     got: dict[str, str | None] = {}
 
     def repair(name):
