@@ -476,8 +476,8 @@ loss.py -> git
     is the commit marker: a run with no meta file does not exist. The ID is
     <code>&lt;UTC time&gt;-&lt;8 random hex&gt;</code>.</td><td>No shared file, so parallel sessions
     cannot damage a record.</td></tr>
-    <tr><td>Retention</td><td>Nothing is deleted automatically. <code>history --size</code> prints
-    the size. <code>jacked tests prune --before DATE</code> deletes on request and prints each
+    <tr><td>Retention</td><td>Nothing is deleted automatically. <code>history</code> always prints
+    the size of the store. <code>jacked tests prune --before DATE</code> deletes on request and prints each
     deleted run.</td><td>An automatic limit drops data silently.</td></tr>
     <tr><td>Tree identity</td><td><code>TreeId(commit, tree, clean)</code>. A clean tree uses
     <code>HEAD^{tree}</code>. A tree with changes uses a copy of the index
@@ -864,7 +864,7 @@ def history(store: Path, *, machine: str | None = None, days: int | None = None)
 #       repeated_green: [{tree, command_sha, runs}], failing_sets: [{sig, runs, first, last, trees, on_default_branch, ids}],
 #       flaky: [{id, runs}], other_machines: [labels], size_bytes
 # jacked tests profile [--run ID] [--machine LABEL] [--top N] [--json]
-# jacked tests history [--machine LABEL] [--days N] [--json] [--size]
+# jacked tests history [--machine LABEL] [--days N] [--json]   (the size line always prints)
 # jacked tests prune --before YYYY-MM-DD</code></pre>
 <p><strong>Rules.</strong> With no <code>--machine</code>, a view uses the machine of the newest
 run with the label <code>full</code> and prints which machine it used. A group never mixes two
