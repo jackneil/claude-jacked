@@ -264,13 +264,14 @@ def test_cli_prune_prints_each_run_that_it_deletes(repo, monkeypatch):
     kept = [store_run(store, when, exit_code=0, tests=None) for when in ("20210101T000000", "20261125T080000")]
     out = _invoke("tests", "prune", "--before", "2021-01-01")
     assert out.exit_code == 0
-    assert out.output.splitlines() == [f"deleted {run_id}" for run_id in sorted(old)]
+    assert out.output.splitlines() == [*(f"deleted {run_id}" for run_id in sorted(old)),
+                                       "2 runs stay in the history."]
     assert sorted(_ids(store)) == sorted(kept)
     again = _invoke("tests", "prune", "--before", "2021-01-01")
     assert again.exit_code == 0 and "Nothing is deleted" in again.output
     assert _invoke("tests", "prune", "--before", "2021-13-01").exit_code == 2
 
-    def refuse(store, before, *, now=None):
+    def refuse(store, before, *, now=None, dry_run=False):
         raise history.PruneError([kept[0]], [(f"{kept[1]}.meta.json\x1b[2J", "PermissionError")])
 
     monkeypatch.setattr(history, "prune", refuse)
@@ -551,3 +552,19 @@ def test_a_written_record_holds_the_sum_of_its_test_seconds(store):
         data = history.load_tests(store, run_id)
         expected = None if data is None else views._sum(c.seconds for c in data.tests)
         assert meta.test_seconds == expected, run_id
+
+
+def test_a_run_that_the_user_stopped_is_not_the_default_profile_run(tmp_path):
+    from jacked.testdiet import history as _history
+
+    store = tmp_path / "s"
+    kept = store_run(store, "20261120T080000", exit_code=0, kind="full", tests=[make_case("a::t", "a.py", 1.0)])
+    stopped = store_run(store, "20261121T080000", exit_code=130, kind="full",
+                        tests=[make_case("a::t", "a.py", 0.1)])
+    path = store / _history.RUNS / f"{stopped}.meta.json"
+    import json as _json
+
+    raw = _json.loads(path.read_bytes())
+    raw["interrupted"] = True
+    path.write_bytes(_json.dumps(raw).encode("ascii"))
+    assert views.profile(store)["run"] == kept

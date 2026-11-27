@@ -18,6 +18,8 @@ from jacked.testdiet.model import emit
 
 #: The exit code of a command that cannot start (the shell convention).
 EXIT_NOT_STARTED = 127
+#: The exit code of a run that an interrupt stopped before the gate started (the shell convention).
+EXIT_INTERRUPTED = 130
 
 
 _SIGNAL_BASE = 128
@@ -64,6 +66,10 @@ class Signals:
         self.child_done = False
         self.raise_ok = False
         self.stopped: int | None = None
+        #: True when an interrupt (Ctrl-C) came while the gate ran.
+        self.interrupted = False
+        #: The exit code of the gate, when it stopped.
+        self.code: int | None = None
         self._old: dict = {}
 
     def install(self) -> None:
@@ -141,6 +147,10 @@ def start_and_wait(argv: list[str], cwd: Path, signals: Signals) -> int:
             code = proc.wait()
             break
         except KeyboardInterrupt:
-            emit("the run got an interrupt. It waits for the gate command to stop.")
+            if not signals.interrupted:
+                emit("the run got an interrupt: the user stopped the run. It waits for the gate "
+                     "command to stop, and the record says that the user stopped it.")
+            signals.interrupted = True
     signals.child_done = True
-    return _SIGNAL_BASE - code if code < 0 else code
+    signals.code = _SIGNAL_BASE - code if code < 0 else code
+    return signals.code

@@ -183,11 +183,12 @@ jacked tests record --junit PATH [--exit-code N] [--wall SECONDS] [--commit SHA]
 jacked tests seen [--input GLOB] [--any-machine] [--json] -- CMD...
 jacked tests profile [--run ID] [--machine LABEL] [--top N] [--json]
 jacked tests history [--machine LABEL] [--days N] [--size] [--json]
-jacked tests prune --before YYYY-MM-DD
+jacked tests prune --before YYYY-MM-DD [--dry-run]
 jacked tests loss [--base REF] [--json]
 ```
 
 - `jacked tests run` runs CMD, records the run, and returns the exit code of CMD. A recorder error never changes that code. The one exception is `--strict`: it gives exit 1 when the gate returns 0 and the report holds failures. When CMD cannot start, the exit code is 127. When signal N stops CMD, the exit code is 128 plus N. A SIGTERM or a SIGHUP to `run` goes on to CMD. Under `nohup`, SIGHUP stays ignored for CMD, as with `nohup CMD`. Put the options before CMD. Put `--` between the options and CMD.
+  - Ctrl-C before the gate starts gives exit 130, and jacked records nothing. Ctrl-C while the gate runs goes to the gate too. Then the exit code is the code of the gate, and the record says that the user stopped the run. `profile` does not use such a run as the newest full run. Ctrl-C after the gate stops makes `run` write the record without the tree after the gate, so that run cannot prove a tree.
   - The placeholder `{junit}`: an argument that holds the text `{junit}` gets the path of a private report file. `run` makes a private temporary folder for it, reads the report after the gate, and then removes the folder. The record holds the SHA-256 of the arguments as you typed them, so the path does not change the identity of the command.
   - A command with no `{junit}` and a run with no `--junit` have no report. Then `run` prints one line before the gate: the run cannot prove a tree.
   - After each record, `run` prints one line: `recorded <run id>, verdict <verdict>.`
@@ -195,13 +196,14 @@ jacked tests loss [--base REF] [--json]
   - `--junit GLOB`: use it for a runner that writes its report at a fixed path. Before the gate, `run` takes the SHA-256 of each file that matches. After the gate, it reads each match that is new or that has new content. It prints one line for each match that it did not read, so an old report never becomes this run.
   - `--kind full|targeted` is a label for `profile` and `history` only.
   - The verdict of a run is one of five values. `passed`: exit code 0, a report with at least one test, and no failed or error test. `failed`: an exit code that is not 0. `conflict`: exit code 0 and a failed or an error test in the report. `no-data`: exit code 0 and no test data. `unknown`: no exit code. A pipe can turn a red gate into exit code 0, and then the verdict is `conflict`.
+  - A conflict prints one line. Without `--strict`, the line says that `seen` does not accept the run, and that `--strict` gives exit 1.
   - When git cannot read the work tree (for example, a file that you cannot read, or a clean filter that git cannot start), `run` prints one line with the first error line of git, and the run cannot prove a tree. `seen` prints the same line. A repository with no commit gives a line too.
   - A gate can change a path that git sees, for example a cache file that git does not ignore. Then `run` prints each changed path, and the run cannot prove a tree. Add these paths to `.gitignore`.
-  - A red run whose failing set is in an earlier record prints a notice. The notice gives the number of earlier records, the number of trees, and how many of the records are on the default branch. A count that some records do not hold prints as in `history`: `K (M not recorded)`, or `not recorded (N runs)`. Then it gives the failing test IDs and one line for each earlier record, by machine. It does not say whose defect it is.
+  - A red run whose failing set is in an earlier record prints a notice. The notice gives the number of earlier records, the number of trees, and how many of the records are on the default branch. A count that some records do not hold prints as in `history`: `K (M not recorded)`, or `not recorded (N runs)`. Then it gives the failing test IDs and one line for each earlier record, by machine. It does not say whose defect it is. The last line points to "A red gate" in this reference.
   - Outside a git repository, the gate runs and jacked records nothing. The line says which git failure it is: no git program, a git call that does not answer, a repository that another user owns (git names `safe.directory`), or a folder outside a work tree. The line holds the first error line of git. The other commands print the same line and give exit 1.
   - Each output line of `jacked tests` is one line. A line break or a bidi control in a stored value (a test ID, a file name, the text of an error) prints as an escape, for example `\n` or `\u2028`.
 - `jacked tests record` records the JUnit files of a gate run that `run` did not wrap, for example a run on hosted CI. Without `--exit-code`, the verdict is `unknown`. `--machine LABEL` names the machine that ran the gate. `--report-root PATH` gives the root folder of the machine that wrote the report, so the reader can make the paths relative. `--started ISO` needs a time zone. The command prints `<run id> <verdict>`.
-- `jacked tests seen` looks for a wrapped run on this machine that proves that this tree passed this command. When it finds one, it prints one line about the run and gives exit 0. When not, it prints one line and gives exit 1.
+- `jacked tests seen` looks for a wrapped run on this machine that proves that this tree passed this command. When it finds one, it prints one line that starts with `passed before:` and gives exit 0. When not, it prints one line and gives exit 1. That line names the nearest record and what to do: a run on another machine, a run with other `--input` files, a run of another command or in another folder, or only records of `record`.
   - A run proves it when all of these are true: `run` made it, its verdict is `passed`, and the gate did not change the tree. The tree hash, the command SHA-256 and the `--input` fingerprint must also be equal.
   - The newest run of the same tree, command, folder, inputs and machine decides. When that run did not pass, `seen` gives exit 1, and its line names that run and the cause. An older pass never hides a newer failure.
   - The command identity holds the folder that the gate ran in, relative to the top of the work tree. A run in `sub` never proves the same command at the top, because the same command can collect a different set of tests in a different folder. Run `seen` in the folder where the gate runs. The hit line names that folder.
@@ -214,14 +216,14 @@ jacked tests loss [--base REF] [--json]
   - It prints the number of files that hold half of the test seconds. When each file took 0 seconds, it prints `every file took 0 seconds`. When some files have no time and each other file took 0 seconds, it prints `every file with a time took 0 seconds`.
   - A value that the record does not hold prints as text (`no time recorded`, `no time`, `kind not given`), never as 0 or as an empty space. The JSON gives `null`.
   - `--top N` sets the rows of each text table, and `--json` prints all rows. It prints a setup share only when the record holds one, and a JUnit report never holds one.
-  - With no run in the history, `profile` gives exit 1. An unknown `--run` or `--machine` also gives exit 1.
+  - With no run in the history, `profile` gives exit 1, and its line says to run the gate with `jacked tests run` first. An unknown `--run` or `--machine` also gives exit 1. The line for an unknown `--machine` gives the machine labels in the history.
 - `jacked tests history` shows the runs of one machine.
   - It shows the verdict counts, the failing sets and the flaky tests. It also shows the trees that passed one command two times or more, and the labels of the other machines.
   - `--days N` shows only the last N days. `--size` adds the size of the history in bytes.
   - A value that the record does not hold prints as text, never as 0. A count of a failing set that no run holds prints `not recorded (N runs)`. A count that only some runs hold prints `K (M not recorded)`. A size that jacked cannot read prints `the folder cannot be read`.
   - With no run in the history, `history` prints one line and gives exit 0. An unknown `--machine` gives exit 1.
-- `jacked tests prune --before YYYY-MM-DD` deletes each run whose UTC date is before that date. It prints `deleted <run id>` for each deleted run. jacked deletes nothing automatically.
-- `jacked tests loss` compares the work tree with the merge base of HEAD and `--base REF`. The work tree includes the commits, the changes that are not committed, and the untracked files that git does not ignore. With no `--base`, REF is `refs/remotes/origin/HEAD`. `loss` does no fetch. It is a report, and it gives exit 0 for each result.
+- `jacked tests prune --before YYYY-MM-DD` deletes each run whose UTC date is before that date. It prints `deleted <run id>` for each deleted run. Then it prints the number of runs that stay. With `--dry-run`, it prints `would delete <run id>` for each run, and it deletes nothing. jacked deletes nothing automatically.
+- `jacked tests loss` compares the work tree with the merge base of HEAD and `--base REF`. The work tree includes the commits, the changes that are not committed, and the untracked files that git does not ignore. With no `--base`, REF is `refs/remotes/origin/HEAD`. `loss` does no fetch. It is a report: it gives exit 0 when it makes a report, also a report with a loss.
   - The output lines are `base <commit> (<ref>)`, `net <+N|-N|0>` and `added N, removed N`. Then come the lines `removed <test>`, `added <test>`, `moved <old> -> <new>`, `fewer assertions <test>`, `fewer cases <test> <before> -> <after>`, `skip mark added <test>`, `not read <test> (<reason>)` and `not read file <path> (<kind>)`.
   - A renamed file, a test that moves to a different file, and an edited parameter value give no loss. A test that gets a new name inside one file shows as one removed test and one added test.
   - `loss` counts these cases: the literal lists of Python parametrize marks, the rows of a literal `.each` table (TypeScript and JavaScript), and the `t.Run` calls of a Go test.
@@ -285,6 +287,11 @@ Claude-only artifacts excluded from Codex: the `chain-of-command` and `recover`
 skills, and the `swarm`, `goal-maker`, `browser-reset`, and `jacked-setup`
 commands (each is wired to Claude Code machinery Codex has no analog for).
 Upgrades prune any previously-shipped copies of these.
+
+Codex does not start the `cleanup` command or the `review-animations` skill
+by itself. Each one sets `disable-model-invocation: true`, so the install gives
+its Codex skill an `agents/openai.yaml` with `allow_implicit_invocation: false`.
+To start one in Codex, type `$cleanup` or `$review-animations`.
 
 Manifest and uninstall: everything above is recorded in
 `~/.codex/jacked-codex-manifest.json` (skills, prompts, agents, mcp, hooks), which

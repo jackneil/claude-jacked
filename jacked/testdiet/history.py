@@ -55,7 +55,7 @@ _TUPLE_FIELDS = ("failing", "flaky")
 _INT_FIELDS = ("exit_code",)
 _NUMBER_FIELDS = ("wall_seconds", "seconds_reported", "load_start", "load_end", "child_cpu_seconds",
                   "test_seconds")
-_BOOL_FIELDS = ("tree_changed", "on_default_branch")
+_BOOL_FIELDS = ("tree_changed", "on_default_branch", "interrupted")
 
 
 class DamagedRecordError(ValueError):
@@ -317,8 +317,20 @@ def load_tests(store: Path, run_id: str) -> RunData | None:
         return None
 
 
-def prune(store: Path, before: date, *, now: datetime | None = None) -> list[str]:
+def run_ids(store: Path) -> set[str]:
+    """Return the ID of each run that has a meta file in ``store``."""
+    try:
+        names = os.listdir(Path(store) / RUNS)
+    except FileNotFoundError:
+        return set()
+    return {name[: -len(META_SUFFIX)] for name in names
+            if name.endswith(META_SUFFIX) and RUN_ID_RE.fullmatch(name[: -len(META_SUFFIX)])}
+
+
+def prune(store: Path, before: date, *, now: datetime | None = None, dry_run: bool = False) -> list[str]:
     """Delete each run whose UTC date is before ``before``. Return the deleted run IDs, sorted.
+
+    With ``dry_run``, delete nothing, and return the IDs that a prune deletes.
 
     For a complete run, the meta file goes first, so the run is gone in one
     step, and then its tests file. A tests file with no meta file is a write
@@ -350,6 +362,9 @@ def prune(store: Path, before: date, *, now: datetime | None = None) -> list[str
         suffixes = found[run_id]
         if META_SUFFIX not in suffixes and id_time(run_id) >= orphan_limit:
             continue  # a write can still be in progress
+        if dry_run:
+            deleted.append(run_id)
+            continue
         gone = False
         for suffix in (META_SUFFIX, TESTS_SUFFIX):
             if suffix not in suffixes:

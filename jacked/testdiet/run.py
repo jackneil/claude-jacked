@@ -24,7 +24,7 @@ from jacked.public_errors import os_error_reason
 from jacked.testdiet import globs, history, machine, reports, tree
 from jacked.testdiet.cleanup import remove_tree_quietly
 from jacked.testdiet.model import SCHEMA, RunMeta, TreeId, emit
-from jacked.testdiet.process import Signals, Stopped, start_and_wait
+from jacked.testdiet.process import EXIT_INTERRUPTED, Signals, Stopped, start_and_wait
 from jacked.testdiet.record import (
     _LOCAL,
     INPUTS_UNAVAILABLE,
@@ -91,6 +91,12 @@ def run_gate(argv: Sequence[str], *, cwd: Path, junit: Sequence[str] = (), input
     signals.install()
     try:
         return _run_gate(argv, cwd, signals, junit, inputs, kind, label, runner, strict)
+    except KeyboardInterrupt:
+        if signals.code is not None:
+            return signals.code  # the gate is done: its exit code stays the result
+        emit("the run got an interrupt before the gate started. The gate did not run, and the run "
+             "is not recorded.")
+        return EXIT_INTERRUPTED
     finally:
         signals.restore()
 
@@ -138,7 +144,7 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
         cpu_end = _guard("read the processor time", _child_cpu, None)
         load_end = _load()
         # What the post-run steps know. A stop keeps the values that are read.
-        known: dict = {"data": None, "changed": None, "written": False}
+        known: dict = {"data": None, "changed": None, "written": False, "meta": None}
 
         def build() -> RunMeta:
             data = known["data"]
@@ -157,10 +163,12 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                 failing=_failing(data), flaky=_flaky(data),
                 failing_sig=history.failing_signature(data.tests) if data else None,
                 folder=folder, schema=SCHEMA, test_seconds=history.sum_test_seconds(data),
+                interrupted=signals.interrupted,
             )
 
         def write() -> RunMeta:
-            meta = build()
+            # One meta for each run: a second write of it replaces the same files.
+            meta = known["meta"] = build()
             notice = _guard("read the earlier records", lambda: repeat_notice(store, meta), None)
             if _write_record(store, meta, known["data"]):
                 known["written"] = True
@@ -198,17 +206,22 @@ def _run_gate(argv: list[str], cwd: Path, signals: Signals, junit: Sequence[str]
                 _guard("write the record", lambda: _write_record(store, build(), known["data"]), None)
             return code
         except KeyboardInterrupt:
-            # The gate is done. An interrupt now stops only the recorder.
-            emit("the run got an interrupt after the gate stopped. The recorder stops; "
-                 "the exit code is the code of the gate.")
+            # The gate is done. An interrupt now stops only the recorder, as a SIGTERM does.
+            emit("the run got an interrupt after the gate stopped. The recorder skips its other steps "
+                 "and writes the record, which cannot prove a tree. The exit code is the code of the gate.")
+            if not known["written"]:
+                meta = known["meta"] or build()
+                _guard("write the record", lambda: _write_record(store, meta, known["data"]), None)
             return code
         data = known["data"]
         verdict = meta.verdict if meta is not None else _guard(
             "find the verdict", lambda: history.verdict_of(code, data), None)
         if verdict == "conflict":
             failing = len(_failing(data))
-            emit(f"the gate returned 0, but the report holds failures ({failing} failed or error tests)."
-                 + (" --strict makes the exit code 1." if strict else ""))
+            tests = "test" if failing == 1 else "tests"
+            emit(f"the gate returned 0, but the report holds failures ({failing} failed or error {tests}). "
+                 + ("--strict makes the exit code 1." if strict else
+                    "This run is not a pass, and seen does not accept it. Give --strict to get exit 1."))
             if strict:
                 return 1
         return code
@@ -241,7 +254,7 @@ def _read_tree(cwd: Path, objects: Path | None, *, quiet: bool = False) -> TreeI
     """The tree identity. When there is none, one line says why, unless ``quiet``."""
     found, problem = tree.tree_state(cwd, objects=objects)
     if found is None and not quiet:
-        emit(f"{problem}, so this run cannot prove a tree.")
+        emit(f"{problem}, so this run cannot prove a tree. Run git status to see the cause.")
     return found
 
 
@@ -273,14 +286,16 @@ def _tree_changed(before: TreeId | None, after: TreeId | None) -> bool | None:
 def _print_changes(cwd: Path, before: TreeId, after: TreeId, objects: Path | None) -> None:
     if before.tree == after.tree:
         emit("the gate changed the HEAD commit. The content of the tree is the same. "
-             "This run cannot prove a tree.")
+             "This run cannot prove a tree. Make the gate keep HEAD as it is.")
         return
     try:
         paths = tree.changed_paths(cwd, before, after, objects=objects)
     except tree.TreeError:
         emit("the gate changed the work tree. The changed paths are not available. "
-             "This run cannot prove a tree.")
+             "This run cannot prove a tree. Run git status to see the changed paths.")
         return
-    emit(f"the gate changed {len(paths)} path(s) in the work tree. This run cannot prove a tree:")
+    count = "1 path" if len(paths) == 1 else f"{len(paths)} paths"
+    emit(f"the gate changed {count} in the work tree. This run cannot prove a tree:")
     for path in paths:
         emit(f"  {path}")
+    emit("add these paths to .gitignore, or make the gate write them outside the work tree.")

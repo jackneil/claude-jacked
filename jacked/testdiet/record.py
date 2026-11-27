@@ -155,9 +155,14 @@ def parse_started(text: str) -> str:
     >>> parse_started("2026-11-26T09:25:01-05:00")
     '2026-11-26T14:25:01+00:00'
     """
-    moment = datetime.fromisoformat(text)
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(f"the start time {one_line(text)!r} is not an ISO 8601 time. Give a time such "
+                         "as 2026-11-26T09:00:00+00:00 or 2026-11-26T09:00:00Z") from None
     if moment.tzinfo is None:
-        raise ValueError("the start time must have a time zone (for example +00:00 or Z)")
+        raise ValueError("the start time must have a time zone. Give a time such as "
+                         "2026-11-26T09:00:00+00:00 or 2026-11-26T09:00:00Z")
     return moment.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
@@ -242,7 +247,41 @@ def seen_answer(store: Path, tree_value: TreeId, command_sha: str, *, folder: st
         if not any_machine:
             break
     decider = next(iter(deciders.values()), None)
-    return SeenAnswer(None, decider, _not_proved(decider) if decider is not None else "")
+    if decider is not None:
+        return SeenAnswer(None, decider, _not_proved(decider))
+    return SeenAnswer(None, None, _nearest(store, tree_value, command_sha, folder, inputs_sha,
+                                           machine_id, any_machine))
+
+
+def _nearest(store: Path, tree_value: TreeId, command_sha: str, folder: str, inputs_sha: str | None,
+             machine_id: str | None, any_machine: bool) -> str:
+    """One line that names the nearest record when no run of the same identity exists.
+
+    The order: the same identity on another machine, the same command with
+    other ``--input`` files, other commands in this folder, a run in another
+    folder, a record of ``record``. Each line ends with what to do.
+    """
+    same_tree = [m for m in history.iter_runs(store) if m.tree is not None and m.tree.tree == tree_value.tree]
+    runs = [m for m in same_tree if m.source == "run" and m.schema == SCHEMA]
+    same_command = [m for m in runs if m.command_sha == command_sha and m.folder == folder]
+    if not any_machine and any(m.inputs_sha == inputs_sha and m.machine_id != machine_id for m in same_command):
+        return ("a run of this tree and this command is on another machine. Give --any-machine to accept "
+                "a run of any machine.")
+    mine = [m for m in same_command if any_machine or m.machine_id == machine_id]
+    if mine:
+        return ("the runs of this tree and this command have other --input files. Run the gate with "
+                "jacked tests run, with the same --input options.")
+    if any(m.folder == folder for m in runs):
+        return ("the runs of this tree in this folder have other commands. Run seen with the same "
+                "command that jacked tests run ran, or run that command with jacked tests run.")
+    other = sorted({one_line(m.folder) for m in runs if m.folder is not None and m.folder != folder})
+    if other:
+        return (f"the runs of this tree are in the folder {', '.join(other)}, not in {one_line(folder)}. "
+                "Run seen in the folder of the gate.")
+    if same_tree:
+        return ("this tree has only records of jacked tests record, and seen accepts only a run of "
+                "jacked tests run. Run the gate with jacked tests run.")
+    return "no run of this tree is in the history. Run the gate with jacked tests run."
 
 
 def seen(store: Path, tree_value: TreeId, command_sha: str, *, folder: str, inputs_sha: str | None,
@@ -288,6 +327,8 @@ def repeat_notice(store: Path, meta: RunMeta) -> str | None:
         flag = ", default branch" if m.on_default_branch is True else ""
         lines.append(f"  {label_text(m.machine)} {m.id} {one_line(m.started)} {one_line(m.source)} "
                      f"{place}{flag}")
+    lines.append('see "A red gate" in jacked-reference.md: a failure on the base branch never clears '
+                 "the branch.")
     return "\n".join(lines)
 
 
@@ -298,5 +339,5 @@ def seen_line(meta: RunMeta) -> str:
     """
     counts = ", ".join(f"{one_line(k)} {v}" for k, v in (meta.counts or {}).items()) or "no counts"
     wall = "unknown" if meta.wall_seconds is None else f"{meta.wall_seconds} s"
-    return clean_text(f"{meta.id} started {one_line(meta.started)}, folder {one_line(meta.folder)}, "
-                      f"wall {wall}, {counts}")
+    return clean_text(f"passed before: {meta.id} started {one_line(meta.started)}, "
+                      f"folder {one_line(meta.folder)}, wall {wall}, {counts}")

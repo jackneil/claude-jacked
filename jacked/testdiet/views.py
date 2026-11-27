@@ -47,11 +47,14 @@ def _identity_note(runs: list[RunMeta], pick: RunMeta, which: str) -> list[str]:
 def _select(runs: list[RunMeta], machine: str | None) -> tuple[tuple[str | None, str | None], list[str]]:
     """Return the machine of a view and the lines that say why. ``runs`` is newest first."""
     if not runs:
-        raise ViewError("the history has no run")
+        raise ViewError("the history has no run. Run the gate with jacked tests run first.")
     candidates = runs if machine is None else [m for m in runs if m.machine == machine]
     if not candidates:
-        raise ViewError(f"the history has no run of the machine {machine}")
-    full = [m for m in candidates if m.kind == "full"]
+        labels = ", ".join(sorted({label_text(m.machine) for m in runs}))
+        raise ViewError(f"the history has no run of the machine {machine}. The machine labels in the "
+                        f"history: {labels}.")
+    # A run that the user stopped (Ctrl-C) is not the newest full run.
+    full = [m for m in candidates if m.kind == "full" and not m.interrupted]
     pick = full[0] if full else candidates[0]
     if machine is None:
         why = "the machine of the newest full run" if full else \
@@ -160,7 +163,7 @@ def profile(store: Path, run_id: str | None = None, *, machine: str | None = Non
     else:
         key, notes = _select(runs, machine)
         mine = [m for m in runs if _key(m) == key]
-        meta = next((m for m in mine if m.kind == "full"), mine[0])
+        meta = next((m for m in mine if m.kind == "full" and not m.interrupted), mine[0])
     data = _history.load_tests(store, meta.id)
     tests = data.tests if data is not None else ()
     if data is None:

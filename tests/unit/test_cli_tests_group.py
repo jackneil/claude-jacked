@@ -98,7 +98,7 @@ def test_cli_seen_matches_only_the_folder_where_the_gate_ran(repo, monkeypatch):
     assert _invoke("tests", "seen", "--", *argv).exit_code == 1
     assert _invoke("tests", "run", "--", *argv).exit_code == 0
     hit = _invoke("tests", "seen", "--", *argv)
-    assert hit.exit_code == 0 and "folder sub" in hit.stdout
+    assert hit.exit_code == 0 and "folder sub" in hit.stdout and hit.stdout.startswith("passed before: ")
     monkeypatch.chdir(repo)
     hit = _invoke("tests", "seen", "--", *argv)
     assert hit.exit_code == 0 and "folder ." in hit.stdout
@@ -252,3 +252,52 @@ def test_cli_names_a_dubious_ownership_refusal_and_not_a_missing_repository(repo
         assert result.exit_code == 0
     else:
         assert result.exit_code == 1
+
+
+def test_cli_run_gives_130_and_no_aborted_line_for_an_interrupt_before_the_gate(repo, monkeypatch):
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tree, "tree_state", interrupt)
+    result = _invoke("tests", "run", "--", *gate(GREEN, 0))
+    assert result.exit_code == 130 and "Aborted" not in result.output
+
+
+def test_cli_prune_dry_run_deletes_nothing_and_both_print_the_kept_count(repo):
+    for code in (0, 0):
+        _invoke("tests", "run", "--", *gate(GREEN, code))
+    store = tree.store_dir(repo)
+    dry = _invoke("tests", "prune", "--dry-run", "--before", "2099-01-01")
+    assert dry.exit_code == 0
+    assert sum(line.startswith("would delete ") for line in dry.stdout.splitlines()) == 2
+    assert "0 runs stay" in dry.stdout and len(list(history.iter_runs(store))) == 2
+    real = _invoke("tests", "prune", "--before", "2000-01-01")
+    assert "2 runs stay" in real.stdout + real.stderr
+    real = _invoke("tests", "prune", "--before", "2099-01-01")
+    assert real.stdout.count("deleted ") == 2 and "0 runs stay" in real.stdout
+
+
+def test_cli_wording_of_help_and_errors(repo):
+    loss_help = _invoke("tests", "loss", "--help").stdout
+    assert "exit 1" in loss_help and "it exits 0." not in loss_help
+    assert all(len(line) <= 80 for line in loss_help.splitlines())
+    started = _invoke("tests", "record", "--junit", str(GREEN), "--started", "yesterday")
+    assert started.exit_code == 2 and "Invalid isoformat" not in started.output
+    assert "2026-11-26T09:00:00+00:00" in started.output
+    assert "views" in _invoke("tests", "run", "--help").stdout.split("--label", 1)[1].split("--", 1)[0]
+    empty = _invoke("tests", "profile")
+    assert empty.exit_code == 1 and "jacked tests run" in empty.stderr
+    _invoke("tests", "run", "--", *gate(GREEN, 0))
+    unknown = _invoke("tests", "profile", "--machine", "ci")
+    assert unknown.exit_code == 1 and "local" in unknown.stderr
+
+
+def test_cli_seen_outside_a_repository_prints_one_line(tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    result = _invoke("tests", "seen", "--", "pytest")
+    assert result.exit_code == 1 and len(result.stderr.splitlines()) == 1
+    assert "this tree" not in result.stderr
+

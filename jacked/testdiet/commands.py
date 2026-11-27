@@ -56,7 +56,8 @@ def _started_option(ctx, param, value):
               help="A file that the gate reads and git does not see. Its fingerprint is recorded.")
 @click.option("--kind", type=click.Choice(_KINDS), default=None,
               help="A label for the views only.")
-@click.option("--label", default=None, callback=_label_option, help="A label: [A-Za-z0-9._-]+.")
+@click.option("--label", default=None, callback=_label_option,
+              help="A free name for the run, for the views (history, profile). [A-Za-z0-9._-]+.")
 @click.option("--runner", type=click.Choice(_RUNNERS), default=None,
               help="The runner of the report. Found from the report when not given.")
 @click.option("--strict", is_flag=True, help="Exit 1 when the gate returns 0 and the report holds failures.")
@@ -83,7 +84,8 @@ def run_command(ctx, junit, inputs, kind, label, runner, strict, command):
 @click.option("--junit", "junit", multiple=True, required=True, metavar="PATH",
               type=click.Path(dir_okay=False, path_type=Path), help="A JUnit file of the run.")
 @click.option("--kind", type=click.Choice(_KINDS), default=None, help="A label for the views only.")
-@click.option("--label", default=None, callback=_label_option, help="A label: [A-Za-z0-9._-]+.")
+@click.option("--label", default=None, callback=_label_option,
+              help="A free name for the run, for the views (history, profile). [A-Za-z0-9._-]+.")
 @click.option("--runner", type=click.Choice(_RUNNERS), default=None,
               help="The runner of the report. Found from the report when not given.")
 @click.option("--exit-code", "exit_code", type=int, default=None,
@@ -244,23 +246,31 @@ def history_command(machine, days, as_json, size):
 @recorder_group.command(name="prune")
 @click.option("--before", required=True, type=click.DateTime(formats=["%Y-%m-%d"]), metavar="YYYY-MM-DD",
               help="Delete each run whose UTC date is before this date.")
-def prune_command(before):
-    """Delete the runs before a date. Print each run that is deleted."""
+@click.option("--dry-run", is_flag=True, help="Print the runs that prune deletes, and delete nothing.")
+def prune_command(before, dry_run):
+    """Delete the runs before a date. Print each run that is deleted, and the count that stays."""
     from jacked.testdiet import history as _history
 
     store = _store_or_exit()
     try:
-        deleted = _history.prune(store, before.date())
+        deleted = _history.prune(store, before.date(), dry_run=dry_run)
     except _history.PruneError as exc:
         for run_id in exc.deleted:
             click.echo(_model.clean_text(f"deleted {run_id}"))
         for name, error in exc.failed:
             _model.emit(f"cannot delete {name} ({error})")
+        click.echo(_kept_line(len(_history.run_ids(store))))
         raise SystemExit(1)
+    verb = "would delete" if dry_run else "deleted"
     for run_id in deleted:
-        click.echo(_model.clean_text(f"deleted {run_id}"))
+        click.echo(_model.clean_text(f"{verb} {run_id}"))
     if not deleted:
         _model.emit(f"no run is before {before:%Y-%m-%d}. Nothing is deleted.")
+    click.echo(_kept_line(len(_history.run_ids(store) - set(deleted))))
+
+
+def _kept_line(count: int) -> str:
+    return "1 run stays in the history." if count == 1 else f"{count} runs stay in the history."
 
 
 @recorder_group.command(name="loss")
@@ -268,7 +278,10 @@ def prune_command(before):
               help="Compare with the merge base of HEAD and REF. Default REF: refs/remotes/origin/HEAD.")
 @click.option("--json", "as_json", is_flag=True, help="Print the report as JSON.")
 def loss_command(base, as_json):
-    """Show the tests that the change removes or weakens. This is a report: it exits 0.
+    """Show the tests that the change removes or weakens.
+
+    It gives exit 0 when it makes a report, also a report with a loss. It
+    gives exit 1 when it cannot make a report.
 
     The change is the work tree against the base: commits, changes that are
     not committed and untracked files. A renamed file, a moved test and an
@@ -281,9 +294,9 @@ def loss_command(base, as_json):
     a Go test. A t.Run inside a for-range loop over a slice literal (inline,
     or assigned in the same function and not assigned again) counts each
     element of that literal. A t.Run in a loop over any other value, a
-    computed case list and a fixture parameter are not counted. A test on both sides whose cases or body the report
-    cannot read prints a not read line. A file that is not read prints a
-    not read file line.
+    computed case list and a fixture parameter are not counted. A test on
+    both sides whose cases or body the report cannot read prints a not read
+    line. A file that is not read prints a not read file line.
     """
     import dataclasses
     import json as _json

@@ -160,6 +160,8 @@ class RunMeta:
     ``machine`` is None when a stored record holds no valid label.
     ``test_seconds`` is the sum of the seconds of the tests that have a
     time, or None when no test has one (or the run has no report).
+    ``interrupted`` is True when the user stopped the run (Ctrl-C) while
+    the gate ran, False when not, and None for a record of ``record``.
     """
 
     id: str
@@ -189,6 +191,7 @@ class RunMeta:
     folder: str | None = None
     schema: int | None = None
     test_seconds: float | None = None
+    interrupted: bool | None = None
 
 
 class JUnitError(ValueError):

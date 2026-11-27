@@ -322,7 +322,11 @@ def test_exit_0_with_failures_in_the_report_is_a_conflict_and_is_printed(repo, c
     assert run.run_gate(junit_gate(0, RED), cwd=repo) == 0
     assert _last(repo).verdict == "conflict"
     lines = [line for line in capsys.readouterr().err.splitlines() if "returned 0" in line]
-    assert len(lines) == 1 and "failures" in lines[0]
+    assert len(lines) == 1 and "1 failed or error test)" in lines[0] and "error tests" not in lines[0]
+    assert "seen does not accept it" in lines[0] and "Give --strict" in lines[0]
+    run.run_gate(junit_gate(0, RED), cwd=repo, strict=True)
+    lines = [line for line in capsys.readouterr().err.splitlines() if "returned 0" in line]
+    assert len(lines) == 1 and "--strict makes the exit code 1" in lines[0]
 
 
 def test_strict_returns_1_on_a_conflict_and_the_gate_code_in_each_other_case(repo):
@@ -431,14 +435,31 @@ def test_a_sigterm_to_the_run_records_and_cleans_up(repo, side, tmp_path, monkey
     assert restored is caught  # the run put the handler of the test back
 
 
-def test_an_interrupt_after_the_gate_keeps_its_exit_code(repo, monkeypatch, capsys):
+def test_an_interrupt_after_the_gate_keeps_its_exit_code_and_writes_a_record_that_proves_nothing(
+        repo, monkeypatch, capsys):
     def interrupt(*args, **kwargs):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(junit, "read_junit", interrupt)
-    assert run.run_gate(junit_gate(5, RED), cwd=repo) == 5
-    assert "after the gate stopped" in capsys.readouterr().err
-    assert _runs(repo) == []
+    assert run.run_gate(junit_gate(0, GREEN), cwd=repo) == 0
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "after the gate stopped" in line]
+    assert len(lines) == 1 and "cannot prove a tree" in lines[0]
+    [meta] = _runs(repo)
+    assert meta.exit_code == 0 and meta.tree_changed is None and meta.counts is None
+    assert _seen(repo, junit_gate(0, GREEN)) is None
+
+
+def test_an_interrupt_before_the_gate_gives_130_and_runs_no_gate(repo, side, monkeypatch, capsys):
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    marker = side / "ran"
+    monkeypatch.setattr(tree, "tree_state", interrupt)
+    assert run.run_gate(gate(0, "write", str(marker)), cwd=repo) == 130
+    lines = [line for line in capsys.readouterr().err.splitlines() if "interrupt" in line]
+    assert len(lines) == 1 and "before the gate started" in lines[0]
+    assert not marker.exists() and _runs(repo) == []
 
 
 @POSIX
@@ -463,8 +484,12 @@ def test_an_interrupt_of_the_parent_waits_for_the_child(repo, monkeypatch, capsy
     monkeypatch.setattr(subprocess, "Popen", InterruptOnce)
     assert run.run_gate(gate(3, "sleep", "0.2"), cwd=repo) == 3
     assert interrupted == [True]
-    assert _last(repo).exit_code == 3
-    assert "interrupt" in capsys.readouterr().err
+    meta = _last(repo)
+    assert meta.exit_code == 3 and meta.interrupted is True
+    lines = [line for line in capsys.readouterr().err.splitlines() if "interrupt" in line]
+    assert len(lines) == 1 and "the user stopped the run" in lines[0]
+    run.run_gate(gate(0), cwd=repo)
+    assert _last(repo).interrupted is False
 
 
 def test_run_outside_a_git_repository_records_nothing_and_keeps_the_exit_code(hermetic_git, capsys):
@@ -483,7 +508,11 @@ def test_run_outside_a_git_repository_records_nothing_and_keeps_the_exit_code(he
 def test_a_gate_that_writes_a_file_into_the_tree_is_named_and_never_seen(repo, capsys):
     argv = [*junit_gate(0, GREEN), "write", str(repo / "made-by-gate.txt")]
     assert run.run_gate(argv, cwd=repo) == 0
-    assert "made-by-gate.txt" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "made-by-gate.txt" in err and "changed 1 path in the work tree" in err
+    lines = err.splitlines()
+    path_line = next(i for i, line in enumerate(lines) if "made-by-gate.txt" in line)
+    assert ".gitignore" in lines[path_line + 1]
     meta = _last(repo)
     assert meta.tree_changed is True and meta.verdict == "passed"
     found = record.seen(tree.store_dir(repo), meta.tree, meta.command_sha, folder=".", inputs_sha=None,
@@ -828,8 +857,8 @@ def test_the_notice_groups_records_by_machine_and_has_no_date_range(repo, capsys
     text = record.repeat_notice(tree.store_dir(repo), _last(repo))
     lines = text.splitlines()
     assert "2 earlier records" in lines[0] and " to " not in lines[0] and "from" not in lines[0]
-    rows = [line.strip() for line in lines[lines.index("the earlier records, by machine:") + 1:]]
-    assert len(rows) == 2
+    rows = [line.strip() for line in lines[lines.index("the earlier records, by machine:") + 1:-1]]
+    assert len(rows) == 2 and lines[-1].startswith('see "A red gate"')
     assert rows[0].startswith(f"ci {ci.id} 2026-11-01T00:00:00+00:00 record")
     assert rows[1].startswith("local ")
 
@@ -959,8 +988,9 @@ def test_the_repeat_notice_shows_a_record_with_no_label_after_each_real_label(tm
     assert notice is not None
     lines = notice.splitlines()
     assert lines[0].startswith("the same failing set is in 2 earlier records")
-    records = lines[lines.index("the earlier records, by machine:") + 1:]
+    records = lines[lines.index("the earlier records, by machine:") + 1:-1]
     assert [line.split()[:2] for line in records] == [["ci", ci], ["(no", "label)"]]
+    assert lines[-1].startswith('see "A red gate"')
     assert no_label in records[1] and "None" not in notice
 
 
@@ -979,7 +1009,7 @@ def test_a_test_id_with_a_line_break_prints_on_one_line_in_the_notice_and_in_see
     shown = dataclasses.replace(meta, started="2026-11-21\nfake line", counts={"passed\nx": 1})
     line = record.seen_line(shown)
     assert "\n" not in line
-    assert line == f"{now} started 2026-11-21\\nfake line, folder ., wall 100.0 s, passed\\nx 1"
+    assert line == f"passed before: {now} started 2026-11-21\\nfake line, folder ., wall 100.0 s, passed\\nx 1"
 
 
 def test_the_repeat_notice_of_run_prints_one_line_for_a_test_id_with_u2028(repo, side, capsys):
@@ -1196,3 +1226,37 @@ def test_cli_seen_names_the_newer_run_that_failed(repo, side, monkeypatch):
     result = CliRunner().invoke(main, ["tests", "seen", "--", *argv], catch_exceptions=False)
     assert result.exit_code == 1
     assert newer in result.stderr and "failed" in result.stderr
+
+
+def test_the_repeat_notice_ends_with_the_next_action(tmp_path):
+    from tests._testdiet import make_case, store_run
+
+    store = tmp_path / "store"
+    red = [make_case("tests/test_x.py::test_fails", "tests/test_x.py", 0.1, "failed")]
+    store_run(store, "20261120T080000", exit_code=1, tests=red)
+    now = store_run(store, "20261121T080000", exit_code=1, tests=red)
+    meta = next(m for m in history.iter_runs(store) if m.id == now)
+    last = record.repeat_notice(store, meta).splitlines()[-1]
+    assert "A red gate" in last and "never clears the branch" in last
+
+
+def test_the_seen_miss_names_the_nearest_record(repo, side, monkeypatch):
+    argv = junit_gate(0, GREEN)
+    current = tree.tree_id(repo)
+    sha = tree.command_sha(argv, folder=".")
+    args = dict(folder=".", inputs_sha=None, machine_id=machine.machine_id())
+    store = tree.store_dir(repo)
+    assert "no run of this tree" in record.seen_answer(store, current, sha, **args).why
+    (repo / "sub").mkdir()
+    run.run_gate(argv, cwd=repo / "sub")
+    assert "folder sub" in record.seen_answer(store, current, sha, **args).why
+    run.run_gate([*argv, "-x"], cwd=repo)
+    monkeypatch.setattr(machine, "machine_id", lambda home=None: "a" * 32)
+    run.run_gate(argv, cwd=repo)
+    why = record.seen_answer(store, current, sha, **args).why
+    assert "another machine" in why and "--any-machine" in why
+    record.record_files([GREEN], cwd=repo, kind=None, label=None, runner=None, commit="HEAD",
+                        exit_code=0, wall_seconds=None, machine="ci", report_root=None)
+    other = tree.command_sha(["other"], folder=".")
+    why = record.seen_answer(store, current, other, **args).why
+    assert "other commands" in why
