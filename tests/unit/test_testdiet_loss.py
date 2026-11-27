@@ -938,16 +938,25 @@ class _CountingText(str):
         return super().__getitem__(key)
 
 
-@pytest.mark.parametrize("line", [
-    "x = " + "\\'" * 3000,            # each ' is escaped: no quote closes on the line
-    'x = ' + '\\"' * 3000,
-    "(/[" * 3000,                      # each / starts a regex whose class never closes
-    "(/[ (/ x" * 1000,                 # a later regex start that does close
+_JS = (loss_braces._JS_QUOTES, "`", False, True)
+_GO = ("\"`", "`", True, False)
+_RUST = ("\"", "\"", True, False)
+
+
+@pytest.mark.parametrize("language, line", [
+    (_JS, "x = " + "\\'" * 3000),      # each ' is escaped: no quote closes on the line
+    (_JS, 'x = ' + '\\"' * 3000),
+    (_JS, "(/[" * 3000),                # each / starts a regex whose class never closes
+    (_JS, "(/[ (/ x" * 1000),           # a later regex start that does close
+    (_JS, "\\`\n" * 3000),             # a multi-line quote that never closes, on each line
+    (_GO, "\\`\n" * 3000),
+    (_RUST, '\\"\n' * 3000),
 ])
-def test_the_script_scan_reads_each_character_a_bounded_number_of_times(line):
+def test_the_brace_scan_reads_each_character_a_bounded_number_of_times(language, line):
+    quotes, multiline, chars, script = language
     text = _CountingText('test("a", () => {\n' + line + "\n});\n")
     _CountingText.reads = 0
-    loss_braces._Index(text, loss_braces._JS_QUOTES, "`", chars=False, script=True)
+    loss_braces._Index(text, quotes, multiline, chars=chars, script=script)
     assert _CountingText.reads < 20 * len(text), _CountingText.reads
 
 

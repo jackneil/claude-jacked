@@ -153,9 +153,12 @@ class _Index:
         """
         ch = text[j]
         one_line_script = self._script and not multiline
-        if one_line_script and j < self._no_close.get(ch, -1):
-            return None  # an earlier quote of this kind on this line did not close: text
-        end = _skip_quoted(text, j, ch, multiline)
+        # An earlier quote of this kind failed, and every later one fails the same way (it reads the
+        # same escapes): before the line end for a one-line quote, before the file end for a multi-line one.
+        known = j < self._no_close.get(ch, -1)
+        if known and one_line_script:
+            return None  # text
+        end = -1 if known else _skip_quoted(text, j, ch, multiline)
         if end >= 0:
             return end
         newline = text.find("\n", j)
@@ -163,6 +166,8 @@ class _Index:
         if one_line_script:
             self._no_close[ch] = line_end
             return None  # JSX text, not a string
+        if multiline:
+            self._no_close[ch] = len(text)
         self._damage.append(j)
         self.unclosed.append(j)
         return line_end
