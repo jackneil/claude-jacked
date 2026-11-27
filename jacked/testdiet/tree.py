@@ -281,8 +281,7 @@ def read_tree_id(cwd: Path, *, objects: Path | None = None,
         }
         if real_index.is_file():
             source_times = _copy_index(real_index, index_copy)
-            # From the top: ls-files in a subfolder lists that subfolder only, and add -A hashes all.
-            if _clear_hiding_bits(top, env, work):
+            if _clear_hiding_bits(top, env, work):  # from the top: ls-files in a subfolder lists only it
                 _set_index_times(index_copy, source_times)
         with tempfile.TemporaryFile(dir=work) as errors:
             code, _ = git(cwd, *_INDEX_COPY_ARGS, "add", "-A", "--sparse", env=env, stderr=errors)

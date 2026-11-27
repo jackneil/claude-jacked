@@ -278,14 +278,8 @@ def _meta_from(run_id: str, raw) -> RunMeta:
             value = value if isinstance(value, str) and LABEL_RE.fullmatch(value) else None
         elif name == "machine_id":
             value = value if isinstance(value, str) and MACHINE_ID_RE.fullmatch(value) else None
-        elif name == "inputs_sha":
-            # None means "no --input", so a value that is not valid must not read as None.
-            if value is not None and not (isinstance(value, str) and (
-                    _SHA256_RE.fullmatch(value) or value == INPUTS_UNAVAILABLE)):
-                value = INPUTS_INVALID
         elif name in _HASH_FIELDS:
-            # A hash that is not 64 hex characters reads as empty; seen never matches it.
-            value = value if isinstance(value, str) and _SHA256_RE.fullmatch(value) else None
+            value = _hash_value(name, value)
         elif name == "schema":
             # A version that is not an integer reads as no version: seen never uses the record.
             value = value if _is(value, int) else None
@@ -382,6 +376,15 @@ def load_tests(store: Path, run_id: str) -> RunData | None:
 
 def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _hash_value(name: str, value):
+    """A hash that is not 64 hex characters reads as None, so seen never matches it. For ``inputs_sha``
+    it reads as ``INPUTS_INVALID``: there None means "no --input", and "unavailable" stays."""
+    if isinstance(value, str) and _SHA256_RE.fullmatch(value) or name == "inputs_sha" and value in (
+            None, INPUTS_UNAVAILABLE):
+        return value
+    return INPUTS_INVALID if name == "inputs_sha" else None
 
 
 def _case_from(case: dict) -> CaseResult:
