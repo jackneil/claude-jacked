@@ -459,52 +459,6 @@ def test_new_file_mode_sets_no_private_acl_on_windows(tmp_path, monkeypatch):
     assert target.read_text(encoding="utf-8") == "doc"
 
 
-@pytest.mark.parametrize("writer", ["text", "bytes"])
-def test_before_replace_runs_once_before_the_replace(tmp_path, writer):
-    target = tmp_path / "MEMORY.md"
-    seen: list = []
-
-    def before_replace():
-        seen.append(_stray_temps(tmp_path))  # the temp file is complete by now
-
-    if writer == "text":
-        atomic_io.atomic_write_text(target, "new", before_replace=before_replace)
-    else:
-        atomic_io.atomic_write_bytes(target, b"new", before_replace=before_replace)
-
-    assert len(seen) == 1 and len(seen[0]) == 1
-    assert target.read_text(encoding="utf-8") == "new"
-
-
-def test_before_replace_can_stop_the_write(tmp_path):
-    target = tmp_path / "MEMORY.md"
-    target.write_text("old", encoding="utf-8")
-
-    class Changed(Exception):
-        pass
-
-    def before_replace():
-        raise Changed
-
-    with pytest.raises(Changed):
-        atomic_io.atomic_write_bytes(target, b"new", before_replace=before_replace)
-
-    assert target.read_text(encoding="utf-8") == "old"
-    assert _stray_temps(tmp_path) == []
-
-
-def test_before_replace_runs_again_before_each_windows_retry(tmp_path, monkeypatch):
-    _on_windows(monkeypatch)
-    _record_pauses(monkeypatch)
-    calls = _flaky_replace(monkeypatch, failures=2)
-    checks: list = []
-
-    atomic_io.atomic_write_bytes(tmp_path / "state.json", b"{}", before_replace=lambda: checks.append(1))
-
-    assert len(calls) == 3
-    assert len(checks) == 3  # the first try and each of the two retries
-
-
 def _chmod_not_supported(monkeypatch) -> list:
     """Storage that creates and replaces files but refuses chmod (ENOTSUP),
     by descriptor and by path."""

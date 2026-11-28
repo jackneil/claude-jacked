@@ -407,7 +407,7 @@ def test_settings_json_is_written_off_the_loop_under_the_settings_lock(
     def write(path, data, **kwargs):
         writes.append((threading.get_ident(), features._settings_lock.locked()))
 
-    # Every settings.json write goes through settings_io.write_settings (#99i).
+    # Every settings.json write goes through settings_io.write_settings.
     monkeypatch.setattr(features, "write_settings", write)
 
     result, loop_thread = _run_on_loop(_settings_routes()[route])

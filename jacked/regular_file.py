@@ -18,6 +18,24 @@ import os
 import stat
 
 
+#: FILE_ATTRIBUTE_REPARSE_POINT of Windows: a junction, a symbolic link or another reparse point.
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def is_reparse_point(info: os.stat_result) -> bool:
+    """True when ``info`` (from ``lstat`` or ``fstat``) is a Windows reparse point: a junction, for example.
+
+    A directory junction is the folder link that Windows makes with no
+    privilege, and ``stat.S_ISLNK`` does not see it. This is the one check
+    in jacked; each module calls it. On POSIX the result is always False.
+
+    >>> from types import SimpleNamespace
+    >>> is_reparse_point(SimpleNamespace(st_file_attributes=0x400)), is_reparse_point(SimpleNamespace())
+    (True, False)
+    """
+    return bool(getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 class NotRegularFileError(OSError):
     """The path exists, but it is not a regular file."""
 

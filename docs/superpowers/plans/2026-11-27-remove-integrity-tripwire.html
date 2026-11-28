@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!--
+  jacked artifact template — for plans, specs, research, checkpoints.
+  Replace placeholders, keep what you need, delete sections you don't.
+  Opens cleanly in any browser, offline. Mermaid diagrams load from CDN.
+-->
+<title>Remove the integrity tripwire (#99i)</title>
+
+<!-- Metadata block — adjust fields per artifact type -->
+<meta name="jacked:type" content="plan">
+<meta name="jacked:status" content="in-progress">
+<meta name="jacked:branch" content="jack_20261127_integrity_scoped_accept">
+<meta name="jacked:date" content="2026-11-27">
+<meta name="jacked:project" content="claude-jacked">
+
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-muted: #555;
+    --bg: #fafaf7;
+    --bg-card: #fff;
+    --accent: #2266aa;
+    --accent-bg: #e7f0fa;
+    --warn: #b3681c;
+    --warn-bg: #fcf3e7;
+    --danger: #b32424;
+    --danger-bg: #fbe9e7;
+    --ok: #1f7a3f;
+    --ok-bg: #e8f4ec;
+    --border: #d8d4cc;
+    --code-bg: #f3efe8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+    --radius: 6px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8e6e1;
+      --fg-muted: #a8a5a0;
+      --bg: #161616;
+      --bg-card: #1f1f1f;
+      --accent: #6aa8e8;
+      --accent-bg: #1a2935;
+      --warn: #e0a85b;
+      --warn-bg: #3a2d18;
+      --danger: #ea7670;
+      --danger-bg: #3a1f1c;
+      --ok: #6acd8e;
+      --ok-bg: #1c3327;
+      --border: #2e2e2e;
+      --code-bg: #232323;
+      --shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--fg);
+    background: var(--bg);
+    margin: 0;
+    padding: 2rem 1rem;
+  }
+  .wrap {
+    max-width: 880px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 .25rem;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 1.4rem;
+    margin: 2.5rem 0 .75rem;
+    padding-bottom: .35rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 {
+    font-size: 1.1rem;
+    margin: 1.5rem 0 .5rem;
+    color: var(--fg-muted);
+  }
+  p { margin: .5rem 0 1rem; }
+  a { color: var(--accent); }
+  a:hover { text-decoration: underline; }
+
+  /* Metadata strip under title */
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    margin: .5rem 0 2rem;
+    padding: .75rem 1rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    font-size: .9rem;
+  }
+  .meta .kv { display: flex; gap: .35rem; }
+  .meta .k { color: var(--fg-muted); }
+  .meta .v { font-family: var(--mono); }
+
+  /* Status badges — drop into a <span class="badge X"> */
+  .badge {
+    display: inline-block;
+    padding: .15rem .6rem;
+    border-radius: 99px;
+    font-size: .8rem;
+    font-weight: 500;
+    line-height: 1.4;
+  }
+  .badge.ok       { background: var(--ok-bg);     color: var(--ok); }
+  .badge.warn     { background: var(--warn-bg);   color: var(--warn); }
+  .badge.danger   { background: var(--danger-bg); color: var(--danger); }
+  .badge.info     { background: var(--accent-bg); color: var(--accent); }
+
+  /* Table of contents */
+  nav.toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+    box-shadow: var(--shadow);
+  }
+  nav.toc h2 {
+    margin: 0 0 .5rem;
+    font-size: .9rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--fg-muted);
+    border: none;
+    padding: 0;
+  }
+  nav.toc ol {
+    margin: 0;
+    padding-left: 1.5rem;
+  }
+  nav.toc li { margin: .15rem 0; }
+
+  /* Callouts — drop into <aside class="callout warn"> ... </aside> */
+  aside.callout {
+    margin: 1rem 0;
+    padding: .9rem 1.1rem;
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  aside.callout.warn   { border-color: var(--warn);   background: var(--warn-bg); }
+  aside.callout.danger { border-color: var(--danger); background: var(--danger-bg); }
+  aside.callout.ok     { border-color: var(--ok);     background: var(--ok-bg); }
+  aside.callout > :first-child { margin-top: 0; }
+  aside.callout > :last-child  { margin-bottom: 0; }
+
+  /* Code */
+  code {
+    font-family: var(--mono);
+    font-size: .92em;
+    background: var(--code-bg);
+    padding: .12em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: .88rem;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: .9rem 1rem;
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    background: var(--bg-card);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow);
+  }
+  th, td {
+    text-align: left;
+    padding: .55rem .8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--code-bg);
+    font-weight: 600;
+    font-size: .9rem;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  /* Task checklist — use <ul class="tasks"> + <li><input type="checkbox" disabled> ...</li> */
+  ul.tasks { list-style: none; padding-left: 0; }
+  ul.tasks li {
+    padding: .25rem 0;
+    display: flex;
+    align-items: flex-start;
+    gap: .6rem;
+  }
+  ul.tasks input[type="checkbox"] { margin-top: .4rem; }
+
+  /* Mermaid diagram wrappers */
+  .diagram {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  /* If mermaid fails (no network), fall back to showing the source in a code block */
+  .diagram pre.mermaid-source {
+    text-align: left;
+    display: none;
+  }
+  .diagram.failed pre.mermaid-source { display: block; }
+  .diagram.failed svg { display: none; }
+
+  blockquote {
+    border-left: 3px solid var(--border);
+    padding: .2rem 1rem;
+    margin: 1rem 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.5rem 0;
+  }
+
+  /* Print: paginate cleanly, drop the dark-mode flip, expand TOC */
+  @media print {
+    body { background: white; color: black; padding: 0; }
+    .wrap { max-width: none; }
+    nav.toc { break-inside: avoid; }
+    h2, h3 { break-after: avoid; }
+    pre, table, aside.callout, .diagram { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Remove the hook and settings integrity tripwire (#99i)</h1>
+
+<div class="meta">
+  <div class="kv"><span class="k">Status:</span><span class="v"><span class="badge info">approved by the owner, 2026-11-27</span></span></div>
+  <div class="kv"><span class="k">Date:</span><span class="v">2026-11-27</span></div>
+  <div class="kv"><span class="k">Branch:</span><span class="v">jack_20261127_integrity_scoped_accept</span></div>
+  <div class="kv"><span class="k">Type:</span><span class="v">plan</span></div>
+</div>
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#goal">Goal</a></li>
+    <li><a href="#why">Why</a></li>
+    <li><a href="#remove">What to remove</a></li>
+    <li><a href="#keep">What to keep</a></li>
+    <li><a href="#cleanup">Cleanup of old baseline files</a></li>
+    <li><a href="#docs">Documents and rules</a></li>
+    <li><a href="#tests">Tests</a></li>
+    <li><a href="#constraints">Constraints</a></li>
+    <li><a href="#tasks">Tasks</a></li>
+  </ol>
+</nav>
+
+<h2 id="goal">Goal</h2>
+<p>Remove the hook and settings integrity tripwire and the <code>MEMORY.md</code> quarantine from jacked, in one pull request. After the change, jacked does not snapshot <code>settings.json</code>, does not compare hook scripts, does not add an integrity block at session start, and does not move lines out of a memory file.</p>
+
+<aside class="callout info">
+  <p>The owner chose this in the question dialog on 2026-11-27: "Rip it out". The option text was: "Delete the tripwire, the session-start block, the MEMORY.md quarantine, the baseline file, the doctor line, the dashboard panel and the rules sentence, with their tests and docs, in one PR. A user's existing ~/.claude/jacked/integrity.json is removed at install. Close #324i as won't-do."</p>
+</aside>
+
+<h2 id="why">Why</h2>
+<p>The owner did not ask for the tripwire. A Claude session filed #99i on 2026-08-02 after a research pass, and a backlog batch built it as milestone M14 (#276pr, release 0.111.0). It warns at each session start about changes that Claude Code, the user or an installer that the user ran made. The owner said: "you are thinking you are some type of gatekeeper ... did i ask for it or scope creep?"</p>
+
+<h2 id="remove">What to remove</h2>
+<table>
+  <thead><tr><th>Area</th><th>Remove</th></tr></thead>
+  <tbody>
+    <tr><td>Modules</td><td><code>jacked/integrity.py</code>, <code>jacked/integrity_baseline.py</code>, <code>jacked/integrity_snapshot.py</code>, <code>jacked/integrity_command.py</code>, <code>jacked/integrity_cli.py</code>. Also <code>jacked/memory/quarantine.py</code> and <code>jacked/memory/injection_shapes.py</code>, after a grep shows that only the tripwire imports them.</td></tr>
+    <tr><td>Settings writer</td><td>The rebaseline step in <code>jacked/memory/settings_io.py</code> (<code>_integrity_snapshot</code>, <code>_rebaseline</code>, the <code>baseline_lock</code> around the write, and their docstring text).</td></tr>
+    <tr><td>Session start</td><td>The <code>integrity</code> step of <code>jacked/data/hooks/session_start.py</code> (<code>_emit_integrity</code>, its <code>STEPS</code> entry, and the docstring lines that name it).</td></tr>
+    <tr><td>CLI</td><td>In <code>jacked/cli.py</code>: the import of <code>print_doctor_lines</code> and <code>integrity_group</code>, the doctor call, and <code>main.add_command(integrity_group)</code>. The command <code>jacked integrity</code> no longer exists.</td></tr>
+    <tr><td>Dashboard</td><td>The <code>"integrity"</code> field of <code>GET /api/features</code> and its import in <code>jacked/api/routes/features.py</code>. The <code>_integrityPanel</code> function, the <code>_INTEGRITY_SCOPE</code> text and the render call in <code>jacked/data/web/js/components/settings.js</code>.</td></tr>
+    <tr><td>Rules</td><td>The whole bullet that starts "When a memory file (MEMORY.md, a vault note, CLAUDE.md) holds content that looks injected" in <code>jacked/data/rules/jacked_behaviors.md</code>. The Codex <code>AGENTS.md</code> copy follows from that file.</td></tr>
+    <tr><td>Issue</td><td>The lead closes #324i as not planned. The implementer does not touch GitHub.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="keep">What to keep</h2>
+<ul>
+  <li><code>settings_io.write_settings</code> stays the one writer of <code>settings.json</code>, with its atomic write, its read-back check and its static test (<code>test_no_module_other_than_settings_io_writes_settings_json</code>).</li>
+  <li><code>jacked install</code> still stops on a <code>settings.json</code> that is not valid JSON, and does not write over it. That rule protects user data. Move its test out of <code>tests/unit/test_integrity.py</code> (class <code>TestSurfaces</code>) into the install tests before you delete that file.</li>
+  <li><code>vault._file_lock</code> and every other user of it.</li>
+  <li>The "data integrity" words in lenses, agents and skills. They name another subject. Change only text that names the tripwire, the baseline, <code>jacked integrity accept</code>, the integrity block or the memory quarantine.</li>
+  <li>The historical release rows in <code>README.md</code> (for example the 0.111.0 row). They record what shipped. Do not edit them.</li>
+</ul>
+
+<h2 id="cleanup">Cleanup of old baseline files</h2>
+<p>A machine that ran 0.111.0 or later has <code>&lt;config dir&gt;/jacked/integrity.json</code> and <code>&lt;config dir&gt;/jacked/integrity.json.lock</code>. The config dir is <code>claude_paths.config_dir(home)</code>, so <code>CLAUDE_CONFIG_DIR</code> applies.</p>
+<ul>
+  <li><code>jacked install</code> (which an upgrade runs) and <code>jacked uninstall</code> remove these two files.</li>
+  <li>Remove only these two exact names. Use <code>lstat</code>: do not follow a link, and do not remove a folder that has the name of a file.</li>
+  <li>Never remove a <code>jacked/</code> folder, not even an empty one (the lead's ruling after the review, 2026-11-27). jacked writes <code>issue-queue/</code> there, and a user's link to that folder must keep resolving. Also remove the old <code>locks/quarantine-*.lock</code> files. Remove <code>locks/</code> only when it is a real folder and empty, and check that again right before the removal.</li>
+  <li>Do not read or remove anything through a link or a Windows junction. Behind a linked <code>jacked/</code> folder, check only whether the two old file names exist, and print one warning line for each name found, so that the user can delete it.</li>
+  <li>Print one line for each file that you removed. A missing file gives no line. An error gives one warning line and does not stop the install.</li>
+</ul>
+
+<h2 id="docs">Documents and rules</h2>
+<ul>
+  <li><code>README.md</code>: remove the integrity section (heading near line 704) and the SessionStart step sentence about the integrity block (near line 1136). Search for every other sentence that describes the tripwire as current behavior.</li>
+  <li><code>JACKED_GUARDRAILS.md</code>: remove the section "Hook and Memory Integrity (MemoryTrap)".</li>
+  <li><code>jacked/data/rules/jacked-reference.md</code>: line 226 says the git reality block comes "before the integrity block, which is the last block". Change it so that it names the real last block.</li>
+  <li>Repo skill overlays: <code>.claude/skills/qa</code>, <code>ux</code>, <code>dcr</code>, <code>docs-sync</code> and <code>whats-next</code>. Remove the lines about the integrity panel, the tripwire and its files.</li>
+  <li>Packaged skills, commands, agents and lenses under <code>jacked/data/</code>: change only a line that names the tripwire.</li>
+  <li>The release note goes in the PR body. The release step writes the README row.</li>
+  <li>Write docs in ASD-STE100. Use no em-dash in user-facing text.</li>
+</ul>
+
+<h2 id="tests">Tests</h2>
+<ul>
+  <li>Delete <code>tests/unit/test_integrity.py</code>, <code>tests/unit/test_integrity_baseline.py</code>, <code>tests/unit/test_web_js_integrity_panel.py</code> and <code>tests/unit/test_memory_quarantine.py</code>, after you move the tests that you keep.</li>
+  <li>Edit the tests that pin the old behavior: <code>test_session_start_hook.py</code> (the step list and the integrity tests), <code>test_doctor.py</code>, <code>test_install_hook_shim.py</code> (the <code>jacked/</code> folder contents), <code>test_memory_settings_io.py</code> (the rebaseline tests), <code>test_repo_skill_overlays.py</code>, and every other file that <code>grep -rln "integrity\|quarantine\|injection_shapes" tests/</code> finds and that names the tripwire.</li>
+  <li>New tests:
+    <ul>
+      <li>Install removes both baseline files, prints one line for each, and removes the empty <code>jacked/</code> folder.</li>
+      <li>Install keeps a user file in <code>jacked/</code>, and keeps the folder.</li>
+      <li>Install does not follow a link that has the name <code>integrity.json</code>, and does not remove its target.</li>
+      <li>Uninstall removes both files.</li>
+      <li>Session start adds no integrity text when an old baseline file is there and the settings changed.</li>
+      <li>The doctor prints no integrity line.</li>
+      <li><code>GET /api/features</code> has no <code>integrity</code> key.</li>
+      <li><code>settings.js</code> has no integrity panel.</li>
+    </ul>
+  </li>
+  <li>Module size ratchet (<code>tests/unit/test_module_size_ratchet.py</code>): if <code>cli.py</code> or <code>features.py</code> gets shorter, lower its entry to the new count when the test needs that. Never raise an entry.</li>
+</ul>
+
+<h2 id="constraints">Constraints</h2>
+<ul>
+  <li>Run tests with <code>uv run python -m pytest</code>, serial for a targeted set. Run the targeted set only: the test files of the code that you changed, every file that <code>grep -rl &lt;module stem&gt; tests/</code> finds, and the doctests of the changed modules. Do not run the full suite: the lead runs it once at the end.</li>
+  <li>Gate shape: <code>cmd &gt; log 2&gt;&amp;1; rc=$?</code>. Never pipe a test run. Quote the summary line.</li>
+  <li>NEVER <code>pkill -f</code> / <code>killall</code> a generic pattern (<code>pytest</code>, <code>python</code>, <code>node</code>, <code>layout_qa.py</code>, <code>ci_local.py --layout</code>, a server name) on this machine; stop only processes you started, by PID.</li>
+  <li>Never touch the real <code>~/.claude</code>, <code>~/.codex</code>, <code>~/.agents</code> or the service on port 8321. Tests use temporary homes.</li>
+  <li>Commit with <code>git commit -- &lt;paths&gt;</code>. Each substantive commit ends with <code>Why:</code> and <code>Co-Authored-By: Claude Opus 5.5 &lt;noreply@anthropic.com&gt;</code>. GitHub references carry a suffix (<code>#99i</code>, <code>#276pr</code>).</li>
+  <li>Do not push, and do not open a PR. Do not dispatch subagents.</li>
+</ul>
+
+<h2 id="tasks">Tasks</h2>
+<ul class="tasks">
+  <li><input type="checkbox" disabled> 1. Inventory: grep for each module name, each public name and each text string of the tripwire. Write the list in the report before you delete anything.</li>
+  <li><input type="checkbox" disabled> 2. Move the tests that you keep (the corrupt-settings install refusal), then write the new failing tests.</li>
+  <li><input type="checkbox" disabled> 3. Remove the code: modules, settings writer step, session-start step, CLI, dashboard API and panel, rules bullet.</li>
+  <li><input type="checkbox" disabled> 4. Add the install and uninstall cleanup.</li>
+  <li><input type="checkbox" disabled> 5. Update the documents and the skill overlays.</li>
+  <li><input type="checkbox" disabled> 6. Run the targeted tests, ruff, and a final grep that finds no current-behavior text about the tripwire. Commit.</li>
+</ul>
+
+<hr>
+
+<p style="color: var(--fg-muted); font-size: .85rem; text-align: center;">
+  Generated with the <a href="https://github.com/jackneil/claude-jacked">jacked</a>
+  HTML artifact template. Edit freely.
+</p>
+
+</div>
+
+<!-- Mermaid: render diagrams, fail gracefully if CDN unreachable -->
+<script type="module">
+  try {
+    const mermaid = (await import("https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs")).default;
+    // startOnLoad waits for the window "load" event, which has already fired by the time this
+    // dynamic import resolves, so it never renders. Render explicitly instead.
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default",
+      flowchart: { curve: "basis" },
+      securityLevel: "loose"
+    });
+    await mermaid.run({ querySelector: ".diagram pre.mermaid" });
+  } catch (err) {
+    // Network unreachable or import failed — show source instead of broken diagrams.
+    document.querySelectorAll(".diagram").forEach(d => d.classList.add("failed"));
+    console.warn("mermaid load failed, diagrams shown as source:", err);
+  }
+</script>
+
+</body>
+</html>

@@ -137,7 +137,7 @@ def test_json_nested_too_deep_raises_the_settings_error(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# settings_io.write_settings is the ONE settings.json writer (#99i)
+# settings_io.write_settings is the ONE settings.json writer
 # --------------------------------------------------------------------------- #
 
 import ast  # noqa: E402
@@ -146,7 +146,7 @@ from pathlib import Path  # noqa: E402
 
 _PACKAGE = Path(__file__).resolve().parents[2] / "jacked"
 # A write whose target names the user settings file. ``settings.local.json``
-# (a project file) and the integrity baseline beside it are other files.
+# (a project file) is another file.
 _SETTINGS_TARGET = re.compile(r"settings_path|SETTINGS_JSON|settings\.json|settings_file")
 _WRITE_CALLS = {
     "write_text", "write_bytes", "atomic_write_text", "atomic_write_bytes", "dump",
@@ -205,7 +205,7 @@ def _settings_writes(source: str) -> list[str]:
                 target = node.args[-1] if name in _DEST_LAST else node.args[0]
                 parts.append(ast.get_source_segment(source, target) or "")
         text = " ".join(p or "" for p in parts)
-        if _SETTINGS_TARGET.search(text) and "local" not in text and "baseline_path" not in text:
+        if _SETTINGS_TARGET.search(text) and "local" not in text:
             found.append(f"{name}({text})")
     return found
 
@@ -238,18 +238,23 @@ def test_no_module_other_than_settings_io_writes_settings_json():
             offenders.append(f"{path.relative_to(_PACKAGE.parent)}: {call}")
     assert offenders == [], (
         "settings.json must be written only through jacked.memory.settings_io.write_settings, "
-        "which keeps the integrity baseline current:\n" + "\n".join(offenders)
+        "which writes atomically and re-reads the result:\n" + "\n".join(offenders)
     )
 
 
-def test_write_settings_rebaselines_with_its_reason(tmp_path):
-    from jacked import integrity
-
+def test_write_settings_writes_only_the_settings_file(tmp_path):
+    """No baseline, snapshot or lock file goes beside settings.json (#99i removed)."""
     p = tmp_path / ".claude" / "settings.json"
-    settings_io.write_settings(p, {"model": "opus"}, reason="unit test")
+    settings_io.write_settings(p, {"model": "opus"})
 
-    assert integrity.check(p) == []
-    assert integrity.load_baseline(p)["log"][-1]["reason"] == "unit test"
+    assert sorted(x.name for x in p.parent.iterdir()) == ["settings.json"]
+    assert json.loads(p.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+def test_write_settings_takes_no_reason():
+    import inspect
+
+    assert "reason" not in inspect.signature(settings_io.write_settings).parameters
 
 
 # --------------------------------------------------------------------------- #

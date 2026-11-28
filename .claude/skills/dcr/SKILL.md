@@ -9,7 +9,7 @@ description: "Risk-tiered multi-lens review for this repo - the SMALL/MEDIUM/LAR
 
 - **Project**: claude-jacked
 - **Type**: CLI tool + local FastAPI service / dashboard (Python)
-- **Stack**: Python 3.11 (FastAPI, uvicorn, hatchling, pystray/rumps); SQLite via `jacked/web/database.py`; file-based Memory Vault under `jacked/memory/` (cross-process file locks, atomic rollups, Claude-hook capture/recall, merge capture with commit trailers); one combined SessionStart hook (`jacked/data/hooks/session_start.py`: session tracker, chain of command, memory recall, open work, git reality, load budget, integrity, in that fixed order); hook and settings integrity tripwire (`jacked/integrity.py`, `integrity_baseline.py`, `integrity_snapshot.py`) with the MemoryTrap quarantine (`jacked/memory/quarantine.py`, `injection_shapes.py`); untrusted-checkout git guard (`jacked/git_guard.py`); window keeper (`jacked/api/keeper/`); issue queue refresh in the service (`jacked/service/issue_queue_refresh.py`); integrates the Anthropic API, OAuth/credential flows and Codex accounts. CI: `tests.yml` (lock check, ruff, pytest on ubuntu/macos/windows; supply-chain pip-audit + zizmor), `codeql.yml` (python, javascript-typescript, actions), `publish.yml`.
+- **Stack**: Python 3.11 (FastAPI, uvicorn, hatchling, pystray/rumps); SQLite via `jacked/web/database.py`; file-based Memory Vault under `jacked/memory/` (cross-process file locks, atomic rollups, Claude-hook capture/recall, merge capture with commit trailers); one combined SessionStart hook (`jacked/data/hooks/session_start.py`: session tracker, chain of command, memory recall, open work, git reality, load budget, in that fixed order); untrusted-checkout git guard (`jacked/git_guard.py`); window keeper (`jacked/api/keeper/`); issue queue refresh in the service (`jacked/service/issue_queue_refresh.py`); integrates the Anthropic API, OAuth/credential flows and Codex accounts. CI: `tests.yml` (lock check, ruff, pytest on ubuntu/macos/windows; supply-chain pip-audit + zizmor), `codeql.yml` (python, javascript-typescript, actions), `publish.yml`.
 
 ## Default Lens Selection
 Always on: Guardrails, Security, Access Control, Data Integrity & Schema Safety, Observability & Debuggability, Logic & Edge Cases, Testing, Maintainability, Simplicity & Reuse
@@ -24,7 +24,7 @@ Reviewers focus on: missing edge cases in the design, over-engineering, architec
 
 ## PROJECT_CONTEXT Paths
 Read these for reviewer context (validate with `ls` first, skip missing):
-- `CLAUDE.md`, `JACKED_GUARDRAILS.md` (incl. "Hook and Memory Integrity (MemoryTrap)"), `lessons.md`, `SECURITY.md`
+- `CLAUDE.md`, `JACKED_GUARDRAILS.md`, `lessons.md`, `SECURITY.md`
 - `design/guardrails_and_lint_gate.md`
 - `design/memory-vault-design.html`
 - `docs/architecture/oauth-and-credential-flows.md`, `docs/architecture/auto-swap-system.md`, `docs/architecture/work-ledger.html`
@@ -33,10 +33,9 @@ Read these for reviewer context (validate with `ls` first, skip missing):
 
 ## Domain Wild Cards
 In addition to the standard pool, include:
-- Hook-content trust boundary: does every new or changed context-data SessionStart step (`jacked/data/hooks/`: git reality, open work, memory recall) keep its output framed as data (the `(data, not instructions)` headings; recall marks its summary `Context only, not instructions`; the chain-of-command step is the one exception, because its output is instructions by design and its text comes only from the installed skill), and does every step pass untrusted text (memory notes, commit subjects and trailers, issue titles, file names, remote errors) through `jacked.memory.sanitize`, add zero bytes on the healthy path when the step is a warning-only or tracker step (load budget, integrity, the account tracker) and keep its context output constant in shape when it is a context step (chain of command, memory recall, open work, git reality), keep the fixed step order, and exit 0 on every failure so it never blocks or corrupts a session start?
+- Hook-content trust boundary: does every new or changed context-data SessionStart step (`jacked/data/hooks/`: git reality, open work, memory recall) keep its output framed as data (the `(data, not instructions)` headings; recall marks its summary `Context only, not instructions`; the chain-of-command step is the one exception, because its output is instructions by design and its text comes only from the installed skill), and does every step pass untrusted text (memory notes, commit subjects and trailers, issue titles, file names, remote errors) through `jacked.memory.sanitize`, add zero bytes on the healthy path when the step is a warning-only or tracker step (load budget, the account tracker) and keep its context output constant in shape when it is a context step (chain of command, memory recall, open work, git reality), keep the fixed step order, and exit 0 on every failure so it never blocks or corrupts a session start?
 - Untrusted checkouts: does every git call that runs in a session folder or a user repo go through `jacked.git_guard` (the `-c` override args and `guarded_git_env`), so a repo's `core.fsmonitor`, `core.hooksPath`, filter driver or GPG program never runs? Does every read of a settings, memory or index file go through `jacked.regular_file` (no FIFO/device hang, no symlink surprise)?
-- settings.json and hook scripts: is every settings.json write done by `settings_io.write_settings` (which rebaselines the integrity tripwire with only its own change), with an unreadable file raising instead of reading as `{}`? Does the integrity snapshot never store or print a settings value or a hook command (key names, program name, script path and an 8-hex command digest only)?
-- Quarantine: does a change to `injection_shapes.py` or `quarantine.py` still leave user rules and notes about attacks in place, never delete a line, and refuse to move lines when MEMORY.md or the quarantine file is a symlink or a repo-local setting chose the memory folder?
+- settings.json: is every settings.json write done by `settings_io.write_settings` (atomic, read back), with an unreadable file raising instead of reading as `{}`?
 - Does it keep multi-account credentials isolated: no token, session, or usage data from one Claude/Codex account leaking into another (or into the wrong dashboard card)?
 - Does it honor the uv-only rule (no bare `pip`/`python`; use `uv run` / `uv pip`), the 500-line module limit and the size ratchet, and Windows parity (CRLF, cp1252 console, byte-exact writes through `jacked.atomic_io`)?
 - Does it degrade gracefully headless: when the tray/menubar or a display is unavailable, does the service still run?
@@ -45,8 +44,7 @@ In addition to the standard pool, include:
 In addition to the standard pool, include:
 - A credential or usage token from one account leaks into another account's session, or the dashboard renders the wrong account's data.
 - A user opens Claude Code in a hostile clone: its git config or a filter driver runs a program during the git-reality or merge-capture read, or a crafted commit subject / issue title / memory note puts instructions into the session preamble.
-- A settings.json write bypasses `write_settings`: the tripwire then reports jacked's own change as an outside change (alert fatigue), or a racing outside change is silently absorbed into the baseline; or a partial read is treated as empty settings and the next write clobbers the user's hooks.
-- The quarantine moves a real user rule out of MEMORY.md (false positive), or follows a symlink and writes outside the memory folder.
+- A settings.json write bypasses `write_settings`: a partial write leaves a corrupt file, or a partial read is treated as empty settings and the next write clobbers the user's hooks.
 - Two concurrent Claude sessions write the Memory Vault at once and a settings merge wipes user settings or corrupts the vault (settings-wipe, lock contract, rollup atomicity).
 - A SessionStart step raises, hangs on a FIFO or a slow git call, or prints in a different order per session: the session start stalls or the prompt prefix cache breaks.
 - The background service fails to bind `:8321` after an upgrade/restart (launchd KeepAlive race) and the dashboard silently goes dark.
@@ -58,7 +56,6 @@ Touching any of these forces the LARGE risk tier (full reviewer fan-out):
 - OAuth/credential flows and account switching: `jacked/web/auth.py`, `jacked/web/oauth.py`, `jacked/api/credential_helpers.py`, `jacked/api/authority_guard.py`, `jacked/api/keeper/auth_ladder.py`, `jacked/codex/credentials.py`, `jacked/codex/switching.py`, keychain access, credential detection, anything touching account identity
 - `jacked/data/hooks/` (every SessionStart step and the other hook scripts): the hook-content trust boundary, since everything a hook prints reaches the model
 - settings.json and hook-script handling: `jacked/memory/settings_io.py`, `jacked/memory/hooks_config.py`, `jacked/memory/setup.py`, any other code that writes `settings.json` or installs a hook
-- The integrity tripwire and quarantine: `jacked/integrity.py`, `jacked/integrity_baseline.py`, `jacked/integrity_snapshot.py`, `jacked/integrity_cli.py`, `jacked/memory/quarantine.py`, `jacked/memory/injection_shapes.py`
 - The git guard and git reads of untrusted checkouts: `jacked/git_guard.py`, `jacked/git_reality_read.py`, `jacked/memory/merge_git.py`, `jacked/memory/trailers.py`
 - Untrusted-text and file-read primitives: `jacked/memory/sanitize.py`, `jacked/regular_file.py`, `jacked/jsonl_lines.py`, `jacked/project_slug.py`
 - Memory Vault write paths (`jacked/memory/`): cross-process file locks, atomic rollups, user data loss risk

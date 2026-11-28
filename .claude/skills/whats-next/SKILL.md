@@ -10,7 +10,7 @@ description: "Roadmap advisor: weighs a coverage-matrix read plus plans, issues,
 
 - **Project**: claude-jacked
 - **Type**: CLI tool + local FastAPI web dashboard / background service (Python)
-- **Stack**: Python 3.11 (FastAPI, uvicorn, hatchling; pystray tray + macOS rumps menubar); vanilla JS/HTML/CSS dashboard under `jacked/data/web/` (vendored Tailwind 3.4, Chart.js, SweetAlert2); one combined SessionStart hook (`jacked/data/hooks/session_start.py`) with seven fixed-order steps; file-based Memory Vault (`jacked/memory/`); hook and settings integrity tripwire (`jacked/integrity*.py`)
+- **Stack**: Python 3.11 (FastAPI, uvicorn, hatchling; pystray tray + macOS rumps menubar); vanilla JS/HTML/CSS dashboard under `jacked/data/web/` (vendored Tailwind 3.4, Chart.js, SweetAlert2); one combined SessionStart hook (`jacked/data/hooks/session_start.py`) with six fixed-order steps; file-based Memory Vault (`jacked/memory/`)
 - **Lifecycle**: Beta
 - **GitHub**: authenticated
 
@@ -29,14 +29,14 @@ Validate paths before reading (skip missing ones silently):
 - `design/` (feature design notes, incl. `2026-10-01-skill-diet.html`, `20260724-night-shift-research-and-design.html`, `memory-vault-design.html` + `memory-vault-implementation-plan.html`)
 - `.claude/research/` (local research reports, `.html`; gitignored, often absent in a fresh clone or worktree)
 - `README.md` (the "Version History" table is the de-facto changelog/roadmap signal)
-- `lessons.md` (recurring pitfalls), `CLAUDE.md`, `JACKED_GUARDRAILS.md` (incl. the MemoryTrap section), `SECURITY.md`
+- `lessons.md` (recurring pitfalls), `CLAUDE.md`, `JACKED_GUARDRAILS.md`, `SECURITY.md`
 - `tests/unit/test_module_size_ratchet.py` (BASELINE lists every module still over the 500-line limit: a standing split backlog)
 
 ## TODO Scan Extensions
 Include: `.py` (primary), plus `.js`, `.html`, `.css` (dashboard assets under `jacked/data/web/`, skip `jacked/data/web/js/vendor/`), `.sh` (`install.sh`, `uninstall.sh`), `.yml` (`.github/workflows/`)
 
 ## Strategic Emphasis
-Lifecycle lean (Beta): weight the Step 6 decision toward cross-cutting experience and operational-reliability levers over one-off features. Recent velocity (since 2026-09-01) is dominated by credentials/account switching, the Memory Vault and its capture ledger, the usage monitor and window keeper, service/upgrade robustness, Windows parity, and the session-boot trust work (one ordered SessionStart hook, git reality, open-work queue, load budget, the integrity tripwire and MemoryTrap quarantine, the untrusted-checkout git guard). Favor moves that lift the whole install, run, observe, remember loop. Two standing levers exist: the module size ratchet BASELINE (split an oversized module) and the open GitHub issue queue (`next` before anything new). Thin signal: take the smallest high-certainty move over a guess.
+Lifecycle lean (Beta): weight the Step 6 decision toward cross-cutting experience and operational-reliability levers over one-off features. Recent velocity (since 2026-09-01) is dominated by credentials/account switching, the Memory Vault and its capture ledger, the usage monitor and window keeper, service/upgrade robustness, Windows parity, and the session-boot trust work (one ordered SessionStart hook, git reality, open-work queue, load budget, the untrusted-checkout git guard). Favor moves that lift the whole install, run, observe, remember loop. Two standing levers exist: the module size ratchet BASELINE (split an oversized module) and the open GitHub issue queue (`next` before anything new). Thin signal: take the smallest high-certainty move over a guess.
 
 Forged briefs follow the Ledger contract (see the engine and `jacked/data/commands/goal-maker.md`): every brief gets `.claude/goals/<YYYYMMDD>-<slug>/worklist.json` + `progress.md`, and discovered work goes to a GitHub issue (`gh issue create` with the /dcr evidence body and a `Discovered from:` line), not to a note.
 

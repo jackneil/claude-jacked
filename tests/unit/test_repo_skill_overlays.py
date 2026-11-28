@@ -185,16 +185,17 @@ def test_dcr_wild_card_scopes_data_framing_to_the_context_data_steps():
     assert "does every new or changed SessionStart step" not in card
 
 
-def test_qa_and_ux_name_the_real_location_of_the_integrity_panel():
-    """Hooks is a section of Settings > Features, not a tab of Settings."""
-    settings = (REPO_ROOT / "jacked" / "data" / "web" / "js" / "components" / "settings.js").read_text(
-        encoding="utf-8"
+def test_no_overlay_names_the_retired_integrity_tripwire():
+    """The tripwire (#99i) and the MEMORY.md quarantine are gone, so no overlay
+    sends a reviewer or a QA pass to them."""
+    retired = (
+        "jacked integrity accept", "integrity panel", "integrity tripwire", "jacked/integrity",
+        "integrity_cli", "quarantine.py", "injection_shapes", "MemoryTrap", "the integrity state",
     )
-    assert ">Hooks</h3>" in settings
-    for name in ("qa", "ux"):
-        overlay = _overlay(name)
-        assert "Settings > Features, Hooks section" in overlay, name
-        assert "Settings > Hooks" not in overlay, name
+    for path in sorted(SKILLS.glob("*/SKILL.md")):
+        text = path.read_text(encoding="utf-8")
+        for phrase in retired:
+            assert phrase.lower() not in text.lower(), (path.parent.name, phrase)
 
 
 def test_whats_next_overlay_carries_no_counts_that_go_stale():
