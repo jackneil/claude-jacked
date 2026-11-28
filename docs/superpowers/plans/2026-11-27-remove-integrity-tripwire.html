@@ -320,7 +320,8 @@
 <ul>
   <li><code>jacked install</code> (which an upgrade runs) and <code>jacked uninstall</code> remove these two files.</li>
   <li>Remove only these two exact names. Use <code>lstat</code>: do not follow a link, and do not remove a folder that has the name of a file.</li>
-  <li>Remove the <code>jacked/</code> folder only when it is empty after that. A user file in it stays, and so does the folder.</li>
+  <li>Never remove a <code>jacked/</code> folder, not even an empty one (the lead's ruling after the review, 2026-11-27). jacked writes <code>issue-queue/</code> there, and a user's link to that folder must keep resolving. Also remove the old <code>locks/quarantine-*.lock</code> files. Remove <code>locks/</code> only when it is a real folder and empty, and check that again right before the removal.</li>
+  <li>Do not read or remove anything through a link or a Windows junction. Behind a linked <code>jacked/</code> folder, check only whether the two old file names exist, and print one warning line for each name found, so that the user can delete it.</li>
   <li>Print one line for each file that you removed. A missing file gives no line. An error gives one warning line and does not stop the install.</li>
 </ul>
 
