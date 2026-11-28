@@ -4,7 +4,7 @@ jacked 0.111.0 to 0.111.5 kept a baseline of settings.json in
 ``jacked/integrity.json`` beside the settings file, with the lock file
 ``jacked/integrity.json.lock``. The MEMORY.md quarantine of the same versions
 kept one lock file for each memory folder that it checked, in
-``<home>/.claude/jacked/locks/quarantine-<project>.lock``. jacked does not use
+``jacked/locks/quarantine-<project>.lock``. jacked does not use
 these files now. ``jacked install`` (an upgrade runs it) and
 ``jacked uninstall`` call ``report_removal`` to remove them.
 
@@ -14,14 +14,13 @@ The rules:
   names start with ``quarantine-`` and end with ``.lock``. Remove a file only
   when ``os.lstat`` shows a regular file. jacked does not follow a link, and it
   does not remove a folder that has the name of a file.
-* Look for the two names in ``<home>/.claude/jacked`` and in
-  ``<config folder>/jacked`` (``claude_paths.config_dir``, so
-  ``CLAUDE_CONFIG_DIR`` applies). The old writer put the baseline beside each
-  settings file that it wrote, so both folders can hold one. Two paths that
-  resolve to the same folder count as one folder.
-* Look for the lock files only in ``<home>/.claude/jacked/locks``, the one
-  folder where the quarantine made them. Remove ``locks`` when it is empty
-  after that: nothing else uses it.
+* Look in ``<home>/.claude/jacked`` and in ``<config folder>/jacked``
+  (``claude_paths.config_dir``, so ``CLAUDE_CONFIG_DIR`` applies), with the
+  same rules for each. The old writer put the baseline beside each settings
+  file that it wrote, so both folders can hold one. Two paths that resolve to
+  the same folder count as one folder.
+* Look for the lock files in the ``locks`` folder of each of these folders.
+  Remove ``locks`` when it is empty after that: nothing else uses it.
 * Remove a ``jacked`` folder only when this cleanup removed something from it
   and the folder is then empty. A user file or ``issue-queue`` in the folder
   keeps it.
@@ -51,11 +50,16 @@ LOCK_SUFFIX = ".lock"
 
 @dataclass
 class Removal:
-    """What ``remove_leftovers`` did. Each failure is ``(path, error class name)``."""
+    """What ``remove_leftovers`` did. Each failure is ``(path, error class name)``.
+
+    ``locks_folders`` holds each ``locks`` folder that gave up at least one
+    lock file. A lock failure names the lock file, or the ``locks`` folder
+    when it could not be read.
+    """
 
     files: list[Path] = field(default_factory=list)
     failed: list[tuple[Path, str]] = field(default_factory=list)
-    locks_folder: Path | None = None
+    locks_folders: list[Path] = field(default_factory=list)
     locks_removed: int = 0
     locks_failed: list[tuple[Path, str]] = field(default_factory=list)
 
@@ -136,7 +140,7 @@ def _remove_locks(locks: Path, result: Removal) -> bool:
     """
     if not _is_real_folder(locks):
         return False
-    result.locks_folder = locks
+    before = result.locks_removed
     try:
         names = sorted(entry.name for entry in os.scandir(locks))
     except OSError as exc:
@@ -150,13 +154,14 @@ def _remove_locks(locks: Path, result: Removal) -> bool:
                 result.locks_removed += 1
         except OSError as exc:
             result.locks_failed.append((locks / name, type(exc).__name__))
-    return _remove_empty_folder(locks) or result.locks_removed > 0
+    if result.locks_removed > before:
+        result.locks_folders.append(locks)
+    return _remove_empty_folder(locks) or result.locks_removed > before
 
 
 def remove_leftovers(home: Path | str, env: Mapping[str, str] | None = None) -> Removal:
     """Remove the files of the retired check and return what was done."""
     result = Removal()
-    home_folder = Path(home) / ".claude" / "jacked"
     for folder in leftover_folders(home, env):
         removed_here = False
         for name in LEFTOVER_NAMES:
@@ -168,7 +173,7 @@ def remove_leftovers(home: Path | str, env: Mapping[str, str] | None = None) -> 
             except OSError as exc:
                 logger.warning("retired integrity: could not remove %s (%s)", path, type(exc).__name__)
                 result.failed.append((path, type(exc).__name__))
-        if folder == home_folder and _remove_locks(folder / "locks", result):
+        if _remove_locks(folder / "locks", result):
             removed_here = True
         if removed_here:
             _remove_empty_folder(folder)
@@ -207,17 +212,22 @@ def report_removal(home: Path | str, console) -> None:
             f"[yellow][WARN][/yellow] Could not remove {escape(str(path))} ({error}). Delete it yourself.",
             soft_wrap=True,
         )
-    locks = escape(str(result.locks_folder))
     if result.locks_removed:
+        removed_from = " and ".join(escape(str(folder)) for folder in result.locks_folders)
         console.print(
-            f"[green][OK][/green] Removed {_plural(result.locks_removed, 'old quarantine lock file')} from {locks}",
+            f"[green][OK][/green] Removed {_plural(result.locks_removed, 'old quarantine lock file')} "
+            f"from {removed_from}",
             soft_wrap=True,
         )
     if result.locks_failed:
+        failed_in = " and ".join(
+            escape(str(folder))
+            for folder in dict.fromkeys(path if path.name == "locks" else path.parent for path, _ in result.locks_failed)
+        )
         errors = ", ".join(sorted({error for _, error in result.locks_failed}))
         console.print(
             f"[yellow][WARN][/yellow] Could not remove "
-            f"{_plural(len(result.locks_failed), 'old quarantine lock file')} in {locks} ({errors}). "
+            f"{_plural(len(result.locks_failed), 'old quarantine lock file')} in {failed_in} ({errors}). "
             "Delete them yourself.",
             soft_wrap=True,
         )

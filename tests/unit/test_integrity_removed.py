@@ -350,16 +350,18 @@ class TestQuarantineLocks:
         assert _report(home) == []
         assert victim.read_text(encoding="utf-8") == "keep me"
 
-    def test_lock_files_under_claude_config_dir_are_not_touched(self, home, tmp_path, monkeypatch):
-        """The quarantine made its locks only under the jacked home."""
+    def test_lock_files_in_both_folders_give_one_count_line(self, home, tmp_path, monkeypatch):
         config = tmp_path / "config"
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
-        theirs = config / "jacked" / "locks" / "quarantine--x.lock"
-        theirs.parent.mkdir(parents=True)
-        theirs.write_text("", encoding="utf-8")
+        in_home = _seed_locks(home, 2)
+        in_config = config / "jacked" / "locks"
+        in_config.mkdir(parents=True)
+        (in_config / "quarantine--x.lock").write_text("", encoding="utf-8")
 
-        assert _report(home) == []
-        assert theirs.exists()
+        assert _report(home) == [f"[OK] Removed 3 old quarantine lock files from {in_home} and {in_config}"]
+        assert not (home / ".claude" / "jacked").exists()
+        assert not (config / "jacked").exists()
+        assert config.is_dir()
 
     def test_a_lock_error_gives_one_warning_line(self, home, monkeypatch):
         locks = _seed_locks(home, 3)
