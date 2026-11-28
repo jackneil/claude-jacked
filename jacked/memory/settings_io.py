@@ -139,14 +139,11 @@ def _read_text(path: Path) -> str:
         raise SettingsUnreadableError(f"{path} is not valid UTF-8: {e}") from e
 
 
-def write_settings(path: Path | str, data: dict, *, reason: str = "jacked settings write") -> None:
+def write_settings(path: Path | str, data: dict) -> None:
     """Atomically write settings.json, then verify it re-reads as a JSON object.
 
     This is the one jacked writer of settings.json (a static test holds every
-    other module to it). After a verified write it calls
-    ``jacked.integrity.rebaseline`` with ``reason`` and a snapshot from before
-    the write, so the integrity baseline takes in this change and only this
-    change. An integrity failure is logged and never blocks the write.
+    other module to it).
 
     The atomic write itself (writer-unique tmp + the shared replace) is delegated
     to the shared ``atomic_write_bytes`` (``jacked.atomic_io``) so every atomic
@@ -159,30 +156,22 @@ def write_settings(path: Path | str, data: dict, *, reason: str = "jacked settin
 
     A settings.json that is a symlink (a dotfiles setup) stays a symlink: the
     write goes to the regular file that the link points at
-    (``_write_target``). The integrity baseline keeps the path of the link.
-    The size check (``settings_text``) comes before the write, so settings
-    over the limit leave the original file as it is.
+    (``_write_target``). The size check (``settings_text``) comes before the
+    write, so settings over the limit leave the original file as it is.
     """
     from jacked.atomic_io import atomic_write_bytes
-
-    from jacked import integrity
 
     path = Path(path)
     text = settings_text(data)  # raises before anything is touched
     target = _write_target(path)
-    # One lock over the snapshot, the write and the rebaseline: two jacked
-    # writers that interleave would lose a log entry and report each other.
-    with integrity.baseline_lock(path):
-        before = _integrity_snapshot(path)
-        atomic_write_bytes(target, text.encode("utf-8"))  # LF on every platform
+    atomic_write_bytes(target, text.encode("utf-8"))  # LF on every platform
 
-        try:
-            verify = json.loads(_read_text(path))
-        except (OSError, SettingsUnreadableError, json.JSONDecodeError) as e:
-            raise SettingsUnreadableError(f"post-write verification failed for {path}: {e}") from e
-        if not isinstance(verify, dict):
-            raise SettingsUnreadableError(f"post-write verification failed for {path}: not a JSON object")
-        _rebaseline(path, reason, before)
+    try:
+        verify = json.loads(_read_text(path))
+    except (OSError, SettingsUnreadableError, json.JSONDecodeError) as e:
+        raise SettingsUnreadableError(f"post-write verification failed for {path}: {e}") from e
+    if not isinstance(verify, dict):
+        raise SettingsUnreadableError(f"post-write verification failed for {path}: not a JSON object")
 
 
 def _write_target(path: Path) -> Path:
@@ -214,31 +203,3 @@ def _write_target(path: Path) -> Path:
         )
         raise SettingsUnreadableError(f"{path} is a symlink to a path that is not a regular file")
     return Path(os.path.realpath(path))
-
-
-def _integrity_snapshot(path: Path) -> dict | None:
-    """The integrity snapshot from before a write, or None when it cannot be taken."""
-    from jacked import integrity
-
-    try:
-        return integrity.snapshot(path)
-    except Exception as e:  # noqa: BLE001 -- the tripwire must never block a settings write
-        logger.warning("settings: integrity snapshot before the write failed (%s)", type(e).__name__)
-        return None
-
-
-def _rebaseline(path: Path, reason: str, before: dict | None) -> None:
-    """Rebaseline after a verified write. A failure goes to the log, never up.
-
-    With no snapshot from before the write, the baseline stays as it is: this
-    write then shows as a change, which is loud, and a full rebaseline would
-    silently take in any earlier change from outside jacked.
-    """
-    from jacked import integrity
-
-    if before is None:
-        return
-    try:
-        integrity.rebaseline(path, reason=reason, previous=before)
-    except Exception as e:  # noqa: BLE001 -- the tripwire must never block a settings write
-        logger.warning("settings: integrity rebaseline after the write failed (%s)", type(e).__name__)

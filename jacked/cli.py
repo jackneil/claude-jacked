@@ -26,7 +26,6 @@ from rich.panel import Panel
 # stdlib-only at import time too, so this costs nothing at startup.
 from jacked.dcr_settings import EFFORT_CHOICES as _DCR_EFFORT_CHOICES
 from jacked.dcr_settings import ENGINE_CHOICES as _DCR_ENGINE_CHOICES
-from jacked.integrity_cli import integrity_group, print_doctor_lines
 from jacked.issues_cli import issues_group
 from jacked.provider_cli import grok_group, provider_db as _codex_db
 from jacked.memory.settings_io import SettingsUnreadableError as _SettingsUnreadable
@@ -2844,10 +2843,10 @@ def _rotate_backups(dir_path: Path, prefix: str, keep: int = 5) -> None:
 
 
 def _write_settings_atomic(settings_path: Path, data: dict) -> None:
-    """Write settings.json via ``settings_io.write_settings`` (atomic, size-checked; rebaselines integrity, #99i)."""
+    """Write settings.json via ``settings_io.write_settings`` (atomic, size-checked, read back)."""
     from jacked.memory.settings_io import write_settings
 
-    write_settings(settings_path, data, reason="jacked cli")
+    write_settings(settings_path, data)
 
 
 def _link_or_copy(src: Path, dst: Path) -> str:
@@ -5019,6 +5018,8 @@ def _run_install(
             console.print("[dim][-][/dim] Removed gatekeeper prompt file (feature retired)")
         except Exception:
             pass
+    from jacked import retired_integrity  # the files of the retired settings integrity check (#99i)
+    retired_integrity.report_removal(home, console)
 
     # Install skills — iterate all skills/*/SKILL.md in data root
     # Claude Code expects skills in subdirectories with SKILL.md
@@ -6121,8 +6122,6 @@ def doctor():
         )
         console.print("  Recovery: [cyan]jacked service restart[/cyan]")
 
-    print_doctor_lines(console)
-
     # Install-method-specific recovery
     if method == "editable":
         console.print(
@@ -6291,6 +6290,8 @@ def uninstall(yes: bool, sounds: bool, security: bool, rules: bool):
     if ref_path.exists():
         ref_path.unlink()
         console.print("[green][OK][/green] Removed jacked reference doc")
+    from jacked import retired_integrity  # the files of the retired settings integrity check (#99i)
+    retired_integrity.report_removal(home, console)
 
     # Remove only jacked-installed agents (not the whole directory!)
     agents_src = pkg_root / "agents"
@@ -7013,7 +7014,6 @@ def dcr_engine_clear():
 
 
 main.add_command(issues_group)
-main.add_command(integrity_group)
 main.add_command(grok_group)
 
 

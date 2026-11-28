@@ -515,7 +515,7 @@ def test_doctor_asks_launchctl_once_for_both_launchd_checks(
         assert "The launchd job is loaded but never ran." in text
 
 
-# --- hook and settings integrity line (#99i) ---------------------------------
+# --- no hook and settings integrity line (#99i removed) ----------------------
 
 @pytest.fixture
 def integrity_home(tmp_path, monkeypatch):
@@ -527,47 +527,21 @@ def integrity_home(tmp_path, monkeypatch):
     return home
 
 
-def test_doctor_prints_the_integrity_ok_line(integrity_home):
-    from jacked import integrity
-    from jacked.cli import main
-    from jacked.memory import settings_io
-
-    path = settings_io.settings_path(integrity_home)
-    settings_io.write_settings(path, {})
-    time = integrity.load_baseline(path)["log"][-1]["time"]
-
-    result = CliRunner().invoke(main, ["doctor"])
-
-    assert result.exit_code == 0, result.output
-    assert f"Hook/settings integrity: OK (baseline {time})" in result.output
-
-
-def test_doctor_prints_each_integrity_finding_unwrapped(integrity_home):
+def test_doctor_prints_no_integrity_line(integrity_home):
+    """An old baseline and a hook from outside jacked give no doctor line."""
     import json
 
     from jacked.cli import main
-    from jacked.memory import settings_io
 
-    path = settings_io.settings_path(integrity_home)
-    settings_io.write_settings(path, {})
-    path.write_text(json.dumps({"hooks": {"UserPromptSubmit": [
+    old = integrity_home / ".claude" / "jacked" / "integrity.json"
+    old.parent.mkdir(parents=True)
+    old.write_text('{"version": 1, "baseline_time": null, "baseline": {}, "log": []}', encoding="utf-8")
+    (integrity_home / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"UserPromptSubmit": [
         {"hooks": [{"type": "command", "command": "python3 /tmp/payload.py"}]},
     ]}}), encoding="utf-8")
 
     result = CliRunner().invoke(main, ["doctor"])
 
     assert result.exit_code == 0, result.output
-    assert "Hook/settings integrity: 1 change outside jacked" in result.output
-    assert ("  jacked integrity: settings.json changed outside jacked; "
-            "UserPromptSubmit hook added: program python3, script /tmp/payload.py, "
-            "command sha256:36da742e") in result.output
-    assert "  Review each change. If you made it, run: jacked integrity accept" in result.output
-
-
-def test_doctor_without_a_baseline_says_so(integrity_home):
-    from jacked.cli import main
-
-    result = CliRunner().invoke(main, ["doctor"])
-
-    assert result.exit_code == 0, result.output
-    assert "Hook/settings integrity: no baseline yet" in result.output
+    assert "Hook/settings integrity" not in result.output
+    assert "jacked integrity" not in result.output

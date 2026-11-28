@@ -1,0 +1,312 @@
+"""The hook and settings integrity tripwire (#99i) and the MEMORY.md quarantine are gone.
+
+jacked 0.111.0 to 0.111.5 kept a baseline of settings.json in
+``jacked/integrity.json`` beside the settings file, with the lock file
+``integrity.json.lock``. ``jacked install`` and ``jacked uninstall`` now remove
+these two files (``jacked.retired_integrity``). These tests also hold every
+surface of the tripwire to its removal: the CLI command, the doctor line, the
+dashboard field and panel, the rules bullet and the modules. Every test runs in
+a scratch home.
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+from io import StringIO
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+from rich.console import Console
+
+from jacked import retired_integrity
+from tests._platform import symlinks_supported
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+NAMES = ("integrity.json", "integrity.json.lock")
+OLD_BASELINE = {
+    "version": 1,
+    "baseline_time": "2026-11-21T12:00:00+00:00",
+    "baseline": {"file": "sha256:0", "hooks": {}, "scripts": {}, "settings": {}},
+    "log": [{"time": "2026-11-21T12:00:00+00:00", "reason": "first baseline", "version": "0.111.5"}],
+}
+
+requires_symlinks = pytest.mark.skipif(not symlinks_supported(), reason="needs symlinks")
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("JACKED_HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    return home
+
+
+def _seed_leftovers(folder: Path) -> list[Path]:
+    """Write the two files that an old jacked left in ``folder``."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "integrity.json").write_text(json.dumps(OLD_BASELINE), encoding="utf-8")
+    (folder / "integrity.json.lock").write_text("", encoding="utf-8")
+    return [folder / name for name in NAMES]
+
+
+def _report(home: Path) -> list[str]:
+    """The lines that ``report_removal`` prints, as plain text."""
+    out = StringIO()
+    retired_integrity.report_removal(home, Console(file=out, width=60, highlight=False))
+    return out.getvalue().splitlines()
+
+
+def _install(monkeypatch, *extra: str):
+    from jacked import cli
+
+    monkeypatch.setattr(cli, "_setup_tray_autostart", lambda: None)
+    return CliRunner().invoke(
+        cli.main, ["install", "--no-rules", "--no-packs", "--no-tray", "--no-codex", *extra]
+    )
+
+
+def _removed_line(path: Path) -> str:
+    return f"[OK] Removed {path} (a file of the retired settings integrity check)"
+
+
+# --------------------------------------------------------------------------- #
+# jacked install and jacked uninstall remove the old baseline files
+# --------------------------------------------------------------------------- #
+
+class TestInstallRemovesTheOldFiles:
+    def test_install_removes_both_files_and_the_empty_folder(self, home, monkeypatch):
+        folder = home / ".claude" / "jacked"
+        files = _seed_leftovers(folder)
+
+        r = _install(monkeypatch)
+
+        assert r.exit_code == 0, r.output
+        lines = r.output.splitlines()
+        for path in files:
+            assert not os.path.lexists(path)
+            assert lines.count(_removed_line(path)) == 1, r.output
+        assert not folder.exists()
+
+    def test_install_on_a_clean_home_prints_no_integrity_line(self, home, monkeypatch):
+        r = _install(monkeypatch)
+
+        assert r.exit_code == 0, r.output
+        assert "integrity" not in r.output.lower()
+        assert not (home / ".claude" / "jacked").exists()
+
+    def test_install_refuses_a_corrupt_settings_file_and_leaves_it_as_it_is(self, home, monkeypatch):
+        from jacked import cli
+
+        # A narrow console: the FAIL line carries a path and must never wrap
+        # (soft_wrap), whatever width the suite's console happens to have.
+        narrow = StringIO()
+        monkeypatch.setattr(cli, "console", Console(file=narrow, width=60, highlight=False))
+        path = home / ".claude" / "settings.json"
+        path.write_text('{"hooks": {"Stop": [', encoding="utf-8")
+
+        r = _install(monkeypatch)
+
+        out = narrow.getvalue()
+        assert r.exit_code == 1
+        backup = next(path.parent.glob("settings.json.bak-*"))
+        # The whole backup path sits on one line: a wrapped path cannot be copied.
+        assert "FAIL" in out and str(backup) in out
+        assert path.read_text(encoding="utf-8") == '{"hooks": {"Stop": ['
+
+    def test_an_error_gives_one_warning_and_the_install_goes_on(self, home, monkeypatch):
+        folder = home / ".claude" / "jacked"
+        baseline, lock = _seed_leftovers(folder)
+        real_unlink = os.unlink
+
+        def unlink(path, *args, **kwargs):
+            if Path(path) == baseline:
+                raise PermissionError(13, "Permission denied")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(retired_integrity.os, "unlink", unlink)
+
+        r = _install(monkeypatch)
+
+        assert r.exit_code == 0, r.output
+        lines = r.output.splitlines()
+        assert lines.count(
+            f"[WARN] Could not remove {baseline} (PermissionError). Delete it yourself."
+        ) == 1, r.output
+        assert lines.count(_removed_line(lock)) == 1, r.output
+        assert baseline.exists() and not lock.exists()
+        assert folder.is_dir()  # the folder is not empty, so it stays
+        assert (home / ".claude" / "settings.json").exists()  # the install finished
+
+    def test_uninstall_removes_both_files(self, home, monkeypatch):
+        from jacked import cli
+
+        folder = home / ".claude" / "jacked"
+        files = _seed_leftovers(folder)
+
+        r = CliRunner().invoke(cli.main, ["uninstall", "--yes"])
+
+        assert r.exit_code == 0, r.output
+        lines = r.output.splitlines()
+        for path in files:
+            assert not os.path.lexists(path)
+            assert lines.count(_removed_line(path)) == 1, r.output
+        assert not folder.exists()
+
+    def test_a_partial_uninstall_keeps_the_files(self, home, monkeypatch):
+        """``--rules`` removes only the rules block: it does no other cleanup."""
+        from jacked import cli
+
+        files = _seed_leftovers(home / ".claude" / "jacked")
+
+        r = CliRunner().invoke(cli.main, ["uninstall", "--rules"])
+
+        assert r.exit_code == 0, r.output
+        assert all(path.exists() for path in files)
+
+
+class TestTheRemovalRules:
+    def test_a_user_file_in_the_folder_stays_and_so_does_the_folder(self, home):
+        folder = home / ".claude" / "jacked"
+        files = _seed_leftovers(folder)
+        (folder / "issue-queue").mkdir()
+        mine = folder / "notes.txt"
+        mine.write_text("mine", encoding="utf-8")
+
+        lines = _report(home)
+
+        assert lines == [_removed_line(path) for path in files]
+        assert mine.read_text(encoding="utf-8") == "mine"
+        assert (folder / "issue-queue").is_dir()
+
+    def test_a_missing_file_gives_no_line(self, home):
+        folder = home / ".claude" / "jacked"
+        folder.mkdir()
+        (folder / "integrity.json.lock").write_text("", encoding="utf-8")
+
+        assert _report(home) == [_removed_line(folder / "integrity.json.lock")]
+        assert _report(home) == []
+
+    def test_an_empty_folder_that_held_no_old_file_stays(self, home):
+        """The folder goes only when this cleanup emptied it."""
+        folder = home / ".claude" / "jacked"
+        folder.mkdir()
+
+        assert _report(home) == []
+        assert folder.is_dir()
+
+    @requires_symlinks
+    def test_a_link_named_integrity_json_is_not_followed(self, home, tmp_path):
+        folder = home / ".claude" / "jacked"
+        folder.mkdir()
+        target = tmp_path / "elsewhere" / "important.json"
+        target.parent.mkdir()
+        target.write_text("keep me", encoding="utf-8")
+        link = folder / "integrity.json"
+        link.symlink_to(target)
+
+        assert _report(home) == []
+        assert target.read_text(encoding="utf-8") == "keep me"
+        assert link.is_symlink()
+        assert folder.is_dir()
+
+    @requires_symlinks
+    def test_a_linked_folder_is_not_removed(self, home, tmp_path):
+        real = tmp_path / "real-jacked"
+        files = _seed_leftovers(real)
+        (home / ".claude" / "jacked").symlink_to(real, target_is_directory=True)
+
+        lines = _report(home)
+
+        assert lines == [_removed_line(home / ".claude" / "jacked" / p.name) for p in files]
+        assert (home / ".claude" / "jacked").is_symlink()
+        assert real.is_dir()
+
+    def test_a_folder_with_the_name_of_a_file_stays(self, home):
+        folder = home / ".claude" / "jacked"
+        (folder / "integrity.json").mkdir(parents=True)
+        (folder / "integrity.json" / "inside.txt").write_text("x", encoding="utf-8")
+
+        assert _report(home) == []
+        assert (folder / "integrity.json" / "inside.txt").read_text(encoding="utf-8") == "x"
+
+    def test_claude_config_dir_is_cleaned_too(self, home, tmp_path, monkeypatch):
+        config = tmp_path / "config"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+        in_home = _seed_leftovers(home / ".claude" / "jacked")
+        in_config = _seed_leftovers(config / "jacked")
+
+        lines = _report(home)
+
+        assert lines == [_removed_line(path) for path in (*in_home, *in_config)]
+        assert not (home / ".claude" / "jacked").exists()
+        assert not (config / "jacked").exists()
+        assert config.is_dir()
+
+    def test_the_folders_have_no_duplicate(self):
+        assert retired_integrity.leftover_folders("/h", {}) == [Path("/h/.claude/jacked")]
+        assert retired_integrity.leftover_folders("/h", {"CLAUDE_CONFIG_DIR": "/h/.claude"}) == [
+            Path("/h/.claude/jacked")
+        ]
+
+
+# --------------------------------------------------------------------------- #
+# No surface of the tripwire is left
+# --------------------------------------------------------------------------- #
+
+class TestNoSurfaceIsLeft:
+    @pytest.mark.parametrize("module", [
+        "jacked.integrity", "jacked.integrity_baseline", "jacked.integrity_snapshot",
+        "jacked.integrity_command", "jacked.integrity_cli",
+        "jacked.memory.quarantine", "jacked.memory.injection_shapes",
+    ])
+    def test_the_module_is_gone(self, module):
+        assert importlib.util.find_spec(module) is None
+
+    def test_the_integrity_command_is_gone(self, home):
+        from jacked.cli import main
+
+        r = CliRunner().invoke(main, ["integrity", "accept"])
+
+        assert r.exit_code == 2
+        assert "No such command 'integrity'" in r.output
+        assert "integrity" not in CliRunner().invoke(main, ["--help"]).output
+
+    def test_the_features_list_has_no_integrity_key(self, home, monkeypatch):
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+
+        from jacked.api.routes import features
+
+        path = home / ".claude" / "settings.json"
+        path.write_text(json.dumps({"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": "echo x"}]},
+        ]}}), encoding="utf-8")
+        _seed_leftovers(home / ".claude" / "jacked")
+        monkeypatch.setattr(features, "SETTINGS_JSON", path)
+        app = FastAPI()
+        app.include_router(features.router, prefix="/api")
+
+        resp = TestClient(app).get("/api/features")
+
+        assert resp.status_code == 200, resp.text
+        assert "integrity" not in resp.json()
+
+    def test_settings_js_has_no_integrity_panel(self):
+        source = (REPO_ROOT / "jacked" / "data" / "web" / "js" / "components" / "settings.js").read_text(
+            encoding="utf-8"
+        )
+        for text in (
+            "_integrityPanel", "_INTEGRITY_SCOPE", "data-integrity-panel", "features.integrity",
+            "jacked integrity accept", "Hook and settings integrity",
+        ):
+            assert text not in source, text
+
+    def test_the_rules_have_no_quarantine_bullet(self):
+        rules = (REPO_ROOT / "jacked" / "data" / "rules" / "jacked_behaviors.md").read_text(encoding="utf-8")
+
+        assert "quarantine" not in rules
+        assert "jacked integrity" not in rules
+        assert "looks injected" not in rules
