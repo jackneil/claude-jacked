@@ -108,12 +108,16 @@ def _removed_line(path: Path) -> str:
     return f"[OK] Removed {path} (a file of the retired settings integrity check)"
 
 
+def _behind_link_line(path: Path, folder: Path) -> str:
+    return f"[WARN] Did not remove {path}: {folder} is a link. Delete it yourself."
+
+
 # --------------------------------------------------------------------------- #
 # jacked install and jacked uninstall remove the old baseline files
 # --------------------------------------------------------------------------- #
 
 class TestInstallRemovesTheOldFiles:
-    def test_install_removes_both_files_and_the_empty_folder(self, home, monkeypatch):
+    def test_install_removes_both_files_and_keeps_the_jacked_folder(self, home, monkeypatch):
         folder = home / ".claude" / "jacked"
         files = _seed_leftovers(folder)
 
@@ -124,7 +128,7 @@ class TestInstallRemovesTheOldFiles:
         for path in files:
             assert not os.path.lexists(path)
             assert lines.count(_removed_line(path)) == 1, r.output
-        assert not folder.exists()
+        assert folder.is_dir() and list(folder.iterdir()) == []  # the cleanup never removes jacked/
 
     def test_install_json_removes_the_files_and_stdout_stays_one_json_record(self, home, monkeypatch):
         folder = home / ".claude" / "jacked"
@@ -135,7 +139,7 @@ class TestInstallRemovesTheOldFiles:
         assert r.exit_code == 0, r.output
         assert isinstance(json.loads(r.output), dict), r.output
         assert not any(os.path.lexists(path) for path in files)
-        assert not folder.exists()
+        assert folder.is_dir()
 
     def test_install_on_a_clean_home_prints_no_integrity_line(self, home, monkeypatch):
         r = _install(monkeypatch)
@@ -200,7 +204,7 @@ class TestInstallRemovesTheOldFiles:
         for path in files:
             assert not os.path.lexists(path)
             assert lines.count(_removed_line(path)) == 1, r.output
-        assert not folder.exists()
+        assert folder.is_dir()
 
     def test_a_partial_uninstall_keeps_the_files(self, home, monkeypatch):
         """``--rules`` removes only the rules block: it does no other cleanup."""
@@ -237,7 +241,7 @@ class TestTheRemovalRules:
         assert _report(home) == []
 
     def test_an_empty_folder_that_held_no_old_file_stays(self, home):
-        """The folder goes only when this cleanup emptied it."""
+        """The cleanup never removes a jacked folder."""
         folder = home / ".claude" / "jacked"
         folder.mkdir()
 
@@ -261,14 +265,16 @@ class TestTheRemovalRules:
 
     @requires_symlinks
     def test_a_linked_jacked_folder_is_left_alone(self, home, tmp_path):
-        """Nothing inside a symlinked jacked folder is removed (DCR wave 1)."""
+        """Nothing inside a symlinked jacked folder is removed (DCR wave 1). Each
+        old file behind it gets one warning (wave 2 Security), on purpose."""
         real = tmp_path / "real-jacked"
-        files = _seed_leftovers(real)
-        (home / ".claude" / "jacked").symlink_to(real, target_is_directory=True)
+        _seed_leftovers(real)
+        link = home / ".claude" / "jacked"
+        link.symlink_to(real, target_is_directory=True)
 
-        assert _report(home) == []
-        assert (home / ".claude" / "jacked").is_symlink()
-        assert all(path.exists() for path in files)
+        assert _report(home) == [_behind_link_line(link / name, link) for name in NAMES]
+        assert link.is_symlink()
+        assert all((real / name).exists() for name in NAMES)
 
     def test_a_folder_with_the_name_of_a_file_stays(self, home):
         folder = home / ".claude" / "jacked"
@@ -287,9 +293,8 @@ class TestTheRemovalRules:
         lines = _report(home)
 
         assert lines == [_removed_line(path) for path in (*in_home, *in_config)]
-        assert not (home / ".claude" / "jacked").exists()
-        assert not (config / "jacked").exists()
-        assert config.is_dir()
+        assert (home / ".claude" / "jacked").is_dir()
+        assert (config / "jacked").is_dir()
 
     def test_the_folders_have_no_duplicate(self):
         assert retired_integrity.leftover_folders("/h", {}) == [Path("/h/.claude/jacked")]
@@ -326,12 +331,12 @@ def _locks_line(count: int, locks: Path) -> str:
 
 
 class TestQuarantineLocks:
-    def test_the_lock_files_go_with_one_count_line_and_the_empty_folders_go(self, home):
+    def test_the_lock_files_go_with_one_count_line_and_the_empty_locks_folder_goes(self, home):
         locks = _seed_locks(home, 3)
 
         assert _report(home) == [_locks_line(3, locks)]
         assert not locks.exists()
-        assert not (home / ".claude" / "jacked").exists()
+        assert (home / ".claude" / "jacked").is_dir()  # the cleanup never removes jacked/
 
     def test_one_lock_file_gives_the_singular_line(self, home):
         locks = _seed_locks(home, 1)
@@ -393,9 +398,9 @@ class TestQuarantineLocks:
         (in_config / "quarantine--x.lock").write_text("", encoding="utf-8")
 
         assert _report(home) == [f"[OK] Removed 3 old quarantine lock files from {in_home} and {in_config}"]
-        assert not (home / ".claude" / "jacked").exists()
-        assert not (config / "jacked").exists()
-        assert config.is_dir()
+        assert not in_home.exists() and not in_config.exists()
+        assert (home / ".claude" / "jacked").is_dir()
+        assert (config / "jacked").is_dir()
 
     def test_a_lock_error_gives_one_warning_line(self, home, monkeypatch):
         locks = _seed_locks(home, 3)
@@ -426,7 +431,8 @@ class TestQuarantineLocks:
         assert lines.count(_locks_line(4, locks)) == 1, r.output
         for path in files:
             assert lines.count(_removed_line(path)) == 1, r.output
-        assert not (home / ".claude" / "jacked").exists()
+        assert not locks.exists()
+        assert (home / ".claude" / "jacked").is_dir()
 
 
 # --------------------------------------------------------------------------- #
@@ -532,7 +538,7 @@ class TestJunctionsAndReadErrors:
         _fake_junction_lstat(monkeypatch, folder)
         calls = _spy_removals(monkeypatch)
 
-        assert _report(home) == []
+        assert _report(home) == [_behind_link_line(path, folder) for path in files]
         assert calls == []
         assert all(path.exists() for path in files) and lock.exists()
 
@@ -578,7 +584,7 @@ class TestJunctionsAndReadErrors:
         assert os.path.lexists(folder)
         assert all(path.exists() for path in files)
         assert (outside / "issue-queue").is_dir()
-        assert not [line for line in lines if line.startswith("[OK]")], lines
+        assert lines == [_behind_link_line(folder / name, folder) for name in NAMES]
 
     @pytest.mark.parametrize("which", ["jacked", "locks"])
     def test_a_folder_that_cannot_be_read_gives_one_warning(self, home, monkeypatch, which):
@@ -683,3 +689,104 @@ class TestJunctionsAndReadErrors:
         assert retired_integrity.leftover_folders(home) == [junction, config / "jacked"]
         assert _report(home) == [_removed_line(path) for path in files]
         assert junction.is_dir()
+
+
+# --------------------------------------------------------------------------- #
+# DCR wave 2 Security: jacked/ is never removed, old files behind a link are
+# reported, and locks/ is checked again right before its removal
+# --------------------------------------------------------------------------- #
+
+def _fake_resolving_junction(monkeypatch, link: Path, target: Path) -> None:
+    """``lstat`` gives a reparse-point folder for ``link``, and ``realpath``
+    resolves it to ``target``, as Windows does for a junction."""
+    _fake_junction_lstat(monkeypatch, link)
+    real_realpath = os.path.realpath
+
+    def realpath(path, *args, **kwargs):
+        if Path(path) == link:
+            return str(target)
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(retired_integrity.os.path, "realpath", realpath)
+
+
+class TestWave2Security:
+    @requires_symlinks
+    @pytest.mark.parametrize("kind", ["symlink", "junction"])
+    def test_a_home_link_to_the_config_folder_keeps_resolving(self, home, tmp_path, monkeypatch, kind):
+        """The cleanup empties cfg/jacked through its real path but never removes
+        it, so the user's link keeps resolving and jacked can still write there."""
+        cfg = tmp_path / "cfg"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+        files = _seed_leftovers(cfg / "jacked")
+        link = home / ".claude" / "jacked"
+        link.symlink_to(cfg / "jacked", target_is_directory=True)
+        if kind == "junction":
+            _fake_resolving_junction(monkeypatch, link, cfg / "jacked")
+
+        assert _report(home) == [_removed_line(path) for path in files]
+        assert not any(os.path.lexists(path) for path in files)
+        assert (cfg / "jacked").is_dir()
+        assert link.exists()
+        (link / "issue-queue").mkdir(parents=True, exist_ok=True)
+        assert (cfg / "jacked" / "issue-queue").is_dir()
+
+    @pytest.mark.parametrize("seeded", [True, False], ids=["leftovers", "no-leftovers"])
+    @pytest.mark.parametrize("kind", ["symlink", "junction"])
+    def test_old_files_behind_a_linked_jacked_folder_each_get_one_warning(
+        self, home, tmp_path, monkeypatch, kind, seeded
+    ):
+        """~/.claude/jacked links to a folder that is not a candidate (a dotfiles copy)."""
+        link = home / ".claude" / "jacked"
+        if kind == "symlink":
+            if not symlinks_supported():
+                pytest.skip("needs symlinks")
+            dotfiles = tmp_path / "dotfiles" / "jacked"
+            dotfiles.mkdir(parents=True)
+            link.symlink_to(dotfiles, target_is_directory=True)
+        else:
+            link.mkdir()
+        if seeded:
+            for name in NAMES:
+                (link / name).write_text("{}", encoding="utf-8")
+        if kind == "junction":
+            _fake_junction_lstat(monkeypatch, link)
+        calls = _spy_removals(monkeypatch)
+
+        expected = [_behind_link_line(link / name, link) for name in NAMES] if seeded else []
+        assert _report(home) == expected
+        assert calls == []
+        assert all((link / name).exists() for name in NAMES) is seeded
+
+    def test_the_locks_folder_is_checked_again_right_before_its_removal(self, home, monkeypatch):
+        """locks/ turns into a junction after its last lock file goes: no rmdir."""
+        locks = _seed_locks(home, 2)
+        real_lstat, real_unlink, real_rmdir, real_listdir = os.lstat, os.unlink, os.rmdir, os.listdir
+        calls: list[str] = []
+        turned: list[bool] = []
+
+        def unlink(path, *args, **kwargs):
+            calls.append(f"unlink {path}")
+            real_unlink(path, *args, **kwargs)
+            if Path(path).parent == locks and not any(
+                retired_integrity.is_lock_name(name) for name in real_listdir(locks)
+            ):
+                turned.append(True)
+
+        def rmdir(path, *args, **kwargs):
+            calls.append(f"rmdir {path}")
+            return real_rmdir(path, *args, **kwargs)
+
+        def lstat(path, *args, **kwargs):
+            if turned and Path(path) == locks:
+                return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x400)
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(retired_integrity.os, "unlink", unlink)
+        monkeypatch.setattr(retired_integrity.os, "rmdir", rmdir)
+        monkeypatch.setattr(retired_integrity.os, "lstat", lstat)
+
+        assert _report(home) == [_locks_line(2, locks)]
+        assert turned == [True]
+        assert f"rmdir {locks}" not in calls
+        assert locks.is_dir()

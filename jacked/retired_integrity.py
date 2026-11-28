@@ -17,7 +17,10 @@ The rules:
 * Read a ``jacked`` or ``locks`` folder only when ``os.lstat`` shows a real
   folder: not a symlink, and not a Windows junction or other reparse point
   (``regular_file.is_reparse_point``). A linked folder is left alone, and
-  nothing in it is removed.
+  nothing in it is removed. The one read behind a linked ``jacked`` folder is
+  ``os.path.lexists`` on the two names in ``LEFTOVER_NAMES``: a metadata read
+  that reads no content and removes nothing. Each name found there gets one
+  warning line, so the user can delete it.
 * Look in ``<home>/.claude/jacked`` and in ``<config folder>/jacked``
   (``claude_paths.config_dir``, so ``CLAUDE_CONFIG_DIR`` applies), with the
   same rules for each. The old writer put the baseline beside each settings
@@ -26,10 +29,11 @@ The rules:
   the place of the real folder that it points at: it is skipped, and the real
   folder is cleaned through its own path.
 * Look for the lock files in the ``locks`` folder of each of these folders.
-  Remove ``locks`` when it is empty after that: nothing else uses it.
-* Remove a ``jacked`` folder only when this cleanup removed something from it
-  and the folder is then empty. A user file or ``issue-queue`` in the folder
-  keeps it.
+  Remove ``locks`` when it is a real folder and empty after that, checked
+  again right before the removal: nothing else uses it.
+* Never remove a ``jacked`` folder, not even an empty one. jacked writes
+  ``issue-queue`` there, and a user's link to that folder must keep
+  resolving.
 * A missing file or folder gives no line. Each removed baseline file gives one
   line, and the lock files give one count line. An error gives one warning
   line and does not stop the install or the uninstall. A folder that cannot be
@@ -62,7 +66,9 @@ class Removal:
 
     ``locks_folders`` holds each ``locks`` folder that gave up at least one
     lock file. ``unchecked`` holds each ``jacked`` or ``locks`` folder that
-    could not be read, so nothing in it was removed.
+    could not be read, so nothing in it was removed. ``behind_link`` holds
+    ``(leftover path, linked folder)`` for each old file that is still behind
+    a linked ``jacked`` folder after the real folders were cleaned.
     """
 
     files: list[Path] = field(default_factory=list)
@@ -71,6 +77,7 @@ class Removal:
     locks_removed: int = 0
     locks_failed: list[tuple[Path, str]] = field(default_factory=list)
     unchecked: list[tuple[Path, str]] = field(default_factory=list)
+    behind_link: list[tuple[Path, Path]] = field(default_factory=list)
 
 
 def _is_link(path: Path) -> bool:
@@ -91,8 +98,9 @@ def leftover_folders(home: Path | str, env: Mapping[str, str] | None = None) -> 
 
     A real folder appears once, even when two paths resolve to it. A link or
     a junction claims no place: it stays in the list (``remove_leftovers``
-    skips it with an INFO line), and the real folder that it points at keeps
-    its own place, so that folder is cleaned once.
+    skips it, and warns about each old file still behind it), and the real
+    folder that it points at keeps its own place, so that folder is cleaned
+    once.
 
     >>> [p.as_posix() for p in leftover_folders("/h", {})]
     ['/h/.claude/jacked']
@@ -179,36 +187,38 @@ def _check_folder(path: Path, result: Removal) -> bool:
     return False
 
 
-def _remove_empty_folder(folder: Path) -> bool:
-    """Remove ``folder`` when it is a real folder and empty. Return True when it went."""
+def _remove_empty_locks_folder(locks: Path) -> None:
+    """Remove ``locks`` when it is still a real folder and empty. Else it stays.
+
+    The check runs again right before ``os.rmdir``: a folder that became a
+    junction after the scan is not removed, because ``RemoveDirectory``
+    removes a junction even when its target is not empty.
+    """
     try:
-        if not _is_real_folder(folder):
-            return False
-        os.rmdir(folder)
+        if _is_real_folder(locks):
+            os.rmdir(locks)
     except OSError as exc:  # not empty, gone or not removable: the folder stays
-        logger.debug("retired integrity: %s stays (%s)", folder, type(exc).__name__)
-        return False
-    return True
+        logger.debug("retired integrity: %s stays (%s)", locks, type(exc).__name__)
 
 
-def _remove_locks(locks: Path, result: Removal) -> bool:
+def _remove_locks(locks: Path, result: Removal) -> None:
     """Remove the quarantine lock files in ``locks``, then ``locks`` when it is empty.
 
-    Return True when this removed anything. A linked or junctioned ``locks``
-    folder is not read, so nothing outside the jacked folder is removed. A
-    ``locks`` folder that another install removed first is not an error.
+    A linked or junctioned ``locks`` folder is not read, so nothing outside
+    the jacked folder is removed. A ``locks`` folder that another install
+    removed first is not an error.
     """
     if not _check_folder(locks, result):
-        return False
+        return
     before = result.locks_removed
     try:
         names = sorted(entry.name for entry in os.scandir(locks))
     except FileNotFoundError:
-        return False
+        return
     except OSError as exc:
         logger.warning("retired integrity: could not read %s (%s)", locks, type(exc).__name__)
         result.unchecked.append((locks, type(exc).__name__))
-        return False
+        return
     for name in names:
         if not is_lock_name(name):
             continue
@@ -219,29 +229,37 @@ def _remove_locks(locks: Path, result: Removal) -> bool:
             result.locks_failed.append((locks / name, type(exc).__name__))
     if result.locks_removed > before:
         result.locks_folders.append(locks)
-    return _remove_empty_folder(locks) or result.locks_removed > before
+    _remove_empty_locks_folder(locks)
 
 
 def remove_leftovers(home: Path | str, env: Mapping[str, str] | None = None) -> Removal:
-    """Remove the files of the retired check and return what was done."""
+    """Remove the files of the retired check and return what was done.
+
+    The real folders go first. Then each linked candidate gets its metadata
+    check, so an old file that was cleaned through the real path of its
+    folder gives no warning.
+    """
     result = Removal()
+    linked: list[Path] = []
     for folder in leftover_folders(home, env):
         if not _check_folder(folder, result):
+            if _is_link(folder):
+                linked.append(folder)
             continue
-        removed_here = False
         for name in LEFTOVER_NAMES:
             path = folder / name
             try:
                 if _remove_file(path):
                     result.files.append(path)
-                    removed_here = True
             except OSError as exc:
                 logger.warning("retired integrity: could not remove %s (%s)", path, type(exc).__name__)
                 result.failed.append((path, type(exc).__name__))
-        if _remove_locks(folder / "locks", result):
-            removed_here = True
-        if removed_here:
-            _remove_empty_folder(folder)
+        _remove_locks(folder / "locks", result)
+    for folder in linked:
+        for name in LEFTOVER_NAMES:
+            if os.path.lexists(folder / name):  # a metadata read: no content, nothing removed
+                logger.warning("retired integrity: %s stays: %s is a link", folder / name, folder)
+                result.behind_link.append((folder / name, folder))
     for path, error in result.locks_failed:
         logger.warning("retired integrity: could not remove %s (%s)", path, error)
     return result
@@ -260,8 +278,9 @@ def report_removal(home: Path | str, console) -> None:
     """Remove the files and print what happened.
 
     One line for each removed baseline file, one count line for the lock files,
-    one warning line for each baseline error, one for the lock errors together,
-    and one for each folder that could not be read. ``console`` is a ``rich``
+    one warning line for each baseline error, one for each old file behind a
+    linked folder, one for the lock errors together, and one for each folder
+    that could not be read. ``console`` is a ``rich``
     console. A path never wraps (``soft_wrap``), so the user can copy it.
     """
     from rich.markup import escape
@@ -275,6 +294,12 @@ def report_removal(home: Path | str, console) -> None:
     for path, error in result.failed:
         console.print(
             f"[yellow][WARN][/yellow] Could not remove {escape(str(path))} ({error}). Delete it yourself.",
+            soft_wrap=True,
+        )
+    for path, folder in result.behind_link:
+        console.print(
+            f"[yellow][WARN][/yellow] Did not remove {escape(str(path))}: {escape(str(folder))} is a link. "
+            "Delete it yourself.",
             soft_wrap=True,
         )
     if result.locks_removed:
