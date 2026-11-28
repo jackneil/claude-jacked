@@ -22,7 +22,9 @@ The rules:
   (``claude_paths.config_dir``, so ``CLAUDE_CONFIG_DIR`` applies), with the
   same rules for each. The old writer put the baseline beside each settings
   file that it wrote, so both folders can hold one. Two paths that resolve to
-  the same folder count as one folder.
+  the same real folder count as one folder. A link or a junction never takes
+  the place of the real folder that it points at: it is skipped, and the real
+  folder is cleaned through its own path.
 * Look for the lock files in the ``locks`` folder of each of these folders.
   Remove ``locks`` when it is empty after that: nothing else uses it.
 * Remove a ``jacked`` folder only when this cleanup removed something from it
@@ -71,18 +73,43 @@ class Removal:
     unchecked: list[tuple[Path, str]] = field(default_factory=list)
 
 
+def _is_link(path: Path) -> bool:
+    """True when ``os.lstat`` shows a symlink or a Windows reparse point (a junction).
+
+    A missing path or an error returns False. ``remove_leftovers`` inspects
+    the folder again and records an error itself.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or is_reparse_point(info)
+
+
 def leftover_folders(home: Path | str, env: Mapping[str, str] | None = None) -> list[Path]:
-    """Return each folder that can hold the two files, one path for each real folder.
+    """Return each folder that can hold the two files.
+
+    A real folder appears once, even when two paths resolve to it. A link or
+    a junction claims no place: it stays in the list (``remove_leftovers``
+    skips it with an INFO line), and the real folder that it points at keeps
+    its own place, so that folder is cleaned once.
 
     >>> [p.as_posix() for p in leftover_folders("/h", {})]
     ['/h/.claude/jacked']
     >>> [p.as_posix() for p in leftover_folders("/h", {"CLAUDE_CONFIG_DIR": "/c"})]
     ['/h/.claude/jacked', '/c/jacked']
+    >>> [p.as_posix() for p in leftover_folders("/h", {"CLAUDE_CONFIG_DIR": "/h/.claude"})]
+    ['/h/.claude/jacked']
     """
     folders: list[Path] = []
     seen: set[str] = set()
     for base in (Path(home) / ".claude", claude_paths.config_dir(home, env)):
         folder = base / "jacked"
+        if folder in folders:
+            continue
+        if _is_link(folder):
+            folders.append(folder)
+            continue
         key = os.path.normcase(os.path.realpath(folder))
         if key not in seen:
             seen.add(key)

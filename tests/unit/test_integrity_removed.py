@@ -618,14 +618,21 @@ class TestJunctionsAndReadErrors:
         assert (locks / "quarantine--Users-me-repo0.lock").exists()
 
     def test_a_locks_folder_that_another_install_removed_is_not_an_error(self, home, monkeypatch, caplog):
-        """Install A sees locks/, install B removes it, then A lists it."""
+        """Install A sees locks/, install B removes it, then A lists it.
+
+        The fake patches the global ``os.scandir``, and on Python 3.13
+        ``Path.iterdir`` calls ``os.scandir``. So the fake empties the folder
+        with the real ``os.listdir`` and acts only on its first call.
+        """
         locks = _seed_locks(home, 2)
-        real_scandir = os.scandir
+        real_scandir, real_listdir = os.scandir, os.listdir
+        raced: list[Path] = []
 
         def scandir(path=".", *args, **kwargs):
-            if Path(path) == locks:
-                for child in locks.iterdir():
-                    child.unlink()
+            if not raced and Path(path) == locks:
+                raced.append(locks)
+                for name in real_listdir(locks):
+                    (locks / name).unlink()
                 locks.rmdir()  # the other install got there first
             return real_scandir(path, *args, **kwargs)
 
@@ -633,5 +640,46 @@ class TestJunctionsAndReadErrors:
 
         with caplog.at_level("WARNING", logger="jacked.retired_integrity"):
             assert _report(home) == []
+        assert raced == [locks]
         assert caplog.records == []
         assert not locks.exists()
+
+    @requires_symlinks
+    def test_a_home_link_to_the_config_folder_still_lets_the_config_folder_be_cleaned(
+        self, home, tmp_path, monkeypatch
+    ):
+        """DCR wave 2: the link must not take the real folder's place in the dedup."""
+        config = tmp_path / "config"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+        files = _seed_leftovers(config / "jacked")
+        link = home / ".claude" / "jacked"
+        link.symlink_to(config / "jacked", target_is_directory=True)
+
+        assert retired_integrity.leftover_folders(home) == [link, config / "jacked"]
+        assert _report(home) == [_removed_line(path) for path in files]
+        assert not any(os.path.lexists(path) for path in files)
+        assert link.is_symlink()
+
+    def test_a_home_junction_to_the_config_folder_still_lets_the_config_folder_be_cleaned(
+        self, home, tmp_path, monkeypatch
+    ):
+        """The same with a faked junction: ``lstat`` gives a reparse-point folder,
+        and ``realpath`` resolves it to the config folder, as on Windows."""
+        config = tmp_path / "config"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+        files = _seed_leftovers(config / "jacked")
+        junction = home / ".claude" / "jacked"
+        junction.mkdir()
+        _fake_junction_lstat(monkeypatch, junction)
+        real_realpath = os.path.realpath
+
+        def realpath(path, *args, **kwargs):
+            if Path(path) == junction:
+                return str(config / "jacked")
+            return real_realpath(path, *args, **kwargs)
+
+        monkeypatch.setattr(retired_integrity.os.path, "realpath", realpath)
+
+        assert retired_integrity.leftover_folders(home) == [junction, config / "jacked"]
+        assert _report(home) == [_removed_line(path) for path in files]
+        assert junction.is_dir()
