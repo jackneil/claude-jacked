@@ -14,7 +14,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import stat
+import subprocess
+import sys
 from io import StringIO
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -34,6 +38,37 @@ OLD_BASELINE = {
 }
 
 requires_symlinks = pytest.mark.skipif(not symlinks_supported(), reason="needs symlinks")
+windows_only = pytest.mark.skipif(sys.platform != "win32", reason="directory junctions exist only on Windows")
+
+
+def _skip_or_fail_in_ci(reason: str):
+    """Skip with ``reason``; on CI (CI true, 1 or yes), fail with one line instead.
+
+    The junction tests are the only proof of the Windows rule, and CI runs
+    pytest with no ``-rs``, so a skip on the windows-latest job would drop the
+    proof with no sign. (The same switch as ``skip_or_fail_in_ci`` of the
+    testdiet branch.)
+    """
+    if os.environ.get("CI", "").strip().lower() in ("true", "1", "yes"):
+        pytest.fail(f"{reason}; on CI this test must run, so it fails instead of a skip", pytrace=False)
+    pytest.skip(reason)
+
+
+def _junction(link: Path, target: Path) -> None:
+    """Make ``link`` a directory junction to ``target``, as ``jacked/launch.py`` does."""
+    try:
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+        return
+    except (ImportError, AttributeError, OSError):
+        pass
+    made = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    if made.returncode != 0 or not os.path.lexists(link):
+        _skip_or_fail_in_ci(f"could not make a directory junction: {made.stderr or made.stdout}")
 
 
 @pytest.fixture
@@ -225,16 +260,15 @@ class TestTheRemovalRules:
         assert folder.is_dir()
 
     @requires_symlinks
-    def test_a_linked_folder_is_not_removed(self, home, tmp_path):
+    def test_a_linked_jacked_folder_is_left_alone(self, home, tmp_path):
+        """Nothing inside a symlinked jacked folder is removed (DCR wave 1)."""
         real = tmp_path / "real-jacked"
         files = _seed_leftovers(real)
         (home / ".claude" / "jacked").symlink_to(real, target_is_directory=True)
 
-        lines = _report(home)
-
-        assert lines == [_removed_line(home / ".claude" / "jacked" / p.name) for p in files]
+        assert _report(home) == []
         assert (home / ".claude" / "jacked").is_symlink()
-        assert real.is_dir()
+        assert all(path.exists() for path in files)
 
     def test_a_folder_with_the_name_of_a_file_stays(self, home):
         folder = home / ".claude" / "jacked"
@@ -453,3 +487,151 @@ class TestNoSurfaceIsLeft:
         assert "quarantine" not in rules
         assert "jacked integrity" not in rules
         assert "looks injected" not in rules
+
+
+
+# --------------------------------------------------------------------------- #
+# DCR wave 1: junctions, unreadable folders, a locks folder that goes mid-run
+# --------------------------------------------------------------------------- #
+
+def _fake_junction_lstat(monkeypatch, target: Path) -> None:
+    """``os.lstat`` reports ``target`` the way Windows reports a directory junction."""
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if Path(path) == target:
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x400)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(retired_integrity.os, "lstat", lstat)
+
+
+def _spy_removals(monkeypatch) -> list[str]:
+    """Record every ``os.unlink`` and ``os.rmdir`` call, then make it."""
+    calls: list[str] = []
+    real_unlink, real_rmdir = os.unlink, os.rmdir
+
+    def unlink(path, *args, **kwargs):
+        calls.append(f"unlink {path}")
+        return real_unlink(path, *args, **kwargs)
+
+    def rmdir(path, *args, **kwargs):
+        calls.append(f"rmdir {path}")
+        return real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(retired_integrity.os, "unlink", unlink)
+    monkeypatch.setattr(retired_integrity.os, "rmdir", rmdir)
+    return calls
+
+
+class TestJunctionsAndReadErrors:
+    def test_a_junction_like_jacked_folder_is_not_touched(self, home, monkeypatch):
+        folder = home / ".claude" / "jacked"
+        files = _seed_leftovers(folder)
+        lock = _seed_locks(home, 1) / "quarantine--Users-me-repo0.lock"
+        _fake_junction_lstat(monkeypatch, folder)
+        calls = _spy_removals(monkeypatch)
+
+        assert _report(home) == []
+        assert calls == []
+        assert all(path.exists() for path in files) and lock.exists()
+
+    def test_a_junction_like_locks_folder_is_not_touched(self, home, monkeypatch):
+        locks = _seed_locks(home, 1)
+        lock = locks / "quarantine--Users-me-repo0.lock"
+        _fake_junction_lstat(monkeypatch, locks)
+        calls = _spy_removals(monkeypatch)
+
+        assert _report(home) == []
+        assert calls == []
+        assert lock.exists()
+
+    @windows_only
+    def test_a_real_locks_junction_is_not_followed_or_removed(self, home, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "quarantine-x.lock"
+        victim.write_text("keep me", encoding="utf-8")
+        other = outside / "notes.txt"
+        other.write_text("mine", encoding="utf-8")
+        (home / ".claude" / "jacked").mkdir()
+        locks = home / ".claude" / "jacked" / "locks"
+        _junction(locks, outside)
+
+        lines = _report(home)
+
+        assert os.path.lexists(locks)
+        assert victim.read_text(encoding="utf-8") == "keep me"
+        assert other.read_text(encoding="utf-8") == "mine"
+        assert not [line for line in lines if line.startswith("[OK]")], lines
+
+    @windows_only
+    def test_a_real_jacked_junction_is_not_followed_or_removed(self, home, tmp_path):
+        outside = tmp_path / "outside-jacked"
+        files = _seed_leftovers(outside)
+        (outside / "issue-queue").mkdir()
+        folder = home / ".claude" / "jacked"
+        _junction(folder, outside)
+
+        lines = _report(home)
+
+        assert os.path.lexists(folder)
+        assert all(path.exists() for path in files)
+        assert (outside / "issue-queue").is_dir()
+        assert not [line for line in lines if line.startswith("[OK]")], lines
+
+    @pytest.mark.parametrize("which", ["jacked", "locks"])
+    def test_a_folder_that_cannot_be_read_gives_one_warning(self, home, monkeypatch, which):
+        folder = home / ".claude" / "jacked"
+        locks = _seed_locks(home, 1)
+        files = _seed_leftovers(folder) if which == "jacked" else []
+        target = folder if which == "jacked" else locks
+        real_lstat = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if Path(path) == target:
+                raise PermissionError(13, "Permission denied")
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(retired_integrity.os, "lstat", lstat)
+
+        assert _report(home) == [
+            f"[WARN] Could not read {target} (PermissionError). jacked did not remove the old files in it."
+        ]
+        assert (locks / "quarantine--Users-me-repo0.lock").exists()
+        assert all(path.exists() for path in files)
+
+    def test_a_locks_folder_that_cannot_be_listed_gives_one_warning(self, home, monkeypatch):
+        locks = _seed_locks(home, 1)
+        real_scandir = os.scandir
+
+        def scandir(path=".", *args, **kwargs):
+            if Path(path) == locks:
+                raise OSError(5, "Input/output error")
+            return real_scandir(path, *args, **kwargs)
+
+        monkeypatch.setattr(retired_integrity.os, "scandir", scandir)
+
+        assert _report(home) == [
+            f"[WARN] Could not read {locks} (OSError). jacked did not remove the old files in it."
+        ]
+        assert (locks / "quarantine--Users-me-repo0.lock").exists()
+
+    def test_a_locks_folder_that_another_install_removed_is_not_an_error(self, home, monkeypatch, caplog):
+        """Install A sees locks/, install B removes it, then A lists it."""
+        locks = _seed_locks(home, 2)
+        real_scandir = os.scandir
+
+        def scandir(path=".", *args, **kwargs):
+            if Path(path) == locks:
+                for child in locks.iterdir():
+                    child.unlink()
+                locks.rmdir()  # the other install got there first
+            return real_scandir(path, *args, **kwargs)
+
+        monkeypatch.setattr(retired_integrity.os, "scandir", scandir)
+
+        with caplog.at_level("WARNING", logger="jacked.retired_integrity"):
+            assert _report(home) == []
+        assert caplog.records == []
+        assert not locks.exists()
