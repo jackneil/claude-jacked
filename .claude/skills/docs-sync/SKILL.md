@@ -13,9 +13,9 @@ description: "Sync docs with code changes: diffs branch, maps to affected docs, 
 - **Doc style**: README, SECURITY.md and other user-facing docs use ASD-STE100 Simplified Technical English (active voice, one instruction per sentence, short sentences) and carry no em-dashes. Docstrings follow the same STE rules. Internal design docs and plans are exempt from the em-dash ban.
 
 ## Doc Inventory
-- `README.md` (sections: What you get, Quick start, Your dashboard, Table of Contents, What's Included, Web Dashboard (Remote Access, Account switching, Plans and usage windows), Background Service and Tray Icon, Upgrading (the upgrade is a transaction), `/recover`, `/whats-next` ambition, Built-in Reviewers and Commands (Skills, Skill Packs, Skill Listing Budget, DCR Review Engine, Memory Vault, Open work at session start, Hook and settings integrity, Statusline, QA Browser Testing, Asana in `/whats-next`), Sound Notifications, FAQ, Uninstall / Troubleshooting, Version History, Advanced / Technical Reference)
+- `README.md` (sections: What you get, Quick start, Your dashboard, Table of Contents, What's Included, Web Dashboard (Remote Access, Account switching, Plans and usage windows), Background Service and Tray Icon, Upgrading (the upgrade is a transaction), `/recover`, `/whats-next` ambition, Built-in Reviewers and Commands (Skills, Skill Packs, Skill Listing Budget, DCR Review Engine, Memory Vault, Open work at session start, Statusline, QA Browser Testing, Asana in `/whats-next`), Sound Notifications, FAQ, Uninstall / Troubleshooting, Version History, Advanced / Technical Reference)
 - `CLAUDE.md` (Project Rules, Environment: the uv-only + test-running rules)
-- `JACKED_GUARDRAILS.md` (Quality Gates, Size Limits, Structure, Error Handling, Testing, Security, Hook and Memory Integrity (MemoryTrap): case study, posture rules, what jacked does, limit of the threat model; Naming, Git, Python-Specific)
+- `JACKED_GUARDRAILS.md` (Quality Gates, Size Limits, Structure, Error Handling, Testing, Security, Naming, Git, Python-Specific)
 - `SECURITY.md` (Report a vulnerability, Supported versions, What jacked protects, How releases are built)
 - `lessons.md` (recurring pitfalls; a Claude-instruction file, stays Markdown)
 - `docs/architecture/` (`oauth-and-credential-flows.md`, `auto-swap-system.md`, `work-ledger.html`: where rules, issues and PRs each belong)
@@ -29,12 +29,11 @@ description: "Sync docs with code changes: diffs branch, maps to affected docs, 
 | Change Category | Affected Docs |
 |----------------|---------------|
 | Pipeline/Architecture | `docs/architecture/*`; `README.md` (Web Dashboard / Background Service) |
-| SessionStart hook steps (`jacked/data/hooks/session_start.py`, `git_reality.py`, `issue_queue.py`, load budget) | `README.md` (Open work at session start, Memory Vault, Hook and settings integrity); `docs/architecture/work-ledger.html` |
-| Integrity tripwire / quarantine (`jacked/integrity*.py`, `jacked/memory/quarantine.py`, `injection_shapes.py`) | `README.md` (Hook and settings integrity); `JACKED_GUARDRAILS.md` (MemoryTrap section); `SECURITY.md` (What jacked protects) |
+| SessionStart hook steps (`jacked/data/hooks/session_start.py`, `git_reality.py`, `issue_queue.py`, load budget) | `README.md` (Open work at session start, Memory Vault); `docs/architecture/work-ledger.html` |
 | Git guard / untrusted-checkout reads (`jacked/git_guard.py`) | `SECURITY.md` (What jacked protects); `JACKED_GUARDRAILS.md` (Security) |
 | Issue queue / work ledger (`jacked/service/issue_queue_refresh.py`, `jacked/issues_cli.py`, goal-maker Ledger contract, whats-next) | `docs/architecture/work-ledger.html`; `README.md` (Open work at session start, `/whats-next` ambition) |
 | Configuration / Env / Install | `README.md` (Quick start, Your dashboard, Upgrading); `CLAUDE.md` (Environment) |
-| Commands/CLI (`jacked/cli.py`, `integrity_cli.py`, `issues_cli.py`) | `README.md` (What's Included, Quick start, Commands, Hook and settings integrity) |
+| Commands/CLI (`jacked/cli.py`, `issues_cli.py`) | `README.md` (What's Included, Quick start, Commands) |
 | Dependencies | `README.md` (Quick start install lines); `pyproject.toml`; `uv.lock` |
 | CI / release workflows (`.github/workflows/`) | `SECURITY.md` (How releases are built); `README.md` if user-visible |
 | UI/Frontend (`jacked/data/web/`) | `README.md` (Web Dashboard, Your dashboard) |
