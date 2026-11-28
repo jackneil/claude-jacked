@@ -2,8 +2,9 @@
 
 jacked 0.111.0 to 0.111.5 kept a baseline of settings.json in
 ``jacked/integrity.json`` beside the settings file, with the lock file
-``integrity.json.lock``. ``jacked install`` and ``jacked uninstall`` now remove
-these two files (``jacked.retired_integrity``). These tests also hold every
+``integrity.json.lock``, and the MEMORY.md quarantine kept lock files in
+``~/.claude/jacked/locks``. ``jacked install`` and ``jacked uninstall`` now
+remove these files (``jacked.retired_integrity``). These tests also hold every
 surface of the tripwire to its removal: the CLI command, the doctor line, the
 dashboard field and panel, the rules bullet and the modules. Every test runs in
 a scratch home.
@@ -261,6 +262,135 @@ class TestTheRemovalRules:
         assert retired_integrity.leftover_folders("/h", {"CLAUDE_CONFIG_DIR": "/h/.claude"}) == [
             Path("/h/.claude/jacked")
         ]
+
+    @requires_symlinks
+    def test_a_config_dir_that_resolves_to_the_home_folder_counts_once(self, home, tmp_path, monkeypatch):
+        alias = tmp_path / "alias"
+        alias.symlink_to(home / ".claude", target_is_directory=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(alias))
+        files = _seed_leftovers(home / ".claude" / "jacked")
+
+        assert retired_integrity.leftover_folders(home) == [home / ".claude" / "jacked"]
+        assert _report(home) == [_removed_line(path) for path in files]
+
+
+# --------------------------------------------------------------------------- #
+# The lock files of the retired MEMORY.md quarantine
+# --------------------------------------------------------------------------- #
+
+def _seed_locks(home: Path, count: int) -> Path:
+    locks = home / ".claude" / "jacked" / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    for n in range(count):
+        (locks / f"quarantine--Users-me-repo{n}.lock").write_text("", encoding="utf-8")
+    return locks
+
+
+def _locks_line(count: int, locks: Path) -> str:
+    noun = "old quarantine lock file" if count == 1 else "old quarantine lock files"
+    return f"[OK] Removed {count} {noun} from {locks}"
+
+
+class TestQuarantineLocks:
+    def test_the_lock_files_go_with_one_count_line_and_the_empty_folders_go(self, home):
+        locks = _seed_locks(home, 3)
+
+        assert _report(home) == [_locks_line(3, locks)]
+        assert not locks.exists()
+        assert not (home / ".claude" / "jacked").exists()
+
+    def test_one_lock_file_gives_the_singular_line(self, home):
+        locks = _seed_locks(home, 1)
+
+        assert _report(home) == [_locks_line(1, locks)]
+
+    def test_an_empty_locks_folder_goes(self, home):
+        locks = home / ".claude" / "jacked" / "locks"
+        locks.mkdir(parents=True)
+        (home / ".claude" / "jacked" / "issue-queue").mkdir()
+
+        assert _report(home) == []
+        assert not locks.exists()
+        assert (home / ".claude" / "jacked" / "issue-queue").is_dir()
+
+    def test_a_file_with_another_name_stays_and_keeps_the_folder(self, home):
+        locks = _seed_locks(home, 2)
+        other = locks / "other.lock"
+        other.write_text("mine", encoding="utf-8")
+        near = locks / "quarantine-notes.txt"
+        near.write_text("mine", encoding="utf-8")
+
+        assert _report(home) == [_locks_line(2, locks)]
+        assert other.read_text(encoding="utf-8") == "mine"
+        assert near.read_text(encoding="utf-8") == "mine"
+        assert sorted(p.name for p in locks.iterdir()) == ["other.lock", "quarantine-notes.txt"]
+
+    @requires_symlinks
+    def test_a_link_with_a_matching_name_stays(self, home, tmp_path):
+        locks = _seed_locks(home, 0)
+        target = tmp_path / "elsewhere.lock"
+        target.write_text("keep me", encoding="utf-8")
+        link = locks / "quarantine--Users-me-linked.lock"
+        link.symlink_to(target)
+
+        assert _report(home) == []
+        assert link.is_symlink()
+        assert target.read_text(encoding="utf-8") == "keep me"
+        assert locks.is_dir()
+
+    @requires_symlinks
+    def test_a_linked_locks_folder_is_not_read(self, home, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        victim = outside / "quarantine--x.lock"
+        victim.write_text("keep me", encoding="utf-8")
+        (home / ".claude" / "jacked").mkdir()
+        (home / ".claude" / "jacked" / "locks").symlink_to(outside, target_is_directory=True)
+
+        assert _report(home) == []
+        assert victim.read_text(encoding="utf-8") == "keep me"
+
+    def test_lock_files_under_claude_config_dir_are_not_touched(self, home, tmp_path, monkeypatch):
+        """The quarantine made its locks only under the jacked home."""
+        config = tmp_path / "config"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+        theirs = config / "jacked" / "locks" / "quarantine--x.lock"
+        theirs.parent.mkdir(parents=True)
+        theirs.write_text("", encoding="utf-8")
+
+        assert _report(home) == []
+        assert theirs.exists()
+
+    def test_a_lock_error_gives_one_warning_line(self, home, monkeypatch):
+        locks = _seed_locks(home, 3)
+        real_unlink = os.unlink
+
+        def unlink(path, *args, **kwargs):
+            if Path(path).parent == locks and not Path(path).name.endswith("0.lock"):
+                raise PermissionError(13, "Permission denied")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(retired_integrity.os, "unlink", unlink)
+
+        assert _report(home) == [
+            _locks_line(1, locks),
+            f"[WARN] Could not remove 2 old quarantine lock files in {locks} (PermissionError). "
+            "Delete them yourself.",
+        ]
+        assert locks.is_dir()
+
+    def test_install_removes_the_baseline_and_the_locks(self, home, monkeypatch):
+        files = _seed_leftovers(home / ".claude" / "jacked")
+        locks = _seed_locks(home, 4)
+
+        r = _install(monkeypatch)
+
+        assert r.exit_code == 0, r.output
+        lines = r.output.splitlines()
+        assert lines.count(_locks_line(4, locks)) == 1, r.output
+        for path in files:
+            assert lines.count(_removed_line(path)) == 1, r.output
+        assert not (home / ".claude" / "jacked").exists()
 
 
 # --------------------------------------------------------------------------- #
