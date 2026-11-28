@@ -286,7 +286,6 @@ def _write_atomically(
     mode: int | None,
     mode_strict: bool,
     retry_budget: float,
-    before_replace: Callable[[], None] | None = None,
     new_file_mode: int | None = None,
 ) -> None:
     # A symlink at ``path`` is replaced by a plain file unless the caller
@@ -318,9 +317,7 @@ def _write_atomically(
             if fsync:
                 handle.flush()
                 os.fsync(handle.fileno())
-        if before_replace is not None:
-            before_replace()
-        replace_with_retry(tmp_name, target, retry_budget=retry_budget, before_retry=before_replace)
+        replace_with_retry(tmp_name, target, retry_budget=retry_budget)
     except BaseException:
         # Any failure (a KeyboardInterrupt mid-write included) removes the
         # temp file, so a crash never leaves a stray temp or a partial target.
@@ -338,7 +335,6 @@ def atomic_write_bytes(
     mode: int | None = None,
     mode_strict: bool = True,
     retry_budget: float = RETRY_BUDGET_SECONDS,
-    before_replace: Callable[[], None] | None = None,
     new_file_mode: int | None = None,
 ) -> None:
     """Atomically replace ``path`` with ``data``, byte for byte.
@@ -354,12 +350,6 @@ def atomic_write_bytes(
     link at ``path`` to the file it points at; by default the link itself is
     replaced by a plain file. ``retry_budget`` is passed to
     ``replace_with_retry``.
-
-    ``before_replace`` is a compare-and-swap check. It runs after the temp
-    file is complete, immediately before the replace, and again before each
-    retry of the replace (``before_retry``). It raises to stop the write: the
-    temp file is removed, the target does not change, and the exception
-    propagates.
 
     By default a failure to set the mode (the chmod, or the private ACL on
     Windows) stops the write before the replace, and the error propagates.
@@ -382,7 +372,6 @@ def atomic_write_bytes(
         mode=mode,
         mode_strict=mode_strict,
         retry_budget=retry_budget,
-        before_replace=before_replace,
         new_file_mode=new_file_mode,
     )
 
@@ -396,7 +385,6 @@ def atomic_write_text(
     mode: int | None = None,
     mode_strict: bool = True,
     retry_budget: float = RETRY_BUDGET_SECONDS,
-    before_replace: Callable[[], None] | None = None,
     new_file_mode: int | None = None,
 ) -> None:
     """Atomically replace ``path`` with ``text`` encoded as UTF-8.
@@ -416,6 +404,5 @@ def atomic_write_text(
         mode=mode,
         mode_strict=mode_strict,
         retry_budget=retry_budget,
-        before_replace=before_replace,
         new_file_mode=new_file_mode,
     )
