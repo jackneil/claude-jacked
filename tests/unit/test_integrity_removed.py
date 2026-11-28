@@ -90,6 +90,17 @@ class TestInstallRemovesTheOldFiles:
             assert lines.count(_removed_line(path)) == 1, r.output
         assert not folder.exists()
 
+    def test_install_json_removes_the_files_and_stdout_stays_one_json_record(self, home, monkeypatch):
+        folder = home / ".claude" / "jacked"
+        files = _seed_leftovers(folder)
+
+        r = _install(monkeypatch, "--json")
+
+        assert r.exit_code == 0, r.output
+        assert isinstance(json.loads(r.output), dict), r.output
+        assert not any(os.path.lexists(path) for path in files)
+        assert not folder.exists()
+
     def test_install_on_a_clean_home_prints_no_integrity_line(self, home, monkeypatch):
         r = _install(monkeypatch)
 
